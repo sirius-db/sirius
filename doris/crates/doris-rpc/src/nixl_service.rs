@@ -4,45 +4,32 @@
 //! - exchange_metadata: sender offers buffers, receiver allocates and returns addresses
 //! - transfer_complete: sender notifies receiver that nixl transfer is done
 
-#[cfg(feature = "nixl")]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
-#[cfg(feature = "nixl")]
 use tracing::{info, instrument, warn};
 
-#[cfg(feature = "nixl")]
 use crate::nixl_exchange::{NixlExchange, NixlRegisteredBuffer};
 use crate::exchange_buffer::ExchangeBuffer;
-use sirius_ffi::SiriusEngine;
 
 /// NIXL metadata exchange service handler.
-#[allow(dead_code)] // fields only read with nixl feature
 pub struct NixlMetadataServiceHandler {
-    #[cfg(feature = "nixl")]
     nixl_agent: Option<Arc<NixlExchange>>,
-    engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
     /// Pending GPU buffers awaiting transfer_complete. RAII cleanup on removal:
     /// deregisters from nixl + frees GPU memory in correct order.
-    #[cfg(feature = "nixl")]
     pending_buffers: Mutex<HashMap<(i64, i64, i32), Vec<NixlRegisteredBuffer>>>,
 }
 
 impl NixlMetadataServiceHandler {
     pub fn new(
-        #[cfg(feature = "nixl")]
         nixl_agent: Option<Arc<NixlExchange>>,
-        engine: Option<Arc<Mutex<SiriusEngine>>>,
         exchange_buffer: ExchangeBuffer,
     ) -> Self {
         Self {
-            #[cfg(feature = "nixl")]
             nixl_agent,
-            engine,
             exchange_buffer,
-            #[cfg(feature = "nixl")]
             pending_buffers: Mutex::new(HashMap::new()),
         }
     }
@@ -51,7 +38,6 @@ impl NixlMetadataServiceHandler {
 // Implement the tonic-generated trait
 #[tonic::async_trait]
 impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
-    #[cfg(feature = "nixl")]
     #[instrument(skip_all, fields(peer, num_buffers))]
     async fn exchange_metadata(
         &self,
@@ -182,16 +168,6 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         }))
     }
 
-    #[cfg(not(feature = "nixl"))]
-    async fn exchange_metadata(
-        &self,
-        _: Request<doris_proto::nixl::PExchangeNixlMetadataRequest>,
-    ) -> Result<Response<doris_proto::nixl::PExchangeNixlMetadataResponse>, Status> {
-        Err(Status::unimplemented(
-            "nixl feature not enabled on this BE",
-        ))
-    }
-
     /// Handle transfer_complete: sender has finished nixl GPU-direct transfer.
     ///
     /// The sender includes Arrow IPC bytes alongside the GPU transfer. We use
@@ -202,7 +178,6 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
     /// The GPU buffers (now in receiver VRAM) are freed after processing.
     /// In a future optimization, we'll register GPU buffers directly as DuckDB
     /// tables, skipping the PBlock round-trip entirely.
-    #[cfg(feature = "nixl")]
     #[instrument(skip_all, fields(num_rows, num_buffers, sender_id))]
     async fn transfer_complete(
         &self,
@@ -281,15 +256,6 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         }))
     }
 
-    #[cfg(not(feature = "nixl"))]
-    async fn transfer_complete(
-        &self,
-        _: Request<doris_proto::nixl::PNixlTransferCompleteRequest>,
-    ) -> Result<Response<doris_proto::nixl::PNixlTransferCompleteResponse>, Status> {
-        Err(Status::unimplemented(
-            "nixl feature not enabled on this BE",
-        ))
-    }
 }
 
 
@@ -302,90 +268,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_service_creation_no_engine() {
-        #[cfg(feature = "nixl")]
-        let service = NixlMetadataServiceHandler::new(None, None, exchange_buf());
-        #[cfg(not(feature = "nixl"))]
+    async fn test_service_creation() {
         let service = NixlMetadataServiceHandler::new(None, exchange_buf());
 
         let _ = service;
-    }
-
-    #[tokio::test]
-    async fn test_service_creation_with_engine() {
-        let engine = sirius_ffi::SiriusEngine::new().ok().map(|e| Arc::new(Mutex::new(e)));
-
-        #[cfg(feature = "nixl")]
-        let service = NixlMetadataServiceHandler::new(None, engine, exchange_buf());
-        #[cfg(not(feature = "nixl"))]
-        let service = NixlMetadataServiceHandler::new(engine, exchange_buf());
-
-        let _ = service;
-    }
-
-    #[tokio::test]
-    #[cfg(not(feature = "nixl"))]
-    async fn test_exchange_metadata_without_nixl() {
-        use doris_proto::nixl::NixlMetadataService;
-
-        let service = NixlMetadataServiceHandler::new(None, exchange_buf());
-        let request = Request::new(doris_proto::nixl::PExchangeNixlMetadataRequest {
-            nixl_metadata: vec![],
-            src_buffers: vec![],
-            columns: vec![],
-            num_rows: 0,
-            query_id_hi: vec![],
-            query_id_lo: vec![],
-            node_id: 0,
-        });
-
-        let result = service.exchange_metadata(request).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    #[cfg(not(feature = "nixl"))]
-    async fn test_exchange_metadata_with_engine_still_unimplemented() {
-        use doris_proto::nixl::NixlMetadataService;
-
-        let engine = sirius_ffi::SiriusEngine::new().ok().map(|e| Arc::new(Mutex::new(e)));
-        let service = NixlMetadataServiceHandler::new(engine, exchange_buf());
-        let request = Request::new(doris_proto::nixl::PExchangeNixlMetadataRequest {
-            nixl_metadata: vec![],
-            src_buffers: vec![],
-            columns: vec![],
-            num_rows: 0,
-            query_id_hi: vec![],
-            query_id_lo: vec![],
-            node_id: 0,
-        });
-
-        // Even with engine, non-nixl build returns unimplemented.
-        let result = service.exchange_metadata(request).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    #[cfg(not(feature = "nixl"))]
-    async fn test_transfer_complete_without_nixl() {
-        use doris_proto::nixl::NixlMetadataService;
-
-        let service = NixlMetadataServiceHandler::new(None, exchange_buf());
-        let request = Request::new(doris_proto::nixl::PNixlTransferCompleteRequest {
-            query_id_hi: vec![],
-            query_id_lo: vec![],
-            node_id: 0,
-            dst_buffers: vec![],
-            columns: vec![],
-            num_rows: 0,
-            sender_id: 0,
-            arrow_ipc_data: vec![],
-        });
-
-        let result = service.transfer_complete(request).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
     }
 }

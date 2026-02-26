@@ -55,6 +55,7 @@ services:
     ipc: host
     cap_add:
       - SYS_PTRACE
+    restart: on-failure:30
     depends_on:
       doris-fe:
         condition: service_healthy
@@ -83,6 +84,7 @@ services:
       - /tmp/claude/orders.parquet:/data/orders.parquet:ro
       - /tmp/claude/customers.parquet:/data/customers.parquet:ro
       - /data/tpch:/data/tpch:ro
+      - ./sirius.cfg:/root/.sirius/sirius.cfg:ro
     entrypoint:
       - /opt/nix-glibc/ld-linux-x86-64.so.2
       - /opt/sirius-doris-be

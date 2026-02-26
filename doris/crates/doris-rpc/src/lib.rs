@@ -7,17 +7,15 @@
 pub mod arrow_to_pblock;
 pub mod backend_service;
 pub mod brpc_server;
-#[cfg(feature = "nixl")]
 pub mod cuda_driver;
 pub mod exchange_buffer;
 pub mod exchange_sender;
 pub mod fragment_manager;
 pub mod grpc_service;
 pub mod heartbeat_service;
-#[cfg(feature = "nixl")]
 pub mod nixl_exchange;
 pub mod nixl_integration;
 pub mod nixl_service;
-#[cfg(all(test, feature = "nixl"))]
+#[cfg(test)]
 mod nixl_exchange_mock;
 pub mod pblock_decoder;

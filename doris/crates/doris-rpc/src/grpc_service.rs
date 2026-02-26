@@ -849,7 +849,17 @@ enum ExecPlan {
 }
 
 /// Execute a plan via Sirius GPU, falling back to DuckDB CPU.
-fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool) -> Result<Vec<u8>, String> {
+fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, force_cpu: bool) -> Result<Vec<u8>, String> {
+    // When force_cpu is set, downgrade GPU plans to CPU-only equivalents.
+    if force_cpu {
+        let cpu_plan = match plan {
+            ExecPlan::Substrait { bytes, sort_limit_sql, .. } =>
+                ExecPlan::SubstraitCpuOnly { bytes, sort_limit_sql },
+            ExecPlan::Sql(sql) => ExecPlan::SqlCpuOnly(sql),
+            other => other, // already CPU-only
+        };
+        return execute_plan(engine, cpu_plan, no_cpu_fallback, false);
+    }
     match plan {
         ExecPlan::Substrait { bytes, sort_limit_sql, sql_fallback } => {
             // Strip SortRel/FetchRel from Substrait before GPU execution — the Sirius
@@ -863,11 +873,11 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool) ->
             let plan_bytes = gpu_bytes.as_deref().unwrap_or(&bytes);
             match engine.execute_substrait(plan_bytes, sort_limit_sql.as_deref()) {
                 Ok(ipc) => {
-                    tracing::info!("executed via gpu_processing_substrait");
+                    tracing::info!("executed via gpu_execution_substrait");
                     Ok(ipc)
                 }
                 Err(e) if no_cpu_fallback => {
-                    tracing::error!(error = %e, "gpu_processing_substrait failed (no CPU fallback)");
+                    tracing::error!(error = %e, "gpu_execution_substrait failed (no CPU fallback)");
                     Err(format!("GPU execution failed: {e}"))
                 }
                 Err(e) => {
@@ -875,7 +885,7 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool) ->
                     // has a column ordering bug where Root.names are applied positionally
                     // but the optimizer reorders join columns, causing data-name mismatches.
                     if let Some(sql) = sql_fallback {
-                        tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to SQL");
+                        tracing::warn!(error = %e, "gpu_execution_substrait failed, falling back to SQL");
                         match engine.execute_gpu(&sql) {
                             Ok(ipc) => {
                                 tracing::info!("executed via gpu_execution (SQL fallback)");
@@ -887,7 +897,7 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool) ->
                             }
                         }
                     } else {
-                        tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
+                        tracing::warn!(error = %e, "gpu_execution_substrait failed, falling back to CPU from_substrait");
                         from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
                     }
                 }
@@ -944,7 +954,7 @@ fn from_substrait_with_sort(
 /// a sort/fetch at the root (or deserialization failed).
 fn strip_sort_limit_from_substrait(bytes: &[u8]) -> Option<Vec<u8>> {
     use prost::Message;
-    use substrait::proto::{plan_rel, rel, Plan};
+    use substrait::proto::{plan_rel, Plan};
 
     let mut plan = Plan::decode(bytes).ok()?;
     let relation = plan.relations.first_mut()?;
@@ -998,6 +1008,9 @@ fn project_ipc_columns(
     use arrow::ipc::reader::StreamReader;
     use arrow::ipc::writer::StreamWriter;
 
+    if ipc_bytes.is_empty() {
+        return Err("parse IPC for projection: empty IPC bytes (no results)".to_string());
+    }
     let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None)
         .map_err(|e| format!("parse IPC for projection: {e}"))?;
     let schema = reader.schema();
@@ -1455,7 +1468,7 @@ pub struct PBackendServiceHandler {
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
     no_cpu_fallback: bool,
-    #[cfg(feature = "nixl")]
+    force_cpu: bool,
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
 }
 
@@ -1466,6 +1479,7 @@ impl PBackendServiceHandler {
         engine: Option<Arc<Mutex<SiriusEngine>>>,
         exchange_buffer: ExchangeBuffer,
         no_cpu_fallback: bool,
+        force_cpu: bool,
     ) -> Self {
         Self {
             state,
@@ -1473,12 +1487,11 @@ impl PBackendServiceHandler {
             engine,
             exchange_buffer,
             no_cpu_fallback,
-            #[cfg(feature = "nixl")]
+            force_cpu,
             nixl_agent: None,
         }
     }
 
-    #[cfg(feature = "nixl")]
     pub fn with_nixl_agent(mut self, agent: Option<Arc<super::nixl_exchange::NixlExchange>>) -> Self {
         self.nixl_agent = agent;
         self
@@ -1581,7 +1594,7 @@ impl PBackendService for PBackendServiceHandler {
                 let store = self.result_store.clone();
                 let buffer = self.exchange_buffer.clone();
                 let no_cpu_fallback = self.no_cpu_fallback;
-                #[cfg(feature = "nixl")]
+                let force_cpu = self.force_cpu;
                 let nixl_agent = self.nixl_agent.clone();
 
                 // Spawn async task: wait for exchange data, decode, load, execute.
@@ -1726,16 +1739,21 @@ impl PBackendService for PBackendServiceHandler {
                     if !file_scan_infos.is_empty() {
                         let engine_guard = engine.lock().unwrap();
                         for fsi in &file_scan_infos {
-                            // Multi-file parquet: use LocalFiles (no table materialization).
-                            // Single-file parquet + non-parquet: register as DuckDB table.
-                            if fsi.format == "parquet" && fsi.files.len() > 1 {
+                            if fsi.format == "parquet" {
+                                // Parquet: use LocalFiles path (no table materialization).
                                 match engine_guard.get_parquet_columns(&fsi.files[0].path) {
                                     Ok(columns) => {
+                                        info!(
+                                            table = %fsi.table_name,
+                                            num_files = fsi.files.len(),
+                                            "parquet LocalFiles path (async)"
+                                        );
                                         table_schemas.insert(fsi.table_name.clone(), columns);
                                         file_scan_map.insert(fsi.table_name.clone(), fsi.clone());
                                     }
                                     Err(e) => {
-                                        warn!(error = %e, table = %fsi.table_name, "failed to get parquet columns, falling back to table registration");
+                                        warn!(error = %e, table = %fsi.table_name,
+                                              "get_parquet_columns failed, falling back");
                                         let empty: Vec<String> = vec![];
                                         if let Err(e) = engine_guard.register_file_table(
                                             &fsi.table_name, &fsi.files[0].path, &fsi.format, &empty,
@@ -1836,7 +1854,7 @@ impl PBackendService for PBackendServiceHandler {
 
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
-                        let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback)?;
+                        let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
                         }
@@ -1853,10 +1871,7 @@ impl PBackendService for PBackendServiceHandler {
                             if let Some((dest_node_id, dests)) = exchange_dests {
                                 let query_id = (params.query_id.hi, params.query_id.lo);
                                 if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
-                                    #[cfg(feature = "nixl")]
                                     nixl_agent.as_ref(),
-                                    #[cfg(not(feature = "nixl"))]
-                                    None,
                                     location, &dests, query_id, dest_node_id, sender_id,
                                 ).await {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
@@ -1909,25 +1924,25 @@ impl PBackendService for PBackendServiceHandler {
                 if let Some(engine) = &self.engine {
                     let engine_guard = engine.lock().unwrap();
                     for fsi in &file_scan_infos {
-                        if fsi.format == "parquet" && fsi.files.len() > 1 {
-                            // Multi-file parquet: get column names without table materialization.
-                            // The Substrait plan will use LocalFiles → parquet_scan([files]).
-                            // Note: single-file parquet uses NamedTable (old path) because
-                            // sirius_physical_parquet_scan has issues with GROUP BY/complex ops.
+                        if fsi.format == "parquet" {
+                            // Parquet: use LocalFiles path (no table materialization).
+                            // Substrait ReadRel::LocalFiles embeds file paths directly.
+                            // GPU: from_substrait → parquet_scan → sirius_physical_parquet_scan
+                            // CPU: from_substrait → parquet_scan (DuckDB native)
                             match engine_guard.get_parquet_columns(&fsi.files[0].path) {
                                 Ok(columns) => {
                                     info!(
                                         table = %fsi.table_name,
                                         num_files = fsi.files.len(),
-                                        columns = ?columns,
-                                        "parquet columns (LocalFiles path)"
+                                        first_file = %fsi.files[0].path,
+                                        "parquet LocalFiles path (no table materialization)"
                                     );
                                     table_schemas.insert(fsi.table_name.clone(), columns);
                                     file_scan_map.insert(fsi.table_name.clone(), fsi.clone());
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, table = %fsi.table_name, "failed to get parquet columns, falling back to table registration");
-                                    // Fallback: register as DuckDB table (old path).
+                                    warn!(error = %e, table = %fsi.table_name,
+                                          "get_parquet_columns failed, falling back to table materialization");
                                     let empty: Vec<String> = vec![];
                                     if let Err(e) = engine_guard.register_file_table(&fsi.table_name, &fsi.files[0].path, &fsi.format, &empty) {
                                         warn!(error = %e, table = %fsi.table_name, "failed to register file table");
@@ -1936,18 +1951,14 @@ impl PBackendService for PBackendServiceHandler {
                                             ..Default::default()
                                         }));
                                     }
-                                    match engine_guard.get_table_columns(&fsi.table_name) {
-                                        Ok(columns) => {
-                                            table_schemas.insert(fsi.table_name.clone(), columns);
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, table = %fsi.table_name, "failed to get table columns");
-                                        }
+                                    if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
+                                        table_schemas.insert(fsi.table_name.clone(), columns);
                                     }
                                 }
                             }
                         } else {
-                            // Non-parquet: register as DuckDB table (old path).
+                            // Single-file non-parquet (or single-file parquet on GPU path):
+                            // register as DuckDB table.
                             let empty: Vec<String> = vec![];
                             if let Err(e) = engine_guard.register_file_table(&fsi.table_name, &fsi.files[0].path, &fsi.format, &empty) {
                                 warn!(error = %e, table = %fsi.table_name, "failed to register file table");
@@ -2051,6 +2062,7 @@ impl PBackendService for PBackendServiceHandler {
             };
             let store = self.result_store.clone();
             let no_cpu_fallback = self.no_cpu_fallback;
+            let force_cpu = self.force_cpu;
 
             // Check if this fragment's output should be sent to remote BEs.
             let exchange_dests = extract_exchange_destinations(params);
@@ -2058,7 +2070,7 @@ impl PBackendService for PBackendServiceHandler {
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                 let engine = engine.lock().unwrap();
-                let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback)?;
+                let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
                 if let Some(names) = output_names {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                 }
@@ -2084,10 +2096,7 @@ impl PBackendService for PBackendServiceHandler {
                             "sending execution result to exchange destinations"
                         );
                         if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
-                            #[cfg(feature = "nixl")]
                             self.nixl_agent.as_ref(),
-                            #[cfg(not(feature = "nixl"))]
-                            None,
                             location,
                             &dests,
                             query_id,
@@ -2592,10 +2601,8 @@ pub async fn start_grpc_server(
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
     no_cpu_fallback: bool,
-    #[cfg(feature = "nixl")]
+    force_cpu: bool,
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
-    #[cfg(not(feature = "nixl"))]
-    _nixl_agent: Option<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use doris_proto::doris::p_backend_service_server::PBackendServiceServer;
     use tokio_stream::wrappers::ReceiverStream;
@@ -2605,24 +2612,18 @@ pub async fn start_grpc_server(
     info!(addr = listen_addr, "starting PBackendService multi-protocol server (gRPC + bRPC)");
 
     // Clone before moving into handler (nixl service also needs these).
-    #[cfg(feature = "nixl")]
     let nixl_agent_for_service = nixl_agent.clone();
-    #[cfg(feature = "nixl")]
-    let engine_for_service = engine.clone();
 
-    #[allow(unused_mut)]
     let mut handler = PBackendServiceHandler::new(
         state,
         result_store,
         engine,
         exchange_buffer.clone(),
         no_cpu_fallback,
+        force_cpu,
     );
 
-    #[cfg(feature = "nixl")]
-    {
-        handler = handler.with_nixl_agent(nixl_agent);
-    }
+    handler = handler.with_nixl_agent(nixl_agent);
 
     let svc = PBackendServiceServer::new(handler);
 
@@ -2630,17 +2631,14 @@ pub async fn start_grpc_server(
     let (grpc_tx, grpc_rx) =
         tokio::sync::mpsc::channel::<tokio::net::TcpStream>(64);
 
-    // Build gRPC server with PBackendService + optional NixlMetadataService.
-    #[allow(unused_mut)]
+    // Build gRPC server with PBackendService + NixlMetadataService.
     let mut server_builder = tonic::transport::Server::builder()
         .add_service(svc);
 
-    #[cfg(feature = "nixl")]
     {
         use doris_proto::nixl::NixlMetadataServiceServer;
         let nixl_handler = super::nixl_service::NixlMetadataServiceHandler::new(
             nixl_agent_for_service,
-            engine_for_service,
             exchange_buffer.clone(),
         );
         server_builder = server_builder.add_service(NixlMetadataServiceServer::new(nixl_handler));

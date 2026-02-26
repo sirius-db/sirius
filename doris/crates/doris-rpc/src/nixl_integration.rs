@@ -6,10 +6,8 @@
 //! - Coordinating metadata exchange and transfer
 //! - Fallback to bRPC when GPU-direct unavailable
 
-#[cfg(feature = "nixl")]
 use std::sync::Arc;
 
-#[cfg(feature = "nixl")]
 use crate::nixl_exchange::{GpuBufferDesc, NixlExchange};
 use crate::exchange_sender::ExchangeDest;
 
@@ -20,7 +18,6 @@ pub enum ExecutionLocation {
     Cpu(Vec<u8>),
     /// Result is in GPU memory (buffer descriptors + schema).
     /// Also carries IPC bytes as fallback for non-exchange paths.
-    #[cfg(feature = "nixl")]
     Gpu {
         /// GPU buffer descriptors (addr, len, device_id).
         buffers: Vec<GpuBufferDesc>,
@@ -40,7 +37,6 @@ impl ExecutionLocation {
     pub fn into_ipc_bytes(self) -> Vec<u8> {
         match self {
             Self::Cpu(bytes) => bytes,
-            #[cfg(feature = "nixl")]
             Self::Gpu { ipc_bytes, .. } => ipc_bytes,
         }
     }
@@ -55,7 +51,6 @@ pub fn detect_execution_location(
     ipc_bytes: Vec<u8>,
     _engine: &sirius_ffi::SiriusEngine,
 ) -> ExecutionLocation {
-    #[cfg(feature = "nixl")]
     {
         // Try to extract GPU buffer pointers from the engine.
         // If the last execution was GPU-accelerated and buffers are still in VRAM,
@@ -105,7 +100,6 @@ pub fn detect_execution_location(
 }
 
 /// Send exchange result using nixl GPU-direct if available, otherwise bRPC.
-#[cfg(feature = "nixl")]
 pub async fn send_exchange_with_nixl(
     nixl_agent: Option<&Arc<NixlExchange>>,
     location: ExecutionLocation,
@@ -171,7 +165,6 @@ pub async fn send_exchange_with_nixl(
 ///
 /// Full flow: register buffers → exchange metadata → load peer metadata →
 /// transfer → notify receiver of completion.
-#[cfg(feature = "nixl")]
 async fn send_nixl_to_peer(
     agent: &Arc<NixlExchange>,
     src_buffers: &[GpuBufferDesc],
@@ -326,30 +319,6 @@ async fn send_nixl_to_peer(
     Ok(())
 }
 
-/// Non-nixl version: always use bRPC.
-#[cfg(not(feature = "nixl"))]
-pub async fn send_exchange_with_nixl(
-    _nixl_agent: Option<&()>,
-    location: ExecutionLocation,
-    destinations: &[ExchangeDest],
-    query_id: (i64, i64),
-    node_id: i32,
-    sender_id: i32,
-) -> Result<(), String> {
-    match location {
-        ExecutionLocation::Cpu(ipc_bytes) => {
-            crate::exchange_sender::send_exchange_result(
-                &ipc_bytes,
-                destinations,
-                query_id,
-                node_id,
-                sender_id,
-            )
-            .await
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,14 +338,12 @@ mod tests {
             ExecutionLocation::Cpu(bytes) => {
                 assert_eq!(bytes, ipc);
             }
-            #[cfg(feature = "nixl")]
             ExecutionLocation::Gpu { .. } => {
                 // Could happen if engine has GPU result
             }
         }
     }
 
-    #[cfg(feature = "nixl")]
     #[test]
     fn test_execution_location_gpu() {
         // This test requires GPU execution, skip in CI.
@@ -404,7 +371,6 @@ mod tests {
         let location = ExecutionLocation::Cpu(data.clone());
         match location {
             ExecutionLocation::Cpu(bytes) => assert_eq!(bytes, data),
-            #[cfg(feature = "nixl")]
             ExecutionLocation::Gpu { .. } => panic!("expected Cpu variant"),
         }
     }
@@ -420,9 +386,6 @@ mod tests {
         // With invalid IPC bytes and no destinations, the bRPC sender will still
         // try to parse. We just verify the function is callable and the type system works.
         let result = send_exchange_with_nixl(
-            #[cfg(feature = "nixl")]
-            None,
-            #[cfg(not(feature = "nixl"))]
             None,
             location,
             &[], // no destinations — but arrow_ipc_to_pblock still runs

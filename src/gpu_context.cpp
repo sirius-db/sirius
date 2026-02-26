@@ -167,8 +167,10 @@ unique_ptr<QueryResult> GPUContext::GPUExecutePendingQueryResult(PendingQueryRes
   D_ASSERT(gpu_active_query->IsOpenResult(pending));
   CheckExecutableInternal(pending);
   auto& gpu_executor = GetGPUExecutor();
+  SIRIUS_LOG_INFO("[GPUExecutePendingQueryResult] calling gpu_executor.Execute()");
   try {
     gpu_executor.Execute();
+    SIRIUS_LOG_INFO("[GPUExecutePendingQueryResult] Execute() returned OK");
   } catch (std::exception& e) {
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in GPUExecutePendingQueryResult: {}", error.RawMessage());

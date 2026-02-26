@@ -148,6 +148,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
   unique_ptr<Connection> conn;
   unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
+  string substrait_blob;  // Original Substrait bytes for from_substrait fallback
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
@@ -362,11 +363,14 @@ unique_ptr<FunctionData> SiriusExtension::GPUProcessingSubstraitBind(
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_processing_substrait cannot be called with a NULL parameter");
   }
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: start, input size={}", input.inputs[0].ToString().size());
   string serialized = input.inputs[0].GetValueUnsafe<string>();
   bool is_json = false;
   // Use the new connection's context to avoid deadlock with the locked caller context.
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: transforming Substrait plan ({} bytes)", serialized.size());
   SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, is_json, false);
   result->plan = transformer_s2d.TransformPlan();
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: TransformPlan done");
 
   auto relation_stmt                  = make_uniq<RelationStatement>(result->plan);
   unique_ptr<SQLStatement> statements = std::move(relation_stmt);
@@ -378,19 +382,24 @@ unique_ptr<FunctionData> SiriusExtension::GPUProcessingSubstraitBind(
   disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
   DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
 
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: creating DuckDB plan");
   Planner planner(context);
   planner.CreatePlan(std::move(statements));
   D_ASSERT(planner.plan);
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: DuckDB plan created, {} columns", planner.names.size());
 
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
   prepared->value_map = std::move(planner.value_map);
 
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: optimizing plan");
   auto query_plan = OptimizePlan(context, planner, *result->conn);
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: plan optimized, generating GPU physical plan");
   try {
     auto gpu_physical_plan =
       GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+    SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: GPU physical plan generated");
     auto gpu_prepared =
       make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
     result->gpu_prepared = gpu_prepared;
@@ -406,6 +415,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUProcessingSubstraitBind(
   for (auto& type : planner.types) {
     return_types.emplace_back(type);
   }
+  SIRIUS_LOG_INFO("[gpu_processing_substrait] bind: done, {} columns, {} types", names.size(), return_types.size());
 
   return std::move(result);
 }
@@ -417,6 +427,7 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext& context,
   auto& data = (GPUTableFunctionData&)*data_p.bind_data;
   if (data.finished) { return; }
   if (!data.res) {
+    SIRIUS_LOG_INFO("[gpu_processing_substrait] exec: starting, buffer_initialized={}, plan_error={}", buffer_is_initialized, data.plan_error);
     auto start = std::chrono::high_resolution_clock::now();
     if (!buffer_is_initialized) {
       SIRIUS_LOG_ERROR("GPUBufferManager not initialized, falling back to DuckDB");
@@ -429,7 +440,9 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext& context,
       data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
       data.res           = data.plan->Execute();
     } else {
+      SIRIUS_LOG_INFO("[gpu_processing_substrait] exec: calling GPUExecuteQuery");
       data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+      SIRIUS_LOG_INFO("[gpu_processing_substrait] exec: GPUExecuteQuery returned, hasError={}", data.res->HasError());
       if (data.res->HasError()) {
         SIRIUS_LOG_ERROR("GPUExecuteQuery error: {}, falling back to DuckDB", data.res->GetError());
         auto con           = Connection(*context.db);
@@ -470,6 +483,16 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
   result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
+
+  // The outer connection may have been created before the Sirius extension was loaded,
+  // so its registered_state won't have "sirius_state". Copy it from the inner connection.
+  if (!context.registered_state->Get<SiriusContext>("sirius_state")) {
+    auto sirius_state = result->conn->context->registered_state->Get<SiriusContext>("sirius_state");
+    if (sirius_state) {
+      context.registered_state->Insert("sirius_state", sirius_state);
+    }
+  }
+
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
@@ -527,30 +550,46 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
                                            TableFunctionInput& data_p,
                                            DataChunk& output)
 {
+  SIRIUS_LOG_INFO("[GPUExecutionFunction] called, bind_data={}", (void*)data_p.bind_data.get());
   auto& data = (SiriusTableFunctionData&)*data_p.bind_data;
-  if (data.finished) { return; }
+  if (data.finished) {
+    SIRIUS_LOG_INFO("[GPUExecutionFunction] already finished");
+    return;
+  }
 
   if (!data.res) {
+    SIRIUS_LOG_INFO("[GPUExecutionFunction] executing: plan_error={}, gpu_prepared={}, sirius_iface={}",
+                    data.plan_error, (void*)data.gpu_prepared.get(), (void*)data.sirius_iface.get());
     auto start = std::chrono::high_resolution_clock::now();
     if (data.plan_error) {
-      printf(
-        "=============================================\nError in SiriusExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      SIRIUS_LOG_WARN("[GPUExecutionFunction] GPU plan failed, falling back to from_substrait");
+      if (!data.substrait_blob.empty()) {
+        data.res = data.conn->TableFunction("from_substrait", {Value::BLOB_RAW(data.substrait_blob)})
+                     ->Execute();
+      } else {
+        SIRIUS_LOG_ERROR("[GPUExecutionFunction] No Substrait blob for fallback");
+        data.res = data.conn->Query(data.query);
+      }
     } else {
-      data.res =
-        data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
+      SIRIUS_LOG_INFO("[GPUExecutionFunction] calling sirius_execute_query");
+      try {
+        data.res =
+          data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
+      } catch (const std::exception& e) {
+        // Catch GPU pipeline errors (e.g. InternalException) and convert to
+        // std::runtime_error so DuckDB treats it as recoverable, not FATAL.
+        // This preserves the connection for CPU fallback on the Rust side.
+        SIRIUS_LOG_ERROR("[GPUExecutionFunction] sirius_execute_query threw: {}", e.what());
+        throw std::runtime_error(std::string("SiriusExecuteQuery error: ") + e.what());
+      }
+      SIRIUS_LOG_INFO("[GPUExecutionFunction] sirius_execute_query returned, hasError={}", data.res->HasError());
       if (data.res->HasError()) {
-        if (Config::ENABLE_DUCKDB_FALLBACK) {
-          SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
-          printf(
-            "=============================================\nError in SiriusExecuteQuery, fallback "
-            "to DuckDB\n=============================================\n");
-          data.res = data.conn->Query(data.query);
-        } else {
-          throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
-          return;
-        }
+        // Propagate GPU runtime errors to the caller (Rust side) for safe fallback.
+        // Do NOT fall back on the same inner connection — GPU pipeline threads may
+        // still be running and accessing shared state, making reuse unsafe (SIGSEGV).
+        auto error_msg = data.res->GetError();
+        SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", error_msg);
+        throw std::runtime_error("SiriusExecuteQuery error: " + error_msg);
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -580,6 +619,19 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionSubstraitBind(ClientContex
   result->conn             = make_uniq<Connection>(*context.db);
   result->enable_optimizer = true;
   result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
+
+  // The outer connection may have been created before the Sirius extension was loaded,
+  // so its registered_state won't have "sirius_state". Copy it from the inner connection
+  // which was opened after extension load and has the SiriusContext registered via
+  // OnConnectionOpened callback.
+  if (!context.registered_state->Get<SiriusContext>("sirius_state")) {
+    auto sirius_state = result->conn->context->registered_state->Get<SiriusContext>("sirius_state");
+    if (sirius_state) {
+      context.registered_state->Insert("sirius_state", sirius_state);
+      SIRIUS_LOG_INFO("[gpu_execution_substrait] registered SiriusContext on outer context");
+    }
+  }
+
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution_substrait cannot be called with a NULL parameter");
   }
@@ -624,20 +676,22 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionSubstraitBind(ClientContex
   result->CleanupConnection(context);
 
   // Generate Sirius physical plan using the new execution framework.
-  SIRIUS_LOG_DEBUG("Substrait query plan:\n{}", plan->ToString());
+  SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: generating Sirius physical plan");
+  SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: logical plan:\n{}", plan->ToString());
   try {
     auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, plan);
-    SIRIUS_LOG_DEBUG("Done generating sirius physical plan (substrait)");
+    SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: Sirius physical plan generated OK");
     auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
       std::move(prepared), std::move(sirius_physical_plan));
     result->gpu_prepared = gpu_prepared;
   } catch (std::exception& e) {
     ErrorData error(e);
-    SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan (substrait): {}", error.RawMessage());
+    SIRIUS_LOG_ERROR("[gpu_execution_substrait] Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
     result->plan_error = true;
   }
 
-  // Store the query string for DuckDB fallback (use a placeholder since we have Substrait, not SQL).
+  // Store the Substrait bytes for from_substrait fallback when GPU plan fails.
+  result->substrait_blob = serialized;
   result->query = "-- substrait plan (no SQL fallback available)";
 
   for (auto& column : planner.names) {

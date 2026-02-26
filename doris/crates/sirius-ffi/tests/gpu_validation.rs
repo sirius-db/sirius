@@ -1,9 +1,7 @@
 //! 3-way query validation: DuckDB SQL (CPU) vs gpu_processing (GPU) vs from_substrait (CPU).
 //!
 //! Run with GPU access + built extensions:
-//!   pixi run -e doris cargo test -p sirius-ffi --features duckdb-bundled --test gpu_validation -- --ignored
-
-#![cfg(feature = "duckdb-bundled")]
+//!   pixi run -e doris cargo test -p sirius-ffi --test gpu_validation -- --ignored
 
 use sirius_ffi::SiriusEngine;
 

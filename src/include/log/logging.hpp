@@ -23,6 +23,7 @@
 #endif
 
 #include <spdlog/sinks/daily_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
@@ -84,18 +85,18 @@ inline void InitGlobalLogger(std::string log_file = "")
   auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
   file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
+  // Stderr sink (for Docker logs visibility)
+  auto stderr_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+  stderr_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
+
   // Logger
-  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
+  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink, stderr_sink});
   auto log_level = GetLogLevel();
   logger->set_level(log_level);
   spdlog::set_default_logger(logger);
   spdlog::set_level(log_level);  // Also set the global level
-  auto log_level_str = GetEnvVar(SIRIUS_LOG_LEVEL_ENV);
-  if (log_level_str.has_value()) {
-    spdlog::flush_on(log_level);
-  } else {
-    spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
-  }
+  // Always flush immediately for info and above (needed for crash debugging)
+  spdlog::flush_on(spdlog::level::info);
 }
 
 }  // namespace duckdb

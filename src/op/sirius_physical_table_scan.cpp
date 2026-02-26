@@ -68,13 +68,20 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     virtual_columns(std::move(virtual_columns_p)),
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
 {
-  auto num_cols = column_ids.size() - gen_row_id_column;
-  for (int col = 0; col < num_cols; col++) {
-    scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
+  // Build scanned_types/scanned_ids, skipping virtual columns (ROW_ID, EMPTY, etc.)
+  // that cannot be used to index into returned_types.
+  auto num_cols = column_ids.size();
+  for (duckdb::idx_t col = 0; col < num_cols; col++) {
+    if (column_ids[col].IsVirtualColumn()) {
+      // Virtual column (ROW_ID = -1, EMPTY = -2, etc.) — use BIGINT placeholder
+      scanned_types.push_back(duckdb::LogicalType::BIGINT);
+    } else {
+      scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
+    }
     scanned_ids.push_back(col);
   }
 
-  if (num_cols == 0) {  // Ensure that scanned_types and ids are properly initialized
+  if (scanned_types.empty()) {
     scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
   }
 
@@ -98,6 +105,9 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     }
 
     auto primary_idx = column_ids[column_index].GetPrimaryIndex();
+    if (column_ids[column_index].IsVirtualColumn()) {
+      continue;  // Skip virtual columns (ROW_ID, EMPTY) in filters
+    }
     auto col_type    = returned_types[primary_idx];
 
     // The batch columns are produced by DUCKDB_SCAN in column_ids order.

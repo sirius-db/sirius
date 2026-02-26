@@ -68,18 +68,22 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types,
     virtual_columns(std::move(virtual_columns_p)),
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == DConstants::INVALID_INDEX)
 {
-  auto num_cols                      = column_ids.size() - gen_row_id_column;
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
   mask_size   = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
-  for (int col = 0; col < num_cols; col++) {
+  // Build scanned_types/scanned_ids, skipping virtual columns (ROW_ID, EMPTY, etc.)
+  for (idx_t col = 0; col < column_ids.size(); col++) {
     column_size[col] = 0;
     mask_size[col]   = 0;
-    scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
+    if (column_ids[col].IsVirtualColumn()) {
+      scanned_types.push_back(LogicalType::BIGINT);
+    } else {
+      scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
+    }
     scanned_ids.push_back(col);
   }
 
-  if (num_cols == 0) {  // Ensure that scanned_types and ids are properly initialized
+  if (scanned_types.empty()) {
     scanned_types.push_back(LogicalType(LogicalTypeId::UBIGINT));
   }
 
@@ -989,33 +993,32 @@ class TableScanCoalesceTask : public BaseExecutorTask {
 SourceResultType GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext& exec_context)
 {
   // Check if columns are all cached
-  SIRIUS_LOG_DEBUG("GPUPhysicalTableScan GetDataDuckDBOpt invoked");
+  SIRIUS_LOG_INFO("[GetDataDuckDBOpt] invoked, column_ids.size()={}, gen_row_id={}, names.size()={}",
+                  column_ids.size(), gen_row_id_column, names.size());
   D_ASSERT(!column_ids.empty());
   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-  SIRIUS_LOG_DEBUG("Reading data from duckdb storage");
-
+  SIRIUS_LOG_INFO("[GetDataDuckDBOpt] getting table name from function");
   TableFunctionToStringInput input(function, bind_data.get());
   auto to_string_result = function.to_string(input);
   string table_name;
   for (const auto& it : to_string_result) {
+    SIRIUS_LOG_INFO("[GetDataDuckDBOpt] to_string: {}={}", it.first, it.second);
     if (it.first.compare("Table") == 0) {
       table_name = it.second;
       break;
     }
   }
+  SIRIUS_LOG_INFO("[GetDataDuckDBOpt] table_name={}", table_name);
 
   // Get cached column info
   for (int i = 0; i < column_ids.size(); i++) {
-    SIRIUS_LOG_DEBUG("Scan Idx {} has column id of {}", i, column_ids[i].GetPrimaryIndex());
+    SIRIUS_LOG_INFO("[GetDataDuckDBOpt] column_id[{}]={}", i, column_ids[i].GetPrimaryIndex());
   }
 
   auto num_columns = column_ids.size() - gen_row_id_column;
   bool all_cached  = num_columns > 0;
-  SIRIUS_LOG_DEBUG("Checking if all of the {}/{} columns of table {} are cached",
-                   num_columns,
-                   column_ids.size(),
-                   table_name);
+  SIRIUS_LOG_INFO("[GetDataDuckDBOpt] checking cache: num_columns={}, table={}", num_columns, table_name);
 
   for (int col = 0; col < num_columns; col++) {
     already_cached[col] =
@@ -1423,10 +1426,13 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
 
 SourceResultType GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext& exec_context)
 {
-  SIRIUS_LOG_DEBUG("GPUPhysicalTableScan GetDataDuckDB invoked");
+  SIRIUS_LOG_INFO("[GetDataDuckDB] invoked, USE_OPT_TABLE_SCAN={}", Config::USE_OPT_TABLE_SCAN);
 
   // Use optimized scan if required
-  if (Config::USE_OPT_TABLE_SCAN) { return GetDataDuckDBOpt(exec_context); }
+  if (Config::USE_OPT_TABLE_SCAN) {
+    SIRIUS_LOG_INFO("[GetDataDuckDB] using optimized scan");
+    return GetDataDuckDBOpt(exec_context);
+  }
 
   D_ASSERT(!column_ids.empty());
   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -1698,6 +1704,11 @@ unique_ptr<Expression> ConvertTableFiltersToExpression(const TableFilterSet& fil
       continue;
     }
 
+    // Skip virtual columns (ROW_ID, EMPTY) — they can't be filtered
+    if (column_ids[column_index].IsVirtualColumn()) {
+      continue;
+    }
+
     // Create column reference for this filter
     auto col_type   = returned_types[column_ids[column_index].GetPrimaryIndex()];
     auto column_ref = make_uniq<BoundReferenceExpression>(col_type, column_index);
@@ -1754,6 +1765,9 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
         SIRIUS_LOG_DEBUG("Cached Column name: {}", table->column_names[i]);
       }
       for (int col = 0; col < num_cols; col++) {
+        if (column_ids[col].IsVirtualColumn()) {
+          continue;  // Skip virtual columns (ROW_ID, EMPTY)
+        }
         auto column_to_find = names[column_ids[col].GetPrimaryIndex()];
         transform(column_to_find.begin(), column_to_find.end(), column_to_find.begin(), ::toupper);
         SIRIUS_LOG_DEBUG("Finding column {}", column_to_find);
@@ -1778,6 +1792,9 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
   if (table_filters) {
     // Reset row_ids for columns involved in filtering
     for (auto& [column_index, filter] : table_filters->filters) {
+      if (column_ids[column_index].IsVirtualColumn()) {
+        continue;
+      }
       table->columns[column_ids[column_index].GetPrimaryIndex()]->row_ids      = nullptr;
       table->columns[column_ids[column_index].GetPrimaryIndex()]->row_id_count = 0;
     }

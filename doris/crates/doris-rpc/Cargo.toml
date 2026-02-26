@@ -3,10 +3,6 @@ name = "doris-rpc"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = []
-nixl = ["dep:nixl-sys", "dep:cudarc"]
-
 [dependencies]
 doris-thrift = { path = "../doris-thrift" }
 doris-proto = { path = "../doris-proto" }
@@ -27,6 +23,6 @@ snap = "1"
 lz4_flex = "0.11"
 zstd = "0.13"
 tokio-stream = "0.1"
-nixl-sys = { version = "0.10", optional = true }
-cudarc = { workspace = true, optional = true }
+nixl-sys = "0.10"
+cudarc.workspace = true
 glob = "0.3"

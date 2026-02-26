@@ -154,25 +154,35 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 
 void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> plan)
 {
-  SIRIUS_LOG_DEBUG("Initializing sirius_engine");
+  SIRIUS_LOG_INFO("[sirius_engine::initialize] start, plan type={}",
+                  SiriusPhysicalOperatorToString(plan->type));
   reset();
   sirius_owned_plan = std::move(plan);
+  SIRIUS_LOG_INFO("[sirius_engine::initialize] calling initialize_internal");
   initialize_internal(*sirius_owned_plan);
+  SIRIUS_LOG_INFO("[sirius_engine::initialize] done, new_scheduled={}", new_scheduled.size());
 }
 
 void sirius_engine::execute()
 {
+  SIRIUS_LOG_INFO("[sirius_engine::execute] start");
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  SIRIUS_LOG_INFO("[sirius_engine::execute] sirius_ctx={}", (void*)sirius_ctx.get());
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
 
   // Create the query with the pipeline hashmap
+  SIRIUS_LOG_INFO("[sirius_engine::execute] creating pipeline_map from new_scheduled (size={})", new_scheduled.size());
   sirius_pipeline_hashmap pipeline_map(new_scheduled);
-  sirius_ctx->create_query(std::move(pipeline_map));
+  SIRIUS_LOG_INFO("[sirius_engine::execute] calling create_query");
+  sirius_ctx->create_query(std::move(pipeline_map), context);
+  SIRIUS_LOG_INFO("[sirius_engine::execute] calling start_query");
   auto future = sirius_ctx->get_pipeline_executor().start_query();
+  SIRIUS_LOG_INFO("[sirius_engine::execute] waiting on future.get()");
   try {
     future.get();
+    SIRIUS_LOG_INFO("[sirius_engine::execute] future.get() returned OK");
   } catch (const std::exception& e) {
     /// todo(bobbi) we should handle the error properly, clean the query context and then return the
     /// error to duckdb
@@ -219,6 +229,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
 
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 {
+  SIRIUS_LOG_INFO("[initialize_internal] start, plan type={}", SiriusPhysicalOperatorToString(plan.type));
   // auto &scheduler = TaskScheduler::GetScheduler(context);
   {
     // lock_guard<mutex> elock(executor_lock);
@@ -229,10 +240,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     // this->producer = scheduler.CreateProducer();
 
     // build and ready the pipelines
+    SIRIUS_LOG_INFO("[initialize_internal] building pipelines");
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =
       duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(*this, state, nullptr);
     root_pipeline->build(*sirius_physical_plan);
+    SIRIUS_LOG_INFO("[initialize_internal] pipelines built, calling ready()");
     root_pipeline->ready();
 
     // ready recursive cte pipelines too
@@ -243,6 +256,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     // }
 
     // set root pipelines, i.e., all pipelines that end in the final sink
+    SIRIUS_LOG_INFO("[initialize_internal] getting root pipelines");
     root_pipeline->get_pipelines(sirius_root_pipelines, false);
     root_pipeline_idx = 0;
 
@@ -256,7 +270,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     // set it here
     total_pipelines = to_schedule.size();
 
-    SIRIUS_LOG_DEBUG("Total meta pipelines {}", to_schedule.size());
+    SIRIUS_LOG_INFO("[initialize_internal] total meta pipelines: {}", to_schedule.size());
     int schedule_count = 0;
     int meta           = 0;
     while (schedule_count < to_schedule.size()) {
@@ -313,6 +327,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     }
 
     // perform deep copy on scheduled pipelines
+    SIRIUS_LOG_INFO("[initialize_internal] scheduled {} pipelines, copying", sirius_scheduled.size());
     duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> copied_scheduled;
     for (size_t i = 0; i < sirius_scheduled.size(); i++) {
       auto copied_pipeline = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
@@ -328,8 +343,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     }
 
     // get data_repo_manager from sirius context
-    auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                                ->get_data_repository_manager();
+    SIRIUS_LOG_INFO("[initialize_internal] getting SiriusContext from registered_state");
+    auto sirius_ctx_check = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    SIRIUS_LOG_INFO("[initialize_internal] SiriusContext={}", (void*)sirius_ctx_check.get());
+    if (!sirius_ctx_check) {
+      throw duckdb::InvalidInputException("[initialize_internal] SiriusContext ('sirius_state') is NULL in registered_state! "
+        "The Sirius extension may not be properly loaded for this connection context.");
+    }
+    auto& data_repo_manager = sirius_ctx_check->get_data_repository_manager();
     std::unordered_map<const op::sirius_physical_operator*,
                        duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>>
       source_to_pipelines;

@@ -43,4 +43,10 @@ pub struct BeConfig {
     /// Sirius GPU coverage (e.g. TPC-H queries).
     #[arg(long, default_value_t = false)]
     pub no_cpu_fallback: bool,
+
+    /// Force CPU execution: all queries use DuckDB's from_substrait/execute_sql
+    /// instead of the Sirius GPU pipeline. Useful when the GPU runtime is not
+    /// functional (e.g. CUDA errors in Docker) but you still want correct results.
+    #[arg(long, default_value_t = false)]
+    pub force_cpu: bool,
 }

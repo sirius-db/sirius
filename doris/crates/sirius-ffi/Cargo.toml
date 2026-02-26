@@ -3,14 +3,9 @@ name = "sirius-ffi"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = []
-# Use bundled DuckDB for CPU-only execution (no GPU, no external C++ deps).
-duckdb-bundled = ["dep:duckdb", "dep:arrow"]
-
 [dependencies]
-duckdb = { workspace = true, optional = true }
+duckdb.workspace = true
 # Match duckdb's arrow version for IPC serialization (workspace uses 54).
-arrow = { version = "56", features = ["ipc"], optional = true }
+arrow = { version = "56", features = ["ipc"] }
 thiserror.workspace = true
 tracing.workspace = true

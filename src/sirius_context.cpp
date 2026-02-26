@@ -222,12 +222,24 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
   return *task_creator_;
 }
 
-void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap)
+void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap,
+                                 ClientContext& context)
 {
   throw_if_not_initialized();
+
+  // Ensure task_creator has the client context set — QueryBegin may not have fired
+  // if the SiriusContext was registered on this connection during the same query's bind phase.
+  spdlog::info("[create_query] resetting task_creator and setting client context");
+  task_creator_->reset();
+  task_creator_->set_client_context(context);
+
+  spdlog::info("[create_query] creating query object");
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipeline_hashmap));
+  spdlog::info("[create_query] calling pipeline_executor_->prepare_for_query");
   pipeline_executor_->prepare_for_query(query_);
+  spdlog::info("[create_query] calling task_creator_->prepare_for_query");
   task_creator_->prepare_for_query(*query_);
+  spdlog::info("[create_query] done");
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
@@ -288,13 +300,15 @@ void SiriusContextExtensionCallback::OnExtensionLoadFail(DatabaseInstance& db,
 void SiriusContextExtensionCallback::read_config_file_if_exists()
 {
   auto config_path = get_config_file_path();
-  if (!std::filesystem::exists(config_path)) {
-    spdlog::info("Sirius configuration file does not exist at path: {}. Skipping loading.",
-                 config_path);
-    return;
+  if (std::filesystem::exists(config_path)) {
+    config_.load_from_file(config_path);
+    spdlog::info("Loaded Sirius configuration from file: {}", config_path);
+  } else {
+    spdlog::info(
+      "Sirius configuration file does not exist at path: {}. Using default configuration.",
+      config_path);
+    config_.ensure_default_memory_configs();
   }
-  config_.load_from_file(config_path);
-  spdlog::info("Loaded Sirius configuration from file: {}", config_path);
 
   // Determine lock prefix: check if $HOME/.sirius directory exists
   std::string lock_prefix = "/var/tmp";

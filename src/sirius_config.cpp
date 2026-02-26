@@ -285,6 +285,22 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   }
 }
 
+void sirius_config::ensure_default_memory_configs()
+{
+  if (!_memory_space_configs.empty()) { return; }
+
+  gpu_mem_config gpu_memory_config_instance;
+  host_mem_config host_memory_config_instance;
+  disk_mem_config disk_memory_config_instance;
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(_hw_topology.num_gpus);
+  gpu_memory_config_instance.setup_configurator(builder);
+  host_memory_config_instance.setup_configurator(builder);
+  disk_memory_config_instance.setup_configurator(builder);
+  _memory_space_configs = builder.build(_hw_topology);
+}
+
 const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_memory_space_configs()
   const noexcept
 {

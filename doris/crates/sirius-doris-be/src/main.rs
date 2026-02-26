@@ -131,7 +131,6 @@ fn main() {
     let exchange_buffer = doris_rpc::exchange_buffer::ExchangeBuffer::new();
 
     // Initialize nixl agent for GPU-direct exchange (optional, graceful fallback).
-    #[cfg(feature = "nixl")]
     let nixl_agent = {
         let agent_name = format!(
             "sirius-be-{}:{}",
@@ -141,15 +140,11 @@ fn main() {
         doris_rpc::nixl_exchange::NixlExchange::try_new(&agent_name)
             .map(|a| std::sync::Arc::new(a))
     };
-    #[cfg(feature = "nixl")]
     if nixl_agent.is_some() {
         info!("nixl GPU-direct exchange enabled");
     } else {
         info!("nixl not available, using bRPC exchange fallback");
     }
-
-    #[cfg(not(feature = "nixl"))]
-    let nixl_agent = None;
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine, exchange_buffer, nixl_agent));
@@ -173,10 +168,7 @@ async fn run(
     flight_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: doris_rpc::exchange_buffer::ExchangeBuffer,
-    #[cfg(feature = "nixl")]
     nixl_agent: Option<std::sync::Arc<doris_rpc::nixl_exchange::NixlExchange>>,
-    #[cfg(not(feature = "nixl"))]
-    _nixl_agent: Option<()>,
 ) {
     if let Some(fe_addr) = &config.fe {
         // Default advertise host: resolve system hostname to an IP.
@@ -211,13 +203,8 @@ async fn run(
         }
     });
 
-    #[cfg(feature = "nixl")]
-    let nixl_for_grpc = nixl_agent;
-    #[cfg(not(feature = "nixl"))]
-    let nixl_for_grpc = None;
-
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, nixl_for_grpc).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, nixl_agent).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }

@@ -92,7 +92,8 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Start a query with its pipeline hashmap.
   /// \param pipeline_hashmap The pipeline hashmap for the query.
-  void create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap);
+  /// \param context The client context for the query execution.
+  void create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap, ClientContext& context);
 
   /// \brief Get the current query.
   [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
