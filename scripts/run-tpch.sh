@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 TRIES=3
 GPU_CACHING_SIZE='100 GB'
 GPU_PROCESSING_SIZE='80 GB'

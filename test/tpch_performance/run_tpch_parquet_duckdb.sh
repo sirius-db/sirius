@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run TPC-H queries against Parquet files using plain DuckDB (no Sirius)
 # Used as a baseline for validating Sirius results.
 #
