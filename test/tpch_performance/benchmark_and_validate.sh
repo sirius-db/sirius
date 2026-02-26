@@ -8,10 +8,10 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/compare_tpch_engines.sh <scale_factor> <iterations>
+#   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
 #
 # Example:
-#   ./test/tpch_performance/compare_tpch_engines.sh 1 3
+#   ./test/tpch_performance/benchmark_and_validate.sh 1 3
 
 set -uo pipefail
 
