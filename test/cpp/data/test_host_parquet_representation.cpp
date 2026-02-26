@@ -19,6 +19,7 @@
 
 // sirius
 #include "cudf/cudf_utils.hpp"
+
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>

@@ -35,6 +35,7 @@
 
 // cudf
 #include "cudf/cudf_utils.hpp"
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -62,8 +63,8 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
   cudf::io::datasource& datasource)
 {
   constexpr size_t PARQUET_MAGIC_SIZE = 4;
-  constexpr size_t FOOTER_LEN_SIZE = 4;
-  constexpr size_t TAIL_SIZE = PARQUET_MAGIC_SIZE + FOOTER_LEN_SIZE;
+  constexpr size_t FOOTER_LEN_SIZE    = 4;
+  constexpr size_t TAIL_SIZE          = PARQUET_MAGIC_SIZE + FOOTER_LEN_SIZE;
 
   auto const file_size = datasource.size();
   if (file_size < TAIL_SIZE + PARQUET_MAGIC_SIZE) {
@@ -71,7 +72,7 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
   }
 
   // Read the last 8 bytes to get footer length
-  auto tail_buf = datasource.host_read(file_size - TAIL_SIZE, TAIL_SIZE);
+  auto tail_buf    = datasource.host_read(file_size - TAIL_SIZE, TAIL_SIZE);
   auto const* tail = tail_buf->data();
 
   // Footer length is a little-endian uint32 at offset 0
