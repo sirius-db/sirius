@@ -52,14 +52,14 @@ SMALL_TABLE_THRESHOLD = 50_000_000
 # Columns to cast to int32. l_orderkey and o_orderkey stay int64 because they
 # exceed the int32 range at large scale factors.
 INT32_COLUMNS = {
-    "customer":  {"c_custkey", "c_nationkey"},
-    "lineitem":  {"l_partkey", "l_suppkey", "l_linenumber"},
-    "nation":    {"n_nationkey", "n_regionkey"},
-    "orders":    {"o_custkey"},
-    "part":      {"p_partkey"},
-    "partsupp":  {"ps_partkey", "ps_suppkey"},
-    "region":    {"r_regionkey"},
-    "supplier":  {"s_suppkey", "s_nationkey"},
+    "customer": {"c_custkey", "c_nationkey"},
+    "lineitem": {"l_partkey", "l_suppkey", "l_linenumber"},
+    "nation": {"n_nationkey", "n_regionkey"},
+    "orders": {"o_custkey"},
+    "part": {"p_partkey"},
+    "partsupp": {"ps_partkey", "ps_suppkey"},
+    "region": {"r_regionkey"},
+    "supplier": {"s_suppkey", "s_nationkey"},
 }
 
 
@@ -105,7 +105,9 @@ def rewrite_table(table_name, source_dir, dest_dir, row_group_size_rows):
     single = os.path.join(source_dir, f"{table_name}.parquet")
     partitioned = sorted(glob.glob(os.path.join(source_dir, f"{table_name}_*.parquet")))
     # tpchgen-cli produces <table>/<table>.<part>.parquet subdirectory layout
-    subdir = sorted(glob.glob(os.path.join(source_dir, table_name, f"{table_name}.*.parquet")))
+    subdir = sorted(
+        glob.glob(os.path.join(source_dir, table_name, f"{table_name}.*.parquet"))
+    )
 
     source_files = []
     if os.path.isfile(single):
