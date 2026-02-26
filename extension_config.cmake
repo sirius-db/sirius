@@ -21,11 +21,4 @@
 duckdb_extension_load(sirius SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR} LOAD_TESTS
                       EXTENSION_VERSION dev)
 
-duckdb_extension_load(json)
-duckdb_extension_load(tpcds)
-duckdb_extension_load(tpch)
 duckdb_extension_load(parquet)
-duckdb_extension_load(icu)
-
-# duckdb_extension_load(substrait SOURCE_DIR
-# ${CMAKE_CURRENT_LIST_DIR}/substrait)
