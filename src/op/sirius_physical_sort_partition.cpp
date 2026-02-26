@@ -24,6 +24,8 @@
 
 #include <cudf/search.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -50,6 +52,7 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
 std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   // If no sample operator or only 1 partition, pass through

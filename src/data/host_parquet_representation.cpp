@@ -25,7 +25,7 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
   // Get the host memory resource from the memory space
   auto* host_mr = get_memory_space().get_memory_resource_of<cucascade::memory::Tier::HOST>();
   if (!host_mr) {
-    throw std::runtime_error("Cannot clone host_table_representation: no host memory resource");
+    throw std::runtime_error("Cannot clone host_parquet_representation: no host memory resource");
   }
 
   // Allocate new blocks for the copy

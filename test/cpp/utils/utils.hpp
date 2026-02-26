@@ -104,12 +104,4 @@ inline duckdb::shared_ptr<duckdb::SiriusContext> get_sirius_context(
   return sirius_ctx;
 }
 
-inline duckdb::shared_ptr<duckdb::SiriusContext> get_sirius_context(
-  const std::filesystem::path& config_path)
-{
-  static duckdb::DuckDB db(nullptr);
-  static duckdb::Connection con(db);
-  return get_sirius_context(con, config_path);
-}
-
 }  // namespace sirius

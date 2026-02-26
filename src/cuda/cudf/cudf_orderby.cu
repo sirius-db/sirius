@@ -70,6 +70,7 @@ enum class KernelColType : int {
   INT_128  = 4,
   INT_16   = 5,
   FLOAT_32 = 6,
+  INT_8    = 7,
   UNKNOWN  = 99
 };
 
@@ -190,6 +191,9 @@ __device__ __forceinline__ uint64_t load_primary_key_as_u64(const DeviceKeyColum
   } else if (type == KernelColType::INT_16) {
     int16_t val = load_unaligned<int16_t>(col.data + static_cast<size_t>(row_id) * 2);
     return (static_cast<uint64_t>(val) ^ 0x8000) << 48;
+  } else if (type == KernelColType::INT_8) {
+    int8_t val = load_unaligned<int8_t>(col.data + static_cast<size_t>(row_id) * 1);
+    return (static_cast<uint64_t>(val) ^ 0x80) << 56;
   } else if (type == KernelColType::DOUBLE) {
     double val    = load_unaligned<double>(col.data + static_cast<size_t>(row_id) * 8);
     uint64_t bits = *reinterpret_cast<uint64_t*>(&val);
@@ -248,6 +252,10 @@ __device__ int compare_rows_multi_col(uint32_t row_a,
         int16_t val_a = load_unaligned<int16_t>(col.data + static_cast<size_t>(row_a) * 2);
         int16_t val_b = load_unaligned<int16_t>(col.data + static_cast<size_t>(row_b) * 2);
         cmp           = (val_a > val_b) - (val_a < val_b);
+      } else if (type == KernelColType::INT_8) {
+        int8_t val_a = load_unaligned<int8_t>(col.data + static_cast<size_t>(row_a) * 1);
+        int8_t val_b = load_unaligned<int8_t>(col.data + static_cast<size_t>(row_b) * 1);
+        cmp          = (val_a > val_b) - (val_a < val_b);
       } else if (type == KernelColType::DOUBLE) {
         double val_a = load_unaligned<double>(col.data + static_cast<size_t>(row_a) * 8);
         double val_b = load_unaligned<double>(col.data + static_cast<size_t>(row_b) * 8);
@@ -644,7 +652,30 @@ void PrepareDeviceColumns(vector<shared_ptr<GPUColumn>>& keys,
 {
   std::vector<DeviceKeyColumn> h_cols(num_keys);
   for (int i = 0; i < num_keys; ++i) {
-    h_cols[i].type = (int)MapSiriusTypeToKernelType(keys[i]->data_wrapper.type.id());
+    // Some types require size-based dispatch: MapSiriusTypeToKernelType uses a fixed
+    // mapping per type ID, but DECIMAL and BOOLEAN have a mismatch between their
+    // GPUColumnTypeId and actual storage width.
+    //
+    // DECIMAL: stored as int16/int32/int64/int128 depending on precision; the type ID
+    //   alone doesn't tell you the width — use getColumnTypeSize() to pick the right kernel
+    //   type, otherwise the kernel reads with the wrong stride (e.g. 16 bytes for int64 data).
+    //
+    // BOOLEAN: stored as uint8 (1 byte) but MapSiriusTypeToKernelType returns INT_32 (4 bytes),
+    //   causing the same stride mismatch. Fixed by mapping to the new INT_8 kernel type.
+    KernelColType ktype;
+    if (keys[i]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+      switch (keys[i]->data_wrapper.getColumnTypeSize()) {
+        case sizeof(int16_t): ktype = KernelColType::INT_16; break;
+        case sizeof(int32_t): ktype = KernelColType::INT_32; break;
+        case sizeof(int64_t): ktype = KernelColType::INT_64; break;
+        default: ktype = KernelColType::INT_128; break;
+      }
+    } else if (keys[i]->data_wrapper.type.id() == GPUColumnTypeId::BOOLEAN) {
+      ktype = KernelColType::INT_8;
+    } else {
+      ktype = MapSiriusTypeToKernelType(keys[i]->data_wrapper.type.id());
+    }
+    h_cols[i].type = (int)ktype;
     if (h_cols[i].type == (int)KernelColType::UNKNOWN) throw std::runtime_error("Unsupported type");
     h_cols[i].data      = keys[i]->data_wrapper.data;
     h_cols[i].offsets   = keys[i]->data_wrapper.offset;

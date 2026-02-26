@@ -83,7 +83,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
     virtual_columns(std::move(virtual_columns_p)),
-    gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
+    gen_row_id_column(column_ids.back().IsRowIdColumn())
 {
   // Build scanned_types: the types of ALL columns DuckDB will output, in column_ids order.
   // DuckDB's table function fills the DataChunk with columns in column_ids order, regardless
@@ -93,7 +93,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
   auto num_cols = column_ids.size();
   for (duckdb::idx_t i = 0; i < num_cols; i++) {
     auto col_idx = column_ids[i].GetPrimaryIndex();
-    if (col_idx == duckdb::DConstants::INVALID_INDEX) {
+    if (column_ids[i].IsRowIdColumn()) {
       // ROW_ID virtual column
       scanned_types.push_back(duckdb::LogicalType::BIGINT);
     } else {

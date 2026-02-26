@@ -185,8 +185,10 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                      op.get().get_operator_id(),
                      operator_input_output_data->get_data_batches().size(),
                      batch_sizes);
-    auto start                 = std::chrono::high_resolution_clock::now();
-    operator_input_output_data = op.get().execute(*operator_input_output_data, stream);
+    auto start            = std::chrono::high_resolution_clock::now();
+    auto temp_output_data = op.get().execute(*operator_input_output_data, stream);
+    stream.synchronize();
+    operator_input_output_data = std::move(temp_output_data);
     auto end                   = std::chrono::high_resolution_clock::now();
     auto duration              = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     batch_sizes                = "";
@@ -267,6 +269,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
   std::size_t input_size = 0;
   if (!local_state._input_data) { return 0; }
   for (const auto& batch : local_state._input_data->get_data_batches()) {
+    if (!batch || !batch->get_data()) { continue; }
     input_size += batch->get_data()->get_size_in_bytes();
   }
   return input_size;
@@ -285,12 +288,9 @@ std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consume
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
     return output_consumers;
   }
-  auto parents =
-    _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_parents();
-  for (auto& parent : parents) {
-    output_consumers.push_back(&parent->get_operators()[0].get());
-  }
-  return output_consumers;
+  return _global_state->cast<gpu_pipeline_task_global_state>()
+    .get_pipeline()
+    ->get_output_consumers();
 }
 
 }  // namespace pipeline

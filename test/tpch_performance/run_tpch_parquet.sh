@@ -2,7 +2,11 @@
 # Run TPC-H GPU queries against Parquet files
 #
 # Creates views from parquet files found in the dataset directory,
-# then runs the standard GPU query files unchanged.
+# then runs the specified queries on the specified engine with the specified number of iterations.
+# All iterations run in a single DuckDB session so that scan caches warm on the first run.
+# Timings are recorded using current_timestamp between steps and written to a CSV file.
+# Output results are saved as result_<engine>_sf<scale_factor>_q<query_number>.txt
+# and timing results as timings_<engine>_sf<scale_factor>_q<query_number>.csv.
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=/home/felipe/sirius/test/cpp/integration/integration.cfg
@@ -13,7 +17,11 @@
 # Timings are recorded using current_timestamp between steps and written to a CSV file.
 #
 # Example:
-#   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 3 1 3 4 5 6 7 8 9 10 12 13 14 18 19
+#   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 3 `seq 1 22`
+#
+# Environment variables:
+#   SIRIUS_CONFIG_FILE - path to Sirius config file (required)
+#   TIMING_CSV         - path to write per-query timing CSV (optional)
 
 set -uo pipefail
 
@@ -81,6 +89,11 @@ for TABLE_NAME in "${TPCH_TABLES[@]}"; do
     VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet([${FILE_LIST}]);"$'\n'
 done
 
+# Initialize timing CSV if requested
+if [ -n "${TIMING_CSV:-}" ]; then
+    echo "query,seconds" > "$TIMING_CSV"
+fi
+
 echo "Running TPC-H queries against SF${SF} parquet data"
 echo "Engine: $ENGINE"
 echo "Parquet dir: $PARQUET_DIR"
@@ -136,7 +149,16 @@ COPY (
 ) TO '${TIMING_FILE}' (FORMAT CSV, HEADER);
 EOF
 
+    START_TIME=$(date +%s.%N)
     "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
+    END_TIME=$(date +%s.%N)
+
+    ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
+    echo "  Time: ${ELAPSED}s"
+
+    if [ -n "${TIMING_CSV:-}" ]; then
+        echo "${q},${ELAPSED}" >> "$TIMING_CSV"
+    fi
 
     rm -f "$TEMP_SQL"
     echo "Timings written to $TIMING_FILE"

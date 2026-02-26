@@ -23,6 +23,8 @@
 
 #include <cudf/copying.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/gpu_data_representation.hpp>
 
 namespace sirius {
@@ -68,6 +70,7 @@ int64_t sirius_physical_streaming_limit::claim(std::atomic<int64_t>& counter, in
 std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {

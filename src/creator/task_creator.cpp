@@ -278,6 +278,12 @@ void task_creator::manager_loop()
           auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
           if (!partition_idx.has_value()) {
             pipeline->mark_task_completed();
+            if (pipeline->is_pipeline_finished()) {
+              auto output_consumers = pipeline->get_output_consumers();
+              for (auto& output_consumer : output_consumers) {
+                schedule(output_consumer);
+              }
+            }
             return;
           }
           if (!parquet_task_global_state->has_more_partitions()) {
@@ -301,10 +307,26 @@ void task_creator::manager_loop()
         } else {
           // need to exhaust input batches until all ports are empty
           while (!node->all_ports_empty()) {
+            // Mark task created BEFORE popping data from ports to prevent a race
+            // condition where update_pipeline_status() sees empty ports and matching
+            // task counters, prematurely marking the pipeline as finished.
+            pipeline->mark_task_created();
+
             auto input_data = node->get_next_task_input_data();
-            if (!input_data) { break; }
-            pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
-                                            // task creation
+            if (!input_data || input_data->get_data_batches().empty()) {
+              // No data was available (e.g., another thread already consumed it).
+              // Balance the counter. mark_task_completed() calls update_pipeline_status()
+              // which is correct: if all ports are truly empty and all real tasks have
+              // completed, the pipeline should finish.
+              pipeline->mark_task_completed();
+              if (pipeline->is_pipeline_finished()) {
+                auto output_consumers = pipeline->get_output_consumers();
+                for (auto& output_consumer : output_consumers) {
+                  this->schedule(output_consumer);
+                }
+              }
+              break;
+            }
 
             // Check to see if you need to create a new global state for this operator
             size_t operator_id                  = node->get_operator_id();

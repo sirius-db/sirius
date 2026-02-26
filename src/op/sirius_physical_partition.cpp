@@ -30,6 +30,8 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -82,15 +84,33 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       static_cast<int>((op->estimated_cardinality + s_partition_size - 1) / s_partition_size);
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
+      auto& condition = hash_join_op.conditions[cond_idx];
+      if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+          condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        continue;
+      }
       std::optional<duckdb::idx_t> left_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
       std::optional<duckdb::idx_t> right_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
       if (left_index.has_value() && right_index.has_value()) {
+        // Determine if a type cast is needed for hash alignment.
+        // When the join condition has a BOUND_CAST on one side, the two sides have different
+        // physical column types (e.g. INT32 vs INT64). cuDF's murmur3 produces different hash
+        // values for the same integer in different representations, so without a cast, matching
+        // keys would land in different partitions. We apply the same cast used by the join
+        // condition so both sides hash identically.
+        const auto& key_expr = is_build ? *hash_join_op.conditions[cond_idx].right
+                                        : *hash_join_op.conditions[cond_idx].left;
         if (is_build) {
           _partition_keys.push_back(right_index.value());
         } else {
           _partition_keys.push_back(left_index.value());
+        }
+        if (key_expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
+          _partition_key_cast_types.push_back(duckdb::GetCudfType(key_expr.return_type));
+        } else {
+          _partition_key_cast_types.push_back(cudf::data_type{cudf::type_id::EMPTY});
         }
       }
     }
@@ -138,6 +158,7 @@ bool sirius_physical_partition::is_build_partition() { return _is_build; }
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator");
@@ -151,8 +172,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
-      partitioned_results = gpu_partition_impl::hash_partition(
-        input_batch, _partition_keys, _num_partitions, stream, *input_batch->get_memory_space());
+      partitioned_results = gpu_partition_impl::hash_partition(input_batch,
+                                                               _partition_keys,
+                                                               _partition_key_cast_types,
+                                                               _num_partitions,
+                                                               stream,
+                                                               *input_batch->get_memory_space());
       break;
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
@@ -172,6 +197,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
 
 void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_partition::sink"};
   const auto& input_batches = input_data.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;
