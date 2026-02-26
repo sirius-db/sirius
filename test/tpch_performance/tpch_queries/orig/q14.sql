@@ -10,4 +10,4 @@ from
 where
   l.l_partkey = p.p_partkey
   and l.l_shipdate >= date '1994-08-01'
-  and l.l_shipdate < date '1994-09-01'
+  and l.l_shipdate < date '1994-09-01';

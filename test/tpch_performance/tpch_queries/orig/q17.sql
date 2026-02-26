@@ -14,4 +14,4 @@ where
       lineitem l2
     where
       l2.l_partkey = p.p_partkey
-  )
+  );

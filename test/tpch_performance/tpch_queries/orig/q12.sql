@@ -25,4 +25,4 @@ where
 group by
   l.l_shipmode
 order by
-  l.l_shipmode
+  l.l_shipmode;
