@@ -340,5 +340,6 @@ std::vector<op::sirius_physical_operator*> sirius_pipeline::get_output_consumers
   }
   return result;
 }
+
 }  // namespace pipeline
 }  // namespace sirius
