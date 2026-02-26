@@ -278,6 +278,12 @@ void task_creator::manager_loop()
           auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
           if (!partition_idx.has_value()) {
             pipeline->mark_task_completed();
+            if (pipeline->is_pipeline_finished()) {
+              auto output_consumers = pipeline->get_output_consumers();
+              for (auto& output_consumer : output_consumers) {
+                schedule(output_consumer);
+              }
+            }
             return;
           }
           if (!parquet_task_global_state->has_more_partitions()) {
@@ -313,6 +319,12 @@ void task_creator::manager_loop()
               // which is correct: if all ports are truly empty and all real tasks have
               // completed, the pipeline should finish.
               pipeline->mark_task_completed();
+              if (pipeline->is_pipeline_finished()) {
+                auto output_consumers = pipeline->get_output_consumers();
+                for (auto& output_consumer : output_consumers) {
+                  this->schedule(output_consumer);
+                }
+              }
               break;
             }
 
