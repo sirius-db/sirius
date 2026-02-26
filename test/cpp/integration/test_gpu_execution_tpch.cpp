@@ -1909,7 +1909,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - partitioned anti join (misfit key)",
+                 "gpu_execution - partitioned anti join (misfit key) parquet",
                  "[integration][gpu_execution][antijoin][partitioned_join]")
 {
   partition_size_guard guard(1);
