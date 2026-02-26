@@ -41,10 +41,6 @@ find_package(spdlog REQUIRED CONFIG)
 find_package(libconfig++ REQUIRED)
 find_package(absl REQUIRED)
 
-# Default log directory
-set(SIRIUS_DEFAULT_LOG_DIR "${CMAKE_BINARY_DIR}/log")
-add_compile_definitions(SIRIUS_DEFAULT_LOG_DIR="${SIRIUS_DEFAULT_LOG_DIR}")
-
 # Derive the environment prefix from where cudf was found cudf_DIR is typically:
 # <prefix>/lib/cmake/cudf
 cmake_path(GET cudf_DIR PARENT_PATH _cmake_dir)

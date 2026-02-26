@@ -17,6 +17,7 @@
 #define CATCH_CONFIG_RUNNER
 
 #include "catch.hpp"
+#include "config.hpp"
 #include "log/logging.hpp"
 
 #include <cstdlib>
@@ -27,7 +28,8 @@ int main(int argc, char* argv[])
 {
   // Initialize the logger
   std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
-  InitGlobalLogger(log_dir + "/sirius_unittest.log");
+  Config::LOG_DIR     = log_dir;
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
 
   // Run tests
   int code = Catch::Session().run(argc, argv);

@@ -16,6 +16,7 @@
 
 #include "sirius_context.hpp"
 
+#include "config.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "exec/config.hpp"
@@ -251,7 +252,7 @@ void SiriusContext::throw_if_not_initialized() const
 
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
-  InitGlobalLogger();
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
   read_config_file_if_exists();
 }
 

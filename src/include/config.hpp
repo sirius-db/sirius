@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace duckdb {
 
@@ -64,6 +65,11 @@ struct Config {
   // For sort partitioning:
   //  - max bytes per sort partition (0 = auto based on 33% GPU memory)
   static uint64_t MAX_SORT_PARTITION_BYTES;
+
+  // Logging configuration
+  static std::string LOG_LEVEL;
+  static std::string LOG_DIR;
+  static int LOG_FLUSH_SECONDS;
 };
 
 }  // namespace duckdb
