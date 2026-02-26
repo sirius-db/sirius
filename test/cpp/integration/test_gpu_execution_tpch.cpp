@@ -2400,7 +2400,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - mixed right semi join one equality and one inequality condition",
-                 "[.][integration_disabled][gpu_execution][mixed_join]")
+                 "[integration][gpu_execution][mixed_join]")
 {
   compare_gpu_vs_cpu(
     "select ps.ps_partkey, ps.ps_suppkey  from partsupp ps semi join lineitem l "
@@ -2422,7 +2422,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - mixed anti semi join one equality and one inequality condition",
-                 "[.][integration_disabled][gpu_execution][mixed_join]")
+                 "[integration][gpu_execution][mixed_join]")
 {
   compare_gpu_vs_cpu(
     "select ps.ps_partkey, ps.ps_suppkey  from partsupp ps anti join lineitem l "
