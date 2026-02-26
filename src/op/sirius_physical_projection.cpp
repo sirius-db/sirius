@@ -26,6 +26,8 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <chrono>
 
 namespace sirius {
@@ -44,6 +46,7 @@ sirius_physical_projection::sirius_physical_projection(
 std::unique_ptr<operator_data> sirius_physical_projection::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_projection::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);

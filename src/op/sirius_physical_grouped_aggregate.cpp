@@ -21,6 +21,8 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -169,6 +171,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
   const auto& input_batches = input_data.get_data_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {

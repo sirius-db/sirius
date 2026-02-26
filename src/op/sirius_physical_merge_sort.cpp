@@ -23,6 +23,8 @@
 
 #include <cudf/cudf_utils.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -78,6 +80,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   // Collect valid batches and find memory space

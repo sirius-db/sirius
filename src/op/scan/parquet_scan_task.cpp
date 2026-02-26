@@ -75,7 +75,7 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
 
   // In case there are duplicate columns in the projection list, we deduplicate, in order
   auto push_unique = [&selected_column_indices, &seen](auto col_idx) {
-    if (col_idx == duckdb::DConstants::INVALID_INDEX) { return; }
+    if (duckdb::IsVirtualColumn(col_idx)) { return; }
     if (seen.insert(col_idx).second) {
       // Insert successful (not yet seen)
       selected_column_indices.push_back(col_idx);

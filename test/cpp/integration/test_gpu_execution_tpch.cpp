@@ -3594,7 +3594,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 11",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q11]")
+                 "[integration][gpu_execution][TPC-H][Q11]")
 {
   compare_gpu_vs_cpu(
     "select ps.ps_partkey, "
@@ -3616,7 +3616,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 11 parquet",
-                 "[.][integration_disabled][gpu_execution][parquet][TPC-H][Q11]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q11]")
 {
   compare_gpu_vs_cpu(
     "select ps.ps_partkey, "
@@ -3744,7 +3744,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 15",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q15]")
+                 "[integration][gpu_execution][TPC-H][Q15]")
 {
   compare_gpu_vs_cpu(
     "with revenue_view as ("
@@ -3766,7 +3766,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 15 parquet",
-                 "[.][integration_disabled][gpu_execution][parquet][TPC-H][Q15]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q15]")
 {
   compare_gpu_vs_cpu(
     "with revenue_view as ("
@@ -4020,7 +4020,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 21",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q21]")
+                 "[integration][gpu_execution][TPC-H][Q21]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, count(*) as numwait "
@@ -4049,7 +4049,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 21 parquet",
-                 "[.][integration_disabled][gpu_execution][parquet][TPC-H][Q21]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q21]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, count(*) as numwait "
@@ -4078,7 +4078,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 22",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q22]")
+                 "[integration][gpu_execution][TPC-H][Q22]")
 {
   compare_gpu_vs_cpu(
     "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal "
@@ -4103,7 +4103,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 22 parquet",
-                 "[.][integration_disabled][gpu_execution][parquet][TPC-H][Q22]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q22]")
 {
   compare_gpu_vs_cpu(
     "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal "

@@ -27,6 +27,8 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <chrono>
 #include <stdexcept>
 
@@ -58,6 +60,7 @@ sirius_physical_filter::sirius_physical_filter(
 std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_data& input_data,
                                                                rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_filter::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   // The executor uses the data_batch API to filter rows according to `expression`.

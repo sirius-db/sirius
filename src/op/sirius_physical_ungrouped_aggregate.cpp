@@ -36,6 +36,8 @@
 
 #include <rmm/resource_ref.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
@@ -325,6 +327,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (aggregates.empty()) {
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -487,6 +490,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (aggregates.empty()) {
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});

@@ -36,6 +36,8 @@
 
 #include <rmm/resource_ref.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/gpu_data_representation.hpp>
 
 #include <algorithm>
@@ -144,6 +146,7 @@ sirius_physical_top_n::~sirius_physical_top_n() {}
 std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_data& input_data,
                                                               rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (limit == 0) {
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -211,6 +214,7 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operator_data& input_data,
                                                                     rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (limit == 0) {
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
