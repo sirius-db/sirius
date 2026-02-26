@@ -222,7 +222,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 {
   libconfig::Config config;
   config.readFile(config_path.string().c_str());
-  std::cerr << "Loaded Sirius configuration from file: " << config_path << std::endl;
 
   config::configuration_setter config_setter;
 
