@@ -278,35 +278,34 @@ void sirius_physical_nested_loop_join::build_pipelines(
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
 {
-  size_t batch_index = 0;
-  {
-    std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
-    if (left_batch_ids.empty() && right_batch_ids.empty()) {
-      auto* default_port = get_port("default");
-      auto* build_port   = get_port("build");
-      if (!default_port || !default_port->repo || !build_port || !build_port->repo) {
-        return nullptr;
-      }
-      if (default_port->repo->num_partitions() != build_port->repo->num_partitions()) {
-        throw std::runtime_error(
-          "sirius_physical_nested_loop_join: number of partitions for default and build ports must "
-          "match");
-      }
-      left_batch_ids.reserve(default_port->repo->num_partitions());
-      right_batch_ids.reserve(build_port->repo->num_partitions());
-      for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
-        left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
-        right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
-        num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
-      }
-    }
-    if (current_partition_index < num_batches_to_process) {
-      batch_index = current_partition_index;
-      current_partition_index++;
-    } else {
+  // Hold the mutex for the entire operation to prevent concurrent pop/get races.
+  // A pop on one thread must not remove a batch that another thread's get expects to find.
+  std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
+
+  // One-time initialization: snapshot all batch IDs from both ports.
+  if (left_batch_ids.empty() && right_batch_ids.empty()) {
+    auto* default_port = get_port("default");
+    auto* build_port   = get_port("build");
+    if (!default_port || !default_port->repo || !build_port || !build_port->repo) {
       return nullptr;
     }
+    if (default_port->repo->num_partitions() != build_port->repo->num_partitions()) {
+      throw std::runtime_error(
+        "sirius_physical_nested_loop_join: number of partitions for default and build ports must "
+        "match");
+    }
+    left_batch_ids.reserve(default_port->repo->num_partitions());
+    right_batch_ids.reserve(build_port->repo->num_partitions());
+    for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
+      left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
+      right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
+      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+    }
   }
+
+  if (current_partition_index >= num_batches_to_process) { return nullptr; }
+
+  size_t batch_index = current_partition_index++;
 
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
