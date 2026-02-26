@@ -111,3 +111,72 @@ for engine in sirius duckdb; do
 done
 
 echo "Timings CSV saved to $TIMINGS_CSV"
+
+# ---------- Print comparison table ----------
+echo ""
+echo "============================================================"
+printf "  Results Summary  (SF%s)\n" "$SF"
+echo "============================================================"
+echo ""
+
+declare -A DC DW SC SW
+
+for q in "${QUERIES[@]}"; do
+    DUCKDB_TIMING="$PROJECT_DIR/timings_duckdb_sf${SF}_q${q}.csv"
+    SIRIUS_TIMING="$PROJECT_DIR/timings_sirius_sf${SF}_q${q}.csv"
+
+    if [ -f "$DUCKDB_TIMING" ]; then
+        DC[$q]=$(awk -F',' '$1=="iter_1"{print $2}' "$DUCKDB_TIMING")
+        DW[$q]=$(awk -F',' '$1~/^iter_/ && $1!="iter_1"{v=$2+0; if(min==""||v<min)min=v}END{if(min!="")print min}' "$DUCKDB_TIMING")
+    fi
+    if [ -f "$SIRIUS_TIMING" ]; then
+        SC[$q]=$(awk -F',' '$1=="iter_1"{print $2}' "$SIRIUS_TIMING")
+        SW[$q]=$(awk -F',' '$1~/^iter_/ && $1!="iter_1"{v=$2+0; if(min==""||v<min)min=v}END{if(min!="")print min}' "$SIRIUS_TIMING")
+    fi
+done
+
+printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
+    "Query" "DuckDB Cold" "DuckDB Warm" "Sirius Cold" "Sirius Warm" "Speedup (warm)"
+printf "%-7s-+-%13s-+-%13s-+-%13s-+-%13s-+-%14s\n" \
+    "-------" "-------------" "-------------" "-------------" "-------------" "--------------"
+
+TOTAL_DC=0; TOTAL_DW=0; TOTAL_SC=0; TOTAL_SW=0
+
+for q in "${QUERIES[@]}"; do
+    dc="${DC[$q]:-N/A}"; dw="${DW[$q]:-N/A}"
+    sc="${SC[$q]:-N/A}"; sw="${SW[$q]:-N/A}"
+
+    speedup="N/A"
+    if [ "$dw" != "N/A" ] && [ "$sw" != "N/A" ]; then
+        speedup=$(echo "scale=2; $dw / $sw" | bc 2>/dev/null || echo "N/A")
+        [ "$speedup" != "N/A" ] && speedup="${speedup}x"
+    fi
+
+    fmt_dc="N/A"; fmt_dw="N/A"; fmt_sc="N/A"; fmt_sw="N/A"
+    [ "$dc" != "N/A" ] && fmt_dc=$(printf "%.2fs" "$dc")
+    [ "$dw" != "N/A" ] && fmt_dw=$(printf "%.2fs" "$dw")
+    [ "$sc" != "N/A" ] && fmt_sc=$(printf "%.2fs" "$sc")
+    [ "$sw" != "N/A" ] && fmt_sw=$(printf "%.2fs" "$sw")
+
+    printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
+        "Q${q}" "$fmt_dc" "$fmt_dw" "$fmt_sc" "$fmt_sw" "$speedup"
+
+    [ "$dc" != "N/A" ] && TOTAL_DC=$(echo "$TOTAL_DC + $dc" | bc)
+    [ "$dw" != "N/A" ] && TOTAL_DW=$(echo "$TOTAL_DW + $dw" | bc)
+    [ "$sc" != "N/A" ] && TOTAL_SC=$(echo "$TOTAL_SC + $sc" | bc)
+    [ "$sw" != "N/A" ] && TOTAL_SW=$(echo "$TOTAL_SW + $sw" | bc)
+done
+
+total_speedup="N/A"
+if [ "$(echo "$TOTAL_SW > 0" | bc)" -eq 1 ]; then
+    total_speedup=$(echo "scale=2; $TOTAL_DW / $TOTAL_SW" | bc 2>/dev/null || echo "N/A")
+    [ "$total_speedup" != "N/A" ] && total_speedup="${total_speedup}x"
+fi
+
+printf "%-7s-+-%13s-+-%13s-+-%13s-+-%13s-+-%14s\n" \
+    "-------" "-------------" "-------------" "-------------" "-------------" "--------------"
+printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
+    "TOTAL" "$(printf '%.2fs' "$TOTAL_DC")" "$(printf '%.2fs' "$TOTAL_DW")" \
+    "$(printf '%.2fs' "$TOTAL_SC")" "$(printf '%.2fs' "$TOTAL_SW")" "$total_speedup"
+echo ""
+echo "============================================================"
