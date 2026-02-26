@@ -2289,6 +2289,124 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "by c.c_custkey, n.n_nationkey limit 1000;");
 }
 
+TEST_CASE_METHOD(
+  GPUExecutionDuckDBFixture,
+  "gpu_execution - nested loop inner join two inequality condition and expression eval",
+  "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "join customer c on n.n_nationkey < c.c_nationkey * 2 and n.n_regionkey * 1000 > c.c_custkey "
+    "order "
+    "by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed inner join one equality and one inequality condition but "
+                 "equality column is shared (triggers nested join)",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l right join partsupp ps "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_partkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000 "
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+//===----------------------------------------------------------------------===//
+// Mixed join tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(
+  GPUExecutionDuckDBFixture,
+  "gpu_execution - mixed inner join one equality and one inequality condition with cast needed",
+  "[integration][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "join customer c on n.n_nationkey = c.c_nationkey and n.n_regionkey < c.c_custkey  "
+    "where c.c_custkey < 10000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed right join one equality and one inequality condition",
+                 "[integration][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l right join partsupp ps "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000 "
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed left join one equality and two inequality condition",
+                 "[integration][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l left join partsupp ps "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey and l.l_orderkey < "
+    "ps.ps_suppkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000 "
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed inner join two equality and one inequality condition",
+                 "[integration][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l join partsupp ps "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey and l.l_orderkey = "
+    "ps.ps_partkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000 "
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed semi join one equality and one inequality condition",
+                 "[integration][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey, l.l_linenumber from lineitem l semi join partsupp ps "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000 "
+    "order by l.l_orderkey, l.l_linenumber limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed right semi join one equality and one inequality condition",
+                 "[.][integration_disabled][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey  from partsupp ps semi join lineitem l "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where ps.ps_partkey < 1000 "
+    "order by ps.ps_partkey, ps.ps_suppkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed anti join one equality and one inequality condition",
+                 "[integration][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey, l.l_linenumber from lineitem l anti join partsupp ps "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000 "
+    "order by l.l_orderkey, l.l_linenumber limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed anti semi join one equality and one inequality condition",
+                 "[.][integration_disabled][gpu_execution][mixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey  from partsupp ps anti join lineitem l "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where ps.ps_partkey < 1000 "
+    "order by ps.ps_partkey, ps.ps_suppkey limit 1000;");
+}
+
 //===----------------------------------------------------------------------===//
 // Disabled tests - known issues
 //===----------------------------------------------------------------------===//

@@ -114,6 +114,26 @@ class gpu_expression_translator {
   std::optional<translated_expression> translate_join_condition(
     duckdb::JoinCondition const& condition);
 
+  /**
+   * @brief Try to translate a contiguous range of DuckDB join conditions into a single cuDF AST,
+   * combining them with logical AND.
+   *
+   * Intended for translating the inequality conditions of a mixed join into a binary predicate.
+   *
+   * @param conditions The vector of join conditions.
+   * @param start_idx The first condition index to translate (inclusive).
+   * @param end_idx One past the last condition index to translate (exclusive).
+   * @param swap_sides If true, swap LEFT/RIGHT table references in the produced AST. Used when the
+   * caller needs to flip the join sides (e.g. to implement a RIGHT join as a swapped LEFT join).
+   * @return An optional containing the combined translated expression, or std::nullopt if any
+   * condition could not be translated.
+   */
+  std::optional<translated_expression> translate_join_conditions(
+    duckdb::vector<duckdb::JoinCondition> const& conditions,
+    std::size_t start_idx,
+    std::size_t end_idx,
+    bool swap_sides = false);
+
  private:
   // std::optional cannot wrap a real reference, so we use reference_wrapper instead
   using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
@@ -153,6 +173,12 @@ class gpu_expression_translator {
   /// @brief Specialized add_expression for column REFERENCE expressions.
   std::optional<expr_ref> add_expression(duckdb::BoundReferenceExpression const& expr,
                                          cudf::ast::table_reference const table_src);
+
+  /// @brief Add a single join condition to the current AST tree without resetting it.
+  /// @param condition The join condition to translate.
+  /// @param swap_sides If true, swap LEFT/RIGHT table references in the column references.
+  std::optional<expr_ref> add_join_condition(duckdb::JoinCondition const& condition,
+                                             bool swap_sides = false);
 
   /// @brief Helper function for adding a binary function expression (e.g. addition) to the AST.
   /// OP is the cuDF AST operator corresponding to the function (e.g. cudf::ast::ast_operator::ADD).

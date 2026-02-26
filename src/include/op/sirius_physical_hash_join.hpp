@@ -97,6 +97,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op,
                                    bool build_rhs = true);
+
+  /**
+   * @brief Returns true if the given join conditions can be handled by this operator.
+   *
+   * Requires at least one equality condition. For mixed joins (equality + inequality), also
+   * requires that no column referenced by an equality condition appears in any inequality
+   * condition on the same side — cuDF's mixed_join API requires disjoint equality and
+   * conditional table columns.
+   */
+  static bool are_conditions_supported(duckdb::vector<duckdb::JoinCondition>& conditions);
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
@@ -121,7 +131,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
 
-  bool is_equality_join = true;
+  bool is_all_inequality_join = true;
+  // True when conditions contain both equality conditions (hashed) and inequality conditions
+  // (evaluated via cuDF mixed_join binary predicate).
+  bool is_mixed_join = false;
+  // Number of equality conditions after reordering; inequality conditions follow at higher indices.
+  std::size_t num_equality_conditions = 0;
   std::vector<cudf::size_type> left_key_col_indices;
   std::vector<cudf::size_type> right_key_col_indices;
   bool cast_necessary = false;

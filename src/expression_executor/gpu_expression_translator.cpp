@@ -35,54 +35,79 @@ gpu_expression_translator::translate_expression(duckdb::Expression const& expr,
   return result;
 }
 
+std::optional<expr_ref> gpu_expression_translator::add_join_condition(
+  duckdb::JoinCondition const& condition, bool swap_sides)
+{
+  auto left_table_ref =
+    swap_sides ? cudf::ast::table_reference::RIGHT : cudf::ast::table_reference::LEFT;
+  auto right_table_ref =
+    swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT;
+
+  auto left_expr = add_expression(*condition.left, left_table_ref);
+  if (!left_expr) { return std::nullopt; }
+
+  auto right_expr = add_expression(*condition.right, right_table_ref);
+  if (!right_expr) { return std::nullopt; }
+
+  switch (condition.comparison) {
+    case duckdb::ExpressionType::COMPARE_EQUAL:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
+    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
+    case duckdb::ExpressionType::COMPARE_LESSTHAN:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+    default:
+      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported join condition comparison type: {}",
+                       condition.comparison);
+      return std::nullopt;
+  }
+}
+
 std::optional<gpu_expression_translator::translated_expression>
 gpu_expression_translator::translate_join_condition(duckdb::JoinCondition const& condition)
 {
   reset_tree();
-  auto left_expr = add_expression(*condition.left, cudf::ast::table_reference::LEFT);
-  if (!left_expr) { return std::nullopt; }
+  auto cond_ref = add_join_condition(condition);
+  if (!cond_ref) { return std::nullopt; }
+  translated_expression result;
+  result.tree           = std::move(_ast_tree);
+  result.owned_literals = std::move(_literal_scalars);
+  return result;
+}
 
-  auto right_expr = add_expression(*condition.right, cudf::ast::table_reference::RIGHT);
-  if (!right_expr) { return std::nullopt; }
+std::optional<gpu_expression_translator::translated_expression>
+gpu_expression_translator::translate_join_conditions(
+  duckdb::vector<duckdb::JoinCondition> const& conditions,
+  std::size_t start_idx,
+  std::size_t end_idx,
+  bool swap_sides)
+{
+  if (start_idx >= end_idx) { return std::nullopt; }
 
-  // Combine the left and right expressions with the appropriate comparison operator
-  switch (condition.comparison) {
-    case duckdb::ExpressionType::COMPARE_EQUAL: {
-      _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
-      break;
-    }
-    case duckdb::ExpressionType::COMPARE_NOTEQUAL: {
-      _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
-      break;
-    }
-    case duckdb::ExpressionType::COMPARE_LESSTHAN: {
-      _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
-      break;
-    }
-    case duckdb::ExpressionType::COMPARE_GREATERTHAN: {
-      _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
-      break;
-    }
-    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO: {
-      _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
-      break;
-    }
-    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
-      _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
-      break;
-    }
-    default: {
-      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported join condition comparison type: {}",
-                       condition.comparison);
-      return std::nullopt;
-    }
+  reset_tree();
+
+  auto combined = add_join_condition(conditions[start_idx], swap_sides);
+  if (!combined) { return std::nullopt; }
+
+  for (std::size_t i = start_idx + 1; i < end_idx; ++i) {
+    auto next = add_join_condition(conditions[i], swap_sides);
+    if (!next) { return std::nullopt; }
+    combined = _ast_tree.emplace<cudf::ast::operation>(
+      cudf::ast::ast_operator::LOGICAL_AND, *combined, *next);
   }
+
   translated_expression result;
   result.tree           = std::move(_ast_tree);
   result.owned_literals = std::move(_literal_scalars);

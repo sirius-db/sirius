@@ -74,17 +74,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   //	TODO: Extend PWMJ to handle all comparisons and projection maps
   bool prefer_range_joins = duckdb::DBConfig::GetSetting<duckdb::PreferRangeJoinsSetting>(context);
   prefer_range_joins      = prefer_range_joins && can_iejoin;
-  // Hash join only supports equality and NOT_DISTINCT_FROM; use nested loop join if any condition
-  // is non-equality (e.g. COMPARE_GREATERTHAN).
-  bool all_equality = true;
-  for (const auto& c : op.conditions) {
-    if (c.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-        c.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      all_equality = false;
-      break;
-    }
-  }
-  if (has_equality && all_equality && !prefer_range_joins) {
+
+  bool is_supported_by_hash_join =
+    sirius::op::sirius_physical_hash_join::are_conditions_supported(op.conditions);
+  if (is_supported_by_hash_join && !prefer_range_joins) {
     // Equality join with small number of keys : possible perfect join optimization
     // auto &join = Make<PhysicalHashJoin>(op, left, right, std::move(op.conditions), op.join_type,
     //                                     op.left_projection_map, op.right_projection_map,
