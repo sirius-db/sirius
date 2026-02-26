@@ -1,5 +1,5 @@
 [workspace]
-channels = ["rapidsai-nightly", "conda-forge", "nvidia" ]
+channels = ["rapidsai", "conda-forge" ]
 name = "sirius"
 platforms = ["linux-64", "linux-aarch64"]
 requires-pixi = ">=0.59"
@@ -18,8 +18,8 @@ sccache = "*"
 unzip = "*"
 clang = ">=21"
 wget = "*"
-libcudf = "26.04.*"
-librmm = "26.04.*"
+libcudf = "26.02.*"
+librmm = "*"
 libcurand-dev = "*"
 pre-commit = "*"
 libconfig = "*"
