@@ -269,6 +269,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
   std::size_t input_size = 0;
   if (!local_state._input_data) { return 0; }
   for (const auto& batch : local_state._input_data->get_data_batches()) {
+    if (!batch || !batch->get_data()) { continue; }
     input_size += batch->get_data()->get_size_in_bytes();
   }
   return input_size;

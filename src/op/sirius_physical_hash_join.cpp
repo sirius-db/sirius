@@ -349,32 +349,32 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_data()
 {
-  size_t batch_index = 0;
-  {
-    std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
-    if (left_batch_ids.empty() && right_batch_ids.empty()) {
-      if (ports["default"]->repo->num_partitions() != ports["build"]->repo->num_partitions()) {
-        throw std::runtime_error(
-          "In sirius_physical_hash_join:Number of partitions for left and right ports must be the "
-          "same");
-      }
+  // Hold the mutex for the entire operation to prevent concurrent pop/get races.
+  // A pop on one thread must not remove a batch that another thread's get expects to find.
+  std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
 
-      left_batch_ids.reserve(ports["default"]->repo->num_partitions());
-      right_batch_ids.reserve(ports["build"]->repo->num_partitions());
-      for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
-        left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
-        right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
-        num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
-      }
+  // One-time initialization: snapshot all batch IDs from both ports.
+  if (left_batch_ids.empty() && right_batch_ids.empty()) {
+    if (ports["default"]->repo->num_partitions() != ports["build"]->repo->num_partitions()) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join:Number of partitions for left and right ports must be the "
+        "same");
     }
-    if (current_partition_index < num_batches_to_process) {
-      batch_index = current_partition_index;
-      current_partition_index++;
-    } else {
-      return nullptr;
+
+    left_batch_ids.reserve(ports["default"]->repo->num_partitions());
+    right_batch_ids.reserve(ports["build"]->repo->num_partitions());
+    for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
+      left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
+      right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
+      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
     }
   }
 
+  if (current_partition_index >= num_batches_to_process) { return nullptr; }
+
+  size_t batch_index = current_partition_index++;
+
+  // Walk the partition × left × right grid to find the (left, right) pair for this batch_index.
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
   size_t counter = 0;
@@ -384,14 +384,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       size_t right_counter = 0;
       for (auto& right_batch_id : right_batch_ids[partition_idx]) {
         if (counter == batch_index) {
-          if (right_counter == right_batch_ids[partition_idx].size() - 1) {
+          bool pop_left  = (right_counter == right_batch_ids[partition_idx].size() - 1);
+          bool pop_right = (left_counter == left_batch_ids[partition_idx].size() - 1);
+          if (pop_left) {
             input_batch.push_back(ports["default"]->repo->pop_data_batch_by_id(
               left_batch_id, cucascade::batch_state::task_created, partition_idx));
           } else {
             input_batch.push_back(ports["default"]->repo->get_data_batch_by_id(
               left_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
-          if (left_counter == left_batch_ids[partition_idx].size() - 1) {
+          if (pop_right) {
             input_batch.push_back(ports["build"]->repo->pop_data_batch_by_id(
               right_batch_id, cucascade::batch_state::task_created, partition_idx));
           } else {
