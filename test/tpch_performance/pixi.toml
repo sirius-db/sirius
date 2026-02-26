@@ -1,7 +1,7 @@
 [workspace]
 name = "tpch-parquet-tools"
 channels = ["rapidsai-nightly", "conda-forge", "nvidia"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "linux-aarch64"]
 
 [dependencies]
 cudf = "26.04.*"
