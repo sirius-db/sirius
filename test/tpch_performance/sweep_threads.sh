@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
 # Thread sweep benchmark: Sirius-only on 2M RG parquet
 #

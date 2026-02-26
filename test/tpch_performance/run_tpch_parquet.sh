@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run TPC-H GPU queries against Parquet files
 #
 # Creates views from parquet files found in the dataset directory,

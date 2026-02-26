@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
 # TPC-H Benchmark: DuckDB vs Sirius
 #

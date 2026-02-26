@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 git submodule update --init --recursive
 export SIRIUS_HOME_PATH=`pwd`
