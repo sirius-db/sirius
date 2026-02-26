@@ -36,7 +36,8 @@
         "CMAKE_CUDA_COMPILER_LAUNCHER": "sccache",
         "CMAKE_CXX_COMPILER_LAUNCHER": "sccache",
         "CMAKE_C_COMPILER_LAUNCHER": "sccache",
-        "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake"
+        "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake",
+        "EXTENSION_STATIC_BUILD": "ON"
       },
       "generator": "Ninja",
       "hidden": true,
