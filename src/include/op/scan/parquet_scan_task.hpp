@@ -23,6 +23,7 @@
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
+#include <sirius_config.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
@@ -89,7 +90,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
-    size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE);
+    size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE);
 
   //===----------Methods----------===//
   /**

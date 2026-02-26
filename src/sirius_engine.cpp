@@ -44,6 +44,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "sirius_context.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 
@@ -220,6 +221,10 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 {
   // auto &scheduler = TaskScheduler::GetScheduler(context);
+  const sirius::operator_params& op_params =
+    context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+      ->get_config()
+      .get_operator_params();
   {
     // lock_guard<mutex> elock(executor_lock);
     sirius_physical_plan = &plan;
@@ -412,24 +417,28 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
               current_pipeline->get_source()->types,
               current_pipeline->get_source()->estimated_cardinality,
               &current_pipeline->operators[join_pos].get(),
-              false);
+              false,
+              op_params.concat_batch_bytes);
             auto partition_op = make_uniq<op::sirius_physical_partition>(
               current_pipeline->get_source()->types,
               current_pipeline->get_source()->estimated_cardinality,
               concat_op.get(),
-              false);
+              false,
+              op_params.hash_partition_bytes);
             new_pipeline_breakers.push_back(std::move(partition_op));
           } else {
             concat_op = make_uniq<op::sirius_physical_concat>(
               current_pipeline->operators[join_pos - 1].get().types,
               current_pipeline->operators[join_pos - 1].get().estimated_cardinality,
               &current_pipeline->operators[join_pos].get(),
-              false);
+              false,
+              op_params.concat_batch_bytes);
             auto partition_op = make_uniq<op::sirius_physical_partition>(
               current_pipeline->operators[join_pos - 1].get().types,
               current_pipeline->operators[join_pos - 1].get().estimated_cardinality,
               concat_op.get(),
-              false);
+              false,
+              op_params.hash_partition_bytes);
             new_pipeline_breakers.push_back(std::move(partition_op));
           }
 
@@ -497,12 +506,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             current_pipeline->get_source()->types,
             current_pipeline->get_source()->estimated_cardinality,
             hash_join_op.get(),
-            true);
+            true,
+            op_params.concat_batch_bytes);
           partition_op = make_uniq<op::sirius_physical_partition>(
             current_pipeline->get_source()->types,
             current_pipeline->get_source()->estimated_cardinality,
             concat_op.get(),
-            true);
+            true,
+            op_params.hash_partition_bytes);
         } else {
           concat_op = make_uniq<op::sirius_physical_concat>(
             current_pipeline->operators[current_pipeline->operators.size() - 1].get().types,
@@ -510,14 +521,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
               .get()
               .estimated_cardinality,
             hash_join_op.get(),
-            true);
+            true,
+            op_params.concat_batch_bytes);
           partition_op = make_uniq<op::sirius_physical_partition>(
             current_pipeline->operators[current_pipeline->operators.size() - 1].get().types,
             current_pipeline->operators[current_pipeline->operators.size() - 1]
               .get()
               .estimated_cardinality,
             concat_op.get(),
-            true);
+            true,
+            op_params.hash_partition_bytes);
         }
 
         // replace sink with partition_op
@@ -548,7 +561,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             current_pipeline->get_sink()->types,
             current_pipeline->get_sink()->estimated_cardinality,
             current_pipeline->get_sink().get(),
-            false);
+            false,
+            op_params.hash_partition_bytes);
           new_pipeline_breakers.push_back(std::move(partition_op));
 
           op::sirius_physical_partition* partition_ptr =
@@ -608,8 +622,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         // Create SORT_SAMPLE operator
         auto sample_op   = duckdb::make_uniq<op::sirius_physical_sort_sample>(order_ptr);
         auto* sample_ptr = sample_op.get();
-        if (duckdb::Config::MAX_SORT_PARTITION_BYTES > 0) {
-          sample_ptr->set_max_partition_bytes(duckdb::Config::MAX_SORT_PARTITION_BYTES);
+        if (op_params.max_sort_partition_bytes > 0) {
+          sample_ptr->set_max_partition_bytes(op_params.max_sort_partition_bytes);
         }
 
         // Pipeline B: ORDER (source) → SORT_SAMPLE (sink)
@@ -721,7 +735,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
               current_pipeline->get_source()->types,
               current_pipeline->get_source()->estimated_cardinality,
               join_op.get(),
-              delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+              delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN,
+              op_params.hash_partition_bytes);
           } else {
             partition_join = make_uniq<op::sirius_physical_partition>(
               current_pipeline->operators[current_pipeline->operators.size() - 1].get().types,
@@ -729,7 +744,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                 .get()
                 .estimated_cardinality,
               join_op.get(),
-              delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+              delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN,
+              op_params.hash_partition_bytes);
           }
           delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join =
             static_cast<op::sirius_physical_partition*>(partition_join.get());
@@ -738,8 +754,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             static_cast<op::sirius_physical_column_data_scan*>(join_op->children[0].get());
         }
 
-        auto partition_distinct = make_uniq<op::sirius_physical_partition>(
-          distinct_op->types, distinct_op->estimated_cardinality, distinct_op.get(), false);
+        auto partition_distinct =
+          make_uniq<op::sirius_physical_partition>(distinct_op->types,
+                                                   distinct_op->estimated_cardinality,
+                                                   distinct_op.get(),
+                                                   false,
+                                                   op_params.hash_partition_bytes);
 
         delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct =
           static_cast<op::sirius_physical_partition*>(partition_distinct.get());
@@ -754,7 +774,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
               partition_join.get()->types,
               partition_join.get()->estimated_cardinality,
               join_op.get(),
-              delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+              delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN,
+              op_params.concat_batch_bytes);
           new_pipeline->source = partition_join.get();
           new_pipeline->sink   = concat_op.get();
           new_pipeline->dependencies.push_back(current_pipeline);

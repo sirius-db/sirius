@@ -24,6 +24,7 @@
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius {
 namespace op {
@@ -32,10 +33,12 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
-  explicit sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
-                                  duckdb::idx_t estimated_cardinality,
-                                  sirius_physical_operator* parent_op,
-                                  bool is_build);
+  explicit sirius_physical_concat(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::idx_t estimated_cardinality,
+    sirius_physical_operator* parent_op,
+    bool is_build,
+    uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
 
   std::string get_name() const override;
 
@@ -59,6 +62,7 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   sirius_physical_operator* _parent_op;
   bool _is_build;
   bool _concat_all;
+  uint64_t _concat_batch_bytes;
 };
 
 }  // namespace op
