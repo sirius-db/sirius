@@ -18,6 +18,8 @@
 #include <catch.hpp>
 
 // sirius
+#include "cudf/cudf_utils.hpp"
+
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -523,7 +525,11 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
   auto footer_buffer = read_parquet_footer(*datasource);
 
   auto reader_options = cudf::io::parquet_reader_options::builder().build();
+#if CUDF_VERSION_NUM >= 2604
   reader_options.set_column_names({"id", "price"});
+#else
+  reader_options.set_columns({"id", "price"});
+#endif
 
   auto reader = std::make_unique<hybrid_scan_reader>(
     cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()), reader_options);

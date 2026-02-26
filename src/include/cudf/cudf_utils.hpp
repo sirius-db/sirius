@@ -38,7 +38,9 @@
 #include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/reduction.hpp>
+#if CUDF_VERSION_NUM >= 2604
 #include <cudf/reduction/distinct_count.hpp>
+#endif
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>

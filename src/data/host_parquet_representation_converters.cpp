@@ -24,6 +24,8 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // cudf
+#include "cudf/cudf_utils.hpp"
+
 #include <cudf/io/parquet.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -128,10 +130,20 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 #endif
 
   // Invoke the Parquet reader to materialize the table on GPU
+#if CUDF_VERSION_NUM >= 2604
   auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
     column_chunk_spans_d.data(), column_chunk_spans_d.size());
   auto result = reader.materialize_all_columns(
     host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
+#else
+  // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
+  std::vector<rmm::device_buffer> column_chunk_buffers;
+  for (auto const& span : column_chunk_spans_d) {
+    column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
+  }
+  auto result = reader.materialize_all_columns(
+    host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
+#endif
   auto new_table = std::move(result.tbl);  // Discard metadata
   stream.synchronize();
 

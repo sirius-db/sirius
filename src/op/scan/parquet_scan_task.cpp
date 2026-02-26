@@ -34,12 +34,16 @@
 #include <duckdb/main/config.hpp>
 
 // cudf
+#include "cudf/cudf_utils.hpp"
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#if CUDF_VERSION_NUM >= 2604
+#include <cudf/io/parquet_io_utils.hpp>
+#endif
 
 // standard library
 #include <algorithm>
@@ -49,6 +53,37 @@
 #include <vector>
 
 namespace sirius::op::scan {
+
+#if CUDF_VERSION_NUM < 2604
+namespace {
+// Fallback for cudf < 26.04 which lacks cudf::io::parquet::fetch_footer_to_host.
+// Reads the Parquet footer: last 8 bytes = [4-byte footer_len LE][4-byte "PAR1"],
+// then reads footer_len bytes before that.
+std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
+  cudf::io::datasource& datasource)
+{
+  constexpr size_t PARQUET_MAGIC_SIZE = 4;
+  constexpr size_t FOOTER_LEN_SIZE    = 4;
+  constexpr size_t TAIL_SIZE          = PARQUET_MAGIC_SIZE + FOOTER_LEN_SIZE;
+
+  auto const file_size = datasource.size();
+  if (file_size < TAIL_SIZE + PARQUET_MAGIC_SIZE) {
+    throw std::runtime_error("File too small to be a valid Parquet file");
+  }
+
+  // Read the last 8 bytes to get footer length
+  auto tail_buf    = datasource.host_read(file_size - TAIL_SIZE, TAIL_SIZE);
+  auto const* tail = tail_buf->data();
+
+  // Footer length is a little-endian uint32 at offset 0
+  uint32_t footer_len = tail[0] | (tail[1] << 8) | (tail[2] << 16) | (tail[3] << 24);
+
+  // Read the footer bytes
+  auto const footer_offset = file_size - TAIL_SIZE - footer_len;
+  return datasource.host_read(footer_offset, footer_len);
+}
+}  // namespace
+#endif
 
 namespace detail {
 
@@ -154,7 +189,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     _file_paths.begin(), _file_paths.end(), [&datasources, &footer_buffers](auto const& file_path) {
       auto datasource = cudf::io::datasource::create(file_path);
       datasources.push_back(std::move(datasource));
+#if CUDF_VERSION_NUM >= 2604
       footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
+#else
+      footer_buffers.push_back(fetch_footer_to_host_fallback(*datasources.back()));
+#endif
     });
 
   // Initialize reader options for applying projections (FUTURE: filters)
@@ -198,7 +237,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
                     projected_columns.emplace_back(scan_op->names[col_idx]);
                   });
 
+#if CUDF_VERSION_NUM >= 2604
     _reader_options.set_column_names(std::move(projected_columns));
+#else
+    _reader_options.set_columns(std::move(projected_columns));
+#endif
   }
 
   // Compute the byte counts per row group for the selected columns for task partitioning
