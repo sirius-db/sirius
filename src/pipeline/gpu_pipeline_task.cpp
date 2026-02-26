@@ -285,7 +285,9 @@ std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consume
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
     return output_consumers;
   }
-  return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_output_consumers();
+  return _global_state->cast<gpu_pipeline_task_global_state>()
+    .get_pipeline()
+    ->get_output_consumers();
 }
 
 }  // namespace pipeline

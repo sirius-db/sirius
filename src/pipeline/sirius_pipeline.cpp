@@ -336,11 +336,9 @@ std::vector<op::sirius_physical_operator*> sirius_pipeline::get_output_consumers
   auto parents = get_parents();
   std::vector<op::sirius_physical_operator*> result;
   for (auto& parent : parents) {
-    if (auto src = parent->get_source(); src) {
-      result.push_back(src.get());
-    }
-    }
-    return result;
+    if (auto src = parent->get_source(); src) { result.push_back(src.get()); }
   }
+  return result;
+}
 }  // namespace pipeline
 }  // namespace sirius
