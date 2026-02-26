@@ -72,6 +72,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     SIRIUS_LOG_DEBUG("merge_sort: drained {} batches for partition {}",
                      all_batches.size(),
                      _current_partition_index - 1);
+    if (all_batches.empty()) { return nullptr; }
     return std::make_unique<operator_data>(all_batches);
   }
   return nullptr;

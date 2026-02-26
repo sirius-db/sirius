@@ -172,7 +172,7 @@ sirius_pipeline::get_operators() const
   return result;
 }
 
-std::vector<sirius_pipeline*> sirius_pipeline::get_parents()
+std::vector<sirius_pipeline*> sirius_pipeline::get_parents() const
 {
   std::vector<sirius_pipeline*> result;
   for (auto& weak_parent : parents) {
@@ -331,5 +331,14 @@ void sirius_pipeline::mark_task_completed()
   update_pipeline_status();
 }
 
+std::vector<op::sirius_physical_operator*> sirius_pipeline::get_output_consumers() const
+{
+  auto parents = get_parents();
+  std::vector<op::sirius_physical_operator*> result;
+  for (auto& parent : parents) {
+    if (auto src = parent->get_source(); src) { result.push_back(src.get()); }
+  }
+  return result;
+}
 }  // namespace pipeline
 }  // namespace sirius
