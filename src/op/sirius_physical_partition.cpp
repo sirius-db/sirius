@@ -119,7 +119,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
-    _partition_keys            = grouped_aggregate_op.group_idx;
+    _partition_keys            = grouped_aggregate_op.get_output_grouping_indices();
 
     // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate
     // operator which may be what we want to use when we care about grouping sets for (duckdb::idx_t
@@ -135,7 +135,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
   } else if (op->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
     _partition_type                  = PartitionType::HASH;
     auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
-    _partition_keys                  = grouped_aggregate_merge_op.group_idx;
+    _partition_keys                  = grouped_aggregate_merge_op.get_output_grouping_indices();
 
   } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
     auto& parent_concat_op = op->Cast<sirius_physical_concat>();
