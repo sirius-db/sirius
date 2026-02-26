@@ -37,4 +37,4 @@ group by
 order by
   numwait desc,
   s.s_name
-limit 100
+limit 100;

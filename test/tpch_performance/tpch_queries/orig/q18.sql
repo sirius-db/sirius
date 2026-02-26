@@ -30,4 +30,4 @@ group by
 order by
   o.o_totalprice desc,
   o.o_orderdate
-limit 100
+limit 100;

@@ -29,4 +29,4 @@ where
       revenue_view
   )
 order by
-  s.s_suppkey
+  s.s_suppkey;
