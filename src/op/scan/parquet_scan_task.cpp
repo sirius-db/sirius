@@ -17,8 +17,10 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
+#include <expression_executor/gpu_expression_translator.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
 // cucascade
@@ -157,8 +159,25 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
     });
 
-  // Initialize reader options for applying projections (FUTURE: filters)
-  _reader_options = cudf::io::parquet_reader_options::builder().build();
+  // Build reader options: apply filter pushdown if table_filters can be translated to cudf::ast
+  _reader_options = cudf::io::parquet_reader_options::builder().build();  // default: no filter
+  if (scan_op->table_filters && !scan_op->table_filters->filters.empty()) {
+    std::cerr << "[parquet_scan_task_global_state] Applying filter pushdown" << std::endl;
+    auto duckdb_expr = sirius::op::convert_table_filters_to_expression(
+      *scan_op->table_filters, scan_op->column_ids, scan_op->returned_types, scan_op->projection_ids);
+    if (duckdb_expr) {
+      std::cerr << "[parquet_scan_task_global_state] Filter converted to cudf::ast" << std::endl;
+      sirius::gpu_expression_translator translator(rmm::cuda_stream_default,
+                                                   cudf::get_current_device_resource_ref());
+      _translated_filter = translator.translate_expression(*duckdb_expr);
+      if (_translated_filter) {
+        std::cerr << "[parquet scan task] Filter converted to cudf::ast" << std::endl;
+        _reader_options = cudf::io::parquet_reader_options::builder()
+                            .filter(_translated_filter->back())
+                            .build();
+      }
+    }
+  }
 
   // Construct the file readers and parse the metadata
   std::vector<std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader>> readers;

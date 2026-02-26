@@ -39,6 +39,9 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 
+// sirius (expression)
+#include <expression_executor/gpu_expression_translator.hpp>
+
 // standard library
 #include <atomic>
 #include <memory>
@@ -210,6 +213,9 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
   cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
+  /// Owning storage for the translated filter AST and its scalar literals. Must outlive
+  /// _reader_options since the AST nodes hold references into it.
+  std::optional<sirius::gpu_expression_translator::translated_expression> _translated_filter;
 
   std::vector<std::vector<size_t>>
     _row_group_uncompressed_bytes;  ///< Per-(file,row-group) uncompressed bytes
