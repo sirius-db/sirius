@@ -185,8 +185,10 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                      op.get().get_operator_id(),
                      operator_input_output_data->get_data_batches().size(),
                      batch_sizes);
-    auto start                 = std::chrono::high_resolution_clock::now();
-    operator_input_output_data = op.get().execute(*operator_input_output_data, stream);
+    auto start            = std::chrono::high_resolution_clock::now();
+    auto temp_output_data = op.get().execute(*operator_input_output_data, stream);
+    stream.synchronize();
+    operator_input_output_data = std::move(temp_output_data);
     auto end                   = std::chrono::high_resolution_clock::now();
     auto duration              = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     batch_sizes                = "";
