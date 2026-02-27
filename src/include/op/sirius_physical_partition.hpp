@@ -77,22 +77,33 @@ class sirius_physical_partition : public sirius_physical_operator {
   {
     _sibling_partition_op = sibling_partition_op;
   }
+  //! Set _sibling_op_for_join by finding the sibling PARTITION child.
+  void set_sibling_op_for_join(sirius_physical_operator* join_op);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  void set_num_partitions(int num_partitions);
+
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
+  int determine_num_partitions();
   sirius_physical_operator* _parent_op;
+<<<<<<< HEAD
   sirius_physical_operator* _sibling_partition_op;
+=======
+  sirius_physical_operator* _sibling_op_for_join = nullptr;
+>>>>>>> 811dcc87 (initial implementation)
   std::vector<int> _partition_keys;
   /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
   /// cast the key column to this type before hashing.  Used to align hash values when the
   /// two join sides have different physical column types for the same logical key.
   std::vector<cudf::data_type> _partition_key_cast_types;
-  int _num_partitions;
+  std::optional<int> _num_partitions;
   bool _is_build;
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
