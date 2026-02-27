@@ -1,9 +1,9 @@
-name: Sirius Test
+name: Test
 
-on: [push, pull_request, workflow_dispatch]
+on: pull_request
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
