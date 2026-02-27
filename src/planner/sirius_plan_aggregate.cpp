@@ -59,13 +59,6 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
                                           duckdb::vector<duckdb::column_t>& partition_columns)
 {
   if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) { return false; }
-  for (auto& expression : op.expressions) {
-    auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (aggregate.IsDistinct()) {
-      // distinct aggregates are not supported in partitioned hash aggregates
-      return false;
-    }
-  }
   // check if the source is partitioned by the aggregate columns
   // figure out the columns we are grouping by
   for (auto& group_expr : op.groups) {
@@ -230,10 +223,29 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
+/// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
+/// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
+/// (including the result collector) use the correct type.
+static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
+                                   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
+{
+  for (auto& type : types) {
+    if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
+  }
+  for (auto& expr : exprs) {
+    if (expr->return_type == duckdb::LogicalType::HUGEINT) {
+      expr->return_type = duckdb::LogicalType::BIGINT;
+    }
+  }
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
+
+  // Downcast HUGEINT to BIGINT since cuDF does not support int128
+  downcast_hugeint_types(op.types, op.expressions);
 
   auto plan = create_plan(*op.children[0]);
 

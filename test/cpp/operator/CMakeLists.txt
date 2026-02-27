@@ -16,13 +16,22 @@
 
 set(TEST_SOURCES
     ${TEST_SOURCES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_merge_impl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/test_gpu_merge_impl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_partition_impl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_host_table_chunk_reader.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_sirius_physical_result_collector.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_result_collector.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_filter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_limit.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_top_n.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_order.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_merge_sort.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_projection.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_ungrouped_aggregate.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_table_scan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_partition.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_concat.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_mark_join.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/test_physical_grouped_aggregate.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/test_physical_grouped_aggregate_merge.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     PARENT_SCOPE)

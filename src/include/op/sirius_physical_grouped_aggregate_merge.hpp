@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cudf/aggregation.hpp"
+#include "cudf/types.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -23,13 +25,17 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
+
+#include <numeric>
 
 namespace sirius {
 namespace op {
 
-class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator {
+class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
@@ -38,6 +44,25 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
   sirius_physical_grouped_aggregate_merge(
+    duckdb::vector<duckdb::LogicalType> types,
+    std::vector<int> group_idx,
+    std::vector<cudf::aggregation::Kind> cudf_aggregates,
+    std::vector<int> cudf_aggregate_idx,
+    std::vector<std::vector<int>> cudf_aggregate_struct_col_indices,
+    std::vector<AggregateSlot> aggregate_slots,
+    bool has_avg,
+    bool has_count_distinct,
+    duckdb::idx_t estimated_cardinality);
+
+  sirius_physical_grouped_aggregate_merge(
+    duckdb::ClientContext& context,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
+    duckdb::idx_t estimated_cardinality);
+
+  sirius_physical_grouped_aggregate_merge(
+    duckdb::ClientContext& context,
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
@@ -66,7 +91,27 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }
 
+  // Grouped aggregatge definitions for cudf compute
+  std::vector<int> group_idx;
+  std::vector<cudf::aggregation::Kind> cudf_aggregates;
+  std::vector<int> cudf_aggregate_idx;
+  std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
+
+  // AVG and COUNT DISTINCT decomposition metadata
+  std::vector<AggregateSlot> aggregate_slots;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
+
+  std::size_t current_partition_index = 0;
+
  public:
+  std::vector<int> get_output_grouping_indices() const
+  {
+    std::vector<int> indices(group_idx.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    return indices;
+  }
+
   // Source interface
   bool is_source() const override { return true; }
 
@@ -75,11 +120,15 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
     return duckdb::OrderPreservationType::NO_ORDER;
   }
 
- public:
   // Sink interface
   bool is_sink() const override { return true; }
 
   bool sink_order_dependent() const override { return false; }
+
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

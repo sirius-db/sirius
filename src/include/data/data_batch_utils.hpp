@@ -67,8 +67,8 @@ inline cudf::table_view get_cudf_table_view(const cucascade::data_batch& batch)
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   cudf::table&& table, cucascade::memory::memory_space& memory_space)
 {
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), memory_space);
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), memory_space);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 
@@ -83,7 +83,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   std::unique_ptr<cudf::table> table, cucascade::memory::memory_space& memory_space)
 {
   auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(*table), memory_space);
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), memory_space);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 

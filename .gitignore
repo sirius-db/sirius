@@ -11,7 +11,7 @@ test/__pycache__/
 tpch-data/dbgen
 .vscode/
 *.duckdb
-duckdb/*
+!test/cpp/integration/integration.duckdb
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
@@ -29,3 +29,6 @@ cufile.log
 .pixi/*
 !.pixi/config.toml
 compile_commands.json
+
+# Zed editor settings
+.zed

@@ -19,3 +19,9 @@
 # gpu_data_representation.cpp - data_batch.cpp - data_batch_view.cpp (removed -
 # replaced by shared_ptr<data_batch>) - data_repository.cpp -
 # data_repository_manager.cpp
+
+set(EXTENSION_SOURCES
+    ${EXTENSION_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/host_parquet_representation.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/host_parquet_representation_converters.cpp
+    PARENT_SCOPE)

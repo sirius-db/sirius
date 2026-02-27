@@ -26,11 +26,8 @@
 #include <duckdb/common/types/column/column_data_collection.hpp>
 #include <duckdb/main/client_context.hpp>
 
-namespace duckdb {
-class SiriusPreparedStatementData;
-}  // namespace duckdb
-
 namespace sirius {
+class sirius_prepared_statement_data;
 
 namespace pipeline {
 class sirius_pipeline;
@@ -45,7 +42,10 @@ class sirius_physical_result_collector : public sirius_physical_operator {
     SiriusPhysicalOperatorType::RESULT_COLLECTOR;
 
  public:
-  explicit sirius_physical_result_collector(duckdb::SiriusPreparedStatementData& data);
+  explicit sirius_physical_result_collector(::sirius::sirius_prepared_statement_data& data);
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 
   duckdb::StatementType statement_type;
   duckdb::StatementProperties properties;
@@ -68,7 +68,7 @@ class sirius_physical_result_collector : public sirius_physical_operator {
 
 class sirius_physical_materialized_collector : public sirius_physical_result_collector {
  public:
-  sirius_physical_materialized_collector(duckdb::SiriusPreparedStatementData& data,
+  sirius_physical_materialized_collector(::sirius::sirius_prepared_statement_data& data,
                                          duckdb::ClientContext& client_ctx);
   duckdb::unique_ptr<duckdb::ColumnDataCollection> result_collection;
 
@@ -90,11 +90,11 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
    * @throws InternalException if the memory manager is not initialized, if the reservation fails,
    * or if the memory space for the reservation is invalid
    * @note For now, we assume that the input batch, if in the HOST tier, is always in the
-   * host_table_representation. If it is in the GPU tier, we convert it to the
-   * host_table_representation. In the future, we should register converters for other specialized
-   * data representations and invoke one such here.
+   * host_data_packed_representation. If it is in the GPU tier, we convert it to the
+   * host_data_packed_representation. In the future, we should register converters for other
+   * specialized data representations and invoke one such here.
    */
-  void sink(const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
  private:
   duckdb::ClientContext& _client_ctx;

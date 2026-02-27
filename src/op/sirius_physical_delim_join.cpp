@@ -26,6 +26,8 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -150,6 +152,52 @@ void sirius_physical_right_delim_join::build_pipelines(
   }
 
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join, false);
+}
+
+std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::execute"};
+  return std::make_unique<operator_data>(input_data);
+}
+
+void sirius_physical_right_delim_join::sink(const operator_data& input_data,
+                                            rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::sink"};
+  // call partition join execute
+  auto partition_join_output = partition_join->execute(input_data, stream);
+  // call distinct execute
+  auto distinct_output = distinct->execute(input_data, stream);
+  // call partition distinct execute
+  auto partition_distinct_output = partition_distinct->execute(*distinct_output, stream);
+  // call partition join sink
+  partition_join->sink(*partition_join_output, stream);
+  // call partition distinct sink
+  partition_distinct->sink(*partition_distinct_output, stream);
+}
+
+std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::execute"};
+  return std::make_unique<operator_data>(input_data);
+}
+
+void sirius_physical_left_delim_join::sink(const operator_data& input_data,
+                                           rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::sink"};
+  // call distinct execute
+  auto distinct_output = distinct->execute(input_data, stream);
+  // call column data scan execute
+  auto column_data_scan_output = column_data_scan->execute(input_data, stream);
+  // call partition distinct execute
+  auto partition_distinct_output = partition_distinct->execute(*distinct_output, stream);
+  // call partition join sink
+  column_data_scan->sink(*column_data_scan_output, stream);
+  // call partition distinct sink
+  partition_distinct->sink(*partition_distinct_output, stream);
 }
 
 }  // namespace op

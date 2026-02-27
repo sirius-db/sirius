@@ -18,14 +18,14 @@
 
 #ifndef SPDLOG_ACTIVE_LEVEL
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
+#else
+#warning "SPDLOG_ACTIVE_LEVEL is overridden, output may be lost"
 #endif
 
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
-#include <iostream>
-#include <memory>
 #include <optional>
 #include <string>
 
@@ -38,7 +38,9 @@
 
 namespace duckdb {
 
-inline constexpr int SIRIUS_LOG_FLUSH_SEC = 3;
+inline constexpr int SIRIUS_LOG_FLUSH_SEC         = 3;
+inline constexpr const char* SIRIUS_LOG_LEVEL_ENV = "SIRIUS_LOG_LEVEL";
+inline constexpr const char* SIRIUS_LOG_DIR_ENV   = "SIRIUS_LOG_DIR";
 
 inline std::optional<std::string> GetEnvVar(const std::string& name)
 {
@@ -52,7 +54,7 @@ inline std::optional<std::string> GetEnvVar(const std::string& name)
 
 inline spdlog::level::level_enum GetLogLevel()
 {
-  auto log_level_str = GetEnvVar("SIRIUS_LOG_LEVEL");
+  auto log_level_str = GetEnvVar(SIRIUS_LOG_LEVEL_ENV);
   if (log_level_str.has_value()) {
     if (*log_level_str == "trace") return spdlog::level::trace;
     if (*log_level_str == "debug") return spdlog::level::debug;
@@ -67,7 +69,7 @@ inline spdlog::level::level_enum GetLogLevel()
 
 inline std::string GetLogDir()
 {
-  auto log_dir_str = GetEnvVar("SIRIUS_LOG_DIR");
+  auto log_dir_str = GetEnvVar(SIRIUS_LOG_DIR_ENV);
   if (log_dir_str.has_value()) { return *log_dir_str; }
   return SIRIUS_DEFAULT_LOG_DIR;
 }
@@ -86,8 +88,14 @@ inline void InitGlobalLogger(std::string log_file = "")
   auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
   auto log_level = GetLogLevel();
   logger->set_level(log_level);
-  spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
   spdlog::set_default_logger(logger);
+  spdlog::set_level(log_level);  // Also set the global level
+  auto log_level_str = GetEnvVar(SIRIUS_LOG_LEVEL_ENV);
+  if (log_level_str.has_value()) {
+    spdlog::flush_on(log_level);
+  } else {
+    spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
+  }
 }
 
 }  // namespace duckdb

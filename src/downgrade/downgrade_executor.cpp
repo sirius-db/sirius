@@ -74,7 +74,7 @@ void downgrade_executor::worker_loop(int worker_id)
       break;
     }
     try {
-      task->execute();
+      task->execute(cudf::get_default_stream());
     } catch (const std::exception& e) {
       on_task_error(worker_id, std::move(task), e);
     }

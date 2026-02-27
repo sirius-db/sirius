@@ -62,8 +62,10 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
  public:
   bool is_sink() const override { return true; }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
 };
 
 }  // namespace op

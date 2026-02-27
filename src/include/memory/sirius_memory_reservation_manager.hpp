@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -28,16 +28,9 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
  public:
   explicit sirius_memory_reservation_manager(
     const std::vector<cucascade::memory::memory_space_config>& configs);
+
   ~sirius_memory_reservation_manager();
-
-  [[nodiscard]] rmm::mr::device_memory_resource* get_sirius_device_memory_resource() const noexcept
-  {
-    return sirius_device_memory_resource_.get();
-  }
-
- private:
-  std::unique_ptr<rmm::mr::device_memory_resource> sirius_device_memory_resource_;
 };
 
-};  // namespace memory
+}  // namespace memory
 }  // namespace sirius

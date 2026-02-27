@@ -49,6 +49,12 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
                               duckdb::vector<duckdb::Value> parameters,
                               duckdb::virtual_column_map_t virtual_columns);
 
+  std::optional<task_creation_hint> get_next_task_hint() override
+  {
+    if (exhausted.load()) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::READY, this};
+  }
+
   //! The table function
   duckdb::TableFunction function;
   //! Bind data of the function
@@ -84,17 +90,16 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
 
   bool* already_cached;
 
+  //! Types of the columns that DuckDB will output after projection.
+  //! Includes ROW_ID (as BIGINT) when the plan requires it.
   duckdb::vector<duckdb::LogicalType> scanned_types;
-
-  duckdb::vector<duckdb::idx_t> scanned_ids;
 
   duckdb::unique_ptr<duckdb::TableFilterSet> fake_table_filters;
 
   //! Whether it's required to generate a separate row id column (e.g., in some select *)
   bool gen_row_id_column;
 
-  //! Only used in optimized table scan
-  bool exhausted = false;
+  std::atomic<bool> exhausted{false};
 
  public:
   bool is_source() const override { return true; }

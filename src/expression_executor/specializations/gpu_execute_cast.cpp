@@ -34,14 +34,14 @@ std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpression& expr,
                                                              GpuExpressionState* state)
 {
-  auto return_type_id = GetCudfType(expr.return_type).id();
+  auto return_type = GetCudfType(expr.return_type);
 
   // Resolve the child
   auto* child_state = state->child_states[0].get();
   auto child        = Execute(*expr.child, child_state);
 
   // Execute the cast
-  return cudf::cast(child->view(), cudf::data_type{return_type_id}, execution_stream, resource_ref);
+  return cudf::cast(child->view(), return_type, execution_stream, resource_ref);
 }
 
 }  // namespace sirius

@@ -16,5 +16,5 @@
 
 set(TEST_SOURCES
     ${TEST_SOURCES}
-    # Sirius-specific data tests can be added here
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_host_parquet_representation.cpp
     PARENT_SCOPE)

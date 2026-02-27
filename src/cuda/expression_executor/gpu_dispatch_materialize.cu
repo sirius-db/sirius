@@ -37,7 +37,7 @@ struct MaterializeNumeric {
                                           const uint64_t* row_ids,
                                           uint64_t row_id_count,
                                           rmm::device_async_resource_ref mr,
-                                          rmm::cuda_stream_view stream = rmm::cuda_stream_default)
+                                          rmm::cuda_stream_view stream)
   {
     // Define the thrust execution policy
     rmm::mr::thrust_allocator<uint8_t> thrust_allocator(stream, mr);

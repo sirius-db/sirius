@@ -11,7 +11,7 @@ Sirius is a GPU-native SQL engine. It plugs into existing databases such as Duck
 </p>
 
 ## Performance
-Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
+Running TPC-H on SF=100, Sirius achieves ~8x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
 
 Experiment Setup:
 - GPU instance: GH200@LambdaLabs ($1.5/hour)
@@ -20,155 +20,35 @@ Experiment Setup:
 ![Performance](sirius-perf.png)
 
 ## Supported OS/GPU/CUDA/CMake
-- Ubuntu >= 20.04
+- Ubuntu >= 22.04
 - NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 11.2
+- CUDA >= 13.0
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
+- libcudf >= 26.04
 - We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
-## Dependencies (Option 1): Use AWS Image
-For users who have access to AWS and want to launch AWS EC2 instances to run Sirius, the following images are prepared with dependencies fully installed.
-
-<table border="1" cellpadding="6" cellspacing="0">
-  <tr>
-    <td><b>AMI Name</b></td>
-    <td><b>AWS Region</b></td>
-    <td><b>AMI ID</b></td>
-  </tr>
-  <tr>
-    <td rowspan="3">Sirius Dependencies AMI (Ubuntu 24.04) 20250611</td>
-    <td>us-east-1</td>
-    <td>ami-06020f2b2161f5d62</td>
-  </tr>
-  <tr>
-    <td>us-east-2</td>
-    <td>ami-016b589f441fecc5d</td>
-  </tr>
-  <tr>
-    <td>us-west-2</td>
-    <td>ami-060043bae3f9b5eb4</td>
-  </tr>
-</table>
-
-Supported EC2 instances: G4dn, G5, G6, Gr6, G6e, P4, P5, P6.
-
-## Dependencies (Option 2): Use Docker Image
-To use the docker image with dependencies fully installed:
-
-For x86 machine:
-```
-sudo docker run --gpus all -it siriusdb/sirius_dependencies_x86_64:stable bash
-```
-For aarch64 machine:
-```
-sudo docker run --gpus all -it siriusdb/sirius_dependencies_aarch64:stable bash
-```
-
-If encountering errors like the following when running the docker image as above:
-```
-docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]].
-```
-This means `nvidia-driver` or `nvidia-container-toolkit` is not installed.
-
-To install `nvidia-driver`:
-```
-sudo apt install nvidia-driver-535
-```
-
-To install `nvidia-container-toolkit`, please follow the [instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-
-Finally restart docker by
-```
-sudo systemctl restart docker
-```
-
-## Dependencies (Option 3): Install Manually
-
-### Install duckdb dependencies
-```
-sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-dev
-```
-
-### Install CUDA
-If CUDA is not installed, download [here](https://developer.nvidia.com/cuda-downloads). Follow the instructions for the deb(local) installer and complete the [post-installation steps](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#mandatory-actions).
-
-Verify installation:
-```
-nvcc --version
-nvidia-smi
-```
-
-### Install libcudf dependencies
-
-This approach requires cloning the repo following the instructions specified in [Building Sirius](#building-sirius).
-
-libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
-```
-conda create --name libcudf-env
-conda activate libcudf-env
-conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
-```
-Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
-```
-export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
-```
-It is recommended to add the environment variables to your `bashrc` to avoid repetition.
-
-## Dependencies (Option 4): Use Pixi
-
-There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed.
-
 ### Requirements
-
-#### Build
 
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
-#### Test
-
-- A supported NVIDIA GPU
-- NVIDIA GPU driver installed
-
-### Setup
-
-The environment activation handles setting up everything needed to build and test.
-
-Start a shell in the environment with:
-```
-pixi shell
-```
-
-Then build and test as described in the sections below.
-```
-make
-make test
-```
-
 ## Building Sirius
+
 To clone the Sirius repository:
 ```
 git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-source setup_sirius.sh
 ```
 The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 
+There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed. Start a shell in the environment with:
+```
+pixi shell
+```
+The environment activation handles setting up everything needed to build and test.
+
 To build Sirius:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
-```
-
-Common issues:
-If you encounter an error such as:
-```
-/usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `std::ios_base_library_init()@GLIBCXX_3.4.32'
-/usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `__cxa_call_terminate@CXXABI_1.3.15'
-```
-Solve this issue by running the following command, then delete the build directory and install Sirius once again:
-```
-export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
-rm -rf build
 CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 ```
 
@@ -202,7 +82,7 @@ cd ../../
 To load the TPC-H dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
-.read tpch_load.sql
+.read scripts/tpch_load.sql
 ```
 
 ### ClickBench Dataset
@@ -218,7 +98,7 @@ cd ..
 To load the dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
-.read clickbench_load_duckdb.sql
+.read scripts/clickbench_load_duckdb.sql
 ```
 
 ## Running Sirius: CLI
@@ -340,13 +220,6 @@ build/release/extension/sirius/test/cpp/log
 ```
 
 Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.
-
-## Performance Testing
-Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):
-```
-python3 test/tpch_performance/generate_test_data.py {SF}
-python3 test/tpch_performance/performance_test.py {SF}
-```
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:

@@ -9,6 +9,7 @@ concurrency:
 jobs:
   test:
     runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
     steps:
       - name: Cleanup
         run: rm -rf -- * .[^.]* ..?*
@@ -22,7 +23,6 @@ jobs:
         with:
           pixi-version: v0.59.0
           activate-environment: true
-          environments: cuda12
       - name: Build
         env:
           CUDAARCHS: native

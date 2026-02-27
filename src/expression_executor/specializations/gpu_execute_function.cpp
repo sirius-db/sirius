@@ -27,6 +27,7 @@
 #include "log/logging.hpp"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
@@ -128,11 +129,12 @@ struct StringMatchingDispatcher {
                     MatchType == StringMatchingType::NOT_LIKE) {
         std::vector<std::string> match_terms = string_split(match_str, SPLIT_DELIMITER);
 
-        auto like = cudf::strings::like(cudf::strings_column_view(input_view),
-                                        cudf::string_scalar(match_str),
-                                        cudf::string_scalar(""),
-                                        executor.execution_stream,
-                                        executor.resource_ref);
+        auto like = cudf::strings::like(
+          cudf::strings_column_view(input_view),
+          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref),
+          cudf::string_scalar("", true, executor.execution_stream, executor.resource_ref),
+          executor.execution_stream,
+          executor.resource_ref);
 
         // LIKE or NOT LIKE?
         if constexpr (MatchType == StringMatchingType::LIKE) {
@@ -160,7 +162,7 @@ struct StringMatchingDispatcher {
           cudf::strings_column_view(input_view),
           cudf::string_scalar(
             "%" + match_str + "%", true, executor.execution_stream, executor.resource_ref),
-          cudf::string_scalar(""),
+          cudf::string_scalar("", true, executor.execution_stream, executor.resource_ref),
           executor.execution_stream,
           executor.resource_ref);
 #else
@@ -746,6 +748,20 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   else if (func_str == REGEXP_REPLACE_FUNC_STR) {
     RegexFunctionDispatcher dispatcher(*this);
     return dispatcher(expr, state);
+  }
+
+  //----------Struct Functions----------//
+  // row() and struct_pack() both construct a struct column from their child expressions.
+  // row() is used by DuckDB for tuple constructors like (col1, col2).
+  if (func_str == "row" || func_str == "struct_pack") {
+    D_ASSERT(!expr.children.empty());
+    std::vector<std::unique_ptr<cudf::column>> child_cols;
+    for (size_t i = 0; i < expr.children.size(); ++i) {
+      child_cols.push_back(Execute(*expr.children[i], state->child_states[i].get()));
+    }
+    cudf::size_type num_rows = child_cols[0]->size();
+    return cudf::make_structs_column(
+      num_rows, std::move(child_cols), 0, rmm::device_buffer{}, execution_stream, resource_ref);
   }
 
   // If we've gotten this far, we've encountered a unimplemented function type

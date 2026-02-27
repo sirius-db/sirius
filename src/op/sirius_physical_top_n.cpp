@@ -36,6 +36,8 @@
 
 #include <rmm/resource_ref.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/gpu_data_representation.hpp>
 
 #include <algorithm>
@@ -141,10 +143,14 @@ sirius_physical_top_n::sirius_physical_top_n(
 
 sirius_physical_top_n::~sirius_physical_top_n() {}
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_data& input_data,
+                                                              rmm::cuda_stream_view stream)
 {
-  if (limit == 0) { return {}; }
+  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
+  const auto& input_batches = input_data.get_data_batches();
+  if (limit == 0) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   std::shared_ptr<cucascade::data_batch> input_batch;
   for (auto const& batch : input_batches) {
@@ -155,12 +161,15 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
       input_batch = batch;
     }
   }
-  if (!input_batch) { return {}; }
+  if (!input_batch) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   auto* space = input_batch->get_memory_space();
-  if (space == nullptr) { return {}; }
+  if (space == nullptr) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
-  auto stream = space->acquire_stream();
   auto input_table =
     input_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
   auto output_table =
@@ -168,21 +177,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   std::unique_ptr<cucascade::idata_representation> output_data =
-    std::make_unique<cucascade::gpu_table_representation>(*output_table, *space);
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
-  return outputs;
-}
-
-static duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
-  const duckdb::vector<duckdb::BoundOrderByNode>& src)
-{
-  duckdb::vector<duckdb::BoundOrderByNode> result;
-  result.reserve(src.size());
-  for (const auto& order : src) {
-    result.push_back(order.Copy());
-  }
-  return result;
+  return std::make_unique<operator_data>(outputs);
 }
 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* top_n)
@@ -213,10 +211,14 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
 {
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operator_data& input_data,
+                                                                    rmm::cuda_stream_view stream)
 {
-  if (limit == 0) { return {}; }
+  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
+  const auto& input_batches = input_data.get_data_batches();
+  if (limit == 0) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   // Use the memory space from the first valid batch (all batches are expected to share the same
   // space in practice).
@@ -227,9 +229,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge:
       break;
     }
   }
-  if (space == nullptr) { return {}; }
+  if (space == nullptr) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
-  auto stream = space->acquire_stream();
   std::vector<std::unique_ptr<cudf::table>> owned_tables;
   std::vector<cudf::table_view> concat_views;
   for (auto const& batch : input_batches) {
@@ -242,7 +245,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge:
     owned_tables.push_back(std::move(table));
   }
 
-  if (concat_views.empty()) { return {}; }
+  if (concat_views.empty()) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   std::unique_ptr<cudf::table> combined;
   if (concat_views.size() == 1) {
@@ -266,10 +271,30 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge:
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   std::unique_ptr<cucascade::idata_representation> output_data =
-    std::make_unique<cucascade::gpu_table_representation>(*output_table, *space);
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
-  return outputs;
+  return std::make_unique<operator_data>(outputs);
+}
+
+std::unique_ptr<operator_data> sirius_physical_top_n_merge::get_next_task_input_data()
+{
+  // we need to lock, then pull all the batches from one partition and return them, and increment
+  // the partition index
+  std::lock_guard<std::mutex> lg(lock);
+  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+  bool found_batch = true;
+  while (found_batch) {
+    auto batch =
+      ports.begin()->second->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    if (batch) {
+      input_batch.push_back(std::move(batch));
+    } else {
+      found_batch = false;
+    }
+  }
+  if (input_batch.empty()) { return nullptr; }
+  return std::make_unique<operator_data>(input_batch);
 }
 
 }  // namespace op

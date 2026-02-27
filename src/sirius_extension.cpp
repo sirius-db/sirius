@@ -45,6 +45,7 @@
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "sirius_interface.hpp"
 
 #include <cstdlib>
 
@@ -75,8 +76,7 @@ struct GPUTableFunctionData : public TableFunctionData {
     original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 
     // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer      = enable_optimizer;
-    context.config.use_replacement_scans = false;
+    context.config.enable_optimizer = enable_optimizer;
     // We want for sure to disable the internal compression optimizations.
     // These are DuckDB specific, no other system implements these. Also,
     // respect the user's settings if they chose to disable any specific optimizers.
@@ -88,6 +88,9 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -139,10 +142,10 @@ struct GPUTableFunctionData : public TableFunctionData {
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
-  shared_ptr<SiriusPreparedStatementData> gpu_prepared;
+  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<GPUContext> gpu_context;
+  unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -158,8 +161,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
     original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 
     // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer      = enable_optimizer;
-    context.config.use_replacement_scans = false;
+    context.config.enable_optimizer = enable_optimizer;
     // We want for sure to disable the internal compression optimizations.
     // These are DuckDB specific, no other system implements these. Also,
     // respect the user's settings if they chose to disable any specific optimizers.
@@ -171,6 +173,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -338,10 +343,10 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
 }
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
-  ClientContext& context, GPUContext& gpu_context, unique_ptr<LogicalOperator>& logical_plan)
+  ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
 {
   sirius::planner::sirius_physical_plan_generator physical_planner =
-    sirius::planner::sirius_physical_plan_generator(context, gpu_context);
+    sirius::planner::sirius_physical_plan_generator(context);
   auto physical_plan = physical_planner.create_plan(std::move(logical_plan));
   return physical_plan;
 }
@@ -355,9 +360,10 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
                                                            vector<string>& names)
 {
   auto result              = make_uniq<SiriusTableFunctionData>();
+  result->conn             = make_uniq<Connection>(*context.db);
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
-  result->gpu_context      = make_uniq<GPUContext>(context);
+  result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
@@ -370,6 +376,12 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
 
+  // cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT.
+  // Downcast to BIGINT so all downstream operators and the result collector use a supported type.
+  for (auto& type : planner.types) {
+    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
+  }
+
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
@@ -379,15 +391,20 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   unique_ptr<LogicalOperator> query_plan = result->ExtractPlan(context);
   SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
   try {
-    auto sirius_physical_plan =
-      SiriusGeneratePhysicalPlan(context, *result->gpu_context, query_plan);
-    auto gpu_prepared = make_shared_ptr<SiriusPreparedStatementData>(
+    auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, query_plan);
+    SIRIUS_LOG_DEBUG("Done generating sirius physical plan");
+    auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
       std::move(prepared), std::move(sirius_physical_plan));
     result->gpu_prepared = gpu_prepared;
   } catch (std::exception& e) {
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
-    result->plan_error = true;
+    if (Config::ENABLE_DUCKDB_FALLBACK) {
+      result->plan_error = true;
+    } else {
+      throw std::runtime_error("Error in SiriusGeneratePhysicalPlan: " + error.RawMessage());
+      return nullptr;
+    }
   }
 
   for (auto& column : planner.names) {
@@ -415,12 +432,19 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
         "DuckDB\n=============================================\n");
       data.res = data.conn->Query(data.query);
     } else {
-      data.res = data.gpu_context->SiriusExecuteQuery(context, data.query, data.gpu_prepared, {});
+      data.res =
+        data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
-        printf(
-          "=============================================\nError in SiriusExecuteQuery, fallback to "
-          "DuckDB\n=============================================\n");
-        data.res = data.conn->Query(data.query);
+        if (Config::ENABLE_DUCKDB_FALLBACK) {
+          SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
+          printf(
+            "=============================================\nError in SiriusExecuteQuery, fallback "
+            "to DuckDB\n=============================================\n");
+          data.res = data.conn->Query(data.query);
+        } else {
+          throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
+          return;
+        }
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -649,6 +673,12 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
 
+static void SetEnableDuckdbFallback(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_DUCKDB_FALLBACK = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DUCKDB_FALLBACK to {}", Config::ENABLE_DUCKDB_FALLBACK);
+}
+
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::ENABLE_REGEX_JIT_IMPL = BooleanValue::Get(parameter);
@@ -673,6 +703,13 @@ static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope
   Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_VARCHAR_SIZE to {}",
                    Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE);
+}
+
+static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::MAX_SORT_PARTITION_BYTES = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
+                   Config::MAX_SORT_PARTITION_BYTES);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -724,10 +761,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   // Add in config options for duckdb fallback checking
   config.AddExtensionOption("enable_fallback_check",
-                            "Whether to enable checking of fallback to duckdb execution",
+                            "Whether to enable fallback checking",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
                             SetEnableFallbackCheck);
+
+  config.AddExtensionOption(
+    "enable_duckdb_fallback",
+    "Whether to enable fallback to duckdb execution after an error is detected",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_DUCKDB_FALLBACK),
+    SetEnableDuckdbFallback);
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(
@@ -758,6 +802,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::UBIGINT,
     Value::UBIGINT(Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE),
     SetDefaultScanTaskVarcharSize);
+
+  // Add in config option for sort partition size
+  config.AddExtensionOption("max_sort_partition_bytes",
+                            "Maximum bytes per sort partition (0 = auto based on 33% GPU memory)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(Config::MAX_SORT_PARTITION_BYTES),
+                            SetMaxSortPartitionBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

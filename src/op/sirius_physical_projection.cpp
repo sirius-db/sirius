@@ -26,6 +26,8 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <chrono>
 
 namespace sirius {
@@ -41,11 +43,11 @@ sirius_physical_projection::sirius_physical_projection(
 {
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+std::unique_ptr<operator_data> sirius_physical_projection::execute(const operator_data& input_data,
+                                                                   rmm::cuda_stream_view stream)
 {
-  SIRIUS_LOG_DEBUG("Executing projection");
-  auto start = std::chrono::high_resolution_clock::now();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_projection::execute"};
+  const auto& input_batches = input_data.get_data_batches();
 
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
 
@@ -54,15 +56,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    auto projected_batch = gpu_expression_executor.execute(batch);
+    auto projected_batch = gpu_expression_executor.execute(batch, stream);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }
-
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Projection time: {:.2f} ms", duration.count() / 1000.0);
-
-  return output_batches;
+  return std::make_unique<operator_data>(output_batches);
 }
 
 }  // namespace op

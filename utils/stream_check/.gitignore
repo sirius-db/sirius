@@ -1,0 +1,5 @@
+*.so
+*.o
+*.a
+test_stream_check
+preload_stream_check.sh

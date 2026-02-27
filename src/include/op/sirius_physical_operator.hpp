@@ -34,6 +34,9 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <memory>
+#include <optional>
+#include <string_view>
 
 namespace sirius {
 
@@ -46,16 +49,69 @@ class sirius_pipeline;
 class sirius_pipeline_build_state;
 class sirius_meta_pipeline;
 }  // namespace pipeline
-
-namespace creator {
-class task_creator;
-using task_creation_hint = std::variant<std::monostate,
-                                        op::sirius_physical_operator*,
-                                        duckdb::shared_ptr<pipeline::sirius_pipeline>>;
-}  // namespace creator
-
 namespace op {
+
+enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
+
+struct task_creation_hint {
+  TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
+  sirius_physical_operator* producer{nullptr};
+};
+
+/**
+ * @brief Container for operator data batches.
+ *
+ * Wraps a collection of data batches that can be passed between operators.
+ */
+class operator_data {
+ public:
+  operator_data() = default;
+  explicit operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+    : _data_batches(std::move(data_batches))
+  {
+  }
+
+  virtual ~operator_data() = default;
+
+  /**
+   * @brief Get mutable data batches.
+   * @return Mutable reference to vector of data batch pointers
+   */
+  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
+    const
+  {
+    return _data_batches;
+  }
+
+ private:
+  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+};
+
+/**
+ * @brief Container for partitioned operator data.
+ *
+ * Extends operator_data to include partition index information.
+ */
+class partitioned_operator_data : public operator_data {
+ public:
+  partitioned_operator_data() = default;
+  partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+                            std::size_t partition_idx)
+    : operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+  {
+  }
+
+  /**
+   * @brief Get the partition index.
+   * @return Partition index
+   */
+  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
+
+ private:
+  std::size_t _partition_idx = 0;
+};
 
 //! sirius_physical_operator is the base class of the physical operators present in the
 //! execution plan
@@ -125,8 +181,8 @@ class sirius_physical_operator {
   virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
     duckdb::ClientContext& context) const;
 
-  virtual std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches);
+  virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                                 rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
@@ -158,7 +214,7 @@ class sirius_physical_operator {
   virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
     duckdb::ClientContext& context) const;
 
-  virtual void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches);
+  virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }
 
@@ -178,6 +234,7 @@ class sirius_physical_operator {
   template <class TARGET>
   TARGET& Cast()
   {
+    // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
       throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");
@@ -217,24 +274,49 @@ class sirius_physical_operator {
     std::pair<sirius_physical_operator*, std::string_view> port_locator);
   //! Get the next ports after sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>>& get_next_port_after_sink();
+
   //! Get the next task hint
-  virtual creator::task_creation_hint get_next_task_hint();
+  virtual std::optional<task_creation_hint> get_next_task_hint();
+
+  /// \brief check if there are more tasks to create
+  /// \note not necessarily ready to create at the moment
+  /// the function is called
+  virtual bool can_create_more_tasks() const
+  {
+    // WSM TODO implement this
+    throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
+    return true;
+  }
+
+  /// \brief check if all tasks have been processed
+  virtual bool has_processed_all_tasks() const
+  {
+    // WSM TODO implement this
+    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
+    return true;
+  }
+
+  /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
+  virtual bool is_limit_exhausted() const { return false; }
+
   //! Get the input batch
-  std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch();
+  virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
-  //! Set the creator of the task
-  void set_creator(creator::task_creator* creator);
 
- private:
+  //! Get pipeline
+  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
+
+  void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
+
+ protected:
+  duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
-  //! The creator of the task
-  creator::task_creator* creator;
 };
 
 }  // namespace op

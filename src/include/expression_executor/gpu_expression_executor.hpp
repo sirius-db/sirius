@@ -71,7 +71,7 @@ struct GpuExpressionExecutor {
    */
   GpuExpressionExecutor(
     const Expression& expr,
-    rmm::device_async_resource_ref resource_ref = GPUBufferManager::GetInstance().mr);
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Constructs an expression executor with a set of expressions
@@ -81,7 +81,7 @@ struct GpuExpressionExecutor {
    */
   GpuExpressionExecutor(
     const vector<unique_ptr<Expression>>& expressions,
-    rmm::device_async_resource_ref resource_ref = GPUBufferManager::GetInstance().mr);
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref());
 
   //===----------Fields----------===//
   std::vector<const Expression*> expressions;  ///< The expressions to execute
@@ -142,7 +142,7 @@ struct GpuExpressionExecutor {
    * @note It is required that there is only one boolean expression in the current expression set.
    */
   std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
-                                      rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+                                      rmm::cuda_stream_view stream);
 
   /**
    * @brief Evaluates a boolean expression and filters the input batch according to the result.
@@ -153,9 +153,8 @@ struct GpuExpressionExecutor {
    * @return std::shared_ptr<cucascade::data_batch> The input batch filtered by the boolean
    * expression
    */
-  std::shared_ptr<cucascade::data_batch> select(
-    std::shared_ptr<data_batch> input_batch,
-    rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+  std::shared_ptr<cucascade::data_batch> select(std::shared_ptr<data_batch> input_batch,
+                                                rmm::cuda_stream_view stream);
 
   // Execute the expression at the given index and return the result
   std::unique_ptr<cudf::column> ExecuteExpression(idx_t expression_idx);

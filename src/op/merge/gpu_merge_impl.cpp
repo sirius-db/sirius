@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/merge.hpp>
 
@@ -51,6 +52,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
   const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space)
 {
@@ -58,6 +60,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   if (input.size() < 2) {
     throw std::runtime_error(
       "`input` in `merge_ungrouped_aggregate()` should at least contain two data batches");
+  }
+  if (merge_nth_index.size() != aggregates.size()) {
+    throw std::runtime_error(
+      "`merge_nth_index` must have the same size as `aggregates` in `merge_ungrouped_aggregate()`");
   }
 
   // Pull input cudf tables and concatenate.
@@ -112,6 +118,16 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
         reduce_aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         break;
       }
+      case cudf::aggregation::Kind::NTH_ELEMENT: {
+        if (!merge_nth_index[c].has_value()) {
+          throw std::runtime_error(
+            "NTH_ELEMENT aggregate requires a value in `merge_nth_index` in "
+            "`merge_ungrouped_aggregate()`");
+        }
+        reduce_aggregation = cudf::make_nth_element_aggregation<cudf::reduce_aggregation>(
+          *merge_nth_index[c], cudf::null_policy::INCLUDE);
+        break;
+      }
       default:
         throw std::runtime_error(
           "Unsupported cudf aggregate kind in `merge_ungrouped_aggregate()`: " +
@@ -125,7 +141,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
     output_cudf_cols.push_back(cudf::make_column_from_scalar(
       *output_scalar, 1, stream, memory_space.get_default_allocator()));
   }
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(output_cudf_cols));
+  auto output_cudf_table = std::make_unique<cudf::table>(
+    std::move(output_cudf_cols), stream, memory_space.get_default_allocator());
 
   // Create output data batch.
   return make_data_batch(std::move(output_cudf_table), memory_space);
@@ -184,6 +201,13 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
         request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
         break;
       }
+      case cudf::aggregation::Kind::COLLECT_SET: {
+        // Intermediate column is a LIST produced by local COLLECT_SET. MERGE_SETS unions the
+        // per-partition lists and drops duplicates, producing a deduplicated LIST per group.
+        request.aggregations.push_back(
+          cudf::make_merge_sets_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
       default:
         throw std::runtime_error(
           "Unsupported cudf aggregate kind in `merge_grouped_aggregate()`: " +
@@ -200,7 +224,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   }
 
   // Create the output data batch
-  auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
+  auto output_table = std::make_unique<cudf::table>(
+    std::move(output_cols), stream, memory_space.get_default_allocator());
   return make_data_batch(std::move(output_table), memory_space);
 }
 
