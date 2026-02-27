@@ -65,8 +65,7 @@ has_error() {
     local file="$1"
     [[ ! -f "$file" ]] && return 0
     [[ ! -s "$file" ]] && return 0
-    grep -qE "(Error|Segmentation fault):" \
-        "$file" 2>/dev/null
+    grep -qE "(Error|Segmentation fault):" "$file" 2>/dev/null
 }
 
 printf 'query,status\n' | tee "$COMPARISON_CSV"
@@ -75,6 +74,7 @@ ok=0; validate=0; errors=0
 
 for q in "${QUERIES[@]}"; do
     SIRIUS_FILE="$RUN_DIR/sirius/q${q}/result.txt"
+    DUCKDB_FILE="$RUN_DIR/duckdb/q${q}/result.txt"
     if has_error "$SIRIUS_FILE"; then
         status="error"
         (( errors++ ))
