@@ -30,6 +30,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+set(CMAKE_CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 # Optional features
 option(ENABLE_STREAM_CHECK
@@ -69,8 +70,7 @@ build_loadable_extension(sirius " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
-  set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
-                                              LINKER_LANGUAGE CUDA)
+  set_target_properties(${_target} PROPERTIES LINKER_LANGUAGE CUDA)
 
   target_include_directories(
     ${_target}
