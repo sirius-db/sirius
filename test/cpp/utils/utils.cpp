@@ -19,7 +19,6 @@
 #include "catch.hpp"
 #include "operator/gpu_materialize.hpp"
 
-
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>

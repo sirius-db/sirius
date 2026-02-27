@@ -15,8 +15,8 @@
  */
 
 #include "duckdb/planner/operator/logical_order.hpp"
-#include "operator/gpu_physical_order.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_order.hpp"
 
 namespace duckdb {
 

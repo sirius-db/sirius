@@ -17,8 +17,8 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
-#include "operator/gpu_physical_cte.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_cte.hpp"
 
 namespace duckdb {
 

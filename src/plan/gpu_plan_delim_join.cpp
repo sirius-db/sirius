@@ -16,11 +16,11 @@
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "gpu_physical_plan_generator.hpp"
+#include "log/logging.hpp"
 #include "operator/gpu_physical_column_data_scan.hpp"
 #include "operator/gpu_physical_delim_join.hpp"
 #include "operator/gpu_physical_grouped_aggregate.hpp"
-#include "gpu_physical_plan_generator.hpp"
-#include "log/logging.hpp"
 
 namespace duckdb {
 

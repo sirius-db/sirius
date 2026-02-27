@@ -16,7 +16,6 @@
 
 #include "pipeline/pipeline_queue.hpp"
 
-
 namespace sirius {
 namespace pipeline {
 

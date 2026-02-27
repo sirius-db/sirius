@@ -18,9 +18,9 @@
 
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "operator/gpu_physical_order.hpp"
-#include "log/logging.hpp"
 #include "utils.hpp"
 
 #include <algorithm>

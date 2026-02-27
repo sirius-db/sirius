@@ -25,7 +25,6 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 
-
 using namespace duckdb;
 using namespace sirius::op;
 using namespace cucascade;

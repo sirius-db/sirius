@@ -15,8 +15,8 @@
  */
 
 #include "duckdb/planner/operator/logical_empty_result.hpp"
-#include "operator/gpu_physical_empty_result.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_empty_result.hpp"
 
 namespace duckdb {
 

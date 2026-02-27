@@ -25,8 +25,6 @@
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
 
-
-
 namespace sirius {
 
 void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement,

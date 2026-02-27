@@ -18,9 +18,9 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "gpu_physical_plan_generator.hpp"
 #include "operator/gpu_physical_hash_join.hpp"
 #include "operator/gpu_physical_nested_loop_join.hpp"
-#include "gpu_physical_plan_generator.hpp"
 
 namespace duckdb {
 

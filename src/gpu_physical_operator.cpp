@@ -21,7 +21,6 @@
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 
-
 namespace duckdb {
 
 string GPUPhysicalOperator::GetName() const { return PhysicalOperatorToString(type); }

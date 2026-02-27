@@ -26,8 +26,6 @@
 #include "log/logging.hpp"
 #include "sirius_extension.hpp"
 
-
-
 namespace duckdb {
 
 void GPUBindPreparedStatementParameters(PreparedStatementData& statement,

@@ -17,9 +17,10 @@
 // #include "duckdb/parallel/meta_pipeline.hpp"
 // #include "duckdb/parallel/pipeline.hpp"
 
+#include "operator/gpu_physical_cte.hpp"
+
 #include "gpu_buffer_manager.hpp"
 #include "gpu_meta_pipeline.hpp"
-#include "operator/gpu_physical_cte.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
 

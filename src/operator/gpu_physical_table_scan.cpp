@@ -30,8 +30,8 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
-#include "operator/gpu_materialize.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "utils.hpp"
 
 namespace duckdb {

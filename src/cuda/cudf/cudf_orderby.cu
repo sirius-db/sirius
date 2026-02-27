@@ -18,8 +18,8 @@
 #include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "operator/gpu_physical_order.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_order.hpp"
 
 #include <cub/cub.cuh>
 

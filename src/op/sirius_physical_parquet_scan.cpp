@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_parquet_scan.hpp"
 
-
 namespace sirius {
 namespace op {
 

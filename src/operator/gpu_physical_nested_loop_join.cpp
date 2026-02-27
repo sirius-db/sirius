@@ -22,11 +22,11 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "operator/gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
-#include "operator/gpu_physical_hash_join.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 
 namespace duckdb {
 

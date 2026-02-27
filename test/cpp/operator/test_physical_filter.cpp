@@ -25,7 +25,6 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_filter.hpp>
 
-
 using namespace duckdb;
 using namespace sirius::op;
 using namespace cucascade;

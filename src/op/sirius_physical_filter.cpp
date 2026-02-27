@@ -21,7 +21,6 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-
 namespace sirius {
 namespace op {
 

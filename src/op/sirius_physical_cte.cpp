@@ -18,6 +18,7 @@
 // #include "duckdb/parallel/pipeline.hpp"
 
 #include "op/sirius_physical_cte.hpp"
+
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 

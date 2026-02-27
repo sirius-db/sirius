@@ -20,9 +20,9 @@
 // #include "operator/gpu_physical_expression_scan.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "operator/gpu_physical_column_data_scan.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_column_data_scan.hpp"
 
 namespace duckdb {
 

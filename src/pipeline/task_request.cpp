@@ -16,7 +16,6 @@
 
 #include "pipeline/task_request.hpp"
 
-
 namespace sirius {
 namespace pipeline {
 

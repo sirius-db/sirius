@@ -16,8 +16,8 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
-#include "operator/gpu_physical_filter.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_filter.hpp"
 #include "operator/gpu_physical_projection.hpp"
 
 namespace duckdb {

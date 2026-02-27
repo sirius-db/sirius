@@ -15,8 +15,8 @@
  */
 
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
-#include "operator/gpu_physical_dummy_scan.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_dummy_scan.hpp"
 
 namespace duckdb {
 

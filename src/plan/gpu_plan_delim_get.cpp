@@ -15,8 +15,8 @@
  */
 
 #include "duckdb/planner/operator/logical_delim_get.hpp"
-#include "operator/gpu_physical_column_data_scan.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_column_data_scan.hpp"
 
 namespace duckdb {
 

@@ -15,8 +15,8 @@
  */
 
 #include "duckdb/planner/operator/logical_limit.hpp"
-#include "operator/gpu_physical_limit.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_limit.hpp"
 
 namespace duckdb {
 

@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_partition.hpp"
 
-
 #include <catch.hpp>
 
 #include <cmath>
