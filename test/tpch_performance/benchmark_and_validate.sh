@@ -65,7 +65,7 @@ has_error() {
     local file="$1"
     [[ ! -f "$file" ]] && return 0
     [[ ! -s "$file" ]] && return 0
-    grep -qE "^(Error|Binder Error|Parser Error|Runtime Error|Catalog Error|Fatal Error|Invalid Error):" \
+    grep -qE "(Error|Segmentation fault):" \
         "$file" 2>/dev/null
 }
 
@@ -75,9 +75,7 @@ ok=0; validate=0; errors=0
 
 for q in "${QUERIES[@]}"; do
     SIRIUS_FILE="$RUN_DIR/sirius/q${q}/result.txt"
-    DUCKDB_FILE="$RUN_DIR/duckdb/q${q}/result.txt"
-
-    if has_error "$SIRIUS_FILE" || has_error "$DUCKDB_FILE"; then
+    if has_error "$SIRIUS_FILE"; then
         status="error"
         (( errors++ ))
     elif diff -q "$SIRIUS_FILE" "$DUCKDB_FILE" >/dev/null 2>&1; then
