@@ -39,10 +39,10 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 
 // standard library
 #include <filesystem>
@@ -64,7 +64,7 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,
   std::string const& parquet_path,
-  duckdb::vector<duckdb::idx_t> projection_ids = {},
+  duckdb::vector<duckdb::idx_t> projection_ids             = {},
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr)
 {
   auto& table_function_entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
@@ -140,8 +140,8 @@ static duckdb::unique_ptr<duckdb::TableFilterSet> make_id_constant_filter(
   duckdb::ExpressionType comparison, int32_t constant)
 {
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(comparison,
-                                                           duckdb::Value::INTEGER(constant));
+  auto filter =
+    duckdb::make_uniq<duckdb::ConstantFilter>(comparison, duckdb::Value::INTEGER(constant));
   table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter));  // id column
   return table_filters;
 }
@@ -442,15 +442,16 @@ static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
   std::filesystem::remove_all(parquet_dir);
 }
 
-static void run_parquet_scan_test_with_filter(std::string const& table_name,
-                                              size_t num_rows,
-                                              size_t expected_rows,
-                                              duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
-                                              int num_threads,
-                                              size_t batch_size,
-                                              size_t row_group_size = 0,
-                                              duckdb::vector<duckdb::idx_t> projection_ids = {},
-                                              batch_validator_t validator = validate_scanned_batches)
+static void run_parquet_scan_test_with_filter(
+  std::string const& table_name,
+  size_t num_rows,
+  size_t expected_rows,
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
+  int num_threads,
+  size_t batch_size,
+  size_t row_group_size                        = 0,
+  duckdb::vector<duckdb::idx_t> projection_ids = {},
+  batch_validator_t validator                  = validate_scanned_batches)
 {
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -626,8 +627,7 @@ TEST_CASE("parquet_scan_task - filter prunes all rows", "[parquet_scan_task][fil
 TEST_CASE("parquet_scan_task - filter keeps prefix rows", "[parquet_scan_task][filter]")
 {
   constexpr int32_t threshold = 1234;
-  auto table_filters =
-    make_id_constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, threshold);
+  auto table_filters = make_id_constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, threshold);
   run_parquet_scan_test_with_filter("parquet_filter_prefix",
                                     8000,
                                     static_cast<size_t>(threshold),

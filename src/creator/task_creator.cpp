@@ -290,8 +290,8 @@ void task_creator::manager_loop()
             parquet_scan->has_more_partitions = false;
           }
 
-          auto parquet_task_local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
-            std::move(*partition));
+          auto parquet_task_local_state =
+            std::make_unique<op::scan::parquet_scan_task_local_state>(std::move(*partition));
 
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
