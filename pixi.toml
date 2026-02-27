@@ -1,0 +1,29 @@
+[workspace]
+channels = ["rapidsai", "conda-forge", "nvidia"]
+name = "sirius"
+platforms = ["linux-64", "linux-aarch64"]
+requires-pixi = ">=0.59"
+
+[dependencies]
+cmake = "4.1.*"
+cuda-nvcc = "*"
+ninja = "*"
+sccache = "*"
+cxx-compiler = "*"
+
+libcudf = "25.12.*"
+librmm = "25.12.*"
+libcurand-dev = "*"
+
+[feature.cuda12.system-requirements]
+cuda = "12"
+
+[feature.cuda12.dependencies]
+cuda-version = "12.*"
+
+[feature.cuda12.activation.env]
+CUDAARCHS = "90a-real"
+
+[environments]
+default = ["cuda12"]
+cuda12 = ["cuda12"]

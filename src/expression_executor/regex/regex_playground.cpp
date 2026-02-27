@@ -22,7 +22,7 @@ namespace expression {
 std::unique_ptr<cudf::column>
 regex_playground::jit_transform_clickbench_q28_regex(const cudf::column_view& input) {
     auto udf = R"***(
-__device__ void extract_domain(cudf::string_view* out, cuda::std::optional<cudf::string_view> const url_opt) {
+__device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda::std::optional<cudf::string_view> const url_opt) {
     // Skip null
     if (!url_opt.has_value()) {
         return;
@@ -74,8 +74,12 @@ __device__ void extract_domain(cudf::string_view* out, cuda::std::optional<cudf:
 }
 )***";
 
-    return cudf::transform({input}, udf, cudf::data_type{cudf::type_id::STRING}, false,
-                            std::nullopt, cudf::null_aware::YES);
+    return cudf::transform({input},
+                           udf,
+                           cudf::data_type{cudf::type_id::STRING},
+                           false,
+                           std::nullopt,
+                           cudf::null_aware::YES);
 }
 
 } // namespace expression
