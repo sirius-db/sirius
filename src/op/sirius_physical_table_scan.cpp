@@ -71,8 +71,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
 {
 }
 
-duckdb::unique_ptr<duckdb::Expression>
-sirius_physical_table_scan::convert_table_filters_to_expression(
+duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<duckdb::LogicalType>& returned_types,

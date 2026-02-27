@@ -218,10 +218,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       gpu_expression_translator translator(rmm::cuda_stream_default,
                                            cudf::get_current_device_resource_ref());
       _translated_filter = translator.translate_expression(*duckdb_expr);
-      if (_translated_filter) {
-        _reader_options =
-          cudf::io::parquet_reader_options::builder().filter(_translated_filter->back()).build();
-      }
+      if (_translated_filter) { _reader_options.set_filter(_translated_filter->back()); }
     }
   }
 
@@ -259,15 +256,17 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 
   // Partition the row groups
   for (size_t file_idx = 0; file_idx < _file_paths.size(); ++file_idx) {
-    auto const row_group_indices          = readers[file_idx]->all_row_groups(_reader_options);
-    auto const filtered_row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
-      row_group_indices, _reader_options, rmm::cuda_stream_default);
+    auto row_group_indices = readers[file_idx]->all_row_groups(_reader_options);
+    if (_translated_filter) {
+      row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
+        row_group_indices, _reader_options, rmm::cuda_stream_default);
+    }
     auto const& file_metadata = _file_metadatas[file_idx];
 
     size_t partition_uncompressed_bytes = 0;
     size_t partition_compressed_bytes   = 0;
     std::vector<cudf::size_type> partition_rg_indices;
-    partition_rg_indices.reserve(filtered_row_group_indices.size());
+    partition_rg_indices.reserve(row_group_indices.size());
 
     auto flush_partition = [&]() {
       if (partition_rg_indices.empty()) { return; }
@@ -280,7 +279,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       partition_compressed_bytes   = 0;
     };
 
-    for (auto const rg_idx : filtered_row_group_indices) {
+    for (auto const rg_idx : row_group_indices) {
       auto const& row_group = file_metadata.row_groups[rg_idx];
       partition_rg_indices.push_back(rg_idx);
 
