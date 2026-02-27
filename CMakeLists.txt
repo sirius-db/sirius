@@ -14,7 +14,7 @@
 # the License.
 # =============================================================================
 
-cmake_minimum_required(VERSION 3.30.4)
+cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
 project(sirius LANGUAGES CXX CUDA)
 
@@ -67,57 +67,37 @@ list(FILTER CUDA_SOURCES EXCLUDE REGEX ".*/unused/.*")
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
-# Target properties
-set_target_properties(
-  sirius_extension
-  PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
-             CUDA_SEPARABLE_COMPILATION ON
-             LINKER_LANGUAGE CUDA)
+# Shared configuration for both extension targets
+foreach(_target sirius_extension sirius_loadable_extension)
+  set_target_properties(
+    ${_target}
+    PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
+               LINKER_LANGUAGE CUDA)
 
-set_target_properties(
-  sirius_loadable_extension
-  PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
-             CUDA_SEPARABLE_COMPILATION ON
-             LINKER_LANGUAGE CUDA)
+  target_include_directories(
+    ${_target}
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
 
-# Include directories
-target_include_directories(
-  sirius_extension PRIVATE src/include src/include/operator src/include/cudf)
-target_include_directories(
-  sirius_loadable_extension PRIVATE src/include src/include/operator
-                                    src/include/cudf)
+  target_compile_definitions(
+    ${_target}
+    PRIVATE $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">)
 
-# Compile definitions
-target_compile_definitions(
-  sirius_extension PRIVATE SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log")
-target_compile_definitions(
-  sirius_loadable_extension
-  PRIVATE SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log")
+  target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
+                        cuCascade::cucascade)
 
-# Link libraries
-target_link_libraries(
-  sirius_extension
-  cudf::cudf
-  rmm::rmm
-  PkgConfig::NUMA
-  ${LIBCONFIG++_LIBRARIES}
-  absl::any_invocable
-  spdlog::spdlog
-  cuCascade::cucascade)
-target_link_libraries(sirius_loadable_extension cudf::cudf rmm::rmm
-                      spdlog::spdlog cuCascade::cucascade)
+  add_dependencies(${_target} duckdb_static)
+endforeach()
 
-add_dependencies(sirius_extension duckdb_static)
-add_dependencies(sirius_loadable_extension duckdb_static)
+# Additional libraries only needed by the static extension
+target_link_libraries(sirius_extension PkgConfig::NUMA ${LIBCONFIG++_LIBRARIES}
+                      absl::any_invocable)
 
+# Required by DuckDB's export set (duckdb_static -> sirius_extension ->
+# cucascade_static)
 install(
-  TARGETS cucascade_static
-  EXPORT "${DUCKDB_EXPORT_SET}"
-  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
-
-install(
-  TARGETS sirius_extension
+  TARGETS sirius_extension cucascade_static
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -126,11 +106,6 @@ if(ENABLE_STREAM_CHECK)
   message(
     STATUS "Stream check library will be built (loaded dynamically at runtime)")
   add_subdirectory(utils/stream_check)
-
-  install(
-    TARGETS stream_check
-    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 else()
   message(
     STATUS
@@ -138,27 +113,30 @@ else()
   )
 endif()
 
-set(TEST_NAME sirius_unittest)
-
 file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/*.cpp")
 list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_modified_pipeline\\.cpp$")
 list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_task_creator\\.cpp$")
 
-add_executable(${TEST_NAME} ${TEST_SOURCES})
+add_executable(sirius_unittest ${TEST_SOURCES})
 
 target_include_directories(
-  ${TEST_NAME} PRIVATE duckdb/third_party/catch test/cpp src/include
-                       src/include/operator src/include/cudf)
+  sirius_unittest
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
 
-target_link_libraries(${TEST_NAME} sirius_extension)
+target_link_libraries(sirius_unittest sirius_extension)
 
 set_target_properties(
-  ${TEST_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+  sirius_unittest PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                           "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
 target_compile_definitions(
-  ${TEST_NAME}
-  PRIVATE SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log"
-          SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log"
-          SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+  sirius_unittest
+  PRIVATE
+    $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
+    $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
+    $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
