@@ -67,8 +67,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
             cancel_task_if_needed();
             return std::nullopt;
           }
-          batch->convert_to<cucascade::gpu_table_representation>(
-            registry, requested_memory_space, stream);
+          try {
+            batch->convert_to<cucascade::gpu_table_representation>(
+              registry, requested_memory_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
           batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
           break;
         }
@@ -78,8 +83,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
             cancel_task_if_needed();
             return std::nullopt;
           }
-          batch->convert_to<cucascade::host_data_packed_representation>(
-            registry, requested_memory_space, stream);
+          try {
+            batch->convert_to<cucascade::host_data_representation>(
+              registry, requested_memory_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
           batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
           break;
         }

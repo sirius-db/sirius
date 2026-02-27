@@ -48,6 +48,7 @@
 #include <cuda_runtime.h>
 
 // rmm
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -327,9 +328,10 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-cucascade::host_data_packed_representation const& convert_to_host_table(
+cucascade::host_data_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
-  std::shared_ptr<cucascade::data_batch> const& batch)
+  std::shared_ptr<cucascade::data_batch> const& batch,
+  rmm::cuda_stream_view stream)
 {
   auto* data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data representation"); }
@@ -347,29 +349,26 @@ cucascade::host_data_packed_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::host_data_packed_representation>(
-    registry, host_space, rmm::cuda_stream_default);
+  batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
 
   data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return data->cast<cucascade::host_data_packed_representation>();
+  return data->cast<cucascade::host_data_representation>();
 }
 
 }  // namespace
 
 TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
-          "[memory][host_table_utils]")
+          "[memory][host_table_utils][shared_context]")
 {
-  using metadata_node = sirius::metadata_node;
-
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
 
   auto* host_space = get_memory_space(sirius_ctx, Tier::HOST, 0);
   REQUIRE(host_space != nullptr);
   auto* gpu_space = get_memory_space(sirius_ctx, Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
 
   auto* allocator = host_space->get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
@@ -464,24 +463,22 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
     str_builder.data_blocks_accessor.initial_byte_offset + str_builder.total_data_bytes;
   REQUIRE(str_end < big_builder.data_blocks_accessor.initial_byte_offset);
 
-  std::vector<metadata_node> column_metadata;
-  column_metadata.reserve(3);
-  column_metadata.push_back(int_builder.make_metadata_node(num_rows));
-  column_metadata.push_back(str_builder.make_metadata_node(num_rows));
-  column_metadata.push_back(big_builder.make_metadata_node(num_rows));
-  auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
+  std::vector<cucascade::memory::column_metadata> columns;
+  columns.reserve(3);
+  columns.push_back(int_builder.make_column_metadata(num_rows));
+  columns.push_back(str_builder.make_column_metadata(num_rows));
+  columns.push_back(big_builder.make_column_metadata(num_rows));
 
   auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_packed_allocation>(
-    std::move(allocation), std::move(metadata), sz);
-  auto host_table = std::make_unique<cucascade::host_data_packed_representation>(
-    std::move(table_allocation), host_space);
+  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
+    std::move(allocation), std::move(columns), sz);
+  auto host_table =
+    std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(
-    registry, gpu_space, cudf::get_default_stream());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(num_rows));
@@ -496,18 +493,16 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
 }
 
 TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
-          "[memory][host_table_utils]")
+          "[memory][host_table_utils][shared_context]")
 {
-  using metadata_node = sirius::metadata_node;
-
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
 
   auto* host_space = get_memory_space(sirius_ctx, Tier::HOST, 0);
   REQUIRE(host_space != nullptr);
   auto* gpu_space = get_memory_space(sirius_ctx, Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
 
   auto* allocator = host_space->get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
@@ -594,23 +589,21 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
     expected_str_valid[i] = all_str_valid[i];
   }
 
-  std::vector<metadata_node> column_metadata;
-  column_metadata.reserve(2);
-  column_metadata.push_back(int_builder.make_metadata_node(rows_fit));
-  column_metadata.push_back(str_builder.make_metadata_node(rows_fit));
-  auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
+  std::vector<cucascade::memory::column_metadata> columns;
+  columns.reserve(2);
+  columns.push_back(int_builder.make_column_metadata(rows_fit));
+  columns.push_back(str_builder.make_column_metadata(rows_fit));
 
   auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_packed_allocation>(
-    std::move(allocation), std::move(metadata), sz);
-  auto host_table = std::make_unique<cucascade::host_data_packed_representation>(
-    std::move(table_allocation), host_space);
+  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
+    std::move(allocation), std::move(columns), sz);
+  auto host_table =
+    std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(
-    registry, gpu_space, cudf::get_default_stream());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(rows_fit));
@@ -622,17 +615,17 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
   verify_string_column(table_view.column(1), expected_str, expected_str_valid);
 }
 
-TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][host_table_utils]")
+TEST_CASE("host_table_utils - metadata offsets match packed data",
+          "[memory][host_table_utils][shared_context]")
 {
   constexpr size_t num_rows = 257;
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con]      = sirius::make_test_db_and_connection();
+  auto sirius_ctx           = sirius::get_sirius_context(con, get_test_config_path());
 
   auto* gpu_space = get_memory_space(sirius_ctx, Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = gpu_space->get_default_allocator();
+  rmm::cuda_stream stream;
+  auto mr = gpu_space->get_default_allocator();
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
                                             cudf::data_type{cudf::type_id::INT64},
@@ -663,22 +656,22 @@ TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][hos
     expected_string_mask = extract_mask_bytes(gpu_view.column(2));
   }
 
-  auto const& host_table = convert_to_host_table(sirius_ctx, batch);
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
   auto const& host_alloc = host_table.get_host_table();
   auto const& allocation = host_alloc->allocation;
 
-  auto metadata_nodes = sirius::unpack_metadata_to_nodes(host_alloc->metadata);
-  REQUIRE(metadata_nodes.size() == column_types.size());
+  auto const& cols = host_alloc->columns;
+  REQUIRE(cols.size() == column_types.size());
 
-  REQUIRE(metadata_nodes[0].null_count == 0);
-  REQUIRE(metadata_nodes[0].null_mask_offset < 0);
-  REQUIRE(metadata_nodes[1].null_count == static_cast<cudf::size_type>(int64_nulls.size()));
-  REQUIRE(metadata_nodes[1].null_mask_offset >= 0);
-  REQUIRE(metadata_nodes[2].null_count == static_cast<cudf::size_type>(string_nulls.size()));
-  REQUIRE(metadata_nodes[2].null_mask_offset >= 0);
+  REQUIRE(cols[0].null_count == 0);
+  REQUIRE(!cols[0].has_null_mask);
+  REQUIRE(cols[1].null_count == static_cast<cudf::size_type>(int64_nulls.size()));
+  REQUIRE(cols[1].has_null_mask);
+  REQUIRE(cols[2].null_count == static_cast<cudf::size_type>(string_nulls.size()));
+  REQUIRE(cols[2].has_null_mask);
 
   sirius::memory::multiple_blocks_allocation_accessor<int32_t> int32_accessor;
-  int32_accessor.initialize(static_cast<size_t>(metadata_nodes[0].data_offset), allocation);
+  int32_accessor.initialize(cols[0].data_offset, allocation);
   std::vector<int32_t> actual_int32(num_rows);
   if (num_rows > 0) {
     int32_accessor.memcpy_to(allocation, actual_int32.data(), sizeof(int32_t) * num_rows);
@@ -686,7 +679,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][hos
   REQUIRE(actual_int32 == expected.int32_values);
 
   sirius::memory::multiple_blocks_allocation_accessor<int64_t> int64_accessor;
-  int64_accessor.initialize(static_cast<size_t>(metadata_nodes[1].data_offset), allocation);
+  int64_accessor.initialize(cols[1].data_offset, allocation);
   std::vector<int64_t> actual_int64(num_rows);
   if (num_rows > 0) {
     int64_accessor.memcpy_to(allocation, actual_int64.data(), sizeof(int64_t) * num_rows);
@@ -696,18 +689,18 @@ TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][hos
   sirius::memory::multiple_blocks_allocation_accessor<uint8_t> mask_accessor;
   if (!expected_int64_mask.empty()) {
     std::vector<uint8_t> actual_int64_mask(expected_int64_mask.size(), 0);
-    mask_accessor.initialize(static_cast<size_t>(metadata_nodes[1].null_mask_offset), allocation);
+    mask_accessor.initialize(cols[1].null_mask_offset, allocation);
     mask_accessor.memcpy_to(allocation, actual_int64_mask.data(), actual_int64_mask.size());
     mask_unused_bits(actual_int64_mask, num_rows);
     REQUIRE(actual_int64_mask == expected_int64_mask);
   }
 
-  auto const& string_node = metadata_nodes[2];
-  REQUIRE(string_node.children.size() == 1);
-  REQUIRE(string_node.children[0].type.id() == cudf::type_id::INT64);
+  auto const& string_col = cols[2];
+  REQUIRE(string_col.children.size() == 1);
+  REQUIRE(string_col.children[0].type_id == cudf::type_id::INT64);
 
   sirius::memory::multiple_blocks_allocation_accessor<int64_t> offset_accessor;
-  offset_accessor.initialize(static_cast<size_t>(string_node.children[0].data_offset), allocation);
+  offset_accessor.initialize(string_col.children[0].data_offset, allocation);
   std::vector<int64_t> actual_offsets(num_rows + 1);
   if (num_rows > 0) {
     offset_accessor.memcpy_to(allocation, actual_offsets.data(), sizeof(int64_t) * (num_rows + 1));
@@ -715,7 +708,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][hos
   REQUIRE(actual_offsets == expected.string_offsets);
 
   sirius::memory::multiple_blocks_allocation_accessor<uint8_t> chars_accessor;
-  chars_accessor.initialize(static_cast<size_t>(string_node.data_offset), allocation);
+  chars_accessor.initialize(string_col.data_offset, allocation);
   std::vector<char> actual_chars(expected.string_chars.size());
   if (!actual_chars.empty()) {
     chars_accessor.memcpy_to(allocation, actual_chars.data(), actual_chars.size());
@@ -724,7 +717,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][hos
 
   if (!expected_string_mask.empty()) {
     std::vector<uint8_t> actual_string_mask(expected_string_mask.size(), 0);
-    mask_accessor.initialize(static_cast<size_t>(string_node.null_mask_offset), allocation);
+    mask_accessor.initialize(string_col.null_mask_offset, allocation);
     mask_accessor.memcpy_to(allocation, actual_string_mask.data(), actual_string_mask.size());
     mask_unused_bits(actual_string_mask, num_rows);
     REQUIRE(actual_string_mask == expected_string_mask);

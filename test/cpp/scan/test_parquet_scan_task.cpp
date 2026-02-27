@@ -29,6 +29,9 @@
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+// rmm
+#include <rmm/cuda_stream.hpp>
+
 // cudf
 #include <cudf/logger.hpp>
 
@@ -58,7 +61,8 @@ using table_creator_t = void (*)(duckdb::Connection&,
 
 using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::data_batch>>&,
                                    size_t,
-                                   cucascade::memory::memory_reservation_manager&);
+                                   cucascade::memory::memory_reservation_manager&,
+                                   rmm::cuda_stream_view);
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,
@@ -166,10 +170,11 @@ static std::filesystem::path write_parquet_from_table(duckdb::Connection& con,
 static void validate_scanned_batches_suppress_cudf(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
   size_t expected_rows,
-  cucascade::memory::memory_reservation_manager& mem_mgr)
+  cucascade::memory::memory_reservation_manager& mem_mgr,
+  rmm::cuda_stream_view stream)
 {
   rapids_logger::log_level_setter guard(cudf::default_logger(), rapids_logger::level_enum::error);
-  validate_scanned_batches(batches, expected_rows, mem_mgr);
+  validate_scanned_batches(batches, expected_rows, mem_mgr, stream);
 }
 
 static void create_synthetic_table_with_nested_list(duckdb::Connection& con,
@@ -258,8 +263,7 @@ static void run_parquet_scan_test(std::string const& table_name,
                                   batch_validator_t validator   = validate_scanned_batches,
                                   table_creator_t table_creator = create_synthetic_table)
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
 
   table_creator(con, table_name, num_rows);
   auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
@@ -317,8 +321,10 @@ static void run_parquet_scan_test(std::string const& table_name,
     return batches;
   };
 
+  // The stream must be declared before batches so it outlives GPU data allocated on it.
+  rmm::cuda_stream stream;
   auto batches = run_scan();
-  validator(batches, num_rows, mem_mgr);
+  validator(batches, num_rows, mem_mgr, stream);
 
   // End the transaction.
   auto commit_result = con.Query("COMMIT");
@@ -341,8 +347,7 @@ static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
 {
   REQUIRE(!file_row_counts.empty());
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
 
   auto parquet_dir = std::filesystem::temp_directory_path() / (table_prefix + "_multi_file");
   std::filesystem::remove_all(parquet_dir);
@@ -415,8 +420,10 @@ static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
     return batches;
   };
 
+  // The stream must be declared before batches so it outlives GPU data allocated on it.
+  rmm::cuda_stream stream;
   auto batches = run_scan();
-  validator(batches, total_rows, mem_mgr);
+  validator(batches, total_rows, mem_mgr, stream);
 
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
@@ -430,32 +437,37 @@ static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
   std::filesystem::remove_all(parquet_dir);
 }
 
-TEST_CASE("parquet_scan_task - single threaded small table", "[parquet_scan_task][single_thread]")
+TEST_CASE("parquet_scan_task - single threaded small table",
+          "[parquet_scan_task][single_thread][shared_context]")
 {
   run_parquet_scan_test("parquet_small", 2000, 1, 200000, 500);
 }
 
-TEST_CASE("parquet_scan_task - single threaded small batches", "[parquet_scan_task][single_thread]")
+TEST_CASE("parquet_scan_task - single threaded small batches",
+          "[parquet_scan_task][single_thread][shared_context]")
 {
   run_parquet_scan_test("parquet_medium", 10000, 1, 150000, 500);
 }
 
-TEST_CASE("parquet_scan_task - multi threaded medium table", "[parquet_scan_task][multi_thread]")
+TEST_CASE("parquet_scan_task - multi threaded medium table",
+          "[parquet_scan_task][multi_thread][shared_context]")
 {
   run_parquet_scan_test("parquet_mt", 100000, 4, 1000000, 0);
 }
 
-TEST_CASE("parquet_scan_task - multi threaded large table", "[parquet_scan_task][multi_thread]")
+TEST_CASE("parquet_scan_task - multi threaded large table",
+          "[parquet_scan_task][multi_thread][shared_context]")
 {
   run_parquet_scan_test("parquet_mt_large", 500000, 8, 10000000, 0);
 }
 
-TEST_CASE("parquet_scan_task - single partition row group", "[parquet_scan_task][edge_case]")
+TEST_CASE("parquet_scan_task - single partition row group",
+          "[parquet_scan_task][edge_case][shared_context]")
 {
   run_parquet_scan_test("parquet_single_partition", 5000, 2, 5000000, 100000);
 }
 
-TEST_CASE("parquet_scan_task - projected subset", "[parquet_scan_task][projection]")
+TEST_CASE("parquet_scan_task - projected subset", "[parquet_scan_task][projection][shared_context]")
 {
   duckdb::vector<duckdb::idx_t> projection_ids{0, 2};  // id, price
   run_parquet_scan_test("parquet_projected",
@@ -468,7 +480,7 @@ TEST_CASE("parquet_scan_task - projected subset", "[parquet_scan_task][projectio
 }
 
 TEST_CASE("parquet_scan_task - projected flat columns with nested schema",
-          "[parquet_scan_task][projection][nested_schema]")
+          "[parquet_scan_task][projection][nested_schema][shared_context]")
 {
   duckdb::vector<duckdb::idx_t> projection_ids{0, 2};  // id, price
   run_parquet_scan_test("parquet_projected_nested_schema",
@@ -481,12 +493,12 @@ TEST_CASE("parquet_scan_task - projected flat columns with nested schema",
                         create_synthetic_table_with_nested_list);
 }
 
-TEST_CASE("parquet_scan_task - empty table", "[parquet_scan_task][edge_case]")
+TEST_CASE("parquet_scan_task - empty table", "[parquet_scan_task][edge_case][shared_context]")
 {
   run_parquet_scan_test("parquet_empty", 0, 1, 200000, 500);
 }
 
-TEST_CASE("parquet_scan_task - single row table", "[parquet_scan_task][edge_case]")
+TEST_CASE("parquet_scan_task - single row table", "[parquet_scan_task][edge_case][shared_context]")
 {
   // Suppress cudf warnings about single-row parquet files
   run_parquet_scan_test("parquet_single_row",
@@ -498,13 +510,14 @@ TEST_CASE("parquet_scan_task - single row table", "[parquet_scan_task][edge_case
                         validate_scanned_batches_suppress_cudf);
 }
 
-TEST_CASE("parquet_scan_task - multi file full scan", "[parquet_scan_task][multi_file]")
+TEST_CASE("parquet_scan_task - multi file full scan",
+          "[parquet_scan_task][multi_file][shared_context]")
 {
   run_multi_file_parquet_scan_test("parquet_multi_file", {3000, 4200}, 4, 200000, 500);
 }
 
 TEST_CASE("parquet_scan_task - multi file projected subset",
-          "[parquet_scan_task][multi_file][projection]")
+          "[parquet_scan_task][multi_file][projection][shared_context]")
 {
   duckdb::vector<duckdb::idx_t> projection_ids{0, 2};  // id, price
   run_multi_file_parquet_scan_test("parquet_multi_file_projected",
@@ -517,7 +530,7 @@ TEST_CASE("parquet_scan_task - multi file projected subset",
 }
 
 TEST_CASE("parquet_scan_task - multi file full scan five files mixed sizes",
-          "[parquet_scan_task][multi_file]")
+          "[parquet_scan_task][multi_file][shared_context]")
 {
   run_multi_file_parquet_scan_test(
     "parquet_multi_file_five", {1400, 2600, 0, 3100, 900}, 6, 150000, 300);
