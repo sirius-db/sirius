@@ -178,7 +178,7 @@ void gpu_pipeline_executor::manager_loop()
         // Brief backoff before rescheduling to allow other tasks to complete
         // and free memory. Without this, a rescheduled task can spin in a tight
         // OOM → reschedule → OOM loop consuming CPU without making progress.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
         // Schedule the rescheduled task. It goes back through manager_loop()
         // to acquire a fresh reservation before execution.
