@@ -24,6 +24,13 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
 endif()
 
+# Language standards
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
@@ -31,8 +38,8 @@ option(ENABLE_STREAM_CHECK
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
-find_package(libconfig++ REQUIRED CONFIG)
-find_package(absl REQUIRED CONFIG)
+find_package(libconfig++ REQUIRED)
+find_package(absl REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
@@ -51,190 +58,25 @@ set(WARNINGS_AS_ERRORS
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
-# cmake-format: off
-set(EXTENSION_SOURCES
-    src/config.cpp
-    src/cpu_cache.cpp
-    src/creator/task_creator.cpp
-    src/data/host_parquet_representation.cpp
-    src/data/host_parquet_representation_converters.cpp
-    src/downgrade/downgrade_executor.cpp
-    src/downgrade/downgrade_queue.cpp
-    src/downgrade/downgrade_task.cpp
-    src/expression_executor/gpu_expression_executor.cpp
-    src/expression_executor/gpu_expression_executor_state.cpp
-    src/expression_executor/gpu_expression_translator.cpp
-    src/expression_executor/regex/regex_playground.cpp
-    src/expression_executor/specializations/gpu_execute_between.cpp
-    src/expression_executor/specializations/gpu_execute_case.cpp
-    src/expression_executor/specializations/gpu_execute_cast.cpp
-    src/expression_executor/specializations/gpu_execute_comparison.cpp
-    src/expression_executor/specializations/gpu_execute_conjunction.cpp
-    src/expression_executor/specializations/gpu_execute_constant.cpp
-    src/expression_executor/specializations/gpu_execute_function.cpp
-    src/expression_executor/specializations/gpu_execute_operator.cpp
-    src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/extension_lock.cpp
-    src/fallback.cpp
-    src/gpu_buffer_manager.cpp
-    src/gpu_columns.cpp
-    src/gpu_context.cpp
-    src/gpu_executor.cpp
-    src/gpu_meta_pipeline.cpp
-    src/gpu_physical_operator.cpp
-    src/gpu_physical_plan_generator.cpp
-    src/gpu_pipeline.cpp
-    src/gpu_query_result.cpp
-    src/memory/sirius_memory_reservation_manager.cpp
-    src/op/aggregate/aggregate_op_util.cpp
-    src/op/aggregate/gpu_aggregate_impl.cpp
-    src/op/merge/gpu_merge_impl.cpp
-    src/op/order/gpu_order_impl.cpp
-    src/op/partition/gpu_partition_impl.cpp
-    src/op/result/host_table_chunk_reader.cpp
-    src/op/scan/duckdb_scan_executor.cpp
-    src/op/scan/duckdb_scan_task.cpp
-    src/op/scan/parquet_scan_task.cpp
-    src/op/sirius_physical_column_data_scan.cpp
-    src/op/sirius_physical_concat.cpp
-    src/op/sirius_physical_cte.cpp
-    src/op/sirius_physical_delim_join.cpp
-    src/op/sirius_physical_duckdb_scan.cpp
-    src/op/sirius_physical_dummy_scan.cpp
-    src/op/sirius_physical_empty_result.cpp
-    src/op/sirius_physical_filter.cpp
-    src/op/sirius_physical_grouped_aggregate.cpp
-    src/op/sirius_physical_grouped_aggregate_merge.cpp
-    src/op/sirius_physical_hash_join.cpp
-    src/op/sirius_physical_limit.cpp
-    src/op/sirius_physical_merge_sort.cpp
-    src/op/sirius_physical_nested_loop_join.cpp
-    src/op/sirius_physical_operator.cpp
-    src/op/sirius_physical_operator_type.cpp
-    src/op/sirius_physical_order.cpp
-    src/op/sirius_physical_parquet_scan.cpp
-    src/op/sirius_physical_partition.cpp
-    src/op/sirius_physical_partition_consumer_operator.cpp
-    src/op/sirius_physical_projection.cpp
-    src/op/sirius_physical_result_collector.cpp
-    src/op/sirius_physical_sort_partition.cpp
-    src/op/sirius_physical_sort_sample.cpp
-    src/op/sirius_physical_table_scan.cpp
-    src/op/sirius_physical_top_n.cpp
-    src/op/sirius_physical_ungrouped_aggregate.cpp
-    src/operator/gpu_materialize.cpp
-    src/operator/gpu_physical_column_data_scan.cpp
-    src/operator/gpu_physical_concat.cpp
-    src/operator/gpu_physical_cte.cpp
-    src/operator/gpu_physical_delim_join.cpp
-    src/operator/gpu_physical_dummy_scan.cpp
-    src/operator/gpu_physical_empty_result.cpp
-    src/operator/gpu_physical_filter.cpp
-    src/operator/gpu_physical_grouped_aggregate.cpp
-    src/operator/gpu_physical_hash_join.cpp
-    src/operator/gpu_physical_limit.cpp
-    src/operator/gpu_physical_nested_loop_join.cpp
-    src/operator/gpu_physical_order.cpp
-    src/operator/gpu_physical_partition.cpp
-    src/operator/gpu_physical_projection.cpp
-    src/operator/gpu_physical_result_collector.cpp
-    src/operator/gpu_physical_strings_matching.cpp
-    src/operator/gpu_physical_substring.cpp
-    src/operator/gpu_physical_table_scan.cpp
-    src/operator/gpu_physical_top_n.cpp
-    src/operator/gpu_physical_ungrouped_aggregate.cpp
-    src/parallel/task_executor.cpp
-    src/pipeline/gpu_pipeline_executor.cpp
-    src/pipeline/gpu_pipeline_queue.cpp
-    src/pipeline/gpu_pipeline_task.cpp
-    src/pipeline/pipeline_executor.cpp
-    src/pipeline/pipeline_queue.cpp
-    src/pipeline/sirius_meta_pipeline.cpp
-    src/pipeline/sirius_pipeline.cpp
-    src/pipeline/task_request.cpp
-    src/plan/gpu_plan_aggregate.cpp
-    src/plan/gpu_plan_column_data_get.cpp
-    src/plan/gpu_plan_comparison_join.cpp
-    src/plan/gpu_plan_cte.cpp
-    src/plan/gpu_plan_delim_get.cpp
-    src/plan/gpu_plan_delim_join.cpp
-    src/plan/gpu_plan_dummy_scan.cpp
-    src/plan/gpu_plan_empty_result.cpp
-    src/plan/gpu_plan_expression_get.cpp
-    src/plan/gpu_plan_filter.cpp
-    src/plan/gpu_plan_get.cpp
-    src/plan/gpu_plan_limit.cpp
-    src/plan/gpu_plan_order.cpp
-    src/plan/gpu_plan_projection.cpp
-    src/plan/gpu_plan_recursive_cte.cpp
-    src/plan/gpu_plan_top_n.cpp
-    src/planner/query.cpp
-    src/planner/sirius_physical_plan_generator.cpp
-    src/planner/sirius_plan_aggregate.cpp
-    src/planner/sirius_plan_column_data_get.cpp
-    src/planner/sirius_plan_comparison_join.cpp
-    src/planner/sirius_plan_cte.cpp
-    src/planner/sirius_plan_delim_get.cpp
-    src/planner/sirius_plan_delim_join.cpp
-    src/planner/sirius_plan_dummy_scan.cpp
-    src/planner/sirius_plan_empty_result.cpp
-    src/planner/sirius_plan_expression_get.cpp
-    src/planner/sirius_plan_filter.cpp
-    src/planner/sirius_plan_get.cpp
-    src/planner/sirius_plan_limit.cpp
-    src/planner/sirius_plan_order.cpp
-    src/planner/sirius_plan_projection.cpp
-    src/planner/sirius_plan_recursive_cte.cpp
-    src/planner/sirius_plan_top_n.cpp
-    src/sirius_config.cpp
-    src/sirius_context.cpp
-    src/sirius_engine.cpp
-    src/sirius_extension.cpp
-    src/sirius_interface.cpp
-    src/util/stream_check_wrapper.cpp)
-
-set(CUDA_SOURCES
-    src/cuda/allocator.cu
-    src/cuda/communication.cu
-    src/cuda/cudf/cudf_aggregate.cu
-    src/cuda/cudf/cudf_duplicate_elimination.cu
-    src/cuda/cudf/cudf_groupby.cu
-    src/cuda/cudf/cudf_join.cu
-    src/cuda/cudf/cudf_orderby.cu
-    src/cuda/cudf/cudf_utils.cu
-    src/cuda/expression_executor/gpu_dispatch_materialize.cu
-    src/cuda/expression_executor/gpu_dispatch_select.cu
-    src/cuda/expression_executor/gpu_dispatch_string.cu
-    src/cuda/operator/arbitrary_expression.cu
-    src/cuda/operator/comparison_expression.cu
-    src/cuda/operator/hash_join_inner.cu
-    src/cuda/operator/hash_join_right.cu
-    src/cuda/operator/hash_join_single.cu
-    src/cuda/operator/materialize.cu
-    src/cuda/operator/nested_loop_join.cu
-    src/cuda/operator/strings_matching.cu
-    src/cuda/operator/substring.cu
-    src/cuda/print.cu
-    src/cuda/utils.cu)
-# cmake-format: on
+file(GLOB_RECURSE EXTENSION_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+file(GLOB_RECURSE CUDA_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu")
+list(FILTER CUDA_SOURCES EXCLUDE REGEX ".*/unused/.*")
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
-build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
+build_loadable_extension(sirius " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
-  set_target_properties(
-    ${_target}
-    PROPERTIES CXX_STANDARD 20
-               CXX_STANDARD_REQUIRED ON
-               CUDA_STANDARD 20
-               CUDA_STANDARD_REQUIRED ON
-               CUDA_SEPARABLE_COMPILATION ON
-               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
+                                              LINKER_LANGUAGE CUDA)
 
   target_include_directories(
     ${_target}
-    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
 
   target_compile_definitions(
     ${_target}
@@ -245,27 +87,6 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
-
-# Precompiled headers for extension targets
-target_precompile_headers(
-  sirius_extension
-  PRIVATE
-  # STL headers (60+ combined inclusions)
-  <algorithm>
-  <memory>
-  <optional>
-  <string>
-  <string_view>
-  <vector>
-  # Logging (44/139 source files)
-  "src/include/log/logging.hpp"
-  # DuckDB planner (30+ files)
-  <duckdb/planner/expression/bound_reference_expression.hpp>)
-target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
-
-# CMake PCH doesn't apply to nvcc — skip PCH for CUDA sources
-set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
-                                                       ON)
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA ${LIBCONFIG++_LIBRARIES}
@@ -290,49 +111,10 @@ else()
   )
 endif()
 
-# cmake-format: off
-set(TEST_SOURCES
-    test/cpp/config/test_config.cpp
-    test/cpp/config/test_context.cpp
-    test/cpp/data/test_host_parquet_representation.cpp
-    test/cpp/downgrade/test_downgrade_executor.cpp
-    test/cpp/exec/test_interruptible_mpmc.cpp
-    test/cpp/exec/test_kiosk.cpp
-    test/cpp/expression_executor/test_gpu_expression_executor.cpp
-    test/cpp/expression_executor/test_gpu_expression_translator.cpp
-    test/cpp/integration/test_gpu_execution_tpch.cpp
-    test/cpp/memory/test_host_table_utils.cpp
-    test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
-    test/cpp/memory_management/test_cpu_cache.cpp
-    test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
-    test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
-    test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
-    test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
-    test/cpp/operator/test_gpu_partition_impl.cpp
-    test/cpp/operator/test_host_table_chunk_reader.cpp
-    test/cpp/operator/test_physical_concat.cpp
-    test/cpp/operator/test_physical_filter.cpp
-    test/cpp/operator/test_physical_limit.cpp
-    test/cpp/operator/test_physical_mark_join.cpp
-    test/cpp/operator/test_physical_merge_sort.cpp
-    test/cpp/operator/test_physical_order.cpp
-    test/cpp/operator/test_physical_partition.cpp
-    test/cpp/operator/test_physical_projection.cpp
-    test/cpp/operator/test_physical_result_collector.cpp
-    test/cpp/operator/test_physical_table_scan.cpp
-    test/cpp/operator/test_physical_top_n.cpp
-    test/cpp/operator/test_physical_ungrouped_aggregate.cpp
-    test/cpp/parallel/test_task_executor.cpp
-    test/cpp/pipeline/test_gpu_pipeline_executor.cpp
-    test/cpp/pipeline/test_oom_reschedule.cpp
-    test/cpp/pipeline/test_pipeline_executor.cpp
-    test/cpp/scan/test_column_builder.cpp
-    test/cpp/scan/test_parquet_scan_task.cpp
-    test/cpp/scan/test_scan_executor.cpp
-    test/cpp/unittest.cpp
-    test/cpp/utils/sirius_test_env.cpp
-    test/cpp/utils/utils.cpp)
-# cmake-format: on
+file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/*.cpp")
+list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_modified_pipeline\\.cpp$")
+list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_task_creator\\.cpp$")
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 
@@ -341,22 +123,15 @@ target_include_directories(
   PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
 
 target_link_libraries(sirius_unittest sirius_extension)
 
-# Precompile Catch2 header (18K lines) once instead of in every test file
-target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
-# unittest.cpp defines CATCH_CONFIG_RUNNER before including catch.hpp, which is
-# incompatible with the PCH (compiled without that define). Exclude it.
-set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/unittest.cpp"
-                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
-
 set_target_properties(
-  sirius_unittest
-  PROPERTIES CXX_STANDARD 20
-             CXX_STANDARD_REQUIRED ON
-             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+  sirius_unittest PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                             "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
 target_compile_definitions(
   sirius_unittest
@@ -364,3 +139,6 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
+
+enable_testing()
+add_test(NAME sirius COMMAND sirius_unittest)
