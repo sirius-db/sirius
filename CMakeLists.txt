@@ -70,8 +70,6 @@ build_loadable_extension(sirius " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
-  set_target_properties(${_target} PROPERTIES LINKER_LANGUAGE CUDA)
-
   target_include_directories(
     ${_target}
     PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
