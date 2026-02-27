@@ -1901,7 +1901,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   // Regression test for the bug where n_nationkey (INT32) and c_custkey (INT64) were hashed
   // using different physical types: cuDF murmur3 produces different hash values for the same
   // integer in INT32 vs INT64, so matching keys landed in different partitions.
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_regionkey from nation n "
     "anti join customer c on n.n_nationkey = c.c_custkey;");
@@ -1911,7 +1911,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - partitioned anti join (misfit key) parquet",
                  "[integration][gpu_execution][antijoin][partitioned_join]")
 {
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_regionkey from nation n "
     "anti join customer c on n.n_nationkey = c.c_custkey;");
