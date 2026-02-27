@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_partition.hpp"
-
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
@@ -1827,11 +1825,12 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 // RAII guard to reset partition size after each test, even on failure.
 struct partition_size_guard {
-  explicit partition_size_guard(duckdb::idx_t size)
+  duckdb::Connection& con;
+  explicit partition_size_guard(duckdb::Connection& con, duckdb::idx_t size) : con(con)
   {
-    sirius::op::sirius_physical_partition::set_partition_size(size);
+    con.Query("SET hash_partition_bytes = " + std::to_string(size));
   }
-  ~partition_size_guard() { sirius::op::sirius_physical_partition::reset_partition_size(); }
+  ~partition_size_guard() { con.Query("RESET hash_partition_bytes"); }
 };
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -1839,7 +1838,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "[integration][gpu_execution][antijoin][partitioned_join]")
 {
   // n.n_regionkey is not column 0 in nation — this is the index mismatch that triggered the bug.
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey from nation n anti join region r on n.n_regionkey = r.r_regionkey;");
 }
@@ -1849,7 +1848,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][parquet][antijoin][partitioned_join]")
 {
   // n.n_regionkey is not column 0 in nation — this is the index mismatch that triggered the bug.
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey from nation n anti join region r on n.n_regionkey = r.r_regionkey;");
 }
@@ -1859,7 +1858,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "[integration][gpu_execution][semijoin][partitioned_join]")
 {
   // Same shape as the anti join above — verifies the fix didn't break semi join partitioning.
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey from nation n semi join region r on n.n_regionkey = r.r_regionkey;");
 }
@@ -1869,7 +1868,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][parquet][semijoin][partitioned_join]")
 {
   // Same shape as the anti join above — verifies the fix didn't break semi join partitioning.
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey from nation n semi join region r on n.n_regionkey = r.r_regionkey;");
 }
@@ -1878,7 +1877,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - partitioned inner join (key not at col 0)",
                  "[integration][gpu_execution][partitioned_join]")
 {
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_regionkey, r.r_name "
     "from nation n join region r on n.n_regionkey = r.r_regionkey;");
@@ -1888,7 +1887,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - partitioned inner join (key not at col 0) parquet",
                  "[integration][gpu_execution][parquet][partitioned_join]")
 {
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_regionkey, r.r_name "
     "from nation n join region r on n.n_regionkey = r.r_regionkey;");
@@ -1902,7 +1901,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   // Regression test for the bug where n_nationkey (INT32) and c_custkey (INT64) were hashed
   // using different physical types: cuDF murmur3 produces different hash values for the same
   // integer in INT32 vs INT64, so matching keys landed in different partitions.
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_regionkey from nation n "
     "anti join customer c on n.n_nationkey = c.c_custkey;");
@@ -1912,7 +1911,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - partitioned anti join (misfit key) parquet",
                  "[integration][gpu_execution][antijoin][partitioned_join]")
 {
-  partition_size_guard guard(1);
+  partition_size_guard guard(*con, 1);
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_regionkey from nation n "
     "anti join customer c on n.n_nationkey = c.c_custkey;");
@@ -3094,21 +3093,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // the original value after each test regardless of pass/fail.
 // ---------------------------------------------------------------------------
 
-struct PartitionSizeGuard {
-  explicit PartitionSizeGuard(duckdb::idx_t override_size)
-  {
-    sirius::op::sirius_physical_partition::set_partition_size(override_size);
-  }
-  ~PartitionSizeGuard() { sirius::op::sirius_physical_partition::reset_partition_size(); }
-};
-
 // nation (25 rows) with partition_size=5 → ceil(25/5) = 5 partitions.
 // count(distinct n_nationkey) per region must still equal 5.
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - count distinct: multi-partition forced, single group key",
                  "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(5);
+  partition_size_guard guard(*con, 5);
   compare_gpu_vs_cpu(
     "select n_regionkey, count(distinct n_nationkey) from nation group by n_regionkey;");
 }
@@ -3117,7 +3108,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - count distinct: multi-partition forced, single group key parquet",
                  "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(5);
+  partition_size_guard guard(*con, 5);
   compare_gpu_vs_cpu(
     "select n_regionkey, count(distinct n_nationkey) from nation group by n_regionkey;");
 }
@@ -3127,7 +3118,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - count distinct: multi-partition forced, customer table",
                  "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(1000);
+  partition_size_guard guard(*con, 1000);
   compare_gpu_vs_cpu(
     "select c_nationkey, count(distinct c_mktsegment) from customer group by c_nationkey;");
 }
@@ -3136,7 +3127,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - count distinct: multi-partition forced, customer table parquet",
                  "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(1000);
+  partition_size_guard guard(*con, 1000);
   compare_gpu_vs_cpu(
     "select c_nationkey, count(distinct c_mktsegment) from customer group by c_nationkey;");
 }
@@ -3146,7 +3137,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - count distinct: multi-partition forced, mixed aggregations",
                  "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(1000);
+  partition_size_guard guard(*con, 1000);
   compare_gpu_vs_cpu(
     "select c_nationkey, count(distinct c_mktsegment), min(c_custkey), count(*) "
     "from customer group by c_nationkey;");
@@ -3157,7 +3148,7 @@ TEST_CASE_METHOD(
   "gpu_execution - count distinct: multi-partition forced, mixed aggregations parquet",
   "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(1000);
+  partition_size_guard guard(*con, 1000);
   compare_gpu_vs_cpu(
     "select c_nationkey, count(distinct c_mktsegment), min(c_custkey), count(*) "
     "from customer group by c_nationkey;");
@@ -3190,7 +3181,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - count distinct: multi-column struct, multi-partition forced",
                  "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(5);
+  partition_size_guard guard(*con, 5);
   compare_gpu_vs_cpu(
     "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
 }
@@ -3200,7 +3191,7 @@ TEST_CASE_METHOD(
   "gpu_execution - count distinct: multi-column struct, multi-partition forced parquet",
   "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
 {
-  PartitionSizeGuard guard(5);
+  partition_size_guard guard(*con, 5);
   compare_gpu_vs_cpu(
     "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
 }

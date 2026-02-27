@@ -390,19 +390,18 @@ TEST_CASE("sirius_physical_concat sink forwards to multiple downstream operators
 // 3. get_next_task_input_batch threshold tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH_SIZE threshold",
+TEST_CASE("sirius_physical_concat stops concatenating at concat_batch_bytes threshold",
           "[physical_concat]")
 {
   auto* space = get_shared_mem_space();
   REQUIRE(space != nullptr);
 
-  // Save and set a small threshold so our test batches exceed it
-  auto original_threshold                      = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 1024;  // 1 KB
+  // Use a small threshold so our test batches exceed it
+  constexpr uint64_t threshold = 1024;  // 1 KB
 
   auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
-    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false, threshold);
 
   // Set up a port with a data repository
   auto repo = std::make_unique<cucascade::shared_data_repository>();
@@ -441,9 +440,6 @@ TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH
 
   // All batches should eventually be consumed
   REQUIRE(total_batches_returned == static_cast<std::size_t>(num_batches));
-
-  // Restore threshold
-  duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = original_threshold;
 }
 
 TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[physical_concat]")
@@ -451,14 +447,13 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
   auto* space = get_shared_mem_space();
   REQUIRE(space != nullptr);
 
-  // Save and set a small threshold
-  auto original_threshold                      = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 1024;  // 1 KB
+  // Use a small threshold (ignored when concat_all=true)
+  constexpr uint64_t threshold = 1024;  // 1 KB
 
   // LEFT join + is_build=true -> _concat_all = true
   auto fixture = create_test_hash_join(duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
-    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), true);
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), true, threshold);
 
   // Set up a port with a data repository
   auto repo = std::make_unique<cucascade::shared_data_repository>();
@@ -488,9 +483,6 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
   // No more batches remaining
   auto result2 = concat_op.get_next_task_input_data();
   REQUIRE(result2 == nullptr);
-
-  // Restore threshold
-  duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = original_threshold;
 }
 
 //===----------------------------------------------------------------------===//
@@ -568,13 +560,12 @@ TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe", "[p
   auto* space = get_shared_mem_space();
   REQUIRE(space != nullptr);
 
-  // Save and set a small threshold to force multiple get_next_task_input_batch calls
-  auto original_threshold                      = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 1024;  // 1 KB
+  // Use a small threshold to force multiple get_next_task_input_batch calls
+  constexpr uint64_t threshold = 1024;  // 1 KB
 
   auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
-    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false, threshold);
 
   // Set up a port with a data repository containing many batches across partitions
   auto repo = std::make_unique<cucascade::shared_data_repository>();
@@ -640,9 +631,6 @@ TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe", "[p
 
   // Check all expected IDs are present
   REQUIRE(collected_set == expected_batch_ids);
-
-  // Restore threshold
-  duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = original_threshold;
 }
 
 TEST_CASE("sirius_physical_concat execute is thread-safe with independent streams",

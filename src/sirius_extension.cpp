@@ -691,25 +691,56 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static sirius::operator_params* get_operator_params(ClientContext& context)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; operator_params SET ignored");
+    return nullptr;
+  }
+  return &sirius_ctx->get_config().get_operator_params();
+}
+
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::DEFAULT_SCAN_TASK_BATCH_SIZE = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_BATCH_SIZE to {}",
-                   Config::DEFAULT_SCAN_TASK_BATCH_SIZE);
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->scan_task_batch_size = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
 static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = UBigIntValue::Get(parameter);
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->default_scan_task_varchar_size = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_VARCHAR_SIZE to {}",
-                   Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE);
+                   params->default_scan_task_varchar_size);
 }
 
 static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::MAX_SORT_PARTITION_BYTES = UBigIntValue::Get(parameter);
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->max_sort_partition_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
-                   Config::MAX_SORT_PARTITION_BYTES);
+                   params->max_sort_partition_bytes);
+}
+
+static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->hash_partition_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config HASH_PARTITION_BYTES to {}", params->hash_partition_bytes);
+}
+
+static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->concat_batch_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -790,25 +821,37 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   // Add in config options for duckdb scan task
   // Default batch size
-  config.AddExtensionOption("default_scan_task_batch_size",
+  config.AddExtensionOption("scan_task_batch_size",
                             "The default batch size for a duckdb scan task",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(Config::DEFAULT_SCAN_TASK_BATCH_SIZE),
+                            Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
   // Default varchar size for estimating rows per batch
   config.AddExtensionOption(
     "default_scan_task_varchar_size",
     "The default varchar size for estimating rows per batch in a duckdb scan task",
     LogicalType::UBIGINT,
-    Value::UBIGINT(Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE),
+    Value::UBIGINT(sirius::operator_params{}.default_scan_task_varchar_size),
     SetDefaultScanTaskVarcharSize);
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
                             "Maximum bytes per sort partition (0 = auto based on 33% GPU memory)",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(Config::MAX_SORT_PARTITION_BYTES),
+                            Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
+
+  config.AddExtensionOption("hash_partition_bytes",
+                            "Target size in bytes per hash partition",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.hash_partition_bytes),
+                            SetHashPartitionBytes);
+
+  config.AddExtensionOption("concat_batch_bytes",
+                            "Target size for concat operator",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
+                            SetConcatBatchBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

@@ -98,8 +98,11 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
   [[nodiscard]] duckdb::shared_ptr<const sirius::planner::query> get_query() const;
 
-  /// \brief Get the current Sirius configuration.
+  /// \brief Get the current Sirius configuration (const).
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
+
+  /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
+  [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
 
  private:
   void throw_if_not_initialized() const;
