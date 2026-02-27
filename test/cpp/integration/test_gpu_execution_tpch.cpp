@@ -62,9 +62,9 @@ class GPUExecutionFixtureBase {
   GPUExecutionFixtureBase()
   {
     // Set up environment variable for config file
-    // auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
-    // REQUIRE(fs::exists(cfg_path));
-    // config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
+    auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+    REQUIRE(fs::exists(cfg_path));
+    config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
     // Initialize DuckDB in-memory, then attach the TPC-H database
     db  = std::make_unique<duckdb::DuckDB>(nullptr);
