@@ -114,7 +114,11 @@ for q in "${QUERIES[@]}"; do
     echo ""
     echo "========== Q${q} =========="
 
-    TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        TEMP_SQL="$Q_DIR/query.sql"
+    else
+        TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
+    fi
 
     # Timing table: one row per checkpoint, ordered by seq
     printf 'CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);\n' > "$TEMP_SQL"
@@ -163,7 +167,9 @@ EOF
         echo "${q},${ELAPSED}" >> "$TIMING_CSV"
     fi
 
-    rm -f "$TEMP_SQL"
+    if [ -z "${OUTPUT_DIR:-}" ]; then
+        rm -f "$TEMP_SQL"
+    fi
     echo "Timings written to $TIMING_FILE"
 done
 
