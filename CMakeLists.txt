@@ -69,10 +69,8 @@ build_loadable_extension(sirius " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
-  set_target_properties(
-    ${_target}
-    PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
-               LINKER_LANGUAGE CUDA)
+  set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
+                                              LINKER_LANGUAGE CUDA)
 
   target_include_directories(
     ${_target}
@@ -122,17 +120,18 @@ add_executable(sirius_unittest ${TEST_SOURCES})
 
 target_include_directories(
   sirius_unittest
-  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
-          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
-          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
-          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
+  PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
 
 target_link_libraries(sirius_unittest sirius_extension)
 
 set_target_properties(
   sirius_unittest PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                          "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+                             "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
 target_compile_definitions(
   sirius_unittest
