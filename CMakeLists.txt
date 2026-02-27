@@ -39,8 +39,8 @@ option(ENABLE_STREAM_CHECK
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
-find_package(libconfig++ REQUIRED)
-find_package(absl REQUIRED)
+find_package(libconfig++ REQUIRED CONFIG)
+find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
@@ -66,7 +66,7 @@ file(GLOB_RECURSE CUDA_SOURCES CONFIGURE_DEPENDS
 list(FILTER CUDA_SOURCES EXCLUDE REGEX ".*/unused/.*")
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
-build_loadable_extension(sirius " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
+build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
