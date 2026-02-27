@@ -105,6 +105,20 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+
+  /**
+   * @brief Convert the scan's DuckDB TableFilterSet into a single bound DuckDB expression
+   * (conjunction of all filters), suitable for passing to
+   * gpu_expression_translator::translate_expression().
+   *
+   * @return nullptr if the filter set is empty or contains only unsupported filter types, otherwise
+   * a bound DuckDB expression.
+   */
+  duckdb::unique_ptr<duckdb::Expression> get_table_filter_expression() const
+  {
+    return sirius::op::convert_table_filters_to_expression(
+      *table_filters, column_ids, returned_types, projection_ids);
+  }
 };
 
 }  // namespace op
