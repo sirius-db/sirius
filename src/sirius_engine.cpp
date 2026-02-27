@@ -18,11 +18,7 @@
 
 #include "config.hpp"
 #include "duckdb/execution/execution_context.hpp"
-#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
-#include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "fallback.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"

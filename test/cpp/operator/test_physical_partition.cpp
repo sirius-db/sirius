@@ -21,10 +21,6 @@
 #include "utils/data_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
-#include <duckdb/parser/query_error_context.hpp>
-#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_partition.hpp>
 
 #include <numeric>

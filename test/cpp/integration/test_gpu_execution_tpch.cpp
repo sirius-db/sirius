@@ -16,10 +16,8 @@
 
 #include "op/sirius_physical_partition.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 
 #include <cmath>
 #include <cstdlib>
@@ -27,7 +25,6 @@
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
 
 namespace fs = std::filesystem;

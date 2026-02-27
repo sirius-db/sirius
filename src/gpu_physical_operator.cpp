@@ -21,7 +21,6 @@
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 
-#include <cucascade/data/data_batch.hpp>
 
 namespace duckdb {
 

@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "duckdb/function/table/table_scan.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "op/sirius_physical_filter.hpp"

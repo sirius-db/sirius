@@ -22,14 +22,12 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <rmm/cuda_device.hpp>
 
 #include <util/stream_check_wrapper.hpp>
 
-#include <iostream>
 
 namespace sirius {
 namespace pipeline {

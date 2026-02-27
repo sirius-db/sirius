@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"

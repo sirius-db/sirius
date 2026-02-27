@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <expression_executor/gpu_dispatcher.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <operator/gpu_materialize.hpp>
 

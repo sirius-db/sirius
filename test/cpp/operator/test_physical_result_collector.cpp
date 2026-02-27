@@ -33,7 +33,6 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 // rmm

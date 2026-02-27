@@ -26,7 +26,6 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/expression_filter.hpp"
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "gpu_buffer_manager.hpp"

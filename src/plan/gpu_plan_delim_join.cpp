@@ -15,12 +15,6 @@
  */
 
 #include "duckdb/common/enum_util.hpp"
-#include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
-#include "duckdb/execution/operator/join/physical_hash_join.hpp"
-#include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
-#include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "operator/gpu_physical_column_data_scan.hpp"
 #include "operator/gpu_physical_delim_join.hpp"

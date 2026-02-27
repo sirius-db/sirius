@@ -16,14 +16,7 @@
 
 #include "operator/gpu_physical_concat.hpp"
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
-#include "operator/gpu_physical_grouped_aggregate.hpp"
-#include "operator/gpu_physical_hash_join.hpp"
-#include "operator/gpu_physical_order.hpp"
 #include "operator/gpu_physical_partition.hpp"
-#include "operator/gpu_physical_top_n.hpp"
 
 namespace duckdb {
 

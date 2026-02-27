@@ -19,7 +19,6 @@
 #include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
-#include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -29,7 +28,6 @@
 
 #include <cucascade/memory/common.hpp>
 
-#include <iostream>
 #include <mutex>
 
 namespace sirius::op::scan {

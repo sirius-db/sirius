@@ -17,7 +17,6 @@
 #include "gpu_query_result.hpp"
 
 #include "duckdb/common/box_renderer.hpp"
-#include "duckdb/common/to_string.hpp"
 #include "duckdb/main/client_context.hpp"
 
 namespace duckdb {

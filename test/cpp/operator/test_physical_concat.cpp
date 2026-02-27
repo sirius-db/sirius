@@ -19,7 +19,6 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <duckdb.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_concat.hpp>

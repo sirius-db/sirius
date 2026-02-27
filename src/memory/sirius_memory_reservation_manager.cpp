@@ -22,8 +22,6 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 

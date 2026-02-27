@@ -19,9 +19,6 @@
 
 #include "config.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "duckdb.hpp"
-#include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
-#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -35,7 +32,6 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"

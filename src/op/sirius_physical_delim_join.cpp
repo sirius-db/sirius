@@ -16,9 +16,6 @@
 
 #include "op/sirius_physical_delim_join.hpp"
 
-#include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
-#include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
-#include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"

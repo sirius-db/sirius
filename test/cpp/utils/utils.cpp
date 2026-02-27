@@ -19,8 +19,6 @@
 #include "catch.hpp"
 #include "operator/gpu_materialize.hpp"
 
-#include <cuda.h>
-#include <cuda_runtime.h>
 
 #include <cmath>
 #include <cstdint>

@@ -16,7 +16,6 @@
 
 #include "operator/gpu_physical_limit.hpp"
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 

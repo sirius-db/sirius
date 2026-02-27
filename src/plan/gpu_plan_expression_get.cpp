@@ -15,8 +15,6 @@
  */
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
-#include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 // #include "operator/gpu_physical_expression_scan.hpp"
