@@ -1,6 +1,10 @@
 #!/bin/bash
 # Official ClickBench run script for Sirius (clickbench_with_topk branch)
 # Based on: https://github.com/ClickHouse/ClickBench/tree/main/sirius/run.sh
+#
+# GPU memory sizes below are tuned for GH200 (96 GB HBM3).
+# Adjust GPU_CACHING_SIZE + GPU_PROCESSING_SIZE to fit your GPU.
+# Rule of thumb: caching + processing <= 85% of GPU VRAM.
 
 TRIES=3
 GPU_CACHING_SIZE='80 GB'
@@ -13,8 +17,20 @@ QUERIES_FILE="$SCRIPT_DIR/scripts/clickbench_runner/queries.sql"
 HITS_DB="$SCRIPT_DIR/hits.duckdb"
 
 if [[ ! -x "$DUCKDB" ]]; then
-    echo "ERROR: Sirius binary not found at $DUCKDB"
+    echo "ERROR: Sirius binary not found. Run: bash build.sh"
     exit 1
+fi
+
+# Create hits.duckdb from hits.parquet if needed
+if [[ ! -f "$HITS_DB" ]]; then
+    if [[ ! -f "$SCRIPT_DIR/hits.parquet" ]]; then
+        echo "ERROR: hits.parquet not found. Download from ClickBench:"
+        echo "  wget https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+        exit 1
+    fi
+    echo "Creating hits.duckdb from hits.parquet (one-time, ~2 min)..."
+    "$DUCKDB" "$HITS_DB" -c "CREATE TABLE hits AS SELECT * FROM read_parquet('$SCRIPT_DIR/hits.parquet');"
+    echo "hits.duckdb created."
 fi
 
 cat "$QUERIES_FILE" | while read -r query; do
