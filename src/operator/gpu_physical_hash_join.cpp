@@ -19,7 +19,7 @@
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_materialize.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"

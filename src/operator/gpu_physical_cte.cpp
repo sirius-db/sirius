@@ -24,7 +24,7 @@
 
 #include "gpu_buffer_manager.hpp"
 #include "gpu_meta_pipeline.hpp"
-#include "gpu_physical_cte.hpp"
+#include "operator/gpu_physical_cte.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
 

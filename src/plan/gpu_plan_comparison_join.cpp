@@ -32,8 +32,8 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
-#include "gpu_physical_hash_join.hpp"
-#include "gpu_physical_nested_loop_join.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
+#include "operator/gpu_physical_nested_loop_join.hpp"
 #include "gpu_physical_plan_generator.hpp"
 
 namespace duckdb {

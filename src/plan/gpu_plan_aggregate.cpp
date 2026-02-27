@@ -28,11 +28,11 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "gpu_physical_grouped_aggregate.hpp"
+#include "operator/gpu_physical_grouped_aggregate.hpp"
 #include "gpu_physical_plan_generator.hpp"
-#include "gpu_physical_projection.hpp"
-#include "gpu_physical_table_scan.hpp"
-#include "gpu_physical_ungrouped_aggregate.hpp"
+#include "operator/gpu_physical_projection.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
+#include "operator/gpu_physical_ungrouped_aggregate.hpp"
 
 namespace duckdb {
 

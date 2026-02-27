@@ -16,7 +16,7 @@
 
 #include "cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_strings_matching.hpp"
+#include "operator/gpu_physical_strings_matching.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>

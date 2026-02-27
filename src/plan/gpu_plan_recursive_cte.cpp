@@ -25,8 +25,8 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_recursive_cte.hpp"
-#include "gpu_physical_column_data_scan.hpp"
-#include "gpu_physical_cte.hpp"
+#include "operator/gpu_physical_column_data_scan.hpp"
+#include "operator/gpu_physical_cte.hpp"
 #include "gpu_physical_plan_generator.hpp"
 
 namespace duckdb {

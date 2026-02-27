@@ -16,8 +16,8 @@
 
 #include "cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_materialize.hpp"
-#include "gpu_physical_grouped_aggregate.hpp"
+#include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_grouped_aggregate.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {

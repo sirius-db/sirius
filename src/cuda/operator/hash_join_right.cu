@@ -16,7 +16,7 @@
 
 #include "cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_hash_join.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {

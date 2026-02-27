@@ -16,7 +16,7 @@
 
 #include "cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_table_scan.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 #include "log/logging.hpp"
 
 #include <thrust/copy.h>

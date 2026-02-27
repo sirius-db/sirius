@@ -17,7 +17,7 @@
 #include "../operator/cuda_helper.cuh"
 #include "cudf/cudf_utils.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_ungrouped_aggregate.hpp"
+#include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {

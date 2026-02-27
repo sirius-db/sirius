@@ -17,7 +17,7 @@
 #pragma once
 
 #include "duckdb/common/exception.hpp"
-#include "gpu_physical_projection.hpp"
+#include "operator/gpu_physical_projection.hpp"
 #include "gpu_pipeline.hpp"
 
 #include <string>

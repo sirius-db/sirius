@@ -17,7 +17,7 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "gpu_materialize.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {

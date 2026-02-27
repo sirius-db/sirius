@@ -17,7 +17,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
-#include "gpu_physical_substring.hpp"
+#include "operator/gpu_physical_substring.hpp"
 #include "log/logging.hpp"
 
 #define THREADS_PER_BLOCK 512

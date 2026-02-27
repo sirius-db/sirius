@@ -19,7 +19,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "gpu_physical_plan_generator.hpp"
-#include "gpu_physical_projection.hpp"
+#include "operator/gpu_physical_projection.hpp"
 
 namespace duckdb {
 

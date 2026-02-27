@@ -16,9 +16,9 @@
 
 #include "../operator/cuda_helper.cuh"
 #include "config.hpp"
-#include "cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_order.hpp"
+#include "operator/gpu_physical_order.hpp"
 #include "log/logging.hpp"
 
 #include <cub/cub.cuh>
