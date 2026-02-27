@@ -84,6 +84,20 @@ foreach(_target sirius_extension sirius_loadable_extension)
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
+# Precompiled headers for extension targets
+target_precompile_headers(sirius_extension PRIVATE
+  # STL headers (60+ combined inclusions)
+  <algorithm> <memory> <optional> <string> <string_view> <vector>
+  # Logging (44/139 source files)
+  "src/include/log/logging.hpp"
+  # DuckDB planner (30+ files)
+  <duckdb/planner/expression/bound_reference_expression.hpp>
+)
+target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
+
+# CMake PCH doesn't apply to nvcc — skip PCH for CUDA sources
+set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA ${LIBCONFIG++_LIBRARIES}
                       absl::any_invocable)
@@ -122,6 +136,16 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
 
 target_link_libraries(sirius_unittest sirius_extension)
+
+# Precompile Catch2 header (18K lines) once instead of in every test file
+target_precompile_headers(sirius_unittest PRIVATE
+  <catch.hpp>
+)
+# unittest.cpp defines CATCH_CONFIG_RUNNER before including catch.hpp, which is
+# incompatible with the PCH (compiled without that define). Exclude it.
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/unittest.cpp"
+  PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 set_target_properties(
   sirius_unittest PROPERTIES RUNTIME_OUTPUT_DIRECTORY
