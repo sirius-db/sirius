@@ -41,11 +41,9 @@
 #define CUB_STDERR
 
 // clang-format off
-// FIXME: handle error message from kernel to log file
 #define cudaAssert( X ) { \
     if ( !(X) ) { \
-        /* printf( "Thread %d:%d failed assert at %s:%d!\n", blockIdx.x, threadIdx.x, __FILE__, __LINE__ ); */ \
-        return; \
+        __trap(); \
     } \
 }
 
