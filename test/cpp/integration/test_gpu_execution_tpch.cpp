@@ -18,6 +18,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/sirius_test_env.hpp>
 
 #include <cmath>
 #include <cstdlib>
@@ -61,14 +62,19 @@ class GPUExecutionFixtureBase {
  public:
   GPUExecutionFixtureBase()
   {
-    // Set up environment variable for config file
-    auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
-    REQUIRE(fs::exists(cfg_path));
-    config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
+    if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+      // Use the shared DuckDB instance managed by the test listener
+      con =
+        std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+    } else {
+      // Fallback: create an isolated DuckDB (e.g. when running a single test directly)
+      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+      REQUIRE(fs::exists(cfg_path));
+      config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
-    // Initialize DuckDB in-memory, then attach the TPC-H database
-    db  = std::make_unique<duckdb::DuckDB>(nullptr);
-    con = std::make_unique<duckdb::Connection>(*db);
+      db  = std::make_unique<duckdb::DuckDB>(nullptr);
+      con = std::make_unique<duckdb::Connection>(*db);
+    }
   }
 
   ~GPUExecutionFixtureBase() = default;
@@ -183,7 +189,7 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
   GPUExecutionDuckDBFixture()
   {
     auto db_path = get_tpch_db_path().string();
-    auto result  = con->Query("ATTACH '" + db_path + "' AS tpch (READ_ONLY);");
+    auto result  = con->Query("ATTACH IF NOT EXISTS '" + db_path + "' AS tpch (READ_ONLY);");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
@@ -204,42 +210,42 @@ class GPUExecutionParquetFixture : public GPUExecutionFixtureBase {
   GPUExecutionParquetFixture()
   {
     auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
-    auto result      = con->Query("CREATE VIEW nation AS SELECT * FROM read_parquet('" +
+    auto result = con->Query("CREATE VIEW IF NOT EXISTS nation AS SELECT * FROM read_parquet('" +
                              parquet_dir.string() + "/nation.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    result = con->Query("CREATE VIEW region AS SELECT * FROM read_parquet('" +
+    result = con->Query("CREATE VIEW IF NOT EXISTS region AS SELECT * FROM read_parquet('" +
                         parquet_dir.string() + "/region.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    result = con->Query("CREATE VIEW customer AS SELECT * FROM read_parquet('" +
+    result = con->Query("CREATE VIEW IF NOT EXISTS customer AS SELECT * FROM read_parquet('" +
                         parquet_dir.string() + "/customer.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    result = con->Query("CREATE VIEW orders AS SELECT * FROM read_parquet('" +
+    result = con->Query("CREATE VIEW IF NOT EXISTS orders AS SELECT * FROM read_parquet('" +
                         parquet_dir.string() + "/orders.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    result = con->Query("CREATE VIEW part AS SELECT * FROM read_parquet('" + parquet_dir.string() +
-                        "/part.parquet');");
+    result = con->Query("CREATE VIEW IF NOT EXISTS part AS SELECT * FROM read_parquet('" +
+                        parquet_dir.string() + "/part.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    result = con->Query("CREATE VIEW partsupp AS SELECT * FROM read_parquet('" +
+    result = con->Query("CREATE VIEW IF NOT EXISTS partsupp AS SELECT * FROM read_parquet('" +
                         parquet_dir.string() + "/partsupp.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    result = con->Query("CREATE VIEW supplier AS SELECT * FROM read_parquet('" +
+    result = con->Query("CREATE VIEW IF NOT EXISTS supplier AS SELECT * FROM read_parquet('" +
                         parquet_dir.string() + "/supplier.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    result = con->Query("CREATE VIEW lineitem AS SELECT * FROM read_parquet('" +
+    result = con->Query("CREATE VIEW IF NOT EXISTS lineitem AS SELECT * FROM read_parquet('" +
                         parquet_dir.string() + "/lineitem.parquet');");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());

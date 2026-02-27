@@ -18,7 +18,8 @@
 
 namespace sirius::test {
 
-shared_test_env* g_shared_env = nullptr;
+shared_test_env* g_shared_env      = nullptr;
+shared_test_env* g_integration_env = nullptr;
 
 shared_test_env::shared_test_env(const std::filesystem::path& config_path)
   : config_path_(config_path)

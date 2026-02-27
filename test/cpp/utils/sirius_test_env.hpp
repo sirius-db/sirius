@@ -96,5 +96,6 @@ class shared_test_env {
  * Check is_active() before using — it may be temporarily paused for isolated tests.
  */
 extern shared_test_env* g_shared_env;
+extern shared_test_env* g_integration_env;
 
 }  // namespace sirius::test
