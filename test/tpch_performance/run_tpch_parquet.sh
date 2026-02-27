@@ -101,11 +101,9 @@ for q in "${QUERIES[@]}"; do
         mkdir -p "$Q_DIR"
         RESULT_FILE="$Q_DIR/result.txt"
         TIMING_FILE="$Q_DIR/timings.csv"
-        LOG_FILE="$Q_DIR/log.txt"
     else
         RESULT_FILE="$PROJECT_DIR/result_${ENGINE}_sf${SF}_q${q}.txt"
         TIMING_FILE="$PROJECT_DIR/timings_${ENGINE}_sf${SF}_q${q}.csv"
-        LOG_FILE=/dev/null
     fi
 
     if [ ! -f "$QUERY_FILE" ]; then
@@ -113,31 +111,30 @@ for q in "${QUERIES[@]}"; do
         continue
     fi
 
-    {
-        echo ""
-        echo "========== Q${q} =========="
+    echo ""
+    echo "========== Q${q} =========="
 
-        TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
+    TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
 
-        # Timing table: one row per checkpoint, ordered by seq
-        printf 'CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);\n' > "$TEMP_SQL"
-        printf "INSERT INTO _timings VALUES (0, 'start', current_timestamp);\n" >> "$TEMP_SQL"
+    # Timing table: one row per checkpoint, ordered by seq
+    printf 'CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);\n' > "$TEMP_SQL"
+    printf "INSERT INTO _timings VALUES (0, 'start', current_timestamp);\n" >> "$TEMP_SQL"
 
-        # View creation
-        printf '%s\n' "$VIEW_SQL" >> "$TEMP_SQL"
-        printf "INSERT INTO _timings VALUES (1, 'views', current_timestamp);\n" >> "$TEMP_SQL"
+    # View creation
+    printf '%s\n' "$VIEW_SQL" >> "$TEMP_SQL"
+    printf "INSERT INTO _timings VALUES (1, 'views', current_timestamp);\n" >> "$TEMP_SQL"
 
-        # Append the query N times, recording a timestamp after each run
-        for ((i = 1; i <= ITERATIONS; i++)); do
-            cat "$QUERY_FILE" >> "$TEMP_SQL"
-            printf "\nINSERT INTO _timings VALUES (%d, 'iter_%d', current_timestamp);\n" \
-                $((i + 1)) "$i" >> "$TEMP_SQL"
-        done
+    # Append the query N times, recording a timestamp after each run
+    for ((i = 1; i <= ITERATIONS; i++)); do
+        cat "$QUERY_FILE" >> "$TEMP_SQL"
+        printf "\nINSERT INTO _timings VALUES (%d, 'iter_%d', current_timestamp);\n" \
+            $((i + 1)) "$i" >> "$TEMP_SQL"
+    done
 
-        # Write per-step runtimes (seconds) to CSV using LAG over the checkpoints.
-        # The 'start' row is excluded from output after the window function runs,
-        # so that LAG for 'views' (seq=1) can still see seq=0 as its predecessor.
-        cat >> "$TEMP_SQL" <<EOF
+    # Write per-step runtimes (seconds) to CSV using LAG over the checkpoints.
+    # The 'start' row is excluded from output after the window function runs,
+    # so that LAG for 'views' (seq=1) can still see seq=0 as its predecessor.
+    cat >> "$TEMP_SQL" <<EOF
 COPY (
     SELECT step, runtime_s FROM (
         SELECT
@@ -151,20 +148,23 @@ COPY (
 ) TO '${TIMING_FILE}' (FORMAT CSV, HEADER);
 EOF
 
-        START_TIME=$(date +%s.%N)
+    START_TIME=$(date +%s.%N)
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        SIRIUS_LOG_DIR="$Q_DIR" "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
+    else
         "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
-        END_TIME=$(date +%s.%N)
+    fi
+    END_TIME=$(date +%s.%N)
 
-        ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
-        echo "  Time: ${ELAPSED}s"
+    ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
+    echo "  Time: ${ELAPSED}s"
 
-        if [ -n "${TIMING_CSV:-}" ]; then
-            echo "${q},${ELAPSED}" >> "$TIMING_CSV"
-        fi
+    if [ -n "${TIMING_CSV:-}" ]; then
+        echo "${q},${ELAPSED}" >> "$TIMING_CSV"
+    fi
 
-        rm -f "$TEMP_SQL"
-        echo "Timings written to $TIMING_FILE"
-    } 2>&1 | tee -a "$LOG_FILE"
+    rm -f "$TEMP_SQL"
+    echo "Timings written to $TIMING_FILE"
 done
 
 echo ""
