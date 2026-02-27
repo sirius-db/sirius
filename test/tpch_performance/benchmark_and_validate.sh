@@ -1,10 +1,17 @@
 #!/bin/bash
-# compare_tpch_engines.sh
+# benchmark_and_validate.sh
 #
 # Runs all 22 TPC-H queries for both sirius and duckdb, compares results,
 # and writes two CSVs:
-#   comparison_sf<SF>.csv  - per-query match/error status
-#   timings_sf<SF>.csv     - long-format iteration runtimes (engine,query,iteration,runtime_s)
+#   comparison.csv  - per-query match/error status
+#   timings.csv     - long-format iteration runtimes (engine,query,iteration,runtime_s)
+#
+# Each run gets its own timestamped directory under runs/:
+#   runs/<timestamp>_sf<SF>_<N>iter/
+#     sirius/run.log  sirius/q<N>/result.txt  sirius/q<N>/timings.csv
+#     duckdb/run.log  duckdb/q<N>/result.txt  duckdb/q<N>/timings.csv
+#     comparison.csv
+#     timings.csv
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
@@ -29,28 +36,35 @@ SF="$1"
 ITERATIONS="$2"
 QUERIES=($(seq 1 22))
 
-COMPARISON_CSV="$PROJECT_DIR/comparison_sf${SF}.csv"
-TIMINGS_CSV="$PROJECT_DIR/timings_sf${SF}.csv"
+RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${ITERATIONS}iter"
+mkdir -p "$RUN_DIR"
+
+COMPARISON_CSV="$RUN_DIR/comparison.csv"
+TIMINGS_CSV="$RUN_DIR/timings.csv"
 
 echo "Scale factor: SF${SF}   Iterations: ${ITERATIONS}"
+echo "Run directory: $RUN_DIR"
 echo "=========================================="
 
-echo ""
-echo "=== Running sirius ==="
-"$RUN_SCRIPT" sirius "$SF" "$ITERATIONS" "${QUERIES[@]}" || true
+for engine in sirius duckdb; do
+    ENGINE_DIR="$RUN_DIR/$engine"
+    mkdir -p "$ENGINE_DIR"
 
-echo ""
-echo "=== Running duckdb ==="
-"$RUN_SCRIPT" duckdb "$SF" "$ITERATIONS" "${QUERIES[@]}" || true
+    echo ""
+    echo "=== Running $engine ==="
+    OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "$engine" "$SF" "$ITERATIONS" "${QUERIES[@]}" \
+        2>&1 | tee "$ENGINE_DIR/run.log" || true
+done
 
 echo ""
 echo "=== Comparing results ==="
 echo "=========================================="
 
-# Returns 0 (true) if the result file contains a DuckDB error message.
+# Returns 0 (true) if the result file is missing, empty, or contains a DuckDB error message.
 has_error() {
     local file="$1"
     [[ ! -f "$file" ]] && return 0
+    [[ ! -s "$file" ]] && return 0
     grep -qE "^(Error|Binder Error|Parser Error|Runtime Error|Catalog Error|Fatal Error|Invalid Error):" \
         "$file" 2>/dev/null
 }
@@ -60,8 +74,8 @@ printf 'query,status\n' | tee "$COMPARISON_CSV"
 ok=0; validate=0; errors=0
 
 for q in "${QUERIES[@]}"; do
-    SIRIUS_FILE="$PROJECT_DIR/result_sirius_sf${SF}_q${q}.txt"
-    DUCKDB_FILE="$PROJECT_DIR/result_duckdb_sf${SF}_q${q}.txt"
+    SIRIUS_FILE="$RUN_DIR/sirius/q${q}/result.txt"
+    DUCKDB_FILE="$RUN_DIR/duckdb/q${q}/result.txt"
 
     if has_error "$SIRIUS_FILE" || has_error "$DUCKDB_FILE"; then
         status="error"
@@ -83,7 +97,7 @@ printf 'Summary: %d/22 success   %d validate   %d error\n' "$ok" "$validate" "$e
 echo "Comparison CSV saved to $COMPARISON_CSV"
 
 # Build combined timings CSV in long format.
-# Source files: timings_${ENGINE}_sf${SF}_q${q}.csv
+# Source files: <run>/<engine>/q<N>/timings.csv
 #   step,runtime_s
 #   views,0.12       <- skip (view creation, not a query iteration)
 #   iter_1,4.56
@@ -96,7 +110,7 @@ printf 'engine,query,iteration,runtime_s\n' > "$TIMINGS_CSV"
 
 for engine in sirius duckdb; do
     for q in "${QUERIES[@]}"; do
-        TIMING_FILE="$PROJECT_DIR/timings_${engine}_sf${SF}_q${q}.csv"
+        TIMING_FILE="$RUN_DIR/$engine/q${q}/timings.csv"
         [[ ! -f "$TIMING_FILE" ]] && continue
 
         # Skip the header line and the 'views' row; extract iter_N rows.
@@ -122,8 +136,8 @@ echo ""
 declare -A DC DW SC SW
 
 for q in "${QUERIES[@]}"; do
-    DUCKDB_TIMING="$PROJECT_DIR/timings_duckdb_sf${SF}_q${q}.csv"
-    SIRIUS_TIMING="$PROJECT_DIR/timings_sirius_sf${SF}_q${q}.csv"
+    DUCKDB_TIMING="$RUN_DIR/duckdb/q${q}/timings.csv"
+    SIRIUS_TIMING="$RUN_DIR/sirius/q${q}/timings.csv"
 
     if [ -f "$DUCKDB_TIMING" ]; then
         DC[$q]=$(awk -F',' '$1=="iter_1"{print $2}' "$DUCKDB_TIMING")
@@ -180,3 +194,4 @@ printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
     "$(printf '%.2fs' "$TOTAL_SC")" "$(printf '%.2fs' "$TOTAL_SW")" "$total_speedup"
 echo ""
 echo "============================================================"
+echo "All output saved to $RUN_DIR"
