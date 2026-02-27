@@ -24,13 +24,9 @@ CompileFlags:
 
 # Tweak the clangd parse settings for all files
 CompileFlags:
-  Compiler: clang++-18
+  Compiler: clang++
   CompilationDatabase: ./build/release
   Add:
-    - -x
-    - cuda
-    - -Wno-unknown-cuda-version
-    - --no-cuda-version-check
     # report all errors
     - "-ferror-limit=0"
     - "-ftemplate-backtrace-limit=0"
@@ -48,6 +44,10 @@ CompileFlags:
     - "--generate-code*"
     # strip gcc's -fcoroutines
     - -fcoroutines
+    # strip C++20 module flags (not supported by clangd)
+    - "-fmodules-ts"
+    - "-fmodule-mapper*"
+    - "-fdeps-format*"
     # strip CUDA flags unknown to clang
     - "-ccbin*"
     - "--compiler-options*"
