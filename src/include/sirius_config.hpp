@@ -42,7 +42,7 @@ constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES     = 100ULL * 1024 * 1024;  // 10
 /// or overridden at runtime using DuckDB SET commands.
 struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
-  uint64_t default_scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+  uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   /// Default size estimate (bytes) for VARCHAR columns when computing rows per batch.
   uint64_t default_scan_task_varchar_size = config::DEFAULT_SCAN_TASK_VARCHAR_SIZE;

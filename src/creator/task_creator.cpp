@@ -101,7 +101,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
         std::make_shared<op::scan::parquet_scan_task_global_state>(
           pipeline,
           &source_operator->Cast<op::sirius_physical_parquet_scan>(),
-          op_params.default_scan_task_batch_size));
+          op_params.scan_task_batch_size));
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
@@ -268,7 +268,7 @@ void task_creator::manager_loop()
           auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
             *scan_task_global_state,
             *_execution_context,
-            op_params.default_scan_task_batch_size,
+            op_params.scan_task_batch_size,
             op_params.default_scan_task_varchar_size);
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
