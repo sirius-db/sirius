@@ -30,6 +30,8 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
+#include <numeric>
+
 namespace sirius {
 namespace op {
 
@@ -103,6 +105,13 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::size_t current_partition_index = 0;
 
  public:
+  std::vector<int> get_output_grouping_indices() const
+  {
+    std::vector<int> indices(group_idx.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    return indices;
+  }
+
   // Source interface
   bool is_source() const override { return true; }
 
