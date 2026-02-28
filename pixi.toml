@@ -22,7 +22,7 @@ cuda = "12"
 cuda-version = "12.*"
 
 [feature.cuda12.activation.env]
-CUDAARCHS = "90a-real"
+CUDAARCHS = "89-real"
 
 [environments]
 default = ["cuda12"]

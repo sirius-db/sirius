@@ -24,3 +24,5 @@ cufile.log
 *result.csv
 *output.txt
 *.tsv
+*.parquet
+pixi.lock

@@ -1,0 +1,5 @@
+=== Sirius ClickBench Benchmark ===
+GPU: NVIDIA L40S
+Caching: 20 GB, Processing: 23 GB
+Tries: 3
+Date: Sat Feb 28 01:58:34 UTC 2026

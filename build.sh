@@ -46,7 +46,7 @@ export PATH="$PIXI_ENV/bin:$PATH"
     -DCMAKE_CUDA_HOST_COMPILER="$PIXI_ENV/bin/g++" \
     -DEXTENSION_STATIC_BUILD=1 \
     -DDUCKDB_EXTENSION_CONFIGS="$REPO/extension_config.cmake" \
-    -DDUCKDB_EXPLICIT_PLATFORM=linux_arm64 \
+    -DDUCKDB_EXPLICIT_PLATFORM=linux_amd64 \
     -S "$REPO/duckdb/" \
     -B "$REPO/build/release"
 
