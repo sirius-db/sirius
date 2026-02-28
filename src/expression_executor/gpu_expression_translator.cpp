@@ -35,6 +35,21 @@ gpu_expression_translator::translate_expression(duckdb::Expression const& expr,
   return result;
 }
 
+std::optional<gpu_expression_translator::translated_expression>
+gpu_expression_translator::translate_expression_with_names(
+  duckdb::Expression const& expr, column_name_resolver_fn column_name_resolver)
+{
+  reset_tree();
+  _column_name_resolver = std::move(column_name_resolver);
+  auto expr_ref         = add_expression(expr, cudf::ast::table_reference::LEFT);
+  _column_name_resolver = nullptr;
+  if (!expr_ref) { return std::nullopt; }
+  translated_expression result;
+  result.tree           = std::move(_ast_tree);
+  result.owned_literals = std::move(_literal_scalars);
+  return result;
+}
+
 std::optional<expr_ref> gpu_expression_translator::add_join_condition(
   duckdb::JoinCondition const& condition, bool swap_sides)
 {
@@ -120,8 +135,13 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   switch (expr.GetExpressionClass()) {
     case duckdb::ExpressionClass::BOUND_BETWEEN:
       return add_expression(expr.Cast<duckdb::BoundBetweenExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_CASE:
-      return std::nullopt;  // CASE expressions cannot be translated to cuDF ASTs
+    case duckdb::ExpressionClass::BOUND_CASE: {
+      SIRIUS_LOG_DEBUG(
+        "[expression_translator] CASE expressions cannot be translated to cuDF ASTs: {}",
+        expr.ToString());
+      return std::nullopt;
+    }
+      return std::nullopt;
     case duckdb::ExpressionClass::BOUND_CAST:
       return add_expression(expr.Cast<duckdb::BoundCastExpression>(), table_src);
     case duckdb::ExpressionClass::BOUND_COMPARISON:
@@ -431,6 +451,9 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   duckdb::BoundReferenceExpression const& expr, cudf::ast::table_reference const table_src)
 {
+  if (_column_name_resolver) {
+    return _ast_tree.emplace<cudf::ast::column_name_reference>(_column_name_resolver(expr.index));
+  }
   return _ast_tree.emplace<cudf::ast::column_reference>(expr.index, table_src);
 }
 

@@ -173,7 +173,6 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
   }
-
   auto files = bind_data.file_list->GetAllFiles();
   _file_paths.reserve(files.size());
   std::for_each(
@@ -195,7 +194,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 #endif
     });
 
-  // Initialize reader options for applying projections
+  // Initialize reader options for applying projections and filters
   _reader_options = cudf::io::parquet_reader_options::builder().build();
 
   // Construct the file readers and parse the metadata
@@ -211,25 +210,38 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       readers.push_back(std::move(reader));
     });
 
-  // Apply table filters
+  // If filtering or projecting with hybrid_scan_reader, we need column names
+  bool const try_filter = scan_op->table_filters && !scan_op->table_filters->filters.empty();
+  if (_is_projected || try_filter) {
+    if (scan_op->names.empty()) {
+      throw std::runtime_error(
+        "[parquet_scan_task_global_state] Cannot apply projection or filter: scan has no column "
+        "names");
+    }
+  }
+
+  // Try to apply table filter
   if (scan_op->table_filters && !scan_op->table_filters->filters.empty()) {
     auto duckdb_expr = _scan_op->get_table_filter_expression();
     if (duckdb_expr) {
+      // Name resolver: BoundReferenceExpression::index is a position in column_ids,
+      // and the primary index is the table column ordinal, which indexes into names.
+      auto name_resolver = [&scan_op](duckdb::idx_t ref_index) -> std::string {
+        auto primary_idx = scan_op->column_ids[ref_index].GetPrimaryIndex();
+        return scan_op->names[primary_idx];
+      };
       gpu_expression_translator translator(rmm::cuda_stream_default,
                                            cudf::get_current_device_resource_ref());
-      _translated_filter = translator.translate_expression(*duckdb_expr);
+      _translated_filter = translator.translate_expression_with_names(*duckdb_expr, name_resolver);
       if (_translated_filter) { _reader_options.set_filter(_translated_filter->back()); }
     }
   }
 
   // Apply projections by column name using DuckDB's bound column names.
   if (_is_projected) {
-    if (scan_op->names.empty()) {
-      throw std::runtime_error(
-        "[parquet_scan_task_global_state] Cannot apply projection: scan has no column names");
-    }
-
-    // We currently only support flat schemas for parquet scans with projections
+    // We currently only support flat schemas for parquet scans with projections. This is only
+    // because we need the set of needed column indices for partitioning the row groups, and
+    // determining the full set of column indices for a nested type is more complex.
     /// TODO: Support nested schemas for projected scans
     for (auto const& meta : _file_metadatas) {
       if (!detail::projected_columns_are_flat(meta, _selected_column_indices)) {

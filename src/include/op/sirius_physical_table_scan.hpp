@@ -125,17 +125,5 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   bool is_source() const override { return true; }
 };
 
-/**
- * @brief Convert a DuckDB TableFilterSet into a single bound DuckDB expression (conjunction of
- * all filters), suitable for passing to gpu_expression_translator::translate_expression().
- *
- * Returns nullptr if the filter set is empty or contains only unsupported filter types.
- */
-duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
-  const duckdb::TableFilterSet& filters,
-  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<duckdb::LogicalType>& returned_types,
-  const duckdb::vector<duckdb::idx_t>& projection_ids);
-
 }  // namespace op
 }  // namespace sirius

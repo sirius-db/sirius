@@ -21,6 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
@@ -116,7 +117,7 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
    */
   duckdb::unique_ptr<duckdb::Expression> get_table_filter_expression() const
   {
-    return sirius::op::convert_table_filters_to_expression(
+    return scan::convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, projection_ids);
   }
 };
