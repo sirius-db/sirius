@@ -29,6 +29,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "planner/query.hpp"
+#include "sirius_context.hpp"
 
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
@@ -91,10 +92,16 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+      const auto& op_params =
+        _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+          ->get_config()
+          .get_operator_params();
       _parquet_scan_operator_global_state_map.emplace(
         operator_id,
         std::make_shared<op::scan::parquet_scan_task_global_state>(
-          pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>()));
+          pipeline,
+          &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+          op_params.scan_task_batch_size));
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
@@ -254,8 +261,15 @@ void task_creator::manager_loop()
           size_t operator_id          = node->get_operator_id();
           auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
 
+          const auto& op_params =
+            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+              ->get_config()
+              .get_operator_params();
           auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-            *scan_task_global_state, *_execution_context);
+            *scan_task_global_state,
+            *_execution_context,
+            op_params.scan_task_batch_size,
+            op_params.default_scan_task_varchar_size);
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
               "No destination data repositories provided for scan task creation.");

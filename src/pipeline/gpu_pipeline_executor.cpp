@@ -23,6 +23,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
+#include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -139,6 +140,50 @@ void gpu_pipeline_executor::manager_loop()
                             pipeline]() mutable {
       try {
         task->execute(exc_stream);
+      } catch (oom_reschedule_exception& oom) {
+        SIRIUS_LOG_WARN("GPU Pipeline Executor: OOM reschedule, resuming from operator index {}",
+                        oom.get_resume_operator_index());
+
+        auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
+        if (!gpu_task) {
+          SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+          if (_completion_handler) {
+            _completion_handler->report_error(
+              "GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+          }
+          return;
+        }
+
+        // Mark old task as rescheduled so its destructor skips mark_task_completed().
+        // The rescheduled task will handle completion instead.
+        gpu_task->mark_as_rescheduled();
+
+        // Prepare intermediate data batches for re-processing.
+        // Operator outputs are in idle state; transition to task_created so
+        // lock_or_prepare_batch() can lock them for the rescheduled task.
+        auto intermediate_data = oom.release_intermediate_data();
+        if (intermediate_data) {
+          for (auto& batch : intermediate_data->get_data_batches()) {
+            if (batch) { batch->try_to_create_task(); }
+          }
+        }
+
+        // Build the rescheduled task via virtual factory (preserves derived type).
+        auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
+          std::move(intermediate_data), oom.get_resume_operator_index());
+        auto new_task_id =
+          _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
+        auto new_task = gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
+
+        // Brief backoff before rescheduling to allow other tasks to complete
+        // and free memory. Without this, a rescheduled task can spin in a tight
+        // OOM → reschedule → OOM loop consuming CPU without making progress.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        // Schedule the rescheduled task. It goes back through manager_loop()
+        // to acquire a fresh reservation before execution.
+        this->schedule(std::move(new_task));
+        return;
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
