@@ -272,11 +272,11 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 
   // Add the children and combine with AND/OR operations as we go
   auto result = add_expression(*expr.children[0], table_src);
+  if (!result) { return std::nullopt; }
+
   for (size_t i = 1; i < expr.children.size(); ++i) {
     // Add child expression
     auto child_expr = add_expression(*expr.children[i], table_src);
-
-    // Check for failure in translating child
     if (!child_expr) { return std::nullopt; }
 
     // Combine with previous children using AND/OR
