@@ -46,12 +46,24 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
   // Clone the reader
   auto cloned_reader =
     std::make_unique<hybrid_scan_reader>(_parquet_reader->parquet_metadata(), _reader_options);
+  if (_page_index_buffer) {
+    return std::make_unique<host_parquet_representation>(&get_memory_space(),
+                                                         std::move(allocation_copy),
+                                                         std::move(cloned_reader),
+                                                         _reader_options,
+                                                         _row_group_indices,
+                                                         _filter_column_chunk_byte_ranges,
+                                                         _payload_column_chunk_byte_ranges,
+                                                         _size_in_bytes,
+                                                         _uncompressed_size_in_bytes,
+                                                         _page_index_buffer);
+  }
   return std::make_unique<host_parquet_representation>(&get_memory_space(),
                                                        std::move(allocation_copy),
                                                        std::move(cloned_reader),
                                                        _reader_options,
                                                        _row_group_indices,
-                                                       _column_chunk_byte_ranges,
+                                                       _all_column_chunk_byte_ranges,
                                                        _size_in_bytes,
                                                        _uncompressed_size_in_bytes);
 }

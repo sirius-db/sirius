@@ -154,6 +154,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   size_t approximate_batch_size)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _scan_op(scan_op),
+    _use_multistage_decompression(use_multistage_decompression),
     _approximate_batch_size(approximate_batch_size),
     _selected_column_indices(detail::make_selected_column_indices(*scan_op))
 {
@@ -202,16 +203,27 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 
   // Construct the file readers and parse the metadata
   std::vector<std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader>> readers;
+  std::vector<std::future<std::unique_ptr<cudf::io::datasource::buffer>>> page_index_futures;
   _file_metadatas.reserve(files.size());
   readers.reserve(files.size());
-  std::for_each(
-    footer_buffers.begin(), footer_buffers.end(), [&readers, this](auto& footer_buffer) {
-      auto reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
-        cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-        _reader_options);
-      _file_metadatas.push_back(reader->parquet_metadata());
-      readers.push_back(std::move(reader));
-    });
+  if (_use_multistage_decompression) {
+    page_index_futures.reserve(files.size());
+    _page_index_buffers.reserve(files.size());
+  }
+  for (size_t file_idx = 0; file_idx < files.size(); ++file_idx) {
+    auto const* footer_buffer = footer_buffers[file_idx].get();
+    auto reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
+      cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+      _reader_options);
+    // Read page index if multistage decompression is enabled
+    if (_use_multistage_decompression) {
+      auto page_index_byte_range = reader->page_index_byte_range();
+      page_index_futures.push_back(datasources[file_idx]->host_read_async(
+        page_index_byte_range.offset(), page_index_byte_range.size()));
+    }
+    _file_metadatas.push_back(reader->parquet_metadata());
+    readers.push_back(std::move(reader));
+  }
 
   // If filtering or projecting with hybrid_scan_reader, we need column names
   bool const try_filter   = scan_op->table_filters && !scan_op->table_filters->filters.empty();
@@ -316,6 +328,13 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     // Emit any trailing partition smaller than the target size.
     flush_partition();
   }
+
+  // Ensure the page index buffers are ready
+  if (_use_multistage_decompression) {
+    std::for_each(page_index_futures.begin(), page_index_futures.end(), [this](auto& future) {
+      _page_index_buffers.emplace_back(future.get());
+    });
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -373,38 +392,47 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   // Get the byte ranges for the range of row groups assigned to this task
   auto const& rg_indices = l_state.get_rg_indices();
   auto const rg_span = cudf::host_span<cudf::size_type const>(rg_indices.data(), rg_indices.size());
-  auto byte_ranges   = reader->all_column_chunks_byte_ranges(rg_span, g_state.get_options());
+  std::unique_ptr<host_parquet_representation> parquet_representation;
 
-  // Read each byte range into the allocation asynchronously
-  std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
-  new_byte_ranges.reserve(byte_ranges.size());
-  int64_t new_offset = 0;
-  std::vector<std::future<std::size_t>> read_futures;
-  for (auto const& range : byte_ranges) {
-    read_range_into_allocation(
-      range.offset(), range.size(), data_accessor, allocation, read_futures);
-    new_byte_ranges.emplace_back(new_offset, range.size());
-    new_offset += range.size();
+  if (g_state.use_multistage_decompression()) {
+    /// TODO: do this....
+    auto page_index_buffer = g_state.get_page_index_buffer(l_state.get_file_idx());
+  } else {
+    auto byte_ranges = reader->all_column_chunks_byte_ranges(rg_span, g_state.get_options());
+
+    // Read each byte range into the allocation asynchronously
+    std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
+    new_byte_ranges.reserve(byte_ranges.size());
+    int64_t new_offset = 0;
+    std::vector<std::future<std::size_t>> read_futures;
+    for (auto const& range : byte_ranges) {
+      read_range_into_allocation(
+        range.offset(), range.size(), data_accessor, allocation, read_futures);
+      new_byte_ranges.emplace_back(new_offset, range.size());
+      new_offset += range.size();
+    }
+    std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
+
+    if (new_offset != l_state.get_reserved_compressed_bytes()) {
+      // Metadata / file data mismatch
+      throw std::runtime_error(
+        "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match "
+        "reserved "
+        "compressed bytes");
+    }
+
+    parquet_representation =
+      std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
+                                                    std::move(allocation),
+                                                    std::move(reader),
+                                                    g_state.get_options(),
+                                                    std::move(l_state.get_rg_indices()),
+                                                    std::move(new_byte_ranges),
+                                                    l_state.get_reserved_compressed_bytes(),
+                                                    l_state.get_reserved_uncompressed_bytes());
   }
-  std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
 
-  if (new_offset != l_state.get_reserved_compressed_bytes()) {
-    // Metadata / file data mismatch
-    throw std::runtime_error(
-      "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
-      "compressed bytes");
-  }
-
-  // Create a data batch with the column chunks
-  auto parquet_representation =
-    std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
-                                                  std::move(allocation),
-                                                  std::move(reader),
-                                                  g_state.get_options(),
-                                                  std::move(l_state.get_rg_indices()),
-                                                  std::move(new_byte_ranges),
-                                                  l_state.get_reserved_compressed_bytes(),
-                                                  l_state.get_reserved_uncompressed_bytes());
+  // Create a data batch with the parquet representation and return it wrapped in operator_data
   auto data_batch =
     std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
   return std::make_unique<op::operator_data>(

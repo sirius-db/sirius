@@ -24,8 +24,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // cudf
-#include "cudf/cudf_utils.hpp"
-
+#include <cudf/cudf_utils.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -64,8 +63,13 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 {
   // Source stuff
   auto& host_src          = source.cast<host_parquet_representation>();
-  auto const& byte_ranges = host_src.get_column_chunk_byte_ranges();
+  auto const& byte_ranges = host_src.get_all_column_chunk_byte_ranges();
   auto& reader            = host_src.get_parquet_reader();
+  // Setup page stats for multistage decompression if enabled
+  if (host_src.get_page_index_buffer() != nullptr) {
+    reader.setup_page_index(cudf::host_span<uint8_t const>(
+      host_src.get_page_index_buffer()->data(), host_src.get_page_index_buffer()->size()));
+  }
 
   // Target stuff
   rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
@@ -73,9 +77,6 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
   rmm::cuda_set_device_raii target_device_raii(target_device_id);
 
   auto const& allocation = host_src.get_column_chunks();
-
-  // The following pattern follows the example here:
-  // https://github.com/rapidsai/cudf/blob/main/cpp/examples/hybrid_scan_io/common_utils.cpp#L160
 
   // Allocate a single device buffer and partition it according to the byte ranges
   std::vector<cudf::device_span<uint8_t const>> column_chunk_spans_d;
@@ -130,20 +131,36 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 #endif
 
   // Invoke the Parquet reader to materialize the table on GPU
+  cudf::io::table_with_metadata result;
 #if CUDF_VERSION_NUM >= 2604
   auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
     column_chunk_spans_d.data(), column_chunk_spans_d.size());
-  auto result = reader.materialize_all_columns(
-    host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
+
+  // Do multistage decompression if enabled
+  if (host_src.get_page_index_buffer() != nullptr) {
+    /// TODO
+  } else {
+    result = reader.materialize_all_columns(
+      host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
+  }
 #else
   // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
   std::vector<rmm::device_buffer> column_chunk_buffers;
   for (auto const& span : column_chunk_spans_d) {
     column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
   }
-  auto result = reader.materialize_all_columns(
-    host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
+
+  // Do multistage decompression if enabled
+  if (host_src.get_page_index_buffer() != nullptr) {
+    /// TODO
+  } else {
+    result = reader.materialize_all_columns(host_src.get_rg_span(),
+                                            std::move(column_chunk_buffers),
+                                            host_src.get_reader_options(),
+                                            stream);
+  }
 #endif
+
   auto new_table = std::move(result.tbl);  // Discard metadata
   stream.synchronize();
 
@@ -159,8 +176,12 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view /* stream */)
 {
-  auto& host_src       = source.cast<host_parquet_representation>();
-  auto const data_size = host_src.get_size_in_bytes();
+  auto& host_src             = source.cast<host_parquet_representation>();
+  auto const data_size       = host_src.get_size_in_bytes();
+  auto const& reader_options = host_src.get_reader_options();
+  auto page_index_buffer     = host_src.get_page_index_buffer();
+  auto cloned_reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
+    host_src.get_parquet_reader().parquet_metadata(), reader_options);
 
   assert(source.get_device_id() != target_memory_space->get_device_id());
   auto* mr = target_memory_space
@@ -202,12 +223,13 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
   return std::make_unique<host_parquet_representation>(
     const_cast<cucascade::memory::memory_space*>(target_memory_space),
     std::move(dst_allocation),
-    std::move(host_src.move_parquet_reader()),
-    host_src.get_reader_options(),
-    std::move(host_src.get_row_group_indices()),
-    std::move(host_src.get_column_chunk_byte_ranges()),
+    std::move(cloned_reader),
+    reader_options,
+    host_src.get_row_group_indices(),
+    host_src.get_all_column_chunk_byte_ranges(),
     data_size,
-    host_src.get_uncompressed_size_in_bytes());
+    host_src.get_uncompressed_size_in_bytes(),
+    std::move(page_index_buffer));
 }
 
 }  // namespace detail

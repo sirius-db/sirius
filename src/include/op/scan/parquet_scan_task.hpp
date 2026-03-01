@@ -41,6 +41,7 @@
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/utilities/error.hpp>
 
 // standard library
 #include <atomic>
@@ -103,6 +104,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   [[nodiscard]] sirius_physical_parquet_scan& get_operator() { return *_scan_op; }
 
   /**
+   * @brief Get the multistage decompression flag.
+   *
+   * @return The multistage decompression flag.
+   */
+  [[nodiscard]] bool use_multistage_decompression() const { return _use_multistage_decompression; }
+
+  /**
    * @brief Get the file path of the Parquet file to scan.
    *
    * @param[in] file_idx The index of the file path to retrieve.
@@ -111,6 +119,20 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   [[nodiscard]] std::string const& get_file_path(size_t file_idx) const
   {
     return _file_paths[file_idx];
+  }
+
+  /**
+   * @brief Get the page index buffer for a given file index.
+   *
+   * @param[in] file_idx The index of the file to get the page index buffer for.
+   * @return A shared pointer to the page index buffer for the given file.
+   */
+  [[nodiscard]] std::shared_ptr<cudf::io::datasource::buffer> get_page_index_buffer(
+    size_t file_idx) const
+  {
+    CUDF_EXPECTS(file_idx < _page_index_buffers.size(),
+                 "File index out of range for page index buffers");
+    return _page_index_buffers[file_idx];
   }
 
   /**
@@ -208,10 +230,16 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   //===----------Fields----------===//
   size_t _approximate_batch_size;          ///< Target approximate batch size for scan tasks
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
+  bool _use_multistage_decompression;      ///< Whether to use multistage decompression (i.e., read
+                                           ///< page index and apply page-level filtering in the
+                                           ///< decompression path)
 
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
-  cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
+  std::vector<std::shared_ptr<cudf::io::datasource::buffer>>
+    _page_index_buffers;  ///< The page index buffers for each file (if multistage decompression
+                          ///< enabled)
+  cudf::io::parquet_reader_options _reader_options;  ///< Parquet reader options
   std::optional<gpu_expression_translator::translated_expression>
     _translated_filter;  ///< The translated filter expression as cuDF AST
 
