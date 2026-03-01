@@ -207,7 +207,6 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   //===----------Fields----------===//
   size_t _approximate_batch_size;          ///< Target approximate batch size for scan tasks
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
-  bool _is_projected;                      ///< Whether projection is applied
 
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata

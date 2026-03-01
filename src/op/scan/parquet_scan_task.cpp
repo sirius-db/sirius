@@ -154,7 +154,6 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _scan_op(scan_op),
     _approximate_batch_size(approximate_batch_size),
-    _is_projected(!scan_op->projection_ids.empty()),
     _selected_column_indices(detail::make_selected_column_indices(*scan_op))
 {
   if (scan_op->function.in_out_function) {
@@ -212,7 +211,8 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 
   // If filtering or projecting with hybrid_scan_reader, we need column names
   bool const try_filter = scan_op->table_filters && !scan_op->table_filters->filters.empty();
-  if (_is_projected || try_filter) {
+  bool const is_projected = !_selected_column_indices.empty();
+  if (is_projected || try_filter) {
     if (scan_op->names.empty()) {
       throw std::runtime_error(
         "[parquet_scan_task_global_state] Cannot apply projection or filter: scan has no column "
@@ -221,7 +221,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   }
 
   // Try to apply table filter
-  if (scan_op->table_filters && !scan_op->table_filters->filters.empty()) {
+  if (try_filter) {
     auto duckdb_expr = _scan_op->get_table_filter_expression();
     if (duckdb_expr) {
       // Name resolver: BoundReferenceExpression::index is a position in column_ids,
@@ -238,7 +238,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   }
 
   // Apply projections by column name using DuckDB's bound column names.
-  if (_is_projected) {
+  if (is_projected) {
     // We currently only support flat schemas for parquet scans with projections. This is only
     // because we need the set of needed column indices for partitioning the row groups, and
     // determining the full set of column indices for a nested type is more complex.
