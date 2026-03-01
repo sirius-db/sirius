@@ -802,8 +802,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         }
 
         // Create partition_distinct — external to delim join, in its own pipeline
-        auto partition_distinct = make_uniq<op::sirius_physical_partition>(
-          distinct_op->types, distinct_op->estimated_cardinality, distinct_op.get(), false, op_params.hash_partition_bytes);
+        auto partition_distinct =
+          make_uniq<op::sirius_physical_partition>(distinct_op->types,
+                                                   distinct_op->estimated_cardinality,
+                                                   distinct_op.get(),
+                                                   false,
+                                                   op_params.hash_partition_bytes);
         op::sirius_physical_partition* partition_distinct_ptr =
           static_cast<op::sirius_physical_partition*>(partition_distinct.get());
 
