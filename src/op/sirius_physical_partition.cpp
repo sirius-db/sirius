@@ -77,8 +77,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
                                                             bool is_build)
 {
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-    _partition_type = PartitionType::HASH;
-    set_sibling_op_for_join(op);
+    _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
       auto& condition = hash_join_op.conditions[cond_idx];
@@ -113,7 +112,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _partition_type = PartitionType::NONE;
-    set_sibling_op_for_join(op);
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -152,36 +150,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 }
 
 bool sirius_physical_partition::is_build_partition() { return _is_build; }
-
-void sirius_physical_partition::set_sibling_op_for_join(sirius_physical_operator* join_op)
-{
-  if (!join_op) {
-    throw std::runtime_error(
-      "Received null join operator when setting partition operator sibling for join for operator "
-      "id: " +
-      std::to_string(this->get_operator_id()));
-  }
-  if (join_op->type != SiriusPhysicalOperatorType::HASH_JOIN &&
-      join_op->type != SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-    throw std::runtime_error(
-      "Received wrong operator type when setting partition operator sibling for join for operator "
-      "id: " +
-      std::to_string(this->get_operator_id()) + " operator was of type: " + join_op->get_name());
-  }
-
-  for (auto& child : join_op->children) {
-    if (child->type == SiriusPhysicalOperatorType::CONCAT && child->children.size() == 1) {
-      auto& grandchild = child->children[0];
-      if (grandchild->operator_id != operator_id &&
-          grandchild->type == SiriusPhysicalOperatorType::PARTITION) {
-        _sibling_op_for_join = grandchild.get();
-        return;
-      }
-    }
-  }
-  throw std::runtime_error("Could not locate sibling for join for operator id: " +
-                           std::to_string(this->get_operator_id()));
-}
 
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
@@ -276,16 +244,20 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
       _num_partitions = determine_num_partitions();
-      if (_sibling_op_for_join) {
-        if (!_is_build) {
-          SIRIUS_LOG_WARN(
-            "sirius_physical_partition non build side is setting the number of partitions in "
-            "operator {}, with siblig {}",
-            this->get_operator_id(),
-            _sibling_op_for_join->get_operator_id());
-        }
-        _sibling_op_for_join->Cast<sirius_physical_partition>().set_num_partitions(
+      if (_sibling_partition_op) {
+        SIRIUS_LOG_DEBUG(
+          "sirius_physical_partition id {} determined {} partitions on sibling id {} and {} build "
+          "side",
+          this->get_operator_id(),
+          _num_partitions.value(),
+          _sibling_partition_op->get_operator_id(),
+          (_is_build ? "is" : "is not"));
+        _sibling_partition_op->Cast<sirius_physical_partition>().set_num_partitions(
           _num_partitions.value());
+      } else {
+        SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions",
+                         this->get_operator_id(),
+                         _num_partitions.value());
       }
     }
   }
