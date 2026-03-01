@@ -210,7 +210,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     });
 
   // If filtering or projecting with hybrid_scan_reader, we need column names
-  bool const try_filter = scan_op->table_filters && !scan_op->table_filters->filters.empty();
+  bool const try_filter   = scan_op->table_filters && !scan_op->table_filters->filters.empty();
   bool const is_projected = !_selected_column_indices.empty();
   if (is_projected || try_filter) {
     if (scan_op->names.empty()) {
