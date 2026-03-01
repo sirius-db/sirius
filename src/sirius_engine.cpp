@@ -376,10 +376,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             current_pipeline->operators[op_idx].get().type ==
               op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
           join_positions.push_back(op_idx);
-          printf("join_positions: %zu\n", op_idx);
-          for (auto& op : current_pipeline->operators) {
-            printf("operator type: %s %p\n", op.get().get_name().c_str(), &op.get());
-          }
         }
       }
 
@@ -499,10 +495,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             // remove operators from current pipeline
             current_pipeline->operators.erase(current_pipeline->operators.begin(),
                                               current_pipeline->operators.begin() + join_pos);
-            // print the operators in the current pipeline
-            for (auto& op : current_pipeline->operators) {
-              printf("operator type: %s %p\n", op.get().get_name().c_str(), &op.get());
-            }
             current_pipeline->source = concat_ptr;
           }
 
@@ -517,9 +509,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         duckdb::unique_ptr<op::sirius_physical_partition> partition_op;
         duckdb::unique_ptr<op::sirius_physical_concat> concat_op;
         auto hash_join_op = current_pipeline->get_sink();
-        printf("hash join operator type: %s %p\n",
-               hash_join_op.get()->get_name().c_str(),
-               hash_join_op.get());
         if (current_pipeline->operators.size() == 0) {
           // source -> partition -> hash join
           concat_op = make_uniq<op::sirius_physical_concat>(
@@ -922,9 +911,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         // Wire distinct_op -> partition_distinct (distinct output pushed via distinct's
         // next_port_after_sink)
         for (auto dependent_pipeline : source_to_pipelines[distinct_op]) {
-          printf("wiring distinct_op to dependent_pipeline: %s %p\n",
-                 dependent_pipeline->get_sink()->get_name().c_str(),
-                 dependent_pipeline->get_sink().get());
           insert_repository("default", distinct_op, new_scheduled[i], dependent_pipeline);
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
@@ -951,9 +937,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           // Instead, connect directly to the HASH_JOIN operator stored in parent_op.
           // Find the pipeline containing this HASH_JOIN as the first operator.
           op::sirius_physical_operator* hash_join_op = concat.get_parent_op();
-          printf("hash join operator looking for type: %s %p\n",
-                 hash_join_op->get_name().c_str(),
-                 hash_join_op);
           bool found = false;
           for (size_t j = 0; j < new_scheduled.size(); j++) {
             // The join is guaranteed to be the first operator in the pipeline
