@@ -150,6 +150,7 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_parquet_scan* scan_op,
+  bool use_multistage_decompression,
   size_t approximate_batch_size)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _scan_op(scan_op),
@@ -178,6 +179,9 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     files.begin(), files.end(), [this](auto const& file) { _file_paths.push_back(file.path); });
 
   // Construct the io_sources and read the footers
+  /// TODO: fetch page index bytes and setup the page index for each reader before getting metadata
+  /// TODO: the rest of the stuff goes into the converter
+  /// TODO: pass multistage_decompression flag to the parquet representation
   std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
   std::vector<std::unique_ptr<cudf::io::datasource::buffer>> footer_buffers;
   datasources.reserve(files.size());
