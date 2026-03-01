@@ -66,6 +66,12 @@ class sirius_physical_partition : public sirius_physical_operator {
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
   [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
+  [[nodiscard]] sirius_physical_operator* get_sibling_partition_op() const { return _sibling_partition_op; }
+
+  bool has_sibling() const { return _has_sibling_partition_op; }
+
+  void set_sibling_partition_op(sirius_physical_operator* sibling_partition_op) { _sibling_partition_op = sibling_partition_op; }
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
@@ -74,6 +80,7 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
   sirius_physical_operator* _parent_op;
+  sirius_physical_operator* _sibling_partition_op;
   std::vector<int> _partition_keys;
   /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
   /// cast the key column to this type before hashing.  Used to align hash values when the
@@ -81,6 +88,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   std::vector<cudf::data_type> _partition_key_cast_types;
   int _num_partitions;
   bool _is_build;
+  bool _has_sibling_partition_op;
   PartitionType _partition_type;
   uint64_t s_partition_size;
 };

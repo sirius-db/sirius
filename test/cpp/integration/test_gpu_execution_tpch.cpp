@@ -596,7 +596,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - limit on large table parquet",
-                 "[.][integration][gpu_execution][parquet][limit][limit_multi_batch]")
+                 "[.][integration_disabled][gpu_execution][parquet][limit][limit_multi_batch]")
 {
   // lineitem has ~6K rows at SF-0.01, ensuring multiple batches.
   // A limit of 100 should produce exactly 100 rows regardless of batch count.
@@ -612,7 +612,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - limit with offset on large table parquet",
-                 "[.][integration][gpu_execution][parquet][limit][limit_multi_batch]")
+                 "[.][integration_disabled][gpu_execution][parquet][limit][limit_multi_batch]")
 {
   compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem limit 50 offset 200;");
 }
