@@ -937,7 +937,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           // Instead, connect directly to the HASH_JOIN operator stored in parent_op.
           // Find the pipeline containing this HASH_JOIN as the first operator.
           op::sirius_physical_operator* hash_join_op = concat.get_parent_op();
-          bool found = false;
+          bool found                                 = false;
           for (size_t j = 0; j < new_scheduled.size(); j++) {
             // The join is guaranteed to be the first operator in the pipeline
             if (new_scheduled[j]->operators.size() > 0 &&
