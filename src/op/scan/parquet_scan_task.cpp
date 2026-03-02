@@ -180,9 +180,6 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     files.begin(), files.end(), [this](auto const& file) { _file_paths.push_back(file.path); });
 
   // Construct the io_sources and read the footers
-  /// TODO: fetch page index bytes and setup the page index for each reader before getting metadata
-  /// TODO: the rest of the stuff goes into the converter
-  /// TODO: pass multistage_decompression flag to the parquet representation
   std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
   std::vector<std::unique_ptr<cudf::io::datasource::buffer>> footer_buffers;
   datasources.reserve(files.size());
@@ -215,7 +212,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     auto reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
       cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
       _reader_options);
-    // Read page index if multistage decompression is enabled
+    // Read page indexes asynchronously if multistage decompression is enabled
     if (_use_multistage_decompression) {
       auto page_index_byte_range = reader->page_index_byte_range();
       page_index_futures.push_back(datasources[file_idx]->host_read_async(
@@ -392,13 +389,61 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   // Get the byte ranges for the range of row groups assigned to this task
   auto const& rg_indices = l_state.get_rg_indices();
   auto const rg_span = cudf::host_span<cudf::size_type const>(rg_indices.data(), rg_indices.size());
-  std::unique_ptr<host_parquet_representation> parquet_representation;
 
+  std::unique_ptr<host_parquet_representation> parquet_representation;
   if (g_state.use_multistage_decompression()) {
-    /// TODO: do this....
+    // Setup the page index
     auto page_index_buffer = g_state.get_page_index_buffer(l_state.get_file_idx());
+    reader->setup_page_index(
+      cudf::host_span<uint8_t const>(page_index_buffer->data(), page_index_buffer->size()));
+
+    // Get the filter and column byte ranges
+    auto const filter_byte_ranges =
+      reader->filter_column_chunks_byte_ranges(rg_span, g_state.get_options());
+    auto const payload_byte_ranges =
+      reader->payload_column_chunks_byte_ranges(rg_span, g_state.get_options());
+
+    // Read each byte range into the allocation asynchronously
+    std::vector<cudf::io::text::byte_range_info> new_filter_byte_ranges;
+    std::vector<cudf::io::text::byte_range_info> new_payload_byte_ranges;
+    new_filter_byte_ranges.reserve(filter_byte_ranges.size());
+    new_payload_byte_ranges.reserve(payload_byte_ranges.size());
+    std::vector<std::future<std::size_t>> read_futures;
+    int64_t new_offset = 0;
+    for (auto const& range : filter_byte_ranges) {
+      read_range_into_allocation(
+        range.offset(), range.size(), data_accessor, allocation, read_futures);
+      new_filter_byte_ranges.emplace_back(new_offset, range.size());
+      new_offset += range.size();
+    }
+    for (auto const& range : payload_byte_ranges) {
+      read_range_into_allocation(
+        range.offset(), range.size(), data_accessor, allocation, read_futures);
+      new_payload_byte_ranges.emplace_back(new_offset, range.size());
+      new_offset += range.size();
+    }
+    std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
+
+    if (new_offset != l_state.get_reserved_compressed_bytes()) {
+      // Metadata / file data mismatch
+      throw std::runtime_error(
+        "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match "
+        "reserved compressed bytes");
+    }
+    
+    parquet_representation = std::make_unique<host_parquet_representation>(
+      l_state.get_memory_space(),
+      std::move(allocation),
+      std::move(reader),
+      g_state.get_options(),
+      std::move(l_state.get_rg_indices()),
+      std::move(new_filter_byte_ranges),
+      std::move(new_payload_byte_ranges),
+      l_state.get_reserved_compressed_bytes(),
+      l_state.get_reserved_uncompressed_bytes(),
+      g_state.get_page_index_buffer(l_state.get_file_idx()));
   } else {
-    auto byte_ranges = reader->all_column_chunks_byte_ranges(rg_span, g_state.get_options());
+    auto const byte_ranges = reader->all_column_chunks_byte_ranges(rg_span, g_state.get_options());
 
     // Read each byte range into the allocation asynchronously
     std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
@@ -417,8 +462,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
       // Metadata / file data mismatch
       throw std::runtime_error(
         "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match "
-        "reserved "
-        "compressed bytes");
+        "reserved compressed bytes");
     }
 
     parquet_representation =
