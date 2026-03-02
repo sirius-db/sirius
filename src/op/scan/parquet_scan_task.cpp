@@ -430,7 +430,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
         "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match "
         "reserved compressed bytes");
     }
-    
+
     parquet_representation = std::make_unique<host_parquet_representation>(
       l_state.get_memory_space(),
       std::move(allocation),
