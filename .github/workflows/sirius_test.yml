@@ -8,7 +8,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, gpu]
     timeout-minutes: 60
     steps:
       - name: Cleanup
