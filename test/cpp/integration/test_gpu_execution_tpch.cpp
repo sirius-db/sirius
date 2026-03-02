@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
