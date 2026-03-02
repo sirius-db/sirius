@@ -112,6 +112,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _partition_type = PartitionType::NONE;
+    _num_partitions = 1;
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -157,10 +158,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() != 1) {
-    throw std::runtime_error("We expect only one input batch for partition operator");
+    throw std::runtime_error("We expect only one input batch for partition operator " +
+                             std::to_string(this->get_operator_id()));
   }
-
-  if (!_num_partitions.has_value() || _num_partitions.value() < 2 || _partition_keys.empty()) {
+  if (!_num_partitions.has_value()) {
+    throw std::runtime_error("Num partitions was not set in sirius_physical_partition operator " +
+                             std::to_string(this->get_operator_id()));
+  }
+  if (_num_partitions.value() < 2 || _partition_keys.empty()) {
     return std::make_unique<operator_data>(input_data);
   }
 
