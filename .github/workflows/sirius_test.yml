@@ -1,4 +1,4 @@
-name: Sirius Test
+name: Sirius GPU Test
 
 on: [push, pull_request, workflow_dispatch]
 
@@ -7,8 +7,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: [self-hosted, Linux, X64, gpu]
+  cpu_build:
+    runs-on: [self-hosted, Linux, X64, cpu-xl]
     timeout-minutes: 60
     steps:
       - name: Cleanup
@@ -25,8 +25,39 @@ jobs:
           activate-environment: true
       - name: Build
         env:
-          CUDAARCHS: native
+          CUDAARCHS: "75" # For Turing, T4 capability
         run: make -j$(nproc)
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.run_id }}
+          path: build/
+          retention-days: 1
+
+  gpu_test:
+    runs-on: [self-hosted, Linux, X64, gpu-t4]
+    needs: build
+    timeout-minutes: 60
+    steps:
+      - name: Cleanup
+        run: rm -rf -- * .[^.]* ..?*
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+        with:
+          pixi-version: v0.59.0
+          activate-environment: true
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ github.run_id }}
+          path: build/
+      - name: Restore executable permissions
+        run: chmod -R u+x build/
       - name: Run C++ unit tests
         run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
       - name: Prepare SQL test datasets
