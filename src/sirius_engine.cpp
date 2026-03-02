@@ -351,7 +351,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto new_scan_op = construct_sirius_specific_operator(&scan_op);
           // todo(bobbi) currently this can be set to any operator since it's never used, and now we
           // set it to scan_op
-          new_pipeline->source = &scan_op;
+          new_pipeline->source = nullptr;
           new_pipeline->sink   = new_scan_op.get();
 
           current_pipeline->source = new_scan_op.get();
