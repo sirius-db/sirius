@@ -106,9 +106,14 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /**
    * @brief Get the multistage decompression flag.
    *
+   * Multistage decompression can only be used if there is a translated filter expression.
+   *
    * @return The multistage decompression flag.
    */
-  [[nodiscard]] bool use_multistage_decompression() const { return _use_multistage_decompression; }
+  [[nodiscard]] bool use_multistage_decompression() const
+  {
+    return _use_multistage_decompression && _translated_filter;
+  }
 
   /**
    * @brief Get the file path of the Parquet file to scan.
@@ -146,6 +151,27 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   [[nodiscard]] cudf::io::parquet_reader_options const& get_options() const
   {
     return _reader_options;
+  }
+
+  /**
+   * @brief Get the column reorder map for reordering concatenated filter and payload columns.
+   *
+   * @return A const reference to the column index permutation.
+   */
+  [[nodiscard]] std::vector<cudf::size_type> const& get_column_reorder_map() const
+  {
+    return _column_reorder_map;
+  }
+
+  /**
+   * @brief Get the shared translated filter expression, for pinning the AST lifetime.
+   *
+   * @return A shared pointer to the translated filter expression.
+   */
+  [[nodiscard]] std::shared_ptr<gpu_expression_translator::translated_expression>
+  get_translated_filter() const
+  {
+    return _translated_filter;
   }
 
   /**
@@ -240,8 +266,14 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     _page_index_buffers;  ///< The page index buffers for each file (if multistage decompression
                           ///< enabled)
   cudf::io::parquet_reader_options _reader_options;  ///< Parquet reader options
-  std::optional<gpu_expression_translator::translated_expression>
-    _translated_filter;  ///< The translated filter expression as cuDF AST
+  std::shared_ptr<gpu_expression_translator::translated_expression>
+    _translated_filter;  ///< The translated filter expression as cuDF AST. Shared so that
+                         ///< host_parquet_representation can pin the AST and its owned scalars
+                         ///< beyond the lifetime of this global state
+  std::vector<cudf::size_type>
+    _column_reorder_map;  ///< Permutation for reordering concatenated filter and payload columns
+                          ///< back to original order when using multistage decompression with the
+                          ///< hybrid_scan_reader
 
   std::vector<row_group_range> _row_group_partitions;  ///< Row-group partitions for tasks
   std::vector<size_t> _selected_column_indices;        ///< Column indices to read (projection)

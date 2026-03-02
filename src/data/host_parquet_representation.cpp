@@ -47,28 +47,21 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
   auto cloned_reader =
     std::make_unique<hybrid_scan_reader>(_parquet_reader->parquet_metadata(), _reader_options);
   if (_page_index_buffer) {
-    // Setup the page index in the cloned reader
     cloned_reader->setup_page_index(
       cudf::host_span<uint8_t const>(_page_index_buffer->data(), _page_index_buffer->size()));
-    return std::make_unique<host_parquet_representation>(&get_memory_space(),
-                                                         std::move(allocation_copy),
-                                                         std::move(cloned_reader),
-                                                         _reader_options,
-                                                         _row_group_indices,
-                                                         _filter_column_chunk_byte_ranges,
-                                                         _payload_column_chunk_byte_ranges,
-                                                         _size_in_bytes,
-                                                         _uncompressed_size_in_bytes,
-                                                         _page_index_buffer);
   }
+
   return std::make_unique<host_parquet_representation>(&get_memory_space(),
                                                        std::move(allocation_copy),
                                                        std::move(cloned_reader),
                                                        _reader_options,
                                                        _row_group_indices,
-                                                       _all_column_chunk_byte_ranges,
+                                                       _byte_ranges,
                                                        _size_in_bytes,
-                                                       _uncompressed_size_in_bytes);
+                                                       _uncompressed_size_in_bytes,
+                                                       _translated_filter_pin,
+                                                       _page_index_buffer,
+                                                       _column_reorder_map);
 }
 
 }  // namespace sirius

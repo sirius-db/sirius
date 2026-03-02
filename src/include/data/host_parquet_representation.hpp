@@ -16,6 +16,9 @@
 
 #pragma once
 
+// sirius
+#include <expression_executor/gpu_expression_translator.hpp>
+
 // cucascade
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -46,46 +49,24 @@ class host_parquet_representation : public cucascade::idata_representation {
 
  public:
   /**
-   * @brief Constructs a host_parquet_representation.
+   * @brief Describes how column chunk byte ranges are organized in the allocation.
    *
-   * @param[in] memory_space The memory space to which the representation beloongs.
-   * @param[in] column_chunks The fixed multiple blocks allocation containing the Parquet column
-   * chunks.
-   * @param[in] parquet_reader An instance hybrid scan Parquet reader for a given Parquet file.
-   * @param[in] reader_options The Parquet reader options used to configure the hybrid scan reader
-   * for materializing data.
-   * @param[in] row_group_indices The row group indices of the row groups represented in the
-   * multiple blocks allocation.
-   * @param[in] column_chunk_byte_ranges The byte ranges in the multiple blocks allocation
-   * representing the column chunks to be read.
-   * @param[in] size_in_bytes The size of the representation in bytes (compressed).
-   * @param[in] uncompressed_size_in_bytes The uncompressed size of the data represented by this
-   * representation.
+   * In non-multistage mode, all column chunks are stored contiguously in `all`.
+   * In multistage mode, filter and payload column chunks are stored separately.
    */
-  host_parquet_representation(cucascade::memory::memory_space* memory_space,
-                              cucascade::memory::fixed_multiple_blocks_allocation column_chunks,
-                              std::unique_ptr<hybrid_scan_reader> parquet_reader,
-                              cudf::io::parquet_reader_options reader_options,
-                              std::vector<cudf::size_type> row_group_indices,
-                              std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
-                              std::size_t size_in_bytes,
-                              std::size_t uncompressed_size_in_bytes)
-    : idata_representation(*memory_space),
-      _column_chunks(std::move(column_chunks)),
-      _parquet_reader(std::move(parquet_reader)),
-      _reader_options(std::move(reader_options)),
-      _row_group_indices(std::move(row_group_indices)),
-      _all_column_chunk_byte_ranges(std::move(column_chunk_byte_ranges)),
-      _size_in_bytes(size_in_bytes),
-      _uncompressed_size_in_bytes(uncompressed_size_in_bytes)
-  {
-  }
+  struct column_byte_ranges {
+    std::vector<cudf::io::text::byte_range_info> all;      ///< All column chunks (non-multistage)
+    std::vector<cudf::io::text::byte_range_info> filter;   ///< Filter column chunks (multistage)
+    std::vector<cudf::io::text::byte_range_info> payload;  ///< Payload column chunks (multistage)
+
+    /// @brief Returns true if this represents a multistage split.
+    [[nodiscard]] bool is_multistage() const { return !filter.empty() || !payload.empty(); }
+  };
 
   /**
-   * @brief Constructs a host_parquet_representation for multi-stage decompression, which requires
-   * separate byte ranges for filter and payload columns.
+   * @brief Constructs a host_parquet_representation.
    *
-   * @param[in] memory_space The memory space to which the representation beloongs.
+   * @param[in] memory_space The memory space to which the representation belongs.
    * @param[in] column_chunks The fixed multiple blocks allocation containing the Parquet column
    * chunks.
    * @param[in] parquet_reader An instance hybrid scan Parquet reader for a given Parquet file.
@@ -93,16 +74,16 @@ class host_parquet_representation : public cucascade::idata_representation {
    * for materializing data.
    * @param[in] row_group_indices The row group indices of the row groups represented in the
    * multiple blocks allocation.
-   * @param[in] filter_column_chunk_byte_ranges The byte ranges in the multiple blocks allocation
-   * representing the filter column chunks to be read.
-   * @param[in] payload_column_chunk_byte_ranges The byte ranges in the multiple blocks allocation
-   * representing the payload column chunks to be read.
+   * @param[in] byte_ranges The column chunk byte ranges (all, or split into filter/payload).
    * @param[in] size_in_bytes The size of the representation in bytes (compressed).
    * @param[in] uncompressed_size_in_bytes The uncompressed size of the data represented by this
    * representation.
+   * @param[in] translated_filter Shared ownership of the translated filter expression, to keep the
+   * cuDF AST alive through this representation's lifetime.
    * @param[in] page_index_buffer Optional buffer containing the page index bytes for multistage
-   * decompression. We need this in each representation so that clones can setup the page index in
-   * the reader.
+   * decompression.
+   * @param[in] column_reorder_map Permutation for reordering concatenated filter and payload
+   * columns back to original order (multistage only).
    */
   host_parquet_representation(
     cucascade::memory::memory_space* memory_space,
@@ -110,21 +91,23 @@ class host_parquet_representation : public cucascade::idata_representation {
     std::unique_ptr<hybrid_scan_reader> parquet_reader,
     cudf::io::parquet_reader_options reader_options,
     std::vector<cudf::size_type> row_group_indices,
-    std::vector<cudf::io::text::byte_range_info> filter_column_chunk_byte_ranges,
-    std::vector<cudf::io::text::byte_range_info> payload_column_chunk_byte_ranges,
+    column_byte_ranges byte_ranges,
     std::size_t size_in_bytes,
     std::size_t uncompressed_size_in_bytes,
-    std::shared_ptr<cudf::io::datasource::buffer> page_index_buffer)
+    std::shared_ptr<gpu_expression_translator::translated_expression> translated_filter = nullptr,
+    std::shared_ptr<cudf::io::datasource::buffer> page_index_buffer                    = nullptr,
+    std::vector<cudf::size_type> column_reorder_map                                    = {})
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),
       _reader_options(std::move(reader_options)),
       _row_group_indices(std::move(row_group_indices)),
-      _filter_column_chunk_byte_ranges(std::move(filter_column_chunk_byte_ranges)),
-      _payload_column_chunk_byte_ranges(std::move(payload_column_chunk_byte_ranges)),
+      _byte_ranges(std::move(byte_ranges)),
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
-      _page_index_buffer(std::move(page_index_buffer))
+      _translated_filter_pin(std::move(translated_filter)),
+      _page_index_buffer(std::move(page_index_buffer)),
+      _column_reorder_map(std::move(column_reorder_map))
   {
   }
 
@@ -136,105 +119,39 @@ class host_parquet_representation : public cucascade::idata_representation {
    */
   std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
 
-  /**
-   * @brief Gets the fixed multiple blocks allocation containing the Parquet column chunks.
-   *
-   * @return A const reference to the fixed multiple blocks allocation containing the Parquet
-   */
+  //===----------Accessors----------===//
+
   [[nodiscard]] cucascade::memory::fixed_multiple_blocks_allocation const& get_column_chunks() const
   {
     return _column_chunks;
-  };
+  }
 
-  /**
-   * @brief Gets the hybrid scan Parquet reader as needed for materializing column data.
-   *
-   * @return A const reference to the hybrid scan Parquet reader.
-   */
-  [[nodiscard]] hybrid_scan_reader const& get_parquet_reader() const { return *_parquet_reader; };
+  [[nodiscard]] hybrid_scan_reader const& get_parquet_reader() const { return *_parquet_reader; }
 
-  /**
-   * @brief Gets the Parquet reader options used to configure the hybrid scan reader.
-   *
-   * @return A const reference to the Parquet reader options.
-   */
   [[nodiscard]] cudf::io::parquet_reader_options const& get_reader_options() const
   {
     return _reader_options;
-  };
+  }
 
-  /**
-   * @brief Gets the row group indices of the row groups represented in the multiple blocks
-   * allocation.
-   *
-   * @return A const reference to the vector of row group indices.
-   */
   [[nodiscard]] std::vector<cudf::size_type> const& get_row_group_indices() const
   {
     return _row_group_indices;
-  };
+  }
 
-  /**
-   * @brief Gets a host span of the row group indices of the row groups represented in the multiple
-   * blocks allocation.
-   *
-   * @return A host span of the row group indices.
-   */
   [[nodiscard]] cudf::host_span<cudf::size_type const> get_rg_span() const
   {
     return cudf::host_span<cudf::size_type const>(_row_group_indices.data(),
                                                   _row_group_indices.size());
-  };
+  }
 
-  /**
-   * @brief Gets the byte ranges in the multiple blocks allocation representing the column chunks to
-   * be read.
-   *
-   * @return A const reference to the vector of byte ranges.
-   */
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> const&
-  get_all_column_chunk_byte_ranges() const
-  {
-    return _all_column_chunk_byte_ranges;
-  };
+  /// @brief Returns true if this representation uses multistage decompression.
+  [[nodiscard]] bool is_multistage() const { return _byte_ranges.is_multistage(); }
 
-  /**
-   * @brief Gets the byte ranges in the multiple blocks allocation representing the filter column
-   * chunks to be read for multi-stage decompression.
-   *
-   * @return A const reference to the vector of byte ranges for the filter columns.
-   */
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> const&
-  get_filter_column_chunk_byte_ranges() const
-  {
-    return _filter_column_chunk_byte_ranges;
-  };
+  /// @brief Gets the byte ranges struct.
+  [[nodiscard]] column_byte_ranges const& get_byte_ranges() const { return _byte_ranges; }
 
-  /**
-   * @brief Gets the byte ranges in the multiple blocks allocation representing the payload column
-   * chunks to be read for multi-stage decompression.
-   *
-   * @return A const reference to the vector of byte ranges for the payload columns.
-   */
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> const&
-  get_payload_column_chunk_byte_ranges() const
-  {
-    return _payload_column_chunk_byte_ranges;
-  };
-
-  /**
-   * @brief Gets the size of the representation in bytes (compressed in the multiple blocks
-   * allocation).
-   *
-   * @return The size of the representation in bytes.
-   */
   [[nodiscard]] std::size_t get_size_in_bytes() const override { return _size_in_bytes; }
 
-  /**
-   * @brief Gets the uncompressed size of the data represented by this representation.
-   *
-   * @return The uncompressed size of the data.
-   */
   [[nodiscard]] std::size_t get_uncompressed_size_in_bytes() const
   {
     return _uncompressed_size_in_bytes;
@@ -245,29 +162,37 @@ class host_parquet_representation : public cucascade::idata_representation {
     return _page_index_buffer;
   }
 
+  [[nodiscard]] std::vector<cudf::size_type> const& get_column_reorder_map() const
+  {
+    return _column_reorder_map;
+  }
+
+  [[nodiscard]] std::shared_ptr<gpu_expression_translator::translated_expression>
+  get_translated_filter_pin() const
+  {
+    return _translated_filter_pin;
+  }
+
  private:
   cucascade::memory::fixed_multiple_blocks_allocation
-    _column_chunks;  ///< The multiple blocks allocation containing contiguous Parquet column chunks
+    _column_chunks;  ///< Multiple blocks allocation containing contiguous Parquet column chunks
   std::unique_ptr<hybrid_scan_reader>
-    _parquet_reader;  ///< The hybrid scan Parquet reader for decompression
+    _parquet_reader;  ///< Hybrid scan Parquet reader for decompression
   cudf::io::parquet_reader_options
-    _reader_options;  ///< The Parquet reader options used to configure the hybrid scan reader
-                      ///< (needed for copies/clones)
+    _reader_options;  ///< Parquet reader options (needed for copies/clones)
   std::vector<cudf::size_type>
-    _row_group_indices;  ///< The row group indices of the row groups represented in the multiple
-                         ///< blocks allocation
-  std::vector<cudf::io::text::byte_range_info>
-    _all_column_chunk_byte_ranges;  ///< The byte range info needed to parse all column chunks
-  std::vector<cudf::io::text::byte_range_info>
-    _filter_column_chunk_byte_ranges;  ///< The byte range info needed to parse the filter column
-                                       ///< chunks (for multi-stage decompression)
-  std::vector<cudf::io::text::byte_range_info>
-    _payload_column_chunk_byte_ranges;  /// The byte range info needed to parse the payload column
-                                        /// chunks (for multi-stage decompression)
-  std::size_t _size_in_bytes;           ///< The compressed size of the data in bytes
-  std::size_t _uncompressed_size_in_bytes;  ///< The uncompressed size of the data in bytes
+    _row_group_indices;          ///< Row group indices represented in the allocation
+  column_byte_ranges _byte_ranges;  ///< Column chunk byte ranges (unified or split)
+
+  std::size_t _size_in_bytes;               ///< Compressed size of the data in bytes
+  std::size_t _uncompressed_size_in_bytes;  ///< Uncompressed size of the data in bytes
+
+  std::shared_ptr<gpu_expression_translator::translated_expression>
+    _translated_filter_pin;  ///< Pins the cuDF AST and its owned scalars alive through this
+                             ///< representation's lifetime
   std::shared_ptr<cudf::io::datasource::buffer>
-    _page_index_buffer;  ///< Buffer containing the page index bytes for multistage decompression
-                         ///< (necessary for copies/clones, otherwise would be set up in scan task)
+    _page_index_buffer;  ///< Page index bytes for multistage decompression
+  std::vector<cudf::size_type>
+    _column_reorder_map;  ///< Permutation for reordering concatenated filter/payload columns
 };
 }  // namespace sirius

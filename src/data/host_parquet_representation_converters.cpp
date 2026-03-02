@@ -27,6 +27,7 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
 
 // rmm
@@ -55,8 +56,35 @@ namespace sirius {
 
 namespace detail {
 
+/**
+ * @brief Partition a device buffer into spans according to a set of byte ranges.
+ *
+ * @param[in] byte_ranges The byte ranges describing contiguous regions.
+ * @param[in] buffer_data Pointer to the start of the device buffer.
+ * @param[in] base_offset Starting offset into the device buffer for the first range.
+ * @return A vector of device spans, one per byte range.
+ */
+std::vector<cudf::device_span<uint8_t const>> partition_device_buffer(
+  std::vector<cudf::io::text::byte_range_info> const& byte_ranges,
+  uint8_t const* buffer_data,
+  size_t base_offset = 0)
+{
+  std::vector<cudf::device_span<uint8_t const>> spans;
+  spans.reserve(byte_ranges.size());
+  std::ignore = std::accumulate(
+    byte_ranges.begin(),
+    byte_ranges.end(),
+    base_offset,
+    [&spans, buffer_data](auto sum, auto const& byte_range) {
+      spans.emplace_back(buffer_data + sum, byte_range.size());
+      return sum + byte_range.size();
+    });
+  return spans;
+}
+
 std::unique_ptr<cudf::table> combine_tables(std::unique_ptr<cudf::table> filter_table,
-                                            std::unique_ptr<cudf::table> payload_table)
+                                            std::unique_ptr<cudf::table> payload_table,
+                                            std::vector<cudf::size_type> const& column_reorder_map)
 {
   auto filter_columns  = filter_table->release();
   auto payload_columns = payload_table->release();
@@ -65,7 +93,116 @@ std::unique_ptr<cudf::table> combine_tables(std::unique_ptr<cudf::table> filter_
   all_columns.reserve(filter_columns.size() + payload_columns.size());
   std::move(filter_columns.begin(), filter_columns.end(), std::back_inserter(all_columns));
   std::move(payload_columns.begin(), payload_columns.end(), std::back_inserter(all_columns));
-  return std::make_unique<cudf::table>(std::move(all_columns));
+  auto concatenated_table = std::make_unique<cudf::table>(std::move(all_columns));
+
+  // Reorder the concatenated table to restore the original column order
+  auto concatenated_columns = concatenated_table->release();
+  std::vector<std::unique_ptr<cudf::column>> reordered_columns(concatenated_columns.size());
+  for (size_t i = 0; i < column_reorder_map.size(); ++i) {
+    reordered_columns[i] = std::move(concatenated_columns[column_reorder_map[i]]);
+  }
+  return std::make_unique<cudf::table>(std::move(reordered_columns));
+}
+
+/**
+ * @brief Materialize a cudf::table from device column chunk spans using multistage decompression.
+ */
+std::unique_ptr<cudf::table> materialize_multistage(
+  host_parquet_representation const& host_src,
+  std::vector<cudf::device_span<uint8_t const>> const& filter_spans,
+  std::vector<cudf::device_span<uint8_t const>> const& payload_spans,
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] rmm::device_async_resource_ref mr_ref)
+{
+  using cudf::io::parquet::experimental::use_data_page_mask;
+  auto& reader = host_src.get_parquet_reader();
+
+  auto row_mask = reader.build_row_mask_with_page_index_stats(
+    host_src.get_rg_span(), host_src.get_reader_options(), stream, mr_ref);
+
+  auto row_mask_mutable_view = row_mask->mutable_view();
+
+#if CUDF_VERSION_NUM >= 2604
+  auto filter_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
+    filter_spans.data(), filter_spans.size());
+  auto payload_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
+    payload_spans.data(), payload_spans.size());
+
+  auto [filter_table, filter_metadata] =
+    reader.materialize_filter_columns(host_src.get_rg_span(),
+                                      filter_spans_h,
+                                      row_mask_mutable_view,
+                                      use_data_page_mask::YES,
+                                      host_src.get_reader_options(),
+                                      stream);
+
+  auto [payload_table, payload_metadata] =
+    reader.materialize_payload_columns(host_src.get_rg_span(),
+                                       payload_spans_h,
+                                       row_mask->view(),
+                                       use_data_page_mask::YES,
+                                       host_src.get_reader_options(),
+                                       stream);
+#else
+  std::vector<rmm::device_buffer> filter_buffers;
+  std::vector<rmm::device_buffer> payload_buffers;
+  filter_buffers.reserve(filter_spans.size());
+  payload_buffers.reserve(payload_spans.size());
+  for (auto const& span : filter_spans) {
+    filter_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
+  }
+  for (auto const& span : payload_spans) {
+    payload_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
+  }
+
+  auto [filter_table, filter_metadata] =
+    reader.materialize_filter_columns(host_src.get_rg_span(),
+                                      std::move(filter_buffers),
+                                      row_mask_mutable_view,
+                                      use_data_page_mask::YES,
+                                      host_src.get_reader_options(),
+                                      stream);
+
+  auto [payload_table, payload_metadata] =
+    reader.materialize_payload_columns(host_src.get_rg_span(),
+                                       std::move(payload_buffers),
+                                       row_mask->view(),
+                                       use_data_page_mask::YES,
+                                       host_src.get_reader_options(),
+                                       stream);
+#endif
+
+  return combine_tables(
+    std::move(filter_table), std::move(payload_table), host_src.get_column_reorder_map());
+}
+
+/**
+ * @brief Materialize a cudf::table from device column chunk spans (single-stage).
+ */
+std::unique_ptr<cudf::table> materialize_single_stage(
+  host_parquet_representation const& host_src,
+  std::vector<cudf::device_span<uint8_t const>> const& all_spans,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr_ref)
+{
+  auto& reader = host_src.get_parquet_reader();
+
+#if CUDF_VERSION_NUM >= 2604
+  auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
+    all_spans.data(), all_spans.size());
+  auto [table, _] = reader.materialize_all_columns(
+    host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
+#else
+  std::vector<rmm::device_buffer> column_chunk_buffers;
+  column_chunk_buffers.reserve(all_spans.size());
+  for (auto const& span : all_spans) {
+    column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
+  }
+  auto [table, _] = reader.materialize_all_columns(
+    host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
+#endif
+
+  return std::move(table);
 }
 
 /**
@@ -76,58 +213,21 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
   cucascade::memory::memory_space const* target_memory_space,
   rmm::cuda_stream_view stream)
 {
-  using cudf::io::parquet::experimental::use_data_page_mask;
-
-  // Source stuff
   auto& host_src = source.cast<host_parquet_representation>();
-  auto& reader   = host_src.get_parquet_reader();
 
-  // Target stuff
+  // Target setup
   rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
   rmm::cuda_device_id target_device_id(target_memory_space->get_device_id());
   rmm::cuda_set_device_raii target_device_raii(target_device_id);
 
-  // Allocate a single device buffer and partition it according to the byte ranges
-  std::vector<cudf::device_span<uint8_t const>> column_chunk_spans_d;
-  std::vector<cudf::device_span<uint8_t const>> filter_column_chunk_spans_d;
-  std::vector<cudf::device_span<uint8_t const>> payload_column_chunk_spans_d;
+  // Allocate a single device buffer for all column chunks
   rmm::device_buffer device_buffer(host_src.get_size_in_bytes(), stream, mr_ref);
   auto buffer_data = static_cast<uint8_t*>(device_buffer.data());
-  if (host_src.get_page_index_buffer()) {
-    auto const& filter_byte_ranges  = host_src.get_filter_column_chunk_byte_ranges();
-    auto const& payload_byte_ranges = host_src.get_payload_column_chunk_byte_ranges();
-    std::ignore                     = std::accumulate(
-      filter_byte_ranges.begin(),
-      filter_byte_ranges.end(),
-      size_t{0},
-      [&filter_column_chunk_spans_d, buffer_data](auto sum, auto const& byte_range) {
-        filter_column_chunk_spans_d.emplace_back(buffer_data + sum, byte_range.size());
-        return sum + byte_range.size();
-      });
-    auto const payload_offset = filter_byte_ranges.empty() ? 0
-                                                           : filter_byte_ranges.back().offset() +
-                                                               filter_byte_ranges.back().size();
-    std::ignore               = std::accumulate(
-      payload_byte_ranges.begin(),
-      payload_byte_ranges.end(),
-      payload_offset,
-      [&payload_column_chunk_spans_d, buffer_data](auto sum, auto const& byte_range) {
-        payload_column_chunk_spans_d.emplace_back(buffer_data + sum, byte_range.size());
-        return sum + byte_range.size();
-      });
-  } else {
-    auto const& byte_ranges = host_src.get_all_column_chunk_byte_ranges();
-    std::ignore =
-      std::accumulate(byte_ranges.begin(),
-                      byte_ranges.end(),
-                      size_t{0},
-                      [&column_chunk_spans_d, buffer_data](auto sum, auto const& byte_range) {
-                        column_chunk_spans_d.emplace_back(buffer_data + sum, byte_range.size());
-                        return sum + byte_range.size();
-                      });
-  }
 
-  // Copy HOST data to GPU with a single async batch copy.
+  // Partition the device buffer into spans according to the byte ranges
+  auto const& byte_ranges = host_src.get_byte_ranges();
+
+  // Copy HOST data to GPU with a single async batch copy
   auto const& allocation = host_src.get_column_chunks();
   size_t bytes_copied    = 0;
   std::vector<void*> dst_ptrs;
@@ -145,16 +245,13 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
     bytes_copied += bytes_to_copy;
   }
 
-// Try to do batch copy if cudaMemcpyBatchAsync is possible, otherwise fall back to individual
-// async copies
 #if CUDART_VERSION >= 13000
   cudaStream_t stream_handle = (stream.value() != nullptr && stream.value() != cudaStreamLegacy)
                                  ? stream.value()
                                  : cudaStreamPerThread;
   cudaMemcpyAttributes attr{};
   attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-  attr.srcLocHint     = {cudaMemLocationTypeHost,
-                         host_src.get_device_id()};  // this is numa node id for pinned host
+  attr.srcLocHint     = {cudaMemLocationTypeHost, host_src.get_device_id()};
   attr.dstLocHint     = {cudaMemLocationTypeDevice, target_memory_space->get_device_id()};
   attr.flags          = cudaMemcpyFlagDefault;
   RMM_CUDA_TRY(::cudaMemcpyBatchAsync(
@@ -167,108 +264,26 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
   }
 #endif
 
-  // Invoke the Parquet reader to materialize the table on GPU
+  // Materialize the table on GPU
   std::unique_ptr<cudf::table> result_table;
-#if CUDF_VERSION_NUM >= 2604
-  if (host_src.get_page_index_buffer()) {
-    auto filter_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
-      filter_column_chunk_spans_d.data(), filter_column_chunk_spans_d.size());
-    auto payload_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
-      payload_column_chunk_spans_d.data(), payload_column_chunk_spans_d.size());
-
-    auto page_index_buffer = host_src.get_page_index_buffer();
-
-    // Build initial row mask
-    auto row_mask = reader.build_row_mask_with_page_index_stats(
-      host_src.get_rg_span(), host_src.get_reader_options(), stream, mr_ref);
-
-    // Materialize filter columns
-    auto row_mask_mutable_view = row_mask->mutable_view();
-    auto [filter_table, filter_metadata] =
-      reader.materialize_filter_columns(host_src.get_rg_span(),
-                                        filter_chunk_spans_h,
-                                        row_mask_mutable_view,
-                                        use_data_page_mask::YES,
-                                        host_src.get_reader_options(),
-                                        stream);
-
-    // Materialize payload columns
-    auto [payload_table, payload_metadata] =
-      reader.materialize_payload_columns(host_src.get_rg_span(),
-                                         payload_chunk_spans_h,
-                                         row_mask->view(),
-                                         use_data_page_mask::YES,
-                                         host_src.get_reader_options(),
-                                         stream);
-
-    // Combine filter and payload tables into a single table
-    result_table = combine_tables(std::move(filter_table), std::move(payload_table));
+  if (byte_ranges.is_multistage()) {
+    auto filter_spans = partition_device_buffer(byte_ranges.filter, buffer_data);
+    auto const filter_total =
+      std::accumulate(byte_ranges.filter.begin(),
+                      byte_ranges.filter.end(),
+                      size_t{0},
+                      [](auto sum, auto const& r) { return sum + r.size(); });
+    auto payload_spans = partition_device_buffer(byte_ranges.payload, buffer_data, filter_total);
+    result_table = materialize_multistage(host_src, filter_spans, payload_spans, stream, mr_ref);
   } else {
-    auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
-      column_chunk_spans_d.data(), column_chunk_spans_d.size());
-    auto [table, _] = reader.materialize_all_columns(
-      host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
-    result_table = std::move(table);
+    auto all_spans = partition_device_buffer(byte_ranges.all, buffer_data);
+    result_table   = materialize_single_stage(host_src, all_spans, stream, mr_ref);
   }
-#else
-  // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
-  if (host_src.get_page_index_buffer()) {
-    std::vector<rmm::device_buffer> filter_chunk_buffers;
-    std::vector<rmm::device_buffer> payload_chunk_buffers;
-    filter_chunk_buffers.reserve(filter_column_chunk_spans_d.size());
-    payload_chunk_buffers.reserve(payload_column_chunk_spans_d.size());
-    for (auto const& span : filter_column_chunk_spans_d) {
-      filter_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
-    }
-    for (auto const& span : payload_column_chunk_spans_d) {
-      payload_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
-    }
 
-    auto page_index_buffer = host_src.get_page_index_buffer();
-
-    // Build initial row mask
-    auto row_mask = reader.build_row_mask_with_page_index_stats(
-      host_src.get_rg_span(), host_src.get_reader_options(), stream, mr_ref);
-
-    // Materialize filter columns
-    auto row_mask_mutable_view = row_mask->mutable_view();
-    auto [filter_table, filter_metadata] =
-      reader.materialize_filter_columns(host_src.get_rg_span(),
-                                        std::move(filter_chunk_buffers),
-                                        row_mask_mutable_view,
-                                        use_data_page_mask::YES,
-                                        host_src.get_reader_options(),
-                                        stream);
-
-    // Materialize payload columns
-    auto [payload_table, payload_metadata] =
-      reader.materialize_payload_columns(host_src.get_rg_span(),
-                                         std::move(payload_chunk_buffers),
-                                         row_mask->view(),
-                                         use_data_page_mask::YES,
-                                         host_src.get_reader_options(),
-                                         stream);
-
-    // Combine filter and payload tables into a single table
-    result_table = combine_tables(std::move(filter_table), std::move(payload_table));
-  } else {
-    std::vector<rmm::device_buffer> column_chunk_buffers;
-    for (auto const& span : column_chunk_spans_d) {
-      column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
-    }
-    auto [table, _] = reader.materialize_all_columns(host_src.get_rg_span(),
-                                                     std::move(column_chunk_buffers),
-                                                     host_src.get_reader_options(),
-                                                     stream);
-    result_table    = std::move(table);
-  }
-#endif
-
-  auto new_table = std::move(result_table);
   stream.synchronize();
 
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(new_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+    std::move(result_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
 }
 
 /**
@@ -325,30 +340,22 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
   }
 
   if (page_index_buffer) {
-    // Setup the page index in the cloned reader
     cloned_reader->setup_page_index(
       cudf::host_span<uint8_t const>(page_index_buffer->data(), page_index_buffer->size()));
-    return std::make_unique<host_parquet_representation>(
-      const_cast<cucascade::memory::memory_space*>(target_memory_space),
-      std::move(dst_allocation),
-      std::move(cloned_reader),
-      reader_options,
-      host_src.get_row_group_indices(),
-      host_src.get_filter_column_chunk_byte_ranges(),
-      host_src.get_payload_column_chunk_byte_ranges(),
-      data_size,
-      host_src.get_uncompressed_size_in_bytes(),
-      std::move(page_index_buffer));
   }
+
   return std::make_unique<host_parquet_representation>(
     const_cast<cucascade::memory::memory_space*>(target_memory_space),
     std::move(dst_allocation),
     std::move(cloned_reader),
     reader_options,
     host_src.get_row_group_indices(),
-    host_src.get_all_column_chunk_byte_ranges(),
+    host_src.get_byte_ranges(),
     data_size,
-    host_src.get_uncompressed_size_in_bytes());
+    host_src.get_uncompressed_size_in_bytes(),
+    host_src.get_translated_filter_pin(),
+    std::move(page_index_buffer),
+    host_src.get_column_reorder_map());
 }
 
 }  // namespace detail

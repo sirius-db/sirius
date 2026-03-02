@@ -239,14 +239,62 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     if (duckdb_expr) {
       // Name resolver: BoundReferenceExpression::index is a position in column_ids,
       // and the primary index is the table column ordinal, which indexes into names.
-      auto name_resolver = [&scan_op](duckdb::idx_t ref_index) -> std::string {
-        auto primary_idx = scan_op->column_ids[ref_index].GetPrimaryIndex();
+      // In multistage mode we also collect the set of filter column indices.
+      std::unordered_set<size_t> filter_column_set;
+      auto name_resolver = [&scan_op,
+                            &filter_column_set,
+                            collect = _use_multistage_decompression](
+                             duckdb::idx_t ref_index) -> std::string {
+        auto const primary_idx = scan_op->column_ids[ref_index].GetPrimaryIndex();
+        if (collect) { filter_column_set.insert(primary_idx); }
         return scan_op->names[primary_idx];
       };
+
       gpu_expression_translator translator(rmm::cuda_stream_default,
                                            cudf::get_current_device_resource_ref());
-      _translated_filter = translator.translate_expression_with_names(*duckdb_expr, name_resolver);
-      if (_translated_filter) { _reader_options.set_filter(_translated_filter->back()); }
+      auto translated =
+        translator.translate_expression_with_names(*duckdb_expr, name_resolver);
+      if (translated) {
+        _translated_filter =
+          std::make_shared<gpu_expression_translator::translated_expression>(
+            std::move(*translated));
+        _reader_options.set_filter(_translated_filter->back());
+
+        // Build the column reorder map if multistage decompression is enabled
+        if (_use_multistage_decompression) {
+          // Build filter and payload column indices preserving the order from
+          // _selected_column_indices (which matches the DuckDB column_ids order).
+          std::vector<size_t> filter_column_indices;
+          std::vector<size_t> payload_column_indices;
+          for (auto const col_idx : _selected_column_indices) {
+            if (filter_column_set.count(col_idx)) {
+              filter_column_indices.push_back(col_idx);
+            } else {
+              payload_column_indices.push_back(col_idx);
+            }
+          }
+
+          // Build a reorder map: after the hybrid_scan_reader materializes [filter_cols...,
+          // payload_cols...], this map gives the permutation to restore the original
+          // _selected_column_indices order.
+          std::vector<size_t> concat_order;
+          concat_order.reserve(filter_column_indices.size() + payload_column_indices.size());
+          concat_order.insert(
+            concat_order.end(), filter_column_indices.begin(), filter_column_indices.end());
+          concat_order.insert(
+            concat_order.end(), payload_column_indices.begin(), payload_column_indices.end());
+
+          _column_reorder_map.reserve(_selected_column_indices.size());
+          for (size_t concat_pos = 0; concat_pos < concat_order.size(); ++concat_pos) {
+            for (auto const _selected_column_index : _selected_column_indices) {
+              if (_selected_column_index == concat_order[concat_pos]) {
+                _column_reorder_map.push_back(static_cast<cudf::size_type>(concat_pos));
+                break;
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -390,91 +438,61 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto const& rg_indices = l_state.get_rg_indices();
   auto const rg_span = cudf::host_span<cudf::size_type const>(rg_indices.data(), rg_indices.size());
 
-  std::unique_ptr<host_parquet_representation> parquet_representation;
-  if (g_state.use_multistage_decompression()) {
-    // Setup the page index
-    auto page_index_buffer = g_state.get_page_index_buffer(l_state.get_file_idx());
-    reader->setup_page_index(
-      cudf::host_span<uint8_t const>(page_index_buffer->data(), page_index_buffer->size()));
-
-    // Get the filter and column byte ranges
-    auto const filter_byte_ranges =
-      reader->filter_column_chunks_byte_ranges(rg_span, g_state.get_options());
-    auto const payload_byte_ranges =
-      reader->payload_column_chunks_byte_ranges(rg_span, g_state.get_options());
-
-    // Read each byte range into the allocation asynchronously
-    std::vector<cudf::io::text::byte_range_info> new_filter_byte_ranges;
-    std::vector<cudf::io::text::byte_range_info> new_payload_byte_ranges;
-    new_filter_byte_ranges.reserve(filter_byte_ranges.size());
-    new_payload_byte_ranges.reserve(payload_byte_ranges.size());
-    std::vector<std::future<std::size_t>> read_futures;
-    int64_t new_offset = 0;
-    for (auto const& range : filter_byte_ranges) {
-      read_range_into_allocation(
-        range.offset(), range.size(), data_accessor, allocation, read_futures);
-      new_filter_byte_ranges.emplace_back(new_offset, range.size());
-      new_offset += range.size();
-    }
-    for (auto const& range : payload_byte_ranges) {
-      read_range_into_allocation(
-        range.offset(), range.size(), data_accessor, allocation, read_futures);
-      new_payload_byte_ranges.emplace_back(new_offset, range.size());
-      new_offset += range.size();
-    }
-    std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
-
-    if (new_offset != l_state.get_reserved_compressed_bytes()) {
-      // Metadata / file data mismatch
-      throw std::runtime_error(
-        "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match "
-        "reserved compressed bytes");
-    }
-
-    parquet_representation = std::make_unique<host_parquet_representation>(
-      l_state.get_memory_space(),
-      std::move(allocation),
-      std::move(reader),
-      g_state.get_options(),
-      std::move(l_state.get_rg_indices()),
-      std::move(new_filter_byte_ranges),
-      std::move(new_payload_byte_ranges),
-      l_state.get_reserved_compressed_bytes(),
-      l_state.get_reserved_uncompressed_bytes(),
-      g_state.get_page_index_buffer(l_state.get_file_idx()));
-  } else {
-    auto const byte_ranges = reader->all_column_chunks_byte_ranges(rg_span, g_state.get_options());
-
-    // Read each byte range into the allocation asynchronously
-    std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
-    new_byte_ranges.reserve(byte_ranges.size());
-    int64_t new_offset = 0;
-    std::vector<std::future<std::size_t>> read_futures;
+  // Helper: read a set of byte ranges into the allocation and return rebased ranges
+  std::vector<std::future<std::size_t>> read_futures;
+  int64_t new_offset = 0;
+  auto read_ranges   = [&](auto const& byte_ranges) {
+    std::vector<cudf::io::text::byte_range_info> new_ranges;
+    new_ranges.reserve(byte_ranges.size());
     for (auto const& range : byte_ranges) {
       read_range_into_allocation(
         range.offset(), range.size(), data_accessor, allocation, read_futures);
-      new_byte_ranges.emplace_back(new_offset, range.size());
+      new_ranges.emplace_back(new_offset, range.size());
       new_offset += range.size();
     }
-    std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
+    return new_ranges;
+  };
 
-    if (new_offset != l_state.get_reserved_compressed_bytes()) {
-      // Metadata / file data mismatch
-      throw std::runtime_error(
-        "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match "
-        "reserved compressed bytes");
-    }
+  // Build byte ranges struct and read data
+  host_parquet_representation::column_byte_ranges byte_ranges;
+  std::shared_ptr<cudf::io::datasource::buffer> page_index_buffer;
 
-    parquet_representation =
-      std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
-                                                    std::move(allocation),
-                                                    std::move(reader),
-                                                    g_state.get_options(),
-                                                    std::move(l_state.get_rg_indices()),
-                                                    std::move(new_byte_ranges),
-                                                    l_state.get_reserved_compressed_bytes(),
-                                                    l_state.get_reserved_uncompressed_bytes());
+  if (g_state.use_multistage_decompression()) {
+    page_index_buffer = g_state.get_page_index_buffer(l_state.get_file_idx());
+    reader->setup_page_index(
+      cudf::host_span<uint8_t const>(page_index_buffer->data(), page_index_buffer->size()));
+
+    byte_ranges.filter =
+      read_ranges(reader->filter_column_chunks_byte_ranges(rg_span, g_state.get_options()));
+    byte_ranges.payload =
+      read_ranges(reader->payload_column_chunks_byte_ranges(rg_span, g_state.get_options()));
+  } else {
+    byte_ranges.all =
+      read_ranges(reader->all_column_chunks_byte_ranges(rg_span, g_state.get_options()));
   }
+
+  // Wait for all async reads to complete
+  std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
+
+  if (new_offset != l_state.get_reserved_compressed_bytes()) {
+    throw std::runtime_error(
+      "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match "
+      "reserved compressed bytes");
+  }
+
+  // Construct the representation
+  auto parquet_representation = std::make_unique<host_parquet_representation>(
+    l_state.get_memory_space(),
+    std::move(allocation),
+    std::move(reader),
+    g_state.get_options(),
+    std::move(l_state.get_rg_indices()),
+    std::move(byte_ranges),
+    l_state.get_reserved_compressed_bytes(),
+    l_state.get_reserved_uncompressed_bytes(),
+    g_state.get_translated_filter(),
+    std::move(page_index_buffer),
+    g_state.get_column_reorder_map());
 
   // Create a data batch with the parquet representation and return it wrapped in operator_data
   auto data_batch =
