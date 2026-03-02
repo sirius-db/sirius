@@ -173,11 +173,7 @@ void sirius_physical_right_delim_join::sink(const operator_data& input_data,
   auto distinct_output = distinct->execute(input_data, stream);
 
   // partition_distinct is external — push distinct output via distinct's next_port_after_sink
-  for (auto& batch : distinct_output->get_data_batches()) {
-    for (auto& [next_op, port_id] : distinct->get_next_port_after_sink()) {
-      next_op->push_data_batch(port_id, batch);
-    }
-  }
+  distinct->sink(*distinct_output, stream);
 }
 
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
@@ -199,11 +195,7 @@ void sirius_physical_left_delim_join::sink(const operator_data& input_data,
   auto distinct_output = distinct->execute(input_data, stream);
 
   // partition_distinct is external — push distinct output via distinct's next_port_after_sink
-  for (auto& batch : distinct_output->get_data_batches()) {
-    for (auto& [next_op, port_id] : distinct->get_next_port_after_sink()) {
-      next_op->push_data_batch(port_id, batch);
-    }
-  }
+  distinct->sink(*distinct_output, stream);
 }
 
 }  // namespace op
