@@ -60,30 +60,10 @@ else
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 fi
 
-ROW_GROUP_SIZE="${ROW_GROUP_SIZE:-10000000}"
-
 if [ ! -d "$PARQUET_DIR" ]; then
     echo "Parquet directory not found: $PARQUET_DIR"
-    RAW_DIR="${PARQUET_DIR}_raw"
-
-    # Step 1: generate raw parquet with tpchgen-cli
-    echo "Step 1: Generating TPC-H SF${SF} raw dataset with tpchgen-cli..."
-    VENV_DIR="$PROJECT_DIR/.venv"
-    if [ ! -f "$VENV_DIR/bin/activate" ]; then
-        python3 -m venv "$VENV_DIR"
-    fi
-    # shellcheck disable=SC1091
-    source "$VENV_DIR/bin/activate"
-    pip install --quiet tpchgen-cli
-    tpchgen-cli -s "$SF" --format=parquet --parts 1 --output-dir "$RAW_DIR"
-    deactivate
-
-    # Step 2: rewrite with int32 join keys and GPU-optimized row groups
-    echo "Step 2: Rewriting parquet with int32 join keys (row group size: ${ROW_GROUP_SIZE})..."
-    (cd "$SCRIPT_DIR" && pixi run python rewrite_parquet.py "$RAW_DIR" "$PARQUET_DIR" "$ROW_GROUP_SIZE")
-
-    echo "Cleaning up raw parquet files..."
-    rm -rf "$RAW_DIR"
+    echo "Generating TPC-H SF${SF} dataset using tpchgen-rs..."
+    (cd "$SCRIPT_DIR" && pixi run bash generate_tpch_data.sh "$SF" "$PARQUET_DIR")
 fi
 
 # Build CREATE VIEW statements for the TPC-H tables.
