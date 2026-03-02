@@ -87,6 +87,8 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
                                          rmm::cuda_stream_view stream) override;
 
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {

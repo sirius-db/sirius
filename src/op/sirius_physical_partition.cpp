@@ -220,6 +220,16 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
 
 int sirius_physical_partition::determine_num_partitions()
 {
+  SIRIUS_LOG_DEBUG("sirius_physical_partition::determine_num_partitions() start for id {}",
+                   this->get_operator_id());
+  if (ports.find("default") == ports.end()) {
+    SIRIUS_LOG_WARN(
+      "sirius_physical_partition::determine_num_partitions() did not find default repo for id {}",
+      this->get_operator_id());
+    throw std::runtime_error(
+      "sirius_physical_partition::determine_num_partitions() did not find default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
   auto& repo           = ports.at("default")->repo;
   auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
