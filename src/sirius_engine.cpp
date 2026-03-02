@@ -48,6 +48,8 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <stdexcept>
+
 namespace sirius {
 
 void sirius_engine::reset()
@@ -83,6 +85,18 @@ void sirius_engine::insert_repository(
                       input_pipeline,
                       dependent_pipeline));
   input_pipeline->get_sink()->add_next_port_after_sink({next_op, port_id});
+
+  if (next_op->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto partition_op = next_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
+    partition_op->add_port(port_id,
+                           std::make_unique<op::sirius_physical_operator::port>(
+                             op::MemoryBarrierType::FULL,
+                             data_repo_manager.get_repository(op_id, port_id).get(),
+                             input_pipeline,
+                             dependent_pipeline));
+  } else if (next_op->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
+    throw std::runtime_error("Left delim join should never be a source");
+  }
 }
 
 void sirius_engine::insert_repository(
@@ -106,6 +120,18 @@ void sirius_engine::insert_repository(
                       input_pipeline,
                       dependent_pipeline));
   cur_op->add_next_port_after_sink({next_op, port_id});
+
+  if (next_op->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto partition_op = next_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
+    partition_op->add_port(port_id,
+                           std::make_unique<op::sirius_physical_operator::port>(
+                             op::MemoryBarrierType::FULL,
+                             data_repo_manager.get_repository(op_id, port_id).get(),
+                             input_pipeline,
+                             dependent_pipeline));
+  } else if (next_op->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
+    throw std::runtime_error("Left delim join should never be a source");
+  }
 }
 
 void sirius_engine::cancel_tasks()
