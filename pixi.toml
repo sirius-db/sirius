@@ -35,8 +35,8 @@ libcudf = "26.02.*"
 librmm = "*"
 libcurand-dev = "*"
 libconfig = "*"
-libabseil = ">=20260107.0"
-duckdb = ">=1.4.4,<2"
+libabseil = "*"
+duckdb = "1.4.*"
 spdlog = "1.8.*"
 
 [feature.cuda12.dependencies]
