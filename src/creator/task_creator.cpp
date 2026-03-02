@@ -313,7 +313,6 @@ void task_creator::manager_loop()
                                                             std::move(parquet_task_local_state),
                                                             parquet_task_global_state);
             _pipeline_executor->schedule(std::move(parquet_task));
-            // scheduling pipeline task
           }
         } else {
           // need to exhaust input batches until all ports are empty
