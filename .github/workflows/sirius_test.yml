@@ -36,7 +36,7 @@ jobs:
 
   gpu_test:
     runs-on: [self-hosted, Linux, X64, gpu-t4]
-    needs: build
+    needs: cpu_build
     timeout-minutes: 60
     steps:
       - name: Cleanup
