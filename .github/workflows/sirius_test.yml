@@ -8,7 +8,7 @@ concurrency:
 
 jobs:
   cpu_build:
-    runs-on: [self-hosted, Linux, X64, cpu-xl]
+    runs-on: [self-hosted, ubuntu-22.04, cuda-13, cpu-xl]
     timeout-minutes: 60
     steps:
       - name: Cleanup
@@ -35,7 +35,7 @@ jobs:
           retention-days: 1
 
   gpu_test:
-    runs-on: [self-hosted, Linux, X64, gpu-t4]
+    runs-on: [self-hosted, ubuntu-22.04, cuda-13, gpu-t4]
     needs: cpu_build
     timeout-minutes: 60
     steps:
