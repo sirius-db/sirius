@@ -23,16 +23,22 @@ TEST_BUILD_TARGET ?= unittest
 	clang-release clang-debug clang-relwithdebinfo \
 	test test_release test_debug test_reldebug clean list-presets
 
+PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
+
 all: release
 
-release:
+$(PRESETS_LINK): cmake/CMakePresets.json
+	rm -f $(DUCKDB_DIR)/CMakeUserPresets.json
+	ln -sf ../cmake/CMakePresets.json $@
+
+release: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset release
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(TEST_BUILD_TARGET)
 endif
 
-debug:
+debug: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset debug
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug
 ifneq ($(TEST_BUILD_TARGET),)
@@ -43,22 +49,22 @@ reldebug: relwithdebinfo
 
 debug-release: relwithdebinfo
 
-relwithdebinfo:
+relwithdebinfo: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset relwithdebinfo
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
 endif
 
-clang-release:
+clang-release: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-release
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release
 
-clang-debug:
+clang-debug: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-debug
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug
 
-clang-relwithdebinfo:
+clang-relwithdebinfo: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-relwithdebinfo
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo
 
@@ -76,5 +82,5 @@ test_reldebug: relwithdebinfo
 clean:
 	rm -rf build
 
-list-presets:
+list-presets: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
