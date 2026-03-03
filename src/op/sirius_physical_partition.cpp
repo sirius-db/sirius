@@ -35,8 +35,6 @@
 namespace sirius {
 namespace op {
 
-duckdb::idx_t sirius_physical_partition::s_partition_size =
-  sirius_physical_partition::DEFAULT_PARTITION_SIZE;
 namespace {
 
 std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& expr)
@@ -58,10 +56,12 @@ std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& e
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
                                                      duckdb::idx_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
-                                                     bool is_build)
+                                                     bool is_build,
+                                                     uint64_t hash_partition_bytes)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
+  s_partition_size = hash_partition_bytes;
   _num_partitions =
     static_cast<int>((estimated_cardinality + s_partition_size - 1) / s_partition_size);
   _parent_op = parent_op;
