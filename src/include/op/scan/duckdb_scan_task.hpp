@@ -20,7 +20,6 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <config.hpp>
-#include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/sirius_physical_duckdb_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
@@ -36,6 +35,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/host_table.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -272,12 +272,12 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
                         std::unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
-     * @brief Create a metadata node for this column for building a host_table_allocation.
+     * @brief Create a column_metadata for this column for building a host_table_allocation.
      *
      * @param[in] num_rows The number of rows in the column.
-     * @return metadata_node The constructed metadata node.
+     * @return cucascade::memory::column_metadata The constructed column metadata.
      */
-    [[nodiscard]] metadata_node make_metadata_node(size_t num_rows) const;
+    [[nodiscard]] cucascade::memory::column_metadata make_column_metadata(size_t num_rows) const;
   };
 
   //===----------Constructor & Destructor----------===//

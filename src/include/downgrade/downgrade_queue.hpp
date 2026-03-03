@@ -67,13 +67,18 @@ class downgrade_task_queue : public itask_queue {
    */
   void close() override
   {
-    // Wake up all waiting threads by releasing the semaphore enough times
-    for (int i = 0; i < Config::NUM_DOWNGRADE_EXECUTOR_THREADS; ++i) {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _is_open = false;
+    }
+    // Wake up all waiting threads by releasing the semaphore enough times.
+    // Use a generous count to cover any number of blocked workers.
+    for (int i = 0; i < _num_workers; ++i) {
       _sem.release();
     }
-    std::lock_guard<std::mutex> lock(_mutex);
-    _is_open = false;
   }
+
+  void set_num_workers(int n) { _num_workers = n; }
 
   /**
    * @brief Pushes a new task to be scheduled (base interface implementation)
@@ -181,8 +186,9 @@ class downgrade_task_queue : public itask_queue {
 
  private:
   std::queue<std::unique_ptr<downgrade_task>>
-    _task_queue;                      ///< FIFO queue storing the downgrade tasks
-  bool _is_open = false;              ///< Whether the queue is open for operations
+    _task_queue;          ///< FIFO queue storing the downgrade tasks
+  bool _is_open = false;  ///< Whether the queue is open for operations
+  int _num_workers{Config::NUM_DOWNGRADE_EXECUTOR_THREADS};  ///< Number of worker threads to wake
   mutable std::mutex _mutex;          ///< Mutex for thread-safe access (mutable for const methods)
   std::counting_semaphore<> _sem{0};  ///< Semaphore for blocking/signaling (starts with 0 permits)
 };

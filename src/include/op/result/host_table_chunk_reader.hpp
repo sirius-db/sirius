@@ -18,7 +18,6 @@
 
 // sirius
 #include <helper/utils.hpp>
-#include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 
 // duckdb
@@ -34,6 +33,7 @@
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/host_table.hpp>
 
 // standard library
 #include <memory>
@@ -46,8 +46,7 @@ namespace sirius::op::result {
 //===----------------------------------------------------------------------===//
 
 /**
- * @brief Reads chunks of data from a cucascade::host_data_packed_representation into duckdb data
- * chunkss
+ * @brief Reads chunks of data from a cucascade::host_data_representation into duckdb data chunks
  */
 class host_table_chunk_reader {
   using multiple_blocks_allocation =
@@ -79,10 +78,10 @@ class host_table_chunk_reader {
 
     /**
      * @brief Construct a new column reader object
-     * @param[in] node The metadata node for the column (via unpack proxy)
+     * @param[in] col The column metadata describing the column's buffer layout
      * @param[in] allocation The multiple blocks allocation containing the column data
      */
-    column_reader(metadata_node const& node,
+    column_reader(cucascade::memory::column_metadata const& col,
                   std::unique_ptr<multiple_blocks_allocation> const& allocation);
 
     /**
@@ -130,14 +129,14 @@ class host_table_chunk_reader {
    * @brief Construct a new host table chunk reader object
    *
    * @param[in] client_ctx The duckdb client context (for allocation)
-   * @param[in] host_table The cucascade::host_data_packed_representation to read from
+   * @param[in] host_table The cucascade::host_data_representation to read from
    * @param[in] types The duckdb logical types for the chunk columns
-   * @throw std::runtime_error If there is a mismatch in metadata and types, if the row count is
-   * negative or inconsistent across metadata_nodes, or if the duckdb output logical type for any
-   * column is HUGEINT.
+   * @throw std::runtime_error If there is a mismatch in column metadata and types, if the row count
+   * is negative or inconsistent across columns, or if the duckdb output logical type for any column
+   * is HUGEINT.
    */
   host_table_chunk_reader(duckdb::ClientContext& client_ctx,
-                          cucascade::host_data_packed_representation const& host_table,
+                          cucascade::host_data_representation const& host_table,
                           duckdb::vector<duckdb::LogicalType> const& types);
   ~host_table_chunk_reader() = default;
 

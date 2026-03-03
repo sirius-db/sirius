@@ -28,6 +28,9 @@
 // cucascade
 #include <cucascade/data/data_repository.hpp>
 
+// rmm
+#include <rmm/cuda_stream.hpp>
+
 // duckdb
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
@@ -117,9 +120,8 @@ static void run_scan_test(std::string const& table_name,
                           int num_threads,
                           size_t batch_size)
 {
-  // Setup DuckDB database
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
+  // Use shared DuckDB when available, otherwise create standalone
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
 
   // Create and populate table
   create_synthetic_table(con, table_name, num_rows);
@@ -158,8 +160,12 @@ static void run_scan_test(std::string const& table_name,
   auto execution_context =
     std::make_unique<duckdb::ExecutionContext>(client_ctx, *thread_context, nullptr);
 
-  // Run tasks
-  pipeline_executor.start();
+  // Only start/stop the pipeline executor when NOT using the shared test env.
+  // The shared env's SiriusContext already started it, and stopping it would
+  // permanently break the interruptible_mpmc queue (no reset on restart).
+  bool const manage_executor = !sirius::test::g_shared_env;
+  if (manage_executor) { pipeline_executor.start(); }
+
   for (int i = 0; i < scan_executor.get_num_threads(); ++i) {
     auto local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
       *global_state, *execution_context, batch_size);
@@ -171,11 +177,13 @@ static void run_scan_test(std::string const& table_name,
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  pipeline_executor.stop();
+  if (manage_executor) { pipeline_executor.stop(); }
 
-  // Validate repository data batches
+  // Validate repository data batches.
+  // The stream must be declared before batches so it outlives GPU data allocated on it.
+  rmm::cuda_stream stream;
   auto batches = drain_data_repo(data_repo);
-  validate_scanned_batches(batches, num_rows, mem_mgr);
+  validate_scanned_batches(batches, num_rows, mem_mgr, stream);
 
   // End the transaction
   auto commit_result = con.Query("COMMIT");
@@ -190,13 +198,15 @@ static void run_scan_test(std::string const& table_name,
 // Test: Single-threaded scan executor
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("scan_executor - single threaded small table", "[scan_executor][single_thread]")
+TEST_CASE("scan_executor - single threaded small table",
+          "[scan_executor][single_thread][shared_context]")
 {
   // Use 10MB batch size to ensure multiple 1MB blocks are allocated
   run_scan_test("test_small", 100, 1, 10000000);
 }
 
-TEST_CASE("scan_executor - single threaded with small batches", "[scan_executor][single_thread]")
+TEST_CASE("scan_executor - single threaded with small batches",
+          "[scan_executor][single_thread][shared_context]")
 {
   // Use a small batch size to force multiple batches
   // With 4 columns (INT + BIGINT + DOUBLE + VARCHAR(256)) = 4 + 8 + 8 + 256 = 276 bytes per row
@@ -208,17 +218,20 @@ TEST_CASE("scan_executor - single threaded with small batches", "[scan_executor]
 // Test: Multi-threaded scan executor
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("scan_executor - multi threaded small table", "[scan_executor][multi_thread]")
+TEST_CASE("scan_executor - multi threaded small table",
+          "[scan_executor][multi_thread][shared_context]")
 {
   run_scan_test("test_mt_small", 1000, 4, 1000000);
 }
 
-TEST_CASE("scan_executor - multi threaded medium table", "[scan_executor][multi_thread]")
+TEST_CASE("scan_executor - multi threaded medium table",
+          "[scan_executor][multi_thread][shared_context]")
 {
   run_scan_test("test_mt_medium", 100000, 4, 1000000);
 }
 
-TEST_CASE("scan_executor - multi threaded large table", "[scan_executor][multi_thread]")
+TEST_CASE("scan_executor - multi threaded large table",
+          "[scan_executor][multi_thread][shared_context]")
 {
   run_scan_test("test_mt_large", 500000, 8, 10000000);
 }
@@ -227,12 +240,12 @@ TEST_CASE("scan_executor - multi threaded large table", "[scan_executor][multi_t
 // Test: Edge cases
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("scan_executor - empty table", "[scan_executor][edge_case]")
+TEST_CASE("scan_executor - empty table", "[scan_executor][edge_case][shared_context]")
 {
   run_scan_test("test_empty", 0, 1, 1000000);
 }
 
-TEST_CASE("scan_executor - single row table", "[scan_executor][edge_case]")
+TEST_CASE("scan_executor - single row table", "[scan_executor][edge_case][shared_context]")
 {
   run_scan_test("test_single_row", 1, 1, 1000000);
 }

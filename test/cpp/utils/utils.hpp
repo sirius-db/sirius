@@ -20,6 +20,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
 #include "sirius_context.hpp"
+#include "sirius_test_env.hpp"
 
 #include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace duckdb {
@@ -86,6 +88,34 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
   rmm::device_async_resource_ref mr,
   bool use_int64_string_offsets = false);
 
+/**
+ * @brief Get a DuckDB database and connection for testing.
+ *
+ * When a shared test environment is active (g_shared_env != nullptr), returns a
+ * connection to the shared DuckDB instance (db_owner will be null).
+ * Otherwise, creates a standalone DuckDB instance and connection (db_owner will
+ * own the DuckDB instance and must outlive the connection).
+ */
+inline std::pair<std::unique_ptr<duckdb::DuckDB>, duckdb::Connection> make_test_db_and_connection()
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    return {nullptr, sirius::test::g_shared_env->make_connection()};
+  }
+  auto db  = std::make_unique<duckdb::DuckDB>(nullptr);
+  auto con = duckdb::Connection(*db);
+  return {std::move(db), std::move(con)};
+}
+
+/**
+ * @brief Get or create a SiriusContext for the given connection.
+ *
+ * When a shared test environment is active, the SiriusContext is already registered
+ * in the connection by the extension callback's OnConnectionOpened. In that case,
+ * the config_path is ignored.
+ *
+ * When no shared environment is active (isolated tests), creates and initializes
+ * a new SiriusContext from the given config file.
+ */
 inline duckdb::shared_ptr<duckdb::SiriusContext> get_sirius_context(
   duckdb::Connection& con, const std::filesystem::path& config_path)
 {

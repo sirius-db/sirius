@@ -16,7 +16,6 @@
 
 // sirius
 #include <helper/utils.hpp>
-#include <memory/host_table_utils.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 
 // cucascade
@@ -34,34 +33,34 @@
 namespace sirius::op::result {
 
 host_table_chunk_reader::column_reader::column_reader(
-  metadata_node const& node, std::unique_ptr<multiple_blocks_allocation> const& allocation)
+  cucascade::memory::column_metadata const& col,
+  std::unique_ptr<multiple_blocks_allocation> const& allocation)
 {
   if (allocation == nullptr || allocation->block_size() == 0) {
     throw std::runtime_error(
       "[host_table_chunk_reader::column_reader::column_reader] Invalid allocation.");
   }
-  size          = static_cast<size_t>(node.size);
-  null_count    = static_cast<size_t>(node.null_count);
-  cudf_col_type = node.type;
-  if (node.null_mask_offset < 0) { null_count = 0; }
+  size       = static_cast<size_t>(col.num_rows);
+  null_count = static_cast<size_t>(col.null_count);
+  cudf_col_type =
+    col.scale != 0 ? cudf::data_type(col.type_id, col.scale) : cudf::data_type(col.type_id);
+  if (!col.has_null_mask) { null_count = 0; }
 
-  data_accessor.initialize(static_cast<size_t>(node.data_offset), allocation);
+  data_accessor.initialize(col.data_offset, allocation);
 
-  if (null_count > 0) {
-    mask_accessor.initialize(static_cast<size_t>(node.null_mask_offset), allocation);
-  }
+  if (null_count > 0) { mask_accessor.initialize(col.null_mask_offset, allocation); }
 
-  if (node.type.id() == cudf::type_id::STRING) {
-    if (node.children.size() != 1) {
+  if (col.type_id == cudf::type_id::STRING) {
+    if (col.children.size() != 1) {
       throw std::runtime_error(
         "[host_table_chunk_reader::column_reader::initialize_accessors] STRING type must have one "
         "child node for offsets.");
     }
-    use_int64_offsets = (node.children[0].type.id() == cudf::type_id::INT64);
+    use_int64_offsets = (col.children[0].type_id == cudf::type_id::INT64);
     if (use_int64_offsets) {
-      offset_accessor_64.initialize(node.children[0].data_offset, allocation);
+      offset_accessor_64.initialize(col.children[0].data_offset, allocation);
     } else {
-      offset_accessor_32.initialize(node.children[0].data_offset, allocation);
+      offset_accessor_32.initialize(col.children[0].data_offset, allocation);
     }
   }
 }
@@ -221,7 +220,7 @@ void host_table_chunk_reader::column_reader::copy_string(
 
 host_table_chunk_reader::host_table_chunk_reader(
   duckdb::ClientContext& client_ctx,
-  cucascade::host_data_packed_representation const& host_table,
+  cucascade::host_data_representation const& host_table,
   duckdb::vector<duckdb::LogicalType> const& types_p)
   : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
 {
@@ -233,14 +232,14 @@ host_table_chunk_reader::host_table_chunk_reader(
     throw std::runtime_error(
       "[host_table_chunk_reader] host_table allocation is null (cannot read column data)");
   }
-  // Unpack metadata
-  auto metadata_nodes = sirius::unpack_metadata_to_nodes(host_table.get_host_table()->metadata);
-  if (metadata_nodes.size() != _types.size()) {
+  // Access column metadata directly
+  auto const& columns = host_table.get_host_table()->columns;
+  if (columns.size() != _types.size()) {
     throw std::runtime_error(
       "[host_table_chunk_reader] Metadata column count does not match expected column count.");
   }
   if (_allocation->size_bytes() == 0) {
-    if (metadata_nodes[0].size == 0) {
+    if (columns[0].num_rows == 0) {
       // Empty result host table, return without any column readers (creating them would fail).
       // Because _row_offset and _total_rows are 0 by default, get_next_chunk() will immediately
       // return false.
@@ -251,14 +250,14 @@ host_table_chunk_reader::host_table_chunk_reader(
     }
   }
   // Initialize column readers
-  _column_readers.reserve(metadata_nodes.size());
-  for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
+  _column_readers.reserve(columns.size());
+  for (size_t col_idx = 0; col_idx < columns.size(); ++col_idx) {
     if (col_idx == 0) {
-      _total_rows = static_cast<size_t>(metadata_nodes[col_idx].size);
+      _total_rows = static_cast<size_t>(columns[col_idx].num_rows);
       if (_total_rows < 0) {
         throw std::runtime_error("[host_table_chunk_reader] Negative total rows in first column.");
       }
-    } else if (metadata_nodes[col_idx].size != _total_rows) {
+    } else if (static_cast<size_t>(columns[col_idx].num_rows) != _total_rows) {
       throw std::runtime_error(
         "[host_table_chunk_reader] Metadata column size mismatch across columns.");
     }
@@ -268,7 +267,7 @@ host_table_chunk_reader::host_table_chunk_reader(
       throw std::runtime_error(
         "[host_table_chunk_reader] HUGEINT type is not currently supported.");
     }
-    _column_readers.emplace_back(metadata_nodes[col_idx], _allocation);
+    _column_readers.emplace_back(columns[col_idx], _allocation);
   }
 }
 

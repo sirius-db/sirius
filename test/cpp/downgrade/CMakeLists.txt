@@ -15,6 +15,5 @@
 # =============================================================================
 
 set(TEST_SOURCES
-    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_test_env.cpp
+    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_downgrade_executor.cpp
     PARENT_SCOPE)

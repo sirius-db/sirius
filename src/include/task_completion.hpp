@@ -27,8 +27,9 @@ namespace sirius {
  * @brief Enumeration of task sources for completion tracking
  */
 enum class Source {
-  SCAN,     ///< Task originated from a scan operation
-  PIPELINE  ///< Task originated from a pipeline operation
+  SCAN,      ///< Task originated from a scan operation
+  PIPELINE,  ///< Task originated from a pipeline operation
+  DOWNGRADE  ///< Task originated from a downgrade operation
 };
 
 /**
