@@ -65,7 +65,7 @@ has_error() {
     local file="$1"
     [[ ! -f "$file" ]] && return 0
     [[ ! -s "$file" ]] && return 0
-    grep -qE "(Error|Segmentation fault):" "$file" 2>/dev/null
+    grep -qE "(Error|Segmentation fault)" "$file" 2>/dev/null
 }
 
 printf 'query,status\n' | tee "$COMPARISON_CSV"
