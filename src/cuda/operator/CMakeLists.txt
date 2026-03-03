@@ -23,5 +23,6 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/nested_loop_join.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/strings_matching.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/substring.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/strlen_from_offsets.cu
         PARENT_SCOPE
 )

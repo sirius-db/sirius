@@ -19,12 +19,14 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "expression_executor/regex/regex_playground.hpp"
 #include "gpu_physical_strings_matching.hpp"
 #include "log/logging.hpp"
+#include "operator/strlen_from_offsets.cuh"
 #include <cudf/binaryop.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -772,6 +774,21 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
 
   //----------Unary Functions----------//
   else if (func_str == STRLEN_FUNC_STR) {
+    // Fast path: compute STRLEN directly from offsets when child is a column reference
+    if (expr.children[0]->type == ExpressionType::BOUND_REF) {
+      auto& ref = expr.children[0]->Cast<BoundReferenceExpression>();
+      auto& col = input_columns[ref.index];
+      if (col->data_wrapper.is_string_data && col->data_wrapper.offset != nullptr) {
+        size_t num_rows = col->row_ids != nullptr ? col->row_id_count : col->column_length;
+        SIRIUS_LOG_DEBUG("STRLEN fast path: {} rows from offsets (bypassing materialization)", num_rows);
+        return StrlenFromOffsets(col->data_wrapper.offset,
+                                col->row_ids,
+                                num_rows,
+                                execution_stream,
+                                resource_ref);
+      }
+    }
+    // Fallback: materialize string column then count bytes
     UnaryFunctionDispatcher<UnaryFunctionType::STRLEN> dispatcher(*this);
     return dispatcher(expr, state);
   }

@@ -35,6 +35,11 @@ fi
 mkdir -p "$REPO/build/release"
 
 export PATH="$PIXI_ENV/bin:$PATH"
+export LIBCUDF_ENV_PREFIX="$PIXI_ENV"
+
+# Detect GPU compute capability dynamically (e.g. "7.5" -> "75")
+CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+echo "Detected GPU compute capability: $CUDA_ARCH"
 
 "$PIXI_ENV/bin/cmake" -G Ninja \
     -DCMAKE_MAKE_PROGRAM="$PIXI_ENV/bin/ninja" \
@@ -44,6 +49,7 @@ export PATH="$PIXI_ENV/bin:$PATH"
     -DCMAKE_CXX_COMPILER="$PIXI_ENV/bin/g++" \
     -DCMAKE_CUDA_COMPILER="$PIXI_ENV/bin/nvcc" \
     -DCMAKE_CUDA_HOST_COMPILER="$PIXI_ENV/bin/g++" \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}-real" \
     -DEXTENSION_STATIC_BUILD=1 \
     -DDUCKDB_EXTENSION_CONFIGS="$REPO/extension_config.cmake" \
     -DDUCKDB_EXPLICIT_PLATFORM=linux_amd64 \

@@ -241,6 +241,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
 				printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+				printf("GPU error: %s\n", data.res->GetErrorObject().RawMessage().c_str());
 				data.res = data.conn->Query(data.query);
 			}
 		}
