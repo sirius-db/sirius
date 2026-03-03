@@ -78,14 +78,28 @@ build_analysis_sql() {
 .mode markdown
 .headers on
 
-.print
-.print ### Trace Overview
+-- Define query execution window: span of all Sirius operator NVTX ranges.
+-- All subsequent analysis is scoped to this window unless noted.
+CREATE TEMP VIEW query_window AS
 SELECT
-    ROUND(duration / 1e9, 3) AS trace_duration_s
-FROM ANALYSIS_DETAILS;
+    MIN(start) AS qstart,
+    MAX(end) AS qend,
+    MAX(end) - MIN(start) AS qspan
+FROM NVTX_EVENTS
+WHERE domainId = 0 AND eventType = 59 AND end > start;
 
 .print
-.print ### GPU Hardware
+.print #### Execution Time Breakdown
+SELECT
+    ROUND((SELECT duration FROM ANALYSIS_DETAILS) / 1e9, 3) AS trace_s,
+    ROUND((SELECT qspan FROM query_window) / 1e9, 3) AS query_exec_s,
+    ROUND((SELECT qstart FROM query_window) / 1e9, 3) AS init_s,
+    ROUND(((SELECT duration FROM ANALYSIS_DETAILS) - (SELECT qend FROM query_window)) / 1e9, 3) AS cleanup_s,
+    ROUND((SELECT qspan FROM query_window) * 100.0 /
+        NULLIF((SELECT duration FROM ANALYSIS_DETAILS), 0), 1) AS query_pct;
+
+.print
+.print #### GPU Hardware
 SELECT
     name AS gpu,
     id AS device_id,
@@ -95,7 +109,7 @@ SELECT
 FROM TARGET_INFO_GPU;
 
 .print
-.print ### NVTX Domain Summary
+.print #### NVTX Domain Summary
 WITH domain_names AS (
     SELECT DISTINCT domainId, text AS domain_name
     FROM NVTX_EVENTS WHERE eventType = 75
@@ -112,7 +126,7 @@ GROUP BY e.domainId
 ORDER BY wall_time_s DESC;
 
 .print
-.print ### Sirius Physical Operators
+.print #### Sirius Physical Operators
 SELECT
     text AS operator,
     COUNT(*) AS calls,
@@ -132,7 +146,7 @@ COMMON_SQL
         cat <<'GPU_SQL'
 
 .print
-.print ### Top GPU Kernels (by total time)
+.print #### Top GPU Kernels (by total time)
 SELECT
     SUBSTR(s.value, 1, 90) AS kernel,
     COUNT(*) AS launches,
@@ -147,7 +161,7 @@ ORDER BY total_s DESC
 LIMIT 25;
 
 .print
-.print ### Kernel Occupancy Estimation
+.print #### Kernel Occupancy Estimation
 .print (Theoretical occupancy based on registers, shared memory, and block size)
 WITH gpu AS (
     SELECT maxRegistersPerSm, maxShmemPerSm, maxWarpsPerSm,
@@ -205,7 +219,7 @@ ORDER BY total_gpu_s DESC
 LIMIT 20;
 
 .print
-.print ### Register Spill / Local Memory Analysis
+.print #### Register Spill / Local Memory Analysis
 .print (Kernels using local memory indicate register spilling to slow memory)
 SELECT
     SUBSTR(s.value, 1, 55) AS kernel,
@@ -222,7 +236,7 @@ ORDER BY gpu_time_s DESC
 LIMIT 15;
 
 .print
-.print ### GPU Kernel Time Summary
+.print #### GPU Kernel Time Summary
 SELECT
     COUNT(*) AS total_kernels,
     ROUND(SUM(end - start) / 1e9, 4) AS total_gpu_s,
@@ -233,19 +247,20 @@ SELECT
 FROM CUPTI_ACTIVITY_KIND_KERNEL;
 
 .print
-.print ### GPU Utilization Overview
+.print #### GPU Utilization Overview
+.print (Scoped to query execution window — excludes init and cleanup)
 SELECT
     ROUND(SUM(k.end - k.start) / 1e9, 4) AS kernel_time_s,
-    ROUND((SELECT duration FROM ANALYSIS_DETAILS) / 1e9, 3) AS trace_s,
+    ROUND((SELECT qspan FROM query_window) / 1e9, 3) AS query_exec_s,
     ROUND(SUM(k.end - k.start) * 100.0 /
-        NULLIF((SELECT duration FROM ANALYSIS_DETAILS), 0), 1) AS kernel_pct_of_trace,
+        NULLIF((SELECT qspan FROM query_window), 0), 1) AS kernel_pct_of_query,
     ROUND(SUM(k.end - k.start) * 100.0 /
         NULLIF((SELECT SUM(end - start) FROM NVTX_EVENTS
                 WHERE domainId = 0 AND eventType = 59 AND end > start), 0), 1) AS kernel_pct_of_ops
 FROM CUPTI_ACTIVITY_KIND_KERNEL k;
 
 .print
-.print ### Memory Transfer Breakdown (with bandwidth)
+.print #### Memory Transfer Breakdown (with bandwidth)
 SELECT
     e.label AS direction,
     CASE m.srcKind WHEN 0 THEN 'Pageable' WHEN 1 THEN 'Pinned'
@@ -263,7 +278,8 @@ GROUP BY m.copyKind, m.srcKind, m.dstKind
 ORDER BY total_gb DESC;
 
 .print
-.print ### CUDA Runtime API Hotspots
+.print #### CUDA Runtime API Hotspots (query execution only)
+.print (Excludes init/cleanup — only API calls during Sirius operator execution)
 SELECT
     s.value AS function,
     COUNT(*) AS calls,
@@ -272,12 +288,15 @@ SELECT
     ROUND(MAX(r.end - r.start) / 1e6, 3) AS max_ms
 FROM CUPTI_ACTIVITY_KIND_RUNTIME r
 JOIN StringIds s ON r.nameId = s.id
+WHERE r.start >= (SELECT qstart FROM query_window)
+  AND r.start <  (SELECT qend FROM query_window)
 GROUP BY s.value
 ORDER BY total_s DESC
 LIMIT 20;
 
 .print
-.print ### Host Memory Allocation Overhead
+.print #### Host Memory Allocation During Query Execution
+.print (Only allocation calls during query runtime — init/cleanup allocations excluded)
 SELECT
     s.value AS function,
     COUNT(*) AS calls,
@@ -285,20 +304,42 @@ SELECT
     ROUND(AVG(r.end - r.start) / 1e6, 3) AS avg_ms,
     ROUND(MAX(r.end - r.start) / 1e6, 3) AS max_ms,
     ROUND(SUM(r.end - r.start) * 100.0 /
-        NULLIF((SELECT SUM(end - start) FROM CUPTI_ACTIVITY_KIND_RUNTIME), 0), 1) AS pct_api
+        NULLIF((SELECT SUM(end - start) FROM CUPTI_ACTIVITY_KIND_RUNTIME r2
+                WHERE r2.start >= (SELECT qstart FROM query_window)
+                  AND r2.start <  (SELECT qend FROM query_window)), 0), 1) AS pct_query_api
 FROM CUPTI_ACTIVITY_KIND_RUNTIME r
 JOIN StringIds s ON r.nameId = s.id
-WHERE s.value LIKE 'cudaHostAlloc%'
+WHERE (s.value LIKE 'cudaHostAlloc%'
    OR s.value LIKE 'cudaFreeHost%'
    OR s.value LIKE 'cudaMalloc_v%'
    OR s.value LIKE 'cudaFree_v%'
    OR s.value LIKE 'cudaMallocManaged%'
-   OR s.value LIKE 'cudaMemPoolDestroy%'
+   OR s.value LIKE 'cudaMemPoolDestroy%')
+  AND r.start >= (SELECT qstart FROM query_window)
+  AND r.start <  (SELECT qend FROM query_window)
 GROUP BY s.value
 ORDER BY total_s DESC;
 
 .print
-.print ### GPU Kernel Attribution to Sirius Operators
+.print #### Init/Cleanup Overhead (excluded from query analysis)
+.print (Top CUDA API calls that occur before first operator or after last operator)
+SELECT
+    CASE WHEN r.start < (SELECT qstart FROM query_window) THEN 'init'
+         ELSE 'cleanup' END AS phase,
+    s.value AS function,
+    COUNT(*) AS calls,
+    ROUND(SUM(r.end - r.start) / 1e9, 4) AS total_s
+FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+JOIN StringIds s ON r.nameId = s.id
+WHERE r.start < (SELECT qstart FROM query_window)
+   OR r.start >= (SELECT qend FROM query_window)
+GROUP BY phase, s.value
+HAVING total_s > 0.01
+ORDER BY total_s DESC
+LIMIT 15;
+
+.print
+.print #### GPU Kernel Attribution to Sirius Operators
 .print (Maps GPU kernel time back to the Sirius operator that launched it)
 WITH sirius_ops AS (
     SELECT start, end, text, globalTid
@@ -327,7 +368,7 @@ ORDER BY gpu_time_s DESC
 LIMIT 20;
 
 .print
-.print ### Top Kernels per Sirius Operator
+.print #### Top Kernels per Sirius Operator
 .print (Shows which GPU kernels each operator uses most)
 WITH sirius_ops AS (
     SELECT start, end, text, globalTid
@@ -368,7 +409,7 @@ WHERE rn <= 3
 ORDER BY operator, gpu_time_s DESC;
 
 .print
-.print ### GPU Stream Utilization (busy %)
+.print #### GPU Stream Utilization (busy %)
 .print (busy% = kernel_time / stream_active_span per stream)
 SELECT
     streamId AS stream,
@@ -383,7 +424,7 @@ ORDER BY gpu_time_s DESC
 LIMIT 15;
 
 .print
-.print ### Synchronization Analysis
+.print #### Synchronization Analysis
 SELECT
     e.label AS sync_type,
     COUNT(*) AS events,
@@ -395,7 +436,7 @@ GROUP BY s.syncType
 ORDER BY total_s DESC;
 
 .print
-.print ### Memset Summary
+.print #### Memset Summary
 SELECT
     COUNT(*) AS ops,
     ROUND(SUM(bytes) / 1048576.0, 3) AS total_mb,
@@ -409,7 +450,7 @@ GPU_SQL
     cat <<'DOMAIN_SQL'
 
 .print
-.print ### NVTX Operations by Domain (top operations per domain)
+.print #### NVTX Operations by Domain (top operations per domain)
 WITH domain_names AS (
     SELECT DISTINCT domainId, text AS domain_name
     FROM NVTX_EVENTS WHERE eventType = 75
@@ -440,34 +481,21 @@ DOMAIN_SQL
 # Cross-query comparison (when analyzing multiple files)
 # ============================================================
 
-print_cross_query_summary() {
-    local dir="$1"
-    shift
+print_overview() {
     local files=("$@")
 
-    if [ ${#files[@]} -lt 2 ]; then
-        return
-    fi
-
-    echo ""
-    echo "# Cross-Query Comparison"
-    echo ""
-
-    # Build a temp database with aggregated stats from all queries
+    # Build a temp database with per-query stats
     local tmpdb
-    tmpdb=$(mktemp /tmp/nsys_compare_XXXXXX.db)
+    tmpdb=$(mktemp /tmp/nsys_overview_XXXXXX.db)
     trap "rm -f '$tmpdb'" RETURN
 
     sqlite3 "$tmpdb" "CREATE TABLE query_stats (
-        query TEXT,
-        trace_duration_s REAL,
-        nvtx_events INTEGER,
-        sirius_ops INTEGER,
-        gpu_kernels INTEGER,
-        gpu_time_s REAL,
-        memcpy_gb REAL,
-        streams_used INTEGER,
-        status TEXT
+        query TEXT, status TEXT,
+        cold_s REAL, hot_s REAL,
+        query_exec_s REAL, init_s REAL,
+        gpu_kernels INTEGER, gpu_time_s REAL,
+        h2d_gb REAL, d2d_gb REAL, d2h_gb REAL,
+        sync_time_s REAL, streams_used INTEGER
     );"
 
     for db in "${files[@]}"; do
@@ -479,40 +507,71 @@ print_cross_query_summary() {
         local has_gpu=0
         [[ "$tables" == *"CUPTI_ACTIVITY_KIND_KERNEL"* ]] && has_gpu=1
 
-        local trace_dur nvtx_count sirius_count gpu_kernels gpu_time memcpy_gb streams status
-        trace_dur=$(sqlite3 "$db" "SELECT ROUND(duration / 1e9, 3) FROM ANALYSIS_DETAILS;" 2>/dev/null || echo "0")
-        nvtx_count=$(sqlite3 "$db" "SELECT COUNT(*) FROM NVTX_EVENTS WHERE eventType = 59;" 2>/dev/null || echo "0")
-        sirius_count=$(sqlite3 "$db" "SELECT COUNT(*) FROM NVTX_EVENTS WHERE domainId = 0 AND eventType = 59;" 2>/dev/null || echo "0")
-
-        if [ "$has_gpu" = "1" ]; then
-            gpu_kernels=$(sqlite3 "$db" "SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL;" 2>/dev/null || echo "0")
-            gpu_time=$(sqlite3 "$db" "SELECT ROUND(SUM(end - start) / 1e9, 4) FROM CUPTI_ACTIVITY_KIND_KERNEL;" 2>/dev/null || echo "0")
-            memcpy_gb=$(sqlite3 "$db" "SELECT ROUND(SUM(bytes) / 1073741824.0, 3) FROM CUPTI_ACTIVITY_KIND_MEMCPY;" 2>/dev/null || echo "0")
-            streams=$(sqlite3 "$db" "SELECT COUNT(DISTINCT streamId) FROM CUPTI_ACTIVITY_KIND_KERNEL;" 2>/dev/null || echo "0")
-            status="OK"
-        else
-            gpu_kernels=0; gpu_time=0; memcpy_gb=0; streams=0
-            status="FAIL (no GPU data)"
+        # Parse timing CSV
+        local cold_s="NULL" hot_s="NULL"
+        local timing_file="${db%.sqlite}_timings.csv"
+        if [ -f "$timing_file" ]; then
+            cold_s=$(awk -F, 'NR==3{printf "%.3f", $2}' "$timing_file" 2>/dev/null || echo "NULL")
+            hot_s=$(awk -F, 'NR==4{printf "%.3f", $2}' "$timing_file" 2>/dev/null || echo "NULL")
         fi
 
-        sqlite3 "$tmpdb" "INSERT INTO query_stats VALUES ('$qname', $trace_dur, $nvtx_count, $sirius_count, $gpu_kernels, $gpu_time, $memcpy_gb, $streams, '$status');"
+        if [ "$has_gpu" = "1" ]; then
+            # Single sqlite3 call for all metrics
+            local metrics
+            metrics=$(sqlite3 -separator '|' "$db" "
+WITH qw AS (
+    SELECT MIN(start) AS qstart, MAX(end) AS qend
+    FROM NVTX_EVENTS WHERE domainId=0 AND eventType=59 AND end>start
+)
+SELECT
+    ROUND((qend - qstart) / 1e9, 3),
+    ROUND(qstart / 1e9, 3),
+    (SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL),
+    (SELECT ROUND(SUM(end-start)/1e9, 4) FROM CUPTI_ACTIVITY_KIND_KERNEL),
+    COALESCE((SELECT ROUND(SUM(bytes)/1073741824.0, 3) FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE copyKind IN (SELECT id FROM ENUM_CUDA_MEMCPY_OPER WHERE label LIKE 'Host-to-Device%')), 0),
+    COALESCE((SELECT ROUND(SUM(bytes)/1073741824.0, 3) FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE copyKind IN (SELECT id FROM ENUM_CUDA_MEMCPY_OPER WHERE label LIKE 'Device-to-Device%')), 0),
+    COALESCE((SELECT ROUND(SUM(bytes)/1073741824.0, 3) FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE copyKind IN (SELECT id FROM ENUM_CUDA_MEMCPY_OPER WHERE label LIKE 'Device-to-Host%')), 0),
+    COALESCE((SELECT ROUND(SUM(end-start)/1e9, 4) FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION), 0),
+    (SELECT COUNT(DISTINCT streamId) FROM CUPTI_ACTIVITY_KIND_KERNEL)
+FROM qw;
+" 2>/dev/null)
+            IFS='|' read -r qexec_s init_s kernels gpu_s h2d d2d d2h sync_s streams <<< "$metrics"
+            sqlite3 "$tmpdb" "INSERT INTO query_stats VALUES ('$qname','OK',$cold_s,$hot_s,${qexec_s:-0},${init_s:-0},${kernels:-0},${gpu_s:-0},${h2d:-0},${d2d:-0},${d2h:-0},${sync_s:-0},${streams:-0});"
+        else
+            sqlite3 "$tmpdb" "INSERT INTO query_stats VALUES ('$qname','FAIL',$cold_s,$hot_s,0,0,0,0,0,0,0,0,0);"
+        fi
     done
 
-    sqlite3 -batch "$tmpdb" <<'COMPARE_SQL'
+    sqlite3 -batch "$tmpdb" <<'OVERVIEW_SQL'
 .mode markdown
 .headers on
 
-.print ### Query Overview
+.print ### Timing Overview
 SELECT
     query,
-    trace_duration_s AS trace_s,
-    sirius_ops,
-    gpu_kernels AS kernels,
-    gpu_time_s,
-    memcpy_gb,
-    streams_used AS streams,
+    CASE WHEN cold_s IS NOT NULL THEN ROUND(cold_s, 2) END AS cold_s,
+    CASE WHEN hot_s IS NOT NULL THEN ROUND(hot_s, 2) END AS hot_s,
+    ROUND(query_exec_s, 2) AS exec_s,
+    ROUND(gpu_time_s, 2) AS gpu_s,
+    CASE WHEN query_exec_s > 0
+        THEN ROUND(gpu_time_s * 100.0 / query_exec_s, 1)
+    END AS gpu_util_pct,
     status
 FROM query_stats
+ORDER BY query;
+
+.print
+.print ### Memory Transfer Overview (GB)
+SELECT
+    query,
+    h2d_gb AS h2d,
+    d2d_gb AS d2d,
+    d2h_gb AS d2h,
+    ROUND(h2d_gb + d2d_gb + d2h_gb, 1) AS total_gb,
+    ROUND(sync_time_s, 2) AS sync_s,
+    streams_used AS streams
+FROM query_stats
+WHERE status = 'OK'
 ORDER BY query;
 
 .print
@@ -521,12 +580,13 @@ SELECT
     COUNT(*) AS queries,
     SUM(CASE WHEN status = 'OK' THEN 1 ELSE 0 END) AS passed,
     SUM(CASE WHEN status != 'OK' THEN 1 ELSE 0 END) AS failed,
-    ROUND(AVG(CASE WHEN status = 'OK' THEN trace_duration_s END), 3) AS avg_trace_s,
-    ROUND(SUM(CASE WHEN status = 'OK' THEN gpu_time_s ELSE 0 END), 3) AS total_gpu_s,
-    ROUND(SUM(CASE WHEN status = 'OK' THEN memcpy_gb ELSE 0 END), 3) AS total_memcpy_gb
+    ROUND(SUM(CASE WHEN status = 'OK' THEN hot_s END), 2) AS total_hot_s,
+    ROUND(AVG(CASE WHEN status = 'OK' THEN hot_s END), 2) AS avg_hot_s,
+    ROUND(SUM(CASE WHEN status = 'OK' THEN gpu_time_s END), 2) AS total_gpu_s,
+    ROUND(SUM(CASE WHEN status = 'OK' THEN h2d_gb + d2d_gb + d2h_gb END), 1) AS total_xfer_gb
 FROM query_stats;
 
-COMPARE_SQL
+OVERVIEW_SQL
 
     rm -f "$tmpdb"
 }
@@ -541,10 +601,37 @@ echo "Generated: $(date -Iseconds)"
 echo "Files: ${#SQLITE_FILES[@]}"
 echo ""
 
-# Check for timings CSV and summary files alongside the SQLite files
+# ---- Table of Contents ----
+echo "## Table of Contents"
+echo ""
+
+# Check for benchmark summary
 FIRST_DIR=$(dirname "${SQLITE_FILES[0]}")
 if [ -f "$FIRST_DIR/summary.txt" ]; then
-    echo "## Benchmark Summary (from profiling run)"
+    echo "- [Benchmark Summary](#benchmark-summary)"
+fi
+
+if [ ${#SQLITE_FILES[@]} -gt 1 ]; then
+    echo "- [Overall Analysis](#overall-analysis)"
+    echo "  - [Timing Overview](#timing-overview)"
+    echo "  - [Memory Transfer Overview](#memory-transfer-overview)"
+    echo "  - [Aggregated Statistics](#aggregated-statistics)"
+fi
+
+echo "- [Per-Query Analysis](#per-query-analysis)"
+for db in "${SQLITE_FILES[@]}"; do
+    QNAME=$(basename "$db" .sqlite)
+    echo "  - [$QNAME](#$QNAME)"
+done
+echo ""
+
+# ---- Benchmark Summary ----
+if [ -f "$FIRST_DIR/summary.txt" ]; then
+    echo "---"
+    echo ""
+    echo "<a id=\"benchmark-summary\"></a>"
+    echo ""
+    echo "## Benchmark Summary"
     echo ""
     echo '```'
     cat "$FIRST_DIR/summary.txt"
@@ -552,18 +639,40 @@ if [ -f "$FIRST_DIR/summary.txt" ]; then
     echo ""
 fi
 
+# ---- Overall Analysis (multi-file) ----
+if [ ${#SQLITE_FILES[@]} -gt 1 ]; then
+    echo "---"
+    echo ""
+    echo "<a id=\"overall-analysis\"></a>"
+    echo ""
+    echo "## Overall Analysis"
+    echo ""
+    print_overview "${SQLITE_FILES[@]}"
+    echo ""
+fi
+
+# ---- Per-Query Analysis ----
+echo "---"
+echo ""
+echo "<a id=\"per-query-analysis\"></a>"
+echo ""
+echo "## Per-Query Analysis"
+echo ""
+
 for db in "${SQLITE_FILES[@]}"; do
     QNAME=$(basename "$db" .sqlite)
 
     echo "---"
     echo ""
-    echo "## $QNAME"
+    echo "<a id=\"$QNAME\"></a>"
+    echo ""
+    echo "### $QNAME"
     echo ""
 
     # Check for companion timings CSV
     TIMING_FILE="${db%.sqlite}_timings.csv"
     if [ -f "$TIMING_FILE" ]; then
-        echo "### Iteration Timings"
+        echo "#### Iteration Timings"
         echo ""
         echo '```'
         cat "$TIMING_FILE"
@@ -586,13 +695,6 @@ for db in "${SQLITE_FILES[@]}"; do
 
     echo ""
 done
-
-# Cross-query comparison for multi-file analysis
-if [ ${#SQLITE_FILES[@]} -gt 1 ]; then
-    echo "---"
-    echo ""
-    print_cross_query_summary "$(dirname "${SQLITE_FILES[0]}")" "${SQLITE_FILES[@]}"
-fi
 
 echo ""
 echo "---"

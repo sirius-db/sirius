@@ -76,9 +76,11 @@ Default threshold is 10%. Values beyond the threshold are flagged:
 
 The report contains these sections per query:
 
+All analysis is **scoped to the query execution window** — the time span from the first Sirius operator start to the last operator end. Init overhead (CUDA context creation, cudaHostAlloc, cuFile init) and cleanup (cudaFreeHost, pool destruction) are excluded from the main metrics and shown separately.
+
 | Section | What it Shows |
 |---------|---------------|
-| **Trace Overview** | Total trace duration |
+| **Execution Time Breakdown** | Trace duration vs query execution time vs init vs cleanup |
 | **GPU Hardware** | GPU model, SM count, VRAM, compute capability |
 | **NVTX Domain Summary** | Time breakdown across software layers (Sirius, libkvikio, libcudf, CCCL, cuFile) |
 | **Sirius Physical Operators** | Per-operator call counts, wall times, percentages |
@@ -86,10 +88,11 @@ The report contains these sections per query:
 | **Kernel Occupancy Estimation** | Theoretical SM occupancy per kernel, limiting factor (registers/shared_mem/warps) |
 | **Register Spill Analysis** | Kernels using local memory (register spilling to slow memory) |
 | **GPU Kernel Time Summary** | Aggregate kernel stats, stream count, device count |
-| **GPU Utilization Overview** | Kernel time as % of trace and as % of Sirius operator time |
+| **GPU Utilization Overview** | Kernel time as % of query execution time (not total trace) |
 | **Memory Transfer Breakdown** | H2D/D2H/D2D with Pageable vs Pinned src/dst, bandwidth in GB/s |
-| **CUDA Runtime API Hotspots** | Slowest CUDA API calls |
-| **Host Memory Allocation Overhead** | cudaHostAlloc/cudaFreeHost/cudaMalloc costs |
+| **CUDA Runtime API Hotspots** | Slowest CUDA API calls *during query execution only* |
+| **Host Memory Allocation During Query** | Only alloc calls during runtime (init allocs excluded) |
+| **Init/Cleanup Overhead** | What was excluded — cudaHostAlloc, cudaFreeHost, context creation, etc. |
 | **GPU Kernel Attribution** | Maps GPU kernel time back to Sirius operators via correlation chain |
 | **Top Kernels per Operator** | Which specific kernels each operator launches |
 | **GPU Stream Utilization** | Per-stream busy% = kernel_time / stream_active_span |
@@ -155,13 +158,14 @@ Sirius intercepts DuckDB query plans and offloads them to GPU via cuDF:
 - **D2H**: Usually small volumes (query results). Bandwidth similar to H2D.
 
 ### GPU Utilization
-- `kernel_pct_of_trace`: Kernel time / trace duration. Low values (<20%) mean the GPU is idle most of the time — look at CUDA API overhead and sync waits.
+- `kernel_pct_of_query`: Kernel time / query execution span (excludes init/cleanup). Values of 40-60% are typical — the remainder is CPU orchestration, sync waits, and memcpy. Below 30% suggests the GPU is starved.
 - `kernel_pct_of_ops`: Kernel time / Sirius operator time. Values >100% indicate GPU kernels overlap with CPU operator orchestration (normal with async execution). Low values suggest CPU-side bottlenecks within operators.
 
 ### Host Memory Overhead
-- `cudaHostAlloc` is synchronous and extremely expensive (100-700ms per call). Each call forces a full GPU sync.
-- `cudaFreeHost` is similarly expensive.
-- `pct_api` shows what fraction of total CUDA API time is spent on memory allocation — often 40-60% of all API time.
+- The analysis separates init-time allocations from query-runtime allocations.
+- `cudaHostAlloc` during init (10+ seconds) is a one-time cost — it's shown in the Init/Cleanup Overhead section.
+- If `cudaHostAlloc` appears in the "During Query Execution" section, that's a performance issue — synchronous allocation during active queries stalls the pipeline.
+- `cudaStreamSynchronize` is typically the dominant cost during query execution — it represents time the CPU waits for GPU work to complete.
 
 ### Register Spill
 - `local_bytes_per_thread > 0` means the kernel exceeded the register file and is spilling to local memory (which actually resides in global/L2 memory — much slower).
@@ -169,8 +173,8 @@ Sirius intercepts DuckDB query plans and offloads them to GPU via cuDF:
 
 ## What to Look For
 
-1. **Where is wall time going?** Compare operator time vs trace duration. Large gaps = overhead (host alloc, sync, nsys).
-2. **GPU utilization**: Low kernel_pct_of_trace = GPU underutilized (CPU-bound or I/O-bound).
+1. **Where is query time going?** Compare operator time vs query execution span. Large gaps = sync waits, memcpy, or CPU orchestration overhead.
+2. **GPU utilization**: Low kernel_pct_of_query (<30%) = GPU underutilized during query execution (CPU-bound, sync-bound, or I/O-bound).
 3. **Occupancy hotspots**: Kernels with <50% occupancy that consume significant GPU time.
 4. **Memory bandwidth**: Pageable transfers are orders of magnitude slower than pinned.
 5. **Host allocation cost**: cudaHostAlloc often dominates CUDA API time.
