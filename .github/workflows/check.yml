@@ -3,38 +3,49 @@ name: Check
 on:
   pull_request:
 
-env:
-  SCCACHE_GHA_ENABLED: true
-
 jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
-      - name: Run pre-commit
-        uses: pre-commit/action@v3.0.1
-  # build:
-  #   needs: lint
-  #   strategy:
-  #     matrix:
-  #       runs-on:
-  #         - ubuntu-24.04
-  #         - ubuntu-24.04-arm
-  #     fail-fast: false
-  #   runs-on: ${{ matrix.runs-on }}
-  #   steps:
-  #     - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
-  #       with:
-  #         submodules: recursive
-  #     - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
-  #       with:
-  #         pixi-version: v0.59.0
-  #         activate-environment: true
-  #     - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-  #     - run: make -j$(nproc)
-  #     - name: Stop sccache
-  #       if: always()
-  #       run: sccache --stop-server || true
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+
+  build:
+    env:
+      SCCACHE_GHA_ENABLED: true
+    strategy:
+      matrix:
+        arch:
+          - x64
+          - arm64
+        compiler:
+          - gcc
+          - clang
+        build-type:
+          - release
+          - debug
+        exclude:
+          - compiler: gcc
+            build-type: debug
+          - compiler: clang
+            build-type: release
+      fail-fast: false
+    runs-on: ${{ format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+        with:
+          pixi-version: v0.65.0
+          activate-environment: true
+
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - run: make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+        env:
+          CUDAARCHS: "100"
