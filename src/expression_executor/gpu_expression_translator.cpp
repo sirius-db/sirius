@@ -49,6 +49,10 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
   auto right_expr = add_expression(*condition.right, right_table_ref);
   if (!right_expr) { return std::nullopt; }
 
+  // When swap_sides is true, left_expr and right_expr reference swapped tables,
+  // so inequality operators must be flipped to preserve the original semantics.
+  // E.g. original "L.a > R.b" with swapped refs becomes "R.a ? L.b" — we need
+  // LESS so that "R.a < L.b" ≡ "L.a > R.b".
   switch (condition.comparison) {
     case duckdb::ExpressionType::COMPARE_EQUAL:
       return _ast_tree.emplace<cudf::ast::operation>(
@@ -58,16 +62,24 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
         cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
     case duckdb::ExpressionType::COMPARE_LESSTHAN:
       return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
+        swap_sides ? cudf::ast::ast_operator::GREATER : cudf::ast::ast_operator::LESS,
+        *left_expr,
+        *right_expr);
     case duckdb::ExpressionType::COMPARE_GREATERTHAN:
       return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
+        swap_sides ? cudf::ast::ast_operator::LESS : cudf::ast::ast_operator::GREATER,
+        *left_expr,
+        *right_expr);
     case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
       return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
+        swap_sides ? cudf::ast::ast_operator::GREATER_EQUAL : cudf::ast::ast_operator::LESS_EQUAL,
+        *left_expr,
+        *right_expr);
     case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
       return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+        swap_sides ? cudf::ast::ast_operator::LESS_EQUAL : cudf::ast::ast_operator::GREATER_EQUAL,
+        *left_expr,
+        *right_expr);
     default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported join condition comparison type: {}",
                        condition.comparison);
