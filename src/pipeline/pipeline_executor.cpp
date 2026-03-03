@@ -146,9 +146,9 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
   while (!_priority_scans.empty()) {
     _priority_scans.pop();
   }
-  for (auto* scan : scans) {
-    _priority_scans.push(scan);
-  }
+  // Only enqueue the first scan so it is scheduled by schedule_next_scan_tasks(); additional scans
+  // are enqueued by the task hints in the task creator.
+  if (!scans.empty()) { _priority_scans.push(scans[0]); }
 }
 
 std::future<void> pipeline_executor::start_query()
