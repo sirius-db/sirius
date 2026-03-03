@@ -53,7 +53,25 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
                                                        _row_group_indices,
                                                        _column_chunk_byte_ranges,
                                                        _size_in_bytes,
-                                                       _uncompressed_size_in_bytes);
+                                                       _uncompressed_size_in_bytes,
+                                                       _fallback_datasource);
+}
+
+std::unique_ptr<cucascade::idata_representation> host_parquet_representation::shallow_clone()
+{
+  auto cloned_reader =
+    std::make_unique<hybrid_scan_reader>(_parquet_reader->parquet_metadata(), _reader_options);
+  auto hpr = std::unique_ptr<host_parquet_representation>(
+    new host_parquet_representation(&get_memory_space(),
+                                    std::move(cloned_reader),
+                                    _reader_options,
+                                    _row_group_indices,
+                                    _column_chunk_byte_ranges,
+                                    _size_in_bytes,
+                                    _uncompressed_size_in_bytes,
+                                    _fallback_datasource));
+  hpr->_column_chunks = _column_chunks;
+  return hpr;
 }
 
 }  // namespace sirius

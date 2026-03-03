@@ -18,6 +18,7 @@
 
 #include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/host_parquet_representation.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -150,6 +151,34 @@ void duckdb_scan_executor::submit_scan_request()
 std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
   pipeline::sirius_pipeline_itask* task, rmm::cuda_stream_view stream)
 {
+  bool is_duckdb_scan  = dynamic_cast<duckdb_scan_task*>(task) != nullptr;
+  bool is_parquet_scan = !is_duckdb_scan and dynamic_cast<parquet_scan_task*>(task) != nullptr;
+
+  auto clone_batches = [&](const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
+                           rmm::cuda_stream_view stream) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
+    cloned_batches.reserve(batches.size());
+    if (is_duckdb_scan) {
+      for (auto& batch : batches) {
+        cloned_batches.push_back(batch->clone(get_next_batch_id(), stream));
+      }
+    } else if (is_parquet_scan) {
+      for (auto& batch : batches) {
+        auto* idata_rep = batch->get_data();
+        if (auto* parquet_rep = dynamic_cast<host_parquet_representation*>(idata_rep);
+            parquet_rep) {
+          cloned_batches.push_back(std::make_shared<cucascade::data_batch>(
+            get_next_batch_id(), parquet_rep->shallow_clone()));
+        } else {
+          throw std::runtime_error("Invalid data representation type");
+        }
+      }
+    } else {
+      throw std::runtime_error("Invalid task type");
+    }
+    return cloned_batches;
+  };
+
   if (!_caching_enabled) {
     return task->compute_task(stream);
   } else {
@@ -162,20 +191,10 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
         throw std::runtime_error("Scan results for query not cached");
       }
       auto batches = entry->batches[entry->batch_index++];
-      std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
-      cloned_batches.reserve(batches.size());
-      for (auto& b : batches) {
-        cloned_batches.push_back(b->clone(::sirius::get_next_batch_id(), stream));
-      }
-      return std::make_unique<op::operator_data>(std::move(cloned_batches));
+      return std::make_unique<op::operator_data>(clone_batches(std::move(batches), stream));
     } else {
       auto scan_output = task->compute_task(stream);
-      std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
-      cloned_batches.reserve(scan_output->get_data_batches().size());
-      for (auto& b : scan_output->get_data_batches()) {
-        cloned_batches.push_back(b->clone(::sirius::get_next_batch_id(), stream));
-      }
-      entry->batches.push_back(std::move(cloned_batches));
+      entry->batches.push_back(clone_batches(scan_output->get_data_batches(), stream));
       return scan_output;
     }
   }
@@ -233,9 +252,11 @@ void duckdb_scan_executor::manager_loop()
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
       try {
-        auto consumers   = scan_task->get_output_consumers();
-        auto output_data = get_scan_output(scan_task, stream);
-        scan_task->publish_output(*output_data, stream);
+        auto consumers = scan_task->get_output_consumers();
+        {
+          auto output_data = get_scan_output(scan_task, stream);
+          scan_task->publish_output(*output_data, stream);
+        }
 
         t.reset();
         if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
