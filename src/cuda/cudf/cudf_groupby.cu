@@ -19,6 +19,7 @@
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
+#include <cudf/stream_compaction.hpp>
 
 namespace duckdb {
 
@@ -186,6 +187,91 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   }
 
   auto keys_table = cudf::table_view(keys_cudf);
+
+  // --- Two-phase COUNT DISTINCT optimization ---
+  // When all aggregates are COUNT_DISTINCT, use: distinct(group_keys + value) → groupby COUNT_STAR
+  // This is faster than cudf's internal nunique which does sort-per-group + unique.
+  {
+    bool all_count_distinct = (num_aggregates > 0);
+    for (int agg = 0; agg < num_aggregates; agg++) {
+      if (agg_mode[agg] != AggregationType::COUNT_DISTINCT) {
+        all_count_distinct = false;
+        break;
+      }
+    }
+
+    if (all_count_distinct) {
+      SIRIUS_LOG_DEBUG("Two-phase COUNT DISTINCT: {} aggregates", num_aggregates);
+
+      for (int agg = 0; agg < num_aggregates; agg++) {
+        // Phase 1: Build table (group_keys..., value) and deduplicate
+        std::vector<cudf::column_view> dedup_columns;
+        for (int key = 0; key < num_keys; key++) {
+          dedup_columns.push_back(keys_cudf[key]);
+        }
+        auto value_view = aggregate_keys[agg]->convertToCudfColumn();
+        dedup_columns.push_back(value_view);
+
+        auto dedup_table = cudf::table_view(dedup_columns);
+        // All columns are keys for deduplication
+        std::vector<cudf::size_type> all_key_indices;
+        for (int k = 0; k < static_cast<int>(dedup_columns.size()); k++) {
+          all_key_indices.push_back(k);
+        }
+
+        auto distinct_result = cudf::distinct(
+          dedup_table, all_key_indices,
+          cudf::duplicate_keep_option::KEEP_ANY,
+          cudf::null_equality::EQUAL,
+          cudf::nan_equality::ALL_EQUAL,
+          rmm::cuda_stream_default,
+          gpuBufferManager->mr);
+
+        SIRIUS_LOG_DEBUG("Two-phase COUNT DISTINCT: {} -> {} rows after distinct",
+                         size, distinct_result->num_rows());
+
+        // Phase 2: GroupBy COUNT_STAR on the deduplicated table
+        std::vector<cudf::column_view> dedup_keys_views;
+        for (int key = 0; key < num_keys; key++) {
+          dedup_keys_views.push_back(distinct_result->get_column(key));
+        }
+        auto dedup_keys_table = cudf::table_view(dedup_keys_views);
+
+        cudf::groupby::groupby grpby_phase2(
+          dedup_keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
+
+        std::vector<cudf::groupby::aggregation_request> phase2_requests;
+        phase2_requests.emplace_back(cudf::groupby::aggregation_request());
+        auto count_agg = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE);
+        phase2_requests[0].aggregations.push_back(std::move(count_agg));
+        // Use the value column from distinct result as the values input (just need something to count)
+        phase2_requests[0].values = distinct_result->get_column(num_keys);
+
+        auto phase2_result = grpby_phase2.aggregate(phase2_requests);
+
+        // Extract results: group keys from first aggregate, count from each
+        if (agg == 0) {
+          auto result_key = std::move(phase2_result.first);
+          for (int key = 0; key < num_keys; key++) {
+            cudf::column group_key = result_key->get_column(key);
+            keys[key]->setFromCudfColumn(group_key, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
+          }
+        }
+
+        auto agg_val = std::move(phase2_result.second[0].results[0]);
+        auto agg_val_view = agg_val->view();
+        auto temp_data = convertInt32ToUInt64(const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
+        auto validity_mask = createNullMask(agg_val_view.size());
+        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(), GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp_data), validity_mask);
+      }
+
+      STOP_TIMER();
+      SIRIUS_LOG_DEBUG("CUDF Groupby (two-phase COUNT DISTINCT) result count: {}", keys[0]->column_length);
+      return;
+    }
+  }
+  // --- End two-phase COUNT DISTINCT optimization ---
+
   cudf::groupby::groupby grpby_obj(
     keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
 

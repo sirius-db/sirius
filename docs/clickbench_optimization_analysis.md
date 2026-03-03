@@ -398,10 +398,14 @@ Top-K (Heap Sort):                              1.52 ms
 internal per-group sort+unique that libcudf performs. Two-phase (distinct → count_star) should
 bypass this entirely. Expected: 229ms → 10-30ms.
 
-### P3: STRLEN offset arithmetic
+### P3: STRLEN offset arithmetic — DONE (commit 67a12c8)
 
 ```
-TODO: measure Q27 before/after
+RTX 6000, 10M rows, gpu_processing(), per-query gpu_buffer_init
+Q27: 0.021s → 0.007s (3x speedup) — STRLEN(URL) GROUP BY
+Q28: 0.125s → 0.109s (13% faster) — AVG(STRLEN(Referer)) with REGEXP_REPLACE
+Correctness: PASS (all 43 queries match CPU golden)
+No regressions on other queries
 ```
 
 ### P5: Top-K malloc elimination
@@ -415,3 +419,34 @@ TODO: measure affected queries before/after
 ```
 TODO: measure Q8, Q9, Q13 before/after
 ```
+
+---
+
+## Future Proposal: Dictionary Encoding for String Columns
+
+**Idea**: During cold-run data loading (gpu_buffer_init), compute cardinality
+of each string column. If `distinct_count / row_count < threshold` (e.g., 0.5),
+dictionary-encode the column: store a dictionary of unique strings + integer
+codes per row.
+
+**Impact on GPU operations**:
+- GROUP BY on strings → GROUP BY on integers (fixes VARCHAR GROUP BY fallback)
+- JOIN on string keys → integer JOIN
+- WHERE col = 'value' → single dict lookup + integer filter
+- ORDER BY strings → integer sort
+- These cover majority of real-world analytics string operations
+
+**When it helps**: Columns with < ~1M distinct values (categories, status codes,
+country names, browser names, search engines). ClickBench examples: CounterID
+labels, MobilePhoneModel (~500 distinct), BrowserLanguage, SocialNetwork.
+
+**When it doesn't help**: Near-unique columns (URL with 6M/100M distinct,
+WatchID, UserID). LIKE/REGEXP still need to decode back to strings.
+
+**Implementation path**: cudf already has `cudf::dictionary_column_view` with
+dict-aware GROUP BY, sort, etc. Main work is integrating dict encoding into
+Sirius's GPUColumn and data loading path, and routing operators through cudf's
+dictionary APIs.
+
+**Estimated scope**: Medium-term (not a weekend project). High impact across
+real workloads beyond ClickBench.
