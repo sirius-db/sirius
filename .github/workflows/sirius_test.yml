@@ -27,11 +27,17 @@ jobs:
         env:
           CUDAARCHS: "75" # For Turing, T4 capability
         run: make -j$(nproc)
-      - name: Upload build artifacts
+      - name: Archive workspace
+        run: |
+          tar -czf /tmp/workspace.tar.gz \
+            --exclude='.git' \
+            --exclude='.pixi' \
+            .
+      - name: Upload workspace
         uses: actions/upload-artifact@v4
         with:
-          name: build-${{ github.run_id }}
-          path: build/
+          name: workspace-${{ github.run_id }}
+          path: /tmp/workspace.tar.gz
           retention-days: 1
 
   gpu_test:
@@ -41,23 +47,20 @@ jobs:
     steps:
       - name: Cleanup
         run: rm -rf -- * .[^.]* ..?*
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Download workspace
+        uses: actions/download-artifact@v4
         with:
-          submodules: recursive
-          fetch-depth: 0
+          name: workspace-${{ github.run_id }}
+          path: /tmp/
+      - name: Extract workspace
+        run: |
+          tar -xzf /tmp/workspace.tar.gz
+          rm /tmp/workspace.tar.gz
       - name: Setup Pixi
         uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
         with:
           pixi-version: v0.59.0
           activate-environment: true
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-${{ github.run_id }}
-          path: build/
-      - name: Restore executable permissions
-        run: chmod -R u+x build/
       - name: Run C++ unit tests
         run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
       - name: Prepare SQL test datasets
