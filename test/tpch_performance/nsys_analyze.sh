@@ -592,6 +592,312 @@ OVERVIEW_SQL
 }
 
 # ============================================================
+# Key findings / executive summary (multi-query)
+# ============================================================
+
+print_conclusions() {
+    local files=("$@")
+    [ ${#files[@]} -lt 2 ] && return
+    local tmpdb
+    tmpdb=$(mktemp /tmp/nsys_conclusions_XXXXXX.db)
+
+    sqlite3 "$tmpdb" "CREATE TABLE qstats (
+        query TEXT, status TEXT, cold_s REAL, hot_s REAL,
+        query_exec_s REAL, init_s REAL, cleanup_s REAL,
+        gpu_time_s REAL, kernel_count INTEGER,
+        h2d_gb REAL, d2d_gb REAL, d2h_gb REAL,
+        sync_time_s REAL, streams_used INTEGER,
+        ops_time_s REAL);
+    CREATE TABLE kernel_agg (
+        query TEXT, kernel TEXT, launches INTEGER,
+        gpu_time_s REAL, occ_pct REAL, limiter TEXT);
+    CREATE TABLE top_ops (
+        query TEXT, operator TEXT, total_s REAL, pct REAL);"
+
+    # ---- Collect data from all profiles ----
+    for db in "${files[@]}"; do
+        local qname
+        qname=$(basename "$db" .sqlite)
+        local tables
+        tables=$(sqlite3 "$db" "SELECT GROUP_CONCAT(name) FROM sqlite_master WHERE type='table';")
+        local has_gpu=0
+        [[ "$tables" == *"CUPTI_ACTIVITY_KIND_KERNEL"* ]] && has_gpu=1
+
+        local cold_s="NULL" hot_s="NULL"
+        local timing_file="${db%.sqlite}_timings.csv"
+        if [ -f "$timing_file" ]; then
+            cold_s=$(awk -F, 'NR==3{printf "%.4f", $2}' "$timing_file" 2>/dev/null || echo "NULL")
+            hot_s=$(awk -F, 'NR==4{printf "%.4f", $2}' "$timing_file" 2>/dev/null || echo "NULL")
+            [ -z "$cold_s" ] && cold_s="NULL"
+            [ -z "$hot_s" ] && hot_s="NULL"
+        fi
+
+        if [ "$has_gpu" = "0" ]; then
+            sqlite3 "$tmpdb" "INSERT INTO qstats VALUES ('$qname','FAIL',$cold_s,$hot_s,0,0,0,0,0,0,0,0,0,0,0);"
+            continue
+        fi
+
+        local metrics
+        metrics=$(sqlite3 -separator '|' "$db" "
+WITH qw AS (
+    SELECT MIN(start) AS qstart, MAX(end) AS qend, MAX(end)-MIN(start) AS qspan
+    FROM NVTX_EVENTS WHERE domainId=0 AND eventType=59 AND end>start
+)
+SELECT
+    ROUND(qspan/1e9, 4),
+    ROUND(qstart/1e9, 4),
+    ROUND(((SELECT duration FROM ANALYSIS_DETAILS) - qend)/1e9, 4),
+    (SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL),
+    (SELECT ROUND(SUM(end-start)/1e9, 4) FROM CUPTI_ACTIVITY_KIND_KERNEL),
+    COALESCE((SELECT ROUND(SUM(bytes)/1073741824.0,3) FROM CUPTI_ACTIVITY_KIND_MEMCPY
+              WHERE copyKind IN (SELECT id FROM ENUM_CUDA_MEMCPY_OPER WHERE label LIKE 'Host-to-Device%')),0),
+    COALESCE((SELECT ROUND(SUM(bytes)/1073741824.0,3) FROM CUPTI_ACTIVITY_KIND_MEMCPY
+              WHERE copyKind IN (SELECT id FROM ENUM_CUDA_MEMCPY_OPER WHERE label LIKE 'Device-to-Device%')),0),
+    COALESCE((SELECT ROUND(SUM(bytes)/1073741824.0,3) FROM CUPTI_ACTIVITY_KIND_MEMCPY
+              WHERE copyKind IN (SELECT id FROM ENUM_CUDA_MEMCPY_OPER WHERE label LIKE 'Device-to-Host%')),0),
+    COALESCE((SELECT ROUND(SUM(end-start)/1e9,4) FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION),0),
+    (SELECT COUNT(DISTINCT streamId) FROM CUPTI_ACTIVITY_KIND_KERNEL),
+    (SELECT ROUND(SUM(end-start)/1e9,4) FROM NVTX_EVENTS
+     WHERE domainId=0 AND eventType=59 AND end>start)
+FROM qw;" 2>/dev/null)
+        IFS='|' read -r qexec init cleanup kernels gpu h2d d2d d2h sync streams ops_time <<< "$metrics"
+        sqlite3 "$tmpdb" "INSERT INTO qstats VALUES (
+            '$qname','OK',$cold_s,$hot_s,
+            ${qexec:-0},${init:-0},${cleanup:-0},
+            ${gpu:-0},${kernels:-0},
+            ${h2d:-0},${d2d:-0},${d2h:-0},
+            ${sync:-0},${streams:-0},${ops_time:-0});"
+
+        # Top kernels with occupancy (pipe via stdin so .mode works)
+        sqlite3 "$db" <<KERNEL_SQL 2>/dev/null | sqlite3 "$tmpdb" || true
+.mode insert kernel_agg
+WITH gpu AS (
+    SELECT maxWarpsPerSm, maxRegistersPerSm, maxShmemPerSm,
+           maxBlocksPerSm, threadsPerWarp
+    FROM TARGET_INFO_GPU LIMIT 1
+),kc AS (
+    SELECT s.value AS kernel, k.registersPerThread AS regs,
+           k.blockX*k.blockY*k.blockZ AS tpb,
+           k.sharedMemoryExecuted AS shmem,
+           COUNT(*) AS launches, SUM(k.end-k.start) AS gpu_ns
+    FROM CUPTI_ACTIVITY_KIND_KERNEL k
+    JOIN StringIds s ON k.shortName=s.id
+    GROUP BY s.value, k.registersPerThread,
+             k.blockX*k.blockY*k.blockZ, k.sharedMemoryExecuted
+),occ AS (
+    SELECT kc.*,
+        CAST((tpb+g.threadsPerWarp-1)/g.threadsPerWarp AS INT) AS wpb,
+        g.maxWarpsPerSm/CAST((tpb+g.threadsPerWarp-1)/g.threadsPerWarp AS INT) AS mb_w,
+        CASE WHEN regs>0 THEN g.maxRegistersPerSm/(regs*tpb)
+             ELSE g.maxBlocksPerSm END AS mb_r,
+        CASE WHEN shmem>0 THEN g.maxShmemPerSm/shmem
+             ELSE g.maxBlocksPerSm END AS mb_s,
+        g.maxBlocksPerSm AS mb_h, g.maxWarpsPerSm
+    FROM kc CROSS JOIN gpu g
+)
+SELECT '$qname', kernel, launches,
+       ROUND(gpu_ns/1e9, 6),
+       ROUND(MIN(mb_w,mb_r,mb_s,mb_h)*wpb*100.0/maxWarpsPerSm, 1),
+       CASE WHEN MIN(mb_w,mb_r,mb_s,mb_h)=mb_s THEN 'shared_mem'
+            WHEN MIN(mb_w,mb_r,mb_s,mb_h)=mb_r THEN 'registers'
+            WHEN MIN(mb_w,mb_r,mb_s,mb_h)=mb_w THEN 'warps'
+            ELSE 'hw_limit' END
+FROM occ ORDER BY gpu_ns DESC LIMIT 8;
+KERNEL_SQL
+
+        # Top operators (top 3 per query)
+        sqlite3 "$db" <<OPS_SQL 2>/dev/null | sqlite3 "$tmpdb" || true
+.mode insert top_ops
+SELECT '$qname', text,
+       ROUND(SUM(end-start)/1e9, 4),
+       ROUND(SUM(end-start)*100.0/NULLIF(
+           (SELECT SUM(end-start) FROM NVTX_EVENTS
+            WHERE domainId=0 AND eventType=59 AND end>start), 0), 1)
+FROM NVTX_EVENTS
+WHERE domainId=0 AND eventType=59 AND end>start
+GROUP BY text ORDER BY SUM(end-start) DESC LIMIT 3;
+OPS_SQL
+
+    done
+
+    # ---- Generate Key Findings markdown ----
+    echo "## Key Findings"
+    echo ""
+
+    # === Performance Summary ===
+    local summary
+    summary=$(sqlite3 -separator '|' "$tmpdb" "
+SELECT
+    COUNT(*),
+    SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN status!='OK' THEN 1 ELSE 0 END),
+    ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN hot_s END),0), 2),
+    ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN cold_s END),0), 2),
+    ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN gpu_time_s END),0), 2),
+    ROUND(COALESCE(AVG(CASE WHEN status='OK' AND query_exec_s>0
+         THEN gpu_time_s*100.0/query_exec_s END),0), 1),
+    ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN query_exec_s END),0), 2),
+    ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN h2d_gb+d2d_gb+d2h_gb END),0), 1),
+    ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN sync_time_s END),0), 2)
+FROM qstats;")
+    local total passed failed total_hot total_cold total_gpu avg_util total_exec total_xfer total_sync
+    IFS='|' read -r total passed failed total_hot total_cold total_gpu avg_util total_exec total_xfer total_sync <<< "$summary"
+
+    echo "### Performance Summary"
+    echo ""
+    if [ "$failed" -gt 0 ]; then
+        local failed_list
+        failed_list=$(sqlite3 "$tmpdb" "SELECT GROUP_CONCAT(UPPER(query), ', ') FROM qstats WHERE status!='OK';")
+        echo "**${passed}/${total}** queries passed. Failed: ${failed_list}."
+    else
+        echo "All **${total}** queries passed."
+    fi
+    local ratio="N/A"
+    if [ -n "$total_hot" ] && [ "$total_hot" != "0" ] && [ "$total_hot" != "0.00" ]; then
+        ratio=$(awk "BEGIN{printf \"%.1f\", $total_cold/$total_hot}")
+    fi
+    echo "Total hot runtime: **${total_hot}s** | Total cold: **${total_cold}s** | Cold/hot ratio: **${ratio}x**"
+    echo ""
+    echo "| Metric | Value |"
+    echo "|--------|-------|"
+    echo "| Total query execution time | ${total_exec}s |"
+    echo "| Total GPU compute time | ${total_gpu}s |"
+    echo "| Avg GPU utilization | ${avg_util}% |"
+    echo "| Total data transferred | ${total_xfer} GB |"
+    echo "| Total sync wait time | ${total_sync}s |"
+    echo ""
+
+    # === Slowest Queries ===
+    echo "### Slowest Queries (by hot runtime)"
+    echo ""
+    while IFS='|' read -r q hot exec gpu util; do
+        local top_op
+        top_op=$(sqlite3 "$tmpdb" \
+            "SELECT operator || ' (' || CAST(ROUND(pct,0) AS INTEGER) || '%)' FROM top_ops WHERE query='$q' ORDER BY total_s DESC LIMIT 1;")
+        echo "- **${q^^}** — ${hot}s hot, ${gpu}s GPU (${util}% util). Top operator: \`${top_op}\`"
+    done < <(sqlite3 -separator '|' "$tmpdb" "
+SELECT query, hot_s, ROUND(query_exec_s,2), gpu_time_s,
+       ROUND(gpu_time_s*100.0/NULLIF(query_exec_s,0), 1)
+FROM qstats WHERE status='OK' AND hot_s IS NOT NULL
+ORDER BY hot_s DESC LIMIT 5;")
+    echo ""
+
+    # === Dominant Operators ===
+    echo "### Dominant Operators (cross-query wall time)"
+    echo ""
+    echo "| Operator | Queries | Total Wall Time (s) | Avg % of Query |"
+    echo "|----------|---------|---------------------|----------------|"
+    sqlite3 -separator '|' "$tmpdb" "
+SELECT operator, COUNT(DISTINCT query),
+       ROUND(SUM(total_s), 2),
+       ROUND(AVG(pct), 1)
+FROM top_ops
+GROUP BY operator
+ORDER BY SUM(total_s) DESC LIMIT 8;" | while IFS='|' read -r op queries total_s avg_pct; do
+        echo "| \`${op}\` | ${queries} | ${total_s} | ${avg_pct}% |"
+    done
+    echo ""
+
+    # === GPU Utilization ===
+    echo "### GPU Utilization"
+    echo ""
+    local high med low
+    high=$(sqlite3 "$tmpdb" "SELECT COUNT(*) FROM qstats WHERE status='OK' AND query_exec_s>0 AND gpu_time_s*100.0/query_exec_s >= 30;")
+    med=$(sqlite3 "$tmpdb" "SELECT COUNT(*) FROM qstats WHERE status='OK' AND query_exec_s>0 AND gpu_time_s*100.0/query_exec_s >= 15 AND gpu_time_s*100.0/query_exec_s < 30;")
+    low=$(sqlite3 "$tmpdb" "SELECT COUNT(*) FROM qstats WHERE status='OK' AND query_exec_s>0 AND gpu_time_s*100.0/query_exec_s < 15;")
+    echo "- **High utilization (>=30%)**: ${high} queries — GPU is well utilized"
+    echo "- **Medium (15-30%)**: ${med} queries — significant sync/CPU overhead"
+    echo "- **Low (<15%)**: ${low} queries — GPU starved; bottleneck is memcpy, sync, or host-side"
+    echo ""
+
+    # === Hottest Kernels ===
+    echo "### Hottest GPU Kernels (cross-query)"
+    echo ""
+    echo "| Kernel | Queries | Total GPU (s) | Avg Occupancy | Limiter |"
+    echo "|--------|---------|---------------|---------------|---------|"
+    sqlite3 -separator '|' "$tmpdb" "
+SELECT SUBSTR(kernel,1,55),
+       COUNT(DISTINCT query),
+       ROUND(SUM(gpu_time_s), 4),
+       ROUND(AVG(occ_pct), 1),
+       (SELECT limiter FROM kernel_agg k2
+        WHERE k2.kernel=k.kernel
+        GROUP BY limiter ORDER BY SUM(gpu_time_s) DESC LIMIT 1)
+FROM kernel_agg k
+GROUP BY kernel
+ORDER BY SUM(gpu_time_s) DESC LIMIT 10;
+" | while IFS='|' read -r kernel queries total_gpu avg_occ limiter; do
+        echo "| \`${kernel}\` | ${queries} | ${total_gpu} | ${avg_occ}% | ${limiter} |"
+    done
+    echo ""
+
+    # === Low Occupancy ===
+    local low_occ_count
+    low_occ_count=$(sqlite3 "$tmpdb" "SELECT COUNT(DISTINCT kernel) FROM kernel_agg
+WHERE occ_pct < 25 AND gpu_time_s > 0.01;")
+    if [ "${low_occ_count:-0}" -gt 0 ]; then
+        echo "### Low Occupancy Alerts"
+        echo ""
+        echo "Kernels with <25% theoretical occupancy and significant GPU time:"
+        echo ""
+        sqlite3 -separator '|' "$tmpdb" "
+SELECT SUBSTR(kernel,1,55), ROUND(AVG(occ_pct),1),
+       (SELECT limiter FROM kernel_agg k2 WHERE k2.kernel=k.kernel ORDER BY gpu_time_s DESC LIMIT 1),
+       ROUND(SUM(gpu_time_s), 4), COUNT(DISTINCT query)
+FROM kernel_agg k
+WHERE occ_pct < 25 AND gpu_time_s > 0.01
+GROUP BY kernel
+ORDER BY SUM(gpu_time_s) DESC LIMIT 5;
+" | while IFS='|' read -r kernel occ limiter gpu_total queries; do
+            echo "- \`${kernel}\` — **${occ}%** occupancy (limited by ${limiter}), ${gpu_total}s total across ${queries} queries"
+        done
+        echo ""
+    fi
+
+    # === Memory ===
+    echo "### Memory Transfer Summary"
+    echo ""
+    local th2d td2d td2h
+    th2d=$(sqlite3 "$tmpdb" "SELECT ROUND(SUM(h2d_gb),1) FROM qstats WHERE status='OK';")
+    td2d=$(sqlite3 "$tmpdb" "SELECT ROUND(SUM(d2d_gb),1) FROM qstats WHERE status='OK';")
+    td2h=$(sqlite3 "$tmpdb" "SELECT ROUND(SUM(d2h_gb),1) FROM qstats WHERE status='OK';")
+    echo "- **H2D**: ${th2d} GB — parquet data from host to GPU"
+    echo "- **D2D**: ${td2d} GB — internal GPU shuffles (joins, partitions, aggregations)"
+    echo "- **D2H**: ${td2h} GB — query results back to host"
+    if [ -n "$td2d" ] && [ -n "$th2d" ] && [ "$th2d" != "0" ] && [ "$th2d" != "0.0" ]; then
+        local amp
+        amp=$(awk "BEGIN{printf \"%.0f\", $td2d/$th2d}")
+        echo "- D2D/H2D amplification: **${amp}x** — intermediate data volume from joins and partitions"
+    fi
+    echo ""
+
+    # === Failed Queries ===
+    if [ "$failed" -gt 0 ]; then
+        echo "### Failed Queries"
+        echo ""
+        while read -r q; do
+            local result_file=""
+            for f in "${files[@]}"; do
+                if [[ "$(basename "$f" .sqlite)" == "$q" ]]; then
+                    result_file="${f%.sqlite}_result.txt"
+                    break
+                fi
+            done
+            if [ -f "$result_file" ]; then
+                local error
+                error=$(grep -m1 -iE 'error|fault|abort|bad_alloc|signal|killed|SIGSEGV' "$result_file" 2>/dev/null | sed 's/^[[:space:]]*//' | head -c 120)
+                echo "- **${q^^}**: ${error:-Unknown failure}"
+            else
+                echo "- **${q^^}**: Failed (no details available)"
+            fi
+        done < <(sqlite3 "$tmpdb" "SELECT query FROM qstats WHERE status!='OK' ORDER BY query;")
+        echo ""
+    fi
+
+    rm -f "$tmpdb"
+}
+
+# ============================================================
 # Main analysis loop
 # ============================================================
 
@@ -609,6 +915,10 @@ echo ""
 FIRST_DIR=$(dirname "${SQLITE_FILES[0]}")
 if [ -f "$FIRST_DIR/summary.txt" ]; then
     echo "- [Benchmark Summary](#benchmark-summary)"
+fi
+
+if [ ${#SQLITE_FILES[@]} -gt 1 ]; then
+    echo "- [Key Findings](#key-findings)"
 fi
 
 if [ ${#SQLITE_FILES[@]} -gt 1 ]; then
@@ -636,6 +946,16 @@ if [ -f "$FIRST_DIR/summary.txt" ]; then
     echo '```'
     cat "$FIRST_DIR/summary.txt"
     echo '```'
+    echo ""
+fi
+
+# ---- Key Findings (multi-file) ----
+if [ ${#SQLITE_FILES[@]} -gt 1 ]; then
+    echo "---"
+    echo ""
+    echo "<a id=\"key-findings\"></a>"
+    echo ""
+    print_conclusions "${SQLITE_FILES[@]}"
     echo ""
 fi
 
