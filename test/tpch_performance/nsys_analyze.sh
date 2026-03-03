@@ -730,7 +730,7 @@ OPS_SQL
 SELECT
     COUNT(*),
     SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END),
-    SUM(CASE WHEN status!='OK' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN status<>'OK' THEN 1 ELSE 0 END),
     ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN hot_s END),0), 2),
     ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN cold_s END),0), 2),
     ROUND(COALESCE(SUM(CASE WHEN status='OK' THEN gpu_time_s END),0), 2),
@@ -747,7 +747,7 @@ FROM qstats;")
     echo ""
     if [ "$failed" -gt 0 ]; then
         local failed_list
-        failed_list=$(sqlite3 "$tmpdb" "SELECT GROUP_CONCAT(UPPER(query), ', ') FROM qstats WHERE status!='OK';")
+        failed_list=$(sqlite3 "$tmpdb" "SELECT GROUP_CONCAT(UPPER(query), ', ') FROM qstats WHERE status<>'OK';")
         echo "**${passed}/${total}** queries passed. Failed: ${failed_list}."
     else
         echo "All **${total}** queries passed."
@@ -885,12 +885,12 @@ ORDER BY SUM(gpu_time_s) DESC LIMIT 5;
             done
             if [ -f "$result_file" ]; then
                 local error
-                error=$(grep -m1 -iE 'error|fault|abort|bad_alloc|signal|killed|SIGSEGV' "$result_file" 2>/dev/null | sed 's/^[[:space:]]*//' | head -c 120)
+                error=$(grep -m1 -iE 'error|fault|abort|bad_alloc|signal|killed|SIGSEGV' "$result_file" 2>/dev/null | sed 's/^[[:space:]]*//' | head -c 120 || true)
                 echo "- **${q^^}**: ${error:-Unknown failure}"
             else
                 echo "- **${q^^}**: Failed (no details available)"
             fi
-        done < <(sqlite3 "$tmpdb" "SELECT query FROM qstats WHERE status!='OK' ORDER BY query;")
+        done < <(sqlite3 "$tmpdb" "SELECT query FROM qstats WHERE status<>'OK' ORDER BY query;")
         echo ""
     fi
 
