@@ -1,3 +1,9 @@
+---
+name: profile-analyzer
+description: Analyze Sirius GPU performance from nsys profiles — runs benchmarks, generates reports with kernel occupancy, memory bandwidth, operator attribution, and compares runs for regression detection.
+allowed-tools: Bash, Read, Grep, Glob, Write
+---
+
 # Sirius nsys Profile Analyzer
 
 You are analyzing GPU performance profiles for Sirius, a GPU-accelerated SQL query engine built on DuckDB. The profiles come from NVIDIA Nsight Systems (nsys) and are stored as SQLite databases.
