@@ -175,10 +175,14 @@ void gpu_pipeline_executor::manager_loop()
           _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
         auto new_task = gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
 
-        // Brief backoff before rescheduling to allow other tasks to complete
-        // and free memory. Without this, a rescheduled task can spin in a tight
-        // OOM → reschedule → OOM loop consuming CPU without making progress.
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        // Trim the memory pool and perform a device synchronization. This will trigger the driver
+        // to defragment the free space to return it to the OS. Trimming will not change the
+        // threshold of the pool, it will grow again after this until the next trim.
+        cudaMemPool_t pool{};
+        if (cudaDeviceGetDefaultMemPool(&pool, _memory_space->get_device_id()) == cudaSuccess) {
+          cudaMemPoolTrimTo(pool, 0);
+          cudaDeviceSynchronize();
+        }
 
         // Schedule the rescheduled task. It goes back through manager_loop()
         // to acquire a fresh reservation before execution.
