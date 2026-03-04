@@ -6,6 +6,19 @@ Debugging Sirius — a GPU-native SQL engine built as a DuckDB extension with CU
 
 Each skill will be a `.claude/skills/<skill-name>/SKILL.md` file committed to the repo so the whole team benefits.
 
+## Skills at a Glance
+
+| # | Skill | Slash Command | What It Does |
+|---|-------|---------------|--------------|
+| 1 | **Build Error Analyzer** | `/build-errors` | Analyzes C++/CUDA compilation errors, suggests fixes, rebuilds, and iterates until the build succeeds. |
+| 2 | **Runtime Error Analyzer** | `/runtime-errors` | Diagnoses runtime errors and wrong results by analyzing log files, inserting targeted debug logs, re-running queries, and iterating to find root cause. Supports DuckDB CPU baseline comparison. |
+| 3 | **Segmentation Fault Analyzer** | `/segfault` | Pinpoints segfaults using logs, AddressSanitizer, NVIDIA Compute Sanitizer, or GDB backtraces. Iteratively applies and verifies fixes. |
+| 4 | **Commit Comparison / Bisect** | `/bisect` | Finds which commit introduced a bug using `git bisect` with automated build+test. Compares query output across commits against DuckDB CPU baseline. |
+| 5 | **Race Condition Analyzer** | `/race-check` | Detects data races using ThreadSanitizer (CPU) and NVIDIA Compute Sanitizer racecheck (GPU). Includes multi-run consistency checks. |
+| 6 | **Memory Leak Analyzer** | `/mem-leak` | Detects memory leaks using AddressSanitizer, Valgrind, and Compute Sanitizer. Tracks bytes leaked before/after fixes. |
+
+**Shared across all skills:** configurable autonomy mode (interactive/autonomous/semi-autonomous), DuckDB CPU baseline comparison, multi-run consistency checks, git-based change tracking with easy revert, and `[SIRIUS_DIAG]` tagged debug log insertion/cleanup.
+
 ---
 
 ## Shared Infrastructure
@@ -95,9 +108,71 @@ All skills support an **autonomy mode** that controls how interactive vs indepen
 | `semi-autonomous` | Apply fixes and iterate automatically, but pause for user confirmation at key decision points (e.g., choosing between multiple possible fixes, before modifying >3 files). |
 
 In `autonomous` and `semi-autonomous` modes:
-- Each skill tracks all changes made for easy revert if the final state isn't satisfactory
+- All changes are tracked via git commits (see "Change Tracking & Easy Revert" above)
 - Max iteration limit (default: 5) prevents infinite loops
 - A summary of all attempted fixes is presented at the end, including what worked and what didn't
+- End-of-session cleanup prompts the user to keep, revert, or cherry-pick changes
+
+### Change Tracking & Easy Revert
+All skills must make their changes fully reversible. This is critical — the user should never feel "stuck" with debug modifications or partial fixes.
+
+**Git stash checkpoint (before any changes):**
+At the start of every skill invocation, before modifying any files:
+```bash
+git stash push -m "sirius-debug-checkpoint-$(date +%s)" --include-untracked
+git stash pop  # immediately restore — this just creates a safety checkpoint
+```
+Or equivalently, create a temporary commit:
+```bash
+git add -A && git commit -m "SIRIUS_DEBUG_CHECKPOINT: pre-skill state" --allow-empty
+```
+This gives the user a known-good state to return to with `git reset --soft HEAD~1` or `git stash pop`.
+
+**Per-iteration snapshots:**
+During iterative fix loops, the skill creates a lightweight checkpoint before each iteration:
+```bash
+git add -A && git commit -m "SIRIUS_DEBUG_ITER_<N>: <brief description of change>"
+```
+This allows the user to:
+- See the history of all attempted fixes: `git log --oneline`
+- Cherry-pick just the fixes that worked
+- Revert any individual iteration: `git revert <commit>`
+- Squash all debug commits when done: `git rebase -i <checkpoint>`
+
+**End-of-session cleanup:**
+When a skill completes (success or failure), it presents the user with options:
+1. **Keep all changes** — squash debug commits into a single clean commit
+2. **Keep only the fix** — revert all diagnostic logs, keep only the actual bug fix
+3. **Revert everything** — return to the pre-skill checkpoint
+4. **Cherry-pick** — let the user choose which iterations to keep
+
+### Debug Log Insertion & Cleanup
+Skills can freely insert `SIRIUS_LOG_DEBUG(...)` statements anywhere in the codebase to gain visibility during diagnosis. These are designed to be trivially identifiable and removable.
+
+**Conventions for inserted debug logs:**
+- All inserted logs use a unique tag: `[SIRIUS_DIAG]`
+- Format: `SIRIUS_LOG_DEBUG("[SIRIUS_DIAG] <context>: var={}", var);`
+- The tag makes it trivial to find and remove all diagnostic logs:
+  ```bash
+  grep -rn "SIRIUS_DIAG" src/  # find all diagnostic logs
+  ```
+- Skills can also remove them programmatically by reverting to the checkpoint commit
+
+**Where to insert logs:**
+- Function entry/exit points to trace execution flow
+- Before/after critical operations (memory allocation, cuDF calls, pipeline transitions)
+- Around conditional branches to understand which path is taken
+- Variable values at key decision points
+
+**Log lifecycle:**
+1. **Insert** — skill adds `[SIRIUS_DIAG]` logs as needed during diagnosis
+2. **Rebuild & run** — logs appear in `build/<preset>/log/sirius_<date>.log`
+3. **Analyze** — skill reads logs to narrow down the issue
+4. **Iterate** — add more targeted logs if needed, repeat
+5. **Cleanup** — at the end, skill categorizes each log:
+   - **Promote**: Useful long-term → change tag from `[SIRIUS_DIAG]` to a proper log message, suggest appropriate log level
+   - **Remove**: Only useful for this investigation → delete the line entirely
+   - The user reviews and approves the final categorization
 
 ### Log Analysis
 - Logs live in `build/<preset>/log/sirius_<date>.log`
@@ -189,9 +264,8 @@ disable-model-invocation: true
    - Generate a clean diff showing the recommended final state
 
 **Key design decisions:**
-- New log statements use `SIRIUS_LOG_DEBUG` by default (filtered out in production)
-- Each added log line includes a `[DIAG]` prefix tag so they're easy to find and clean up
-- The skill tracks every file it modifies for easy revert
+- New log statements use `SIRIUS_LOG_DEBUG` with `[SIRIUS_DIAG]` tag (see "Debug Log Insertion & Cleanup" in Shared Infrastructure)
+- All changes tracked via git checkpoints for easy revert (see "Change Tracking & Easy Revert")
 
 ---
 
@@ -489,4 +563,3 @@ Add a section documenting the debugging skills and how to use them.
 - [LLM-based Compilation Error Repair (paper)](https://arxiv.org/html/2510.13575v1)
 - [Addy Osmani - LLM Coding Workflow 2026](https://addyo.substack.com/p/my-llm-coding-workflow-going-into)
 - [Efficient CUDA Debugging with Compute Sanitizer](https://developer.nvidia.com/blog/debugging-cuda-more-efficiently-with-nvidia-compute-sanitizer/)
-
