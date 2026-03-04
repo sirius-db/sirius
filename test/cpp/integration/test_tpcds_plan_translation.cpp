@@ -17,19 +17,24 @@
 /**
  * @file test_tpcds_plan_translation.cpp
  * @brief Tests how many TPC-DS queries can be translated from DuckDB logical
- *        plans to Sirius physical plans.
+ *        plans to physical plans, for both the new Sirius planner and the
+ *        legacy GPU planner.
  *
  * This test does NOT execute the queries on GPU. It only tests the plan
- * translation step (DuckDB LogicalOperator -> Sirius sirius_physical_operator).
+ * translation step:
+ *   - sirius_physical_plan_generator::create_plan  (new Sirius planner)
+ *   - GPUPhysicalPlanGenerator::CreatePlan          (legacy GPU planner)
  *
  * Requirements:
  *   - DuckDB tpcds extension must be installable (requires network on first run)
  *
- * The test registers a custom table function `sirius_plan_check(query)` that
- * performs the same plan extraction and translation as gpu_execution's bind
- * phase, but returns the result as a row instead of attempting execution.
+ * The test registers custom table functions `sirius_plan_check(query)` and
+ * `gpu_plan_check(query)` that perform plan extraction and translation,
+ * returning the result as a row instead of attempting execution.
  */
 
+#include "gpu_context.hpp"
+#include "gpu_physical_plan_generator.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <catch.hpp>
@@ -130,6 +135,72 @@ unique_ptr<FunctionData> PlanCheckBind(ClientContext& context,
   return std::move(result);
 }
 
+// ============================================================================
+// Custom table function: gpu_plan_check(query VARCHAR)
+// Returns: (success BOOLEAN, error_message VARCHAR)
+//
+// Same as sirius_plan_check but uses the legacy GPUPhysicalPlanGenerator.
+// ============================================================================
+
+unique_ptr<FunctionData> GPUPlanCheckBind(ClientContext& context,
+                                          TableFunctionBindInput& input,
+                                          vector<LogicalType>& return_types,
+                                          vector<string>& names)
+{
+  auto result  = make_uniq<PlanCheckBindData>();
+  string query = input.inputs[0].ToString();
+
+  // Save and modify disabled optimizers (same as Sirius extension)
+  auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
+  auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
+  disabled.insert(OptimizerType::IN_CLAUSE);
+  disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+
+  try {
+    // 1. Parse
+    Parser parser(context.GetParserOptions());
+    parser.ParseQuery(query);
+
+    if (parser.statements.empty()) { throw std::runtime_error("No statements parsed"); }
+
+    // 2. Plan (creates LogicalOperator tree)
+    Planner planner(context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+
+    if (!planner.plan) { throw std::runtime_error("Planner produced null plan"); }
+
+    auto plan = std::move(planner.plan);
+
+    // 3. Optimize
+    if (context.config.enable_optimizer) {
+      Optimizer optimizer(*planner.binder, context);
+      plan = optimizer.Optimize(std::move(plan));
+    }
+
+    // 4. Translate to GPU physical plan (legacy)
+    // GPUPhysicalPlanGenerator::CreatePlan resolves types and column bindings internally.
+    GPUContext gpu_context(context);
+    GPUPhysicalPlanGenerator gen(context, gpu_context);
+    auto gpu_plan = gen.CreatePlan(std::move(plan));
+
+    result->success = true;
+  } catch (const std::exception& e) {
+    result->success       = false;
+    result->error_message = e.what();
+  }
+
+  // Restore disabled optimizers
+  DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
+
+  // Output schema
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("success");
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("error_message");
+
+  return std::move(result);
+}
+
 void PlanCheckFunction(ClientContext& context, TableFunctionInput& data_p, DataChunk& output)
 {
   auto& data = data_p.bind_data->CastNoConst<PlanCheckBindData>();
@@ -155,13 +226,20 @@ class TpcDsPlanTranslationFixture {
     db  = std::make_unique<DuckDB>(nullptr);
     con = std::make_unique<Connection>(*db);
 
-    // Register the plan check function
-    TableFunction plan_check(
-      "sirius_plan_check", {LogicalType::VARCHAR}, PlanCheckFunction, PlanCheckBind);
     auto& catalog    = Catalog::GetSystemCatalog(*db->instance);
     auto transaction = CatalogTransaction::GetSystemTransaction(*db->instance);
+
+    // Register the Sirius (new) plan check function
+    TableFunction plan_check(
+      "sirius_plan_check", {LogicalType::VARCHAR}, PlanCheckFunction, PlanCheckBind);
     CreateTableFunctionInfo info(plan_check);
     catalog.CreateTableFunction(transaction, info);
+
+    // Register the GPU (legacy) plan check function
+    TableFunction gpu_plan_check(
+      "gpu_plan_check", {LogicalType::VARCHAR}, PlanCheckFunction, GPUPlanCheckBind);
+    CreateTableFunctionInfo gpu_info(gpu_plan_check);
+    catalog.CreateTableFunction(transaction, gpu_info);
   }
 
   bool load_tpcds()
@@ -209,6 +287,89 @@ class TpcDsPlanTranslationFixture {
     return queries;
   }
 
+  void run_plan_translation_test(const std::string& check_function_name,
+                                  const std::string& summary_title)
+  {
+    auto queries = get_queries();
+    REQUIRE(queries.size() > 0);
+
+    int passed = 0;
+    int failed = 0;
+    std::vector<std::pair<int, std::string>> failures;
+
+    for (const auto& qi : queries) {
+      // Escape single quotes for SQL string literal embedding
+      std::string escaped = qi.query_text;
+      size_t pos          = 0;
+      while ((pos = escaped.find('\'', pos)) != std::string::npos) {
+        escaped.insert(pos, "'");
+        pos += 2;
+      }
+
+      auto sql = "SELECT success, error_message FROM " + check_function_name + "('" + escaped + "')";
+      auto result = con->Query(sql);
+
+      REQUIRE(result);
+      if (result->HasError()) {
+        failed++;
+        failures.push_back({qi.query_nr, result->GetError()});
+        std::cout << "  FAIL: Q" << qi.query_nr << " - query error: " << result->GetError()
+                  << std::endl;
+        continue;
+      }
+
+      auto chunk = result->Fetch();
+      REQUIRE(chunk);
+      REQUIRE(chunk->size() == 1);
+
+      bool success    = chunk->GetValue(0, 0).GetValue<bool>();
+      auto error_text = chunk->GetValue(1, 0).ToString();
+
+      if (success) {
+        passed++;
+        std::cout << "  PASS: Q" << qi.query_nr << std::endl;
+      } else {
+        failed++;
+        // Truncate long error messages
+        if (error_text.size() > 150) { error_text = error_text.substr(0, 150) + "..."; }
+        failures.push_back({qi.query_nr, error_text});
+        std::cout << "  FAIL: Q" << qi.query_nr << " - " << error_text << std::endl;
+      }
+    }
+
+    // Print summary
+    auto total = queries.size();
+    std::cout << "\n========================================" << std::endl;
+    std::cout << summary_title << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "  Total:  " << total << std::endl;
+    std::cout << "  Passed: " << passed << " (" << (100 * passed / total) << "%)" << std::endl;
+    std::cout << "  Failed: " << failed << " (" << (100 * failed / total) << "%)" << std::endl;
+
+    if (!failures.empty()) {
+      // Group failures by error type
+      std::map<std::string, std::vector<int>> error_groups;
+      for (const auto& [nr, err] : failures) {
+        // Normalize: take first 80 chars for grouping
+        auto key = err.substr(0, std::min(err.size(), size_t(80)));
+        error_groups[key].push_back(nr);
+      }
+
+      std::cout << "\nFailures by error type:" << std::endl;
+      for (const auto& [err, nrs] : error_groups) {
+        std::cout << "  [" << nrs.size() << " queries] " << err << std::endl;
+        std::cout << "    ";
+        for (size_t i = 0; i < nrs.size(); i++) {
+          if (i > 0) std::cout << ", ";
+          std::cout << "Q" << nrs[i];
+        }
+        std::cout << std::endl;
+      }
+    }
+
+    std::cout << "========================================" << std::endl;
+  }
+
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
 };
@@ -228,86 +389,21 @@ TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
     return;
   }
 
-  auto queries = get_queries();
-  REQUIRE(queries.size() > 0);
-
-  int passed = 0;
-  int failed = 0;
-  std::vector<std::pair<int, std::string>> failures;
-
-  for (const auto& qi : queries) {
-    // Escape single quotes for SQL string literal embedding
-    std::string escaped = qi.query_text;
-    size_t pos          = 0;
-    while ((pos = escaped.find('\'', pos)) != std::string::npos) {
-      escaped.insert(pos, "'");
-      pos += 2;
-    }
-
-    auto sql    = "SELECT success, error_message FROM sirius_plan_check('" + escaped + "')";
-    auto result = con->Query(sql);
-
-    REQUIRE(result);
-    if (result->HasError()) {
-      failed++;
-      failures.push_back({qi.query_nr, result->GetError()});
-      std::cout << "  FAIL: Q" << qi.query_nr << " - query error: " << result->GetError()
-                << std::endl;
-      continue;
-    }
-
-    auto chunk = result->Fetch();
-    REQUIRE(chunk);
-    REQUIRE(chunk->size() == 1);
-
-    bool success    = chunk->GetValue(0, 0).GetValue<bool>();
-    auto error_text = chunk->GetValue(1, 0).ToString();
-
-    if (success) {
-      passed++;
-      std::cout << "  PASS: Q" << qi.query_nr << std::endl;
-    } else {
-      failed++;
-      // Truncate long error messages
-      if (error_text.size() > 150) { error_text = error_text.substr(0, 150) + "..."; }
-      failures.push_back({qi.query_nr, error_text});
-      std::cout << "  FAIL: Q" << qi.query_nr << " - " << error_text << std::endl;
-    }
-  }
-
-  // Print summary
-  auto total = queries.size();
-  std::cout << "\n========================================" << std::endl;
-  std::cout << "TPC-DS Plan Translation Summary" << std::endl;
-  std::cout << "========================================" << std::endl;
-  std::cout << "  Total:  " << total << std::endl;
-  std::cout << "  Passed: " << passed << " (" << (100 * passed / total) << "%)" << std::endl;
-  std::cout << "  Failed: " << failed << " (" << (100 * failed / total) << "%)" << std::endl;
-
-  if (!failures.empty()) {
-    // Group failures by error type
-    std::map<std::string, std::vector<int>> error_groups;
-    for (const auto& [nr, err] : failures) {
-      // Normalize: take first 80 chars for grouping
-      auto key = err.substr(0, std::min(err.size(), size_t(80)));
-      error_groups[key].push_back(nr);
-    }
-
-    std::cout << "\nFailures by error type:" << std::endl;
-    for (const auto& [err, nrs] : error_groups) {
-      std::cout << "  [" << nrs.size() << " queries] " << err << std::endl;
-      std::cout << "    ";
-      for (size_t i = 0; i < nrs.size(); i++) {
-        if (i > 0) std::cout << ", ";
-        std::cout << "Q" << nrs[i];
-      }
-      std::cout << std::endl;
-    }
-  }
-
-  std::cout << "========================================" << std::endl;
+  run_plan_translation_test("sirius_plan_check", "TPC-DS Plan Translation Summary (Sirius)");
 
   // The test passes as long as it runs — the summary shows coverage.
   // If you want to enforce a minimum number of passing queries, uncomment:
   // REQUIRE(passed >= 50);
+}
+
+TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
+                 "TPC-DS legacy plan translation coverage",
+                 "[tpcds][plan][coverage][legacy]")
+{
+  if (!load_tpcds()) {
+    WARN("TPC-DS extension not available — skipping legacy plan translation test");
+    return;
+  }
+
+  run_plan_translation_test("gpu_plan_check", "TPC-DS Plan Translation Summary (Legacy GPU)");
 }
