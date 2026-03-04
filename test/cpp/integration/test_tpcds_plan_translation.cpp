@@ -20,10 +20,10 @@
  *        plans to physical plans, for both the new Sirius planner and the
  *        legacy GPU planner.
  *
- * This test does NOT execute the queries on GPU. It only tests the plan
- * translation step:
+ * This test does NOT execute the queries on GPU. It only tests plan
+ * translation coverage:
  *   - sirius_physical_plan_generator::create_plan  (new Sirius planner)
- *   - GPUPhysicalPlanGenerator::CreatePlan          (legacy GPU planner)
+ *   - GPUPhysicalPlanGenerator dispatch table       (legacy GPU planner)
  *
  * Requirements:
  *   - DuckDB tpcds extension must be installable (requires network on first run)
@@ -33,8 +33,6 @@
  * returning the result as a row instead of attempting execution.
  */
 
-#include "gpu_context.hpp"
-#include "gpu_physical_plan_generator.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <catch.hpp>
@@ -136,10 +134,96 @@ unique_ptr<FunctionData> PlanCheckBind(ClientContext& context,
 }
 
 // ============================================================================
+// Legacy GPU planner operator support check.
+//
+// We cannot call GPUPhysicalPlanGenerator::CreatePlan directly because GPU
+// physical operators allocate CUDA memory in their constructors, which fails
+// without an initialized GPU buffer. Instead, we walk the optimized logical
+// plan tree and check each operator against the legacy planner's dispatch
+// table (GPUPhysicalPlanGenerator::CreatePlan in gpu_physical_plan_generator.cpp).
+// ============================================================================
+
+// Returns the error message for the first unsupported operator found,
+// or an empty string if all operators in the tree are supported.
+std::string find_unsupported_gpu_operator(LogicalOperator& op)
+{
+  // Check children first (depth-first)
+  for (auto& child : op.children) {
+    auto err = find_unsupported_gpu_operator(*child);
+    if (!err.empty()) return err;
+  }
+
+  // Mirror the dispatch table from GPUPhysicalPlanGenerator::CreatePlan(LogicalOperator&)
+  switch (op.type) {
+    case LogicalOperatorType::LOGICAL_GET:
+    case LogicalOperatorType::LOGICAL_PROJECTION:
+    case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+    case LogicalOperatorType::LOGICAL_FILTER:
+    case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+    case LogicalOperatorType::LOGICAL_LIMIT:
+    case LogicalOperatorType::LOGICAL_ORDER_BY:
+    case LogicalOperatorType::LOGICAL_TOP_N:
+    case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+    case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+    case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+    case LogicalOperatorType::LOGICAL_CHUNK_GET:
+    case LogicalOperatorType::LOGICAL_DELIM_GET:
+    case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+    case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+    case LogicalOperatorType::LOGICAL_CTE_REF: return "";
+
+    case LogicalOperatorType::LOGICAL_WINDOW: return "Window not supported";
+    case LogicalOperatorType::LOGICAL_UNNEST: return "Unnest not supported";
+    case LogicalOperatorType::LOGICAL_SAMPLE: return "Sample not supported";
+    case LogicalOperatorType::LOGICAL_COPY_TO_FILE: return "Copy to file not supported";
+    case LogicalOperatorType::LOGICAL_ANY_JOIN: return "Any join not supported";
+    case LogicalOperatorType::LOGICAL_ASOF_JOIN: return "Asof join not supported";
+    case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: return "Cross product not supported";
+    case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN: return "Positional join not supported";
+    case LogicalOperatorType::LOGICAL_UNION:
+    case LogicalOperatorType::LOGICAL_EXCEPT:
+    case LogicalOperatorType::LOGICAL_INTERSECT: return "Set operation not supported";
+    case LogicalOperatorType::LOGICAL_INSERT: return "Insert not supported";
+    case LogicalOperatorType::LOGICAL_DELETE: return "Delete not supported";
+    case LogicalOperatorType::LOGICAL_UPDATE: return "Update not supported";
+    case LogicalOperatorType::LOGICAL_CREATE_TABLE: return "Create table not supported";
+    case LogicalOperatorType::LOGICAL_CREATE_INDEX: return "Create index not supported";
+    case LogicalOperatorType::LOGICAL_CREATE_SECRET: return "Create secret not supported";
+    case LogicalOperatorType::LOGICAL_EXPLAIN: return "Explain not supported";
+    case LogicalOperatorType::LOGICAL_DISTINCT: return "Distinct not supported";
+    case LogicalOperatorType::LOGICAL_PREPARE: return "Prepare not supported";
+    case LogicalOperatorType::LOGICAL_EXECUTE: return "Execute not supported";
+    case LogicalOperatorType::LOGICAL_CREATE_VIEW:
+    case LogicalOperatorType::LOGICAL_CREATE_SEQUENCE:
+    case LogicalOperatorType::LOGICAL_CREATE_SCHEMA:
+    case LogicalOperatorType::LOGICAL_CREATE_MACRO:
+    case LogicalOperatorType::LOGICAL_CREATE_TYPE: return "Create not supported";
+    case LogicalOperatorType::LOGICAL_PRAGMA: return "Pragma not supported";
+    case LogicalOperatorType::LOGICAL_VACUUM: return "Vacuum not supported";
+    case LogicalOperatorType::LOGICAL_TRANSACTION:
+    case LogicalOperatorType::LOGICAL_ALTER:
+    case LogicalOperatorType::LOGICAL_DROP:
+    case LogicalOperatorType::LOGICAL_LOAD:
+    case LogicalOperatorType::LOGICAL_ATTACH:
+    case LogicalOperatorType::LOGICAL_DETACH: return "Simple not supported";
+    case LogicalOperatorType::LOGICAL_RECURSIVE_CTE: return "Recursive CTE not supported";
+    case LogicalOperatorType::LOGICAL_EXPORT: return "Export not supported";
+    case LogicalOperatorType::LOGICAL_SET: return "Set not supported";
+    case LogicalOperatorType::LOGICAL_RESET: return "Reset not supported";
+    case LogicalOperatorType::LOGICAL_PIVOT: return "Pivot not supported";
+    case LogicalOperatorType::LOGICAL_COPY_DATABASE: return "Copy database not supported";
+    case LogicalOperatorType::LOGICAL_UPDATE_EXTENSIONS: return "Update extensions not supported";
+    case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: return "Extension operator not supported";
+    default: return "Unimplemented logical operator type";
+  }
+}
+
+// ============================================================================
 // Custom table function: gpu_plan_check(query VARCHAR)
 // Returns: (success BOOLEAN, error_message VARCHAR)
 //
-// Same as sirius_plan_check but uses the legacy GPUPhysicalPlanGenerator.
+// Checks whether a query's logical plan uses only operators supported by
+// the legacy GPUPhysicalPlanGenerator, without constructing GPU operators.
 // ============================================================================
 
 unique_ptr<FunctionData> GPUPlanCheckBind(ClientContext& context,
@@ -177,11 +261,16 @@ unique_ptr<FunctionData> GPUPlanCheckBind(ClientContext& context,
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    // 4. Translate to GPU physical plan (legacy)
-    // GPUPhysicalPlanGenerator::CreatePlan resolves types and column bindings internally.
-    GPUContext gpu_context(context);
-    GPUPhysicalPlanGenerator gen(context, gpu_context);
-    auto gpu_plan = gen.CreatePlan(std::move(plan));
+    // 4. Resolve types and column bindings (same as CreatePlan does internally)
+    plan->ResolveOperatorTypes();
+
+    ColumnBindingResolver resolver;
+    ColumnBindingResolver::Verify(*plan);
+    resolver.VisitOperator(*plan);
+
+    // 5. Check operator support against the legacy GPU planner dispatch table
+    auto err = find_unsupported_gpu_operator(*plan);
+    if (!err.empty()) { throw NotImplementedException(err); }
 
     result->success = true;
   } catch (const std::exception& e) {
@@ -288,7 +377,7 @@ class TpcDsPlanTranslationFixture {
   }
 
   void run_plan_translation_test(const std::string& check_function_name,
-                                  const std::string& summary_title)
+                                 const std::string& summary_title)
   {
     auto queries = get_queries();
     REQUIRE(queries.size() > 0);
@@ -306,7 +395,8 @@ class TpcDsPlanTranslationFixture {
         pos += 2;
       }
 
-      auto sql = "SELECT success, error_message FROM " + check_function_name + "('" + escaped + "')";
+      auto sql =
+        "SELECT success, error_message FROM " + check_function_name + "('" + escaped + "')";
       auto result = con->Query(sql);
 
       REQUIRE(result);
