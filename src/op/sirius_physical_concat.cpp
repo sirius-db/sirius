@@ -16,14 +16,8 @@
 
 #include "op/sirius_physical_concat.hpp"
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_partition.hpp"
-#include "op/sirius_physical_top_n.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 

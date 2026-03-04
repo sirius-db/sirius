@@ -30,9 +30,6 @@
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
-// cudf
-#include <cudf/utilities/bit.hpp>
-
 // duckdb
 #include <duckdb/common/types.hpp>
 #include <duckdb/function/table_function.hpp>

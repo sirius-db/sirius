@@ -16,7 +16,6 @@
 
 #include "sirius_engine.hpp"
 
-#include "config.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "log/logging.hpp"
