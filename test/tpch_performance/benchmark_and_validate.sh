@@ -3,7 +3,8 @@
 #
 # Runs all 22 TPC-H queries for both sirius and duckdb, compares results,
 # and writes two CSVs:
-#   comparison.csv  - per-query match/error status
+#   validation.csv  - per-query match/error status
+#   comparison.txt  - results summary table (cold/warm timings, speedup)
 #   timings.csv     - long-format iteration runtimes (engine,query,iteration,runtime_s)
 #
 # Each run gets its own timestamped directory under runs/:
@@ -14,7 +15,8 @@
 #     sirius_config.cfg - copy of SIRIUS_CONFIG_FILE
 #     sirius/run.log  sirius/q<N>/result.txt  sirius/q<N>/timings.csv
 #     duckdb/run.log  duckdb/q<N>/result.txt  duckdb/q<N>/timings.csv
-#     comparison.csv
+#     validation.csv
+#     comparison.txt
 #     timings.csv
 #
 # Before running benchmarks, a tiny read-only filesystem benchmark is run on the
@@ -52,7 +54,7 @@ else
     cp "$HOME/.sirius/sirius.cfg" "$RUN_DIR/"
 fi
 
-COMPARISON_CSV="$RUN_DIR/comparison.csv"
+VALIDATION_CSV="$RUN_DIR/validation.csv"
 TIMINGS_CSV="$RUN_DIR/timings.csv"
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
 PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
@@ -202,7 +204,7 @@ has_error() {
     grep -qE "(Error|Segmentation fault)" "$file" 2>/dev/null
 }
 
-printf 'query,status\n' | tee "$COMPARISON_CSV"
+printf 'query,status\n' | tee "$VALIDATION_CSV"
 
 ok=0; validate=0; errors=0
 
@@ -220,13 +222,13 @@ for q in "${QUERIES[@]}"; do
         (( validate++ ))
     fi
 
-    printf 'Q%s,%s\n' "$q" "$status" | tee -a "$COMPARISON_CSV"
+    printf 'Q%s,%s\n' "$q" "$status" | tee -a "$VALIDATION_CSV"
 done
 
 echo ""
 echo "=========================================="
 printf 'Summary: %d/22 success   %d validate   %d error\n' "$ok" "$validate" "$errors"
-echo "Comparison CSV saved to $COMPARISON_CSV"
+echo "Validation CSV saved to $VALIDATION_CSV"
 
 # Build combined timings CSV in long format.
 # Source files: <run>/<engine>/q<N>/timings.csv
@@ -258,7 +260,8 @@ done
 
 echo "Timings CSV saved to $TIMINGS_CSV"
 
-# ---------- Print comparison table ----------
+# ---------- Print comparison table (to stdout and comparison.txt) ----------
+{
 echo ""
 echo "============================================================"
 printf "  Results Summary  (SF%s)\n" "$SF"
@@ -327,3 +330,4 @@ printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
 echo ""
 echo "============================================================"
 echo "All output saved to $RUN_DIR"
+} | tee "$RUN_DIR/comparison.txt"
