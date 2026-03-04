@@ -6,7 +6,7 @@
 #       prefix-dev/setup-pixi@*
 #       mozilla-actions/sccache-action@*
 #       pre-commit/action@*
-#     - Require actions to be pinned to a full-length commit SHA: YES
+#     - Require actions to be pinned to a full-length commit SHA: NO
 #
 # Adding a new action? You must:
 #   1. Pin it to a full-length commit SHA (e.g. uses: owner/repo@<40-char-sha> # vX.Y.Z)
