@@ -23,12 +23,16 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <cuda_runtime_api.h>
 
+<<<<<<< HEAD
+=======
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/small_pinned_host_memory_resource.hpp>
+#include <spdlog/sinks/basic_file_sink.h>
+>>>>>>> 1cb59f8 (fixed format issues)
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>  // for std::getenv
@@ -135,8 +139,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
   {
-    auto host_spaces =
-      memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
       auto* fsmr = host_spaces[0]
                      ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
@@ -146,9 +149,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         cudf::set_pinned_memory_resource(*small_pinned_allocator_);
         cudf::set_allocate_host_as_pinned_threshold(
           cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
-        spdlog::info(
-          "SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
-          cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+        spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
+                     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
       }
     }
   }
