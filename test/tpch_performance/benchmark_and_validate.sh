@@ -11,6 +11,7 @@
 #     run_info.txt    - git branch/revision, tree clean/dirty, build freshness,
 #                       hostname, memory, CPUs, load, GPUs/free memory, fs read benchmark
 #     run_info.patch  - when tree is dirty, full git diff and diff --cached
+#     sirius_config.cfg - copy of SIRIUS_CONFIG_FILE
 #     sirius/run.log  sirius/q<N>/result.txt  sirius/q<N>/timings.csv
 #     duckdb/run.log  duckdb/q<N>/result.txt  duckdb/q<N>/timings.csv
 #     comparison.csv
@@ -44,6 +45,12 @@ QUERIES=($(seq 1 22))
 
 RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${ITERATIONS}iter"
 mkdir -p "$RUN_DIR"
+
+if [ -n "${SIRIUS_CONFIG_FILE:-}" ] && [ -f "${SIRIUS_CONFIG_FILE}" ]; then
+    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
+else
+    cp "$HOME/.sirius/sirius.cfg" "$RUN_DIR/"
+fi
 
 COMPARISON_CSV="$RUN_DIR/comparison.csv"
 TIMINGS_CSV="$RUN_DIR/timings.csv"
