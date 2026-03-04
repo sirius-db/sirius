@@ -165,16 +165,20 @@ void sirius_physical_right_delim_join::sink(const operator_data& input_data,
                                             rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::sink"};
-  // call partition join execute
+  // partition_join stays inline (still part of the delim join)
   auto partition_join_output = partition_join->execute(input_data, stream);
-  // call distinct execute
-  auto distinct_output = distinct->execute(input_data, stream);
-  // call partition distinct execute
-  auto partition_distinct_output = partition_distinct->execute(*distinct_output, stream);
-  // call partition join sink
   partition_join->sink(*partition_join_output, stream);
-  // call partition distinct sink
-  partition_distinct->sink(*partition_distinct_output, stream);
+
+  // distinct stays inline (still part of the delim join)
+  auto distinct_output = distinct->execute(input_data, stream);
+
+  // partition_distinct is external — push distinct output via distinct's next_port_after_sink
+  distinct->sink(*distinct_output, stream);
+}
+
+std::unique_ptr<operator_data> sirius_physical_right_delim_join::get_next_task_input_data()
+{
+  return partition_join->get_next_task_input_data();
 }
 
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
@@ -188,16 +192,15 @@ void sirius_physical_left_delim_join::sink(const operator_data& input_data,
                                            rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::sink"};
-  // call distinct execute
-  auto distinct_output = distinct->execute(input_data, stream);
-  // call column data scan execute
+  // column_data_scan stays inline (still part of the delim join)
   auto column_data_scan_output = column_data_scan->execute(input_data, stream);
-  // call partition distinct execute
-  auto partition_distinct_output = partition_distinct->execute(*distinct_output, stream);
-  // call partition join sink
   column_data_scan->sink(*column_data_scan_output, stream);
-  // call partition distinct sink
-  partition_distinct->sink(*partition_distinct_output, stream);
+
+  // distinct stays inline (still part of the delim join)
+  auto distinct_output = distinct->execute(input_data, stream);
+
+  // partition_distinct is external — push distinct output via distinct's next_port_after_sink
+  distinct->sink(*distinct_output, stream);
 }
 
 }  // namespace op

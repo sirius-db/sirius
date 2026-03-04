@@ -231,22 +231,22 @@ void task_creator::manager_loop()
             ::sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           auto& delim_join    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
           auto partition_join = delim_join.partition_join;
-          auto partition_distinct = delim_join.partition_distinct;
+          auto distinct_op    = delim_join.distinct.get();
           for (auto& [next_op, port_id] : partition_join->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
-          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
         } else if (pipeline->get_sink()->type ==
                    ::sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-          auto& delim_join = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
-          auto partition_distinct = delim_join.partition_distinct;
-          auto column_data_scan   = delim_join.column_data_scan;
+          auto& delim_join      = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
+          auto distinct_op      = delim_join.distinct.get();
+          auto column_data_scan = delim_join.column_data_scan;
           for (auto& [next_op, port_id] : column_data_scan->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
-          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
         } else {

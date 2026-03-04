@@ -122,6 +122,8 @@ void validate_operator_output_types(const op::operator_data* data,
     if (!batch) { continue; }
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
+      // bobbi (todo): delim join will return this warning for now, but there is no bug here, so we
+      // can ignore it. we can do something about this after gtc
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
         "{}, expected {}",

@@ -62,10 +62,8 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
   s_partition_size = hash_partition_bytes;
-  _num_partitions =
-    static_cast<int>((estimated_cardinality + s_partition_size - 1) / s_partition_size);
-  _parent_op = parent_op;
-  _is_build  = is_build;
+  _parent_op       = parent_op;
+  _is_build        = is_build;
   get_partition_keys_and_type(parent_op, is_build);
 }
 
@@ -79,9 +77,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
                                                             bool is_build)
 {
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-    _partition_type = PartitionType::HASH;
-    _num_partitions =
-      static_cast<int>((op->estimated_cardinality + s_partition_size - 1) / s_partition_size);
+    _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
       auto& condition = hash_join_op.conditions[cond_idx];
@@ -116,6 +112,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _partition_type = PartitionType::NONE;
+    _num_partitions = 1;
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -161,10 +158,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() != 1) {
-    throw std::runtime_error("We expect only one input batch for partition operator");
+    throw std::runtime_error("We expect only one input batch for partition operator " +
+                             std::to_string(this->get_operator_id()));
   }
-
-  if (_num_partitions < 2 || _partition_keys.empty()) {
+  if (!_num_partitions.has_value()) {
+    throw std::runtime_error("Num partitions was not set in sirius_physical_partition operator " +
+                             std::to_string(this->get_operator_id()));
+  }
+  if (_num_partitions.value() < 2 || _partition_keys.empty()) {
     return std::make_unique<operator_data>(input_data);
   }
 
@@ -175,7 +176,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       partitioned_results = gpu_partition_impl::hash_partition(input_batch,
                                                                _partition_keys,
                                                                _partition_key_cast_types,
-                                                               _num_partitions,
+                                                               _num_partitions.value(),
                                                                stream,
                                                                *input_batch->get_memory_space());
       break;
@@ -183,7 +184,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       throw std::runtime_error("Range partitioning is not implemented yet");
     case PartitionType::EVENLY:
       partitioned_results = gpu_partition_impl::evenly_partition(
-        input_batch, _num_partitions, stream, *input_batch->get_memory_space());
+        input_batch, _num_partitions.value(), stream, *input_batch->get_memory_space());
       break;
     case PartitionType::NONE: partitioned_results = {input_batch}; break;
     case PartitionType::CUSTOM:
@@ -215,6 +216,67 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
     }
     partition_id++;
   }
+}
+
+int sirius_physical_partition::determine_num_partitions()
+{
+  SIRIUS_LOG_DEBUG("sirius_physical_partition::determine_num_partitions() start for id {}",
+                   this->get_operator_id());
+  if (ports.find("default") == ports.end()) {
+    SIRIUS_LOG_WARN(
+      "sirius_physical_partition::determine_num_partitions() did not find default repo for id {}",
+      this->get_operator_id());
+    throw std::runtime_error(
+      "sirius_physical_partition::determine_num_partitions() did not find default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
+  auto& repo           = ports.at("default")->repo;
+  auto batch_ids       = repo->get_batch_ids(0);
+  uint64_t total_bytes = 0;
+  for (auto batch_id : batch_ids) {
+    auto batch = repo->get_data_batch_by_id(batch_id, std::nullopt, 0);
+    if (batch && batch->get_data()) { total_bytes += batch->get_data()->get_size_in_bytes(); }
+  }
+  return static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+}
+
+void sirius_physical_partition::set_num_partitions(int num_partitions)
+{
+  std::unique_lock<std::mutex> guard(lock, std::try_to_lock);
+  if (!guard.owns_lock()) {
+    throw std::runtime_error(
+      "set_num_partitions failed to acquire lock for partition operator " +
+      std::to_string(get_operator_id()) +
+      " — likely a cross-partition deadlock: both sibling partitions are simultaneously "
+      "in get_next_task_input_data");
+  }
+  _num_partitions = num_partitions;
+}
+
+std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_data()
+{
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    if (!_num_partitions.has_value()) {
+      _num_partitions = determine_num_partitions();
+      if (_sibling_partition_op) {
+        SIRIUS_LOG_DEBUG(
+          "sirius_physical_partition id {} determined {} partitions on sibling id {} and {} build "
+          "side",
+          this->get_operator_id(),
+          _num_partitions.value(),
+          _sibling_partition_op->get_operator_id(),
+          (_is_build ? "is" : "is not"));
+        _sibling_partition_op->Cast<sirius_physical_partition>().set_num_partitions(
+          _num_partitions.value());
+      } else {
+        SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions",
+                         this->get_operator_id(),
+                         _num_partitions.value());
+      }
+    }
+  }
+  return sirius_physical_operator::get_next_task_input_data();
 }
 
 }  // namespace op

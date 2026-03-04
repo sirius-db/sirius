@@ -32,8 +32,8 @@ struct configuration_setter;
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE   = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256LL;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES   = 100ULL * 1024 * 1024;  // 100 MB
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES     = 100ULL * 1024 * 1024;  // 100 MB
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES   = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES     = 512ULL * 1024 * 1024;  // 512 MB
 
 }  // namespace config
 
