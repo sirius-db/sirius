@@ -1,0 +1,74 @@
+name: Test
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    env:
+      SCCACHE_GHA_ENABLED: true
+    runs-on: [self-hosted, ubuntu-22.04, cuda-13, cpu-xl]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+        with:
+          cache: false
+          pixi-version: v0.65.0
+          activate-environment: true
+
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Build
+        env:
+          CUDAARCHS: "75" # For Turing, T4 capability
+        run: make -j$(nproc)
+
+      - name: Package build artifacts
+        run: tar -cf build.tar build/release/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          path: build.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    runs-on: [self-hosted, ubuntu-22.04, cuda-13, gpu-t4]
+    needs: build
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+        with:
+          cache: false
+          pixi-version: v0.65.0
+          activate-environment: true
+
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+
+      - name: Extract build artifacts
+        run: tar -xf build.tar
+
+      - name: Run C++ unit tests
+        run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+
+      - name: Prepare SQL test datasets
+        run: ./setup_test_datasets.sh
+
+      - name: Run sqllogic tests
+        run: |
+          ./build/release/test/unittest "$PWD/test/*" | tee test.log
+          if grep -q "Error in GPUExecuteQuery" test.log; then
+            echo "GPU execution errors detected!"
+            exit 1
+          fi

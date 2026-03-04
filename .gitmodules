@@ -2,6 +2,7 @@
 	path = duckdb
 	url = https://github.com/duckdb/duckdb
 	branch = main
+	ignore = dirty
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
@@ -13,7 +14,7 @@
 [submodule "cucascade"]
 	path = cucascade
 	url = https://github.com/NVIDIA/cuCascade.git
-	branch = main
+	branch = release/26.02
 [submodule "duckdb-python"]
 	path = duckdb-python
 	url = https://github.com/duckdb/duckdb-python.git

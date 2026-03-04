@@ -28,6 +28,8 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <numeric>
+
 namespace sirius {
 namespace op {
 
@@ -86,6 +88,13 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_count_distinct = false;
 
  public:
+  std::vector<int> get_output_grouping_indices() const
+  {
+    std::vector<int> indices(group_idx.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    return indices;
+  }
+
   // Source interface
   bool is_source() const override { return true; }
 

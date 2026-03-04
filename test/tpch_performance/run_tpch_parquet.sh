@@ -62,16 +62,8 @@ fi
 
 if [ ! -d "$PARQUET_DIR" ]; then
     echo "Parquet directory not found: $PARQUET_DIR"
-    echo "Generating TPC-H SF${SF} dataset with tpchgen-cli..."
-
-    VENV_DIR="$PROJECT_DIR/.venv"
-    if [ ! -f "$VENV_DIR/bin/activate" ]; then
-        python3 -m venv "$VENV_DIR"
-    fi
-    # shellcheck disable=SC1091
-    source "$VENV_DIR/bin/activate"
-    pip install --quiet tpchgen-cli
-    tpchgen-cli -s "$SF" --format=parquet --parts 1 --output-dir "$PARQUET_DIR"
+    echo "Generating TPC-H SF${SF} dataset using tpchgen-rs..."
+    (cd "$SCRIPT_DIR" && pixi run bash generate_tpch_data.sh "$SF" "$PARQUET_DIR")
 fi
 
 # Build CREATE VIEW statements for the TPC-H tables.

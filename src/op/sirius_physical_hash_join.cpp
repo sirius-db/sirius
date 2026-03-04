@@ -160,8 +160,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
-    join_type(join_type),
     conditions(std::move(cond)),
+    join_type(join_type),
     delim_types(std::move(delim_types))
 {
   reorder_join_conditions(conditions);
@@ -358,7 +358,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     if (ports["default"]->repo->num_partitions() != ports["build"]->repo->num_partitions()) {
       throw std::runtime_error(
         "In sirius_physical_hash_join:Number of partitions for left and right ports must be the "
-        "same");
+        "same in operator " +
+        std::to_string(this->get_operator_id()));
     }
 
     left_batch_ids.reserve(ports["default"]->repo->num_partitions());
