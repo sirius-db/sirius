@@ -143,7 +143,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 is int32_t
-  std::size_t bytes_per_row              = sizeof(typename Traits::type) + sizeof(int32_t);
+  std::size_t bytes_per_row               = sizeof(typename Traits::type) + sizeof(int32_t);
   std::size_t estimated_cardinality_bytes = estimated_cardinality * bytes_per_row;
   int num_partitions =
     static_cast<int>(std::max(std::size_t(1), estimated_cardinality_bytes / partition_size));
@@ -274,7 +274,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 and col2 are int32_t
-  std::size_t bytes_per_row              = sizeof(typename Traits::type) + sizeof(int32_t) * 2;
+  std::size_t bytes_per_row               = sizeof(typename Traits::type) + sizeof(int32_t) * 2;
   std::size_t estimated_cardinality_bytes = estimated_cardinality * bytes_per_row;
   int num_partitions =
     static_cast<int>(std::max(std::size_t(1), estimated_cardinality_bytes / partition_size));
@@ -359,11 +359,10 @@ TEST_CASE(
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 and col1 are both int32_t; uses default partition size (512 MB)
-  std::size_t bytes_per_row              = sizeof(int32_t) * 2;
+  std::size_t bytes_per_row               = sizeof(int32_t) * 2;
   std::size_t estimated_cardinality_bytes = estimated_cardinality * bytes_per_row;
-  int num_partitions                     = static_cast<int>(
-    std::max(std::size_t(1),
-             estimated_cardinality_bytes / sirius::config::DEFAULT_HASH_PARTITION_BYTES));
+  int num_partitions                      = static_cast<int>(std::max(
+    std::size_t(1), estimated_cardinality_bytes / sirius::config::DEFAULT_HASH_PARTITION_BYTES));
   partitioner.set_num_partitions(num_partitions);
 
   auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
