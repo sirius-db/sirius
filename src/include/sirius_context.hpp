@@ -34,6 +34,10 @@
 #include <mutex>
 #include <vector>
 
+namespace cucascade::memory {
+class small_pinned_host_memory_resource;
+}  // namespace cucascade::memory
+
 namespace duckdb {
 
 /// \brief Manages the lifetime of the sirius_context within a DuckDB ClientContext.
@@ -120,6 +124,8 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  // Destroyed before memory_manager_ (declared after it — reverse destruction order).
+  std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
   std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
