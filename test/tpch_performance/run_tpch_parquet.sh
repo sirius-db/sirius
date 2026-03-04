@@ -7,6 +7,9 @@
 # Timings are recorded using current_timestamp between steps and written to a CSV file.
 # Output results are saved as result_<engine>_sf<scale_factor>_q<query_number>.txt
 # and timing results as timings_<engine>_sf<scale_factor>_q<query_number>.csv.
+# If OUTPUT_DIR is set (this is done by benchmark_and_validate.sh),
+# results are saved in the specified directory (in a subdirectory per query),
+# otherwise they are saved in the project directory.
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=/home/felipe/sirius/test/cpp/integration/integration.cfg
