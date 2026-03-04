@@ -27,5 +27,5 @@ prost = "0.13"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
-duckdb = { version = "=1.4.3", features = ["bundled"] }
+duckdb = { version = "=1.4.4", features = ["bundled"] }
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-version-from-build-system"] }
