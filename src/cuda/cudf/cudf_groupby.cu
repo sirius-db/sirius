@@ -22,6 +22,8 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/hashing.hpp>
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -495,6 +497,198 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     }
   }
   // --- End mixed aggregate optimization ---
+
+  // --- P4: String GROUP BY hash fingerprint acceleration ---
+  // Enabled via SIRIUS_P4_HASH_GROUPBY=1 env var.
+  // Replaces string key columns with xxhash_64 fingerprints for the groupby,
+  // then recovers original strings via distinct_indices + join.
+  // Expected to help at 100M+ rows where string data >> hash data.
+  if (std::getenv("SIRIUS_P4_HASH_GROUPBY")) {
+    bool has_string_key = false;
+    for (int key = 0; key < num_keys; key++) {
+      if (keys[key]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+        has_string_key = true;
+        break;
+      }
+    }
+
+    if (has_string_key) {
+      SIRIUS_LOG_DEBUG("P4: String GROUP BY hash fingerprint ({} keys, {} rows)", num_keys, size);
+
+      // Step 1: Compute xxhash_64 for each string key, build hash key table
+      struct StrKeyInfo { int idx; std::unique_ptr<cudf::column> hash; };
+      std::vector<StrKeyInfo> str_infos;
+      for (int key = 0; key < num_keys; key++) {
+        if (keys[key]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+          auto hash = cudf::hashing::xxhash_64(
+            cudf::table_view({keys_cudf[key]}), 0,
+            rmm::cuda_stream_default, gpuBufferManager->mr);
+          str_infos.push_back({key, std::move(hash)});
+        }
+      }
+
+      std::vector<cudf::column_view> hash_keys;
+      for (int key = 0; key < num_keys; key++) {
+        bool replaced = false;
+        for (auto& si : str_infos) {
+          if (si.idx == key) { hash_keys.push_back(si.hash->view()); replaced = true; break; }
+        }
+        if (!replaced) hash_keys.push_back(keys_cudf[key]);
+      }
+      auto hash_keys_table = cudf::table_view(hash_keys);
+
+      // Step 2: Groupby on hash keys
+      cudf::groupby::groupby grpby_hash(
+        hash_keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
+
+      // Build aggregation requests (same as regular path)
+      std::vector<cudf::groupby::aggregation_request> p4_requests;
+      for (int agg = 0; agg < num_aggregates; agg++) {
+        p4_requests.emplace_back(cudf::groupby::aggregation_request());
+        if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT && aggregate_keys[agg]->column_length == 0) {
+          auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+          cudaMemset(temp, 0, size * sizeof(uint64_t));
+          auto validity_mask = createNullMask(size);
+          shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
+          p4_requests[agg].values = temp_column->convertToCudfColumn();
+        } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::SUM && aggregate_keys[agg]->column_length == 0) {
+          auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+          cudaMemset(temp, 0, size * sizeof(uint64_t));
+          auto validity_mask = createNullMask(size, cudf::mask_state::ALL_NULL);
+          shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
+          p4_requests[agg].values = temp_column->convertToCudfColumn();
+        } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT_STAR && aggregate_keys[agg]->column_length != 0) {
+          auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE);
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+          cudaMemset(temp, 0, size * sizeof(uint64_t));
+          auto validity_mask = createNullMask(size);
+          shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
+          p4_requests[agg].values = temp_column->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::SUM) {
+          auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          p4_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::AVERAGE) {
+          auto aggregate = cudf::make_mean_aggregation<cudf::groupby_aggregation>();
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          if (aggregate_keys[agg]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+            if (aggregate_keys[agg]->data_wrapper.getColumnTypeSize() != sizeof(int64_t)) {
+              throw NotImplementedException("Only support decimal64 for decimal AVG group-by");
+            }
+            auto from_cudf_column_view = aggregate_keys[agg]->convertToCudfColumn();
+            auto to_cudf_type = cudf::data_type(cudf::type_id::FLOAT64);
+            auto to_cudf_column = cudf::cast(
+              from_cudf_column_view, to_cudf_type, rmm::cuda_stream_default, GPUBufferManager::GetInstance().mr);
+            aggregate_keys[agg]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
+          }
+          p4_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::MIN) {
+          auto aggregate = cudf::make_min_aggregation<cudf::groupby_aggregation>();
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          p4_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::MAX) {
+          auto aggregate = cudf::make_max_aggregation<cudf::groupby_aggregation>();
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          p4_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::COUNT) {
+          auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          p4_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
+          auto aggregate = cudf::make_nunique_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+          p4_requests[agg].aggregations.push_back(std::move(aggregate));
+          p4_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else {
+          throw NotImplementedException("Aggregate function not supported in `cudf_groupby` (P4): %d",
+                                        static_cast<int>(agg_mode[agg]));
+        }
+      }
+
+      auto result = grpby_hash.aggregate(p4_requests);
+      auto result_key_table = std::move(result.first);
+      auto num_groups = result_key_table->num_rows();
+
+      // Step 3: Set non-string keys and aggregate results
+      for (int key = 0; key < num_keys; key++) {
+        bool is_str = false;
+        for (auto& si : str_infos) { if (si.idx == key) { is_str = true; break; } }
+        if (!is_str) {
+          cudf::column gk = result_key_table->get_column(key);
+          keys[key]->setFromCudfColumn(gk, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
+        }
+      }
+
+      for (int agg = 0; agg < num_aggregates; agg++) {
+        auto agg_val = std::move(result.second[agg].results[0]);
+        if (agg_mode[agg] == AggregationType::COUNT || agg_mode[agg] == AggregationType::COUNT_STAR || agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
+          auto v = agg_val->view();
+          auto td = convertInt32ToUInt64(const_cast<int32_t*>(v.data<int32_t>()), v.size());
+          auto vm = createNullMask(v.size());
+          aggregate_keys[agg] = make_shared_ptr<GPUColumn>(v.size(), GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(td), vm);
+        } else {
+          aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
+        }
+      }
+
+      // Step 4: Recover original string keys via hash→string mapping
+      for (auto& si : str_infos) {
+        auto hash_table_view = cudf::table_view({si.hash->view()});
+        auto distinct_idx = cudf::distinct_indices(
+          hash_table_view,
+          cudf::duplicate_keep_option::KEEP_FIRST,
+          cudf::null_equality::EQUAL,
+          cudf::nan_equality::ALL_EQUAL,
+          rmm::cuda_stream_default, gpuBufferManager->mr);
+
+        auto original_combo = cudf::table_view({si.hash->view(), keys_cudf[si.idx]});
+        auto mapping = cudf::gather(
+          original_combo, distinct_idx->view(),
+          cudf::out_of_bounds_policy::DONT_CHECK,
+          rmm::cuda_stream_default, gpuBufferManager->mr);
+
+        auto result_hash_col = result_key_table->get_column(si.idx);
+        auto result_hash_view = cudf::table_view({result_hash_col});
+        auto mapping_hash_view = cudf::table_view({mapping->get_column(0)});
+
+        auto [left_map, right_map] = cudf::left_join(
+          result_hash_view, mapping_hash_view,
+          cudf::null_equality::EQUAL,
+          rmm::cuda_stream_default, gpuBufferManager->mr);
+
+        cudf::column_view right_map_col(
+          cudf::data_type{cudf::type_id::INT32},
+          static_cast<cudf::size_type>(right_map->size()),
+          right_map->data(), nullptr, 0);
+        cudf::column_view left_map_col(
+          cudf::data_type{cudf::type_id::INT32},
+          static_cast<cudf::size_type>(left_map->size()),
+          left_map->data(), nullptr, 0);
+
+        auto mapping_str_table = cudf::table_view({mapping->get_column(1)});
+        auto reordered = cudf::gather(
+          mapping_str_table, right_map_col,
+          cudf::out_of_bounds_policy::DONT_CHECK,
+          rmm::cuda_stream_default, gpuBufferManager->mr);
+
+        auto aligned = cudf::scatter(
+          reordered->view(), left_map_col, reordered->view(),
+          rmm::cuda_stream_default, gpuBufferManager->mr);
+
+        cudf::column str_result = aligned->get_column(0);
+        keys[si.idx]->setFromCudfColumn(str_result, keys[si.idx]->is_unique, nullptr, 0, gpuBufferManager);
+      }
+
+      STOP_TIMER();
+      SIRIUS_LOG_DEBUG("P4: String GROUP BY hash fingerprint result count: {}", keys[0]->column_length);
+      return;
+    }
+  }
+  // --- End P4 ---
 
   cudf::groupby::groupby grpby_obj(
     keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);

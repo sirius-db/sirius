@@ -52,7 +52,7 @@ echo "Detected GPU compute capability: $CUDA_ARCH"
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}-real" \
     -DEXTENSION_STATIC_BUILD=1 \
     -DDUCKDB_EXTENSION_CONFIGS="$REPO/extension_config.cmake" \
-    -DDUCKDB_EXPLICIT_PLATFORM=linux_amd64 \
+    -DDUCKDB_EXPLICIT_PLATFORM=linux_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
     -S "$REPO/duckdb/" \
     -B "$REPO/build/release"
 
