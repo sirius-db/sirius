@@ -29,6 +29,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "planner/query.hpp"
+#include "sirius_context.hpp"
 
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
@@ -91,10 +92,16 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+      const auto& op_params =
+        _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+          ->get_config()
+          .get_operator_params();
       _parquet_scan_operator_global_state_map.emplace(
         operator_id,
         std::make_shared<op::scan::parquet_scan_task_global_state>(
-          pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>()));
+          pipeline,
+          &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+          op_params.scan_task_batch_size));
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
@@ -224,22 +231,22 @@ void task_creator::manager_loop()
             ::sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           auto& delim_join    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
           auto partition_join = delim_join.partition_join;
-          auto partition_distinct = delim_join.partition_distinct;
+          auto distinct_op    = delim_join.distinct.get();
           for (auto& [next_op, port_id] : partition_join->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
-          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
         } else if (pipeline->get_sink()->type ==
                    ::sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-          auto& delim_join = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
-          auto partition_distinct = delim_join.partition_distinct;
-          auto column_data_scan   = delim_join.column_data_scan;
+          auto& delim_join      = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
+          auto distinct_op      = delim_join.distinct.get();
+          auto column_data_scan = delim_join.column_data_scan;
           for (auto& [next_op, port_id] : column_data_scan->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
-          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
         } else {
@@ -254,8 +261,15 @@ void task_creator::manager_loop()
           size_t operator_id          = node->get_operator_id();
           auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
 
+          const auto& op_params =
+            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+              ->get_config()
+              .get_operator_params();
           auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-            *scan_task_global_state, *_execution_context);
+            *scan_task_global_state,
+            *_execution_context,
+            op_params.scan_task_batch_size,
+            op_params.default_scan_task_varchar_size);
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
               "No destination data repositories provided for scan task creation.");
@@ -278,6 +292,12 @@ void task_creator::manager_loop()
           auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
           if (!partition_idx.has_value()) {
             pipeline->mark_task_completed();
+            if (pipeline->is_pipeline_finished()) {
+              auto output_consumers = pipeline->get_output_consumers();
+              for (auto& output_consumer : output_consumers) {
+                schedule(output_consumer);
+              }
+            }
             return;
           }
           if (!parquet_task_global_state->has_more_partitions()) {
@@ -301,10 +321,26 @@ void task_creator::manager_loop()
         } else {
           // need to exhaust input batches until all ports are empty
           while (!node->all_ports_empty()) {
+            // Mark task created BEFORE popping data from ports to prevent a race
+            // condition where update_pipeline_status() sees empty ports and matching
+            // task counters, prematurely marking the pipeline as finished.
+            pipeline->mark_task_created();
+
             auto input_data = node->get_next_task_input_data();
-            if (!input_data) { break; }
-            pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
-                                            // task creation
+            if (!input_data || input_data->get_data_batches().empty()) {
+              // No data was available (e.g., another thread already consumed it).
+              // Balance the counter. mark_task_completed() calls update_pipeline_status()
+              // which is correct: if all ports are truly empty and all real tasks have
+              // completed, the pipeline should finish.
+              pipeline->mark_task_completed();
+              if (pipeline->is_pipeline_finished()) {
+                auto output_consumers = pipeline->get_output_consumers();
+                for (auto& output_consumer : output_consumers) {
+                  this->schedule(output_consumer);
+                }
+              }
+              break;
+            }
 
             // Check to see if you need to create a new global state for this operator
             size_t operator_id                  = node->get_operator_id();

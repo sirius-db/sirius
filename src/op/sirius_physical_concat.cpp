@@ -25,18 +25,22 @@
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_top_n.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
                                                duckdb::idx_t estimated_cardinality,
                                                sirius_physical_operator* parent_op,
-                                               bool is_build)
+                                               bool is_build,
+                                               uint64_t concat_batch_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _parent_op = parent_op;
-  _is_build  = is_build;
+  _parent_op          = parent_op;
+  _is_build           = is_build;
+  _concat_batch_bytes = concat_batch_bytes;
   // check if parent_op is a hash join
   if (parent_op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(parent_op);
@@ -90,7 +94,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
-      if (!_concat_all && total_batch_size > duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE) {
+      if (!_concat_all && total_batch_size > _concat_batch_bytes) {
         // if the batch size is already exceed the threshold, then we need to return the batch right
         // away
         if (input_batch.size() == 0) {
@@ -119,6 +123,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
 std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
                                                                rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::execute"};
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
     throw std::runtime_error(
@@ -152,6 +157,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
 
 void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
   auto partition_idx           = partitioned_output_data->get_partition_idx();
   for (auto& batch : partitioned_output_data->get_data_batches()) {

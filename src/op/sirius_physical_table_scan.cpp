@@ -30,6 +30,8 @@
 
 #include <cudf/table/table.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/gpu_data_representation.hpp>
 
 namespace sirius {
@@ -65,28 +67,8 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     table_filters(std::move(table_filters_p)),
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
-    virtual_columns(std::move(virtual_columns_p)),
-    gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
+    virtual_columns(std::move(virtual_columns_p))
 {
-  // Build scanned_types/scanned_ids, skipping virtual columns (ROW_ID, EMPTY, etc.)
-  // that cannot be used to index into returned_types.
-  auto num_cols = column_ids.size();
-  for (duckdb::idx_t col = 0; col < num_cols; col++) {
-    if (column_ids[col].IsVirtualColumn()) {
-      // Virtual column (ROW_ID = -1, EMPTY = -2, etc.) — use BIGINT placeholder
-      scanned_types.push_back(duckdb::LogicalType::BIGINT);
-    } else {
-      scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
-    }
-    scanned_ids.push_back(col);
-  }
-
-  if (scanned_types.empty()) {
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
-  }
-
-  fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
@@ -105,9 +87,6 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     }
 
     auto primary_idx = column_ids[column_index].GetPrimaryIndex();
-    if (column_ids[column_index].IsVirtualColumn()) {
-      continue;  // Skip virtual columns (ROW_ID, EMPTY) in filters
-    }
     auto col_type    = returned_types[primary_idx];
 
     // The batch columns are produced by DUCKDB_SCAN in column_ids order.
@@ -141,6 +120,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   duckdb::unique_ptr<duckdb::Expression> filter_expr;

@@ -17,7 +17,6 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
-#include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
@@ -36,6 +35,7 @@
 
 // cudf
 #include "cudf/cudf_utils.hpp"
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -63,8 +63,8 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
   cudf::io::datasource& datasource)
 {
   constexpr size_t PARQUET_MAGIC_SIZE = 4;
-  constexpr size_t FOOTER_LEN_SIZE = 4;
-  constexpr size_t TAIL_SIZE = PARQUET_MAGIC_SIZE + FOOTER_LEN_SIZE;
+  constexpr size_t FOOTER_LEN_SIZE    = 4;
+  constexpr size_t TAIL_SIZE          = PARQUET_MAGIC_SIZE + FOOTER_LEN_SIZE;
 
   auto const file_size = datasource.size();
   if (file_size < TAIL_SIZE + PARQUET_MAGIC_SIZE) {
@@ -72,7 +72,7 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
   }
 
   // Read the last 8 bytes to get footer length
-  auto tail_buf = datasource.host_read(file_size - TAIL_SIZE, TAIL_SIZE);
+  auto tail_buf    = datasource.host_read(file_size - TAIL_SIZE, TAIL_SIZE);
   auto const* tail = tail_buf->data();
 
   // Footer length is a little-endian uint32 at offset 0
@@ -110,7 +110,7 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
 
   // In case there are duplicate columns in the projection list, we deduplicate, in order
   auto push_unique = [&selected_column_indices, &seen](auto col_idx) {
-    if (col_idx == duckdb::DConstants::INVALID_INDEX) { return; }
+    if (duckdb::IsVirtualColumn(col_idx)) { return; }
     if (seen.insert(col_idx).second) {
       // Insert successful (not yet seen)
       selected_column_indices.push_back(col_idx);
@@ -156,9 +156,6 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     _is_projected(!scan_op->projection_ids.empty()),
     _selected_column_indices(detail::make_selected_column_indices(*scan_op))
 {
-  SIRIUS_LOG_INFO("[parquet_scan_task] global_state ctor: num_files={}, is_projected={}, selected_cols={}",
-                  scan_op->bind_data ? 1 : 0, !scan_op->projection_ids.empty(), _selected_column_indices.size());
-
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] In-out table functions are not supported in sirius "
@@ -240,7 +237,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
                     projected_columns.emplace_back(scan_op->names[col_idx]);
                   });
 
+#if CUDF_VERSION_NUM >= 2604
+    _reader_options.set_column_names(std::move(projected_columns));
+#else
     _reader_options.set_columns(std::move(projected_columns));
+#endif
   }
 
   // Compute the byte counts per row group for the selected columns for task partitioning
@@ -362,27 +363,16 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
-
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: file_idx={}, reserved_compressed={}, reserved_uncompressed={}, rg_count={}",
-                  l_state.get_file_idx(), l_state.get_reserved_compressed_bytes(),
-                  l_state.get_reserved_uncompressed_bytes(), l_state.get_rg_indices().size());
-
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: making reader for file_idx={}", l_state.get_file_idx());
   auto reader   = g_state.make_reader(l_state.get_file_idx());
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: reader created OK");
 
   // Make the allocation and accessor
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: making allocation for {} bytes", l_state.get_reserved_compressed_bytes());
   auto allocation = l_state.make_allocation();
   memory::multiple_blocks_allocation_accessor<uint8_t> data_accessor;
   data_accessor.initialize(0, allocation);
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: allocation OK, num_blocks={}", allocation->get_blocks().size());
 
   // Get the byte ranges for the range of row groups assigned to this task
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: getting byte ranges");
   auto byte_ranges =
     reader->all_column_chunks_byte_ranges(l_state.get_rg_span(), g_state.get_options());
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: got {} byte ranges", byte_ranges.size());
 
   // Read each byte range into the allocation asynchronously
   std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
@@ -395,9 +385,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     new_byte_ranges.emplace_back(new_offset, range.size());
     new_offset += range.size();
   }
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: waiting for {} read futures, total_bytes={}", read_futures.size(), new_offset);
   std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: all reads complete");
 
   if (new_offset != l_state.get_reserved_compressed_bytes()) {
     // Metadata / file data mismatch
@@ -407,7 +395,6 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   }
 
   // Create a data batch with the column chunks
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: creating host_parquet_representation");
   auto parquet_representation =
     std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
                                                   std::move(allocation),
@@ -417,10 +404,8 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   std::move(new_byte_ranges),
                                                   l_state.get_reserved_compressed_bytes(),
                                                   l_state.get_reserved_uncompressed_bytes());
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: host_parquet_representation created, creating data_batch");
   auto data_batch =
     std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
-  SIRIUS_LOG_INFO("[parquet_scan_task] compute_task: returning operator_data");
   return std::make_unique<op::operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
 }

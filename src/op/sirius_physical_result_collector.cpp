@@ -16,6 +16,8 @@
 
 // sirius
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <data/sirius_converter_registry.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 #include <op/sirius_physical_result_collector.hpp>
@@ -56,6 +58,7 @@ sirius_physical_result_collector::sirius_physical_result_collector(
 std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   return std::make_unique<operator_data>(input_data);
 }
 
@@ -110,6 +113,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
 void sirius_physical_materialized_collector::sink(const operator_data& input_data,
                                                   rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_materialized_collector::sink"};
   const auto& input_batches     = input_data.get_data_batches();
   using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
 
@@ -149,26 +153,25 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
       clone_batch         = input_batch->clone(next_batch_id, stream);
       // todo (bobbi) pass stream to sink
-      clone_batch->convert_to<cucascade::host_data_packed_representation>(
-        registry, &mem_space, stream);
+      clone_batch->convert_to<cucascade::host_data_representation>(registry, &mem_space, stream);
       data = clone_batch->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
       throw duckdb::InvalidInputException(
-        "[GPUPhysicalMaterializedCollector] Expected host_data_packed_representation in HOST tier");
+        "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }
 
-    // Only accepting host_data_packed_representation for now
-    assert(dynamic_cast<cucascade::host_data_packed_representation*>(data) != nullptr);
+    // Only accepting host_data_representation for now
+    assert(dynamic_cast<cucascade::host_data_representation*>(data) != nullptr);
 
     // Push chunks to result collection
-    auto const& host_table = data->cast<cucascade::host_data_packed_representation>();
+    auto const& host_table = data->cast<cucascade::host_data_representation>();
     // host_table_chunk_reader expects get_host_table() and ->allocation to be non-null;
     // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
     auto const* ht = host_table.get_host_table().get();
     if (!ht) {
       throw duckdb::InvalidInputException(
-        "[GPUPhysicalMaterializedCollector] host_data_packed_representation has null "
+        "[GPUPhysicalMaterializedCollector] host_data_representation has null "
         "get_host_table()");
     }
     if (!ht->allocation) {

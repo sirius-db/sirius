@@ -24,6 +24,8 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -91,6 +93,12 @@ void SiriusContext::QueryEnd()
 {
   query_.reset();
 
+  // Drain all downgrade executors before clearing repositories — ensures no downgrade
+  // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
+  for (auto& executor : downgrade_executors_) {
+    executor->drain();
+  }
+
   // Clear all data repositories between queries.
   // Any batches still present are leaked — operators should have popped everything.
   if (data_repository_manager_) {
@@ -130,8 +138,25 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     *memory_manager_,
     &config_.get_hw_topology());
 
-  downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
-    sirius::parallel::task_executor_config{}, *data_repository_manager_);
+  // Create one downgrade executor per GPU memory space.
+  // HOST→DISK downgrade is not yet implemented, so we skip HOST tier for now.
+  auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
+    auto spaces        = memory_manager_->get_memory_spaces_for_tier(tier);
+    auto const& dg_cfg = config_.get_downgrade_executor_config();
+    for (auto* space : spaces) {
+      sirius::parallel::task_executor_config executor_config{
+        dg_cfg.num_threads, false, dg_cfg.cpu_affinity_list};
+      auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
+        std::move(executor_config),
+        *data_repository_manager_,
+        space->get_id(),
+        const_cast<cucascade::memory::memory_space*>(space),
+        *memory_manager_);
+      executor->start();
+      downgrade_executors_.push_back(std::move(executor));
+    }
+  };
+  create_executors_for_tier(cucascade::memory::Tier::GPU);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_config(),
                                                                   *memory_manager_);
@@ -154,7 +179,17 @@ void SiriusContext::terminate()
   pipeline_executor_.reset();
   task_creator_->stop_thread_pool();
   task_creator_.reset();
-  downgrade_executor_.reset();
+  for (auto& executor : downgrade_executors_) {
+    executor->stop();
+  }
+  downgrade_executors_.clear();
+
+  // Ensure all CUDA operations (including async copies from downgrade tasks)
+  // are complete before destroying pinned memory pools.  cudaStreamDestroy
+  // returns immediately even when copies are still in-flight; without this
+  // sync, the subsequent cudaFreeHost inside the memory manager destructor
+  // can deadlock against a new cudaHostAlloc from the next SiriusContext.
+  cudaDeviceSynchronize();
 
   memory_manager_->shutdown();
   memory_manager_.reset();
@@ -198,16 +233,31 @@ const sirius::pipeline::pipeline_executor& SiriusContext::get_pipeline_executor(
   return *pipeline_executor_;
 }
 
-sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor()
+sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor(
+  cucascade::memory::memory_space_id space_id)
 {
   throw_if_not_initialized();
-  return *downgrade_executor_;
+  for (auto& executor : downgrade_executors_) {
+    if (executor->get_space_id() == space_id) { return *executor; }
+  }
+  throw std::runtime_error("No downgrade executor for the requested memory space");
 }
 
-const sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor() const
+const sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor(
+  cucascade::memory::memory_space_id space_id) const
 {
   throw_if_not_initialized();
-  return *downgrade_executor_;
+  for (auto& executor : downgrade_executors_) {
+    if (executor->get_space_id() == space_id) { return *executor; }
+  }
+  throw std::runtime_error("No downgrade executor for the requested memory space");
+}
+
+const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
+SiriusContext::get_downgrade_executors() const
+{
+  throw_if_not_initialized();
+  return downgrade_executors_;
 }
 
 sirius::creator::task_creator& SiriusContext::get_task_creator()

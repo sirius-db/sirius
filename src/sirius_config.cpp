@@ -212,6 +212,18 @@ struct sirius::config::custom_config_registrar<sirius::disk_mem_config> {
   }
 };
 
+template <>
+struct sirius::config::custom_config_registrar<sirius::operator_params> {
+  static void config(sirius::config::configuration_setter& setter, sirius::operator_params& opt)
+  {
+    setter.add_config("scan_task_batch_size", opt.scan_task_batch_size);
+    setter.add_config("default_scan_task_varchar_size", opt.default_scan_task_varchar_size);
+    setter.add_config("max_sort_partition_bytes", opt.max_sort_partition_bytes);
+    setter.add_config("hash_partition_bytes", opt.hash_partition_bytes);
+    setter.add_config("concat_batch_bytes", opt.concat_batch_bytes);
+  }
+};
+
 sirius_config::sirius_config()
 {
   cucascade::memory::topology_discovery discovery;
@@ -243,6 +255,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan.cache", _enable_scan_caching);
+  config_setter.add_config("sirius.operator_params", _operator_params);
 
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
   config_setter.add_config("sirius.space.host", host_memory_space_configs);

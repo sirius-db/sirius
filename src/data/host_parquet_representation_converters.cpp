@@ -17,7 +17,6 @@
 // sirius
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
-#include <log/logging.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -25,6 +24,8 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // cudf
+#include "cudf/cudf_utils.hpp"
+
 #include <cudf/io/parquet.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -61,43 +62,35 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
   cucascade::memory::memory_space const* target_memory_space,
   rmm::cuda_stream_view stream)
 {
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] start");
   // Source stuff
   auto& host_src          = source.cast<host_parquet_representation>();
   auto const& byte_ranges = host_src.get_column_chunk_byte_ranges();
   auto& reader            = host_src.get_parquet_reader();
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] byte_ranges={}, size_in_bytes={}, uncompressed={}",
-                  byte_ranges.size(), host_src.get_size_in_bytes(), host_src.get_uncompressed_size_in_bytes());
 
   // Target stuff
   rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
   rmm::cuda_device_id target_device_id(target_memory_space->get_device_id());
   rmm::cuda_set_device_raii target_device_raii(target_device_id);
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] target device_id={}", target_memory_space->get_device_id());
 
   auto const& allocation = host_src.get_column_chunks();
 
-  // Allocate individual device buffers per column chunk byte range
-  std::vector<rmm::device_buffer> column_chunk_buffers;
-  column_chunk_buffers.reserve(byte_ranges.size());
-  for (size_t i = 0; i < byte_ranges.size(); ++i) {
-    column_chunk_buffers.emplace_back(byte_ranges[i].size(), stream, mr_ref);
-  }
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] allocated {} GPU device buffers", byte_ranges.size());
+  // The following pattern follows the example here:
+  // https://github.com/rapidsai/cudf/blob/main/cpp/examples/hybrid_scan_io/common_utils.cpp#L160
 
-  // Build a mapping from global byte offset to (buffer_index, local_offset) for the copy.
-  // Each column_chunk_buffer corresponds to one byte_range, laid out contiguously in the host
-  // allocation. We iterate over host allocation blocks and map into the correct device buffer.
-  std::vector<size_t> range_offsets;  // cumulative start offset per byte range
-  range_offsets.reserve(byte_ranges.size() + 1);
-  range_offsets.push_back(0);
-  for (auto const& br : byte_ranges) {
-    range_offsets.push_back(range_offsets.back() + br.size());
-  }
+  // Allocate a single device buffer and partition it according to the byte ranges
+  std::vector<cudf::device_span<uint8_t const>> column_chunk_spans_d;
+  rmm::device_buffer device_buffer(host_src.get_size_in_bytes(), stream, mr_ref);
+  auto buffer_data = static_cast<uint8_t*>(device_buffer.data());
+  std::ignore =
+    std::accumulate(byte_ranges.begin(),
+                    byte_ranges.end(),
+                    size_t{0},
+                    [&column_chunk_spans_d, buffer_data](auto sum, auto const& byte_range) {
+                      column_chunk_spans_d.emplace_back(buffer_data + sum, byte_range.size());
+                      return sum + byte_range.size();
+                    });
 
   // Copy HOST data to GPU with a single async batch copy.
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] H2D copy: total_bytes={}, block_size={}",
-                  host_src.get_size_in_bytes(), allocation->block_size());
   size_t bytes_copied = 0;
   std::vector<void*> dst_ptrs;
   std::vector<void*> src_ptrs;
@@ -105,22 +98,9 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
   while (bytes_copied < host_src.get_size_in_bytes()) {
     auto const& block        = allocation->at(bytes_copied / allocation->block_size());
     auto const block_offset  = bytes_copied % allocation->block_size();
-    auto const block_remain  = allocation->block_size() - block_offset;
-    auto const total_remain  = host_src.get_size_in_bytes() - bytes_copied;
-    auto bytes_avail         = std::min(block_remain, total_remain);
-
-    // Find which device buffer this global offset falls into
-    auto it        = std::upper_bound(range_offsets.begin(), range_offsets.end(), bytes_copied);
-    auto buf_idx   = static_cast<size_t>(std::distance(range_offsets.begin(), it) - 1);
-    auto local_off = bytes_copied - range_offsets[buf_idx];
-
-    // Clamp copy size to the remaining space in the current device buffer so we don't
-    // overflow when a host block spans multiple column chunk byte ranges.
-    auto buf_remain    = column_chunk_buffers[buf_idx].size() - local_off;
-    auto bytes_to_copy = std::min(bytes_avail, buf_remain);
-
-    dst_ptrs.push_back(
-      static_cast<void*>(static_cast<uint8_t*>(column_chunk_buffers[buf_idx].data()) + local_off));
+    auto const bytes_to_copy = std::min(allocation->block_size() - block_offset,
+                                        host_src.get_size_in_bytes() - bytes_copied);
+    dst_ptrs.push_back(static_cast<void*>(buffer_data + bytes_copied));
     src_ptrs.push_back(const_cast<void*>(
       static_cast<void const*>(reinterpret_cast<uint8_t const*>(block.data() + block_offset))));
     counts.push_back(bytes_to_copy);
@@ -129,16 +109,14 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 
 // Try to do batch copy if cudaMemcpyBatchAsync is possible, otherwise fall back to individual
 // async copies
-// cudaMemcpyBatchAsync (CUDART >= 13000) disabled: fails with cudaErrorInvalidValue
-// in Docker CDI environments regardless of srcLocHint. Individual cudaMemcpyAsync works.
-#if 0
+#if CUDART_VERSION >= 13000
   cudaStream_t stream_handle = (stream.value() != nullptr && stream.value() != cudaStreamLegacy)
                                  ? stream.value()
                                  : cudaStreamPerThread;
   cudaMemcpyAttributes attr{};
   attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
   attr.srcLocHint     = {cudaMemLocationTypeHost,
-                         -1};
+                         host_src.get_device_id()};  // this is numa node id for pinned host
   attr.dstLocHint     = {cudaMemLocationTypeDevice, target_memory_space->get_device_id()};
   attr.flags          = cudaMemcpyFlagDefault;
   RMM_CUDA_TRY(::cudaMemcpyBatchAsync(
@@ -150,18 +128,24 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
       dst_ptrs[i], src_ptrs[i], counts[i], cudaMemcpyHostToDevice, stream.value()));
   }
 #endif
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] H2D copy complete, {} chunks copied", dst_ptrs.size());
 
   // Invoke the Parquet reader to materialize the table on GPU
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] calling reader.materialize_all_columns with {} row groups",
-                  host_src.get_rg_span().size());
+#if CUDF_VERSION_NUM >= 2604
+  auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
+    column_chunk_spans_d.data(), column_chunk_spans_d.size());
+  auto result = reader.materialize_all_columns(
+    host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
+#else
+  // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
+  std::vector<rmm::device_buffer> column_chunk_buffers;
+  for (auto const& span : column_chunk_spans_d) {
+    column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
+  }
   auto result = reader.materialize_all_columns(
     host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] materialize_all_columns returned, table has {} columns",
-                  result.tbl ? result.tbl->num_columns() : -1);
+#endif
   auto new_table = std::move(result.tbl);  // Discard metadata
   stream.synchronize();
-  SIRIUS_LOG_INFO("[convert_host_parquet_to_gpu] stream synchronized, done");
 
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(new_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));

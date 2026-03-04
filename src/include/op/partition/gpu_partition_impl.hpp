@@ -43,6 +43,7 @@ class gpu_partition_impl {
    *
    * @param input The input batch to be hash partitioned.
    * @param partition_key_idx Column ids of the partitioning columns.
+   * @param partition_key_cast_types Per-key target types for the partition hash.
    * @param num_partitions Number of partitions.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
@@ -52,9 +53,21 @@ class gpu_partition_impl {
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
     const std::shared_ptr<cucascade::data_batch>& input,
     const std::vector<int>& partition_key_idx,
+    const std::vector<cudf::data_type>& partition_key_cast_types,
     int num_partitions,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);
+
+  /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
+  static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
+    const std::shared_ptr<cucascade::data_batch>& input,
+    const std::vector<int>& partition_key_idx,
+    int num_partitions,
+    rmm::cuda_stream_view stream,
+    cucascade::memory::memory_space& memory_space)
+  {
+    return hash_partition(input, partition_key_idx, {}, num_partitions, stream, memory_space);
+  }
 
   /**
    * @brief Perform evenly partitioning on the input data batch.

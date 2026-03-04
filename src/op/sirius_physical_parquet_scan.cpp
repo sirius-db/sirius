@@ -82,33 +82,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
     table_filters(std::move(table_filters_p)),
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
-    virtual_columns(std::move(virtual_columns_p)),
-    gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
+    virtual_columns(std::move(virtual_columns_p))
 {
-  // Build scanned_types/scanned_ids, skipping virtual columns (ROW_ID, EMPTY, etc.)
-  auto num_cols = column_ids.size();
-  for (duckdb::idx_t col = 0; col < num_cols; col++) {
-    if (column_ids[col].IsVirtualColumn()) {
-      scanned_types.push_back(duckdb::LogicalType::BIGINT);
-    } else {
-      scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
-    }
-    scanned_ids.push_back(col);
-  }
-
-  if (scanned_types.empty()) {
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
-  }
-
-  fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  SIRIUS_LOG_INFO("[parquet_scan] num_cols={}, gen_row_id_column={}, column_ids.size()={}, projection_ids.size()={}, names.size()={}",
-                  num_cols, gen_row_id_column, column_ids.size(), projection_ids.size(), names.size());
-  for (size_t i = 0; i < scanned_types.size(); i++) {
-    SIRIUS_LOG_INFO("[parquet_scan] scanned_type[{}]={}", i, scanned_types[i].ToString());
-  }
-  for (size_t i = 0; i < std::min(names.size(), static_cast<size_t>(num_cols)); i++) {
-    SIRIUS_LOG_INFO("[parquet_scan] name[{}]={}, returned_type={}", i, names[i], returned_types[column_ids[i].GetPrimaryIndex()].ToString());
-  }
 }
 
 }  // namespace op

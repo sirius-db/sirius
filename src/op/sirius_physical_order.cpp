@@ -20,6 +20,8 @@
 #include "log/logging.hpp"
 #include "op/order/gpu_order_impl.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -39,6 +41,7 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType>
 std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_data& input_data,
                                                               rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   // Build cudf order vectors from BoundOrderByNode

@@ -39,7 +39,8 @@ struct finally {
   }
 };
 
-TEST_CASE("Sirius configuration loading from file with configurator", "[sirius][context]")
+TEST_CASE("Sirius configuration loading from file with configurator",
+          "[sirius][context][isolated_context]")
 {
   finally cleanup_env{[]() { unsetenv("SIRIUS_CONFIG_FILE"); }};
 
@@ -65,7 +66,8 @@ TEST_CASE("Sirius configuration loading from file with configurator", "[sirius][
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 1);
 }
 
-TEST_CASE("Sirius configuration loading from file with spaces", "[sirius][context]")
+TEST_CASE("Sirius configuration loading from file with spaces",
+          "[sirius][context][isolated_context]")
 {
   finally cleanup_env{[]() { unsetenv("SIRIUS_CONFIG_FILE"); }};
 

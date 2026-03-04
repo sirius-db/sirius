@@ -16,4 +16,5 @@
 
 set(TEST_SOURCES
     ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_test_env.cpp
     PARENT_SCOPE)

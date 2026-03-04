@@ -24,6 +24,8 @@
 
 #include <cudf/concatenate.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -75,6 +77,7 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
 std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operator_data& input_data,
                                                                     rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   // After boundaries are computed, just pass through

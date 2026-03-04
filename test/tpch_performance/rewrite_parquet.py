@@ -49,6 +49,19 @@ MAX_PAGE_SIZE_BYTES = 8 * 1024 * 1024  # 8 MiB
 # Tables with fewer rows than this are read in one shot with cudf
 SMALL_TABLE_THRESHOLD = 50_000_000
 
+# Columns to cast to int32. l_orderkey and o_orderkey stay int64 because they
+# exceed the int32 range at large scale factors.
+INT32_COLUMNS = {
+    "customer": {"c_custkey", "c_nationkey"},
+    "lineitem": {"l_partkey", "l_suppkey", "l_linenumber"},
+    "nation": {"n_nationkey", "n_regionkey"},
+    "orders": {"o_custkey"},
+    "part": {"p_partkey"},
+    "partsupp": {"ps_partkey", "ps_suppkey"},
+    "region": {"r_regionkey"},
+    "supplier": {"s_suppkey", "s_nationkey"},
+}
+
 
 def cudf_write_kwargs(row_group_size_rows):
     return dict(
@@ -60,6 +73,20 @@ def cudf_write_kwargs(row_group_size_rows):
         use_dictionary=True,
         index=False,
     )
+
+
+def apply_int32_overrides(schema, table_name):
+    """Return a new schema with key columns downcast to int32 where specified."""
+    overrides = INT32_COLUMNS.get(table_name, set())
+    if not overrides:
+        return schema
+    new_fields = []
+    for field in schema:
+        if field.name in overrides and pa.types.is_integer(field.type):
+            new_fields.append(field.with_type(pa.int32()))
+        else:
+            new_fields.append(field)
+    return pa.schema(new_fields)
 
 
 def cast_to_schema(arrow_table, target_schema):
@@ -77,11 +104,16 @@ def rewrite_table(table_name, source_dir, dest_dir, row_group_size_rows):
     """Read a table's parquet file(s) with cudf and write back optimized."""
     single = os.path.join(source_dir, f"{table_name}.parquet")
     partitioned = sorted(glob.glob(os.path.join(source_dir, f"{table_name}_*.parquet")))
+    # tpchgen-cli produces <table>/<table>.<part>.parquet subdirectory layout
+    subdir = sorted(
+        glob.glob(os.path.join(source_dir, table_name, f"{table_name}.*.parquet"))
+    )
 
     source_files = []
     if os.path.isfile(single):
         source_files.append(single)
     source_files.extend(partitioned)
+    source_files.extend(subdir)
 
     if not source_files:
         print(f"  WARNING: No parquet files found for {table_name}, skipping")
@@ -89,6 +121,7 @@ def rewrite_table(table_name, source_dir, dest_dir, row_group_size_rows):
 
     # Get metadata and original schema
     orig_schema = pq.read_schema(source_files[0])
+    target_schema = apply_int32_overrides(orig_schema, table_name)
     total_rows = 0
     for f in source_files:
         total_rows += pq.read_metadata(f).num_rows
@@ -99,9 +132,9 @@ def rewrite_table(table_name, source_dir, dest_dir, row_group_size_rows):
     t0 = time.time()
 
     if total_rows <= SMALL_TABLE_THRESHOLD:
-        # Small enough — read with cudf, cast back to original schema, write with pyarrow
+        # Small enough — read with cudf, cast to target schema, write with pyarrow
         df = cudf.read_parquet(source_files)
-        arrow_table = cast_to_schema(df.to_arrow(), orig_schema)
+        arrow_table = cast_to_schema(df.to_arrow(), target_schema)
         del df
         pq.write_table(
             arrow_table,
@@ -131,7 +164,7 @@ def rewrite_table(table_name, source_dir, dest_dir, row_group_size_rows):
 
         writer = pq.ParquetWriter(
             dest_path,
-            orig_schema,
+            target_schema,
             compression="snappy",
             version="2.6",
             data_page_version="2.0",
@@ -146,7 +179,7 @@ def rewrite_table(table_name, source_dir, dest_dir, row_group_size_rows):
             rg_indices = list(range(batch_start, batch_end))
 
             df = cudf.read_parquet(source_files[0], row_groups=[rg_indices])
-            arrow_table = cast_to_schema(df.to_arrow(), orig_schema)
+            arrow_table = cast_to_schema(df.to_arrow(), target_schema)
             del df
 
             writer.write_table(arrow_table)

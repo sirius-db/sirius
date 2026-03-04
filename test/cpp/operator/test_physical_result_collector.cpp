@@ -37,6 +37,7 @@
 #include <cudf/utilities/default_stream.hpp>
 
 // rmm
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 // duckdb
@@ -177,7 +178,8 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 }
 
 void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
-                           std::shared_ptr<data_batch> const& batch)
+                           std::shared_ptr<data_batch> const& batch,
+                           rmm::cuda_stream_view stream)
 {
   auto* data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data representation"); }
@@ -194,21 +196,20 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   if (!host_space) { throw std::runtime_error("Invalid host memory space for test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::host_data_packed_representation>(
-    registry, host_space, rmm::cuda_stream_default);
+  batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
 }
 
 }  // namespace
 
 TEST_CASE("sirius_physical_materialized_collector sink with host input",
-          "[operator][physical_result_collector]")
+          "[operator][physical_result_collector][shared_context]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE + 7;
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
-  auto* gpu_space = get_default_gpu_space(sirius_ctx);
+  auto [db_owner, con]      = sirius::make_test_db_and_connection();
+  auto sirius_ctx           = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space           = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
                                             cudf::data_type{cudf::type_id::INT64},
@@ -216,12 +217,8 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
   std::vector<std::optional<std::pair<int, int>>> ranges{
     std::make_pair(0, 100), std::make_pair(1000, 2000), std::make_pair(0, 100)};
 
-  auto table = sirius::create_cudf_table_with_random_data(num_rows,
-                                                          column_types,
-                                                          ranges,
-                                                          cudf::get_default_stream(),
-                                                          gpu_space->get_default_allocator(),
-                                                          true);
+  auto table = sirius::create_cudf_table_with_random_data(
+    num_rows, column_types, ranges, stream, gpu_space->get_default_allocator(), true);
   auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
 
   expected_table_data expected;
@@ -237,7 +234,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
     expected_strings    = build_expected_strings(expected);
   }
 
-  convert_batch_to_host(sirius_ctx, batch);
+  convert_batch_to_host(sirius_ctx, batch, stream);
 
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
@@ -277,26 +274,22 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
 }
 
 TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
-          "[operator][physical_result_collector]")
+          "[operator][physical_result_collector][shared_context]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE * 2 + 3;
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
-  auto* gpu_space = get_default_gpu_space(sirius_ctx);
+  auto [db_owner, con]      = sirius::make_test_db_and_connection();
+  auto sirius_ctx           = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space           = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
                                             cudf::data_type{cudf::type_id::INT64}};
   std::vector<std::optional<std::pair<int, int>>> ranges{std::make_pair(0, 100),
                                                          std::make_pair(1000, 2000)};
 
-  auto table = sirius::create_cudf_table_with_random_data(num_rows,
-                                                          column_types,
-                                                          ranges,
-                                                          cudf::get_default_stream(),
-                                                          gpu_space->get_default_allocator(),
-                                                          false);
+  auto table = sirius::create_cudf_table_with_random_data(
+    num_rows, column_types, ranges, stream, gpu_space->get_default_allocator(), false);
   auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
 
   expected_table_data expected;
@@ -321,7 +314,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
-  collector.sink(operator_data({batch}), cudf::get_default_stream());
+  collector.sink(operator_data({batch}), stream);
   duckdb::GlobalSinkState sink_state;
   auto result = collector.get_result(sink_state);
   REQUIRE(result != nullptr);
@@ -344,15 +337,15 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
 }
 
 TEST_CASE("sirius_physical_materialized_collector sink supports concurrent append",
-          "[operator][physical_result_collector][concurrent]")
+          "[operator][physical_result_collector][concurrent][shared_context]")
 {
   constexpr int num_threads       = 4;
   constexpr size_t rows_per_batch = STANDARD_VECTOR_SIZE * 3 + 13;
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
-  auto* gpu_space = get_default_gpu_space(sirius_ctx);
+  auto [db_owner, con]            = sirius::make_test_db_and_connection();
+  auto sirius_ctx                 = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space                 = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
 
   using row_t = std::pair<int32_t, int64_t>;
   std::vector<row_t> expected_rows;
@@ -360,9 +353,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
 
   std::vector<std::shared_ptr<data_batch>> batches;
   batches.reserve(num_threads);
-
-  auto stream = cudf::get_default_stream();
-  auto mr     = gpu_space->get_default_allocator();
+  auto mr = gpu_space->get_default_allocator();
 
   for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
     std::vector<int32_t> col0_values(rows_per_batch, thread_idx);
@@ -401,7 +392,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
 
     auto table = std::make_unique<cudf::table>(std::move(cols));
     auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
-    convert_batch_to_host(sirius_ctx, batch);
+    convert_batch_to_host(sirius_ctx, batch, stream);
     batches.emplace_back(std::move(batch));
   }
 

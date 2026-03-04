@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 cd "${PIXI_PROJECT_ROOT:-$(dirname "$0")}/test_datasets" 2>/dev/null || return 0
 
