@@ -25,21 +25,26 @@ TEST_BUILD_TARGET ?= unittest
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
+# Inputs that should trigger a CMake re-configure
+CMAKE_INPUTS := cmake/CMakePresets.json CMakeLists.txt extension_config.cmake $(wildcard cmake/*.cmake)
+
 all: release
 
 $(PRESETS_LINK): cmake/CMakePresets.json
 	rm -f $(DUCKDB_DIR)/CMakeUserPresets.json
 	ln -sf ../cmake/CMakePresets.json $@
 
-release: $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset release
+# Configure step — only re-runs when cmake inputs change
+build/%/build.ninja: $(CMAKE_INPUTS) | $(PRESETS_LINK)
+	cd $(DUCKDB_DIR) && $(CMAKE) --preset $*
+
+release: build/release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(TEST_BUILD_TARGET)
 endif
 
-debug: $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset debug
+debug: build/debug/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(TEST_BUILD_TARGET)
@@ -49,23 +54,19 @@ reldebug: relwithdebinfo
 
 debug-release: relwithdebinfo
 
-relwithdebinfo: $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset relwithdebinfo
+relwithdebinfo: build/relwithdebinfo/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
 endif
 
-clang-release: $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-release
+clang-release: build/clang-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release
 
-clang-debug: $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-debug
+clang-debug: build/clang-debug/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug
 
-clang-relwithdebinfo: $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-relwithdebinfo
+clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo
 
 test: test_release
