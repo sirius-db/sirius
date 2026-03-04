@@ -16,4 +16,5 @@
 
 set(TEST_SOURCES
     ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_execution_tpch.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_tpcds_plan_translation.cpp
     PARENT_SCOPE)
