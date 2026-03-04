@@ -79,7 +79,7 @@ create_test_allocation(duckdb::SiriusContext& sirius_ctx, size_t total_size)
 //===----------------------------------------------------------------------===//
 // Test: column_builder - Construction
 //===----------------------------------------------------------------------===//
-TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder][shared_context]")
 {
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
@@ -128,14 +128,14 @@ TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder]")
 //===----------------------------------------------------------------------===//
 // Test: column_builder - Accessor Initialization with Shared Allocation
 //===----------------------------------------------------------------------===//
-TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - accessor initialization",
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
-  auto* mem_space = get_host_space(*sirius_ctx);
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
+  auto* mem_space      = get_host_space(*sirius_ctx);
   REQUIRE(mem_space != nullptr);
   auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
@@ -194,14 +194,14 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
 //===----------------------------------------------------------------------===//
 // Test: column_builder - sufficient_space_for_column
 //===----------------------------------------------------------------------===//
-TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - sufficient_space_for_column",
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
-  auto* mem_space = get_host_space(*sirius_ctx);
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
+  auto* mem_space      = get_host_space(*sirius_ctx);
   REQUIRE(mem_space != nullptr);
   auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
@@ -277,11 +277,11 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
 //===----------------------------------------------------------------------===//
 // Test: column_builder - process_mask_for_column
 //===----------------------------------------------------------------------===//
-TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - process_mask_for_column",
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
 
   SECTION("byte-aligned mask processing")
   {
@@ -423,11 +423,10 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("column_builder - process_column for fixed-width types",
-          "[duckdb_scan_task][column_builder]")
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
   SECTION("INTEGER column processing")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
@@ -538,12 +537,12 @@ TEST_CASE("column_builder - process_column for fixed-width types",
 // Test: column_builder - process_column (VARCHAR)
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("column_builder - process_column for VARCHAR", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - process_column for VARCHAR",
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con]                  = sirius::make_test_db_and_connection();
+  auto sirius_ctx                       = sirius::get_sirius_context(con, get_test_config_path());
   SECTION("VARCHAR column processing with all valid rows")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
@@ -642,11 +641,11 @@ TEST_CASE("column_builder - process_column for VARCHAR", "[duckdb_scan_task][col
 // Test: column_builder - Multiple batch processing
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("column_builder - multiple batch processing", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - multiple batch processing",
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
   SECTION("process multiple batches of INTEGER data")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
@@ -787,11 +786,10 @@ TEST_CASE("column_builder - multiple batch processing", "[duckdb_scan_task][colu
 // Test: column_builder - Edge Cases
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder][shared_context]")
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
   SECTION("empty vector (0 rows)")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
@@ -985,11 +983,10 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("column_builder - packed allocation multiple columns",
-          "[duckdb_scan_task][column_builder]")
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
   SECTION("two fixed-width columns in packed allocation")
   {
     // Simulate layout: [INT column data][INT column mask][BIGINT column data][BIGINT column mask]
@@ -1236,11 +1233,10 @@ TEST_CASE("column_builder - packed allocation multiple columns",
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("column_builder - VARCHAR space checking edge cases",
-          "[duckdb_scan_task][column_builder]")
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
   SECTION("sufficient_space_for_column returns false when space exceeded")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
@@ -1365,11 +1361,11 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
 // Test: NULL handling at block boundaries
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("column_builder - NULL handling at boundaries", "[duckdb_scan_task][column_builder]")
+TEST_CASE("column_builder - NULL handling at boundaries",
+          "[duckdb_scan_task][column_builder][shared_context]")
 {
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
   SECTION("NULLs at byte boundaries in mask")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);

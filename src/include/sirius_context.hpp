@@ -29,8 +29,10 @@
 #include <duckdb/main/client_context_state.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 
+#include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace duckdb {
 
@@ -84,8 +86,15 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::pipeline::pipeline_executor& get_pipeline_executor();
   [[nodiscard]] const sirius::pipeline::pipeline_executor& get_pipeline_executor() const;
 
-  [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor();
-  [[nodiscard]] const sirius::parallel::downgrade_executor& get_downgrade_executor() const;
+  /// \brief Get the downgrade executor for a specific memory space.
+  [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor(
+    cucascade::memory::memory_space_id space_id);
+  [[nodiscard]] const sirius::parallel::downgrade_executor& get_downgrade_executor(
+    cucascade::memory::memory_space_id space_id) const;
+
+  /// \brief Get all downgrade executors.
+  [[nodiscard]] const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
+  get_downgrade_executors() const;
 
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
@@ -113,7 +122,7 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
   std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
-  std::unique_ptr<sirius::parallel::downgrade_executor> downgrade_executor_;
+  std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   duckdb::shared_ptr<sirius::planner::query> query_;
 };
