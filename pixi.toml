@@ -64,8 +64,9 @@ doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris w
 doris-build = { cmd = "cargo build --release", cwd = "doris", description = "Build doris workspace" }
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
 doris-build-nixl = { cmd = "NIXL_PREFIX=$PIXI_PROJECT_ROOT/doris/thirdparty/nixl-install NIXL_NO_STUBS_FALLBACK=1 cargo build --release", cwd = "doris", description = "Build doris workspace with nixl GPU exchange" }
-# Start Sirius GPU BE with offset ports (for running alongside regular Doris BE)
-sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --fe 127.0.0.1:9030", description = "Run Sirius GPU BE with offset ports (coexists with regular BE)" }
+# Start Sirius GPU BEs with offset ports (for running alongside regular Doris BE)
+sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --gpu-cache-size 2GB --gpu-processing-size 2GB --fe 127.0.0.1:9030", description = "Run Sirius GPU BE 1 (ports 19xxx/18xxx)" }
+sirius-be-2 = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 29050 --be-port 29060 --brpc-port 28060 --http-port 28040 --arrow-flight-port 28071 --gpu-cache-size 2GB --gpu-processing-size 2GB --advertise-host 127.0.0.3 --fe 127.0.0.1:9030", description = "Run Sirius GPU BE 2 (ports 29xxx/28xxx)" }
 
 # Docker: Doris FE + regular BE + Sirius GPU BE for exchange testing
 doris-docker-up = { cmd = "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock docker compose -f doris/docker/docker-compose.yml -p sirius-doris up -d", description = "Start Doris FE + BE + Sirius BE in Docker" }
@@ -140,12 +141,17 @@ doris-fe-build = { cmd = """bash -c 'set -e
   rm -rf output/fe/lib/*
   cp fe/fe-core/target/lib/* output/fe/lib/
   cp fe/fe-core/target/doris-fe.jar output/fe/lib/
+
+  echo "==> Installing fe-host.conf as fe.conf..."
+  cp $PIXI_PROJECT_ROOT/doris/docker/fe-host.conf output/fe/conf/fe.conf
   echo "==> Done"
 '""", inputs = ["doris/thirdparty/apache-doris/gensrc/thrift/*.thrift", "doris/thirdparty/apache-doris/fe/fe-core/src/**/*.java", "doris/thirdparty/apache-doris/fe/fe-common/src/**/*.java", "doris/thirdparty/apache-doris/fe/pom.xml"], outputs = ["doris/thirdparty/apache-doris/fe/fe-core/target/doris-fe.jar"], depends-on = ["doris-fe-thrift"], description = "Build Doris FE from source (Maven)" }
 
 doris-fe-start = { cmd = "bin/start_fe.sh --console", cwd = "doris/thirdparty/apache-doris/output/fe", depends-on = ["doris-fe-build"], description = "Build (if needed) and run Doris FE in foreground" }
 doris-fe = { cmd = "bin/start_fe.sh --console", cwd = "doris/thirdparty/apache-doris/output/fe", description = "Run Doris FE in foreground (skip build)" }
+doris-fe-clean = { cmd = "rm -rf doris/thirdparty/apache-doris/output/fe/doris-meta doris/thirdparty/apache-doris/output/fe/log && mkdir -p doris/thirdparty/apache-doris/output/fe/doris-meta doris/thirdparty/apache-doris/output/fe/log", description = "Clean FE metadata and logs (fresh start)" }
 doris-fe-show-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"SHOW BACKENDS\\G\"'", description = "Show registered backends" }
+doris-fe-add-sirius = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND \\\"127.0.0.1:19050\\\"\"'", description = "Register Sirius GPU BE with local FE" }
 
 # Doris C++ BE feature: build & run standard Doris Backend from source
 [feature.doris-be.dependencies]

@@ -1469,6 +1469,7 @@ pub struct PBackendServiceHandler {
     exchange_buffer: ExchangeBuffer,
     no_cpu_fallback: bool,
     force_cpu: bool,
+    nixl_only: bool,
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
 }
 
@@ -1480,6 +1481,7 @@ impl PBackendServiceHandler {
         exchange_buffer: ExchangeBuffer,
         no_cpu_fallback: bool,
         force_cpu: bool,
+        nixl_only: bool,
     ) -> Self {
         Self {
             state,
@@ -1488,6 +1490,7 @@ impl PBackendServiceHandler {
             exchange_buffer,
             no_cpu_fallback,
             force_cpu,
+            nixl_only,
             nixl_agent: None,
         }
     }
@@ -1595,6 +1598,7 @@ impl PBackendService for PBackendServiceHandler {
                 let buffer = self.exchange_buffer.clone();
                 let no_cpu_fallback = self.no_cpu_fallback;
                 let force_cpu = self.force_cpu;
+                let nixl_only = self.nixl_only;
                 let nixl_agent = self.nixl_agent.clone();
 
                 // Spawn async task: wait for exchange data, decode, load, execute.
@@ -1872,7 +1876,7 @@ impl PBackendService for PBackendServiceHandler {
                                 let query_id = (params.query_id.hi, params.query_id.lo);
                                 if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
                                     nixl_agent.as_ref(),
-                                    location, &dests, query_id, dest_node_id, sender_id,
+                                    location, &dests, query_id, dest_node_id, sender_id, nixl_only,
                                 ).await {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
                                 }
@@ -2102,6 +2106,7 @@ impl PBackendService for PBackendServiceHandler {
                             query_id,
                             dest_node_id,
                             sender_id,
+                            self.nixl_only,
                         )
                         .await
                         {
@@ -2602,6 +2607,7 @@ pub async fn start_grpc_server(
     exchange_buffer: ExchangeBuffer,
     no_cpu_fallback: bool,
     force_cpu: bool,
+    nixl_only: bool,
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use doris_proto::doris::p_backend_service_server::PBackendServiceServer;
@@ -2621,6 +2627,7 @@ pub async fn start_grpc_server(
         exchange_buffer.clone(),
         no_cpu_fallback,
         force_cpu,
+        nixl_only,
     );
 
     handler = handler.with_nixl_agent(nixl_agent);

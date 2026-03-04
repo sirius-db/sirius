@@ -77,8 +77,8 @@ fn main() {
         Ok(e) => {
             info!("DuckDB engine initialized");
             // Try to initialize GPU buffers for Sirius GPU execution.
-            match e.init_gpu_buffers("2GB", "2GB") {
-                Ok(()) => info!("GPU buffers initialized (2GB cache, 2GB processing)"),
+            match e.init_gpu_buffers(&config.gpu_cache_size, &config.gpu_processing_size) {
+                Ok(()) => info!(cache = %config.gpu_cache_size, processing = %config.gpu_processing_size, "GPU buffers initialized"),
                 Err(err) => warn!(error = %err, "GPU buffer init failed, gpu_execution will fall back to DuckDB CPU"),
             }
             if config.no_cpu_fallback {
@@ -204,7 +204,7 @@ async fn run(
     });
 
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, nixl_agent).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, config.nixl_only, nixl_agent).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }

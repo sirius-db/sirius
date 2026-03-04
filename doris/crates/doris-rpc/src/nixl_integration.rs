@@ -100,6 +100,9 @@ pub fn detect_execution_location(
 }
 
 /// Send exchange result using nixl GPU-direct if available, otherwise bRPC.
+///
+/// When `nixl_only` is true, bRPC fallback is disabled — errors surface instead
+/// of being silently handled. Useful for debugging nixl exchange issues.
 pub async fn send_exchange_with_nixl(
     nixl_agent: Option<&Arc<NixlExchange>>,
     location: ExecutionLocation,
@@ -107,9 +110,14 @@ pub async fn send_exchange_with_nixl(
     query_id: (i64, i64),
     node_id: i32,
     sender_id: i32,
+    nixl_only: bool,
 ) -> Result<(), String> {
     match location {
         ExecutionLocation::Cpu(ipc_bytes) => {
+            if nixl_only {
+                tracing::error!("nixl-only mode: result is CPU-resident, cannot use nixl GPU-direct transfer");
+                return Err("nixl-only: no GPU buffers for GPU-direct exchange (execution fell back to CPU?)".to_string());
+            }
             crate::exchange_sender::send_exchange_result(
                 &ipc_bytes, destinations, query_id, node_id, sender_id,
             )
@@ -123,6 +131,9 @@ pub async fn send_exchange_with_nixl(
             ipc_bytes,
         } => {
             let Some(agent) = nixl_agent else {
+                if nixl_only {
+                    return Err("nixl-only: GPU result but no nixl agent available".to_string());
+                }
                 tracing::warn!("GPU result but no nixl agent, falling back to bRPC");
                 return crate::exchange_sender::send_exchange_result(
                     &ipc_bytes, destinations, query_id, node_id, sender_id,
@@ -132,6 +143,9 @@ pub async fn send_exchange_with_nixl(
             // Fast-path: skip nixl if a previous registration already detected
             // that UCX treats GPU memory as host memory (would SIGSEGV).
             if !agent.gpu_transfer_enabled() {
+                if nixl_only {
+                    return Err("nixl-only: UCX lacks CUDA support for GPU memory".to_string());
+                }
                 tracing::info!("UCX lacks CUDA support for GPU memory, using bRPC for exchange");
                 return crate::exchange_sender::send_exchange_result(
                     &ipc_bytes, destinations, query_id, node_id, sender_id,
@@ -144,6 +158,9 @@ pub async fn send_exchange_with_nixl(
                     agent, &buffers, &column_info, num_rows,
                     &ipc_bytes, dest, query_id, node_id, sender_id,
                 ).await {
+                    if nixl_only {
+                        return Err(format!("nixl-only: nixl transfer to {} failed: {}", dest.brpc_addr, e));
+                    }
                     tracing::warn!(
                         error = %e,
                         dest = %dest.brpc_addr,
@@ -392,6 +409,7 @@ mod tests {
             (1, 2),
             0,
             0,
+            false, // nixl_only
         )
         .await;
         // Will fail because IPC bytes are invalid, which is expected.

@@ -49,4 +49,18 @@ pub struct BeConfig {
     /// functional (e.g. CUDA errors in Docker) but you still want correct results.
     #[arg(long, default_value_t = false)]
     pub force_cpu: bool,
+
+    /// GPU cache buffer size (e.g. "2GB", "1024MB").
+    #[arg(long, default_value = "2GB")]
+    pub gpu_cache_size: String,
+
+    /// GPU processing buffer size (e.g. "2GB", "1024MB").
+    #[arg(long, default_value = "2GB")]
+    pub gpu_processing_size: String,
+
+    /// Disable bRPC exchange fallback: require nixl GPU-direct for all inter-BE
+    /// exchanges. Queries fail instead of silently falling back to bRPC.
+    /// Useful for debugging/iterating on the nixl exchange path.
+    #[arg(long, default_value_t = false)]
+    pub nixl_only: bool,
 }
