@@ -183,7 +183,7 @@ void pipeline_executor::management_eventloop()
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
       // TODO: implement scan task scheduling when state is owned in the operator itself
-      // schedule_next_scan_tasks();
+      schedule_next_scan_tasks();
     }
   }
 }
