@@ -1,12 +1,20 @@
 ---
 name: optimization-advisor
 description: Identify code optimization targets from nsys profiles — maps GPU hotspots to source functions, detects efficiency bottlenecks, sync overhead, memory issues, and parallelism opportunities.
-allowed-tools: Bash, Read, Grep, Glob, Write
 ---
 
 # Sirius Code Optimization Advisor
 
 You are identifying optimization targets in Sirius, a GPU-accelerated SQL query engine built on DuckDB. You analyze nsys profile data and map hotspots back to specific source code functions so developers know exactly where to focus.
+
+## Profiling Overhead Warning
+
+**nsys profiling adds measurable overhead to query execution times.** When the user wants to validate that an optimization actually improved performance, always recommend running queries both WITH and WITHOUT profiling:
+
+1. **Profiled run** (`nsys_report.sh` / `profile_tpch_nsys.sh`) → Provides GPU analysis data (kernels, operators, occupancy, memory) to understand *why* performance changed
+2. **Non-profiled run** (`run_tpch_parquet.sh` or `benchmark_and_validate.sh`) → Provides accurate cold/hot timings to confirm the optimization actually helped
+
+Never claim an optimization improved or regressed performance based solely on profiled timings. The profiled data tells you what changed internally; the non-profiled timings tell you whether it actually got faster.
 
 ## STEP 1: Confirm Profiles with the User (MANDATORY)
 
@@ -56,6 +64,21 @@ bash test/tpch_performance/nsys_report.sh --sf <scale_factor>
 # Step 2: Analyze the generated profiles
 bash test/tpch_performance/nsys_hotspots.sh reports/<generated_dir>/profiles/
 ```
+
+### Validating Optimizations (non-profiled timing run)
+
+After identifying and implementing an optimization, run queries WITHOUT profiling to get accurate timings:
+
+```bash
+# Sirius-only timing (accurate cold/hot without nsys overhead)
+export SIRIUS_CONFIG_FILE=<path_to_config>
+bash test/tpch_performance/run_tpch_parquet.sh sirius <scale_factor> <iterations> <query_numbers...>
+
+# Full DuckDB vs Sirius benchmark with result validation
+bash test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
+```
+
+Compare these non-profiled timings against a previous non-profiled baseline to confirm the optimization actually improved wall-clock performance. Then run a new profiled analysis to understand what changed internally.
 
 ## Analysis Sections
 
@@ -143,3 +166,4 @@ Always present findings in a structured way:
 - For each target, explain what makes it slow and what to investigate
 - Link operators to source files so the developer can navigate directly
 - When comparing across queries, highlight operators that consistently dominate
+- When presenting optimization recommendations, remind the user to validate improvements with non-profiled timing runs (`run_tpch_parquet.sh` or `benchmark_and_validate.sh`) — profiled timings include nsys overhead and do not reflect actual query performance
