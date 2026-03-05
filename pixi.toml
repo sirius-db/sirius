@@ -130,6 +130,7 @@ libnvjitlink-dev = "*"
 cuda-nvrtc-dev = "*"
 libcurand-dev = "*"
 flex = "*"
+patchelf = "*"
 zip = "*"
 
 [feature.vcpkg.activation]

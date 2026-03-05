@@ -44,6 +44,18 @@ if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
   string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
   string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+
+  # Strip conda-injected -Wl,-rpath flags from linker flags and disable
+  # CMake's RPATH mechanism so binaries don't carry a hardcoded path to the
+  # pixi/conda env. All deps are statically linked, so no RPATH is needed.
+  # FORCE is required because DuckDB's CMakeLists.txt sets this cache var first.
+  set(CMAKE_SKIP_RPATH ON CACHE BOOL "" FORCE)
+  foreach(_var CMAKE_SHARED_LINKER_FLAGS CMAKE_EXE_LINKER_FLAGS
+               CMAKE_MODULE_LINKER_FLAGS)
+    string(REGEX REPLACE "-Wl,-rpath-link[=,][^ ]*" "" ${_var} "${${_var}}")
+    string(REGEX REPLACE "-Wl,-rpath[=,][^ ]*" "" ${_var} "${${_var}}")
+    set(${_var} "${${_var}}" CACHE STRING "" FORCE)
+  endforeach()
 endif()
 
 # Dependencies
@@ -120,6 +132,20 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
+
+# The conda-forge GCC wrapper hard-codes -rpath <conda_prefix>/lib into every
+# link invocation. Strip it from the loadable extension so the binary only
+# depends on system libraries at runtime.
+if(VCPKG_BUILD)
+  find_program(_PATCHELF patchelf)
+  if(_PATCHELF)
+    add_custom_command(
+      TARGET sirius_loadable_extension
+      POST_BUILD
+      COMMAND ${_PATCHELF} --remove-rpath $<TARGET_FILE:sirius_loadable_extension>
+      COMMENT "Stripping RPATH from sirius loadable extension")
+  endif()
+endif()
 
 # Additional libraries only needed by the static extension
 if(TARGET libconfig::config++)
