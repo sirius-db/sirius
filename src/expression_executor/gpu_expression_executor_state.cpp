@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#include <cudf_utils.hpp>
+#include <cudf/cudf_utils.hpp>
+
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_executor_state.hpp>
 

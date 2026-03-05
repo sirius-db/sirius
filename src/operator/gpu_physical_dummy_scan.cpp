@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "gpu_physical_dummy_scan.hpp"
+#include "operator/gpu_physical_dummy_scan.hpp"
 
 #include "log/logging.hpp"
 

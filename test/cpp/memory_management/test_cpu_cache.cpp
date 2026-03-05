@@ -18,7 +18,6 @@
 #include "cpu_cache.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
-#include "log/logging.hpp"
 #include "utils/utils.hpp"
 
 using namespace duckdb;

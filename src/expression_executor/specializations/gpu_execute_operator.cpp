@@ -21,11 +21,8 @@
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "log/logging.hpp"
 
-#include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
-#include <cudf/reduction.hpp>
 #include <cudf/search.hpp>
-#include <cudf/strings/contains.hpp>
 #include <cudf/unary.hpp>
 
 #include <rmm/device_uvector.hpp>

@@ -17,9 +17,6 @@
 #include "op/sirius_physical_limit.hpp"
 
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
-#include "operator/gpu_materialize.hpp"
 
 #include <cudf/copying.hpp>
 

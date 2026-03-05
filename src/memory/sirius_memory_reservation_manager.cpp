@@ -22,8 +22,6 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -38,19 +36,19 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   if (gpu_spaces.empty()) {
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
-  std::for_each(gpu_spaces.begin(), gpu_spaces.end(), [](const auto* space) {
+  std::for_each(gpu_spaces.begin(), gpu_spaces.end(), [this](const auto* space) {
     auto* device_mr = space->get_default_allocator();
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
-    cudf::set_current_device_resource(device_mr);
+    previous_device_resource_ = cudf::set_current_device_resource(device_mr);
   });
 }
 
 sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
 {
   auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  std::for_each(gpu_spaces.begin(), gpu_spaces.end(), [](const auto* space) {
+  std::for_each(gpu_spaces.begin(), gpu_spaces.end(), [this](const auto* space) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
-    cudf::reset_current_device_resource_ref();
+    cudf::set_current_device_resource(previous_device_resource_);
   });
 }
 

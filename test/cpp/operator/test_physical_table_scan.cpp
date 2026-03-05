@@ -20,16 +20,10 @@
 
 #include <catch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/memory_space.hpp>
-#include <duckdb/common/types/date.hpp>
-#include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <op/sirius_physical_table_scan.hpp>
-
-#include <iostream>
-#include <variant>
 
 using namespace duckdb;
 using namespace sirius::op;

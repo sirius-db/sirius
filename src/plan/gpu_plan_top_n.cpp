@@ -16,7 +16,7 @@
 
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "gpu_physical_plan_generator.hpp"
-#include "gpu_physical_top_n.hpp"
+#include "operator/gpu_physical_top_n.hpp"
 
 namespace duckdb {
 

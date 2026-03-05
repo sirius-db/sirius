@@ -21,18 +21,14 @@
 #include "pipeline/oom_reschedule_exception.hpp"
 
 #include <absl/cleanup/cleanup.h>
-#include <absl/functional/any_invocable.h>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
-#include <iostream>
 #include <optional>
 
 namespace sirius {
@@ -67,8 +63,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
             cancel_task_if_needed();
             return std::nullopt;
           }
-          batch->convert_to<cucascade::gpu_table_representation>(
-            registry, requested_memory_space, stream);
+          try {
+            batch->convert_to<cucascade::gpu_table_representation>(
+              registry, requested_memory_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
           batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
           break;
         }
@@ -78,8 +79,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
             cancel_task_if_needed();
             return std::nullopt;
           }
-          batch->convert_to<cucascade::host_data_packed_representation>(
-            registry, requested_memory_space, stream);
+          try {
+            batch->convert_to<cucascade::host_data_representation>(
+              registry, requested_memory_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
           batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
           break;
         }
@@ -112,6 +118,8 @@ void validate_operator_output_types(const op::operator_data* data,
     if (!batch) { continue; }
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
+      // bobbi (todo): delim join will return this warning for now, but there is no bug here, so we
+      // can ignore it. we can do something about this after gtc
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
         "{}, expected {}",

@@ -18,20 +18,14 @@
 #include "../operator_type_traits.hpp"
 #include "aggregate_test_utils.hpp"
 #include "data/data_batch_utils.hpp"
-#include "utils/data_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/table/table.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
-#include <duckdb/parser/query_error_context.hpp>
-#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
 
 #include <algorithm>
-#include <numeric>
 
 using namespace duckdb;
 using namespace sirius::op;

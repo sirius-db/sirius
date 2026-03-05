@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/common/types.hpp"
 #include "helper/common.h"
 
