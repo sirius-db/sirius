@@ -24,14 +24,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
 endif()
 
-# Language standards
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-set(CMAKE_CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
@@ -70,6 +62,15 @@ build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
+  set_target_properties(
+    ${_target}
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON
+               CUDA_SEPARABLE_COMPILATION ON
+               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
   target_include_directories(
     ${_target}
     PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
@@ -152,8 +153,10 @@ set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/unittest.cpp"
                             PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 set_target_properties(
-  sirius_unittest PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                             "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+  sirius_unittest
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
 target_compile_definitions(
   sirius_unittest
