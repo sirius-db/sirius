@@ -182,6 +182,7 @@ void pipeline_executor::management_eventloop()
       }
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
+      // TODO: implement scan task scheduling when state is owned in the operator itself
       schedule_next_scan_tasks();
     }
   }
@@ -192,9 +193,7 @@ void pipeline_executor::schedule_next_scan_tasks()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   if (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    for (auto i = 0; i != _scan_executor->get_num_threads(); ++i) {
-      _task_creator->schedule(scan_op);
-    }
+    _task_creator->schedule(scan_op);
     _priority_scans.pop();
   }
 }

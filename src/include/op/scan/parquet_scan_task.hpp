@@ -423,7 +423,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   //===----------Fields----------===//
   uint64_t _task_id;                   ///< The unique ID of this task
   shared_data_repository* _data_repo;  ///< The shared data repository to which to push batches
-  std::unique_ptr<cudf::io::datasource> _datasource;  ///< The cudf datasource for the input file
+  std::shared_ptr<cudf::io::datasource> _datasource;  ///< The cudf datasource for the input file
 };
 
 }  // namespace sirius::op::scan

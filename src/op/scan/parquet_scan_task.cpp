@@ -384,19 +384,16 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     reader->all_column_chunks_byte_ranges(l_state.get_rg_span(), g_state.get_options());
 
   // Read each byte range into the allocation asynchronously
-  std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
-  new_byte_ranges.reserve(byte_ranges.size());
-  int64_t new_offset = 0;
+  int64_t bytes_read = 0;
   std::vector<std::future<std::size_t>> read_futures;
   for (auto const& range : byte_ranges) {
     read_range_into_allocation(
       range.offset(), range.size(), data_accessor, allocation, read_futures);
-    new_byte_ranges.emplace_back(new_offset, range.size());
-    new_offset += range.size();
+    bytes_read += range.size();
   }
   std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
 
-  if (new_offset != l_state.get_reserved_compressed_bytes()) {
+  if (bytes_read != l_state.get_reserved_compressed_bytes()) {
     // Metadata / file data mismatch
     throw std::runtime_error(
       "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
@@ -410,9 +407,10 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   std::move(reader),
                                                   g_state.get_options(),
                                                   std::move(l_state.get_rg_indices()),
-                                                  std::move(new_byte_ranges),
+                                                  std::move(byte_ranges),
                                                   l_state.get_reserved_compressed_bytes(),
-                                                  l_state.get_reserved_uncompressed_bytes());
+                                                  l_state.get_reserved_uncompressed_bytes(),
+                                                  _datasource);
   auto data_batch =
     std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
   auto result = std::make_unique<op::operator_data>(

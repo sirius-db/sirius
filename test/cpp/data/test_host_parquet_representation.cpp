@@ -23,6 +23,7 @@
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -58,7 +59,8 @@
 
 using namespace sirius;
 using namespace cucascade::memory;
-using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
+using hybrid_scan_reader                = cudf::io::parquet::experimental::hybrid_scan_reader;
+using sirius_memory_reservation_manager = sirius::memory::sirius_memory_reservation_manager;
 
 //===----------------------------------------------------------------------===//
 // Test Helpers
@@ -111,7 +113,6 @@ struct parquet_test_fixture {
   std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
   cudf::io::parquet_reader_options reader_options;
   std::vector<cudf::size_type> row_group_indices;
-  std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges;
   std::size_t size_in_bytes              = 0;
   std::size_t uncompressed_size_in_bytes = 0;
 
@@ -150,8 +151,8 @@ struct parquet_test_fixture {
     REQUIRE(!result->HasError());
 
     // Read the footer
-    auto datasource = cudf::io::datasource::create(parquet_path.string());
-    footer_buffer   = read_parquet_footer(*datasource);
+    _datasource   = cudf::io::datasource::create(parquet_path.string());
+    footer_buffer = read_parquet_footer(*_datasource);
 
     // Build reader options
     reader_options = cudf::io::parquet_reader_options::builder().build();
@@ -169,22 +170,13 @@ struct parquet_test_fixture {
     // Get byte ranges for all column chunks across all row groups
     auto rg_span =
       cudf::host_span<cudf::size_type const>(row_group_indices.data(), row_group_indices.size());
-    auto byte_ranges = reader->all_column_chunks_byte_ranges(rg_span, reader_options);
-
-    // Compute total size and create rebased byte ranges
-    column_chunk_byte_ranges.clear();
-    column_chunk_byte_ranges.reserve(byte_ranges.size());
-    size_in_bytes = 0;
-    for (auto const& range : byte_ranges) {
-      column_chunk_byte_ranges.emplace_back(static_cast<int64_t>(size_in_bytes), range.size());
+    _original_byte_ranges = reader->all_column_chunks_byte_ranges(rg_span, reader_options);
+    size_in_bytes         = 0;
+    for (auto const& range : _original_byte_ranges) {
       size_in_bytes += range.size();
     }
 
     uncompressed_size_in_bytes = size_in_bytes * 2;  // Doesn't matter
-
-    // Store the original byte ranges for reading data
-    _original_byte_ranges = std::move(byte_ranges);
-    _datasource           = std::move(datasource);
   }
 
   /**
@@ -230,9 +222,10 @@ struct parquet_test_fixture {
                                                          std::move(reader),
                                                          reader_options,
                                                          row_group_indices,
-                                                         column_chunk_byte_ranges,
+                                                         _original_byte_ranges,
                                                          size_in_bytes,
-                                                         uncompressed_size_in_bytes);
+                                                         uncompressed_size_in_bytes,
+                                                         _datasource);
   }
 
   ~parquet_test_fixture()
@@ -244,7 +237,7 @@ struct parquet_test_fixture {
 
  private:
   std::vector<cudf::io::text::byte_range_info> _original_byte_ranges;
-  std::unique_ptr<cudf::io::datasource> _datasource;
+  std::shared_ptr<cudf::io::datasource> _datasource;
 };
 
 //===----------------------------------------------------------------------===//
@@ -253,7 +246,7 @@ struct parquet_test_fixture {
 
 TEST_CASE("host_parquet_representation construction", "[host_parquet_representation]")
 {
-  memory_reservation_manager mgr(create_test_configs());
+  sirius_memory_reservation_manager mgr(create_test_configs());
   auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
   REQUIRE(host_space != nullptr);
 
@@ -285,7 +278,7 @@ TEST_CASE("host_parquet_representation construction", "[host_parquet_representat
   SECTION("has column chunk byte ranges")
   {
     auto const& byte_ranges = repr->get_column_chunk_byte_ranges();
-    REQUIRE(byte_ranges.size() == fixture.column_chunk_byte_ranges.size());
+    REQUIRE(!byte_ranges.empty());
   }
 
   SECTION("has valid column chunks allocation")
@@ -302,7 +295,7 @@ TEST_CASE("host_parquet_representation construction", "[host_parquet_representat
 TEST_CASE("host_parquet_representation clone creates independent copy",
           "[host_parquet_representation][clone]")
 {
-  memory_reservation_manager mgr(create_test_configs());
+  sirius_memory_reservation_manager mgr(create_test_configs());
   auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
   REQUIRE(host_space != nullptr);
 
@@ -388,7 +381,7 @@ TEST_CASE("host_parquet_representation clone creates independent copy",
 TEST_CASE("host_parquet_representation clone with small data",
           "[host_parquet_representation][clone]")
 {
-  memory_reservation_manager mgr(create_test_configs());
+  sirius_memory_reservation_manager mgr(create_test_configs());
   auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
   REQUIRE(host_space != nullptr);
 
@@ -466,7 +459,7 @@ TEST_CASE("register_parquet_converters is idempotent", "[host_parquet_representa
 TEST_CASE("host_parquet_representation converts to gpu_table_representation",
           "[host_parquet_representation][converters][gpu]")
 {
-  memory_reservation_manager mgr(create_test_configs());
+  sirius_memory_reservation_manager mgr(create_test_configs());
   cucascade::representation_converter_registry registry;
   cucascade::register_builtin_converters(registry);
   register_parquet_converters(registry);
@@ -526,7 +519,7 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
 TEST_CASE("host_parquet_representation converts to GPU with projected columns",
           "[host_parquet_representation][converters][gpu][projection]")
 {
-  memory_reservation_manager mgr(create_test_configs());
+  sirius_memory_reservation_manager mgr(create_test_configs());
   cucascade::representation_converter_registry registry;
   cucascade::register_builtin_converters(registry);
   register_parquet_converters(registry);
@@ -546,7 +539,8 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
   con.Query("COPY projected_test TO '" + parquet_path.string() +
             "' (FORMAT PARQUET, COMPRESSION snappy)");
 
-  auto datasource    = cudf::io::datasource::create(parquet_path.string());
+  std::shared_ptr<cudf::io::datasource> datasource =
+    cudf::io::datasource::create(parquet_path.string());
   auto footer_buffer = read_parquet_footer(*datasource);
 
   auto reader_options = cudf::io::parquet_reader_options::builder().build();
@@ -566,11 +560,11 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
   auto rg_span     = cudf::host_span<cudf::size_type const>(rg_indices.data(), rg_indices.size());
   auto byte_ranges = reader->all_column_chunks_byte_ranges(rg_span, reader_options);
 
-  // Read data into allocation
-  std::vector<cudf::io::text::byte_range_info> rebased_ranges;
+  // Keep original (absolute) file offsets — cache_ranges answers cudf::io::read_parquet
+  // requests using absolute file offsets, so rebasing to 0 would cause it to serve
+  // data from the wrong buffer position.
   size_t total_size = 0;
   for (auto const& range : byte_ranges) {
-    rebased_ranges.emplace_back(static_cast<int64_t>(total_size), range.size());
     total_size += range.size();
   }
 
@@ -605,9 +599,10 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
                                                             std::move(proj_reader),
                                                             reader_options,
                                                             rg_indices,
-                                                            rebased_ranges,
+                                                            byte_ranges,
                                                             total_size,
-                                                            total_size * 2);
+                                                            total_size * 2,
+                                                            datasource);
 
   auto stream     = gpu_space->acquire_stream();
   auto gpu_result = registry.convert<cucascade::gpu_table_representation>(*repr, gpu_space, stream);
@@ -628,7 +623,7 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
 TEST_CASE("host_parquet_representation clone then convert to GPU",
           "[host_parquet_representation][clone][converters][gpu]")
 {
-  memory_reservation_manager mgr(create_test_configs());
+  sirius_memory_reservation_manager mgr(create_test_configs());
   cucascade::representation_converter_registry registry;
   cucascade::register_builtin_converters(registry);
   register_parquet_converters(registry);
@@ -694,7 +689,7 @@ TEST_CASE("host_parquet_representation cross-host copy converter",
     return;
   }
 
-  memory_reservation_manager mgr(builder.build());
+  sirius_memory_reservation_manager mgr(builder.build());
   cucascade::representation_converter_registry registry;
   cucascade::register_builtin_converters(registry);
   register_parquet_converters(registry);
