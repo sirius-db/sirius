@@ -149,6 +149,37 @@ void validate_operator_output_types(const op::operator_data* data,
   }
 }
 
+std::unique_ptr<op::operator_data> run_one_operator(op::sirius_physical_operator& op,
+                                                    const op::operator_data& operator_input_data,
+                                                    rmm::cuda_stream_view stream,
+                                                    const sirius_pipeline* pipeline,
+                                                    size_t op_index,
+                                                    size_t num_operators,
+                                                    std::string& batch_sizes)
+{
+  auto start                = std::chrono::high_resolution_clock::now();
+  auto operator_output_data = op.execute(operator_input_data, stream);
+  stream.synchronize();
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  batch_sizes   = "";
+  for (auto& batch : operator_output_data->get_data_batches()) {
+    auto view = get_cudf_table_view(*batch);
+    batch_sizes += std::to_string(view.num_rows()) + "  ";
+  }
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
+    "{:.2f} ms",
+    pipeline->get_pipeline_id(),
+    op.get_name(),
+    op.get_operator_id(),
+    operator_output_data ? operator_output_data->get_data_batches().size() : 0u,
+    batch_sizes,
+    duration.count() / 1000.0);
+  validate_operator_output_types(operator_output_data.get(), op);
+  return operator_output_data;
+}
+
 }  // namespace
 
 gpu_pipeline_task::gpu_pipeline_task(
@@ -209,39 +240,48 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                      operator_input_output_data->get_data_batches().size(),
                      batch_sizes);
     try {
-      auto start            = std::chrono::high_resolution_clock::now();
-      auto temp_output_data = op.execute(*operator_input_output_data, stream);
-      stream.synchronize();
-      operator_input_output_data = std::move(temp_output_data);
-      auto end                   = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-      batch_sizes   = "";
-      for (auto& batch : operator_input_output_data->get_data_batches()) {
-        auto view = get_cudf_table_view(*batch);
-        batch_sizes += std::to_string(view.num_rows()) + "  ";
-      }
-      SIRIUS_LOG_TRACE(
-        "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
-        "{:.2f} ms",
-        pipeline->get_pipeline_id(),
-        op.get_name(),
-        op.get_operator_id(),
-        operator_input_output_data ? operator_input_output_data->get_data_batches().size() : 0u,
-        batch_sizes,
-        duration.count() / 1000.0);
-      validate_operator_output_types(operator_input_output_data.get(), op);
+      operator_input_output_data = run_one_operator(
+        op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
     } catch (const rmm::out_of_memory&) {
-      SIRIUS_LOG_WARN("Pipeline {}: OOM at operator {} (id={}, index {}/{}), rescheduling task {}",
+      SIRIUS_LOG_WARN("Pipeline {}: OOM at operator {} (id={}, index {}/{}), retrying once",
                       pipeline->get_pipeline_id(),
                       op.get_name(),
                       op.get_operator_id(),
                       i,
-                      operators.size(),
-                      _task_id);
-      throw oom_reschedule_exception(
-        std::move(operator_input_output_data),
-        i,
-        "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
+                      operators.size());
+      try {
+        SIRIUS_LOG_WARN(
+          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), trimming memory pool and "
+          "retrying operator)",
+          pipeline->get_pipeline_id(),
+          op.get_name(),
+          op.get_operator_id(),
+          i,
+          operators.size());
+        cudaMemPool_t pool{};
+        if (cudaDeviceGetDefaultMemPool(&pool,
+                                        operator_input_output_data->get_data_batches()[0]
+                                          ->get_memory_space()
+                                          ->get_device_id()) == cudaSuccess) {
+          cudaMemPoolTrimTo(pool, 0);
+          cudaDeviceSynchronize();
+        }
+        operator_input_output_data = run_one_operator(
+          op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
+      } catch (const rmm::out_of_memory&) {
+        SIRIUS_LOG_WARN(
+          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), rescheduling task {}",
+          pipeline->get_pipeline_id(),
+          op.get_name(),
+          op.get_operator_id(),
+          i,
+          operators.size(),
+          _task_id);
+        throw oom_reschedule_exception(
+          std::move(operator_input_output_data),
+          i,
+          "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
+      }
     }
   }
   return operator_input_output_data;
