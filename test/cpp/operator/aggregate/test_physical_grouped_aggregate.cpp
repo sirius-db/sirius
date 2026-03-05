@@ -148,7 +148,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
 
   // The local operator outputs expanded columns: group_key, min, max, count, sum, count_valid
   // (AVG decomposed into SUM + COUNT_VALID). Verify column count = 1 group + 5 aggregates.
-  auto output_table = outputs->get_data_batches()[0]
+  auto& output_table = outputs->get_data_batches()[0]
                         ->get_data()
                         ->cast<cucascade::gpu_table_representation>()
                         .get_table();

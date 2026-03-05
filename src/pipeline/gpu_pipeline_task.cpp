@@ -257,6 +257,7 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
     _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_sink();
   if (sink_operators) {
     sink_operators.get()->sink(output_data, stream);
+    stream.synchronize();
   } else {
     throw std::runtime_error("Sink operator not found");
   }
@@ -289,6 +290,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     processing_handles.emplace_back(std::move(*handle));
   }
+  stream.synchronize();  // ensure all conversions are done before we proceed with execution
 
   // At this point, all input batches are locked for processing.
   // They will remain locked until the processing_handles go out of scope.
