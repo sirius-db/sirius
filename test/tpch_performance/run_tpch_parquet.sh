@@ -7,6 +7,9 @@
 # Timings are recorded using current_timestamp between steps and written to a CSV file.
 # Output results are saved as result_<engine>_sf<scale_factor>_q<query_number>.txt
 # and timing results as timings_<engine>_sf<scale_factor>_q<query_number>.csv.
+# If OUTPUT_DIR is set (this is done by benchmark_and_validate.sh),
+# results are saved in the specified directory (in a subdirectory per query),
+# otherwise they are saved in the project directory.
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=/home/felipe/sirius/test/cpp/integration/integration.cfg
@@ -96,8 +99,15 @@ echo "=========================================="
 
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
-    RESULT_FILE="$PROJECT_DIR/result_${ENGINE}_sf${SF}_q${q}.txt"
-    TIMING_FILE="$PROJECT_DIR/timings_${ENGINE}_sf${SF}_q${q}.csv"
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        Q_DIR="$OUTPUT_DIR/q${q}"
+        mkdir -p "$Q_DIR"
+        RESULT_FILE="$Q_DIR/result.txt"
+        TIMING_FILE="$Q_DIR/timings.csv"
+    else
+        RESULT_FILE="$PROJECT_DIR/result_${ENGINE}_sf${SF}_q${q}.txt"
+        TIMING_FILE="$PROJECT_DIR/timings_${ENGINE}_sf${SF}_q${q}.csv"
+    fi
 
     if [ ! -f "$QUERY_FILE" ]; then
         echo "WARNING: Query file not found: $QUERY_FILE, skipping Q${q}"
@@ -107,7 +117,11 @@ for q in "${QUERIES[@]}"; do
     echo ""
     echo "========== Q${q} =========="
 
-    TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        TEMP_SQL="$Q_DIR/query.sql"
+    else
+        TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
+    fi
 
     # Timing table: one row per checkpoint, ordered by seq
     printf 'CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);\n' > "$TEMP_SQL"
@@ -142,7 +156,11 @@ COPY (
 EOF
 
     START_TIME=$(date +%s.%N)
-    "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        SIRIUS_LOG_DIR="$Q_DIR" "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
+    else
+        "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
+    fi
     END_TIME=$(date +%s.%N)
 
     ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
@@ -152,7 +170,9 @@ EOF
         echo "${q},${ELAPSED}" >> "$TIMING_CSV"
     fi
 
-    rm -f "$TEMP_SQL"
+    if [ -z "${OUTPUT_DIR:-}" ]; then
+        rm -f "$TEMP_SQL"
+    fi
     echo "Timings written to $TIMING_FILE"
 done
 
