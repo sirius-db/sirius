@@ -289,10 +289,19 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
 
 void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  auto sink_operators =
-    _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_sink();
+  auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  auto sink_operators = pipeline->get_sink();
   if (sink_operators) {
+    auto const sink_start = std::chrono::high_resolution_clock::now();
     sink_operators.get()->sink(output_data, stream);
+    auto const sink_end = std::chrono::high_resolution_clock::now();
+    auto const sink_duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(sink_end - sink_start);
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) sink execution time: {:.2f} ms",
+                     pipeline->get_pipeline_id(),
+                     sink_operators->get_name(),
+                     sink_operators->get_operator_id(),
+                     sink_duration.count() / 1000.0);
   } else {
     throw std::runtime_error("Sink operator not found");
   }
@@ -301,8 +310,12 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
 void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 {
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  auto operators    = pipeline->get_operators();
+  auto& first_op    = operators[local_state._start_operator_index].get();
 
-  auto reservation = local_state.release_reservation();
+  auto const prepare_start = std::chrono::high_resolution_clock::now();
+  auto reservation         = local_state.release_reservation();
   if (!reservation) { throw std::runtime_error("GPU pipeline task requires a memory reservation"); }
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
@@ -325,6 +338,15 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     processing_handles.emplace_back(std::move(*handle));
   }
+
+  auto const prepare_end = std::chrono::high_resolution_clock::now();
+  auto const prepare_duration =
+    std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
+  SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) prepare execution time: {:.2f} ms",
+                   pipeline->get_pipeline_id(),
+                   first_op.get_name(),
+                   first_op.get_operator_id(),
+                   prepare_duration.count() / 1000.0);
 
   // At this point, all input batches are locked for processing.
   // They will remain locked until the processing_handles go out of scope.

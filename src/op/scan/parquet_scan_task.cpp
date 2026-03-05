@@ -17,6 +17,7 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
+#include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
@@ -43,6 +44,7 @@
 
 // standard library
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <unordered_set>
@@ -361,6 +363,17 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
   auto reader   = g_state.make_reader(l_state.get_file_idx());
 
+  auto& scan_op      = g_state.get_operator();
+  auto const num_rgs = l_state.get_rg_span().size();
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: operator {} (id={}) executing on {} batches with num row: {}",
+    scan_op.get_pipeline().get() != nullptr ? scan_op.get_pipeline()->get_pipeline_id() : 0,
+    scan_op.get_name(),
+    scan_op.get_operator_id(),
+    0,
+    "");
+  auto const task_start = std::chrono::high_resolution_clock::now();
+
   // Make the allocation and accessor
   auto allocation = l_state.make_allocation();
   memory::multiple_blocks_allocation_accessor<uint8_t> data_accessor;
@@ -402,8 +415,21 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   l_state.get_reserved_uncompressed_bytes());
   auto data_batch =
     std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
-  return std::make_unique<op::operator_data>(
+  auto result = std::make_unique<op::operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
+  auto const task_end = std::chrono::high_resolution_clock::now();
+  auto const task_duration =
+    std::chrono::duration_cast<std::chrono::microseconds>(task_end - task_start);
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
+    "{:.2f} ms",
+    scan_op.get_pipeline().get() != nullptr ? scan_op.get_pipeline()->get_pipeline_id() : 0,
+    scan_op.get_name(),
+    scan_op.get_operator_id(),
+    result->get_data_batches().size(),
+    num_rgs,
+    task_duration.count() / 1000.0);
+  return result;
 }
 
 void parquet_scan_task::publish_output(op::operator_data& output_data,
