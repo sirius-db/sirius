@@ -20,8 +20,9 @@ PREPARE_RE = re.compile(
 )
 
 # Matches: Pipeline 1: operator TABLE_SCAN (id=0) executing on 1 batches with num row: 79776599
+# Also handles multi-batch: executing on 120 batches with num row: 0  0  1  0  ...
 EXECUTING_RE = re.compile(
-    r"Pipeline (\d+): operator (\w+) \(id=(\d+)\) executing on (\d+) batches with num row: (\d+)"
+    r"Pipeline (\d+): operator (\w+) \(id=(\d+)\) executing on (\d+) batches with num row: ([\d\s]+)"
 )
 
 # Matches: Pipeline 1: operator TABLE_SCAN (id=0) produced 1 batches with num rows: 41980874  , execution time: 25.29 ms
@@ -77,7 +78,7 @@ def _process_line(line, operators):
         if key not in operators:
             operators[key] = _make_op_entry(pipeline_id, op_id, op_type, "execute")
         operators[key]["input_batches"] += int(m.group(4))
-        operators[key]["input_rows"] += int(m.group(5))
+        operators[key]["input_rows"] += sum(int(x) for x in m.group(5).split())
         return False
 
     m = PRODUCED_RE.search(line)
