@@ -27,12 +27,9 @@
 
 #include <cuda_runtime_api.h>
 
-<<<<<<< HEAD
-=======
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
->>>>>>> 1cb59f8 (fixed format issues)
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>  // for std::getenv
