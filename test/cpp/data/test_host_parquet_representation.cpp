@@ -30,12 +30,14 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 // cudf
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 #include <cudf/utilities/span.hpp>
 
 // rmm
@@ -473,6 +475,29 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
   auto* gpu_space  = const_cast<memory_space*>(mgr.get_memory_space(Tier::GPU, 0));
   REQUIRE(host_space != nullptr);
   REQUIRE(gpu_space != nullptr);
+
+  // This test runs without a SiriusContext so cuDF's global pinned memory resource
+  // may be unset or point to a stale allocator from a previously-paused context.
+  // Explicitly install a slab allocator backed by the test's own fixed_size_host_memory_resource
+  // so cuDF internal host allocations (e.g. hostdevice_vector) always succeed.
+  auto* fsmr =
+    host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+  REQUIRE(fsmr != nullptr);
+  cucascade::memory::small_pinned_host_memory_resource slab_mr(*fsmr);
+  // RAII guard: restores previous cuDF state before slab_mr is destroyed.
+  // Declared AFTER slab_mr so it is destroyed FIRST (reverse construction order).
+  struct cudf_pinned_guard {
+    rmm::host_device_async_resource_ref prev_mr;
+    std::size_t prev_threshold;
+    ~cudf_pinned_guard() noexcept
+    {
+      cudf::set_pinned_memory_resource(prev_mr);
+      cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
+    }
+  } pinned_guard{cudf::set_pinned_memory_resource(slab_mr),
+                 cudf::get_allocate_host_as_pinned_threshold()};
+  cudf::set_allocate_host_as_pinned_threshold(
+    cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
 
   parquet_test_fixture fixture;
   fixture.setup(500, "convert_to_gpu");
