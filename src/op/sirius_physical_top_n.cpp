@@ -239,7 +239,6 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
     if (!batch) { continue; }
     concat_views.push_back(
       batch->get_data()->cast<cucascade::gpu_table_representation>().get_table().view());
-    // owned_tables.push_back(std::move(table));
   }
 
   if (concat_views.empty()) {
