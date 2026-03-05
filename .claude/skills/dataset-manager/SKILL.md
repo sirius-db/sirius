@@ -36,23 +36,35 @@ The pixi environment for Python scripts: `cd test/tpch_performance && pixi run p
 
 ### Workflow A: Generate TPC-H Data
 
-#### Option 1: DuckDB built-in generator (simplest, no extra tools needed)
-
-```bash
-SF=100
-./build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$SF); EXPORT DATABASE 'test_datasets/tpch_parquet_sf${SF}' (FORMAT PARQUET);"
-```
-
-This produces one parquet file per table with DuckDB's default 122,880-row row groups.
-
-#### Option 2: tpchgen-rs (supports partitioned output)
+Use `generate_tpch_data.sh` which clones and builds [sirius-db/tpchgen-rs](https://github.com/sirius-db/tpchgen-rs) from source, then generates parquet files with optimized row groups, encodings, and compression.
 
 ```bash
 cd test/tpch_performance
-pixi run python generate_test_data_tpchgen-rs.py <SF> <partitions> <format>
+pixi run bash generate_tpch_data.sh <scale_factor> [output_dir] [jobs]
 ```
 
-Produces partitioned files under `test_datasets/tpchgen-rs/sf<SF>/p<partitions>/<format>/`.
+Arguments:
+- `scale_factor` — TPC-H scale factor (e.g. 1, 10, 100)
+- `output_dir` — Output directory (default: `test_datasets/tpch_parquet_sf<SF>`)
+- `jobs` — Number of parallel jobs (default: `nproc`)
+
+Examples:
+```bash
+# Generate SF100 with default settings
+cd test/tpch_performance
+pixi run bash generate_tpch_data.sh 100
+
+# Generate SF10 to a custom location with 8 jobs
+cd test/tpch_performance
+pixi run bash generate_tpch_data.sh 10 ../../test_datasets/tpch_sf10_custom 8
+```
+
+The script:
+1. Clones `sirius-db/tpchgen-rs` to `test_datasets/tpchgen-rs/` (if not already present)
+2. Builds `tpchgen-cli` with native CPU optimizations (`RUSTFLAGS="-C target-cpu=native"`)
+3. Runs `scripts/generate_tpch.py` to produce parquet files
+
+If the output directory already exists, the script skips generation. Remove the directory to regenerate.
 
 ### Workflow B: Consolidate / Optimize Parquet Files
 
@@ -187,7 +199,7 @@ if writer:
   2. Partitioned by suffix: `<dir>/<table>_*.parquet`
   3. Subdirectory (tpchgen-rs): `<dir>/<table>/<table>.*.parquet`
 - **Row group sizing**: Default 10M rows. For small tables (nation, region), use the full table as one row group. For large tables (lineitem at SF100 = ~600M rows), 10M row groups give ~60 row groups.
-- **Recommended sizes**: 2M-10M rows per row group for GPU workloads. 122K (DuckDB default) is too small.
+- **Recommended sizes**: 2M-10M rows per row group for GPU workloads.
 
 ## Before Running
 
