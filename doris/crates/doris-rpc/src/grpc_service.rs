@@ -1707,21 +1707,46 @@ impl PBackendService for PBackendServiceHandler {
                         let column_types_sql: Vec<String> =
                             keep_indices.iter().map(|&i| col_info[i].1.clone()).collect();
 
-                        // Convert to SQL values for DuckDB insertion (filtered columns only).
-                        let column_data_csv: Vec<Vec<String>> = keep_indices.iter()
-                            .map(|&i| pblock_decoder::column_to_sql_values(&decoded.columns[i], decoded.num_rows))
-                            .collect();
-
-                        // Register in DuckDB engine.
-                        let engine_guard = engine.lock().unwrap();
-                        if let Err(e) = engine_guard.register_exchange_table(
-                            &table_name,
-                            &column_names,
-                            &column_types_sql,
-                            decoded.num_rows,
-                            &column_data_csv,
+                        // Convert decoded columns to Arrow IPC and register via fast path.
+                        let ipc_bytes = match pblock_decoder::decoded_columns_to_arrow_ipc(
+                            &decoded, &keep_indices,
                         ) {
-                            warn!(error = %e, table = %table_name, "failed to register exchange table");
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                warn!(error = %e, table = %table_name, "failed to convert exchange PBlock to Arrow IPC");
+                                // Fall back to SQL VALUES path.
+                                let column_data_csv: Vec<Vec<String>> = keep_indices.iter()
+                                    .map(|&i| pblock_decoder::column_to_sql_values(&decoded.columns[i], decoded.num_rows))
+                                    .collect();
+                                let engine_guard = engine.lock().unwrap();
+                                if let Err(e2) = engine_guard.register_exchange_table(
+                                    &table_name, &column_names, &column_types_sql,
+                                    decoded.num_rows, &column_data_csv,
+                                ) {
+                                    warn!(error = %e2, table = %table_name, "SQL VALUES fallback also failed");
+                                    return;
+                                }
+                                if let Ok(cols) = engine_guard.get_table_columns(&table_name) {
+                                    table_schemas.insert(table_name, cols);
+                                }
+                                drop(engine_guard);
+                                continue;
+                            }
+                        };
+
+                        info!(
+                            table = %table_name,
+                            ipc_len = ipc_bytes.len(),
+                            num_rows = decoded.num_rows,
+                            "converted exchange PBlock to Arrow IPC"
+                        );
+
+                        // Register in DuckDB via IPC file (fast path).
+                        let engine_guard = engine.lock().unwrap();
+                        if let Err(e) = engine_guard.register_exchange_table_from_ipc(
+                            &table_name, &ipc_bytes,
+                        ) {
+                            warn!(error = %e, table = %table_name, "IPC registration failed");
                             return;
                         }
 
@@ -1856,8 +1881,18 @@ impl PBackendService for PBackendServiceHandler {
                     // mistakenly detected as the current result's location.
                     let is_cpu_only = matches!(&exec_plan, ExecPlan::SqlCpuOnly(_));
 
+                    // If this exchange fragment has destinations and nixl is available,
+                    // retain GPU buffers so nixl can use them after query cleanup.
+                    let should_retain_exch = exchange_dests.is_some() && nixl_agent.is_some() && !is_cpu_only;
+                    let engine_for_release = engine.clone();
+
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
+                        if should_retain_exch {
+                            if let Err(e) = engine.retain_gpu_buffers() {
+                                tracing::warn!(error = %e, "failed to set retain_gpu_buffers for exchange fragment");
+                            }
+                        }
                         let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
@@ -1870,6 +1905,16 @@ impl PBackendService for PBackendServiceHandler {
                     })
                     .await;
 
+                    // Helper to release retained GPU buffers after transfer (or on error).
+                    let release_retained_exch = || {
+                        if should_retain_exch {
+                            let eng = engine_for_release.lock().unwrap();
+                            if let Err(e) = eng.release_gpu_buffers() {
+                                tracing::warn!(error = %e, "failed to release retained GPU buffers");
+                            }
+                        }
+                    };
+
                     match exec_result {
                         Ok(Ok(location)) => {
                             if let Some((dest_node_id, dests)) = exchange_dests {
@@ -1880,6 +1925,7 @@ impl PBackendService for PBackendServiceHandler {
                                 ).await {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
                                 }
+                                release_retained_exch();
                                 info!(%finst_id, sender_id, "exchange fragment forward complete");
                             } else {
                                 let mut ipc_bytes = location.into_ipc_bytes();
@@ -1904,8 +1950,14 @@ impl PBackendService for PBackendServiceHandler {
                                 }
                             }
                         }
-                        Ok(Err(e)) => warn!(error = %e, %finst_id, "exchange fragment execution failed"),
-                        Err(e) => warn!(error = %e, "exchange fragment spawn_blocking panicked"),
+                        Ok(Err(e)) => {
+                            release_retained_exch();
+                            warn!(error = %e, %finst_id, "exchange fragment execution failed");
+                        }
+                        Err(e) => {
+                            release_retained_exch();
+                            warn!(error = %e, "exchange fragment spawn_blocking panicked");
+                        }
                     }
                 });
 
@@ -2071,9 +2123,21 @@ impl PBackendService for PBackendServiceHandler {
             // Check if this fragment's output should be sent to remote BEs.
             let exchange_dests = extract_exchange_destinations(params);
 
+            // If this leaf has exchange destinations and nixl is available,
+            // tell Sirius to retain GPU result buffers past query cleanup
+            // so the nixl GPU-direct path can use them.
+            let should_retain = exchange_dests.is_some() && self.nixl_agent.is_some();
+
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                 let engine = engine.lock().unwrap();
+                if should_retain {
+                    if let Err(e) = engine.retain_gpu_buffers() {
+                        tracing::warn!(error = %e, "failed to set retain_gpu_buffers, nixl may not work");
+                    } else {
+                        tracing::info!("retain_gpu_buffers set before GPU execution");
+                    }
+                }
                 let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
                 if let Some(names) = output_names {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
@@ -2081,6 +2145,18 @@ impl PBackendService for PBackendServiceHandler {
                 Ok(crate::nixl_integration::detect_execution_location(ipc_bytes, &engine))
             })
             .await;
+
+            // Helper to release retained GPU buffers after nixl transfer (or on error).
+            let release_retained = |engine_arc: &Option<std::sync::Arc<std::sync::Mutex<sirius_ffi::SiriusEngine>>>| {
+                if should_retain {
+                    if let Some(eng) = engine_arc {
+                        let eng = eng.lock().unwrap();
+                        if let Err(e) = eng.release_gpu_buffers() {
+                            tracing::warn!(error = %e, "failed to release retained GPU buffers");
+                        }
+                    }
+                }
+            };
 
             match exec_result {
                 Ok(Ok(location)) => {
@@ -2110,12 +2186,14 @@ impl PBackendService for PBackendServiceHandler {
                         )
                         .await
                         {
+                            release_retained(&self.engine);
                             warn!(error = %e, %finst_id, "exchange send failed");
                             return Ok(Response::new(PExecPlanFragmentResult {
                                 status: err_status(&format!("exchange send: {e}")),
                                 ..Default::default()
                             }));
                         }
+                        release_retained(&self.engine);
                         info!(%finst_id, "exchange send complete");
                     } else {
                         // No exchange destinations — store result locally for fetch_data.
@@ -2131,6 +2209,7 @@ impl PBackendService for PBackendServiceHandler {
                     }
                 }
                 Ok(Err(e)) => {
+                    release_retained(&self.engine);
                     warn!(error = %e, %finst_id, "execution failed");
                     return Ok(Response::new(PExecPlanFragmentResult {
                         status: err_status(&format!("execution: {e}")),
@@ -2138,6 +2217,7 @@ impl PBackendService for PBackendServiceHandler {
                     }));
                 }
                 Err(e) => {
+                    release_retained(&self.engine);
                     warn!(error = %e, "spawn_blocking panicked");
                     return Ok(Response::new(PExecPlanFragmentResult {
                         status: err_status(&format!("internal: {e}")),

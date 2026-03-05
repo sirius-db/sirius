@@ -959,6 +959,81 @@ void SiriusExtension::GetLastGPUBuffersFunction(
   data.finished = true;
 }
 
+// --- sirius_retain_gpu_buffers() table function ---
+
+struct RetainGPUBuffersData : public TableFunctionData {
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::RetainGPUBuffersBind(
+  ClientContext& context,
+  TableFunctionBindInput& input,
+  vector<LogicalType>& return_types,
+  vector<string>& names)
+{
+  return_types = {LogicalType::VARCHAR};
+  names = {"status"};
+  return make_uniq<RetainGPUBuffersData>();
+}
+
+void SiriusExtension::RetainGPUBuffersFunction(
+  ClientContext& context,
+  TableFunctionInput& data_p,
+  DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<RetainGPUBuffersData>();
+  if (data.finished) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  LastGPUBuffers::GetInstance().SetRetainNext(true);
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value("retain_next=true"));
+  data.finished = true;
+}
+
+// --- sirius_release_gpu_buffers() table function ---
+
+struct ReleaseGPUBuffersData : public TableFunctionData {
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::ReleaseGPUBuffersBind(
+  ClientContext& context,
+  TableFunctionBindInput& input,
+  vector<LogicalType>& return_types,
+  vector<string>& names)
+{
+  return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
+  names = {"status", "freed_count"};
+  return make_uniq<ReleaseGPUBuffersData>();
+}
+
+void SiriusExtension::ReleaseGPUBuffersFunction(
+  ClientContext& context,
+  TableFunctionInput& data_p,
+  DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<ReleaseGPUBuffersData>();
+  if (data.finished) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  size_t freed = 0;
+  if (buffer_is_initialized) {
+    freed = GPUBufferManager::GetInstance().ReleaseRetainedBuffers();
+  }
+  LastGPUBuffers::GetInstance().ReleaseRetainedData();
+  LastGPUBuffers::GetInstance().Clear();
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value("released"));
+  output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(freed)));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -1012,6 +1087,20 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                      GPUAllocateBuffersBind);
   CreateTableFunctionInfo gpu_allocate_buffers_info(gpu_allocate_buffers);
   catalog.CreateTableFunction(transaction, gpu_allocate_buffers_info);
+
+  TableFunction retain_gpu_buffers("sirius_retain_gpu_buffers",
+                                    {},
+                                    RetainGPUBuffersFunction,
+                                    RetainGPUBuffersBind);
+  CreateTableFunctionInfo retain_gpu_buffers_info(retain_gpu_buffers);
+  catalog.CreateTableFunction(transaction, retain_gpu_buffers_info);
+
+  TableFunction release_gpu_buffers("sirius_release_gpu_buffers",
+                                     {},
+                                     ReleaseGPUBuffersFunction,
+                                     ReleaseGPUBuffersBind);
+  CreateTableFunctionInfo release_gpu_buffers_info(release_gpu_buffers);
+  catalog.CreateTableFunction(transaction, release_gpu_buffers_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

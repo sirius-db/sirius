@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -57,12 +58,38 @@ class LastGPUBuffers {
   void Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     buffers_.clear();
+    retained_gpu_data_.clear();
+  }
+
+  /// Keep a type-erased reference to GPU data alive (prevents deallocation).
+  /// Used to retain cucascade data_batch objects for nixl transfer.
+  void RetainData(std::shared_ptr<void> data) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    retained_gpu_data_.push_back(std::move(data));
+  }
+
+  /// Release all retained GPU data references.
+  void ReleaseRetainedData() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    retained_gpu_data_.clear();
+  }
+
+  void SetRetainNext(bool v) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    retain_next_ = v;
+  }
+
+  bool ShouldRetain() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return retain_next_;
   }
 
  private:
   LastGPUBuffers() = default;
   mutable std::mutex mutex_;
   std::vector<GPUBufferInfo> buffers_;
+  std::vector<std::shared_ptr<void>> retained_gpu_data_;
+  bool retain_next_ = false;
 };
 
 }  // namespace duckdb

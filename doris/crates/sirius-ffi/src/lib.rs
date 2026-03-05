@@ -65,7 +65,7 @@ impl SiriusEngine {
         } else {
             (
                 format!(
-                    "{}/doris/thirdparty/duckdb-substrait-extension/build/release/extension/substrait/substrait.duckdb_extension",
+                    "{}/substrait/build/release/extension/substrait/substrait.duckdb_extension",
                     sirius_root
                 ),
                 format!(
@@ -391,6 +391,58 @@ impl SiriusEngine {
         Ok(())
     }
 
+    /// Register an exchange table from Arrow IPC bytes via DuckDB's Arrow Appender.
+    ///
+    /// This is orders of magnitude faster than SQL VALUES for large datasets
+    /// (6M rows: <1s vs minutes). Deserializes Arrow IPC → RecordBatch, then
+    /// uses DuckDB's `Appender::append_record_batch()` for zero-copy insertion.
+    pub fn register_exchange_table_from_ipc(
+        &self,
+        table_name: &str,
+        ipc_bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        use arrow::ipc::reader::StreamReader;
+        use std::io::Cursor;
+
+        // Deserialize Arrow IPC stream → RecordBatches.
+        let cursor = Cursor::new(ipc_bytes);
+        let reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| EngineError::ExecFailed(format!("Arrow IPC read: {e}")))?;
+
+        let schema = reader.schema();
+
+        // Create the table with the right schema.
+        let cols: Vec<String> = schema.fields().iter().map(|f| {
+            let dt = arrow_type_to_duckdb_sql(f.data_type());
+            format!("\"{}\" {}", f.name(), dt)
+        }).collect();
+        let create_sql = format!(
+            "CREATE OR REPLACE TABLE \"{}\" ({})",
+            table_name, cols.join(", ")
+        );
+        self.conn
+            .execute_batch(&create_sql)
+            .map_err(|e| EngineError::ExecFailed(format!("create exchange table: {e}")))?;
+
+        // Use DuckDB's Arrow Appender for bulk insertion.
+        let mut appender = self.conn
+            .appender(table_name)
+            .map_err(|e| EngineError::ExecFailed(format!("create appender: {e}")))?;
+
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| EngineError::ExecFailed(format!("read Arrow batch: {e}")))?;
+            appender
+                .append_record_batch(batch)
+                .map_err(|e| EngineError::ExecFailed(format!("append batch: {e}")))?;
+        }
+
+        // Flush is called implicitly when appender is dropped, but let's be explicit.
+        drop(appender);
+
+        Ok(())
+    }
+
     /// Register GPU memory directly as a DuckDB table without CPU copy.
     ///
     /// Used by the nixl exchange path to make GPU-resident data available to
@@ -495,6 +547,21 @@ impl SiriusEngine {
         Ok(result)
     }
 
+    /// Tell Sirius to retain GPU result buffers past query cleanup.
+    /// Must be called BEFORE the GPU query that produces the exchange result.
+    pub fn retain_gpu_buffers(&self) -> Result<(), EngineError> {
+        self.conn
+            .execute_batch("SELECT * FROM sirius_retain_gpu_buffers()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))
+    }
+
+    /// Release previously retained GPU buffers (after nixl transfer or on error).
+    pub fn release_gpu_buffers(&self) -> Result<(), EngineError> {
+        self.conn
+            .execute_batch("SELECT * FROM sirius_release_gpu_buffers()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))
+    }
+
     /// Get GPU buffer pointers from the last execution (for nixl GPU-direct exchange).
     ///
     /// Returns `Ok(Some(...))` if the last query was GPU-accelerated and buffers are
@@ -555,6 +622,31 @@ pub struct GpuResultInfo {
     pub num_rows: u32,
     /// Arrow IPC schema bytes.
     pub schema_ipc: Vec<u8>,
+}
+
+/// Map Arrow DataType to DuckDB SQL type string.
+fn arrow_type_to_duckdb_sql(dt: &arrow::datatypes::DataType) -> String {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INTEGER".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::UInt8 => "UTINYINT".to_string(),
+        DataType::UInt16 => "USMALLINT".to_string(),
+        DataType::UInt32 => "UINTEGER".to_string(),
+        DataType::UInt64 => "UBIGINT".to_string(),
+        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR".to_string(),
+        DataType::Binary | DataType::LargeBinary => "BLOB".to_string(),
+        DataType::Decimal128(p, s) => format!("DECIMAL({}, {})", p, s),
+        DataType::Date32 => "DATE".to_string(),
+        DataType::Date64 => "DATE".to_string(),
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
+        _ => "VARCHAR".to_string(), // fallback
+    }
 }
 
 /// Errors from the Sirius engine.

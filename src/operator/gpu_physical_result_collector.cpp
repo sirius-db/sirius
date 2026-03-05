@@ -443,6 +443,25 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
       });
     }
     LastGPUBuffers::GetInstance().Store(std::move(gpu_buffers));
+
+    // If retain_next_ is set, move result GPU buffers to the retained table
+    // so they survive ResetBuffer() during DuckDB query cleanup.
+    if (LastGPUBuffers::GetInstance().ShouldRetain()) {
+      for (size_t c = 0; c < materialized_relation.columns.size(); c++) {
+        auto& mc = materialized_relation.columns[c];
+        if (mc->data_wrapper.data) {
+          gpuBufferManager->RetainAllocation(mc->data_wrapper.data, 0);
+        }
+        if (mc->data_wrapper.validity_mask) {
+          gpuBufferManager->RetainAllocation(
+            reinterpret_cast<void*>(mc->data_wrapper.validity_mask), 0);
+        }
+        if (mc->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR && mc->data_wrapper.offset) {
+          gpuBufferManager->RetainAllocation(mc->data_wrapper.offset, 0);
+        }
+      }
+      LastGPUBuffers::GetInstance().SetRetainNext(false);
+    }
   }
 
   auto chunk_start_time = std::chrono::high_resolution_clock::now();

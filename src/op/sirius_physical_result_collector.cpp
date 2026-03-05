@@ -28,13 +28,21 @@
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+
+// cudf
+#include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
 #include <duckdb/main/materialized_query_result.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+
+// nixl exchange support
+#include <last_gpu_buffers.hpp>
 
 // standard library
 #include <algorithm>
@@ -122,18 +130,62 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     throw duckdb::InvalidInputException("[GPUPhysicalMaterializedCollector] input_batches is null");
   }
 
-  auto sink_single_batch = [this,
-                            stream](std::shared_ptr<cucascade::data_batch> const& input_batch) {
+  // Check if GPU buffer retention is requested (for nixl GPU-direct exchange).
+  bool should_retain = duckdb::LastGPUBuffers::GetInstance().ShouldRetain();
+  std::vector<duckdb::GPUBufferInfo> gpu_buffer_infos;
+
+  for (auto const& input_batch : input_batches) {
     auto* data = input_batch->get_data();
     std::shared_ptr<cucascade::data_batch> clone_batch;
     if (!data) {
       throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
     }
-    if (data->get_size_in_bytes() == 0) { return; }
+    if (data->get_size_in_bytes() == 0) { continue; }
 
     // If data is in GPU tier, convert to HOST tier first
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
+      // Capture GPU buffer metadata before D2H conversion (for nixl exchange).
+      {
+        auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
+        cudf::table_view view = gpu_rep.get_table().view();
+        int device_id = input_batch->get_memory_space()
+                          ? input_batch->get_memory_space()->get_device_id()
+                          : 0;
+
+        for (cudf::size_type i = 0; i < view.num_columns(); i++) {
+          cudf::column_view col = view.column(i);
+          uintptr_t addr = reinterpret_cast<uintptr_t>(col.data<uint8_t>());
+          size_t len = 0;
+          if (cudf::is_fixed_width(col.type())) {
+            len = static_cast<size_t>(col.size()) * cudf::size_of(col.type());
+          } else {
+            // Variable-width (e.g. STRING): use total representation size as approximation.
+            len = gpu_rep.get_size_in_bytes();
+          }
+
+          std::string col_name = (static_cast<size_t>(i) < names.size())
+                                   ? names[i]
+                                   : "col_" + std::to_string(i);
+          gpu_buffer_infos.push_back({
+            addr,
+            len,
+            device_id,
+            std::move(col_name),
+            static_cast<int>(col.type().id()),
+            static_cast<size_t>(col.size()),
+          });
+        }
+
+        // Retain GPU data to prevent deallocation during query cleanup.
+        // Storing the data_batch shared_ptr keeps the cudf::table (and its GPU
+        // buffers) alive until ReleaseRetainedData() is called.
+        if (should_retain) {
+          duckdb::LastGPUBuffers::GetInstance().RetainData(
+            std::static_pointer_cast<void>(input_batch));
+        }
+      }
+
       // Make the HOST memory reservation
       auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       auto& memory_mgr = sirius_ctx->get_memory_manager();
@@ -196,9 +248,15 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       }
       result_collection->Append(chunk);
     }
-  };
+  }
 
-  std::for_each(input_batches.begin(), input_batches.end(), sink_single_batch);
+  // Store accumulated GPU buffer metadata for detect_execution_location().
+  if (!gpu_buffer_infos.empty()) {
+    duckdb::LastGPUBuffers::GetInstance().Store(std::move(gpu_buffer_infos));
+  }
+  if (should_retain) {
+    duckdb::LastGPUBuffers::GetInstance().SetRetainNext(false);
+  }
 }
 
 }  // namespace op

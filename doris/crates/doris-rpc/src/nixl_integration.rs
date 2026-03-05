@@ -88,10 +88,10 @@ pub fn detect_execution_location(
                 };
             }
             Ok(None) => {
-                tracing::debug!("detect_execution_location: no GPU buffers (CPU execution)");
+                tracing::info!("detect_execution_location: no GPU buffers (CPU execution)");
             }
             Err(e) => {
-                tracing::debug!(error = %e, "detect_execution_location: get_last_gpu_result_buffers failed");
+                tracing::warn!(error = %e, "detect_execution_location: get_last_gpu_result_buffers failed");
             }
         }
     }

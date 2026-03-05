@@ -173,6 +173,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   cudf::set_current_device_resource(mr);
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
+  retained_allocation_table.resize(NUM_GPUS);
   SIRIUS_LOG_INFO("Allocated processing size {} in GPU 0", processing_size_per_gpu);
 
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
@@ -335,6 +336,38 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
     allocation_table[gpu][ptr] = alloc;
     return reinterpret_cast<T*>(ptr);
   }
+}
+
+void GPUBufferManager::RetainAllocation(void* ptr, int gpu)
+{
+  // Move entry from allocation_table (or locked_allocation_table) to retained_allocation_table.
+  auto it = allocation_table[gpu].find(ptr);
+  if (it != allocation_table[gpu].end()) {
+    retained_allocation_table[gpu][ptr] = it->second;
+    allocation_table[gpu].erase(it);
+    return;
+  }
+  auto lit = locked_allocation_table[gpu].find(ptr);
+  if (lit != locked_allocation_table[gpu].end()) {
+    retained_allocation_table[gpu][ptr] = lit->second;
+    locked_allocation_table[gpu].erase(lit);
+  }
+}
+
+size_t GPUBufferManager::ReleaseRetainedBuffers()
+{
+  cudf::set_current_device_resource(mr);
+  size_t count = 0;
+  for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+    for (auto& [ptr, size] : retained_allocation_table[gpu]) {
+      if (ptr != nullptr) {
+        mr->deallocate(rmm::cuda_stream_view{}, ptr, size);
+        count++;
+      }
+    }
+    retained_allocation_table[gpu].clear();
+  }
+  return count;
 }
 
 void GPUBufferManager::lockAllocation(void* ptr, int gpu)

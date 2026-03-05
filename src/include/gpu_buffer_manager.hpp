@@ -147,6 +147,13 @@ class GPUBufferManager {
   vector<map<void*, uint64_t>> allocation_table;
   vector<map<void*, uint64_t>> locked_allocation_table;
 
+  // Allocations that survive ResetBuffer() — used for nixl GPU-direct exchange.
+  // Released explicitly via ReleaseRetainedBuffers().
+  vector<map<void*, uint64_t>> retained_allocation_table;
+
+  void RetainAllocation(void* ptr, int gpu);
+  size_t ReleaseRetainedBuffers();
+
  private:
   // Private constructor
   GPUBufferManager(size_t cache_size_per_gpu,

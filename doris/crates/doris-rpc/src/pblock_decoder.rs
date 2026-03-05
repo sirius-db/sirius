@@ -839,6 +839,234 @@ pub fn decode_pblocks(blocks: &[PBlock]) -> Result<DecodedColumns, String> {
     })
 }
 
+/// Convert decoded PBlock columns to Arrow IPC bytes.
+///
+/// Uses raw buffer construction for efficient (near zero-copy) conversion.
+/// This is orders of magnitude faster than converting to SQL VALUES strings
+/// for large datasets (e.g. 6M rows takes <1s vs minutes with SQL VALUES).
+pub fn decoded_columns_to_arrow_ipc(
+    decoded: &DecodedColumns,
+    keep_indices: &[usize],
+) -> Result<Vec<u8>, String> {
+    use arrow::array::*;
+    use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+    use arrow::datatypes::*;
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let num_rows = decoded.num_rows as usize;
+    let mut fields = Vec::new();
+    let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
+
+    for &i in keep_indices {
+        let col = &decoded.columns[i];
+        let name = if col.col_name.is_empty() {
+            format!("col{}", i)
+        } else {
+            col.col_name.clone()
+        };
+
+        // Build Arrow null buffer from Doris null_mask.
+        // Doris: 1=null, 0=valid. Arrow: bit=1 means valid, bit=0 means null.
+        let null_buf = if col.is_nullable {
+            col.null_mask.as_ref().map(|mask| {
+                let mut bits = vec![0u8; (num_rows + 7) / 8];
+                for r in 0..num_rows {
+                    if r >= mask.len() || mask[r] == 0 {
+                        bits[r / 8] |= 1 << (r % 8); // valid
+                    }
+                }
+                NullBuffer::new(arrow::buffer::BooleanBuffer::new(
+                    Buffer::from(bits), 0, num_rows,
+                ))
+            })
+        } else {
+            None
+        };
+
+        let (field, array): (Field, Arc<dyn Array>) = if col.type_id == TypeId::Boolean as i32 {
+            let mut bits = vec![0u8; (num_rows + 7) / 8];
+            for r in 0..num_rows {
+                if r < col.data.len() && col.data[r] != 0 {
+                    bits[r / 8] |= 1 << (r % 8);
+                }
+            }
+            let bool_buf = arrow::buffer::BooleanBuffer::new(
+                Buffer::from(bits), 0, num_rows,
+            );
+            let arr = BooleanArray::new(bool_buf, null_buf);
+            (Field::new(&name, DataType::Boolean, col.is_nullable), Arc::new(arr))
+        } else if is_string_type(col.type_id) {
+            // Build StringArray from offsets + data.
+            if let Some(offsets) = &col.offsets {
+                // Arrow StringArray uses i32 offsets.
+                let arrow_offsets: Vec<i32> = offsets.iter()
+                    .map(|&o| o as i32)
+                    .collect();
+                let offsets_buf = OffsetBuffer::new(
+                    arrow::buffer::ScalarBuffer::from(arrow_offsets),
+                );
+                let values_buf = Buffer::from_slice_ref(&col.data);
+                let arr = StringArray::new(offsets_buf, values_buf, null_buf);
+                (Field::new(&name, DataType::Utf8, col.is_nullable), Arc::new(arr))
+            } else {
+                // No offsets — empty strings.
+                let arr = StringArray::from(vec![""; num_rows]);
+                (Field::new(&name, DataType::Utf8, col.is_nullable), Arc::new(arr))
+            }
+        } else {
+            // Fixed-width numeric types: create from raw LE bytes buffer.
+            let buf = Buffer::from_slice_ref(&col.data);
+            match col.type_id {
+                x if x == TypeId::Int8 as i32 => {
+                    let arr = Int8Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::Int8, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Uint8 as i32 => {
+                    let arr = UInt8Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::UInt8, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Int16 as i32 => {
+                    let arr = Int16Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::Int16, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Uint16 as i32 => {
+                    let arr = UInt16Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::UInt16, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Int32 as i32 => {
+                    let arr = Int32Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::Int32, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Uint32 as i32 || x == TypeId::Datev2 as i32 || x == TypeId::Ipv4 as i32 => {
+                    // DATEV2 and IPV4 stored as UInt32; DuckDB will handle casting.
+                    let arr = UInt32Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::UInt32, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Int64 as i32 || x == TypeId::Date as i32 || x == TypeId::Datetime as i32 => {
+                    let arr = Int64Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::Int64, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Uint64 as i32 || x == TypeId::Datetimev2 as i32 => {
+                    let arr = UInt64Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::UInt64, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Float as i32 => {
+                    let arr = Float32Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::Float32, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Double as i32 => {
+                    let arr = Float64Array::new(buf.into(), null_buf);
+                    (Field::new(&name, DataType::Float64, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Int128 as i32 || x == TypeId::Uint128 as i32
+                    || x == TypeId::Decimal128 as i32 || x == TypeId::Decimal128i as i32 => {
+                    let p = if col.precision > 0 { col.precision as u8 } else { 38 };
+                    let s = col.scale as i8;
+                    let arr = Decimal128Array::new(buf.into(), null_buf)
+                        .with_precision_and_scale(p, s)
+                        .map_err(|e| format!("decimal128 precision/scale: {e}"))?;
+                    (
+                        Field::new(&name, DataType::Decimal128(p, s), col.is_nullable),
+                        Arc::new(arr),
+                    )
+                }
+                x if x == TypeId::Decimal32 as i32 => {
+                    // Widen Decimal32 (i32) to Decimal128 (i128) for Arrow.
+                    let p = if col.precision > 0 { col.precision as u8 } else { 9 };
+                    let s = col.scale as i8;
+                    let values: Vec<i128> = col.data.chunks_exact(4)
+                        .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i128)
+                        .collect();
+                    let arr = Decimal128Array::from(values)
+                        .with_precision_and_scale(p, s)
+                        .map_err(|e| format!("decimal32 precision/scale: {e}"))?;
+                    let arr = if let Some(nb) = null_buf {
+                        // Re-apply nulls.
+                        let data = arr.into_data().into_builder()
+                            .null_bit_buffer(Some(nb.into_inner().into_inner()))
+                            .build()
+                            .map_err(|e| format!("decimal32 null: {e}"))?;
+                        Decimal128Array::from(data)
+                            .with_precision_and_scale(p, s)
+                            .map_err(|e| format!("decimal32 null ps: {e}"))?
+                    } else {
+                        arr
+                    };
+                    (
+                        Field::new(&name, DataType::Decimal128(p, s), col.is_nullable),
+                        Arc::new(arr),
+                    )
+                }
+                x if x == TypeId::Decimal64 as i32 => {
+                    // Widen Decimal64 (i64) to Decimal128 (i128) for Arrow.
+                    let p = if col.precision > 0 { col.precision as u8 } else { 18 };
+                    let s = col.scale as i8;
+                    let values: Vec<i128> = col.data.chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as i128)
+                        .collect();
+                    let arr = Decimal128Array::from(values)
+                        .with_precision_and_scale(p, s)
+                        .map_err(|e| format!("decimal64 precision/scale: {e}"))?;
+                    let arr = if let Some(nb) = null_buf {
+                        let data = arr.into_data().into_builder()
+                            .null_bit_buffer(Some(nb.into_inner().into_inner()))
+                            .build()
+                            .map_err(|e| format!("decimal64 null: {e}"))?;
+                        Decimal128Array::from(data)
+                            .with_precision_and_scale(p, s)
+                            .map_err(|e| format!("decimal64 null ps: {e}"))?
+                    } else {
+                        arr
+                    };
+                    (
+                        Field::new(&name, DataType::Decimal128(p, s), col.is_nullable),
+                        Arc::new(arr),
+                    )
+                }
+                _ => {
+                    // Unknown type: treat as raw bytes (binary).
+                    let width = type_byte_width(col.type_id);
+                    if width > 0 {
+                        // Fixed-width unknown: use Int64 as fallback.
+                        let values: Vec<i64> = col.data.chunks(8)
+                            .map(|c| {
+                                let mut buf = [0u8; 8];
+                                buf[..c.len()].copy_from_slice(c);
+                                i64::from_le_bytes(buf)
+                            })
+                            .take(num_rows)
+                            .collect();
+                        let arr = Int64Array::from(values);
+                        (Field::new(&name, DataType::Int64, col.is_nullable), Arc::new(arr))
+                    } else {
+                        // Variable-width unknown: use Utf8.
+                        let arr = StringArray::from(vec![""; num_rows]);
+                        (Field::new(&name, DataType::Utf8, col.is_nullable), Arc::new(arr))
+                    }
+                }
+            }
+        };
+
+        fields.push(field);
+        arrays.push(array);
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, arrays)
+        .map_err(|e| format!("RecordBatch creation failed: {e}"))?;
+
+    // Serialize to Arrow IPC stream format.
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+            .map_err(|e| format!("IPC writer init: {e}"))?;
+        writer.write(&batch).map_err(|e| format!("IPC write: {e}"))?;
+        writer.finish().map_err(|e| format!("IPC finish: {e}"))?;
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

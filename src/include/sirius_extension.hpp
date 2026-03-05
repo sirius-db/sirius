@@ -78,6 +78,20 @@ class SiriusExtension : public Extension {
                                                           TableFunctionBindInput& input,
                                                           vector<LogicalType>& return_types,
                                                           vector<string>& names);
+  static void RetainGPUBuffersFunction(ClientContext& context,
+                                        TableFunctionInput& data_p,
+                                        DataChunk& output);
+  static unique_ptr<FunctionData> RetainGPUBuffersBind(ClientContext& context,
+                                                        TableFunctionBindInput& input,
+                                                        vector<LogicalType>& return_types,
+                                                        vector<string>& names);
+  static void ReleaseGPUBuffersFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output);
+  static unique_ptr<FunctionData> ReleaseGPUBuffersBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<string>& names);
 
   static bool buffer_is_initialized;
 };
