@@ -41,7 +41,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: Build
-        run: pixi run build --preset release --cudaarchs 75
+        run: pixi run build release 75
 
       - name: Package build artifacts
         run: tar -cf build.tar build/release/

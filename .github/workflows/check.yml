@@ -64,6 +64,6 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Build
-        run: pixi run -e ${{ matrix.environment || 'default' }} build --preset ${{ matrix.preset }} --cudaarchs 100
+        run: pixi run -e ${{ matrix.environment || 'default' }} build ${{ matrix.preset }} 100
         env:
           VCPKG_BINARY_SOURCES: ${{ matrix.environment == 'vcpkg' && 'clear;x-gha,readwrite' || '' }}
