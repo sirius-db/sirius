@@ -55,8 +55,9 @@ args = [
     "clang-release",
     "clang-relwithdebinfo",
   ] },
+  { arg = "cudaarchs", default = "" },
 ]
-cmd = "cmake -S duckdb --preset {% if 'vcpkg' in pixi.environment.name %}vcpkg-{% endif %}{{ preset }}"
+cmd = "{% if cudaarchs %}CUDAARCHS={{ cudaarchs }} {% endif %}cmake -S duckdb --preset {% if 'vcpkg' in pixi.environment.name %}vcpkg-{% endif %}{{ preset }}"
 inputs = ["CMakePresets.json", "CMakeLists.txt", "extension_config.cmake"]
 outputs = [
   "build/{% if 'vcpkg' in pixi.environment.name %}vcpkg-{% endif %}{{ preset }}/CMakeCache.txt",
@@ -72,9 +73,10 @@ args = [
     "clang-release",
     "clang-relwithdebinfo",
   ] },
+  { arg = "cudaarchs", default = "" },
 ]
 cmd = "cmake --build build/{% if 'vcpkg' in pixi.environment.name %}vcpkg-{% endif %}{{ preset }}"
-depends-on = [{ task = "configure", args = [{ preset = "{{ preset }}" }] }]
+depends-on = [{ task = "configure", args = [{ preset = "{{ preset }}" }, { cudaarchs = "{{ cudaarchs }}" }] }]
 inputs = [
   "src/**/*.cpp",
   "src/**/*.cu",
@@ -121,6 +123,14 @@ activation.env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-
 [feature.cuda12]
 system-requirements = { cuda = "12" }
 activation.env = { CUDAARCHS = "75-real;80-real;86-real;90a-real" }
+
+[feature.vcpkg.dependencies]
+bison = "*"
+libnvjitlink-dev = "*"
+cuda-nvrtc-dev = "*"
+libcurand-dev = "*"
+flex = "*"
+zip = "*"
 
 [feature.vcpkg.activation]
 scripts = ["scripts/vcpkg.sh"]

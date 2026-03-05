@@ -35,15 +35,39 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 
+# In the vcpkg build, vcpkg headers must take priority over:
+#   1) conda's CCCL 3.1.4 (injected via CXXFLAGS as -I.../include/cccl)
+#   2) DuckDB's bundled fmt 6.1.2 (uses duckdb_fmt namespace, incompatible with spdlog)
+# Fix: strip conda CCCL path; use NO_SYSTEM_FROM_IMPORTED + BEFORE include
+# (applied per-target below) to place vcpkg includes first.
+if(VCPKG_BUILD)
+  set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
+  string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+endif()
+
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
-find_package(libconfig++ REQUIRED)
+find_package(libconfig CONFIG QUIET)
+if(NOT libconfig_FOUND)
+  find_package(libconfig++ REQUIRED)
+endif()
 find_package(absl REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
 # cuCascade - GPU Memory Reservation Library (submodule)
+# cucascade links `numa` as a bare library name (-lnuma). In the vcpkg build
+# the static libnuma.a lives in the vcpkg installed lib dir, which isn't on the
+# default linker search path. Create an imported target so CMake resolves the
+# bare name to the full path instead of emitting -lnuma.
+if(VCPKG_BUILD)
+  add_library(numa STATIC IMPORTED)
+  set_target_properties(
+    numa PROPERTIES IMPORTED_LOCATION
+                    "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libnuma.a")
+endif()
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
@@ -72,6 +96,15 @@ foreach(_target sirius_extension sirius_loadable_extension)
   set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
                                               LINKER_LANGUAGE CUDA)
 
+  # In the vcpkg build, vcpkg include dir must be searched before DuckDB's
+  # bundled fmt (which uses duckdb_fmt namespace, incompatible with spdlog).
+  # NO_SYSTEM_FROM_IMPORTED prevents -isystem/-I collapse by GCC;
+  # BEFORE ensures vcpkg includes precede DuckDB's in the search order.
+  if(VCPKG_BUILD)
+    set_target_properties(${_target} PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(${_target} BEFORE PRIVATE ${_VCPKG_INC})
+  endif()
+
   target_include_directories(
     ${_target}
     PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
@@ -89,7 +122,12 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA ${LIBCONFIG++_LIBRARIES}
+if(TARGET libconfig::config++)
+  set(_LIBCONFIG_TARGET libconfig::config++)
+else()
+  set(_LIBCONFIG_TARGET ${LIBCONFIG++_LIBRARIES})
+endif()
+target_link_libraries(sirius_extension PkgConfig::NUMA ${_LIBCONFIG_TARGET}
                       absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
@@ -117,6 +155,11 @@ list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_modified_pipeline\\.cpp$")
 list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_task_creator\\.cpp$")
 
 add_executable(sirius_unittest ${TEST_SOURCES})
+
+if(VCPKG_BUILD)
+  set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
+endif()
 
 target_include_directories(
   sirius_unittest

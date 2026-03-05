@@ -132,7 +132,8 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
-        "VCPKG_BUILD": "ON"
+        "VCPKG_BUILD": "ON",
+        "VCPKG_MANIFEST_DIR": "${sourceDir}/.."
       },
       "environment": {
         "VCPKG_BUILD_TYPE": "release",

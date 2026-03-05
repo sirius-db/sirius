@@ -16,6 +16,8 @@ name: Check
 
 on:
   pull_request:
+  push:
+    branches: [dev]
 
 jobs:
   lint:
@@ -32,20 +34,12 @@ jobs:
       SCCACHE_GHA_ENABLED: true
     strategy:
       matrix:
-        arch:
-          - x64
-          - arm64
-        compiler:
-          - gcc
-          - clang
-        build-type:
-          - release
-          - debug
-        exclude:
-          - compiler: gcc
-            build-type: debug
-          - compiler: clang
-            build-type: release
+        arch: [x64, arm64]
+        preset: [release, clang-debug]
+        include:
+          - arch: arm64
+            preset: release
+            environment: vcpkg
       fail-fast: false
     runs-on: ${{ format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
     steps:
@@ -57,10 +51,19 @@ jobs:
         with:
           cache: false
           pixi-version: v0.65.0
-          activate-environment: true
+          environments: ${{ matrix.environment || 'default' }}
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      - run: make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+      - name: Export vcpkg cache variables
+        if: matrix.environment == 'vcpkg'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Build
+        run: pixi run -e ${{ matrix.environment || 'default' }} build --preset ${{ matrix.preset }} --cudaarchs 100
         env:
-          CUDAARCHS: "100"
+          VCPKG_BINARY_SOURCES: ${{ matrix.environment == 'vcpkg' && 'clear;x-gha,readwrite' || '' }}
