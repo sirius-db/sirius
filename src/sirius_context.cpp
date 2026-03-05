@@ -146,7 +146,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       if (fsmr != nullptr) {
         small_pinned_allocator_ =
           std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr);
-        cudf::set_pinned_memory_resource(*small_pinned_allocator_);
+        prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
+        prev_pinned_mr_        = cudf::set_pinned_memory_resource(*small_pinned_allocator_);
         cudf::set_allocate_host_as_pinned_threshold(
           cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
         spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
@@ -215,6 +216,14 @@ void SiriusContext::terminate()
   // sync, the subsequent cudaFreeHost inside the memory manager destructor
   // can deadlock against a new cudaHostAlloc from the next SiriusContext.
   cudaDeviceSynchronize();
+
+  // Restore the previous cuDF pinned memory resource and threshold before destroying the
+  // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
+  if (prev_pinned_mr_.has_value()) {
+    cudf::set_pinned_memory_resource(*prev_pinned_mr_);
+    cudf::set_allocate_host_as_pinned_threshold(prev_pinned_threshold_);
+    prev_pinned_mr_.reset();
+  }
 
   // Release the slab allocator before tearing down the memory manager, since
   // its owned_allocations_ will return blocks back to the fixed_size_host_memory_resource.
