@@ -369,12 +369,13 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
 
   auto& scan_op      = g_state.get_operator();
   auto const num_rgs = l_state.get_rg_span().size();
-  SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) executing on {} batches with num row: {}",
-                   scan_op.get_pipeline()->get_pipeline_id(),
-                   scan_op.get_name(),
-                   scan_op.get_operator_id(),
-                   0,
-                   "");
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: operator {} (id={}) executing on {} batches with num row: {}",
+    scan_op.get_pipeline().get() != nullptr ? scan_op.get_pipeline()->get_pipeline_id() : 0,
+    scan_op.get_name(),
+    scan_op.get_operator_id(),
+    0,
+    "");
   auto const task_start = std::chrono::high_resolution_clock::now();
 
   // Make the allocation and accessor
@@ -426,7 +427,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   SIRIUS_LOG_TRACE(
     "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
     "{:.2f} ms",
-    scan_op.get_pipeline()->get_pipeline_id(),
+    scan_op.get_pipeline().get() != nullptr ? scan_op.get_pipeline()->get_pipeline_id() : 0,
     scan_op.get_name(),
     scan_op.get_operator_id(),
     result->get_data_batches().size(),
