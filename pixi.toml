@@ -16,6 +16,7 @@ scripts = ["scripts/pixi_activate.sh"]
 
 [dependencies]
 clang = "21.*"
+clangxx = "21.*"
 clang-tools = "21.*"
 cmake = "4.*"
 cuda-nvcc = "*"
