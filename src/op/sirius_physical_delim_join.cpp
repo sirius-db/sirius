@@ -171,7 +171,7 @@ void sirius_physical_right_delim_join::sink(const operator_data& input_data,
   auto distinct_output = distinct->execute(input_data, stream);
 
   stream.synchronize();
-  
+
   partition_join->sink(*partition_join_output, stream);
   // partition_distinct is external — push distinct output via distinct's next_port_after_sink
   distinct->sink(*distinct_output, stream);
