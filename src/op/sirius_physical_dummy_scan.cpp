@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_dummy_scan.hpp"
 
-#include "log/logging.hpp"
-
 namespace sirius {
 namespace op {
 

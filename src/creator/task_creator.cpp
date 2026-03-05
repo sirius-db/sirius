@@ -22,20 +22,15 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
-#include "op/sirius_physical_top_n.hpp"
-#include "op/sirius_physical_top_n_merge.hpp"
-#include "op/sirius_physical_ungrouped_aggregate.hpp"
-#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "planner/query.hpp"
+#include "sirius_context.hpp"
 
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
-#include <iterator>
 #include <optional>
-#include <queue>
 
 namespace sirius::creator {
 
@@ -91,10 +86,16 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+      const auto& op_params =
+        _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+          ->get_config()
+          .get_operator_params();
       _parquet_scan_operator_global_state_map.emplace(
         operator_id,
         std::make_shared<op::scan::parquet_scan_task_global_state>(
-          pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>()));
+          pipeline,
+          &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+          op_params.scan_task_batch_size));
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
@@ -224,22 +225,22 @@ void task_creator::manager_loop()
             ::sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           auto& delim_join    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
           auto partition_join = delim_join.partition_join;
-          auto partition_distinct = delim_join.partition_distinct;
+          auto distinct_op    = delim_join.distinct.get();
           for (auto& [next_op, port_id] : partition_join->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
-          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
         } else if (pipeline->get_sink()->type ==
                    ::sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-          auto& delim_join = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
-          auto partition_distinct = delim_join.partition_distinct;
-          auto column_data_scan   = delim_join.column_data_scan;
+          auto& delim_join      = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
+          auto distinct_op      = delim_join.distinct.get();
+          auto column_data_scan = delim_join.column_data_scan;
           for (auto& [next_op, port_id] : column_data_scan->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
-          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
         } else {
@@ -254,8 +255,15 @@ void task_creator::manager_loop()
           size_t operator_id          = node->get_operator_id();
           auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
 
+          const auto& op_params =
+            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+              ->get_config()
+              .get_operator_params();
           auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-            *scan_task_global_state, *_execution_context);
+            *scan_task_global_state,
+            *_execution_context,
+            op_params.scan_task_batch_size,
+            op_params.default_scan_task_varchar_size);
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
               "No destination data repositories provided for scan task creation.");

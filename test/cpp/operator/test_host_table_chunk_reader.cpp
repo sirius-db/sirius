@@ -20,7 +20,6 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
-#include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 
 // cudf
@@ -32,6 +31,7 @@
 #include <cudf/utilities/default_stream.hpp>
 
 // rmm
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
@@ -209,8 +209,10 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-host_data_packed_representation const& convert_to_host_table(
-  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx, std::shared_ptr<data_batch> const& batch)
+host_data_representation const& convert_to_host_table(
+  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
+  std::shared_ptr<data_batch> const& batch,
+  rmm::cuda_stream_view stream)
 {
   auto* data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data representation"); }
@@ -228,25 +230,24 @@ host_data_packed_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<host_data_packed_representation>(
-    registry, host_space, rmm::cuda_stream_default);
+  batch->convert_to<host_data_representation>(registry, host_space, stream);
 
   data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return data->cast<host_data_packed_representation>();
+  return data->cast<host_data_representation>();
 }
 
 }  // namespace
 
 TEST_CASE("host_table_chunk_reader produces correct DataChunks",
-          "[operator][result_collector][host_table_chunk_reader]")
+          "[operator][result_collector][host_table_chunk_reader][shared_context]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE + 5;
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
-  auto* gpu_space = get_default_gpu_space(sirius_ctx);
+  auto [db_owner, con]      = sirius::make_test_db_and_connection();
+  auto sirius_ctx           = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space           = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
                                             cudf::data_type{cudf::type_id::INT64},
@@ -254,12 +255,8 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
   std::vector<std::optional<std::pair<int, int>>> ranges{
     std::make_pair(0, 100), std::make_pair(1000, 2000), std::make_pair(0, 100)};
 
-  auto table = sirius::create_cudf_table_with_random_data(num_rows,
-                                                          column_types,
-                                                          ranges,
-                                                          cudf::get_default_stream(),
-                                                          gpu_space->get_default_allocator(),
-                                                          true);
+  auto table = sirius::create_cudf_table_with_random_data(
+    num_rows, column_types, ranges, stream, gpu_space->get_default_allocator(), true);
   auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
 
   expected_table_data expected;
@@ -275,7 +272,7 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
     expected_strings    = build_expected_strings(expected);
   }
 
-  auto const& host_table = convert_to_host_table(sirius_ctx, batch);
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
 
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
@@ -317,16 +314,15 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
 }
 
 TEST_CASE("host_table_chunk_reader handles null masks",
-          "[operator][result_collector][host_table_chunk_reader]")
+          "[operator][result_collector][host_table_chunk_reader][shared_context]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE * 2 + 3;
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
-  auto* gpu_space = get_default_gpu_space(sirius_ctx);
+  auto [db_owner, con]      = sirius::make_test_db_and_connection();
+  auto sirius_ctx           = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space           = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = gpu_space->get_default_allocator();
+  rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
+  auto mr = gpu_space->get_default_allocator();
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
                                             cudf::data_type{cudf::type_id::INT64},
@@ -363,7 +359,7 @@ TEST_CASE("host_table_chunk_reader handles null masks",
     expected_string_valid = extract_validity(gpu_view.column(2));
   }
 
-  auto const& host_table = convert_to_host_table(sirius_ctx, batch);
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
 
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),

@@ -17,7 +17,6 @@
 
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 

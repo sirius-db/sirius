@@ -21,6 +21,8 @@
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <vector>
+
 namespace sirius {
 namespace memory {
 
@@ -30,6 +32,11 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
     const std::vector<cucascade::memory::memory_space_config>& configs);
 
   ~sirius_memory_reservation_manager();
+
+ private:
+  // Previous cuDF device resources, saved in constructor and restored in destructor
+  // to prevent dangling references after our custom GPU allocators are torn down.
+  std::vector<rmm::mr::device_memory_resource*> prev_device_mrs_;
 };
 
 }  // namespace memory

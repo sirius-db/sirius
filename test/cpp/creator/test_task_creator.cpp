@@ -18,7 +18,6 @@
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_interface.hpp"
@@ -26,7 +25,6 @@
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
-#include <duckdb.hpp>
 #include <duckdb/main/connection.hpp>
 
 #include <atomic>

@@ -21,10 +21,6 @@
 #include "utils/data_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
-#include <duckdb/parser/query_error_context.hpp>
-#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_partition.hpp>
 
 #include <numeric>
@@ -60,6 +56,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   REQUIRE(space != nullptr);
 
   std::size_t num_values = 10000;
+
+  std::size_t partition_size = 10000000;
 
   std::vector<typename Traits::type> values(num_values);
   if constexpr (Traits::is_string) {
@@ -133,15 +131,23 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
 
-  sirius_physical_partition partitioner(
-    std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
+  sirius_physical_partition partitioner(std::move(partitioner_types),
+                                        estimated_cardinality,
+                                        &grouped_aggregator,
+                                        false,
+                                        partition_size);
+
+  // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
+  // col0 is Traits::type, col1 is int32_t
+  std::size_t bytes_per_row               = sizeof(typename Traits::type) + sizeof(int32_t);
+  std::size_t estimated_cardinality_bytes = estimated_cardinality * bytes_per_row;
+  int num_partitions =
+    static_cast<int>(std::max(std::size_t(1), estimated_cardinality_bytes / partition_size));
+  partitioner.set_num_partitions(num_partitions);
 
   auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
 
-  std::size_t partition_size = 10000000;  // from sirius_physical_partition.hpp
-
-  std::size_t expected_num_partitions =
-    (estimated_cardinality + partition_size - 1) / partition_size;
+  std::size_t expected_num_partitions = static_cast<std::size_t>(num_partitions);
 
   REQUIRE(outputs->get_data_batches().size() == expected_num_partitions);
 
@@ -229,6 +235,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   auto input_batch =
     std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
+  std::size_t partition_size = 10000000;
   // this cardinality is not real, we are setting here this large in order to force more partitions
   // to be made
   std::size_t estimated_cardinality = 100000000;  // 100 million rows = PARTITION_SIZE x 10
@@ -255,15 +262,23 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
 
-  sirius_physical_partition partitioner(
-    std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
+  sirius_physical_partition partitioner(std::move(partitioner_types),
+                                        estimated_cardinality,
+                                        &grouped_aggregator,
+                                        false,
+                                        partition_size);
+
+  // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
+  // col0 is Traits::type, col1 and col2 are int32_t
+  std::size_t bytes_per_row               = sizeof(typename Traits::type) + sizeof(int32_t) * 2;
+  std::size_t estimated_cardinality_bytes = estimated_cardinality * bytes_per_row;
+  int num_partitions =
+    static_cast<int>(std::max(std::size_t(1), estimated_cardinality_bytes / partition_size));
+  partitioner.set_num_partitions(num_partitions);
 
   auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
 
-  std::size_t partition_size = 10000000;  // from sirius_physical_partition.hpp
-
-  std::size_t expected_num_partitions =
-    (estimated_cardinality + partition_size - 1) / partition_size;
+  std::size_t expected_num_partitions = static_cast<std::size_t>(num_partitions);
 
   REQUIRE(outputs->get_data_batches().size() == expected_num_partitions);
 
@@ -337,6 +352,14 @@ TEST_CASE(
 
   sirius_physical_partition partitioner(
     std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
+
+  // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
+  // col0 and col1 are both int32_t; uses default partition size (512 MB)
+  std::size_t bytes_per_row               = sizeof(int32_t) * 2;
+  std::size_t estimated_cardinality_bytes = estimated_cardinality * bytes_per_row;
+  int num_partitions                      = static_cast<int>(std::max(
+    std::size_t(1), estimated_cardinality_bytes / sirius::config::DEFAULT_HASH_PARTITION_BYTES));
+  partitioner.set_num_partitions(num_partitions);
 
   auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
   REQUIRE(outputs->get_data_batches().size() == 1);

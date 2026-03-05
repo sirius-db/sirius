@@ -24,6 +24,7 @@
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius {
 namespace op {
@@ -46,16 +47,13 @@ inline std::string partition_type_to_string(PartitionType type)
 class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
-  static constexpr duckdb::idx_t DEFAULT_PARTITION_SIZE  = 10000000;
 
-  // Override the rows-per-partition threshold. Intended for tests only.
-  static void set_partition_size(duckdb::idx_t size) { s_partition_size = size; }
-  static void reset_partition_size() { s_partition_size = DEFAULT_PARTITION_SIZE; }
-
-  explicit sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
-                                     duckdb::idx_t estimated_cardinality,
-                                     sirius_physical_operator* parent_op,
-                                     bool is_build = false);
+  explicit sirius_physical_partition(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::idx_t estimated_cardinality,
+    sirius_physical_operator* parent_op,
+    bool is_build                 = false,
+    uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES);
 
   std::string get_name() const override;
 
@@ -68,24 +66,42 @@ class sirius_physical_partition : public sirius_physical_operator {
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
   [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
+  [[nodiscard]] sirius_physical_operator* get_sibling_partition_op() const
+  {
+    return _sibling_partition_op;
+  }
+
+  bool has_sibling() const { return _has_sibling_partition_op; }
+
+  void set_sibling_partition_op(sirius_physical_operator* sibling_partition_op)
+  {
+    _sibling_partition_op = sibling_partition_op;
+  }
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  void set_num_partitions(int num_partitions);
+
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
-  sirius_physical_operator* _parent_op;
+  int determine_num_partitions();
+  sirius_physical_operator* _parent_op            = nullptr;
+  sirius_physical_operator* _sibling_partition_op = nullptr;
   std::vector<int> _partition_keys;
   /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
   /// cast the key column to this type before hashing.  Used to align hash values when the
   /// two join sides have different physical column types for the same logical key.
   std::vector<cudf::data_type> _partition_key_cast_types;
-  int _num_partitions;
+  std::optional<int> _num_partitions;
   bool _is_build;
+  bool _has_sibling_partition_op;
   PartitionType _partition_type;
-
-  static duckdb::idx_t s_partition_size;
+  uint64_t s_partition_size;
 };
 
 }  // namespace op

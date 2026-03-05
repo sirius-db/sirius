@@ -16,14 +16,8 @@
 
 #include "op/sirius_physical_concat.hpp"
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_partition.hpp"
-#include "op/sirius_physical_top_n.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -33,12 +27,14 @@ namespace op {
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
                                                duckdb::idx_t estimated_cardinality,
                                                sirius_physical_operator* parent_op,
-                                               bool is_build)
+                                               bool is_build,
+                                               uint64_t concat_batch_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _parent_op = parent_op;
-  _is_build  = is_build;
+  _parent_op          = parent_op;
+  _is_build           = is_build;
+  _concat_batch_bytes = concat_batch_bytes;
   // check if parent_op is a hash join
   if (parent_op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(parent_op);
@@ -92,7 +88,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
-      if (!_concat_all && total_batch_size > duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE) {
+      if (!_concat_all && total_batch_size > _concat_batch_bytes) {
         // if the batch size is already exceed the threshold, then we need to return the batch right
         // away
         if (input_batch.size() == 0) {

@@ -16,8 +16,6 @@
 
 #include "operator/gpu_physical_delim_join.hpp"
 
-#include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
-#include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"

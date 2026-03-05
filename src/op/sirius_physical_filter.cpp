@@ -16,21 +16,10 @@
 
 #include "op/sirius_physical_filter.hpp"
 
-#include "duckdb/planner/expression/bound_between_expression.hpp"
-#include "duckdb/planner/expression/bound_case_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
 
 #include <nvtx3/nvtx3.hpp>
-
-#include <chrono>
-#include <stdexcept>
 
 namespace sirius {
 namespace op {

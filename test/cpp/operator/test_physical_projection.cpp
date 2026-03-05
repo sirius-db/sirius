@@ -18,7 +18,6 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
-#include <duckdb/common/types/decimal.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_projection.hpp>
 
