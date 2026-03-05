@@ -110,7 +110,8 @@ set(EXTENSION_SOURCES
     src/extension_lock.cpp
     src/sirius_engine.cpp
     src/parallel/task_executor.cpp
-    src/util/stream_check_wrapper.cpp)
+    src/util/stream_check_wrapper.cpp
+    src/util/segfault_backtrace_handler.cpp)
 # Note: Memory module sources are now provided by cuCascade library
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
