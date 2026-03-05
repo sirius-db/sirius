@@ -5,7 +5,7 @@
   "description": "RAPIDS Memory Manager - GPU memory management library",
   "homepage": "https://github.com/rapidsai/rmm",
   "license": "Apache-2.0",
-  "supports": "linux & x64",
+  "supports": "linux",
   "dependencies": [
     {
       "name": "vcpkg-cmake",

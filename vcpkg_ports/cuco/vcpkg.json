@@ -5,7 +5,7 @@
   "description": "cuCollections (cuco) - CUDA Unordered Containers",
   "homepage": "https://github.com/NVIDIA/cuCollections",
   "license": "Apache-2.0",
-  "supports": "linux & x64",
+  "supports": "linux",
   "dependencies": [
     {
       "name": "vcpkg-cmake",

@@ -40,6 +40,9 @@ jobs:
           - arch: x64
             preset: release
             environment: vcpkg
+          - arch: arm64
+            preset: release
+            environment: vcpkg
       fail-fast: false
     runs-on: ${{ format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
     steps:

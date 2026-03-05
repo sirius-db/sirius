@@ -3,10 +3,20 @@ vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 set(NVCOMP_VERSION "5.1.0.21")
 set(CUDA_VERSION "12")
 
+if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
+    set(NVCOMP_PLATFORM "linux-x86_64")
+    set(NVCOMP_SHA512 "dcc5ce865aae7027c98508aaf70bb0b1fc07a1b6e574088ca117b35c0e537d6a9b11e42e538a53d1c725e6c91aa0d9e0f88fb72a0162d2a284fdcb948bee3449")
+elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+    set(NVCOMP_PLATFORM "linux-sbsa")
+    set(NVCOMP_SHA512 "a733f7b8e79275e962c5e13e8b5e389ca2c6f0657b59db88d37db824bebb7b3715806ba10d7054ee74c02d0c36b3ebebaba90a225aa6b4152c002f6d1b266770")
+else()
+    message(FATAL_ERROR "Unsupported architecture: ${VCPKG_TARGET_ARCHITECTURE}")
+endif()
+
 vcpkg_download_distfile(ARCHIVE
-    URLS "https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-${NVCOMP_VERSION}_cuda${CUDA_VERSION}-archive.tar.xz"
-    FILENAME "nvcomp-linux-x86_64-${NVCOMP_VERSION}_cuda${CUDA_VERSION}-archive.tar.xz"
-    SHA512 dcc5ce865aae7027c98508aaf70bb0b1fc07a1b6e574088ca117b35c0e537d6a9b11e42e538a53d1c725e6c91aa0d9e0f88fb72a0162d2a284fdcb948bee3449
+    URLS "https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/${NVCOMP_PLATFORM}/nvcomp-${NVCOMP_PLATFORM}-${NVCOMP_VERSION}_cuda${CUDA_VERSION}-archive.tar.xz"
+    FILENAME "nvcomp-${NVCOMP_PLATFORM}-${NVCOMP_VERSION}_cuda${CUDA_VERSION}-archive.tar.xz"
+    SHA512 ${NVCOMP_SHA512}
 )
 
 vcpkg_extract_source_archive(

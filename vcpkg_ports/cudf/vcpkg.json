@@ -5,7 +5,7 @@
   "description": "cuDF - GPU DataFrame Library. CUDA C++ library with Apache Arrow compliant data structures",
   "homepage": "https://github.com/rapidsai/cudf",
   "license": "Apache-2.0",
-  "supports": "linux & x64",
+  "supports": "linux",
   "dependencies": [
     {
       "name": "vcpkg-cmake",
