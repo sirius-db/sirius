@@ -257,7 +257,6 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
     _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_sink();
   if (sink_operators) {
     sink_operators.get()->sink(output_data, stream);
-    stream.synchronize();
   } else {
     throw std::runtime_error("Sink operator not found");
   }
@@ -290,7 +289,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     processing_handles.emplace_back(std::move(*handle));
   }
-  stream.synchronize();  // ensure all conversions are done before we proceed with execution
 
   // At this point, all input batches are locked for processing.
   // They will remain locked until the processing_handles go out of scope.
@@ -298,7 +296,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
   auto output_data = compute_task(stream);
-  stream.synchronize();
+
   if (output_data) { publish_output(*output_data, stream); }
   // 4. After each cudf operator, get peak total bytes to collect statistics
   // 5. Push output batches to the data repository
