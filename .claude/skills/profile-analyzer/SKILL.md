@@ -1,32 +1,54 @@
 ---
 name: profile-analyzer
 description: Analyze Sirius GPU performance from nsys profiles — runs benchmarks, generates reports with kernel occupancy, memory bandwidth, operator attribution, and compares runs for regression detection.
-allowed-tools: Bash, Read, Grep, Glob, Write
 ---
 
 # Sirius nsys Profile Analyzer
 
 You are analyzing GPU performance profiles for Sirius, a GPU-accelerated SQL query engine built on DuckDB. The profiles come from NVIDIA Nsight Systems (nsys) and are stored as SQLite databases.
 
+## Profiling Overhead Warning
+
+**nsys profiling adds measurable overhead to query execution times.** Timings captured during a profiled run (cold/hot in `summary.json`) are inflated and should NOT be used to determine whether an optimization actually improved performance. Instead:
+
+1. **Profiled runs** → Use for GPU analysis (kernels, operators, occupancy, memory, bottlenecks)
+2. **Non-profiled runs** → Use for accurate performance timing (cold/hot comparisons, regression detection)
+
+Always run both when comparing performance across code changes.
+
 ## Workflows
 
-There are three workflows — choose based on what the user wants:
+There are four workflows — choose based on what the user wants:
 
-### Workflow A: Generate a Full Report (recommended)
+### Workflow A: Full Performance Analysis (recommended)
 
-Use `nsys_report.sh` to produce a self-contained report directory with human-readable markdown, machine-readable JSON, and all raw artifacts. This is the preferred workflow — it runs everything in one command.
+This is the complete workflow: profile for GPU analysis, then run without profiling for accurate timings. Both runs should use the same queries, scale factor, and iteration count.
 
+**Step 1: Profiled run** (for GPU analysis data)
 ```bash
-# Profile new queries and generate report
 bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
+```
 
-# Generate report from existing profiles (no profiling step)
-bash test/tpch_performance/nsys_report.sh --profile-dir <path_to_profiles>
+**Step 2: Non-profiled timing run** (for accurate cold/hot times)
+```bash
+# Option A: Sirius-only timing
+export SIRIUS_CONFIG_FILE=<path_to_config>
+bash test/tpch_performance/run_tpch_parquet.sh sirius <scale_factor> <iterations> <query_numbers...>
 
-# Profile, report, and compare against a baseline
-bash test/tpch_performance/nsys_report.sh --sf <scale_factor> --compare <baseline_report_dir>
+# Option B: Full DuckDB vs Sirius benchmark with validation
+export SIRIUS_CONFIG_FILE=<path_to_config>
+bash test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
+```
 
-# Full options
+The non-profiled run produces per-query `timings.csv` files with accurate cold/hot timings. `benchmark_and_validate.sh` also validates GPU results against CPU and produces a comparison table with speedup ratios.
+
+**When comparing across runs:**
+- Use the non-profiled timings to determine if performance actually improved or regressed
+- Use the profiled data to understand *why* performance changed (kernel times, operator attribution, occupancy, memory patterns)
+- The profiled `summary.json` timings are useful for relative comparisons within the same profiled run (e.g., which query is slowest) but not across runs with different code
+
+**Full options for the profiled run:**
+```bash
 bash test/tpch_performance/nsys_report.sh \
     --sf <scale_factor> \
     --output-dir ./reports \
@@ -37,11 +59,11 @@ bash test/tpch_performance/nsys_report.sh \
     [query_numbers...]
 ```
 
-**Output directory structure:**
+**Output directory structure (profiled):**
 ```
 reports/<label>_<YYYYMMDD_HHMMSS>/
   report.md        - Human-readable analysis with all metrics
-  summary.json     - Machine-readable per-query metrics for comparison
+  summary.json     - Machine-readable per-query metrics (profiled timings — use for analysis, not perf comparison)
   metadata.json    - Hardware, git commit, config, driver version
   comparison.md    - (if --compare used) Regression/improvement analysis
   profiles/        - All raw artifacts
@@ -49,7 +71,27 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
     summary.txt
 ```
 
-### Workflow B: Quick Analysis (no archival)
+**Output from non-profiled run:**
+```
+# run_tpch_parquet.sh:
+timings_sirius_sf<SF>_q<N>.csv   - Per-query cold/hot timings (accurate, no profiling overhead)
+
+# benchmark_and_validate.sh:
+runs/<timestamp>_sf<SF>_<N>iter/
+  comparison.txt   - DuckDB vs Sirius timing table with speedup ratios
+  timings.csv      - Combined long-format timings (engine, query, iteration, runtime_s)
+  validation.csv   - Per-query result match status (success/validation/error)
+  sirius/q<N>/timings.csv  - Per-query Sirius timings
+  duckdb/q<N>/timings.csv  - Per-query DuckDB timings
+```
+
+### Workflow B: Generate Report from Existing Profiles
+
+```bash
+bash test/tpch_performance/nsys_report.sh --profile-dir <path_to_profiles>
+```
+
+### Workflow C: Quick Analysis (no archival)
 
 Use `nsys_analyze.sh` directly for quick, one-off analysis without creating a report directory.
 
@@ -57,7 +99,7 @@ Use `nsys_analyze.sh` directly for quick, one-off analysis without creating a re
 bash test/tpch_performance/nsys_analyze.sh <path_to_profiles_or_file> [query_numbers...]
 ```
 
-### Workflow C: Compare Two Existing Reports
+### Workflow D: Compare Two Existing Reports
 
 ```bash
 bash test/tpch_performance/nsys_compare.sh <baseline_report_dir> <current_report_dir> [--threshold PCT]
@@ -68,6 +110,8 @@ Default threshold is 10%. Values beyond the threshold are flagged:
 - **IMPROVED**: current is >threshold% faster
 - **FIXED**: query failed in baseline but passes now
 - **BROKEN**: query passed in baseline but fails now
+
+**Important**: The timings in `summary.json` (used by `nsys_compare.sh`) are from profiled runs and include nsys overhead. These comparisons are useful for spotting large changes but should be validated with non-profiled timing runs before concluding a real regression or improvement exists. For definitive performance comparison, compare the non-profiled `timings.csv` files from `run_tpch_parquet.sh` or `benchmark_and_validate.sh`.
 
 ## Before Running
 
@@ -184,11 +228,12 @@ Sirius intercepts DuckDB query plans and offloads them to GPU via cuDF:
 3. **Occupancy hotspots**: Kernels with <50% occupancy that consume significant GPU time.
 4. **Memory bandwidth**: Pageable transfers are orders of magnitude slower than pinned.
 5. **Host allocation cost**: cudaHostAlloc often dominates CUDA API time.
-6. **Cold vs Hot delta**: Large gap = I/O/JIT overhead. Small gap = compute-dominated.
+6. **Cold vs Hot delta**: Large gap = I/O/JIT overhead. Small gap = compute-dominated. Use non-profiled timings for accurate cold/hot comparison.
 7. **Stream utilization**: Low busy% with many streams = fine-grained parallelism. High busy% on few streams = load imbalance.
 8. **Register spill**: Any kernel with local_bytes_per_thread > 0 is spilling.
 9. **Operator attribution**: Which operators consume the most GPU time? Focus optimization here.
 10. **OOM failures**: Queries failing with `std::bad_alloc` need memory optimization.
+11. **Profiling vs actual performance**: Always validate profiled timing changes with non-profiled runs. nsys overhead can mask or exaggerate real performance differences.
 
 ## Output Format
 
@@ -196,6 +241,7 @@ Always present findings in a structured way:
 - Start with a high-level summary (pass/fail, total times, report location)
 - Identify the top 3-5 bottlenecks
 - For each bottleneck, explain what it means and potential causes
-- Compare cold vs hot when relevant
-- When comparing reports, highlight regressions and improvements
+- Compare cold vs hot when relevant — clearly label whether timings are from profiled or non-profiled runs
+- When comparing reports, highlight regressions and improvements but note that profiled timings include nsys overhead — recommend validating with non-profiled runs if not already done
 - When analyzing a single query deeply, walk through the execution timeline: I/O -> operators -> kernels -> output
+- When presenting performance conclusions, always distinguish between profiled timings (for analysis) and non-profiled timings (for actual performance measurement)
