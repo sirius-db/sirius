@@ -237,10 +237,6 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   std::vector<cudf::table_view> concat_views;
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    // auto table = std::make_unique<cudf::table>(
-    //   batch->get_data()->cast<cucascade::gpu_table_representation>().get_table(),
-    //   stream,
-    //   space->get_default_allocator());
     concat_views.push_back(
       batch->get_data()->cast<cucascade::gpu_table_representation>().get_table().view());
     // owned_tables.push_back(std::move(table));
