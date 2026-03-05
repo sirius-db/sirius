@@ -81,6 +81,9 @@ SiriusContext::~SiriusContext() noexcept
 
 void SiriusContext::QueryBegin(ClientContext& context)
 {
+  // Reset operator ID counter so each query starts from 0
+  sirius::op::sirius_physical_operator::next_operator_id.store(0);
+
   auto query = context.GetCurrentQuery();
   if (config_.is_scan_caching_enabled()) {
     pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);

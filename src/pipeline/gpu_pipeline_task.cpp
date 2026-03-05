@@ -332,7 +332,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
   auto output_data = compute_task(stream);
-  stream.synchronize();
+
   if (output_data) { publish_output(*output_data, stream); }
   // 4. After each cudf operator, get peak total bytes to collect statistics
   // 5. Push output batches to the data repository

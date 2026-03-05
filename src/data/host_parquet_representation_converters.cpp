@@ -140,6 +140,7 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
   for (auto const& span : column_chunk_spans_d) {
     column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
   }
+
   auto result = reader.materialize_all_columns(
     host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
 #endif
