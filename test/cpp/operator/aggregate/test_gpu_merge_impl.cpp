@@ -25,7 +25,6 @@
 
 #include <cudf/utilities/bit.hpp>
 
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 using namespace sirius;

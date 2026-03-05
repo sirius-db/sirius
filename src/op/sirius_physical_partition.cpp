@@ -16,18 +16,12 @@
 
 #include "op/sirius_physical_partition.hpp"
 
-#include "creator/task_creator.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_nested_loop_join.hpp"
-#include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_top_n.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>

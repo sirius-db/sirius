@@ -18,7 +18,8 @@
 #include "cucascade/memory/memory_space.hpp"
 #include "op/sirius_physical_operator.hpp"
 
-#include <cudf_utils.hpp>
+#include <cudf/cudf_utils.hpp>
+
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
@@ -27,11 +28,7 @@
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/memory/host_table.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
-
-// cudf
-#include <cudf/utilities/bit.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>

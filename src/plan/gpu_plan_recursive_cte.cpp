@@ -15,19 +15,10 @@
  */
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/aggregate_hashtable.hpp"
-#include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
-#include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
-#include "duckdb/execution/perfect_aggregate_hashtable.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/function/aggregate/distributive_function_utils.hpp"
-#include "duckdb/function/function_binder.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
-#include "duckdb/planner/operator/logical_recursive_cte.hpp"
-#include "gpu_physical_column_data_scan.hpp"
-#include "gpu_physical_cte.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_column_data_scan.hpp"
 
 namespace duckdb {
 

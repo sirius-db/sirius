@@ -26,7 +26,6 @@
 // cudf
 #include "cudf/cudf_utils.hpp"
 
-#include <cudf/io/parquet.hpp>
 #include <cudf/utilities/span.hpp>
 
 // rmm

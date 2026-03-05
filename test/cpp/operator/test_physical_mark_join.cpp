@@ -16,7 +16,6 @@
 
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
-#include "operator_type_traits.hpp"
 
 #include <catch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>

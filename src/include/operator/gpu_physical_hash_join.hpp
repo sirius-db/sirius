@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"

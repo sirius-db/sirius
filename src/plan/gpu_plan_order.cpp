@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/order/physical_order.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
-#include "gpu_physical_order.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_order.hpp"
 
 namespace duckdb {
 

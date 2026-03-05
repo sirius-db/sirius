@@ -18,7 +18,6 @@
 
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "exec/config.hpp"
 #include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -26,12 +25,10 @@
 
 #include <cuda_runtime_api.h>
 
-#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
-#include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>

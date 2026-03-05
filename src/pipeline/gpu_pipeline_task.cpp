@@ -21,18 +21,14 @@
 #include "pipeline/oom_reschedule_exception.hpp"
 
 #include <absl/cleanup/cleanup.h>
-#include <absl/functional/any_invocable.h>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
-#include <iostream>
 #include <optional>
 
 namespace sirius {

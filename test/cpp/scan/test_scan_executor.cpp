@@ -22,7 +22,6 @@
 // sirius
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
-#include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/pipeline_executor.hpp>
 
 // cucascade
@@ -32,7 +31,6 @@
 #include <rmm/cuda_stream.hpp>
 
 // duckdb
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/types.hpp>
