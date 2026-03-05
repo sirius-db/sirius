@@ -37,7 +37,7 @@ jobs:
         arch: [x64, arm64]
         preset: [release, clang-debug]
         include:
-          - arch: arm64
+          - arch: x64
             preset: release
             environment: vcpkg
       fail-fast: false
