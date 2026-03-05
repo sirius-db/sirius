@@ -47,6 +47,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Unshallow vcpkg for version overrides
+        if: matrix.environment == 'vcpkg'
+        run: git -C vcpkg fetch --unshallow
+
       - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
         with:
           cache: false
