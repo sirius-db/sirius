@@ -147,15 +147,22 @@ impl SiriusEngine {
         } else {
             "SELECT * FROM gpu_execution_substrait(?::blob)".to_string()
         };
+        let t0 = std::time::Instant::now();
         let mut stmt = self
             .conn
             .prepare(&sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        eprintln!("[sirius-ffi] execute_substrait: prepare took {}ms", t0.elapsed().as_millis());
+        let t1 = std::time::Instant::now();
         let batches: Vec<RecordBatch> = stmt
             .query_arrow(duckdb::params![plan_bytes])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?
             .collect();
-        batches_to_ipc(batches)
+        eprintln!("[sirius-ffi] execute_substrait: query_arrow took {}ms, {} batches", t1.elapsed().as_millis(), batches.len());
+        let t2 = std::time::Instant::now();
+        let result = batches_to_ipc(batches);
+        eprintln!("[sirius-ffi] execute_substrait: batches_to_ipc took {}ms", t2.elapsed().as_millis());
+        result
     }
 
     /// Execute a Substrait plan via DuckDB CPU (`from_substrait`).
@@ -550,16 +557,27 @@ impl SiriusEngine {
     /// Tell Sirius to retain GPU result buffers past query cleanup.
     /// Must be called BEFORE the GPU query that produces the exchange result.
     pub fn retain_gpu_buffers(&self) -> Result<(), EngineError> {
-        self.conn
-            .execute_batch("SELECT * FROM sirius_retain_gpu_buffers()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))
+        // Must use prepare+query_arrow (not execute_batch) to properly consume
+        // the result set from this table function. execute_batch with SELECT
+        // leaves the connection "busy", blocking subsequent queries.
+        let mut stmt = self.conn
+            .prepare("SELECT * FROM sirius_retain_gpu_buffers()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .collect();
+        Ok(())
     }
 
     /// Release previously retained GPU buffers (after nixl transfer or on error).
     pub fn release_gpu_buffers(&self) -> Result<(), EngineError> {
-        self.conn
-            .execute_batch("SELECT * FROM sirius_release_gpu_buffers()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))
+        let mut stmt = self.conn
+            .prepare("SELECT * FROM sirius_release_gpu_buffers()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .collect();
+        Ok(())
     }
 
     /// Get GPU buffer pointers from the last execution (for nixl GPU-direct exchange).

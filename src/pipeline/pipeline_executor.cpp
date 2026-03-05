@@ -140,6 +140,10 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
   }
 
   auto scans = query->get_scan_operators();
+  SIRIUS_LOG_INFO("[prepare_for_query] found {} scan operators", scans.size());
+  for (size_t i = 0; i < scans.size(); ++i) {
+    SIRIUS_LOG_INFO("[prepare_for_query] scan[{}]: type={}", i, static_cast<int>(scans[i]->type));
+  }
   _scan_executor->prepare_cache_for_scan_operators(scans);
 
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
@@ -192,12 +196,18 @@ void pipeline_executor::management_eventloop()
 void pipeline_executor::schedule_next_scan_tasks()
 {
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+  SIRIUS_LOG_INFO("[schedule_next_scan_tasks] priority_scans queue size={}", _priority_scans.size());
   if (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    for (auto i = 0; i != _scan_executor->get_num_threads(); ++i) {
+    auto num_threads = _scan_executor->get_num_threads();
+    SIRIUS_LOG_INFO("[schedule_next_scan_tasks] scheduling scan type={} on {} threads",
+                    static_cast<int>(scan_op->type), num_threads);
+    for (auto i = 0; i != num_threads; ++i) {
       _task_creator->schedule(scan_op);
     }
     _priority_scans.pop();
+  } else {
+    SIRIUS_LOG_WARN("[schedule_next_scan_tasks] NO scan operators in queue — pipeline will hang!");
   }
 }
 

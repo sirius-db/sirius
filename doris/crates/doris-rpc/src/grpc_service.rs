@@ -871,9 +871,11 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
                 None
             };
             let plan_bytes = gpu_bytes.as_deref().unwrap_or(&bytes);
+            let t0 = std::time::Instant::now();
+            tracing::info!(substrait_bytes = plan_bytes.len(), "gpu_execution_substrait starting");
             match engine.execute_substrait(plan_bytes, sort_limit_sql.as_deref()) {
                 Ok(ipc) => {
-                    tracing::info!("executed via gpu_execution_substrait");
+                    tracing::info!(elapsed_ms = t0.elapsed().as_millis() as u64, ipc_len = ipc.len(), "executed via gpu_execution_substrait");
                     Ok(ipc)
                 }
                 Err(e) if no_cpu_fallback => {
@@ -2130,6 +2132,7 @@ impl PBackendService for PBackendServiceHandler {
 
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
+                let t_total = std::time::Instant::now();
                 let engine = engine.lock().unwrap();
                 if should_retain {
                     if let Err(e) = engine.retain_gpu_buffers() {
@@ -2138,11 +2141,17 @@ impl PBackendService for PBackendServiceHandler {
                         tracing::info!("retain_gpu_buffers set before GPU execution");
                     }
                 }
+                let t_exec = std::time::Instant::now();
                 let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
+                tracing::info!(exec_ms = t_exec.elapsed().as_millis() as u64, ipc_len = ipc_bytes.len(), "execute_plan completed");
                 if let Some(names) = output_names {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                 }
-                Ok(crate::nixl_integration::detect_execution_location(ipc_bytes, &engine))
+                let t_detect = std::time::Instant::now();
+                let location = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
+                tracing::info!(detect_ms = t_detect.elapsed().as_millis() as u64, gpu = matches!(location, crate::nixl_integration::ExecutionLocation::Gpu { .. }), "detect_execution_location done");
+                tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
+                Ok(location)
             })
             .await;
 

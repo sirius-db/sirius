@@ -677,10 +677,24 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionSubstraitBind(ClientContex
 
   // Generate Sirius physical plan using the new execution framework.
   SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: generating Sirius physical plan");
-  SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: logical plan:\n{}", plan->ToString());
+  SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: logical plan type={} children={}",
+                  LogicalOperatorToString(plan->type), plan->children.size());
+  // Recursively log the logical plan tree.
+  {
+    std::function<void(LogicalOperator*, int)> log_tree = [&](LogicalOperator* op, int depth) {
+      std::string indent(depth * 2, ' ');
+      SIRIUS_LOG_INFO("[gpu_execution_substrait] logical_tree: {}type={} children={}",
+                      indent, LogicalOperatorToString(op->type), op->children.size());
+      for (auto& child : op->children) {
+        log_tree(child.get(), depth + 1);
+      }
+    };
+    log_tree(plan.get(), 0);
+  }
   try {
     auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, plan);
-    SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: Sirius physical plan generated OK");
+    SIRIUS_LOG_INFO("[gpu_execution_substrait] bind: Sirius physical plan generated OK, root type={}",
+                    static_cast<int>(sirius_physical_plan->type));
     auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
       std::move(prepared), std::move(sirius_physical_plan));
     result->gpu_prepared = gpu_prepared;
