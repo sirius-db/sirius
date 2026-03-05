@@ -372,12 +372,6 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
 
-  // cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT.
-  // Downcast to BIGINT so all downstream operators and the result collector use a supported type.
-  for (auto& type : planner.types) {
-    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
-  }
-
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
