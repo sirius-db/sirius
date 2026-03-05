@@ -372,7 +372,6 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
 
-
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
