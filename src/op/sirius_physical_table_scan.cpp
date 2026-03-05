@@ -16,17 +16,7 @@
 
 #include "op/sirius_physical_table_scan.hpp"
 
-#include "config.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/execution_context.hpp"
-#include "duckdb/parallel/task_executor.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
-#include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
-#include "utils.hpp"
 
 #include <cudf/table/table.hpp>
 

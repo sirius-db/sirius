@@ -16,7 +16,6 @@
 
 #include "cpu_cache.hpp"
 
-#include "duckdb/common/assert.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {

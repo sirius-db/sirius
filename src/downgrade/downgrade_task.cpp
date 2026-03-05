@@ -16,15 +16,12 @@
 
 #include "downgrade/downgrade_task.hpp"
 // #include "downgrade/downgrade_executor.hpp"
-#include "cudf/contiguous_split.hpp"
 #include "data/sirius_converter_registry.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 namespace sirius {
 namespace parallel {

@@ -40,7 +40,6 @@
 #include <cudf/table/table.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 

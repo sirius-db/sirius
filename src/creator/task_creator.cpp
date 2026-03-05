@@ -22,10 +22,6 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
-#include "op/sirius_physical_top_n.hpp"
-#include "op/sirius_physical_top_n_merge.hpp"
-#include "op/sirius_physical_ungrouped_aggregate.hpp"
-#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "planner/query.hpp"
@@ -34,9 +30,7 @@
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
-#include <iterator>
 #include <optional>
-#include <queue>
 
 namespace sirius::creator {
 

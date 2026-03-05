@@ -23,7 +23,6 @@
 #include <op/scan/duckdb_scan_task.hpp>
 
 // duckdb
-#include <duckdb.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
 

@@ -14,26 +14,19 @@
  * limitations under the License.
  */
 
-#include "gpu_physical_nested_loop_join.hpp"
+#include "operator/gpu_physical_nested_loop_join.hpp"
 
-#include "cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
-#include "duckdb/common/operator/comparison_operators.hpp"
-#include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/execution/expression_executor.hpp"
-#include "duckdb/execution/nested_loop_join.hpp"
-#include "duckdb/execution/operator/join/outer_join_marker.hpp"
-#include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
-#include "gpu_physical_hash_join.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 
 namespace duckdb {
 

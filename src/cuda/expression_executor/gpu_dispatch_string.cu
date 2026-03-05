@@ -15,8 +15,8 @@
  */
 
 #include "expression_executor/gpu_dispatcher.hpp"
-#include "gpu_physical_strings_matching.hpp"
-#include "gpu_physical_substring.hpp"
+#include "operator/gpu_physical_strings_matching.hpp"
+#include "operator/gpu_physical_substring.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/strings/strings_column_view.hpp>

@@ -16,7 +16,6 @@
 
 #include "pipeline/pipeline_executor.hpp"
 
-#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
@@ -25,7 +24,6 @@
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
-#include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>

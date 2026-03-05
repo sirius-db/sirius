@@ -14,14 +14,9 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/helper/physical_limit.hpp"
-#include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
-#include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/main/config.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
-#include "gpu_physical_limit.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "operator/gpu_physical_limit.hpp"
 
 namespace duckdb {
 

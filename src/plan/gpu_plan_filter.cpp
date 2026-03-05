@@ -14,18 +14,11 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/filter/physical_filter.hpp"
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/optimizer/matcher/expression_matcher.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "gpu_physical_filter.hpp"
 #include "gpu_physical_plan_generator.hpp"
-#include "gpu_physical_projection.hpp"
+#include "operator/gpu_physical_filter.hpp"
+#include "operator/gpu_physical_projection.hpp"
 
 namespace duckdb {
 

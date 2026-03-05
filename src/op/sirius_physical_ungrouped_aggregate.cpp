@@ -31,7 +31,6 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -41,7 +40,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
-#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <optional>

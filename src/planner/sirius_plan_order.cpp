@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/order/physical_order.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"

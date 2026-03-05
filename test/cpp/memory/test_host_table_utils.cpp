@@ -29,7 +29,6 @@
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/host_table.hpp>
 
 // cudf
 #include <cudf/null_mask.hpp>
@@ -40,12 +39,10 @@
 #include <cudf/utilities/default_stream.hpp>
 
 // duckdb
-#include <duckdb.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
 
 // cuda
-#include <cuda_runtime.h>
 
 // rmm
 #include <rmm/cuda_stream.hpp>

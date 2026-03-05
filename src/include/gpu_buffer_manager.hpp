@@ -15,7 +15,7 @@
  */
 
 #pragma once
-#include "cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/materialized_query_result.hpp"

@@ -21,7 +21,6 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <optional>
 #include <thread>
 

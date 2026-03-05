@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"

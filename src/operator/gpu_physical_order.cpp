@@ -18,7 +18,6 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_materialize.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 

@@ -23,7 +23,6 @@
 #include <operator/gpu_materialize.hpp>
 
 // cucascade
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
 

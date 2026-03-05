@@ -16,22 +16,11 @@
 
 #include "gpu_pipeline.hpp"
 
-#include "duckdb/common/algorithm.hpp"
-#include "duckdb/common/printer.hpp"
-#include "duckdb/common/tree_renderer/text_tree_renderer.hpp"
-#include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
-#include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/parallel/pipeline_event.hpp"
-#include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "gpu_executor.hpp"
-#include "gpu_meta_pipeline.hpp"
 #include "log/logging.hpp"
-#include "operator/gpu_physical_table_scan.hpp"
 
 namespace duckdb {
 

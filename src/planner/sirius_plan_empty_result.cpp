@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "op/sirius_physical_empty_result.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"

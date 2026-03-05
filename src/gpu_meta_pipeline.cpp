@@ -16,9 +16,7 @@
 
 #include "gpu_meta_pipeline.hpp"
 
-#include "duckdb/common/enums/physical_operator_type.hpp"
 #include "gpu_executor.hpp"
-#include "log/logging.hpp"
 
 namespace duckdb {
 

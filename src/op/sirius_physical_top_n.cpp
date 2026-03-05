@@ -17,18 +17,11 @@
 #include "op/sirius_physical_top_n.hpp"
 
 #include "data/data_batch_utils.hpp"
-#include "duckdb/common/assert.hpp"
-#include "duckdb/execution/expression_executor.hpp"
-#include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
-#include "duckdb/storage/data_table.hpp"
-#include "log/logging.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
-#include "utils.hpp"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>

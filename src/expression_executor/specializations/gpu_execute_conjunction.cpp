@@ -15,7 +15,6 @@
  */
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/types.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"

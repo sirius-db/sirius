@@ -203,7 +203,7 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                                                  rmm::cuda_stream_view stream)
 {
   D_ASSERT(input->row_ids != nullptr);
-  D_ASSERT(input->row_ids->size() > 0);
+  D_ASSERT(input->row_id_count > 0);
 
   const auto* input_data    = input->data_wrapper.data;
   const auto* input_offsets = input->data_wrapper.offset;  // Maybe unused

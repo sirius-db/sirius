@@ -23,8 +23,7 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "expression_executor/regex/regex_playground.hpp"
-#include "gpu_physical_strings_matching.hpp"
-#include "log/logging.hpp"
+#include "operator/gpu_physical_strings_matching.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>

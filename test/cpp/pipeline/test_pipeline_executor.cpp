@@ -16,17 +16,14 @@
 
 #include "catch.hpp"
 #include "exec/config.hpp"
-#include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
-#include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>

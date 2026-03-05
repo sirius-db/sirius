@@ -16,7 +16,6 @@
 
 #include "op/merge/gpu_merge_impl.hpp"
 
-#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 
 #include <cudf/aggregation.hpp>

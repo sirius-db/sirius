@@ -23,20 +23,16 @@
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // duckdb
 #include <duckdb/common/multi_file/multi_file_states.hpp>
-#include <duckdb/common/types.hpp>
-#include <duckdb/main/config.hpp>
 
 // cudf
 #include "cudf/cudf_utils.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>

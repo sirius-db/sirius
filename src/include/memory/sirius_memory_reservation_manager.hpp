@@ -30,6 +30,10 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
     const std::vector<cucascade::memory::memory_space_config>& configs);
 
   ~sirius_memory_reservation_manager();
+
+ private:
+  /// Previous cudf per-device resource to restore on destruction.
+  rmm::mr::device_memory_resource* previous_device_resource_ = nullptr;
 };
 
 }  // namespace memory

@@ -20,7 +20,6 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "helper/types.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
