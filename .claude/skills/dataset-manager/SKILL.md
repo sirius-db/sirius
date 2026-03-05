@@ -1,6 +1,6 @@
 ---
 name: dataset-manager
-description: Manage TPC-H parquet datasets — generate data at any scale factor, consolidate small parquet files into fewer larger files, inspect dataset layout, and optimize row group sizes. Auto-selects cudf (GPU) or pyarrow (CPU) based on available GPU memory.
+description: Manage TPC-H parquet datasets — generate data at any scale factor, consolidate small parquet files into fewer larger files, inspect dataset layout, and optimize row group sizes. Uses rewrite_parquet.py which auto-selects cudf (GPU) or pyarrow (CPU) with OOM fallback.
 ---
 
 # TPC-H Dataset Manager
@@ -9,17 +9,12 @@ You are managing TPC-H parquet datasets for Sirius, a GPU-accelerated SQL query 
 
 ## Backend Selection
 
-Before any data manipulation, detect available GPU memory:
+The `rewrite_parquet.py` script handles backend selection automatically:
+- If **cudf** is installed, it uses GPU-accelerated reads (much faster for large datasets)
+- If cudf is **not installed** or hits a **GPU out-of-memory** error, it falls back to **pyarrow** (CPU-only)
+- The fallback is per-table and per-batch — if a large table OOMs on the GPU mid-way, remaining batches continue with pyarrow
 
-```bash
-nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits
-```
-
-This returns total GPU memory in MiB. Convert to GB and apply the rule:
-- **>= 80 GB GPU memory**: Use **cudf** (GPU-accelerated, much faster for large datasets)
-- **< 80 GB GPU memory**: Use **pyarrow** (CPU-only, works everywhere)
-
-Tell the user which backend you selected and why.
+No manual GPU memory check is needed. Just run the script.
 
 ## TPC-H Tables
 
@@ -68,71 +63,41 @@ If the output directory already exists, the script skips generation. Remove the 
 
 ### Workflow B: Consolidate / Optimize Parquet Files
 
-This is the most common operation. Takes many small parquet files and consolidates them into fewer, larger files with GPU-optimized settings.
-
-#### With cudf (>= 80 GB GPU memory)
-
-The existing `rewrite_parquet.py` script handles this:
+This is the most common operation. Takes parquet files and rewrites them with optimized row groups, compression, and file size limits. Automatically uses cudf if available, falls back to pyarrow on import failure or GPU OOM.
 
 ```bash
 cd test/tpch_performance
-pixi run python rewrite_parquet.py <source_dir> <dest_dir> [row_group_rows]
+pixi run python rewrite_parquet.py <source_dir> <dest_dir> [row_group_rows] [max_file_gb]
 ```
 
-Default row group size: 10,000,000 rows. Settings applied:
+Parameters:
+- `source_dir` — Directory containing source parquet files
+- `dest_dir` — Output directory for rewritten files
+- `row_group_rows` — Rows per row group (default: 10,000,000)
+- `max_file_gb` — Maximum output file size in GB (default: 20). Tables exceeding this are split into numbered files (e.g., `lineitem_0000.parquet`, `lineitem_0001.parquet`)
+
+Settings applied:
 - Snappy compression
 - Parquet V2 page headers
 - 8 MiB max page size
 - Dictionary encoding enabled
 - ROWGROUP-level statistics
+- Int32 downcasts for key columns to reduce memory footprint
 
-Example:
+Examples:
 ```bash
 cd test/tpch_performance
+
+# Default: 10M-row row groups, 20 GB max file size
 pixi run python rewrite_parquet.py \
     ../../test_datasets/tpch_parquet_sf100 \
-    ../../test_datasets/tpch_parquet_sf100_optimized \
-    10000000
-```
+    ../../test_datasets/tpch_parquet_sf100_optimized
 
-#### With pyarrow (< 80 GB GPU memory)
-
-When cudf is not available (insufficient GPU memory), write a Python script that uses pyarrow only. The script should:
-
-1. Read all parquet files for each table using `pyarrow.parquet.ParquetFile` or `pyarrow.parquet.read_table`
-2. For large tables, read in batches using row group iteration to avoid OOM
-3. Write consolidated output using `pyarrow.parquet.ParquetWriter` with these settings:
-   ```python
-   pq.ParquetWriter(
-       dest_path,
-       schema,
-       compression="snappy",
-       version="2.6",
-       data_page_version="2.0",
-       write_statistics=True,
-       use_dictionary=True,
-       data_page_size=8 * 1024 * 1024,  # 8 MiB
-   )
-   ```
-4. Use `row_group_size=<target_rows>` when writing (default 10M)
-5. Apply int32 downcasts for key columns (same as rewrite_parquet.py):
-   - customer: c_custkey, c_nationkey
-   - lineitem: l_partkey, l_suppkey, l_linenumber
-   - nation: n_nationkey, n_regionkey
-   - orders: o_custkey
-   - part: p_partkey
-   - partsupp: ps_partkey, ps_suppkey
-   - region: r_regionkey
-   - supplier: s_suppkey, s_nationkey
-
-For the pyarrow path, process large tables (> 50M rows) in batches:
-```python
-pf = pq.ParquetFile(source_path)
-writer = pq.ParquetWriter(dest_path, schema, ...)
-for batch in pf.iter_batches(batch_size=row_group_size):
-    table = pa.Table.from_batches([batch])
-    writer.write_table(table)
-writer.close()
+# Custom: 2M-row row groups, 10 GB max file size
+pixi run python rewrite_parquet.py \
+    ../../test_datasets/tpch_parquet_sf100 \
+    ../../test_datasets/tpch_parquet_sf100_rg2m \
+    2000000 10
 ```
 
 ### Workflow C: Inspect Dataset
@@ -162,56 +127,29 @@ Report: table name, total rows, number of files, number of row groups, row group
 
 ### Workflow D: Merge Specific Tables
 
-Sometimes the user wants to merge only specific tables (e.g., just lineitem). Follow the same consolidation logic from Workflow B but for the requested tables only.
-
-### Workflow E: Split Large Files
-
-If a user wants to split a large parquet file into multiple smaller ones:
-
-```python
-pf = pq.ParquetFile(source_path)
-file_idx = 0
-writer = None
-rows_in_current = 0
-target_rows_per_file = <user_specified>
-
-for batch in pf.iter_batches(batch_size=1_000_000):
-    if writer is None or rows_in_current >= target_rows_per_file:
-        if writer:
-            writer.close()
-        file_idx += 1
-        writer = pq.ParquetWriter(f"{dest_dir}/{table}_{file_idx:04d}.parquet", schema, ...)
-        rows_in_current = 0
-    writer.write_table(pa.Table.from_batches([batch]))
-    rows_in_current += len(batch)
-
-if writer:
-    writer.close()
-```
+Sometimes the user wants to merge only specific tables (e.g., just lineitem). Edit the `TPCH_TABLES` list in `rewrite_parquet.py` or call `rewrite_table()` directly for the requested tables.
 
 ## Key Considerations
 
-- **Memory safety**: For large datasets (SF100+), always process in batches. Never load an entire large table into memory at once.
-- **Schema preservation**: Preserve original date32 and decimal types. cudf internally promotes date32 to timestamp; cast back before writing.
-- **Int32 downcasts**: Apply the INT32_COLUMNS mapping from rewrite_parquet.py to reduce memory footprint.
-- **File discovery**: Handle three parquet layouts:
+- **Memory safety**: For large datasets (SF100+), the script processes in batches automatically. If cudf OOMs, it falls back to pyarrow for remaining batches.
+- **Schema preservation**: Preserve original date32 and decimal types. cudf internally promotes date32 to timestamp; the script casts back before writing.
+- **File splitting**: Output files exceeding `max_file_gb` (default 20 GB) are automatically split into numbered files. Small tables that fit under the limit stay as single files (e.g., `customer.parquet`).
+- **File discovery**: The script handles three parquet layouts:
   1. Single file: `<dir>/<table>.parquet`
   2. Partitioned by suffix: `<dir>/<table>_*.parquet`
   3. Subdirectory (tpchgen-rs): `<dir>/<table>/<table>.*.parquet`
-- **Row group sizing**: Default 10M rows. For small tables (nation, region), use the full table as one row group. For large tables (lineitem at SF100 = ~600M rows), 10M row groups give ~60 row groups.
+- **Row group sizing**: Default 10M rows. For small tables (nation, region), the full table is one row group. For large tables (lineitem at SF100 = ~600M rows), 10M row groups give ~60 row groups.
 - **Recommended sizes**: 2M-10M rows per row group for GPU workloads.
 
 ## Before Running
 
 - **Ask the user** for source/destination paths if not clear from context.
-- Confirm the backend choice (cudf vs pyarrow) with the user.
-- For cudf operations, use the pixi environment: `cd test/tpch_performance && pixi run python ...`
-- For pyarrow-only operations, pyarrow should be available in the pixi env or system Python.
+- Use the pixi environment: `cd test/tpch_performance && pixi run python ...`
 
 ## Output
 
 Always report:
-- Backend used (cudf or pyarrow) and why
-- Per-table: rows processed, source size, destination size, compression ratio
+- Backend used (cudf or pyarrow) — the script prints this automatically
+- Per-table: rows processed, source size, destination size, compression ratio, number of output files
 - Total time elapsed
 - Output directory location
