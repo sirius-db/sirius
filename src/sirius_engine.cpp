@@ -1051,7 +1051,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
     // Set pipeline IDs, parents, and operator children (before finalization)
     for (size_t i = 0; i < new_scheduled.size(); i++) {
-      new_scheduled[i]->set_pipeline_id(i);
       new_scheduled[i]->parents.clear();
       new_scheduled[i]->dependencies.clear();
 
