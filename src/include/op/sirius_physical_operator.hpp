@@ -270,6 +270,8 @@ class sirius_physical_operator {
   std::vector<std::string_view> get_port_ids();
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
+  //! Returns true if any FULL-barrier port has src_pipeline == src
+  bool has_full_barrier_from(const pipeline::sirius_pipeline* src) const;
   //! Add a next port after sink
   void add_next_port_after_sink(
     std::pair<sirius_physical_operator*, std::string_view> port_locator);

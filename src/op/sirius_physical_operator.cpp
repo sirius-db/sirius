@@ -296,6 +296,14 @@ bool sirius_physical_operator::is_source_pipeline_finished()
   return true;
 }
 
+bool sirius_physical_operator::has_full_barrier_from(const pipeline::sirius_pipeline* src) const
+{
+  for (auto& p : _ports_list) {
+    if (p->src_pipeline.get() == src && p->type == MemoryBarrierType::FULL) { return true; }
+  }
+  return false;
+}
+
 duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()
   const noexcept
 {
