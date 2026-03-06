@@ -166,6 +166,12 @@ std::future<void> pipeline_executor::start_query()
   return future;
 }
 
+void pipeline_executor::terminate_query(std::exception_ptr error)
+{
+  _completion_handler->report_error(error);
+  stop();
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {

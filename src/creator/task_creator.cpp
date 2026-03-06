@@ -355,6 +355,7 @@ void task_creator::manager_loop()
         }
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
+        _pipeline_executor->terminate_query(std::current_exception());
         stop();
       }
     });
