@@ -4,20 +4,18 @@
 # Creates views from parquet files found in the dataset directory,
 # then runs the specified queries on the specified engine with the specified number of iterations.
 # All iterations run in a single DuckDB session so that scan caches warm on the first run.
-# Timings are recorded using current_timestamp between steps and written to a CSV file.
+# Timings are measured using DuckDB's .timer command and parsed from its output.
 # Output results are saved as result_<engine>_sf<scale_factor>_q<query_number>.txt
 # and timing results as timings_<engine>_sf<scale_factor>_q<query_number>.csv.
 # If OUTPUT_DIR is set (this is done by benchmark_and_validate.sh),
 # results are saved in the specified directory (in a subdirectory per query),
 # otherwise they are saved in the project directory.
+# All iterations run in a single DuckDB session so that scan caches warm on the first run.
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=/home/felipe/sirius/test/cpp/integration/integration.cfg
 #   ./test/tpch_performance/run_tpch_parquet.sh <engine> <scale_factor> <iterations> <query_numbers...>
 # with engine = [sirius/duckdb]
-#
-# All iterations run in a single DuckDB session so that scan caches warm on the first run.
-# Timings are recorded using current_timestamp between steps and written to a CSV file.
 #
 # Example:
 #   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 3 `seq 1 22`
@@ -97,6 +95,13 @@ echo "Views: ${VIEW_SQL}"
 echo "Queries: ${QUERIES[*]}"
 echo "=========================================="
 
+# parse_timer_output <output_text>
+# Extracts real (wall clock) times from DuckDB .timer on output.
+# Format: "Run Time (s): real 5.419 user 20.134 sys 0.512"
+parse_timer_output() {
+    echo "$1" | grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+'
+}
+
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
     if [ -n "${OUTPUT_DIR:-}" ]; then
@@ -123,48 +128,38 @@ for q in "${QUERIES[@]}"; do
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
     fi
 
-    # Timing table: one row per checkpoint, ordered by seq
-    printf 'CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);\n' > "$TEMP_SQL"
-    printf "INSERT INTO _timings VALUES (0, 'start', current_timestamp);\n" >> "$TEMP_SQL"
-
-    # View creation
-    printf '%s\n' "$VIEW_SQL" >> "$TEMP_SQL"
-    printf "INSERT INTO _timings VALUES (1, 'views', current_timestamp);\n" >> "$TEMP_SQL"
-
-    # Append the query N times, recording a timestamp after each run
+    # Build the SQL file: views, then .timer on, then N iterations of the query.
+    printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
+    echo ".timer on" >> "$TEMP_SQL"
     for ((i = 1; i <= ITERATIONS; i++)); do
         cat "$QUERY_FILE" >> "$TEMP_SQL"
-        printf "\nINSERT INTO _timings VALUES (%d, 'iter_%d', current_timestamp);\n" \
-            $((i + 1)) "$i" >> "$TEMP_SQL"
+        printf '\n' >> "$TEMP_SQL"
     done
 
-    # Write per-step runtimes (seconds) to CSV using LAG over the checkpoints.
-    # The 'start' row is excluded from output after the window function runs,
-    # so that LAG for 'views' (seq=1) can still see seq=0 as its predecessor.
-    cat >> "$TEMP_SQL" <<EOF
-COPY (
-    SELECT step, runtime_s FROM (
-        SELECT
-            seq,
-            step,
-            extract(epoch FROM (ts - LAG(ts) OVER (ORDER BY seq))) AS runtime_s
-        FROM _timings
-    )
-    WHERE seq > 0
-    ORDER BY seq
-) TO '${TIMING_FILE}' (FORMAT CSV, HEADER);
-EOF
-
+    # Run DuckDB and capture full output
+    local_output=""
     START_TIME=$(date +%s.%N)
     if [ -n "${OUTPUT_DIR:-}" ]; then
-        SIRIUS_LOG_DIR="$Q_DIR" "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
+        local_output=$(SIRIUS_LOG_DIR="$Q_DIR" "$DUCKDB" -f "$TEMP_SQL" 2>&1)
     else
-        "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
+        local_output=$("$DUCKDB" -f "$TEMP_SQL" 2>&1)
     fi
     END_TIME=$(date +%s.%N)
 
+    # Write result (query output) to file
+    echo "$local_output" | tee "$RESULT_FILE"
+
     ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
     echo "  Time: ${ELAPSED}s"
+
+    # Parse .timer output into per-iteration timings CSV
+    readarray -t TIMES < <(parse_timer_output "$local_output")
+    {
+        echo "step,runtime_s"
+        for ((i = 0; i < ${#TIMES[@]}; i++)); do
+            echo "iter_$((i + 1)),${TIMES[$i]}"
+        done
+    } > "$TIMING_FILE"
 
     if [ -n "${TIMING_CSV:-}" ]; then
         echo "${q},${ELAPSED}" >> "$TIMING_CSV"
