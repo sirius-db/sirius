@@ -59,6 +59,16 @@ class prefetched_data_source : public cudf::io::datasource {
   [[nodiscard]] size_t size() const override;
 
  private:
+  struct copy_result {
+    size_t bytes;
+    cudaStream_t stream_used;
+  };
+
+  copy_result enqueue_device_copies(size_t offset,
+                                    size_t size,
+                                    uint8_t* dst,
+                                    rmm::cuda_stream_view stream);
+
   std::unique_ptr<cache_ranges> ranges_;
   std::shared_ptr<cudf::io::datasource> fallback_;
   std::atomic<size_t> total_bytes_read_from_cache_{0};

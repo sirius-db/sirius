@@ -68,6 +68,21 @@ size_t prefetched_data_source::host_read(size_t offset, size_t size, uint8_t* ds
   }
 }
 
+namespace {
+
+struct cuda_event_guard {
+  cudaEvent_t event{};
+  cuda_event_guard() { RMM_CUDA_TRY(::cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
+  ~cuda_event_guard()
+  {
+    if (event) { ::cudaEventDestroy(event); }
+  }
+  cuda_event_guard(cuda_event_guard const&)            = delete;
+  cuda_event_guard& operator=(cuda_event_guard const&) = delete;
+};
+
+}  // namespace
+
 std::unique_ptr<cudf::io::datasource::buffer> prefetched_data_source::device_read(
   size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
@@ -76,13 +91,9 @@ std::unique_ptr<cudf::io::datasource::buffer> prefetched_data_source::device_rea
   return cudf::io::datasource::buffer::create(std::move(buffer));
 }
 
-size_t prefetched_data_source::device_read(size_t offset,
-                                           size_t size,
-                                           uint8_t* dst,
-                                           rmm::cuda_stream_view stream)
+prefetched_data_source::copy_result prefetched_data_source::enqueue_device_copies(
+  size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
-  if (size == 0) return 0;
-
   std::vector<std::span<const std::byte>> spans;
   try {
     spans = ranges_->get_ranges(offset, size);
@@ -90,18 +101,16 @@ size_t prefetched_data_source::device_read(size_t offset,
     if (!fallback_) throw;
 
     size_t bytes_read = 0;
-    // Fallback: let the underlying datasource handle the device read (or host read + copy).
     if (fallback_->supports_device_read()) {
       bytes_read = fallback_->device_read(offset, size, dst, stream);
     } else {
-      // Fallback does not support device read; read to host then copy to device.
       auto host_buf = fallback_->host_read(offset, size);
       RMM_CUDA_TRY(::cudaMemcpyAsync(
         dst, host_buf->data(), host_buf->size(), cudaMemcpyHostToDevice, stream.value()));
       bytes_read = host_buf->size();
     }
     total_bytes_read_from_fallback_.fetch_add(bytes_read, std::memory_order_relaxed);
-    return bytes_read;
+    return {bytes_read, stream.value()};
   }
 
   std::vector<void*> src_ptrs;
@@ -119,11 +128,13 @@ size_t prefetched_data_source::device_read(size_t offset,
     bytes_queued += span.size();
   }
 
+  cudaStream_t stream_used = stream.value();
+
 // Batch copy if cudaMemcpyBatchAsync is available (CUDA 13+), otherwise fall back to per-span
 // async copies.
 #if CUDART_VERSION >= 13000
-  bool user_stream           = stream.value() != nullptr && stream.value() != cudaStreamLegacy;
-  cudaStream_t stream_handle = user_stream ? stream.value() : cudaStreamPerThread;
+  bool user_stream = stream.value() != nullptr && stream.value() != cudaStreamLegacy;
+  stream_used      = user_stream ? stream.value() : cudaStreamPerThread;
   cudaMemcpyAttributes attr{};
   attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
   attr.srcLocHint = {cudaMemLocationTypeHost, (ranges_->numa_id() >= 0) ? ranges_->numa_id() : 0};
@@ -131,8 +142,7 @@ size_t prefetched_data_source::device_read(size_t offset,
                      (ranges_->device_id() >= 0) ? ranges_->device_id() : 0};
   attr.flags      = cudaMemcpyFlagDefault;
   RMM_CUDA_TRY(::cudaMemcpyBatchAsync(
-    dst_ptrs.data(), src_ptrs.data(), counts.data(), counts.size(), attr, stream_handle));
-  if (!user_stream) { RMM_CUDA_TRY(::cudaStreamSynchronize(stream_handle)); }
+    dst_ptrs.data(), src_ptrs.data(), counts.data(), counts.size(), attr, stream_used));
 #else
   for (size_t i = 0; i < dst_ptrs.size(); ++i) {
     RMM_CUDA_TRY(::cudaMemcpyAsync(
@@ -141,7 +151,21 @@ size_t prefetched_data_source::device_read(size_t offset,
 #endif
 
   total_bytes_read_from_cache_.fetch_add(bytes_queued, std::memory_order_relaxed);
-  return bytes_queued;
+  return {bytes_queued, stream_used};
+}
+
+size_t prefetched_data_source::device_read(size_t offset,
+                                           size_t size,
+                                           uint8_t* dst,
+                                           rmm::cuda_stream_view stream)
+{
+  if (size == 0) return 0;
+  auto [bytes, stream_used] = enqueue_device_copies(offset, size, dst, stream);
+#if CUDART_VERSION >= 13000
+  bool user_stream = stream.value() != nullptr && stream.value() != cudaStreamLegacy;
+  if (!user_stream) { RMM_CUDA_TRY(::cudaStreamSynchronize(stream_used)); }
+#endif
+  return bytes;
 }
 
 std::future<size_t> prefetched_data_source::device_read_async(size_t offset,
@@ -149,8 +173,19 @@ std::future<size_t> prefetched_data_source::device_read_async(size_t offset,
                                                               uint8_t* dst,
                                                               rmm::cuda_stream_view stream)
 {
-  return std::async(std::launch::async, [this, offset, size, dst, stream]() {
-    return device_read(offset, size, dst, stream);
+  if (size == 0) {
+    std::promise<size_t> p;
+    p.set_value(0);
+    return p.get_future();
+  }
+
+  auto [bytes, stream_used] = enqueue_device_copies(offset, size, dst, stream);
+  auto guard                = std::make_shared<cuda_event_guard>();
+  RMM_CUDA_TRY(::cudaEventRecord(guard->event, stream_used));
+
+  return std::async(std::launch::deferred, [guard = std::move(guard), bytes]() {
+    RMM_CUDA_TRY(::cudaEventSynchronize(guard->event));
+    return bytes;
   });
 }
 
