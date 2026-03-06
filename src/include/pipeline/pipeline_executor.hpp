@@ -155,6 +155,13 @@ class pipeline_executor {
    */
   std::future<void> start_query();
 
+  /**
+   * @brief Terminate the query execution and report the error to duckdb.
+   *
+   * @param error The error to report.
+   */
+  void terminate_query(std::exception_ptr error);
+
  private:
   void management_eventloop();
 
