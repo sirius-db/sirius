@@ -15,6 +15,9 @@
 name: Check
 
 on:
+  push:
+    branches:
+      - dev
   pull_request:
 
 jobs:
