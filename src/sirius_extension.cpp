@@ -42,6 +42,7 @@
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
+#include "util/segfault_backtrace.hpp"
 
 #include <cstdlib>
 
@@ -846,6 +847,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  sirius::util::install_segfault_backtrace_handler();
+
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
   config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());

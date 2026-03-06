@@ -193,7 +193,8 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
-    src/util/stream_check_wrapper.cpp)
+    src/util/stream_check_wrapper.cpp
+    src/util/segfault_backtrace_handler.cpp)
 
 set(CUDA_SOURCES
     src/cuda/allocator.cu

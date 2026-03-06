@@ -39,6 +39,7 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_LINKER_TYPE": "MOLD",
         "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake",
+        "EXPORT_DYNAMIC_SYMBOLS": "ON",
         "EXTENSION_STATIC_BUILD": "ON"
       },
       "generator": "Ninja",
