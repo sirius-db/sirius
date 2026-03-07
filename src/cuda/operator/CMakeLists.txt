@@ -24,5 +24,6 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/strings_matching.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/substring.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/strlen_from_offsets.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/empty_str_check.cu
         PARENT_SCOPE
 )
