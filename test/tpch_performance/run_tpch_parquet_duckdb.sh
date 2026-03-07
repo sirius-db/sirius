@@ -3,7 +3,11 @@
 # Used as a baseline for validating Sirius results.
 #
 # Usage:
-#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh <scale_factor> <query_numbers...>
+#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh [--parquet-dir <path>] <scale_factor> <query_numbers...>
+#
+# Example:
+#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh 100 1 3 6
+#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh --parquet-dir /data/tpch 100 1 3 6
 #
 # Environment variables:
 #   TIMING_CSV  - path to write per-query timing CSV (optional)
@@ -15,8 +19,14 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
 
+PARQUET_DIR=""
+if [ "${1:-}" = "--parquet-dir" ]; then
+    PARQUET_DIR="$2"
+    shift 2
+fi
+
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] <scale_factor> <query_numbers...>"
     exit 1
 fi
 
@@ -24,7 +34,9 @@ SF="$1"
 shift
 QUERIES=("$@")
 
-PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+if [ -z "$PARQUET_DIR" ]; then
+    PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+fi
 
 if [ ! -d "$PARQUET_DIR" ]; then
     echo "ERROR: Parquet directory not found: $PARQUET_DIR"
