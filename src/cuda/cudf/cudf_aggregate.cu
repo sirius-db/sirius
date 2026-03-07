@@ -127,12 +127,6 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
         } else if (num_rows > 1) {
           to_cudf_type = cudf::data_type(cudf::type_id::INT32);
         }
-      } else if (to_cudf_type.id() == cudf::type_id::DECIMAL32) {
-        int32_t scale = to_cudf_type.scale();
-        to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL64, scale);
-      } else if (to_cudf_type.id() == cudf::type_id::DECIMAL64) {
-        int32_t scale = to_cudf_type.scale();
-        to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL128, scale);
       }
 
       // CuDF reduce will return an invalid scalar if all values are NULL
