@@ -409,6 +409,21 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    */
   [[nodiscard]] uint64_t get_task_id() const { return _task_id; }
 
+  /**
+   * @brief Set whether this task should operate on materialized (decoded) columns.
+   *
+   * @param materialized_columns True to use materialized columns, false otherwise.
+   * @param gpu_memory_space     Pointer to the GPU memory space used for materialization.
+   */
+  void set_materialized_columns(bool wrap_in_cache,
+                                bool materialized_columns,
+                                cucascade::memory::memory_space* gpu_memory_space)
+  {
+    _wrap_in_cache        = wrap_in_cache;
+    _materialized_columns = materialized_columns;
+    _gpu_memory_space     = gpu_memory_space;
+  }
+
  private:
   /**
    * @brief Read the given byte range from the parquet file into the memory allocation for this
@@ -424,6 +439,10 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   uint64_t _task_id;                   ///< The unique ID of this task
   shared_data_repository* _data_repo;  ///< The shared data repository to which to push batches
   std::shared_ptr<cudf::io::datasource> _datasource;  ///< The cudf datasource for the input file
+  bool _wrap_in_cache{false};
+  bool _materialized_columns{false};  ///< Whether this task operates on materialized columns
+  cucascade::memory::memory_space* _gpu_memory_space{
+    nullptr};  ///< GPU memory space for materialization
 };
 
 }  // namespace sirius::op::scan

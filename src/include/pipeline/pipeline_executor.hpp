@@ -131,7 +131,9 @@ class pipeline_executor {
    *
    * @param enabled True to enable caching, false to disable
    */
-  void set_scan_caching_enabled(bool enabled);
+  void set_scan_caching_enabled(bool enabled,
+                                bool cache_decoded_table = false,
+                                bool cache_in_gpu        = false);
 
   /**
    * @brief Set the priority scan operators

@@ -81,6 +81,13 @@ struct sirius_config {
 
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _enable_scan_caching; }
 
+  [[nodiscard]] bool is_cache_decoded_table_enabled() const noexcept
+  {
+    return _cache_decoded_table;
+  }
+
+  [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept { return _cache_in_gpu; }
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -100,6 +107,8 @@ struct sirius_config {
   exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
                                                         .thread_name_prefix = "duckdb_scan"};
   bool _enable_scan_caching = false;
+  bool _cache_decoded_table = false;
+  bool _cache_in_gpu        = false;
   operator_params _operator_params;
 };
 

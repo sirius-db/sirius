@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <data/cached_data_representation.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <op/scan/cached_ranges.hpp>
@@ -278,6 +279,32 @@ void register_parquet_converters(cucascade::representation_converter_registry& r
   if (!registry.has_converter<host_parquet_representation, host_parquet_representation>()) {
     registry.register_converter<host_parquet_representation, host_parquet_representation>(
       detail::convert_host_parquet_to_host_parquet);
+  }
+
+  if (!registry
+         .has_converter<cached_host_data_representation, cucascade::gpu_table_representation>()) {
+    registry
+      .register_converter<cached_host_data_representation, cucascade::gpu_table_representation>(
+        [&registry](cucascade::idata_representation& source,
+                    const cucascade::memory::memory_space* target_memory_space,
+                    rmm::cuda_stream_view stream) {
+          auto r = source.cast<cached_host_data_representation>().get_representation();
+          return registry.convert<cucascade::gpu_table_representation>(
+            *r, target_memory_space, stream);
+        });
+  }
+
+  if (!registry.has_converter<cached_host_parquet_representation,
+                              cucascade::gpu_table_representation>()) {
+    registry
+      .register_converter<cached_host_parquet_representation, cucascade::gpu_table_representation>(
+        [&registry](cucascade::idata_representation& source,
+                    const cucascade::memory::memory_space* target_memory_space,
+                    rmm::cuda_stream_view stream) {
+          auto r = source.cast<cached_host_parquet_representation>().get_representation();
+          return registry.convert<cucascade::gpu_table_representation>(
+            *r, target_memory_space, stream);
+        });
   }
 }
 

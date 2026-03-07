@@ -17,6 +17,8 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
+#include <data/host_parquet_representation_converters.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
@@ -32,7 +34,10 @@
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 
 // cudf
+#include "cucascade/data/cpu_data_representation.hpp"
+#include "cucascade/data/gpu_data_representation.hpp"
 #include "cudf/cudf_utils.hpp"
+#include "data/cached_data_representation.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -357,7 +362,7 @@ parquet_scan_task::~parquet_scan_task()
 // Parquet Scan Task
 //===----------------------------------------------------------------------===//
 std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
-  rmm::cuda_stream_view /* stream */)
+  [[maybe_unused]] rmm::cuda_stream_view stream)
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
@@ -411,10 +416,36 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   l_state.get_reserved_compressed_bytes(),
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   _datasource);
-  auto data_batch =
-    std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
+
+  std::shared_ptr<cucascade::data_batch> batch;
+  if (_materialized_columns) {
+    auto& registry          = sirius::converter_registry::get();
+    auto materialized_table = registry.convert<cucascade::gpu_table_representation>(
+      *parquet_representation, _gpu_memory_space, stream);
+    stream.synchronize();
+    parquet_representation.reset();
+    auto host_table = registry.convert<cucascade::host_data_representation>(
+      *materialized_table, l_state.get_memory_space(), stream);
+    if (_wrap_in_cache) {
+      batch = std::make_shared<cucascade::data_batch>(
+        get_next_batch_id(),
+        std::make_unique<cached_host_data_representation>(std::move(host_table)));
+    } else {
+      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(host_table));
+    }
+  } else {
+    if (_wrap_in_cache) {
+      batch = std::make_shared<cucascade::data_batch>(
+        get_next_batch_id(),
+        std::make_unique<cached_host_parquet_representation>(std::move(parquet_representation)));
+    } else {
+      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(),
+                                                      std::move(parquet_representation));
+    }
+  }
   auto result = std::make_unique<op::operator_data>(
-    std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
+    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
+
   auto const task_end = std::chrono::high_resolution_clock::now();
   auto const task_duration =
     std::chrono::duration_cast<std::chrono::microseconds>(task_end - task_start);

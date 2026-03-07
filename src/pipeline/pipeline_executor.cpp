@@ -124,9 +124,11 @@ pipeline_executor::get_scan_executor() noexcept
   return *_scan_executor;
 }
 
-void pipeline_executor::set_scan_caching_enabled(bool enabled)
+void pipeline_executor::set_scan_caching_enabled(bool enabled,
+                                                 bool cache_decoded_table,
+                                                 bool cache_in_gpu)
 {
-  _scan_executor->set_scan_caching_enabled(enabled);
+  _scan_executor->set_scan_caching_enabled(enabled, cache_decoded_table, cache_in_gpu);
 }
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)

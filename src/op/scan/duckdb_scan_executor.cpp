@@ -17,6 +17,10 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 
 #include "creator/task_creator.hpp"
+#include "cucascade/data/cpu_data_representation.hpp"
+#include "cucascade/data/data_batch.hpp"
+#include "cucascade/data/gpu_data_representation.hpp"
+#include "data/cached_data_representation.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/host_parquet_representation.hpp"
 #include "log/logging.hpp"
@@ -26,6 +30,8 @@
 #include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <cucascade/memory/common.hpp>
 
@@ -42,6 +48,10 @@ duckdb_scan_executor::duckdb_scan_executor(
     _task_request_publisher(std::move(task_request_publisher)),
     _mem_mgr(mem_mgr)
 {
+  auto gpu_spaces   = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  _gpu_memory_space = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  _stream_pool      = std::make_unique<cucascade::memory::exclusive_stream_pool>(
+    rmm::cuda_device_id(_gpu_memory_space->get_device_id()), _config.num_threads);
 }
 
 duckdb_scan_executor::~duckdb_scan_executor()
@@ -107,10 +117,18 @@ void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query
   _cache.clear();
 }
 
-void duckdb_scan_executor::set_scan_caching_enabled(bool enabled)
+void duckdb_scan_executor::set_scan_caching_enabled(bool enabled,
+                                                    bool cache_decoded_table,
+                                                    bool cache_in_gpu)
 {
-  _caching_enabled = enabled;
-  SIRIUS_LOG_INFO("Scan caching {}", enabled ? "enabled" : "disabled");
+  _caching_enabled     = enabled;
+  _cache_decoded_table = cache_decoded_table;
+  _cache_in_gpu        = cache_in_gpu;
+  _wrap_batch_data     = _caching_enabled && !_cache_in_gpu;
+  SIRIUS_LOG_INFO("Scan caching {} (cache_decoded_table={}, cache_in_gpu={})",
+                  enabled ? "enabled" : "disabled",
+                  cache_decoded_table,
+                  cache_in_gpu);
 }
 
 void duckdb_scan_executor::prepare_cache_for_scan_operators(
@@ -156,6 +174,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 
   auto clone_batches = [&](const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
                            rmm::cuda_stream_view stream) {
+    if (_cache_in_gpu) { return batches; }
     std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
     cloned_batches.reserve(batches.size());
     if (is_duckdb_scan) {
@@ -165,8 +184,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
     } else if (is_parquet_scan) {
       for (auto& batch : batches) {
         auto* idata_rep = batch->get_data();
-        if (auto* parquet_rep = dynamic_cast<host_parquet_representation*>(idata_rep);
-            parquet_rep) {
+        if (auto* host_data = dynamic_cast<cached_host_data_representation*>(idata_rep);
+            host_data) {
+          cloned_batches.push_back(std::make_shared<cucascade::data_batch>(
+            get_next_batch_id(), host_data->shallow_clone()));
+        } else if (auto* parquet_rep = dynamic_cast<cached_host_parquet_representation*>(idata_rep);
+                   parquet_rep) {
           cloned_batches.push_back(std::make_shared<cucascade::data_batch>(
             get_next_batch_id(), parquet_rep->shallow_clone()));
         } else {
@@ -225,6 +248,11 @@ void duckdb_scan_executor::manager_loop()
 
     auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
     if (scan_task && scan_task->is<parquet_scan_task>()) {
+      auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
+      if (_caching_enabled || _cache_in_gpu) {
+        parquet_task->set_materialized_columns(
+          _wrap_batch_data, _cache_decoded_table, _gpu_memory_space);
+      }
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
@@ -245,16 +273,18 @@ void duckdb_scan_executor::manager_loop()
       }
     }
 
-    auto stream = cudf::get_default_stream();
+    auto exc_stream = _stream_pool->acquire_stream(
+      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
     _thread_pool->schedule([this,
                             ticket    = std::move(ticket),
-                            stream    = std::move(stream),
+                            stream    = std::move(exc_stream),
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
       try {
         auto consumers = scan_task->get_output_consumers();
         {
           auto output_data = get_scan_output(scan_task, stream);
+          stream->synchronize();
           scan_task->publish_output(*output_data, stream);
         }
 
