@@ -14,11 +14,12 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=/home/felipe/sirius/test/cpp/integration/integration.cfg
-#   ./test/tpch_performance/run_tpch_parquet.sh <engine> <scale_factor> <iterations> <query_numbers...>
+#   ./test/tpch_performance/run_tpch_parquet.sh [--parquet-dir <path>] <engine> <scale_factor> <iterations> <query_numbers...>
 # with engine = [sirius/duckdb]
 #
 # Example:
 #   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 3 `seq 1 22`
+#   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 3 `seq 1 22`
 #
 # Environment variables:
 #   SIRIUS_CONFIG_FILE - path to Sirius config file (required)
@@ -30,8 +31,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
 
+PARQUET_DIR=""
+if [ "${1:-}" = "--parquet-dir" ]; then
+    PARQUET_DIR="$2"
+    shift 2
+fi
+
 if [ $# -lt 4 ]; then
-    echo "Usage: $0 <engine> <scale_factor> <iterations> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] <engine> <scale_factor> <iterations> <query_numbers...>"
     echo "Example: $0 sirius 100 3 \`seq 1 22\`"
     exit 1
 fi
@@ -49,7 +56,9 @@ if ! [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+if [ -z "$PARQUET_DIR" ]; then
+    PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+fi
 
 if [ "$ENGINE" != "sirius" ] && [ "$ENGINE" != "duckdb" ]; then
     echo "Unknown engine, please use sirius or duckdb"
