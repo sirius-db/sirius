@@ -523,13 +523,30 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   // Replaces string key columns with xxhash_64 fingerprints for the groupby,
   // then recovers original strings via distinct_indices + join.
   // Expected to help at 100M+ rows where string data >> hash data.
+  //
+  // Guard: P4's join-back step is O(distinct_groups). At high cardinality
+  // (groups ≈ input rows), join-back cost dominates any hashing savings.
+  // Only apply when estimated_output_groups < threshold.
+  // Override: SIRIUS_P4_MAX_GROUPS env var (default 100000).
   if (std::getenv("SIRIUS_P4_HASH_GROUPBY")) {
+    static idx_t p4_max_groups = []() -> idx_t {
+      const char* env = std::getenv("SIRIUS_P4_MAX_GROUPS");
+      return env ? std::stoull(env) : 100000ULL;
+    }();
+
     bool has_string_key = false;
     for (int key = 0; key < num_keys; key++) {
       if (keys[key]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
         has_string_key = true;
         break;
       }
+    }
+
+    if (has_string_key && estimated_output_groups > 0 &&
+        estimated_output_groups >= p4_max_groups) {
+      SIRIUS_LOG_DEBUG("P4 guard: skip (estimated_groups={} >= max={})",
+                       estimated_output_groups, p4_max_groups);
+      has_string_key = false;
     }
 
     if (has_string_key) {
