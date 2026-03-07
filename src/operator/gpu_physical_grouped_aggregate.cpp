@@ -310,7 +310,7 @@ CombineColumns(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPU
 // }
 
 void
-HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys, idx_t estimated_output_groups) {
 
 	AggregationType* agg_mode = gpuBufferManager->customCudaHostAlloc<AggregationType>(aggregates.size());
 	SIRIUS_LOG_DEBUG("Handling group by aggregate expression");
@@ -359,11 +359,11 @@ HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 		}
 	}
 	
-	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, aggregates.size(), agg_mode);
+	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, aggregates.size(), agg_mode, estimated_output_groups);
 }
 
 void
-HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys, idx_t estimated_output_groups) {
 	AggregationType* distinct_mode = gpuBufferManager->customCudaHostAlloc<AggregationType>(distinct_info.indices.size());
 
 	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
@@ -378,7 +378,7 @@ HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<s
 		}
 	}
 
-	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, distinct_info.indices.size(), distinct_mode);
+	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, distinct_info.indices.size(), distinct_mode, estimated_output_groups);
 }
 
 void
@@ -714,7 +714,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX) {
 				throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
 			} else {
-				HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+				HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys, estimated_cardinality);
 			}
 		}
 	}

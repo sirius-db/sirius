@@ -136,7 +136,7 @@ void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c,
     cudaDeviceSynchronize();
 }
 
-void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
+void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode, idx_t estimated_output_groups)
 {
   if (keys[0]->column_length == 0) {
     SIRIUS_LOG_DEBUG("Input size is 0");
@@ -281,13 +281,33 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   //   1. Normal groupby for non-CD aggregates (with cheap placeholder for CD slots)
   //   2. Two-phase COUNT DISTINCT for each CD aggregate
   //   3. Align results via left_join on group keys
+  //
+  // Guard: skip P1b when input is large relative to expected output groups.
+  // At high rows/group the distinct step doesn't reduce data enough to justify
+  // the extra join+gather+scatter overhead (e.g. Q09 regression at 100M rows).
+  // Tune via SIRIUS_P1B_K env var (default 1000).
   {
+    static idx_t p1b_K = []() -> idx_t {
+      const char* env = std::getenv("SIRIUS_P1B_K");
+      return env ? std::stoull(env) : 1000ULL;
+    }();
+
     int num_cd = 0;
     for (int agg = 0; agg < num_aggregates; agg++) {
       if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) num_cd++;
     }
 
-    if (num_cd > 0 && num_cd < num_aggregates) {
+    bool skip_p1b = false;
+    if (num_cd > 0 && num_cd < num_aggregates && estimated_output_groups > 0) {
+      idx_t size_threshold = p1b_K * estimated_output_groups;
+      if (size > size_threshold) {
+        skip_p1b = true;
+        SIRIUS_LOG_DEBUG("P1b guard: skip (size={} > K={} * groups={} = {})",
+                         size, p1b_K, estimated_output_groups, size_threshold);
+      }
+    }
+
+    if (num_cd > 0 && num_cd < num_aggregates && !skip_p1b) {
       SIRIUS_LOG_DEBUG("Mixed aggregate: {} COUNT_DISTINCT + {} other", num_cd, num_aggregates - num_cd);
 
       // Step 1: Normal groupby with COUNT placeholder for CD aggregates

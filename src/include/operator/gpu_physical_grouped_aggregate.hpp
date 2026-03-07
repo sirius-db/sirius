@@ -29,7 +29,7 @@ namespace duckdb {
 
 uint64_t* createFixedSizeOffsets(size_t record_size, uint64_t num_rows);
 
-void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode);
+void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode, idx_t estimated_output_groups = 0);
 
 void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t num_keys);
 
