@@ -233,7 +233,6 @@ echo "Validation CSV saved to $VALIDATION_CSV"
 # Build combined timings CSV in long format.
 # Source files: <run>/<engine>/q<N>/timings.csv
 #   step,runtime_s
-#   views,0.12       <- skip (view creation, not a query iteration)
 #   iter_1,4.56
 #   iter_2,1.23
 # Output: engine,query,iteration,runtime_s
@@ -247,7 +246,7 @@ for engine in sirius duckdb; do
         TIMING_FILE="$RUN_DIR/$engine/q${q}/timings.csv"
         [[ ! -f "$TIMING_FILE" ]] && continue
 
-        # Skip the header line and the 'views' row; extract iter_N rows.
+        # Skip the header line; extract iter_N rows.
         awk -F',' -v engine="$engine" -v query="Q${q}" '
             NR == 1 { next }                       # skip CSV header
             $1 ~ /^iter_/ {
