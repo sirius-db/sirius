@@ -26,6 +26,7 @@
 #include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
 #include <memory>
@@ -148,7 +149,9 @@ class duckdb_scan_executor {
    *
    * @param enabled True to enable caching, false to disable
    */
-  void set_scan_caching_enabled(bool enabled);
+  void set_scan_caching_enabled(bool enabled,
+                                bool cache_decoded_table = false,
+                                bool cache_in_gpu        = false);
 
   /**
    * @brief Check if scan result caching is enabled
@@ -191,11 +194,15 @@ class duckdb_scan_executor {
   std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
   std::size_t _query_hash{0};
   bool _caching_enabled{false};
+  bool _cache_decoded_table{false};
+  bool _wrap_batch_data{false};
+  bool _cache_in_gpu{false};
   bool _preload_mode{false};
 
   std::atomic<bool> _running{false};
   exec::thread_pool_config _config;
   exec::kiosk _kiosk;
+  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
   std::unique_ptr<exec::thread_pool> _thread_pool;
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
   std::thread _manager_thread;
@@ -203,6 +210,7 @@ class duckdb_scan_executor {
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   sirius::pipeline::completion_handler* _completion_handler{nullptr};
+  cucascade::memory::memory_space* _gpu_memory_space{nullptr};
 };
 
 }  // namespace sirius::op::scan

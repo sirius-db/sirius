@@ -92,9 +92,11 @@ set(EXTENSION_SOURCES
     src/op/order/gpu_order_impl.cpp
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
+    src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/parquet_scan_task.cpp
+    src/op/scan/prefetched_data_source.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -191,7 +193,8 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
-    src/util/stream_check_wrapper.cpp)
+    src/util/stream_check_wrapper.cpp
+    src/util/segfault_backtrace_handler.cpp)
 
 set(CUDA_SOURCES
     src/cuda/allocator.cu

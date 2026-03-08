@@ -192,7 +192,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   pipeline_executor_->start();
 
   // Configure scan caching based on config
-  pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled());
+  pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled(),
+                                               config_.is_cache_decoded_table_enabled(),
+                                               config_.is_cache_in_gpu_enabled());
 
   is_initialized_ = true;
 }

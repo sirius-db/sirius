@@ -26,6 +26,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <mutex>
+
 namespace sirius {
 namespace op {
 
@@ -236,38 +238,36 @@ int sirius_physical_partition::determine_num_partitions()
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
 {
-  std::unique_lock<std::mutex> guard(lock, std::try_to_lock);
-  if (!guard.owns_lock()) {
-    throw std::runtime_error(
-      "set_num_partitions failed to acquire lock for partition operator " +
-      std::to_string(get_operator_id()) +
-      " — likely a cross-partition deadlock: both sibling partitions are simultaneously "
-      "in get_next_task_input_data");
-  }
+  std::lock_guard<std::mutex> guard(lock);
   _num_partitions = num_partitions;
 }
 
 std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_data()
 {
-  {
+  // Lock both this and the sibling partition atomically to prevent ABBA deadlock:
+  // without this, two threads entering get_next_task_input_data on sibling partitions
+  // simultaneously would each hold their own lock while trying to acquire the other's.
+  if (_sibling_partition_op) {
+    auto& sibling = _sibling_partition_op->Cast<sirius_physical_partition>();
+    std::scoped_lock guard(lock, sibling.lock);
+    if (!_num_partitions.has_value()) {
+      _num_partitions         = determine_num_partitions();
+      sibling._num_partitions = _num_partitions.value();
+      SIRIUS_LOG_DEBUG(
+        "sirius_physical_partition id {} determined {} partitions on sibling id {} and {} build "
+        "side",
+        this->get_operator_id(),
+        _num_partitions.value(),
+        _sibling_partition_op->get_operator_id(),
+        (_is_build ? "is" : "is not"));
+    }
+  } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
       _num_partitions = determine_num_partitions();
-      if (_sibling_partition_op) {
-        SIRIUS_LOG_DEBUG(
-          "sirius_physical_partition id {} determined {} partitions on sibling id {} and {} build "
-          "side",
-          this->get_operator_id(),
-          _num_partitions.value(),
-          _sibling_partition_op->get_operator_id(),
-          (_is_build ? "is" : "is not"));
-        _sibling_partition_op->Cast<sirius_physical_partition>().set_num_partitions(
-          _num_partitions.value());
-      } else {
-        SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions",
-                         this->get_operator_id(),
-                         _num_partitions.value());
-      }
+      SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions",
+                       this->get_operator_id(),
+                       _num_partitions.value());
     }
   }
   return sirius_physical_operator::get_next_task_input_data();

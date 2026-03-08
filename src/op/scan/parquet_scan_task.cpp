@@ -17,6 +17,8 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
+#include <data/host_parquet_representation_converters.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
@@ -32,7 +34,10 @@
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 
 // cudf
+#include "cucascade/data/cpu_data_representation.hpp"
+#include "cucascade/data/gpu_data_representation.hpp"
 #include "cudf/cudf_utils.hpp"
+#include "data/cached_data_representation.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -357,7 +362,7 @@ parquet_scan_task::~parquet_scan_task()
 // Parquet Scan Task
 //===----------------------------------------------------------------------===//
 std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
-  rmm::cuda_stream_view /* stream */)
+  [[maybe_unused]] rmm::cuda_stream_view stream)
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
@@ -384,19 +389,16 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     reader->all_column_chunks_byte_ranges(l_state.get_rg_span(), g_state.get_options());
 
   // Read each byte range into the allocation asynchronously
-  std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
-  new_byte_ranges.reserve(byte_ranges.size());
-  int64_t new_offset = 0;
+  int64_t bytes_read = 0;
   std::vector<std::future<std::size_t>> read_futures;
   for (auto const& range : byte_ranges) {
     read_range_into_allocation(
       range.offset(), range.size(), data_accessor, allocation, read_futures);
-    new_byte_ranges.emplace_back(new_offset, range.size());
-    new_offset += range.size();
+    bytes_read += range.size();
   }
   std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
 
-  if (new_offset != l_state.get_reserved_compressed_bytes()) {
+  if (bytes_read != l_state.get_reserved_compressed_bytes()) {
     // Metadata / file data mismatch
     throw std::runtime_error(
       "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
@@ -410,13 +412,40 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   std::move(reader),
                                                   g_state.get_options(),
                                                   std::move(l_state.get_rg_indices()),
-                                                  std::move(new_byte_ranges),
+                                                  std::move(byte_ranges),
                                                   l_state.get_reserved_compressed_bytes(),
-                                                  l_state.get_reserved_uncompressed_bytes());
-  auto data_batch =
-    std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
+                                                  l_state.get_reserved_uncompressed_bytes(),
+                                                  _datasource);
+
+  std::shared_ptr<cucascade::data_batch> batch;
+  if (_materialized_columns) {
+    auto& registry          = sirius::converter_registry::get();
+    auto materialized_table = registry.convert<cucascade::gpu_table_representation>(
+      *parquet_representation, _gpu_memory_space, stream);
+    stream.synchronize();
+    parquet_representation.reset();
+    auto host_table = registry.convert<cucascade::host_data_representation>(
+      *materialized_table, l_state.get_memory_space(), stream);
+    if (_wrap_in_cache) {
+      batch = std::make_shared<cucascade::data_batch>(
+        get_next_batch_id(),
+        std::make_unique<cached_host_data_representation>(std::move(host_table)));
+    } else {
+      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(host_table));
+    }
+  } else {
+    if (_wrap_in_cache) {
+      batch = std::make_shared<cucascade::data_batch>(
+        get_next_batch_id(),
+        std::make_unique<cached_host_parquet_representation>(std::move(parquet_representation)));
+    } else {
+      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(),
+                                                      std::move(parquet_representation));
+    }
+  }
   auto result = std::make_unique<op::operator_data>(
-    std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
+    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
+
   auto const task_end = std::chrono::high_resolution_clock::now();
   auto const task_duration =
     std::chrono::duration_cast<std::chrono::microseconds>(task_end - task_start);
