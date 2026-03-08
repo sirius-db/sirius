@@ -26,6 +26,9 @@
 namespace duckdb {
 namespace sirius {
 
+// Returns an INT32 column where result[i] = length in bytes of the string at position i.
+// Computed via offset arithmetic: result[i] = offsets[i+1] - offsets[i].
+// Equivalent to LENGTH(col) but avoids materializing the string chars buffer.
 std::unique_ptr<cudf::column> StrlenFromOffsets(const uint64_t* offsets,
                                                  const uint64_t* row_ids,
                                                  size_t num_rows,

@@ -75,10 +75,6 @@ void HandleTopN(vector<shared_ptr<GPUColumn>>& order_by_keys,
 SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) const
 {
   auto start = std::chrono::high_resolution_clock::now();
-  // Reset sort_result so stale data from a previous run never conflicts with this run.
-  for (int col = 0; col < static_cast<int>(types.size()); col++) {
-    sort_result->columns[col] = nullptr;
-  }
   // throw NotImplementedException("Top N Sink not implemented");
   if (dynamic_filter) {
     // `dynamic_filter` is currently not leveraged
