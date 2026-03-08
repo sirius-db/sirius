@@ -4,19 +4,66 @@ This document defines common patterns used across all debugging skills.
 
 ## Build Modes
 
-All skills support two build presets:
-- `release` -- optimized build, default for most analysis
-- `clang-debug` -- clang compiler with debug symbols, required for sanitizers (ASan/TSan)
+All skills support three build presets:
+- `release` -- optimized build, no debug symbols. Default for performance testing and general use.
+- `relwithdebinfo` -- optimized build **with** debug symbols. Best for profiling (nsys), cuda-gdb crash debugging, and getting meaningful stack traces at near-production speed. Also available as `clang-relwithdebinfo`.
+- `clang-debug` -- clang compiler, unoptimized with full debug symbols. Required for sanitizers (ASan/TSan). Slowest but most debuggable.
+
+**When to use which preset:**
+| Preset | Speed | Debug symbols | Sanitizers | Use for |
+|--------|-------|---------------|------------|---------|
+| `release` | Fastest | No | No | Performance benchmarks, general queries |
+| `relwithdebinfo` | Fast | Yes | No | Profiling (nsys), crash backtraces, cuda-gdb |
+| `clang-debug` | Slow | Yes | Yes (ASan/TSan) | Race detection, memory error detection |
 
 **Build command pattern (always use pixi):**
 ```bash
 cd /home/bwyogatama/sirius
 pixi run -e clang make release
 # or
+pixi run -e clang make relwithdebinfo
+# or
 pixi run -e clang make clang-debug
 ```
 
 **Important:** Always build inside a pixi environment. Pixi manages all dependencies (CUDA toolkit, cuDF, clang, sccache, etc.) via `pixi.toml`.
+
+## AddressSanitizer (ASan)
+
+ASan detects CPU-side memory errors: heap/stack buffer overflows, use-after-free, double-free, and memory leaks. It does **not** detect GPU memory errors (use NVIDIA Compute Sanitizer `memcheck` for that).
+
+**How ASan is configured:**
+DuckDB's CMake has `ENABLE_SANITIZER=TRUE` by default, which adds `-fsanitize=address` to Debug builds only (via `CXX_EXTRA_DEBUG`). This means:
+- **`clang-debug`**: ASan is **on by default** -- no extra flags needed
+- **`release` / `relwithdebinfo`**: ASan is **not active** (the flag only applies to Debug build types)
+
+**To explicitly disable ASan in debug builds** (e.g., when using TSan instead):
+```bash
+pixi run -e clang make clang-debug EXTRA_CMAKE_FLAGS="-DENABLE_SANITIZER=0"
+```
+
+**ASan vs TSan -- mutually exclusive:**
+ASan and TSan cannot be used simultaneously. DuckDB will warn and disable ASan if both are enabled. Use separate builds:
+- ASan build: `clang-debug` (default, no extra flags)
+- TSan build: `clang-debug` with `EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON -DENABLE_SANITIZER=0"`
+
+**ASan runtime options:**
+```bash
+ASAN_OPTIONS="detect_leaks=1:halt_on_error=0:print_legend=1" build/clang-debug/duckdb ...
+```
+- `detect_leaks=1`: Also report memory leaks at exit
+- `halt_on_error=0`: Continue after first error (collect multiple reports)
+- `halt_on_error=1` (default): Stop on first error (better for interactive debugging)
+
+**ASan overhead:** ~2x slowdown, ~2-3x memory increase. Much lighter than Valgrind.
+
+**What ASan catches (CPU-side only):**
+- Heap buffer overflow / underflow
+- Stack buffer overflow
+- Use-after-free / use-after-return
+- Double-free
+- Memory leaks (with `detect_leaks=1`)
+- Stack use after scope (with `-fsanitize-address-use-after-scope`)
 
 ## SQL Query Execution
 

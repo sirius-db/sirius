@@ -30,12 +30,13 @@ Find which commit introduced a bug using `git bisect` with automated build+test.
 3. **Establish CPU baseline** (if test is a SQL query):
    Run the query via DuckDB CPU to get the expected correct result. Save to a temp file.
 
-4. **Create bisect test script** at `/tmp/claude-1000/sirius_bisect_test.sh`:
+4. **Create bisect test script** at `/tmp/claude-1000/sirius_bisect_test.sh`.
+   Ask the user which build preset to use: `release` (fastest), `relwithdebinfo` (with debug symbols), or `clang-debug` (full debug):
    ```bash
    #!/bin/bash
    set -e
-   # Build
-   CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make release 2>&1 | tail -5
+   # Build (replace <preset> with user's chosen preset)
+   CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make <preset> 2>&1 | tail -5
    if [ $? -ne 0 ]; then exit 125; fi  # skip if build fails
 
    # Run test

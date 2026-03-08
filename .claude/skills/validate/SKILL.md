@@ -81,7 +81,7 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
 
 1. **Quick check with nsys:** Profile the query with `nsys` and examine the stream IDs:
    ```bash
-   nsys profile --stats=true -o /tmp/claude-1000/validate_profile build/release/duckdb <db_path> <<'EOF'
+   nsys profile --stats=true -o /tmp/claude-1000/validate_profile build/<preset>/duckdb <db_path> <<'EOF'
    CALL gpu_execution('<QUERY>');
    EOF
    ```

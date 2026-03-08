@@ -80,9 +80,9 @@ If Phase 1 narrows the hang to a code region but not the exact cause:
 
 For deadlocks and thread-level hangs where log analysis is insufficient:
 
-1. Run the query **without** timeout (let it hang):
+1. Run the query **without** timeout (let it hang). Use `relwithdebinfo` or `clang-debug`:
    ```bash
-   build/clang-debug/duckdb <db_path> <<'EOF' &
+   build/<preset>/duckdb <db_path> <<'EOF' &
    CALL gpu_execution('<QUERY>');
    EOF
    HANG_PID=$!
@@ -118,7 +118,7 @@ Common hang causes in Sirius:
 
 ## Segfault Path
 
-When the error is a segmentation fault (SIGSEGV). The process is killed by the OS. This uses binary-search logging, cuda-gdb, and Compute Sanitizer to pinpoint the crash.
+When the error is a segmentation fault (SIGSEGV). The process is killed by the OS. This uses binary-search logging, ASan, Compute Sanitizer, and cuda-gdb to pinpoint the crash.
 
 ### Phase 1: Immediate-flush log insertion (preferred first method)
 
@@ -137,29 +137,69 @@ When the error is a segmentation fault (SIGSEGV). The process is killed by the O
   4. Rebuild, run -- narrow down further
   5. Repeat until the exact crashing line is identified
 
-### Phase 2: cuda-gdb (ask user before proceeding)
+After Phase 1, use the log analysis to determine whether the crash is likely **CPU-side** or **GPU-side**, then branch:
+- **CPU-side crash** (last log entry is in CPU orchestration code, pipeline scheduling, memory management, etc.) -> **Phase 2a: ASan**
+- **GPU-side crash** (last log entry is before/during a CUDA kernel launch, cuDF call, or GPU memory operation) -> **Phase 2b: Compute Sanitizer**
+- **Unclear** -> Try Phase 2a first (faster), then Phase 2b if ASan finds nothing
 
-Summarize Phase 1 findings and explain why cuda-gdb may help.
-- Build with `clang-debug` preset (debug symbols required):
+### Phase 2a: AddressSanitizer -- for CPU-side crashes (ask user before proceeding)
+
+Summarize Phase 1 findings. Offer ASan when the crash appears to be a CPU-side memory error (buffer overflow, use-after-free, dangling pointer). ASan pinpoints the exact memory violation with stack traces for both the bad access and the original allocation.
+
+**Note:** ASan only detects **CPU-side** memory errors. If the crash is GPU-side, skip to Phase 2b (Compute Sanitizer).
+
+- Build with `clang-debug` (ASan is on by default in Debug builds):
   ```bash
   CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make clang-debug
   ```
-- Run with cuda-gdb:
+- Run the reproduction case:
   ```bash
-  cuda-gdb --batch -ex run -ex bt -ex quit --args build/clang-debug/duckdb
+  export SIRIUS_LOG_LEVEL=trace
+  export SIRIUS_LOG_DIR=build/clang-debug/log/run_$(date +%s)
+  mkdir -p $SIRIUS_LOG_DIR
+  ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" build/clang-debug/duckdb <db_path> <<'EOF'
+  CALL gpu_execution('<QUERY>');
+  EOF
   ```
-- Parse the backtrace to identify the exact file, line, and call stack
-- For GPU-side crashes, cuda-gdb can inspect device threads and shared memory
+- Parse ASan output. ASan reports include:
+  - **Error type:** heap-buffer-overflow, stack-buffer-overflow, heap-use-after-free, double-free, etc.
+  - **Bad access location:** file, line, and full stack trace of the invalid read/write
+  - **Allocation context:** where the memory was originally allocated (and freed, for use-after-free)
+- Read the source files at both the access and allocation locations
+- Trace the data flow to understand how the invalid state arose
 
-### Phase 3: NVIDIA Compute Sanitizer memcheck (ask user before proceeding)
+**ASan overhead:** ~2x slowdown, ~2-3x memory. See `_shared/build-and-query.md` for full ASan configuration details.
 
-For GPU memory errors:
+### Phase 2b: NVIDIA Compute Sanitizer memcheck -- for GPU-side crashes (ask user before proceeding)
+
+Use when Phase 1 points to a GPU memory error (crash during/after a CUDA kernel launch or cuDF operation). Compute Sanitizer catches the exact GPU memory violation with kernel name and line info.
+
+Build with debug symbols (`clang-debug` or `relwithdebinfo`):
 ```bash
-compute-sanitizer --tool memcheck build/clang-debug/duckdb <<'EOF'
+compute-sanitizer --tool memcheck build/<preset>/duckdb <<'EOF'
 CALL gpu_execution('<QUERY>');
 EOF
 ```
 Parse output for: out-of-bounds accesses, misaligned accesses, use-after-free on device memory.
+
+### Phase 3: cuda-gdb (ask user before proceeding)
+
+Fallback when ASan and Compute Sanitizer don't find the issue, or when you need a full backtrace / interactive stepping to understand the crash context.
+
+- Build with debug symbols. Ask the user which preset to use:
+  - `relwithdebinfo` (recommended) -- optimized with debug symbols, faster execution
+  - `clang-debug` -- unoptimized, best for stepping through code line-by-line
+  ```bash
+  CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make relwithdebinfo
+  # or for full debug:
+  CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make clang-debug
+  ```
+- Run with cuda-gdb (replace `<preset>` with chosen preset):
+  ```bash
+  cuda-gdb --batch -ex run -ex bt -ex quit --args build/<preset>/duckdb
+  ```
+- Parse the backtrace to identify the exact file, line, and call stack
+- For GPU-side crashes, cuda-gdb can inspect device threads and shared memory
 
 ### Crash analysis checklist
 
@@ -232,15 +272,17 @@ If Phase 1 identifies the general area but not the root cause:
 
 For errors that are hard to reproduce or where the exception obscures the true origin:
 
-- Build with `clang-debug` preset
-- Run with cuda-gdb to catch the exception at throw time:
+- Build with debug symbols. Ask the user which preset:
+  - `relwithdebinfo` (recommended) -- optimized with debug symbols, faster reproduction
+  - `clang-debug` -- unoptimized, best for stepping through code line-by-line
+- Run with cuda-gdb to catch the exception at throw time (replace `<preset>` with chosen preset):
   ```bash
   cuda-gdb --batch \
     -ex "catch throw" \
     -ex run \
     -ex bt \
     -ex quit \
-    --args build/clang-debug/duckdb
+    --args build/<preset>/duckdb
   ```
   This catches C++ exceptions at the throw site, before unwinding obscures the call stack.
 - For CUDA errors, set a breakpoint on the CUDA error handler:
@@ -250,7 +292,7 @@ For errors that are hard to reproduce or where the exception obscures the true o
     -ex run \
     -ex bt \
     -ex quit \
-    --args build/clang-debug/duckdb
+    --args build/<preset>/duckdb
   ```
 
 ### Runtime error analysis checklist

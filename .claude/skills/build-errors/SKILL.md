@@ -14,7 +14,7 @@ Analyze build errors, suggest fixes, rebuild, and iterate until the build succee
 ## Workflow
 
 1. **Parse arguments:**
-   - Build preset: `release` (default) or `clang-debug` from `$ARGUMENTS`
+   - Build preset: `release` (default), `relwithdebinfo`, or `clang-debug` from `$ARGUMENTS`
    - Max iterations: default 5, configurable via `--max-iterations N`
    - Autonomy mode: `interactive` (default), `autonomous`, or `semi-autonomous`
 

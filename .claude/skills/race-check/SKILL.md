@@ -31,12 +31,11 @@ Detect and diagnose race conditions using ThreadSanitizer (CPU threads) and NVID
 
 3. **Phase 1: CPU thread race detection with ThreadSanitizer**
    Ask user before proceeding. Warn about 5-15x overhead.
-   - Build with `clang-debug` + TSan flags:
+   - Build with `clang-debug` + TSan flags (TSan requires `clang-debug` -- cannot use `relwithdebinfo`).
+     **Important:** TSan and ASan cannot be used simultaneously. This skill uses TSan only -- explicitly disable ASan:
      ```bash
-     # TSan is enabled via CMake flag or compile option
-     CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make clang-debug EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON"
+     CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make clang-debug EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON -DENABLE_SANITIZER=0"
      ```
-   - Note: TSan and ASan **cannot** be used simultaneously
    - Run the reproduction case:
      ```bash
      TSAN_OPTIONS="second_deadlock_stack=1:history_size=7" build/clang-debug/duckdb <db_path> <<'EOF'
@@ -53,10 +52,10 @@ Detect and diagnose race conditions using ThreadSanitizer (CPU threads) and NVID
      - Check if existing mutexes/atomics should cover this access
 
 4. **Phase 2: GPU memory race detection** (ask user before proceeding)
-   - Build with `clang-debug` preset
+   - Build with debug symbols (`relwithdebinfo` or `clang-debug`):
    - Run with Compute Sanitizer:
      ```bash
-     compute-sanitizer --tool memcheck build/clang-debug/duckdb <<'EOF'
+     compute-sanitizer --tool memcheck build/<preset>/duckdb <<'EOF'
      CALL gpu_execution('<QUERY>');
      EOF
      ```
