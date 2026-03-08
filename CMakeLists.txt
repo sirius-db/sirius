@@ -217,6 +217,8 @@ set(CUDA_SOURCES
     src/cuda/operator/nested_loop_join.cu
     src/cuda/operator/strings_matching.cu
     src/cuda/operator/substring.cu
+    src/cuda/operator/strlen_from_offsets.cu
+    src/cuda/operator/empty_str_check.cu
     src/cuda/print.cu
     src/cuda/utils.cu)
 # cmake-format: on
