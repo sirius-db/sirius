@@ -14,6 +14,7 @@ cxx-compiler = "*"
 libcudf = "25.12.*"
 librmm = "25.12.*"
 libcurand-dev = "*"
+spdlog = "1.8.*"
 
 [feature.cuda12.system-requirements]
 cuda = "12"
