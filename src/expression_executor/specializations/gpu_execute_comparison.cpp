@@ -93,8 +93,10 @@ struct ComparisonDispatcher {
       // For int64_t, check at runtime if this is a timestamp comparison
       switch (left.type().id()) {
         case cudf::type_id::TIMESTAMP_SECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_s>(
-            cudf::duration_s{right_value}, !right_is_null, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_s>(cudf::duration_s{right_value},
+                                                                     !right_is_null,
+                                                                     executor.execution_stream,
+                                                                     executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
@@ -103,8 +105,11 @@ struct ComparisonDispatcher {
                                         executor.resource_ref);
         }
         case cudf::type_id::TIMESTAMP_MILLISECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_ms>(
-            cudf::duration_ms{right_value}, !right_is_null, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar =
+            cudf::timestamp_scalar<cudf::timestamp_ms>(cudf::duration_ms{right_value},
+                                                       !right_is_null,
+                                                       executor.execution_stream,
+                                                       executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
@@ -113,8 +118,11 @@ struct ComparisonDispatcher {
                                         executor.resource_ref);
         }
         case cudf::type_id::TIMESTAMP_MICROSECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_us>(
-            cudf::duration_us{right_value}, !right_is_null, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar =
+            cudf::timestamp_scalar<cudf::timestamp_us>(cudf::duration_us{right_value},
+                                                       !right_is_null,
+                                                       executor.execution_stream,
+                                                       executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
@@ -123,8 +131,11 @@ struct ComparisonDispatcher {
                                         executor.resource_ref);
         }
         case cudf::type_id::TIMESTAMP_NANOSECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_ns>(
-            cudf::duration_ns{right_value}, !right_is_null, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar =
+            cudf::timestamp_scalar<cudf::timestamp_ns>(cudf::duration_ns{right_value},
+                                                       !right_is_null,
+                                                       executor.execution_stream,
+                                                       executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
