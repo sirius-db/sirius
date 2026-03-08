@@ -231,61 +231,6 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
     if (num_cd == num_aggregates && num_cd > 0) {
       SIRIUS_LOG_DEBUG("Two-phase COUNT DISTINCT: {} aggregates", num_cd);
 
-      // --- SIRIUS_P1_STRATEGY=nunique: use native cudf nunique instead of two-phase distinct ---
-      const char* p1_strategy_env = std::getenv("SIRIUS_P1_STRATEGY");
-      if (p1_strategy_env && std::string(p1_strategy_env) == "nunique") {
-        SIRIUS_LOG_INFO("[INVESTIGATE] P1 strategy: native nunique, input={}", size);
-
-        cudaEvent_t nu_start, nu_stop;
-        cudaEventCreate(&nu_start);
-        cudaEventCreate(&nu_stop);
-
-        cudf::groupby::groupby grpby_nu(
-          keys_table,
-          has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
-
-        std::vector<cudf::groupby::aggregation_request> nu_requests;
-        for (int agg = 0; agg < num_aggregates; agg++) {
-          auto value_view = aggregate_keys[agg]->convertToCudfColumn();
-          nu_requests.emplace_back();
-          nu_requests[agg].values = value_view;
-          nu_requests[agg].aggregations.push_back(
-            cudf::make_nunique_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE));
-        }
-
-        cudaEventRecord(nu_start, 0);
-        cudaEventSynchronize(nu_start);
-        auto nu_result = grpby_nu.aggregate(nu_requests);
-        cudaEventRecord(nu_stop, 0);
-        cudaEventSynchronize(nu_stop);
-        float nu_ms = 0;
-        cudaEventElapsedTime(&nu_ms, nu_start, nu_stop);
-        SIRIUS_LOG_INFO("[INVESTIGATE] P1-nunique groupby.aggregate: {:.3f} ms", nu_ms);
-        cudaEventDestroy(nu_start);
-        cudaEventDestroy(nu_stop);
-
-        auto nu_result_keys = std::move(nu_result.first);
-        for (int key = 0; key < num_keys; key++) {
-          cudf::column group_key = nu_result_keys->get_column(key);
-          keys[key]->setFromCudfColumn(group_key, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
-        }
-        for (int agg = 0; agg < num_aggregates; agg++) {
-          auto agg_val      = std::move(nu_result.second[agg].results[0]);
-          auto agg_val_view = agg_val->view();
-          auto temp_data    = convertInt32ToUInt64(
-            const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
-          auto validity_mask = createNullMask(agg_val_view.size());
-          aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(),
-                                                           GPUColumnType(GPUColumnTypeId::INT64),
-                                                           reinterpret_cast<uint8_t*>(temp_data),
-                                                           validity_mask);
-        }
-        STOP_TIMER();
-        SIRIUS_LOG_DEBUG("CUDF Groupby (P1-nunique) result count: {}", keys[0]->column_length);
-        return;
-      }
-      // --- End SIRIUS_P1_STRATEGY=nunique ---
-
       for (int agg = 0; agg < num_aggregates; agg++) {
         auto value_view = aggregate_keys[agg]->convertToCudfColumn();
 
@@ -311,12 +256,6 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
           all_key_indices.push_back(k);
         }
 
-        cudaEvent_t p1_start, p1_stop;
-        cudaEventCreate(&p1_start);
-        cudaEventCreate(&p1_stop);
-
-        cudaEventRecord(p1_start, 0);
-        cudaEventSynchronize(p1_start);
         auto distinct_result = cudf::distinct(
           effective_dedup_table, all_key_indices,
           cudf::duplicate_keep_option::KEEP_ANY,
@@ -324,13 +263,6 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
           cudf::nan_equality::ALL_EQUAL,
           rmm::cuda_stream_default,
           gpuBufferManager->mr);
-        cudaEventRecord(p1_stop, 0);
-        cudaEventSynchronize(p1_stop);
-        float p1_distinct_ms = 0;
-        cudaEventElapsedTime(&p1_distinct_ms, p1_start, p1_stop);
-        SIRIUS_LOG_INFO("[INVESTIGATE] P1 cudf::distinct: {:.3f} ms, {} -> {} rows",
-                        p1_distinct_ms, size, distinct_result->num_rows());
-
         SIRIUS_LOG_DEBUG("Two-phase COUNT DISTINCT: {} -> {} after distinct", size, distinct_result->num_rows());
 
         std::vector<cudf::column_view> dedup_keys_views;
@@ -348,16 +280,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
           cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE));
         phase2_requests[0].values = distinct_result->get_column(num_keys);
 
-        cudaEventRecord(p1_start, 0);
-        cudaEventSynchronize(p1_start);
         auto phase2_result = grpby_phase2.aggregate(phase2_requests);
-        cudaEventRecord(p1_stop, 0);
-        cudaEventSynchronize(p1_stop);
-        float p1_phase2_ms = 0;
-        cudaEventElapsedTime(&p1_phase2_ms, p1_start, p1_stop);
-        SIRIUS_LOG_INFO("[INVESTIGATE] P1 phase2 groupby: {:.3f} ms", p1_phase2_ms);
-        cudaEventDestroy(p1_start);
-        cudaEventDestroy(p1_stop);
 
         auto result_key = std::move(phase2_result.first);
         for (int key = 0; key < num_keys; key++) {

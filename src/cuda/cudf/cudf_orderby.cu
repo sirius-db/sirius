@@ -1069,20 +1069,7 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
 
   auto keys_table = cudf::table_view(columns_cudf);
 
-  cudaEvent_t sort_start, sort_stop;
-  cudaEventCreate(&sort_start);
-  cudaEventCreate(&sort_stop);
-  cudaEventRecord(sort_start, 0);
-  cudaEventSynchronize(sort_start);
   auto sorted_order = cudf::sorted_order(keys_table, orders, null_orders);
-  cudaEventRecord(sort_stop, 0);
-  cudaEventSynchronize(sort_stop);
-  float sort_ms = 0;
-  cudaEventElapsedTime(&sort_ms, sort_start, sort_stop);
-  SIRIUS_LOG_INFO("[INVESTIGATE] cudf::sorted_order: {:.3f} ms, {} rows, {} key col(s)",
-                  sort_ms, (long long)keys_table.num_rows(), (int)columns_cudf.size());
-  cudaEventDestroy(sort_start);
-  cudaEventDestroy(sort_stop);
 
   auto sorted_order_view = sorted_order->view();
 
