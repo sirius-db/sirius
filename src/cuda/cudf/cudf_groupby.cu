@@ -19,6 +19,8 @@
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_physical_grouped_aggregate.hpp"
+#include <cudf/stream_compaction.hpp>
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -144,7 +146,8 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
                   vector<shared_ptr<GPUColumn>>& aggregate_keys,
                   uint64_t num_keys,
                   uint64_t num_aggregates,
-                  AggregationType* agg_mode)
+                  AggregationType* agg_mode,
+                  idx_t estimated_output_groups)
 {
   if (keys[0]->column_length == 0) {
     SIRIUS_LOG_DEBUG("Input size is 0");
@@ -215,6 +218,303 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
   }
 
   auto keys_table = cudf::table_view(keys_cudf);
+
+  // --- Two-phase COUNT DISTINCT optimization (P1) ---
+  // When ALL aggregates are COUNT_DISTINCT, use distinct(keys+value) → count_star groupby
+  // instead of cudf's sort-based nunique. Avoids materializing sorted order.
+  {
+    int num_cd = 0;
+    for (int agg = 0; agg < num_aggregates; agg++) {
+      if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) num_cd++;
+    }
+
+    if (num_cd == num_aggregates && num_cd > 0) {
+      SIRIUS_LOG_DEBUG("Two-phase COUNT DISTINCT: {} aggregates", num_cd);
+
+      for (int agg = 0; agg < num_aggregates; agg++) {
+        auto value_view = aggregate_keys[agg]->convertToCudfColumn();
+
+        std::vector<cudf::column_view> dedup_columns;
+        for (int key = 0; key < num_keys; key++) {
+          dedup_columns.push_back(keys_cudf[key]);
+        }
+        dedup_columns.push_back(value_view);
+
+        auto dedup_table = cudf::table_view(dedup_columns);
+
+        // COUNT DISTINCT must not count NULLs — drop rows where value is NULL
+        std::unique_ptr<cudf::table> null_filtered_owner;
+        cudf::table_view effective_dedup_table = dedup_table;
+        if (value_view.nullable() && value_view.null_count() > 0) {
+          null_filtered_owner = cudf::drop_nulls(dedup_table, {static_cast<cudf::size_type>(num_keys)},
+                                                 rmm::cuda_stream_default, gpuBufferManager->mr);
+          effective_dedup_table = null_filtered_owner->view();
+        }
+
+        std::vector<cudf::size_type> all_key_indices;
+        for (int k = 0; k < static_cast<int>(effective_dedup_table.num_columns()); k++) {
+          all_key_indices.push_back(k);
+        }
+
+        auto distinct_result = cudf::distinct(
+          effective_dedup_table, all_key_indices,
+          cudf::duplicate_keep_option::KEEP_ANY,
+          cudf::null_equality::EQUAL,
+          cudf::nan_equality::ALL_EQUAL,
+          rmm::cuda_stream_default,
+          gpuBufferManager->mr);
+
+        SIRIUS_LOG_DEBUG("Two-phase COUNT DISTINCT: {} -> {} after distinct", size, distinct_result->num_rows());
+
+        std::vector<cudf::column_view> dedup_keys_views;
+        for (int key = 0; key < num_keys; key++) {
+          dedup_keys_views.push_back(distinct_result->get_column(key));
+        }
+        auto dedup_keys_table = cudf::table_view(dedup_keys_views);
+
+        cudf::groupby::groupby grpby_phase2(
+          dedup_keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
+
+        std::vector<cudf::groupby::aggregation_request> phase2_requests;
+        phase2_requests.emplace_back();
+        phase2_requests[0].aggregations.push_back(
+          cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE));
+        phase2_requests[0].values = distinct_result->get_column(num_keys);
+
+        auto phase2_result = grpby_phase2.aggregate(phase2_requests);
+
+        auto result_key = std::move(phase2_result.first);
+        for (int key = 0; key < num_keys; key++) {
+          cudf::column group_key = result_key->get_column(key);
+          keys[key]->setFromCudfColumn(group_key, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
+        }
+
+        auto agg_val      = std::move(phase2_result.second[0].results[0]);
+        auto agg_val_view = agg_val->view();
+        auto temp_data    = convertInt32ToUInt64(const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
+        auto validity_mask = createNullMask(agg_val_view.size());
+        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(),
+                                                         GPUColumnType(GPUColumnTypeId::INT64),
+                                                         reinterpret_cast<uint8_t*>(temp_data),
+                                                         validity_mask);
+      }
+
+      STOP_TIMER();
+      SIRIUS_LOG_DEBUG("CUDF Groupby (two-phase COUNT DISTINCT) result count: {}", keys[0]->column_length);
+      return;
+    }
+  }
+  // --- End two-phase COUNT DISTINCT optimization ---
+
+  // --- Mixed aggregate: COUNT_DISTINCT + other aggregates ---
+  // When some (but not all) aggregates are COUNT_DISTINCT, split into:
+  //   1. Normal groupby for non-CD aggregates (with cheap placeholder for CD slots)
+  //   2. Two-phase COUNT DISTINCT for each CD aggregate
+  // Both groupbys sort output by the same keys → results are positionally aligned.
+  //
+  // Guard: skip P1b when input is large relative to expected output groups.
+  // At high rows/group the distinct step doesn't shrink data enough to justify
+  // the two-pass overhead.
+  // Tune via SIRIUS_P1B_K env var (default 1000); disable with SIRIUS_P1B_NO_GUARD=1.
+  {
+    static idx_t p1b_K = []() -> idx_t {
+      const char* env = std::getenv("SIRIUS_P1B_K");
+      return env ? std::stoull(env) : 1000ULL;
+    }();
+    static bool p1b_no_guard = []() -> bool {
+      const char* env = std::getenv("SIRIUS_P1B_NO_GUARD");
+      return env != nullptr && env[0] == '1';
+    }();
+
+    int num_cd = 0;
+    for (int agg = 0; agg < num_aggregates; agg++) {
+      if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) num_cd++;
+    }
+
+    bool skip_p1b = false;
+    if (!p1b_no_guard && num_cd > 0 && num_cd < num_aggregates && estimated_output_groups > 0) {
+      idx_t size_threshold = p1b_K * estimated_output_groups;
+      if (size > size_threshold) {
+        skip_p1b = true;
+        SIRIUS_LOG_DEBUG("P1b guard: skip (size={} > K={} * groups={} = {})",
+                         size, p1b_K, estimated_output_groups, size_threshold);
+      }
+    }
+
+    if (num_cd > 0 && num_cd < num_aggregates && !skip_p1b) {
+      SIRIUS_LOG_DEBUG("Mixed aggregate: {} COUNT_DISTINCT + {} other", num_cd, num_aggregates - num_cd);
+
+      // Step 1: Normal groupby with COUNT placeholder for CD aggregates
+      cudf::groupby::groupby grpby_normal(
+        keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
+
+      std::vector<cudf::groupby::aggregation_request> normal_requests;
+      for (int agg = 0; agg < num_aggregates; agg++) {
+        normal_requests.emplace_back(cudf::groupby::aggregation_request());
+
+        if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
+          // Cheap placeholder — will be overwritten by two-phase result
+          normal_requests[agg].aggregations.push_back(
+            cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE));
+          normal_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT && aggregate_keys[agg]->column_length == 0) {
+          auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+          normal_requests[agg].aggregations.push_back(std::move(aggregate));
+          uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+          cudaMemset(temp, 0, size * sizeof(uint64_t));
+          auto validity_mask = createNullMask(size);
+          shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
+          normal_requests[agg].values = temp_column->convertToCudfColumn();
+        } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::SUM && aggregate_keys[agg]->column_length == 0) {
+          auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+          normal_requests[agg].aggregations.push_back(std::move(aggregate));
+          uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+          cudaMemset(temp, 0, size * sizeof(uint64_t));
+          auto validity_mask = createNullMask(size, cudf::mask_state::ALL_NULL);
+          shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
+          normal_requests[agg].values = temp_column->convertToCudfColumn();
+        } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT_STAR && aggregate_keys[agg]->column_length != 0) {
+          auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE);
+          normal_requests[agg].aggregations.push_back(std::move(aggregate));
+          uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+          cudaMemset(temp, 0, size * sizeof(uint64_t));
+          auto validity_mask = createNullMask(size);
+          shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
+          normal_requests[agg].values = temp_column->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::SUM) {
+          normal_requests[agg].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+          normal_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::AVERAGE) {
+          normal_requests[agg].aggregations.push_back(cudf::make_mean_aggregation<cudf::groupby_aggregation>());
+          if (aggregate_keys[agg]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+            if (aggregate_keys[agg]->data_wrapper.getColumnTypeSize() != sizeof(int64_t)) {
+              throw NotImplementedException("Only support decimal64 for decimal AVG group-by");
+            }
+            auto from_cudf_column_view = aggregate_keys[agg]->convertToCudfColumn();
+            auto to_cudf_type = cudf::data_type(cudf::type_id::FLOAT64);
+            auto to_cudf_column = cudf::cast(
+              from_cudf_column_view, to_cudf_type, rmm::cuda_stream_default, GPUBufferManager::GetInstance().mr);
+            aggregate_keys[agg]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
+          }
+          normal_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::MIN) {
+          normal_requests[agg].aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
+          normal_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::MAX) {
+          normal_requests[agg].aggregations.push_back(cudf::make_max_aggregation<cudf::groupby_aggregation>());
+          normal_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::COUNT) {
+          normal_requests[agg].aggregations.push_back(
+            cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE));
+          normal_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else if (agg_mode[agg] == AggregationType::COUNT_STAR) {
+          normal_requests[agg].aggregations.push_back(
+            cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE));
+          normal_requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+        } else {
+          throw NotImplementedException("Aggregate function not supported in mixed path: %d",
+                                        static_cast<int>(agg_mode[agg]));
+        }
+      }
+
+      auto normal_result = grpby_normal.aggregate(normal_requests);
+
+      // Extract group keys
+      auto result_key = std::move(normal_result.first);
+      for (int key = 0; key < num_keys; key++) {
+        cudf::column group_key = result_key->get_column(key);
+        keys[key]->setFromCudfColumn(group_key, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
+      }
+
+      // Extract non-CD aggregate results
+      for (int agg = 0; agg < num_aggregates; agg++) {
+        if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) continue;
+        auto agg_val = std::move(normal_result.second[agg].results[0]);
+        if (agg_mode[agg] == AggregationType::COUNT || agg_mode[agg] == AggregationType::COUNT_STAR) {
+          auto agg_val_view = agg_val->view();
+          auto temp_data = convertInt32ToUInt64(const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
+          auto validity_mask = createNullMask(agg_val_view.size());
+          aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(), GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp_data), validity_mask);
+        } else {
+          aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
+        }
+      }
+
+      // Step 2: Two-phase COUNT DISTINCT for each CD aggregate
+      for (int agg = 0; agg < num_aggregates; agg++) {
+        if (agg_mode[agg] != AggregationType::COUNT_DISTINCT) continue;
+
+        // Phase 1: distinct(group_keys + value), excluding NULL values
+        std::vector<cudf::column_view> dedup_columns;
+        for (int key = 0; key < num_keys; key++) {
+          dedup_columns.push_back(keys_cudf[key]);
+        }
+        auto value_view = aggregate_keys[agg]->convertToCudfColumn();
+        dedup_columns.push_back(value_view);
+
+        auto dedup_table = cudf::table_view(dedup_columns);
+
+        // COUNT DISTINCT must not count NULLs — drop rows where value is NULL
+        std::unique_ptr<cudf::table> null_filtered_owner;
+        cudf::table_view effective_dedup_table = dedup_table;
+        if (value_view.nullable() && value_view.null_count() > 0) {
+          null_filtered_owner = cudf::drop_nulls(dedup_table, {static_cast<cudf::size_type>(num_keys)},
+                                                 rmm::cuda_stream_default, gpuBufferManager->mr);
+          effective_dedup_table = null_filtered_owner->view();
+        }
+
+        std::vector<cudf::size_type> all_key_indices;
+        for (int k = 0; k < static_cast<int>(effective_dedup_table.num_columns()); k++) {
+          all_key_indices.push_back(k);
+        }
+
+        auto distinct_result = cudf::distinct(
+          effective_dedup_table, all_key_indices,
+          cudf::duplicate_keep_option::KEEP_ANY,
+          cudf::null_equality::EQUAL,
+          cudf::nan_equality::ALL_EQUAL,
+          rmm::cuda_stream_default,
+          gpuBufferManager->mr);
+
+        SIRIUS_LOG_DEBUG("Mixed two-phase: {} -> {} after distinct", size, distinct_result->num_rows());
+
+        // Phase 2: groupby COUNT_STAR on deduplicated table
+        std::vector<cudf::column_view> dedup_keys_views;
+        for (int key = 0; key < num_keys; key++) {
+          dedup_keys_views.push_back(distinct_result->get_column(key));
+        }
+        auto dedup_keys_table = cudf::table_view(dedup_keys_views);
+
+        cudf::groupby::groupby grpby_phase2(
+          dedup_keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
+
+        std::vector<cudf::groupby::aggregation_request> phase2_requests;
+        phase2_requests.emplace_back();
+        phase2_requests[0].aggregations.push_back(
+          cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE));
+        phase2_requests[0].values = distinct_result->get_column(num_keys);
+
+        auto phase2_result = grpby_phase2.aggregate(phase2_requests);
+
+        // Both the normal groupby (step 1) and this phase2 groupby sort their output by the
+        // same key columns and operate on the same key domain, so results are positionally
+        // aligned — no join needed.
+        auto cd_count_col  = std::move(phase2_result.second[0].results[0]);
+        auto cd_view       = cd_count_col->view();
+        auto temp_data     = convertInt32ToUInt64(const_cast<int32_t*>(cd_view.data<int32_t>()), cd_view.size());
+        auto validity_mask = createNullMask(cd_view.size());
+        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(
+          cd_view.size(), GPUColumnType(GPUColumnTypeId::INT64),
+          reinterpret_cast<uint8_t*>(temp_data), validity_mask);
+      }
+
+      STOP_TIMER();
+      SIRIUS_LOG_DEBUG("CUDF Groupby (mixed COUNT DISTINCT) result count: {}", keys[0]->column_length);
+      return;
+    }
+  }
+  // --- End mixed aggregate optimization ---
+
   cudf::groupby::groupby grpby_obj(
     keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
 
