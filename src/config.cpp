@@ -22,7 +22,7 @@ bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
 
 bool Config::USE_CUDF_EXPR = true;
 
-bool Config::USE_CUSTOM_TOP_N = false;
+bool Config::USE_CUSTOM_TOP_N = true;
 
 bool Config::USE_OPT_TABLE_SCAN                  = true;
 int Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS      = 8;
