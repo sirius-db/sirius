@@ -19,6 +19,7 @@
 #include "exec/config.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
@@ -40,12 +41,13 @@ constexpr std::size_t kReservationBytes = 20 * 1024 * 1024;
 constexpr std::size_t kAllocationBytes  = 10 * 1024 * 1024;
 
 class test_gpu_pipeline_task_global_state
-  : public sirius::pipeline::gpu_pipeline_task_global_state {
+  : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
-  test_gpu_pipeline_task_global_state() : gpu_pipeline_task_global_state(nullptr) {}
+  test_gpu_pipeline_task_global_state() : sirius_pipeline_task_global_state(nullptr) {}
 
   void add_error(std::string message)
   {
+    std::cerr << message << std::endl;
     error_count.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(error_mutex);
     errors.push_back(std::move(message));
@@ -77,7 +79,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  void execute() override
+  void execute(rmm::cuda_stream_view stream) override
   {
     auto& global = _global_state->cast<test_gpu_pipeline_task_global_state>();
     auto& local  = _local_state->cast<test_gpu_pipeline_task_local_state>();
@@ -98,7 +100,6 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
       return;
     }
 
-    auto stream = mem_space.acquire_stream();
     if (!allocator->attach_reservation_to_tracker(stream, std::move(reservation))) {
       global.add_error("Failed to attach reservation to stream tracker.");
       global.executed_count.fetch_add(1, std::memory_order_relaxed);
@@ -139,7 +140,17 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
 {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
   try {
-    manager = initialize_memory_manager(1);
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(256 * 1024 * 1024)
+      .set_reservation_fraction_per_gpu(0.75)
+      .set_per_host_capacity(1 * 1024 * 1024 * 1024)
+      .use_host_per_gpu()
+      .track_reservation_per_stream(false)
+      .set_reservation_fraction_per_host(0.75);
+    auto space_configs = builder.build();
+    manager =
+      std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
   } catch (const std::exception& e) {
     WARN("Skipping test due to insufficient GPUs: " << e.what());
     return;
@@ -172,7 +183,8 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
       if (!request) { break; }
 
       auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
-        std::vector<std::shared_ptr<cucascade::data_batch>>{});
+        std::make_unique<sirius::op::operator_data>(
+          std::vector<std::shared_ptr<cucascade::data_batch>>{}));
       auto task = std::make_unique<sirius_pipeline_task>(
         static_cast<uint64_t>(dispatched.load(std::memory_order_relaxed)),
         std::move(local_state),

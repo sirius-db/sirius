@@ -20,15 +20,10 @@
 
 #include <catch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/memory_space.hpp>
-#include <duckdb/common/types/date.hpp>
-#include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_filter.hpp>
-
-#include <variant>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -97,12 +92,13 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   sirius_physical_filter filter(std::move(types), std::move(exprs), filter_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = filter.execute(inputs);
-  REQUIRE(outputs.size() == 1);
-  auto output_table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto out_view     = output_table.view();
-  auto host_vals    = copy_column_to_host<typename Traits::type>(out_view.column(1));
-  auto host_filter  = copy_column_to_host<int64_t>(out_view.column(0));
+  auto outputs = filter.execute(operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto output_table =
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto out_view    = output_table.view();
+  auto host_vals   = copy_column_to_host<typename Traits::type>(out_view.column(1));
+  auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
 
   std::vector<typename Traits::type> expected_data;
   std::vector<int64_t> expected_filter;

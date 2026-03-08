@@ -17,83 +17,42 @@
 
 #include "memory/sirius_memory_reservation_manager.hpp"
 
+#include "cucascade/memory/common.hpp"
+
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/cuda_device.hpp>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-#include <unordered_map>
-
 namespace sirius {
 namespace memory {
-
-namespace {
-
-std::unordered_map<int, rmm::mr::device_memory_resource*> create_per_device_memory_resource_map(
-  cucascade::memory::memory_reservation_manager& manager)
-{
-  std::unordered_map<int, rmm::mr::device_memory_resource*> result;
-  auto spaces = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  for (auto* space : spaces) {
-    if (space->get_tier() == cucascade::memory::Tier::GPU) {
-      result.insert({space->get_device_id(), space->get_default_allocator()});
-    }
-  }
-  return result;
-}
-
-}  // namespace
-
-class sirius_device_memory_resource : public rmm::mr::device_memory_resource {
- public:
-  sirius_device_memory_resource(sirius::memory::sirius_memory_reservation_manager& memory_manager)
-    : per_device_device_memory_resource_map_(create_per_device_memory_resource_map(memory_manager))
-  {
-  }
-
-  ~sirius_device_memory_resource() override = default;
-
- private:
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
-  {
-    auto dev_id = rmm::get_current_cuda_device();
-    auto it     = per_device_device_memory_resource_map_.find(dev_id.value());
-    if (it == per_device_device_memory_resource_map_.end()) {
-      throw std::runtime_error("No device memory resource found for device id: " +
-                               std::to_string(dev_id.value()));
-    }
-    return it->second->allocate(stream, bytes);
-  }
-
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override
-  {
-    auto dev_id = rmm::get_current_cuda_device();
-    auto it     = per_device_device_memory_resource_map_.find(dev_id.value());
-    assert(it != per_device_device_memory_resource_map_.end());
-    it->second->deallocate(stream, ptr, bytes);
-  }
-
-  [[nodiscard]] bool do_is_equal(device_memory_resource const& other) const noexcept override
-  {
-    return this == &other;
-  }
-  // device memory resources per device id
-  const std::unordered_map<int32_t, rmm::mr::device_memory_resource*>
-    per_device_device_memory_resource_map_;
-};
 
 sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   const std::vector<cucascade::memory::memory_space_config>& configs)
   : cucascade::memory::memory_reservation_manager(configs)
 {
-  sirius_device_memory_resource_ = std::make_unique<sirius_device_memory_resource>(*this);
-  cudf::set_current_device_resource(sirius_device_memory_resource_.get());
+  auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.empty()) {
+    throw std::runtime_error("At least one GPU memory space must be configured");
+  }
+  for (const auto* space : gpu_spaces) {
+    auto* device_mr = space->get_default_allocator();
+    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
+    prev_device_mrs_.push_back(cudf::set_current_device_resource(device_mr));
+  }
 }
 
 sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
 {
-  cudf::set_current_device_resource(nullptr);
+  auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  // Restore the previous cuDF device resources saved in the constructor.
+  // Calling reset_current_device_resource_ref() would leave cuDF with a null/invalid
+  // resource that crashes subsequent allocations in other tests or code paths.
+  for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
+    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
+    cudf::set_current_device_resource(prev_device_mrs_[i]);
+  }
 }
 
 }  // namespace memory

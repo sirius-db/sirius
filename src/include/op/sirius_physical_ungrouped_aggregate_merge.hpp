@@ -52,12 +52,13 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
 
   bool is_source() const override { return true; }
 
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
  public:
   bool is_sink() const override { return true; }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

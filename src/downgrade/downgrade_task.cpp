@@ -16,23 +16,18 @@
 
 #include "downgrade/downgrade_task.hpp"
 // #include "downgrade/downgrade_executor.hpp"
-#include "cudf/contiguous_split.hpp"
 #include "data/sirius_converter_registry.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 namespace sirius {
 namespace parallel {
 
-void downgrade_task::execute()
+void downgrade_task::execute(rmm::cuda_stream_view stream)
 {
-  rmm::cuda_stream_view stream = rmm::cuda_stream_default;
-
   auto& batch = _local_state->cast<downgrade_task_local_state>()._batch;
 
   // Check if already on host tier - nothing to do
@@ -41,6 +36,11 @@ void downgrade_task::execute()
     mark_task_completion();
     return;
   }
+
+  // Save the batch state so we can restore it after the in-transit conversion.
+  // The batch may be in task_created state if a pipeline task is pending for it;
+  // blindly resetting to idle would cause the pipeline task to fail with invalid_state.
+  auto prev_state = batch->get_state();
 
   // Try to acquire an in-transit lock - if batch is being processed, we can't downgrade
   if (!batch->try_to_lock_for_in_transit()) {
@@ -66,15 +66,15 @@ void downgrade_task::execute()
 
     // Use the centralized converter registry to convert GPU representation to HOST
     auto& converter_registry = sirius::converter_registry::get();
-    batch->convert_to<cucascade::host_table_representation>(converter_registry, mem_space, stream);
+    batch->convert_to<cucascade::host_data_representation>(converter_registry, mem_space, stream);
 
-    // Release the in-transit lock once conversion finishes
-    batch->try_to_release_in_transit();
+    // Release the in-transit lock, restoring the batch to its previous state
+    batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
 
     mark_task_completion();
     return;
   } catch (...) {
-    batch->try_to_release_in_transit();
+    batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
     throw;
   }
 }
@@ -87,7 +87,7 @@ void downgrade_task::mark_task_completion()
   auto message         = std::make_unique<sirius::task_completion_message>();
   message->task_id     = task_id;
   message->pipeline_id = pipeline_id;
-  message->source      = sirius::Source::PIPELINE;
+  message->source      = sirius::Source::DOWNGRADE;
   _global_state->cast<downgrade_task_global_state>()._message_queue.EnqueueMessage(
     std::move(message));
 }

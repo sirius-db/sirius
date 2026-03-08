@@ -14,18 +14,15 @@
  * limitations under the License.
  */
 
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/execution/aggregate_hashtable.hpp"
-#include "duckdb/execution/operator/set/physical_cte.hpp"
-#include "duckdb/parallel/event.hpp"
 // #include "duckdb/parallel/meta_pipeline.hpp"
 // #include "duckdb/parallel/pipeline.hpp"
 
-#include "log/logging.hpp"
 #include "op/sirius_physical_cte.hpp"
+
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+
+#include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
@@ -75,6 +72,13 @@ duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physica
   const
 {
   return children[1]->get_sources();
+}
+
+std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data& input_data,
+                                                            rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"sirius_physical_cte::execute"};
+  return std::make_unique<operator_data>(input_data);
 }
 
 }  // namespace op

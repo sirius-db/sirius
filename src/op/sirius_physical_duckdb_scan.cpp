@@ -16,22 +16,13 @@
 
 #include "op/sirius_physical_duckdb_scan.hpp"
 
-#include "config.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/execution_context.hpp"
-#include "duckdb/parallel/task_executor.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
-#include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "log/logging.hpp"
-#include "utils.hpp"
 
 namespace sirius {
 namespace op {
 
 // Helper function to deep copy ExtraOperatorInfo
-duckdb::ExtraOperatorInfo copy_extra_info(const duckdb::ExtraOperatorInfo& src)
+duckdb::ExtraOperatorInfo copy_extra_info_duckdb_scan(const duckdb::ExtraOperatorInfo& src)
 {
   duckdb::ExtraOperatorInfo copy;
   copy.file_filters = src.file_filters;
@@ -52,7 +43,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_s
       table_scan->names,
       table_scan->table_filters ? table_scan->table_filters->Copy() : nullptr,
       table_scan->estimated_cardinality,
-      copy_extra_info(table_scan->extra_info),
+      copy_extra_info_duckdb_scan(table_scan->extra_info),
       table_scan->parameters,
       table_scan->virtual_columns)
 {
@@ -83,16 +74,26 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
     virtual_columns(std::move(virtual_columns_p)),
-    gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
+    gen_row_id_column(column_ids.back().IsRowIdColumn())
 {
-  auto num_cols = column_ids.size() - gen_row_id_column;
-  for (int col = 0; col < num_cols; col++) {
-    scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
-    scanned_ids.push_back(col);
+  // Build scanned_types: the types of ALL columns DuckDB will output, in column_ids order.
+  // DuckDB's table function fills the DataChunk with columns in column_ids order, regardless
+  // of projection_ids. projection_ids only control which columns the PhysicalTableScan keeps
+  // after the scan function returns. Since Sirius handles projection at the TABLE_SCAN level,
+  // we must initialize the DataChunk with ALL column_ids types in their original order.
+  auto num_cols = column_ids.size();
+  for (duckdb::idx_t i = 0; i < num_cols; i++) {
+    auto col_idx = column_ids[i].GetPrimaryIndex();
+    if (column_ids[i].IsRowIdColumn()) {
+      // ROW_ID virtual column
+      scanned_types.push_back(duckdb::LogicalType::BIGINT);
+    } else {
+      scanned_types.push_back(returned_types[col_idx]);
+    }
   }
 
-  if (num_cols == 0) {  // Ensure that scanned_types and ids are properly initialized
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
+  if (scanned_types.empty()) {
+    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();

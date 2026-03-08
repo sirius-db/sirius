@@ -14,40 +14,19 @@
  * limitations under the License.
  */
 
+#include "gpu_executor.hpp"
+
 #include "config.hpp"
 #include "duckdb/execution/execution_context.hpp"
-#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
-#include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "fallback.hpp"
-#include "gpu_context.hpp"
 #include "gpu_physical_operator.hpp"
-#include "gpu_pipeline_hashmap.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_cte.hpp"
-#include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_partition.hpp"
-#include "op/sirius_physical_result_collector.hpp"
-#include "op/sirius_physical_table_scan.hpp"
-#include "op/sirius_physical_top_n.hpp"
-#include "op/sirius_physical_ungrouped_aggregate.hpp"
-#include "operator/gpu_physical_concat.hpp"
-#include "operator/gpu_physical_cte.hpp"
-#include "operator/gpu_physical_delim_join.hpp"
-#include "operator/gpu_physical_grouped_aggregate.hpp"
 #include "operator/gpu_physical_hash_join.hpp"
-#include "operator/gpu_physical_partition.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 
-#include <cucascade/data/data_repository_manager.hpp>
 #include <stdio.h>
-
-#include <iostream>
 
 namespace duckdb {
 

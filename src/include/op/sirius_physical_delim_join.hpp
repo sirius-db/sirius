@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
+#include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition.hpp"
 
@@ -47,8 +48,6 @@ class sirius_physical_delim_join : public sirius_physical_operator {
   duckdb::unique_ptr<sirius_physical_operator> join;
   duckdb::unique_ptr<sirius_physical_grouped_aggregate> distinct;
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans;
-  sirius_physical_partition* partition_join;
-  sirius_physical_partition* partition_distinct;
 
   duckdb::optional_idx delim_idx;
 
@@ -78,10 +77,18 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
     duckdb::idx_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
+  sirius_physical_partition* partition_join;
 
  public:
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
+  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
@@ -96,10 +103,16 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
     duckdb::idx_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
+  sirius_physical_column_data_scan* column_data_scan;
 
  public:
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
+  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

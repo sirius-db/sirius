@@ -142,7 +142,10 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   MERGE_GROUP_BY,
   MERGE_TOP_N,
   MERGE_AGGREGATE,
-  DUCKDB_SCAN
+  SORT_PARTITION,
+  SORT_SAMPLE,
+  DUCKDB_SCAN,
+  PARQUET_SCAN
 };
 
 std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type);

@@ -22,19 +22,23 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius {
 namespace op {
 
-class sirius_physical_concat : public sirius_physical_operator {
+class sirius_physical_concat : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
-  explicit sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
-                                  duckdb::idx_t estimated_cardinality,
-                                  sirius_physical_operator* parent_op,
-                                  bool is_build);
+  explicit sirius_physical_concat(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::idx_t estimated_cardinality,
+    sirius_physical_operator* parent_op,
+    bool is_build,
+    uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
 
   std::string get_name() const override;
 
@@ -44,14 +48,21 @@ class sirius_physical_concat : public sirius_physical_operator {
 
   bool is_build_concat();
 
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
+  void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
+
   //! Get the parent operator (e.g., HASH_JOIN for build concat)
   sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
  private:
-  duckdb::vector<duckdb::idx_t> _partition_keys;
-  duckdb::idx_t _num_partitions;
   sirius_physical_operator* _parent_op;
   bool _is_build;
+  bool _concat_all;
+  uint64_t _concat_batch_bytes;
 };
 
 }  // namespace op

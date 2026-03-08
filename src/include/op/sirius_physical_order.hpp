@@ -22,11 +22,22 @@
 namespace sirius {
 namespace op {
 
+// Helper to deep copy BoundOrderByNode vector (contains unique_ptr<Expression>)
+inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
+  const duckdb::vector<duckdb::BoundOrderByNode>& src)
+{
+  duckdb::vector<duckdb::BoundOrderByNode> result;
+  result.reserve(src.size());
+  for (const auto& order : src) {
+    result.push_back(order.Copy());
+  }
+  return result;
+}
+
 class sirius_physical_order : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
 
- public:
   sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
                         duckdb::vector<duckdb::BoundOrderByNode> orders,
                         duckdb::vector<duckdb::idx_t> projections_p,
@@ -38,19 +49,18 @@ class sirius_physical_order : public sirius_physical_operator {
   duckdb::vector<duckdb::idx_t> projections;
   bool is_index_sort;
 
- public:
-  // Source interface
   bool is_source() const override { return true; }
+  bool is_sink() const override { return true; }
+  bool sink_order_dependent() const override { return false; }
 
   duckdb::OrderPreservationType source_order() const override
   {
     return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
- public:
-  // Sink interface
-  bool is_sink() const override { return true; }
-  bool sink_order_dependent() const override { return false; }
+  std::unique_ptr<operator_data> execute(
+    const operator_data& input_data,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 };
 
 }  // namespace op

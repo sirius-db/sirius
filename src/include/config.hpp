@@ -51,11 +51,8 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
-  // For duckdb scan task:
-  //  - the default batch size
-  //  - the default varchar size for estimating rows per batch
-  static uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE;
-  static uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE;
+  // Whether to fall back to duckdb execution after an error is detected
+  static bool ENABLE_DUCKDB_FALLBACK;
 };
 
 }  // namespace duckdb

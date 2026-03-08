@@ -17,24 +17,30 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 
 #include "creator/task_creator.hpp"
+#include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "pipeline/gpu_pipeline_queue.hpp"
+#include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+
+#include <rmm/cuda_device.hpp>
+
+#include <util/stream_check_wrapper.hpp>
 
 namespace sirius {
 namespace pipeline {
 
-// todo (amin): add stream pool to constructor
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
   : _config(config),
+    _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, _config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
-    _memory_space(mem_space)
+    _memory_space(mem_space),
+    _kiosk(_config.num_threads)
 {
 }
 
@@ -49,11 +55,14 @@ void gpu_pipeline_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
-    _config.num_threads,
-    _config.thread_name_prefix,
-    _config.cpu_affinity_list,
-    [device_id = _memory_space->get_device_id()]() noexcept { cudaSetDevice(device_id); });
+  _thread_pool =
+    std::make_unique<exec::thread_pool>(_config.num_threads,
+                                        _config.thread_name_prefix,
+                                        _config.cpu_affinity_list,
+                                        [device_id = _memory_space->get_device_id()]() noexcept {
+                                          cudaSetDevice(device_id);
+                                          sirius::util::enable_log_on_default_stream();
+                                        });
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 
@@ -70,6 +79,8 @@ void gpu_pipeline_executor::stop()
 
 void gpu_pipeline_executor::manager_loop()
 {
+  rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
+  sirius::util::enable_log_on_default_stream();
   while (_running.load()) {
     auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {
@@ -86,34 +97,96 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
     }
-    auto* gpu_task   = cast_to_gpu_pipeline_task(pipeline_task.get());
+    auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
+    if (!gpu_task) {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      _completion_handler->report_error(
+        "GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      break;
+    }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
     auto reservation = _memory_space->make_reservation(bytes_needs);
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
+      _completion_handler->report_error(
+        "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
+        std::to_string(gpu_task->get_task_id()));
       break;
     }
-    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
+    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation));
     } else {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
                        gpu_task->get_task_id());
+      _completion_handler->report_error(
+        "GPU Pipeline Executor: Failed to cast local state for task " +
+        std::to_string(gpu_task->get_task_id()));
       break;
     }
     auto output_consumers = gpu_task->get_output_consumers();
     auto* pipeline        = gpu_task->get_pipeline();
-    // todo(amin) acquire stream and pass stream to schedule
+    auto exc_stream       = _stream_pool.acquire_stream(
+      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
     _thread_pool->schedule([this,
-                            task      = std::move(pipeline_task),
-                            ticket    = std::move(ticket),
-                            consumers = std::move(output_consumers),
+                            task       = std::move(pipeline_task),
+                            ticket     = std::move(ticket),
+                            exc_stream = std::move(exc_stream),
+                            consumers  = std::move(output_consumers),
                             pipeline]() mutable {
       try {
-        // todo(amin) pass stream to execute
-        task->execute();
+        task->execute(exc_stream);
+      } catch (oom_reschedule_exception& oom) {
+        SIRIUS_LOG_WARN("GPU Pipeline Executor: OOM reschedule, resuming from operator index {}",
+                        oom.get_resume_operator_index());
+
+        auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
+        if (!gpu_task) {
+          SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+          if (_completion_handler) {
+            _completion_handler->report_error(
+              "GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+          }
+          return;
+        }
+
+        // Mark old task as rescheduled so its destructor skips mark_task_completed().
+        // The rescheduled task will handle completion instead.
+        gpu_task->mark_as_rescheduled();
+
+        // Prepare intermediate data batches for re-processing.
+        // Operator outputs are in idle state; transition to task_created so
+        // lock_or_prepare_batch() can lock them for the rescheduled task.
+        auto intermediate_data = oom.release_intermediate_data();
+        if (intermediate_data) {
+          for (auto& batch : intermediate_data->get_data_batches()) {
+            if (batch) { batch->try_to_create_task(); }
+          }
+        }
+
+        // Build the rescheduled task via virtual factory (preserves derived type).
+        auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
+          std::move(intermediate_data), oom.get_resume_operator_index());
+        auto new_task_id =
+          _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
+        auto new_task = gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
+
+        // Brief backoff before rescheduling to allow other tasks to complete
+        // and free memory. Without this, a rescheduled task can spin in a tight
+        // OOM → reschedule → OOM loop consuming CPU without making progress.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        // Schedule the rescheduled task. It goes back through manager_loop()
+        // to acquire a fresh reservation before execution.
+        this->schedule(std::move(new_task));
+        return;
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
+        if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
+        return;
       } catch (...) {
+        SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         return;
       }

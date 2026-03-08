@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cudf/aggregation.hpp"
+#include "cudf/types.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -23,7 +25,10 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
+
+#include <numeric>
 
 namespace sirius {
 namespace op {
@@ -34,12 +39,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     SiriusPhysicalOperatorType::HASH_GROUP_BY;
 
  public:
-  sirius_physical_grouped_aggregate(
-    duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-    duckdb::idx_t estimated_cardinality);
-
   sirius_physical_grouped_aggregate(
     duckdb::ClientContext& context,
     duckdb::vector<duckdb::LogicalType> types,
@@ -58,23 +57,44 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
-  //! The grouping sets
-  duckdb::GroupedAggregateData grouped_aggregate_data;
-
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
-  //! The radix partitioned hash tables (one per grouping set)
-  duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
-  duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
-  //! A recreation of the input chunk, with nulls for everything that isn't a group
-  duckdb::vector<duckdb::LogicalType> input_group_types;
 
-  // Filters given to sink and friends
-  duckdb::unsafe_vector<duckdb::idx_t> non_distinct_filter;
-  duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
+  // TODO: we may need some of these variables later when we implement grouping sets
 
-  duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
+  // //! The grouping sets
+  // duckdb::GroupedAggregateData grouped_aggregate_data;
+
+  // //! The radix partitioned hash tables (one per grouping set)
+  // duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
+  // duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
+  // //! A recreation of the input chunk, with nulls for everything that isn't a group
+  // duckdb::vector<duckdb::LogicalType> input_group_types;
+
+  // // Filters given to sink and friends
+  // duckdb::unsafe_vector<duckdb::idx_t> non_distinct_filter;
+  // duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
+
+  // duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
+
+  // Grouped aggregatge definitions for cudf compute
+  std::vector<int> group_idx;
+  std::vector<cudf::aggregation::Kind> cudf_aggregates;
+  std::vector<int> cudf_aggregate_idx;
+  std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
+
+  // AVG decomposition metadata
+  std::vector<AggregateSlot> aggregate_slots;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
 
  public:
+  std::vector<int> get_output_grouping_indices() const
+  {
+    std::vector<int> indices(group_idx.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    return indices;
+  }
+
   // Source interface
   bool is_source() const override { return true; }
 
@@ -83,11 +103,13 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     return duckdb::OrderPreservationType::NO_ORDER;
   }
 
- public:
   // Sink interface
   bool is_sink() const override { return true; }
 
   bool sink_order_dependent() const override { return false; }
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

@@ -18,6 +18,10 @@
 
 #include "helper/helper.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/memory/memory_reservation.hpp>
 
 #include <memory>
@@ -76,7 +80,7 @@ class itask {
  public:
   itask(std::unique_ptr<itask_local_state> local_state,
         std::shared_ptr<itask_global_state> global_state)
-    : _local_state(std::move(local_state)), _global_state(global_state)
+    : _local_state(std::move(local_state)), _global_state(std::move(global_state))
   {
   }
 
@@ -89,7 +93,7 @@ class itask {
   itask& operator=(itask&&)      = default;
 
   // Execution function.
-  virtual void execute() = 0;
+  virtual void execute(rmm::cuda_stream_view stream) = 0;
 
   template <typename T>
   T* as() noexcept
@@ -104,13 +108,13 @@ class itask {
   }
 
   template <typename T>
-  bool is() const noexcept
+  [[nodiscard]] bool is() const noexcept
   {
     return dynamic_cast<const T*>(this) != nullptr;
   }
 
   itask_local_state* local_state() noexcept { return _local_state.get(); }
-  itask_global_state* global_state() noexcept { return _global_state.get(); }
+  [[nodiscard]] itask_global_state* global_state() noexcept { return _global_state.get(); }
 
  protected:
   std::unique_ptr<itask_local_state> _local_state;

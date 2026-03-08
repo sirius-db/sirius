@@ -16,15 +16,14 @@
 
 #include "pipeline/pipeline_executor.hpp"
 
-#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
-#include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -71,6 +70,8 @@ pipeline_executor::~pipeline_executor() { stop(); }
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
+    _scan_executor->schedule(std::move(task));
+  } else if (task->is<sirius::op::scan::parquet_scan_task>()) {
     _scan_executor->schedule(std::move(task));
   } else {
     _task_queue.push(std::move(task));
@@ -123,9 +124,11 @@ pipeline_executor::get_scan_executor() noexcept
   return *_scan_executor;
 }
 
-void pipeline_executor::set_scan_caching_enabled(bool enabled)
+void pipeline_executor::set_scan_caching_enabled(bool enabled,
+                                                 bool cache_decoded_table,
+                                                 bool cache_in_gpu)
 {
-  _scan_executor->set_scan_caching_enabled(enabled);
+  _scan_executor->set_scan_caching_enabled(enabled, cache_decoded_table, cache_in_gpu);
 }
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
@@ -144,12 +147,7 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
     _priority_scans.pop();
   }
   for (auto* scan : scans) {
-    if (auto* tscan = dynamic_cast<op::sirius_physical_duckdb_scan*>(scan)) {
-      _priority_scans.push(tscan);
-    } else {
-      SIRIUS_LOG_ERROR("Failed to cast scan to sirius_physical_duckdb_scan");
-      continue;
-    }
+    _priority_scans.push(scan);
   }
 }
 
@@ -170,6 +168,12 @@ std::future<void> pipeline_executor::start_query()
   return future;
 }
 
+void pipeline_executor::terminate_query(std::exception_ptr error)
+{
+  _completion_handler->report_error(error);
+  stop();
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
@@ -186,6 +190,7 @@ void pipeline_executor::management_eventloop()
       }
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
+      // TODO: implement scan task scheduling when state is owned in the operator itself
       schedule_next_scan_tasks();
     }
   }
@@ -196,10 +201,8 @@ void pipeline_executor::schedule_next_scan_tasks()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   if (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
+    _task_creator->schedule(scan_op);
     _priority_scans.pop();
-    for (auto i = 0; i != _scan_executor->get_num_threads(); ++i) {
-      _task_creator->schedule(scan_op);
-    }
   }
 }
 

@@ -17,8 +17,8 @@
 #include "../operator/cuda_helper.cuh"
 #include "cudf/cudf_utils.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_ungrouped_aggregate.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_ungrouped_aggregate.hpp"
 
 namespace duckdb {
 
@@ -55,7 +55,8 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
           agg_mode[agg_idx] == AggregationType::COUNT_DISTINCT) {
         uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         cudaMemset(temp, 0, sizeof(uint64_t));
-        auto validity_mask = createNullMask(1, cudf::mask_state::ALL_NULL);
+        // COUNT on empty set should return 0 (valid), not NULL (SQL standard)
+        auto validity_mask = createNullMask(1, cudf::mask_state::ALL_VALID);
         column[agg_idx]    = make_shared_ptr<GPUColumn>(1,
                                                      GPUColumnType(GPUColumnTypeId::INT64),
                                                      reinterpret_cast<uint8_t*>(temp),
@@ -178,11 +179,10 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
 // cudf higher than 25.04 will trigger `NUNIQUE is not supported for boolean or non-numeric types`
 #if CUDF_VERSION_NUM > 2504
       auto nunique_agg = static_cast<cudf::detail::nunique_aggregation const&>(*aggregate);
-      result =
-        cudf::make_fixed_width_scalar(cudf::detail::distinct_count(cudf_column,
-                                                                   nunique_agg._null_handling,
-                                                                   cudf::nan_policy::NAN_IS_VALID,
-                                                                   cudf::get_default_stream()));
+      result           = cudf::make_fixed_width_scalar(cudf::distinct_count(cudf_column,
+                                                                  nunique_agg._null_handling,
+                                                                  cudf::nan_policy::NAN_IS_VALID,
+                                                                  cudf::get_default_stream()));
 #else
       result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
 #endif

@@ -20,7 +20,7 @@
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -32,29 +32,19 @@
 #include <vector>
 
 namespace sirius {
+namespace op {
+class operator_data;
+}
+
 namespace pipeline {
 
 /**
  * @brief Global state shared across all GPU pipeline tasks in an execution context.
  *
- * This class maintains resources and state that are shared among multiple tasks
- * within the same execution context. It provides access to the data repository
- * for retrieving input data and a message queue for notifying the TaskCreator
- * about task completion events.
+ * This is an alias to sirius_pipeline_task_global_state for backward compatibility
+ * and semantic clarity in GPU pipeline contexts.
  */
-class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_state {
- public:
-  /**
-   * @brief Construct a new gpu_pipeline_task_global_state object
-   *
-   * @param pipeline Shared pointer to the GPU pipeline to execute
-   */
-  explicit gpu_pipeline_task_global_state(duckdb::shared_ptr<sirius_pipeline> pipeline)
-    : _pipeline(std::move(pipeline))
-  {
-  }
-  duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
-};
+using gpu_pipeline_task_global_state = sirius_pipeline_task_global_state;
 
 /**
  * @brief Local state specific to an individual GPU pipeline task instance.
@@ -63,7 +53,7 @@ class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_sta
  * execution. It holds the task and pipeline identifiers, the GPU pipeline to
  * execute, and the data batch views that serve as input to the pipeline.
  */
-class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
+class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
@@ -71,14 +61,14 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
    * @param batch_views Vector of data batches serving as input to the pipeline
    * @param res Memory reservation for GPU resources
    */
-  explicit gpu_pipeline_task_local_state(
-    std::vector<std::shared_ptr<cucascade::data_batch>> batches)
-    : _batches(std::move(batches))
+  explicit gpu_pipeline_task_local_state(std::unique_ptr<op::operator_data> input_data,
+                                         size_t start_operator_index = 0)
+    : _input_data(std::move(input_data)), _start_operator_index(start_operator_index)
   {
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>>
-    _batches;  ///< Input data batches for the pipeline
+  std::unique_ptr<op::operator_data> _input_data;  ///< Input data batches for the pipeline
+  size_t _start_operator_index = 0;  ///< Operator index to resume from (0 = start of pipeline)
 
   /**
    * @brief Get a const pointer to the reservation (non-owning).
@@ -111,15 +101,17 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   gpu_pipeline_task(uint64_t task_id,
                     std::vector<cucascade::shared_data_repository*> data_repos,
-                    std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
-                    std::shared_ptr<sirius::parallel::itask_global_state> global_state);
+                    std::unique_ptr<sirius_pipeline_task_local_state> local_state,
+                    std::shared_ptr<sirius_pipeline_task_global_state> global_state);
 
   ~gpu_pipeline_task() override;
 
   /**
    * @brief Method to actually execute the task
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    */
-  void execute() override;
+  void execute(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the unique identifier for this task
@@ -140,9 +132,10 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * Executes the GPU pipeline on the input batches and returns the computed results.
    *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+  std::unique_ptr<op::operator_data> compute_task(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the computed output batches to data repositories.
@@ -151,7 +144,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+  void publish_output(op::operator_data& output_batches, rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the input size for this task
@@ -165,9 +158,57 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 
+  /**
+   * @brief Mark this task as rescheduled due to OOM.
+   *
+   * When set, the destructor will NOT call mark_task_completed() on the pipeline,
+   * since the rescheduled replacement task will handle that instead.
+   */
+  void mark_as_rescheduled() noexcept { _oom_rescheduled = true; }
+
+  /**
+   * @brief Check if this task was rescheduled due to OOM.
+   */
+  [[nodiscard]] bool is_rescheduled() const noexcept { return _oom_rescheduled; }
+
+  /**
+   * @brief Get the data repositories for output publishing.
+   *
+   * Used by the executor to create a rescheduled task with the same output destinations.
+   */
+  [[nodiscard]] const std::vector<cucascade::shared_data_repository*>& get_data_repos()
+    const noexcept
+  {
+    return _data_repos;
+  }
+
+  /**
+   * @brief Get the shared global state.
+   *
+   * Used by the executor to create a rescheduled task sharing the same pipeline context.
+   */
+  [[nodiscard]] std::shared_ptr<sirius_pipeline_task_global_state> get_shared_global_state() const
+  {
+    return std::dynamic_pointer_cast<sirius_pipeline_task_global_state>(_global_state);
+  }
+
+  /**
+   * @brief Create a rescheduled task after an OOM event.
+   *
+   * Derived classes can override this to ensure the rescheduled task has the correct
+   * dynamic type and any additional state needed for re-execution.
+   *
+   * @param task_id The unique identifier for the new task
+   * @param local_state The local state with intermediate data and resume index
+   * @return A new task ready to be scheduled for execution
+   */
+  virtual std::unique_ptr<gpu_pipeline_task> create_rescheduled_task(
+    uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state);
+
  private:
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;
+  bool _oom_rescheduled = false;
 };
 
 }  // namespace pipeline

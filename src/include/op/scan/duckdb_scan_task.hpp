@@ -17,8 +17,9 @@
 #pragma once
 
 // sirius
+#include <cudf/utilities/default_stream.hpp>
+
 #include <config.hpp>
-#include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/sirius_physical_duckdb_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
@@ -26,13 +27,15 @@
 #include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
-#include <pipeline/sirius_pipeline_itask_local_state.hpp>
+#include <pipeline/sirius_pipeline_task_states.hpp>
+#include <sirius_config.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/host_table.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -56,7 +59,7 @@ namespace sirius::op::scan {
 /**
  * @brief The global state for a duckdb_scan_task.
  */
-class duckdb_scan_task_global_state : public sirius::parallel::itask_global_state,
+class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_global_state,
                                       public duckdb::GlobalSourceState {
   friend class duckdb_scan_task;
   friend class duckdb_scan_task_local_state;
@@ -98,9 +101,9 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   void set_source_drained()
   {
     _source_drained.store(true, std::memory_order_release);
-    if (_pipeline) {
+    if (get_pipeline()) {
       auto* scan_op =
-        dynamic_cast<sirius_physical_duckdb_scan*>(&_pipeline->get_operators().at(0).get());
+        dynamic_cast<sirius_physical_duckdb_scan*>(&get_pipeline()->get_operators().at(0).get());
 
       if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
     }
@@ -136,12 +139,8 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     return output_consumers;
   }
 
-  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
-
  private:
   //===----------Fields----------===//
-  duckdb::shared_ptr<pipeline::sirius_pipeline>
-    _pipeline;                         ///< The pipeline to which this table scan belongs
   duckdb::SiriusContext* _sirius_ctx;  ///< The Sirius context
   std::unique_ptr<duckdb::GlobalTableFunctionState>
     _global_tf_state;  ///< Global state for the table function
@@ -165,7 +164,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
  * DuckDB data chunks into those buffers.
  *
  */
-class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_itask_local_state {
+class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_task_local_state {
   using data_batch = cucascade::data_batch;
 
  public:
@@ -197,7 +196,7 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
     // The allocation accessors for the column data, mask, and offsets
     memory::multiple_blocks_allocation_accessor<uint8_t> data_blocks_accessor;
     memory::multiple_blocks_allocation_accessor<uint8_t> mask_blocks_accessor;
-    memory::multiple_blocks_allocation_accessor<int64_t> offset_blocks_accessor;
+    memory::multiple_blocks_allocation_accessor<int32_t> offset_blocks_accessor;
 
     //===----------Constructors & Destructor----------===//
     column_builder() = default;
@@ -273,12 +272,12 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
                         std::unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
-     * @brief Create a metadata node for this column for building a host_table_allocation.
+     * @brief Create a column_metadata for this column for building a host_table_allocation.
      *
      * @param[in] num_rows The number of rows in the column.
-     * @return metadata_node The constructed metadata node.
+     * @return cucascade::memory::column_metadata The constructed column metadata.
      */
-    [[nodiscard]] metadata_node make_metadata_node(size_t num_rows) const;
+    [[nodiscard]] cucascade::memory::column_metadata make_column_metadata(size_t num_rows) const;
   };
 
   //===----------Constructor & Destructor----------===//
@@ -296,8 +295,8 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
   duckdb_scan_task_local_state(
     duckdb_scan_task_global_state& g_state,
     duckdb::ExecutionContext& exec_ctx,
-    size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
+    size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    size_t default_varchar_size   = sirius::config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
   [[nodiscard]] std::size_t get_estimated_reservation_size() const noexcept
@@ -409,7 +408,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   //===----------Destructor----------===//
   ~duckdb_scan_task();
 
-  void execute() override;
+  void execute(rmm::cuda_stream_view stream) override;
 
  private:
   //===----------Methods----------===//
@@ -464,9 +463,11 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    *
    * Scans data from the DuckDB table function and accumulates it into data batches.
    *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+  std::unique_ptr<op::operator_data> compute_task(
+    [[maybe_unused]] rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the computed output batches to the data repository.
@@ -476,7 +477,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+  void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
   std::size_t get_estimated_reservation_size() const override
   {

@@ -14,17 +14,12 @@
  * limitations under the License.
  */
 
-#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
-#include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
-#include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -59,13 +54,6 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
                                           duckdb::vector<duckdb::column_t>& partition_columns)
 {
   if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) { return false; }
-  for (auto& expression : op.expressions) {
-    auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (aggregate.IsDistinct()) {
-      // distinct aggregates are not supported in partitioned hash aggregates
-      return false;
-    }
-  }
   // check if the source is partitioned by the aggregate columns
   // figure out the columns we are grouping by
   for (auto& group_expr : op.groups) {

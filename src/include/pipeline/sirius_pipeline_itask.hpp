@@ -18,7 +18,11 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
+
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 
@@ -51,10 +55,11 @@ class sirius_pipeline_itask : public parallel::itask {
    * the resulting data batches. The computation may involve reading input batches,
    * executing GPU operators, scanning database tables, etc.
    *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output
    *         data batches, which may be empty if no output is produced.
    */
-  virtual std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() = 0;
+  virtual std::unique_ptr<op::operator_data> compute_task(rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Publish the computed output batches to appropriate destinations.
@@ -65,8 +70,7 @@ class sirius_pipeline_itask : public parallel::itask {
    *
    * @param output_batches The data batches to publish (typically the result of compute_task())
    */
-  virtual void publish_output(
-    std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) = 0;
+  virtual void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Get the estimated reservation memory size needed for this task.
@@ -75,15 +79,21 @@ class sirius_pipeline_itask : public parallel::itask {
    *
    * @return std::size_t The estimated reservation size
    */
-  virtual std::size_t get_estimated_reservation_size() const = 0;
+  [[nodiscard]] virtual std::size_t get_estimated_reservation_size() const = 0;
 
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;
 
-  void execute() override
+  void execute(rmm::cuda_stream_view stream) override
   {
-    auto output_batches = compute_task();
-    publish_output(output_batches);
+    auto output_batches = compute_task(stream);
+    if (output_batches) { publish_output(*output_batches, stream); }
+  }
+
+  // Tasks that can exist without an attached pipeline should override this.
+  [[nodiscard]] size_t get_pipeline_id() const
+  {
+    return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
   }
 
  protected:
@@ -93,8 +103,8 @@ class sirius_pipeline_itask : public parallel::itask {
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
-                        std::shared_ptr<parallel::itask_global_state> global_state)
+  sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_task_local_state> local_state,
+                        std::shared_ptr<sirius_pipeline_task_global_state> global_state)
     : itask(std::move(local_state), std::move(global_state))
   {
   }

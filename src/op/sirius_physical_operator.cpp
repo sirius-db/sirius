@@ -131,7 +131,6 @@ sirius_physical_operator::get_sources() const
 {
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
   if (is_sink()) {
-    D_ASSERT(children.size() == 1);
     result.push_back(*this);
     return result;
   } else {
@@ -168,29 +167,30 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 {
   auto it = ports.find(std::string(port_id));
   if (it == ports.end()) {
+    std::string ports_string = "";
+    for (auto& [port_name, port_ptr] : ports) {
+      ports_string += port_name + ", ";
+    }
     throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
-                                    get_name());
+                                    get_name() + " existing ports are: " + ports_string);
   }
   return it->second.get();
 }
 
-void sirius_physical_operator::sink(
-  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& output_batches,
-  rmm::cuda_stream_view stream)
+void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  for (auto& batch : output_batches) {
+  for (auto& batch : output_data.get_data_batches()) {
     for (auto& [next_op, port_id] : next_port_after_sink) {
       next_op->push_data_batch(port_id, batch);
     }
   }
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_operator::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_data& input_data,
+                                                                 rmm::cuda_stream_view stream)
 {
   // not doing anything for now
-  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
@@ -230,9 +230,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   // if no unfinished barriers, then is this operator ready to create a task?
   if (std::all_of(ports.begin(), ports.end(), [](const auto& port_pair) {
         return (port_pair.second->type != MemoryBarrierType::FULL &&
-                port_pair.second->repo->size() > 0) ||
+                port_pair.second->repo->total_size() > 0) ||
                (port_pair.second->type == MemoryBarrierType::FULL &&
-                port_pair.second->repo->size() > 0 && port_pair.second->src_pipeline &&
+                port_pair.second->repo->total_size() > 0 && port_pair.second->src_pipeline &&
                 port_pair.second->src_pipeline->is_pipeline_finished());
       })) {
     return task_creation_hint{TaskCreationHint::READY, this};
@@ -253,8 +253,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   return std::nullopt;
 }
 
-std::optional<std::vector<::std::shared_ptr<::cucascade::data_batch>>>
-sirius_physical_operator::get_next_task_input_batch()
+std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_data()
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
@@ -265,14 +264,14 @@ sirius_physical_operator::get_next_task_input_batch()
     auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
     if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
-  if (input_batch.empty()) { return std::vector<::std::shared_ptr<::cucascade::data_batch>>{}; }
-  return input_batch;
+  if (input_batch.empty()) { return nullptr; }
+  return std::make_unique<operator_data>(input_batch);
 }
 
 bool sirius_physical_operator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (port_ptr->repo->size() != 0) { return false; }
+    if (port_ptr->repo->total_size() != 0) { return false; }
   }
   return true;
 }

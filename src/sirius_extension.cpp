@@ -19,9 +19,6 @@
 
 #include "config.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "duckdb.hpp"
-#include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
-#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -35,7 +32,6 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
@@ -46,6 +42,7 @@
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
+#include "util/segfault_backtrace.hpp"
 
 #include <cstdlib>
 
@@ -76,8 +73,7 @@ struct GPUTableFunctionData : public TableFunctionData {
     original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 
     // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer      = enable_optimizer;
-    context.config.use_replacement_scans = false;
+    context.config.enable_optimizer = enable_optimizer;
     // We want for sure to disable the internal compression optimizations.
     // These are DuckDB specific, no other system implements these. Also,
     // respect the user's settings if they chose to disable any specific optimizers.
@@ -89,6 +85,9 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -159,8 +158,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
     original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 
     // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer      = enable_optimizer;
-    context.config.use_replacement_scans = false;
+    context.config.enable_optimizer = enable_optimizer;
     // We want for sure to disable the internal compression optimizations.
     // These are DuckDB specific, no other system implements these. Also,
     // respect the user's settings if they chose to disable any specific optimizers.
@@ -172,6 +170,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -372,12 +373,6 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
 
-  // cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT.
-  // Downcast to BIGINT so all downstream operators and the result collector use a supported type.
-  for (auto& type : planner.types) {
-    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
-  }
-
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
@@ -395,7 +390,12 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   } catch (std::exception& e) {
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
-    result->plan_error = true;
+    if (Config::ENABLE_DUCKDB_FALLBACK) {
+      result->plan_error = true;
+    } else {
+      throw std::runtime_error("Error in SiriusGeneratePhysicalPlan: " + error.RawMessage());
+      return nullptr;
+    }
   }
 
   for (auto& column : planner.names) {
@@ -426,11 +426,16 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
-        SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
-        printf(
-          "=============================================\nError in SiriusExecuteQuery, fallback to "
-          "DuckDB\n=============================================\n");
-        data.res = data.conn->Query(data.query);
+        if (Config::ENABLE_DUCKDB_FALLBACK) {
+          SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
+          printf(
+            "=============================================\nError in SiriusExecuteQuery, fallback "
+            "to DuckDB\n=============================================\n");
+          data.res = data.conn->Query(data.query);
+        } else {
+          throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
+          return;
+        }
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -659,6 +664,12 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
 
+static void SetEnableDuckdbFallback(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_DUCKDB_FALLBACK = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DUCKDB_FALLBACK to {}", Config::ENABLE_DUCKDB_FALLBACK);
+}
+
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::ENABLE_REGEX_JIT_IMPL = BooleanValue::Get(parameter);
@@ -671,18 +682,56 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static sirius::operator_params* get_operator_params(ClientContext& context)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; operator_params SET ignored");
+    return nullptr;
+  }
+  return &sirius_ctx->get_config().get_operator_params();
+}
+
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::DEFAULT_SCAN_TASK_BATCH_SIZE = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_BATCH_SIZE to {}",
-                   Config::DEFAULT_SCAN_TASK_BATCH_SIZE);
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->scan_task_batch_size = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
 static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = UBigIntValue::Get(parameter);
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->default_scan_task_varchar_size = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_VARCHAR_SIZE to {}",
-                   Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE);
+                   params->default_scan_task_varchar_size);
+}
+
+static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->max_sort_partition_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
+                   params->max_sort_partition_bytes);
+}
+
+static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->hash_partition_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config HASH_PARTITION_BYTES to {}", params->hash_partition_bytes);
+}
+
+static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->concat_batch_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -734,10 +783,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   // Add in config options for duckdb fallback checking
   config.AddExtensionOption("enable_fallback_check",
-                            "Whether to enable checking of fallback to duckdb execution",
+                            "Whether to enable fallback checking",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
                             SetEnableFallbackCheck);
+
+  config.AddExtensionOption(
+    "enable_duckdb_fallback",
+    "Whether to enable fallback to duckdb execution after an error is detected",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_DUCKDB_FALLBACK),
+    SetEnableDuckdbFallback);
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(
@@ -756,22 +812,43 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   // Add in config options for duckdb scan task
   // Default batch size
-  config.AddExtensionOption("default_scan_task_batch_size",
+  config.AddExtensionOption("scan_task_batch_size",
                             "The default batch size for a duckdb scan task",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(Config::DEFAULT_SCAN_TASK_BATCH_SIZE),
+                            Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
   // Default varchar size for estimating rows per batch
   config.AddExtensionOption(
     "default_scan_task_varchar_size",
     "The default varchar size for estimating rows per batch in a duckdb scan task",
     LogicalType::UBIGINT,
-    Value::UBIGINT(Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE),
+    Value::UBIGINT(sirius::operator_params{}.default_scan_task_varchar_size),
     SetDefaultScanTaskVarcharSize);
+
+  // Add in config option for sort partition size
+  config.AddExtensionOption("max_sort_partition_bytes",
+                            "Maximum bytes per sort partition (0 = auto based on 33% GPU memory)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
+                            SetMaxSortPartitionBytes);
+
+  config.AddExtensionOption("hash_partition_bytes",
+                            "Target size in bytes per hash partition",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.hash_partition_bytes),
+                            SetHashPartitionBytes);
+
+  config.AddExtensionOption("concat_batch_bytes",
+                            "Target size for concat operator",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
+                            SetConcatBatchBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  sirius::util::install_segfault_backtrace_handler();
+
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
   config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());

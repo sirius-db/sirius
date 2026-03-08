@@ -23,6 +23,7 @@
 #include <op/sirius_physical_ungrouped_aggregate.hpp>
 #include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
 
+#include <cstdint>
 #include <iterator>
 
 using namespace duckdb;
@@ -30,6 +31,18 @@ using namespace sirius::op;
 using namespace cucascade;
 using namespace cucascade::memory;
 using namespace sirius::test::operator_utils;
+
+namespace {
+inline uint64_t int128_low64(__int128_t value)
+{
+  return static_cast<uint64_t>(static_cast<unsigned __int128>(value));
+}
+
+inline int64_t int128_high64(__int128_t value)
+{
+  return static_cast<int64_t>(static_cast<unsigned __int128>(value) >> 64);
+}
+}  // namespace
 
 // Helper to create a dummy AggregateFunction since we only need the name and types for the GPU
 // operator
@@ -168,46 +181,63 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
-  auto local_out1 = local_op.execute({b1});
-  auto local_out2 = local_op.execute({b2});
+  auto local_out1         = local_op.execute(operator_data({b1}), cudf::get_default_stream());
+  auto local_out2         = local_op.execute(operator_data({b2}), cudf::get_default_stream());
+  auto local_out1_batches = local_out1->get_data_batches();
+  auto local_out2_batches = local_out2->get_data_batches();
   std::vector<std::shared_ptr<data_batch>> merge_inputs;
   merge_inputs.insert(merge_inputs.end(),
-                      std::make_move_iterator(local_out1.begin()),
-                      std::make_move_iterator(local_out1.end()));
+                      std::make_move_iterator(local_out1_batches.begin()),
+                      std::make_move_iterator(local_out1_batches.end()));
   merge_inputs.insert(merge_inputs.end(),
-                      std::make_move_iterator(local_out2.begin()),
-                      std::make_move_iterator(local_out2.end()));
-  auto out = merge_op.execute(merge_inputs);
-  REQUIRE(out.size() == 1);
+                      std::make_move_iterator(local_out2_batches.begin()),
+                      std::make_move_iterator(local_out2_batches.end()));
+  auto out = merge_op.execute(operator_data(merge_inputs), cudf::get_default_stream());
+  REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table = out[0]->get_data()->template cast<gpu_table_representation>().get_table();
-  auto view  = table.view();
+  auto table =
+    out->get_data_batches()[0]->get_data()->template cast<gpu_table_representation>().get_table();
+  auto view = table.view();
 
   REQUIRE(view.num_columns() == 5);
   REQUIRE(view.num_rows() == 1);
 
   // Verify
-  auto sum_out        = copy_column_to_host<typename Traits::type>(view.column(0));
-  auto min_out        = copy_column_to_host<typename Traits::type>(view.column(1));
-  auto max_out        = copy_column_to_host<typename Traits::type>(view.column(2));
+  // SUM may widen the output type (e.g. DECIMAL64 -> DECIMAL128), so read with agg_output_type.
+  // MIN/MAX are not widened for decimals, so read with min_max_output_type (= type for decimals).
+  auto sum_out        = copy_column_to_host<typename Traits::agg_output_type>(view.column(0));
+  auto min_out        = copy_column_to_host<typename Traits::min_max_output_type>(view.column(1));
+  auto max_out        = copy_column_to_host<typename Traits::min_max_output_type>(view.column(2));
   auto count_out      = copy_column_to_host<int64_t>(view.column(3));
   auto count_star_out = copy_column_to_host<int64_t>(view.column(4));
 
-  typename Traits::type expected_sum = 0;
-  typename Traits::type expected_min = vals[0];
-  typename Traits::type expected_max = vals[0];
+  // Compute expected SUM in agg_output_type (DECIMAL64 SUM upcasts to DECIMAL128).
+  // Compute expected MIN/MAX in min_max_output_type (DECIMAL64 stays DECIMAL64).
+  typename Traits::agg_output_type expected_sum = 0;
+  typename Traits::min_max_output_type expected_min =
+    static_cast<typename Traits::min_max_output_type>(vals[0]);
+  typename Traits::min_max_output_type expected_max =
+    static_cast<typename Traits::min_max_output_type>(vals[0]);
 
   for (auto v : vals) {
-    expected_sum += v;
-    if (v < expected_min) expected_min = v;
-    if (v > expected_max) expected_max = v;
+    expected_sum += static_cast<typename Traits::agg_output_type>(v);
+    auto v_mm = static_cast<typename Traits::min_max_output_type>(v);
+    if (v_mm < expected_min) expected_min = v_mm;
+    if (v_mm > expected_max) expected_max = v_mm;
   }
 
   // Approximate check for floats
   if constexpr (std::is_floating_point_v<typename Traits::type>) {
-    REQUIRE(sum_out[0] == Approx(expected_sum));
-    REQUIRE(min_out[0] == Approx(expected_min));
-    REQUIRE(max_out[0] == Approx(expected_max));
+    REQUIRE(sum_out[0] == Approx(static_cast<typename Traits::type>(expected_sum)));
+    REQUIRE(min_out[0] == Approx(static_cast<typename Traits::type>(expected_min)));
+    REQUIRE(max_out[0] == Approx(static_cast<typename Traits::type>(expected_max)));
+  } else if constexpr (std::is_same_v<typename Traits::agg_output_type, __int128_t>) {
+    // SUM output is DECIMAL128 (__int128_t).
+    REQUIRE(int128_high64(sum_out[0]) == int128_high64(expected_sum));
+    REQUIRE(int128_low64(sum_out[0]) == int128_low64(expected_sum));
+    // MIN/MAX output is DECIMAL64 (int64_t) — not widened.
+    REQUIRE(min_out[0] == expected_min);
+    REQUIRE(max_out[0] == expected_max);
   } else {
     REQUIRE(sum_out[0] == expected_sum);
     REQUIRE(min_out[0] == expected_min);
@@ -276,21 +306,24 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
-  auto local_out1 = local_op.execute({b1});
-  auto local_out2 = local_op.execute({b2});
+  auto local_out1         = local_op.execute(operator_data({b1}), cudf::get_default_stream());
+  auto local_out2         = local_op.execute(operator_data({b2}), cudf::get_default_stream());
+  auto local_out1_batches = local_out1->get_data_batches();
+  auto local_out2_batches = local_out2->get_data_batches();
   std::vector<std::shared_ptr<data_batch>> merge_inputs;
   merge_inputs.insert(merge_inputs.end(),
-                      std::make_move_iterator(local_out1.begin()),
-                      std::make_move_iterator(local_out1.end()));
+                      std::make_move_iterator(local_out1_batches.begin()),
+                      std::make_move_iterator(local_out1_batches.end()));
   merge_inputs.insert(merge_inputs.end(),
-                      std::make_move_iterator(local_out2.begin()),
-                      std::make_move_iterator(local_out2.end()));
+                      std::make_move_iterator(local_out2_batches.begin()),
+                      std::make_move_iterator(local_out2_batches.end()));
 
-  auto out = merge_op.execute(merge_inputs);
-  REQUIRE(out.size() == 1);
+  auto out = merge_op.execute(operator_data(merge_inputs), cudf::get_default_stream());
+  REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table = out[0]->get_data()->template cast<gpu_table_representation>().get_table();
-  auto view  = table.view();
+  auto table =
+    out->get_data_batches()[0]->get_data()->template cast<gpu_table_representation>().get_table();
+  auto view = table.view();
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.num_rows() == 1);
 

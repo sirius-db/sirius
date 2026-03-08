@@ -16,15 +16,14 @@
 
 #include "catch.hpp"
 #include "exec/config.hpp"
-#include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
-#include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -32,6 +31,7 @@
 using namespace sirius::pipeline;
 using namespace sirius::parallel;
 using namespace std::chrono_literals;
+using namespace sirius::op;
 
 /**
  * Mock GPU pipeline task for testing.
@@ -52,7 +52,8 @@ class mock_gpu_pipeline_task_global_state : public gpu_pipeline_task_global_stat
 class mock_gpu_pipeline_task_local_state : public gpu_pipeline_task_local_state {
  public:
   mock_gpu_pipeline_task_local_state(int task_id, int expected_gpu_id)
-    : gpu_pipeline_task_local_state(std::vector<std::shared_ptr<cucascade::data_batch>>{}),
+    : gpu_pipeline_task_local_state(
+        std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{})),
       _task_id(task_id),
       _expected_gpu_id(expected_gpu_id)
   {
@@ -73,7 +74,7 @@ class mock_gpu_pipeline_task : public gpu_pipeline_task {
   {
   }
 
-  void execute() override
+  void execute(rmm::cuda_stream_view stream) override
   {
     auto& global = _global_state->cast<mock_gpu_pipeline_task_global_state>();
     auto& local  = _local_state->cast<mock_gpu_pipeline_task_local_state>();

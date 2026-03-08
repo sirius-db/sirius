@@ -51,6 +51,9 @@ class sirius_physical_cte : public sirius_physical_operator {
   duckdb::idx_t table_index;
   std::string ctename;
 
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
  public:
   // Sink interface
   bool is_sink() const override { return true; }

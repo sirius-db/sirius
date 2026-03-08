@@ -74,13 +74,13 @@ class downgrade_task_local_state : public itask_local_state {
  public:
   explicit downgrade_task_local_state(uint64_t task_id,
                                       uint64_t pipeline_id,
-                                      std::unique_ptr<cucascade::data_batch> batch)
+                                      std::shared_ptr<cucascade::data_batch> batch)
     : _task_id(task_id), _pipeline_id(pipeline_id), _batch(std::move(batch))
   {
   }
   uint64_t _task_id;
   uint64_t _pipeline_id;
-  std::unique_ptr<cucascade::data_batch> _batch;
+  std::shared_ptr<cucascade::data_batch> _batch;
 };
 
 /**
@@ -109,8 +109,10 @@ class downgrade_task : public itask {
    *
    * This method performs the actual downgrading of data from a higher memory tier
    * to a lower memory tier.
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    */
-  void execute() override;
+  void execute(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the unique identifier for this task

@@ -44,9 +44,8 @@ class sirius_physical_result_collector : public sirius_physical_operator {
  public:
   explicit sirius_physical_result_collector(::sirius::sirius_prepared_statement_data& data);
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 
   duckdb::StatementType statement_type;
   duckdb::StatementProperties properties;
@@ -91,12 +90,11 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
    * @throws InternalException if the memory manager is not initialized, if the reservation fails,
    * or if the memory space for the reservation is invalid
    * @note For now, we assume that the input batch, if in the HOST tier, is always in the
-   * host_table_representation. If it is in the GPU tier, we convert it to the
-   * host_table_representation. In the future, we should register converters for other specialized
-   * data representations and invoke one such here.
+   * host_data_representation. If it is in the GPU tier, we convert it to the
+   * host_data_representation. In the future, we should register converters for other
+   * specialized data representations and invoke one such here.
    */
-  void sink(const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-            rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
  private:
   duckdb::ClientContext& _client_ctx;

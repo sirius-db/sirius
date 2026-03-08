@@ -16,19 +16,10 @@
 
 #include "op/sirius_physical_filter.hpp"
 
-#include "duckdb/planner/expression/bound_between_expression.hpp"
-#include "duckdb/planner/expression/bound_case_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
 
-#include <chrono>
-#include <stdexcept>
+#include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
@@ -55,12 +46,11 @@ sirius_physical_filter::sirius_physical_filter(
   }
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_filter::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_data& input_data,
+                                                               rmm::cuda_stream_view stream)
 {
-  SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
-  auto start = std::chrono::high_resolution_clock::now();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_filter::execute"};
+  const auto& input_batches = input_data.get_data_batches();
 
   // The executor uses the data_batch API to filter rows according to `expression`.
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
@@ -73,12 +63,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_filter::exec
     auto filtered_batch = gpu_expression_executor.select(batch, stream);
     if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
   }
-
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count() / 1000.0);
-
-  return output_batches;
+  return std::make_unique<operator_data>(output_batches);
 }
 
 }  // namespace op

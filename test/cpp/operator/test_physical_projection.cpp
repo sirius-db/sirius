@@ -18,7 +18,6 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
-#include <duckdb/common/types/decimal.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_projection.hpp>
 
@@ -86,10 +85,11 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = projection.execute(inputs);
-  REQUIRE(outputs.size() == 1);
-  auto output_table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto out_view     = output_table.view();
+  auto outputs = projection.execute(operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto output_table =
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto out_view = output_table.view();
 
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
   auto host_keys = copy_column_to_host<int64_t>(out_view.column(1));
@@ -130,10 +130,13 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = projection.execute(inputs);
-  REQUIRE(outputs.size() == 1);
-  auto output_table = outputs[0]->get_data()->template cast<gpu_table_representation>().get_table();
-  auto out_view     = output_table.view();
+  auto outputs = projection.execute(operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto output_table = outputs->get_data_batches()[0]
+                        ->get_data()
+                        ->template cast<gpu_table_representation>()
+                        .get_table();
+  auto out_view = output_table.view();
 
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
   REQUIRE(host_data == data_vals);
@@ -175,10 +178,13 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = projection.execute(inputs);
-  REQUIRE(outputs.size() == 1);
-  auto output_table = outputs[0]->get_data()->template cast<gpu_table_representation>().get_table();
-  auto out_view     = output_table.view();
+  auto outputs = projection.execute(operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto output_table = outputs->get_data_batches()[0]
+                        ->get_data()
+                        ->template cast<gpu_table_representation>()
+                        .get_table();
+  auto out_view = output_table.view();
 
   auto host_key0 = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(1));

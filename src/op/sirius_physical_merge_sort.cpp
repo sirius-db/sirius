@@ -16,24 +16,15 @@
 
 #include "op/sirius_physical_merge_sort.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
-#include "operator/gpu_materialize.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
+
+#include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
-
-// Helper to deep copy BoundOrderByNode vector
-static duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
-  const duckdb::vector<duckdb::BoundOrderByNode>& src)
-{
-  duckdb::vector<duckdb::BoundOrderByNode> result;
-  result.reserve(src.size());
-  for (const auto& order : src) {
-    result.push_back(order.Copy());
-  }
-  return result;
-}
 
 sirius_physical_merge_sort::sirius_physical_merge_sort(sirius_physical_order* order_by)
   : sirius_physical_merge_sort(
@@ -58,6 +49,101 @@ sirius_physical_merge_sort::sirius_physical_merge_sort(
     projections(std::move(projections_p)),
     is_index_sort(is_index_sort_p)
 {
+}
+
+std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_data()
+{
+  // Drain all batches from one partition per call (one merge task per partition).
+  // Follows the same pattern as sirius_physical_grouped_aggregate_merge.
+  std::lock_guard<std::mutex> lg(_drain_mutex);
+
+  auto* repo = ports.begin()->second->repo;
+  if (_current_partition_index < repo->num_partitions()) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
+    while (true) {
+      auto batch =
+        repo->pop_data_batch(cucascade::batch_state::task_created, _current_partition_index);
+      if (!batch) { break; }
+      all_batches.push_back(std::move(batch));
+    }
+    _current_partition_index++;
+    SIRIUS_LOG_DEBUG("merge_sort: drained {} batches for partition {}",
+                     all_batches.size(),
+                     _current_partition_index - 1);
+    if (all_batches.empty()) { return nullptr; }
+    return std::make_unique<operator_data>(all_batches);
+  }
+  return nullptr;
+}
+
+std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
+                                                                   rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
+  const auto& input_batches = input_data.get_data_batches();
+
+  // Collect valid batches and find memory space
+  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
+  cucascade::memory::memory_space* space = nullptr;
+  for (auto const& batch : input_batches) {
+    if (!batch) { continue; }
+    if (!space) { space = batch->get_memory_space(); }
+    valid_batches.push_back(batch);
+  }
+
+  if (valid_batches.empty() || !space) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
+
+  // Helper lambda to apply final projection to a batch (removes sort-key-only columns)
+  auto apply_final_projection =
+    [this, stream, space](
+      std::shared_ptr<cucascade::data_batch> batch) -> std::shared_ptr<cucascade::data_batch> {
+    if (_final_projections.empty() || !batch) { return batch; }
+    auto table_view = sirius::get_cudf_table_view(*batch);
+    std::vector<cudf::column_view> projected_cols;
+    for (auto idx : _final_projections) {
+      projected_cols.push_back(table_view.column(static_cast<cudf::size_type>(idx)));
+    }
+    auto projected_table = std::make_unique<cudf::table>(
+      cudf::table_view(projected_cols), stream, space->get_default_allocator());
+    return sirius::make_data_batch(std::move(projected_table), *space);
+  };
+
+  // Single batch: no merge needed
+  if (valid_batches.size() == 1) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
+    outputs.push_back(apply_final_projection(valid_batches[0]));
+    return std::make_unique<operator_data>(outputs);
+  }
+
+  // Build cudf order vectors from BoundOrderByNode
+  std::vector<int> order_key_idx;
+  std::vector<cudf::order> column_order;
+  std::vector<cudf::null_order> null_precedence;
+  order_key_idx.reserve(orders.size());
+  column_order.reserve(orders.size());
+  null_precedence.reserve(orders.size());
+
+  for (auto const& ord : orders) {
+    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      throw duckdb::NotImplementedException("Merge sort only supports bound reference expressions");
+    }
+    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    order_key_idx.push_back(idx);
+    column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
+                                                                    : cudf::order::DESCENDING);
+    null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
+                                ? cudf::null_order::BEFORE
+                                : cudf::null_order::AFTER);
+  }
+
+  auto merged_batch = gpu_merge_impl::merge_order_by(
+    valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
+  if (merged_batch) { outputs.push_back(apply_final_projection(std::move(merged_batch))); }
+  return std::make_unique<operator_data>(outputs);
 }
 
 }  // namespace op

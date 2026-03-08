@@ -16,6 +16,9 @@
 
 // sirius
 #include "cucascade/memory/memory_space.hpp"
+#include "op/sirius_physical_operator.hpp"
+
+#include <cudf/cudf_utils.hpp>
 
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
@@ -25,7 +28,6 @@
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/memory/host_table.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
@@ -42,7 +44,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   pipeline::pipeline_executor& pipeline_exec,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
-  : _pipeline(std::move(pipeline)),
+  : sirius_pipeline_task_global_state(pipeline),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
     _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
     _pipeline_executor(pipeline_exec),
@@ -55,7 +57,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   if (_op.function.init_global) {
     duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
                                             _op.column_ids,
-                                            _op.scanned_ids,
+                                            _op.projection_ids,
                                             nullptr,  // Don't pass filters to DuckDB
                                             _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
@@ -102,7 +104,7 @@ void duckdb_scan_task_local_state::column_builder::initialize_accessors(
     offset_blocks_accessor.set_current(0, allocation);
     // Initialize data accessor
     total_data_bytes_allocated = estimated_num_rows * type_size;
-    size_t data_byte_offset    = byte_offset + (estimated_num_rows + 1) * sizeof(int64_t);
+    size_t data_byte_offset    = byte_offset + (estimated_num_rows + 1) * sizeof(int32_t);
     data_blocks_accessor.initialize(data_byte_offset, allocation);
     // Initialize mask accessor
     size_t mask_byte_offset = data_byte_offset + total_data_bytes_allocated;
@@ -255,23 +257,54 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   process_mask_for_column(validity, num_rows, row_offset, allocation);
 }
 
-metadata_node duckdb_scan_task_local_state::column_builder::make_metadata_node(
-  size_t num_rows) const
+cucascade::memory::column_metadata
+duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_rows) const
 {
+  using cucascade::memory::column_metadata;
+
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
-    // VARCHAR column
-    return make_string_metadata_node(
-      static_cast<cudf::size_type>(num_rows),
-      static_cast<cudf::size_type>(null_count),
-      static_cast<int64_t>(data_blocks_accessor.initial_byte_offset),
-      static_cast<int64_t>(mask_blocks_accessor.initial_byte_offset),
-      static_cast<int64_t>(offset_blocks_accessor.initial_byte_offset));
+    // VARCHAR column: data buffer + offsets child
+    column_metadata offsets_child{};
+    offsets_child.type_id          = cudf::type_id::INT32;
+    offsets_child.num_rows         = static_cast<cudf::size_type>(num_rows + 1);
+    offsets_child.null_count       = 0;
+    offsets_child.scale            = 0;
+    offsets_child.has_null_mask    = false;
+    offsets_child.null_mask_offset = 0;
+    offsets_child.null_mask_size   = 0;
+    offsets_child.has_data         = true;
+    offsets_child.data_offset      = offset_blocks_accessor.initial_byte_offset;
+    offsets_child.data_size        = (num_rows + 1) * sizeof(int32_t);
+
+    column_metadata col{};
+    col.type_id          = cudf::type_id::STRING;
+    col.num_rows         = static_cast<cudf::size_type>(num_rows);
+    col.null_count       = static_cast<cudf::size_type>(null_count);
+    col.scale            = 0;
+    col.has_null_mask    = (null_count > 0);
+    col.null_mask_offset = mask_blocks_accessor.initial_byte_offset;
+    col.null_mask_size   = (null_count > 0) ? cudf::bitmask_allocation_size_bytes(num_rows) : 0;
+    col.has_data         = true;
+    col.data_offset      = data_blocks_accessor.initial_byte_offset;
+    col.data_size        = total_data_bytes;
+    col.children.push_back(std::move(offsets_child));
+    return col;
   } else {
-    return make_flat_metadata_node(type,
-                                   static_cast<cudf::size_type>(num_rows),
-                                   static_cast<cudf::size_type>(null_count),
-                                   static_cast<int64_t>(data_blocks_accessor.initial_byte_offset),
-                                   static_cast<int64_t>(mask_blocks_accessor.initial_byte_offset));
+    // Fixed-width column
+    auto cudf_type = duckdb::GetCudfType(type);
+
+    column_metadata col{};
+    col.type_id          = cudf_type.id();
+    col.num_rows         = static_cast<cudf::size_type>(num_rows);
+    col.null_count       = static_cast<cudf::size_type>(null_count);
+    col.scale            = cudf_type.scale();
+    col.has_null_mask    = (null_count > 0);
+    col.null_mask_offset = mask_blocks_accessor.initial_byte_offset;
+    col.null_mask_size   = (null_count > 0) ? cudf::bitmask_allocation_size_bytes(num_rows) : 0;
+    col.has_data         = true;
+    col.data_offset      = data_blocks_accessor.initial_byte_offset;
+    col.data_size        = type_size * num_rows;
+    return col;
   }
 }
 
@@ -290,7 +323,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
     _exec_ctx(exec_ctx)
 {
   auto const& op = g_state._op;
-  _num_columns   = op.projection_ids.size();
+  _num_columns   = op.scanned_types.size();
 
   if (existing_local_tf_state) {
     _local_tf_state = std::move(existing_local_tf_state);
@@ -337,16 +370,16 @@ size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
 
 void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckdb_scan const& op)
 {
-  assert(_num_columns <= op.column_ids.size());
+  assert(_num_columns <= op.scanned_types.size());
 
   size_t estimated_row_bytes = 0;
   _column_builders.reserve(_num_columns);
   for (size_t i = 0; i < _num_columns; ++i) {
-    auto const col_type = op.returned_types[op.column_ids[i].GetPrimaryIndex()];
+    auto const col_type = op.scanned_types[i];
     _column_builders.emplace_back(col_type, _default_varchar_size);
     if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       _varchar_indices.push_back(i);
-      estimated_row_bytes += (sizeof(int64_t) + _default_varchar_size);  // offset + data + mask
+      estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data + mask
     } else {
       estimated_row_bytes += duckdb::GetTypeIdSize(col_type.InternalType());  // data + mask
     }
@@ -358,7 +391,7 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   estimated_row_bytes += mask_bytes_per_row;
 
   // For VARCHAR columns, add space for the extra offset at the end
-  size_t extra_varchar_offset_bytes = _varchar_indices.size() * sizeof(int64_t);
+  size_t extra_varchar_offset_bytes = _varchar_indices.size() * sizeof(int32_t);
 
   // Calculate rows that fit in the batch
   _estimated_rows_per_batch =
@@ -372,11 +405,14 @@ void duckdb_scan_task_local_state::initialize_builders()
 {
   size_t byte_offset = 0;
   for (size_t i = 0; i < _num_columns; ++i) {
+    // Align byte_offset to 8 bytes before each column to ensure proper alignment
+    // for offset arrays (int32/int64) and data types
+    byte_offset = (byte_offset + 7) & ~size_t{7};
     _column_builders[i].initialize_accessors(_estimated_rows_per_batch, byte_offset, _allocation);
     // Update byte_offset for next column
     if (_column_builders[i].type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       // VARCHAR column (offsets + data + mask)
-      byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int64_t) +
+      byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int32_t) +
                      _estimated_rows_per_batch * _default_varchar_size +
                      utils::ceil_div_8(_estimated_rows_per_batch);
     } else {
@@ -407,27 +443,25 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
 
 std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch()
 {
-  using data_batch                = cucascade::data_batch;
-  using host_table_allocation     = cucascade::memory::host_table_allocation;
-  using host_table_representation = cucascade::host_table_representation;
+  using data_batch               = cucascade::data_batch;
+  using host_table_allocation    = cucascade::memory::host_table_allocation;
+  using host_data_representation = cucascade::host_data_representation;
 
-  // Create metadata nodes for each column and assemble metadata buffer
-  std::vector<metadata_node> column_metadata;
-  column_metadata.reserve(_num_columns);
-  for (auto const& builder : _column_builders) {
-    column_metadata.push_back(builder.make_metadata_node(_row_offset));
+  // Create column metadata for each column
+  std::vector<cucascade::memory::column_metadata> columns;
+  columns.reserve(_num_columns);
+  for (size_t ci = 0; ci < _column_builders.size(); ci++) {
+    auto& builder = _column_builders[ci];
+    columns.push_back(builder.make_column_metadata(_row_offset));
   }
-  auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
 
   // Make the host table allocation
   auto const sz = get_tail_byte_offset();
-  // auto const sz = allocation->size_bytes();
   auto table_allocation =
-    std::make_unique<host_table_allocation>(std::move(_allocation), std::move(metadata), sz);
+    std::make_unique<host_table_allocation>(std::move(_allocation), std::move(columns), sz);
 
   // Make the host table representation
-  auto table =
-    std::make_unique<host_table_representation>(std::move(table_allocation), _host_space);
+  auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
 
   // Create the data batch and return
   return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));
@@ -439,10 +473,10 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
 duckdb_scan_task::~duckdb_scan_task()
 {
   if (_global_state == nullptr ||
-      _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get() == nullptr) {
+      _global_state->cast<duckdb_scan_task_global_state>().get_pipeline() == nullptr) {
     return;
   }
-  _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get()->mark_task_completed();
+  _global_state->cast<duckdb_scan_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
 bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
@@ -493,20 +527,20 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
   l_state._row_offset += l_state._chunk.size();
 }
 
-void duckdb_scan_task::execute()
+void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto output_batches = compute_task();
-  publish_output(output_batches);
+  auto output_data = compute_task(stream);
+  if (output_data) { publish_output(*output_data, stream); }
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_task()
+std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stream_view stream)
 {
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // Initialize the data chunk with the SCANNED types (not all returned_types)
-  // The scanned_types correspond to the actual columns being projected
+  // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
+  // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
                             g_state._op.scanned_types);
 
@@ -551,17 +585,17 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_ta
 
   // Make data batch and push to repository
   if (l_state._row_offset > 0) {
-    return std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()};
+    return std::make_unique<op::operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()});
   }
 
-  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+  return std::make_unique<op::operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
 }
 
-void duckdb_scan_task::publish_output(
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  std::for_each(std::make_move_iterator(output_batches.begin()),
-                std::make_move_iterator(output_batches.end()),
+  std::for_each(std::make_move_iterator(output_data.get_data_batches().begin()),
+                std::make_move_iterator(output_data.get_data_batches().end()),
                 [this](auto batch) { this->_data_repo->add_data_batch(std::move(batch)); });
 }
 

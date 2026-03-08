@@ -14,17 +14,13 @@
  * limitations under the License.
  */
 
-#include "gpu_physical_top_n.hpp"
+#include "operator/gpu_physical_top_n.hpp"
 
-#include "duckdb/common/assert.hpp"
-#include "duckdb/execution/expression_executor.hpp"
-#include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
-#include "duckdb/storage/data_table.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_materialize.hpp"
-#include "gpu_physical_order.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_order.hpp"
 #include "utils.hpp"
 
 #include <algorithm>
@@ -112,7 +108,7 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
       "Order by with column length greater than INT32_MAX is not supported");
   }
 
-  HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit);
+  HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit + offset);
 
   for (int col = 0; col < types.size(); col++) {
     if (sort_result->columns[col] == nullptr || sort_result->columns[col]->column_length == 0 ||
