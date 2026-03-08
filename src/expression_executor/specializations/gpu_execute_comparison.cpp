@@ -324,7 +324,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparis
         right_val.GetValue<std::string>().empty()) {
       auto& ref = expr.left->Cast<BoundReferenceExpression>();
       auto& col = input_columns[ref.index];
-      if (col->data_wrapper.is_string_data && col->data_wrapper.offset != nullptr) {
+      if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR && col->data_wrapper.offset != nullptr) {
         size_t num_rows = col->row_ids != nullptr ? col->row_id_count : col->column_length;
         return sirius::EmptyStrCheck(col->data_wrapper.offset,
                                     col->row_ids,
