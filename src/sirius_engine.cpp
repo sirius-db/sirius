@@ -997,14 +997,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
-        // Full barrier operators — wait for upstream to finish before processing
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
           // if the source is CONCAT, then use partial barrier type
-          if (dependent_pipeline->get_operators().size() > 0 &&
-              dependent_pipeline->get_operators()[0].get().type ==
-                op::SiriusPhysicalOperatorType::CONCAT) {
+          if ((dependent_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
+               dependent_pipeline->get_operators().size() == 0) ||
+              (dependent_pipeline->get_operators().size() > 0 &&
+               dependent_pipeline->get_operators()[0].get().type ==
+                 op::SiriusPhysicalOperatorType::CONCAT)) {
             insert_repository(
               "default", new_scheduled[i], dependent_pipeline, op::MemoryBarrierType::PARTIAL);
+            // Full barrier operators — wait for upstream to finish before processing
           } else {
             insert_repository(
               "default", new_scheduled[i], dependent_pipeline, op::MemoryBarrierType::FULL);
