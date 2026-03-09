@@ -37,6 +37,7 @@ jobs:
       matrix:
         arch: [x64, arm64]
         preset: [release, clang-debug]
+        environment: [default]
         include:
           - arch: x64
             preset: release
