@@ -134,6 +134,7 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
         "VCPKG_BUILD": "ON",
+        "VCPKG_INSTALL_OPTIONS": "--clean-buildtrees-after-build",
         "VCPKG_MANIFEST_DIR": "${sourceDir}/.."
       },
       "environment": {
