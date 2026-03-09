@@ -131,7 +131,9 @@ class pipeline_executor {
    *
    * @param enabled True to enable caching, false to disable
    */
-  void set_scan_caching_enabled(bool enabled);
+  void set_scan_caching_enabled(bool enabled,
+                                bool cache_decoded_table = false,
+                                bool cache_in_gpu        = false);
 
   /**
    * @brief Set the priority scan operators
@@ -154,6 +156,13 @@ class pipeline_executor {
    * @return A future that will be satisfied when the query completes.
    */
   std::future<void> start_query();
+
+  /**
+   * @brief Terminate the query execution and report the error to duckdb.
+   *
+   * @param error The error to report.
+   */
+  void terminate_query(std::exception_ptr error);
 
  private:
   void management_eventloop();

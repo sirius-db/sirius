@@ -93,7 +93,7 @@ struct topology {
 struct gpu_mem_config {
   std::variant<double, std::uint64_t> usage_limit_fraction_or_bytes{0.95};
   std::variant<double, std::uint64_t> reservation_limit_fraction_or_bytes{0.9};
-  double downgrade_trigger_fraction_{0.8};
+  double downgrade_trigger_fraction_{1.0};
   double downgrade_stop_fraction_{0.7};
   bool track_per_stream_reservation{false};
 
@@ -255,6 +255,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan.cache", _enable_scan_caching);
+  config_setter.add_config("sirius.executor.duckdb_scan.cache_decoded_table", _cache_decoded_table);
+  config_setter.add_config("sirius.executor.duckdb_scan.cache_in_gpu", _cache_in_gpu);
   config_setter.add_config("sirius.operator_params", _operator_params);
 
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);

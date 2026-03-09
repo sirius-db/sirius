@@ -124,9 +124,11 @@ pipeline_executor::get_scan_executor() noexcept
   return *_scan_executor;
 }
 
-void pipeline_executor::set_scan_caching_enabled(bool enabled)
+void pipeline_executor::set_scan_caching_enabled(bool enabled,
+                                                 bool cache_decoded_table,
+                                                 bool cache_in_gpu)
 {
-  _scan_executor->set_scan_caching_enabled(enabled);
+  _scan_executor->set_scan_caching_enabled(enabled, cache_decoded_table, cache_in_gpu);
 }
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
@@ -166,6 +168,12 @@ std::future<void> pipeline_executor::start_query()
   return future;
 }
 
+void pipeline_executor::terminate_query(std::exception_ptr error)
+{
+  _completion_handler->report_error(error);
+  stop();
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
@@ -182,6 +190,7 @@ void pipeline_executor::management_eventloop()
       }
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
+      // TODO: implement scan task scheduling when state is owned in the operator itself
       schedule_next_scan_tasks();
     }
   }
@@ -192,9 +201,7 @@ void pipeline_executor::schedule_next_scan_tasks()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   if (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    for (auto i = 0; i != _scan_executor->get_num_threads(); ++i) {
-      _task_creator->schedule(scan_op);
-    }
+    _task_creator->schedule(scan_op);
     _priority_scans.pop();
   }
 }

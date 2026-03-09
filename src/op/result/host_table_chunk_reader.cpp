@@ -262,11 +262,6 @@ host_table_chunk_reader::host_table_chunk_reader(
         "[host_table_chunk_reader] Metadata column size mismatch across columns.");
     }
 
-    // For the time being, we do not handle HUGEINT, as cudf does not support it
-    if (_types[col_idx] == duckdb::LogicalType::HUGEINT) {
-      throw std::runtime_error(
-        "[host_table_chunk_reader] HUGEINT type is not currently supported.");
-    }
     _column_readers.emplace_back(columns[col_idx], _allocation);
   }
 }

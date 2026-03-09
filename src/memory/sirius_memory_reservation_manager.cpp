@@ -36,20 +36,23 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   if (gpu_spaces.empty()) {
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
-  std::for_each(gpu_spaces.begin(), gpu_spaces.end(), [this](const auto* space) {
+  for (const auto* space : gpu_spaces) {
     auto* device_mr = space->get_default_allocator();
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
-    previous_device_resource_ = cudf::set_current_device_resource(device_mr);
-  });
+    prev_device_mrs_.push_back(cudf::set_current_device_resource(device_mr));
+  }
 }
 
 sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
 {
   auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  std::for_each(gpu_spaces.begin(), gpu_spaces.end(), [this](const auto* space) {
-    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
-    cudf::set_current_device_resource(previous_device_resource_);
-  });
+  // Restore the previous cuDF device resources saved in the constructor.
+  // Calling reset_current_device_resource_ref() would leave cuDF with a null/invalid
+  // resource that crashes subsequent allocations in other tests or code paths.
+  for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
+    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
+    cudf::set_current_device_resource(prev_device_mrs_[i]);
+  }
 }
 
 }  // namespace memory

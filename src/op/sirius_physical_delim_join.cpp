@@ -164,11 +164,12 @@ void sirius_physical_right_delim_join::sink(const operator_data& input_data,
   nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::sink"};
   // partition_join stays inline (still part of the delim join)
   auto partition_join_output = partition_join->execute(input_data, stream);
-  partition_join->sink(*partition_join_output, stream);
-
   // distinct stays inline (still part of the delim join)
   auto distinct_output = distinct->execute(input_data, stream);
 
+  stream.synchronize();
+
+  partition_join->sink(*partition_join_output, stream);
   // partition_distinct is external — push distinct output via distinct's next_port_after_sink
   distinct->sink(*distinct_output, stream);
 }
@@ -191,11 +192,12 @@ void sirius_physical_left_delim_join::sink(const operator_data& input_data,
   nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::sink"};
   // column_data_scan stays inline (still part of the delim join)
   auto column_data_scan_output = column_data_scan->execute(input_data, stream);
-  column_data_scan->sink(*column_data_scan_output, stream);
-
   // distinct stays inline (still part of the delim join)
   auto distinct_output = distinct->execute(input_data, stream);
 
+  stream.synchronize();
+
+  column_data_scan->sink(*column_data_scan_output, stream);
   // partition_distinct is external — push distinct output via distinct's next_port_after_sink
   distinct->sink(*distinct_output, stream);
 }

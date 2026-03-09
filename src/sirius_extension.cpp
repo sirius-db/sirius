@@ -42,6 +42,7 @@
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
+#include "util/segfault_backtrace.hpp"
 
 #include <cstdlib>
 
@@ -371,12 +372,6 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   auto statement_type = parser.statements[0]->type;
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
-
-  // cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT.
-  // Downcast to BIGINT so all downstream operators and the result collector use a supported type.
-  for (auto& type : planner.types) {
-    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
-  }
 
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
@@ -852,6 +847,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  sirius::util::install_segfault_backtrace_handler();
+
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
   config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
