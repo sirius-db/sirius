@@ -160,7 +160,20 @@ void sirius_physical_operator::verify()
 
 void sirius_physical_operator::add_port(std::string_view port_id, std::unique_ptr<port> p)
 {
-  ports[std::string(port_id)] = std::move(p);
+  // Insert into _ports_list in sorted order by src_pipeline->get_pipeline_id().
+  // Using std::list so that all previously stored raw pointers remain valid.
+  port* raw = p.get();
+  auto insert_pos =
+    std::lower_bound(_ports_list.begin(),
+                     _ports_list.end(),
+                     p,
+                     [](const std::unique_ptr<port>& a, const std::unique_ptr<port>& b) {
+                       size_t id_a = (a->src_pipeline) ? a->src_pipeline->get_pipeline_id() : 0;
+                       size_t id_b = (b->src_pipeline) ? b->src_pipeline->get_pipeline_id() : 0;
+                       return id_a < id_b;
+                     });
+  _ports_list.insert(insert_pos, std::move(p));
+  ports[std::string(port_id)] = raw;
 }
 
 sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_view port_id)
@@ -174,7 +187,7 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
     throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
                                     get_name() + " existing ports are: " + ports_string);
   }
-  return it->second.get();
+  return it->second;
 }
 
 void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
@@ -217,35 +230,34 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   if (ports.empty()) { return std::nullopt; }
 
   // look at the input ports and see if there are any unfinished hard barriers
-  auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
-    return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
-           !port_pair.second->src_pipeline->is_pipeline_finished();
+  auto unfinished_barrier = std::find_if(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
+    return p->type == MemoryBarrierType::FULL && p->src_pipeline &&
+           !p->src_pipeline->is_pipeline_finished();
   });
 
-  if (unfinished_barrier != ports.end()) {
-    auto* producer = &(unfinished_barrier->second->src_pipeline->get_operators()[0].get());
+  if (unfinished_barrier != _ports_list.end()) {
+    auto* producer = &((*unfinished_barrier)->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
   // if no unfinished barriers, then is this operator ready to create a task?
-  if (std::all_of(ports.begin(), ports.end(), [](const auto& port_pair) {
-        return (port_pair.second->type != MemoryBarrierType::FULL &&
-                port_pair.second->repo->total_size() > 0) ||
-               (port_pair.second->type == MemoryBarrierType::FULL &&
-                port_pair.second->repo->total_size() > 0 && port_pair.second->src_pipeline &&
-                port_pair.second->src_pipeline->is_pipeline_finished());
+  if (std::all_of(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
+        return (p->type != MemoryBarrierType::FULL && p->repo->total_size() > 0) ||
+               (p->type == MemoryBarrierType::FULL && p->repo->total_size() > 0 &&
+                p->src_pipeline && p->src_pipeline->is_pipeline_finished());
       })) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
 
   // if not scan from dependent pipelines
-  auto unfinished_pipeline = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
-    return port_pair.second->type != MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
-           !port_pair.second->src_pipeline->is_pipeline_finished();
-  });
+  auto unfinished_pipeline =
+    std::find_if(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
+      return p->type != MemoryBarrierType::FULL && p->src_pipeline &&
+             !p->src_pipeline->is_pipeline_finished();
+    });
 
-  if (unfinished_pipeline != ports.end()) {
-    auto* producer = &(unfinished_pipeline->second->src_pipeline->get_operators()[0].get());
+  if (unfinished_pipeline != _ports_list.end()) {
+    auto* producer = &((*unfinished_pipeline)->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
@@ -282,6 +294,14 @@ bool sirius_physical_operator::is_source_pipeline_finished()
     if (!port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
   }
   return true;
+}
+
+bool sirius_physical_operator::has_full_barrier_from(const pipeline::sirius_pipeline* src) const
+{
+  for (auto& p : _ports_list) {
+    if (p->src_pipeline.get() == src && p->type == MemoryBarrierType::FULL) { return true; }
+  }
+  return false;
 }
 
 duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()

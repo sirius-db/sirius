@@ -216,12 +216,7 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
 
 int sirius_physical_partition::determine_num_partitions()
 {
-  SIRIUS_LOG_DEBUG("sirius_physical_partition::determine_num_partitions() start for id {}",
-                   this->get_operator_id());
   if (ports.find("default") == ports.end()) {
-    SIRIUS_LOG_WARN(
-      "sirius_physical_partition::determine_num_partitions() did not find default repo for id {}",
-      this->get_operator_id());
     throw std::runtime_error(
       "sirius_physical_partition::determine_num_partitions() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
@@ -240,6 +235,20 @@ void sirius_physical_partition::set_num_partitions(int num_partitions)
 {
   std::lock_guard<std::mutex> guard(lock);
   _num_partitions = num_partitions;
+}
+
+std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
+{
+  std::lock_guard<std::mutex> guard(lock);
+  if (!_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
+    // If this is a probe partition and we haven't determined the number of partitions yet, we
+    // should wait for the build sibling to determine it. This is because the build side will drive
+    // the partitioning and the probe side needs to know the number of partitions to create the
+    // correct number of tasks.
+    return _sibling_partition_op->get_next_task_hint();
+  } else {
+    return sirius_physical_operator::get_next_task_hint();
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_data()

@@ -898,6 +898,13 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       source_to_pipelines[new_scheduled[i]->source.get()].push_back(new_scheduled[i]);
     }
 
+    // Assign pipeline IDs before adding ports so that add_port can sort _ports_list
+    // correctly by pipeline ID. (set_pipeline_id was previously called only after
+    // insert_repository, meaning all pipelines had id=0 at port-insertion time.)
+    for (size_t i = 0; i < new_scheduled.size(); i++) {
+      new_scheduled[i]->set_pipeline_id(i);
+    }
+
     // add data repositories and ports
     for (size_t i = 0; i < new_scheduled.size(); i++) {
       if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
@@ -1044,7 +1051,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
     // Set pipeline IDs, parents, and operator children (before finalization)
     for (size_t i = 0; i < new_scheduled.size(); i++) {
-      new_scheduled[i]->set_pipeline_id(i);
       new_scheduled[i]->parents.clear();
       new_scheduled[i]->dependencies.clear();
 

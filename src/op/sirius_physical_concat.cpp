@@ -77,7 +77,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     throw std::runtime_error("sirius_physical_concat: there should be only one port");
   }
 
-  auto port_ptr = ports.begin()->second.get();
+  auto port_ptr = ports.begin()->second;
   for (size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
     std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
     // get all the batch ids from the partition

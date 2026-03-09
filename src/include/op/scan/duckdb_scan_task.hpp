@@ -139,7 +139,13 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
     return output_consumers;
   }
 
+  std::size_t can_create_more_tasks() const noexcept
+  {
+    return _total_task_count.load(std::memory_order_acquire) < _max_threads;
+  }
+
  private:
+  std::atomic<std::size_t> _total_task_count{0};
   //===----------Fields----------===//
   duckdb::SiriusContext* _sirius_ctx;  ///< The Sirius context
   std::unique_ptr<duckdb::GlobalTableFunctionState>
@@ -403,10 +409,13 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
                    std::shared_ptr<duckdb_scan_task_global_state> g_state)
     : sirius::pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
       _task_id(task_id),
-      _data_repo(data_repo) {};
+      _data_repo(data_repo)
+  {
+    g_state->_total_task_count.fetch_add(1);
+  };
 
   //===----------Destructor----------===//
-  ~duckdb_scan_task();
+  ~duckdb_scan_task() override;
 
   void execute(rmm::cuda_stream_view stream) override;
 

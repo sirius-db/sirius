@@ -83,6 +83,8 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
+  std::optional<task_creation_hint> get_next_task_hint() override;
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   void set_num_partitions(int num_partitions);

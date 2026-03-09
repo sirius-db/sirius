@@ -34,6 +34,7 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -269,6 +270,8 @@ class sirius_physical_operator {
   std::vector<std::string_view> get_port_ids();
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
+  //! Returns true if any FULL-barrier port has src_pipeline == src
+  bool has_full_barrier_from(const pipeline::sirius_pipeline* src) const;
   //! Add a next port after sink
   void add_next_port_after_sink(
     std::pair<sirius_physical_operator*, std::string_view> port_locator);
@@ -313,8 +316,12 @@ class sirius_physical_operator {
 
  protected:
   duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
-  //! The ports of the operator
-  std::unordered_map<std::string, std::unique_ptr<port>> ports;
+  //! Lookup map: port name -> raw pointer into _ports_list (never owns)
+  std::unordered_map<std::string, port*> ports;
+  //! Ownership container for ports, kept sorted by src_pipeline->get_pipeline_id().
+  //! std::list is used intentionally: its nodes have stable addresses, so raw pointers
+  //! in `ports` are never invalidated by insertions.
+  std::list<std::unique_ptr<port>> _ports_list;
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
 };
