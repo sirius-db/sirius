@@ -366,7 +366,12 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
-  auto reader   = g_state.make_reader(l_state.get_file_idx());
+
+  if (!_datasource) {
+    _datasource = cudf::io::datasource::create(g_state.get_file_path(l_state.get_file_idx()));
+  }
+
+  auto reader = g_state.make_reader(l_state.get_file_idx());
 
   auto& scan_op      = g_state.get_operator();
   auto const num_rgs = l_state.get_rg_span().size();

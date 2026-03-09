@@ -163,6 +163,13 @@ class duckdb_scan_executor {
   }
 
   /**
+   * @brief Check if the scan executor is in preload mode (cache is hot).
+   *
+   * @return True if preload mode is active, false otherwise.
+   */
+  [[nodiscard]] bool is_preload_mode() const noexcept { return _preload_mode; }
+
+  /**
    * @brief Prepare cache for scan operators
    *
    * In CACHE mode: ensures cache is empty and creates entries for each operator's ID
