@@ -80,12 +80,14 @@ jobs:
         run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
 
       - name: Prepare SQL test datasets
-        run: ./setup_test_datasets.sh
+        run: |
+          ./setup_test_datasets.sh
+          chmod -R a+r test_datasets/
 
       - name: Run sqllogic tests
         run: |
-          ./build/release/test/unittest "$PWD/test/*" | tee test.log
-          if grep -q "Error in GPUExecuteQuery" test.log; then
-            echo "GPU execution errors detected!"
+          ./build/release/test/unittest "$PWD/test/*" | tee test.log; EXIT=${PIPESTATUS[0]}
+          if grep -qE "FAILURES SUMMARY|Error in GPUExecuteQuery" test.log || [ "$EXIT" -ne 0 ]; then
+            echo "Test failures detected!"
             exit 1
           fi
