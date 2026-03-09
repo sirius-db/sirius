@@ -80,7 +80,9 @@ jobs:
         run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
 
       - name: Prepare SQL test datasets
-        run: ./setup_test_datasets.sh
+        run: |
+          ./setup_test_datasets.sh
+          chmod -R a+r test_datasets/
 
       - name: Run sqllogic tests
         run: |
