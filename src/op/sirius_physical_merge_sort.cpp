@@ -17,9 +17,9 @@
 #include "op/sirius_physical_merge_sort.hpp"
 
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/order/order_op_util.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -121,22 +121,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   std::vector<int> order_key_idx;
   std::vector<cudf::order> column_order;
   std::vector<cudf::null_order> null_precedence;
-  order_key_idx.reserve(orders.size());
-  column_order.reserve(orders.size());
-  null_precedence.reserve(orders.size());
-
-  for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw duckdb::NotImplementedException("Merge sort only supports bound reference expressions");
-    }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
-    order_key_idx.push_back(idx);
-    column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
-                                                                    : cudf::order::DESCENDING);
-    null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                                ? cudf::null_order::BEFORE
-                                : cudf::null_order::AFTER);
-  }
+  build_order_vectors(orders, "Merge sort", order_key_idx, column_order, null_precedence);
 
   auto merged_batch = gpu_merge_impl::merge_order_by(
     valid_batches, order_key_idx, column_order, null_precedence, stream, *space);

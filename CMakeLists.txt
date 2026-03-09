@@ -90,6 +90,7 @@ set(EXTENSION_SOURCES
     src/op/aggregate/gpu_aggregate_impl.cpp
     src/op/merge/gpu_merge_impl.cpp
     src/op/order/gpu_order_impl.cpp
+    src/op/order/order_op_util.cpp
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp

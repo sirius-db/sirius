@@ -18,11 +18,10 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
+#include "op/order/order_op_util.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-
-#include <cudf/concatenate.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -104,59 +103,31 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     return std::make_unique<operator_data>(input_data);
   }
 
-  // 2. Concatenate all sample batches into one table
-  std::vector<cudf::table_view> sample_views;
+  // 2. Accumulate byte count for partition sizing
   size_t total_sample_bytes = 0;
-  sample_views.reserve(valid_batches.size());
   for (auto const& batch : valid_batches) {
-    auto view = get_cudf_table_view(*batch);
-    sample_views.push_back(view);
     total_sample_bytes += batch->get_data()->get_size_in_bytes();
   }
-
-  auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());
 
   // 3. Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
   std::vector<cudf::order> column_order;
   std::vector<cudf::null_order> null_precedence;
-  order_key_idx.reserve(orders.size());
-  column_order.reserve(orders.size());
-  null_precedence.reserve(orders.size());
+  build_order_vectors(orders, "Sort sample", order_key_idx, column_order, null_precedence);
 
-  for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw duckdb::NotImplementedException(
-        "Sort sample only supports bound reference expressions");
-    }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
-    order_key_idx.push_back(idx);
-    column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
-                                                                    : cudf::order::DESCENDING);
-    null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                                ? cudf::null_order::BEFORE
-                                : cudf::null_order::AFTER);
+  // 4. Merge the already-sorted sample batches into a single sorted table
+  cudf::table_view sorted_view;
+  std::shared_ptr<cucascade::data_batch> merged_batch;
+  if (valid_batches.size() == 1) {
+    sorted_view = get_cudf_table_view(*valid_batches[0]);
+  } else {
+    merged_batch = gpu_merge_impl::merge_order_by(
+      valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
+    sorted_view = get_cudf_table_view(*merged_batch);
   }
-
-  // 4. Sort the concatenated sample by sort keys
-  std::vector<cudf::column_view> sort_cols;
-  for (int idx : order_key_idx) {
-    sort_cols.push_back(concat_table->view().column(idx));
-  }
-  auto sorted_indices = cudf::sorted_order(cudf::table_view(sort_cols),
-                                           column_order,
-                                           null_precedence,
-                                           stream,
-                                           space->get_default_allocator());
-
-  auto sorted_table = cudf::gather(concat_table->view(),
-                                   sorted_indices->view(),
-                                   cudf::out_of_bounds_policy::DONT_CHECK,
-                                   stream,
-                                   space->get_default_allocator());
 
   // 5. Compute number of partitions
-  size_t total_rows         = static_cast<size_t>(sorted_table->num_rows());
+  size_t total_rows         = static_cast<size_t>(sorted_view.num_rows());
   size_t avg_batch_bytes    = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
   size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
   size_t num_parts          = 1;
@@ -226,7 +197,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     // Extract only the sort key columns from sorted table for the boundaries
     std::vector<cudf::column_view> sort_key_cols;
     for (int idx : order_key_idx) {
-      sort_key_cols.push_back(sorted_table->view().column(idx));
+      sort_key_cols.push_back(sorted_view.column(idx));
     }
     cudf::table_view sort_keys_view(sort_key_cols);
 
@@ -237,6 +208,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                          stream,
                                          space->get_default_allocator());
     _num_partitions       = num_parts;
+    // Lets synchronize here to ensure boundaries are available before downstream operators start
+    // processing
+    stream.synchronize();
   }
 
   _boundaries_computed.store(true);
