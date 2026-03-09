@@ -246,7 +246,7 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     // the partitioning and the probe side needs to know the number of partitions to create the
     // correct number of tasks.
     return _sibling_partition_op->get_next_task_hint();
-  } else {
+  } else if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // Ensure that it only has one port
     if (ports.size() != 1) {
       throw std::runtime_error("sirius_physical_concat: there should be only one port");
@@ -260,6 +260,8 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     } else {
       return std::nullopt;
     }
+  } else {
+    return sirius_physical_operator::get_next_task_hint();
   }
 }
 
