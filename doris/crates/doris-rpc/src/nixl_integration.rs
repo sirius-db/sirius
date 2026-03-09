@@ -437,9 +437,22 @@ async fn send_nixl_to_peer(
             .collect(),
         columns: column_info
             .iter()
-            .map(|(name, type_id)| PColumnInfo {
-                name: name.clone(),
-                type_id: *type_id,
+            .enumerate()
+            .map(|(i, (name, type_id))| {
+                let scale = column_buffers.get(i).map(|cb| cb.scale).unwrap_or(0);
+                // Infer precision from decimal width.
+                let precision = match *type_id {
+                    25 => 9,   // DECIMAL32
+                    26 => 18,  // DECIMAL64
+                    27 => 38,  // DECIMAL128
+                    _ => 0,
+                };
+                PColumnInfo {
+                    name: name.clone(),
+                    type_id: *type_id,
+                    precision,
+                    scale,
+                }
             })
             .collect(),
         num_rows,
@@ -558,9 +571,18 @@ async fn send_nixl_to_peer(
         dst_buffers: response.dst_buffers,
         columns: column_info
             .iter()
-            .map(|(name, type_id)| PColumnInfo {
-                name: name.clone(),
-                type_id: *type_id,
+            .enumerate()
+            .map(|(i, (name, type_id))| {
+                let scale = column_buffers.get(i).map(|cb| cb.scale).unwrap_or(0);
+                let precision = match *type_id {
+                    25 => 9, 26 => 18, 27 => 38, _ => 0,
+                };
+                PColumnInfo {
+                    name: name.clone(),
+                    type_id: *type_id,
+                    precision,
+                    scale,
+                }
             })
             .collect(),
         num_rows,

@@ -40,6 +40,7 @@ struct GPUBufferInfo {
   uintptr_t offsets_addr   = 0; ///< String offsets GPU pointer (0 if not string).
   size_t offsets_len       = 0; ///< Offsets buffer size in bytes.
   int null_count           = 0; ///< Number of null values.
+  int scale                = 0; ///< Decimal scale (from cudf data_type::scale()).
 };
 
 /// Thread-safe singleton that stores GPU buffer metadata from the most recent

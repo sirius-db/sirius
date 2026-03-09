@@ -18,7 +18,9 @@ message PGpuBufferDesc {
 // Column metadata for schema reconstruction.
 message PColumnInfo {
   string name = 1;        // Column name
-  int32 type_id = 2;      // Doris PGenericType::TypeId
+  int32 type_id = 2;      // cudf type_id (see cudf/types.hpp)
+  int32 precision = 3;    // Decimal precision (0 for non-decimal types)
+  int32 scale = 4;        // Decimal scale (0 for non-decimal types)
 }
 
 // Request: sender offers GPU buffers for transfer.

@@ -944,9 +944,10 @@ unique_ptr<FunctionData> SiriusExtension::GetLastGPUBuffersBind(
     LogicalType::BIGINT,   // offsets_addr
     LogicalType::BIGINT,   // offsets_len
     LogicalType::INTEGER,  // null_count
+    LogicalType::INTEGER,  // scale
   };
   names = {"buffer_id", "addr", "len", "device_id", "column_name", "type_id", "num_rows",
-           "null_mask_addr", "null_mask_len", "offsets_addr", "offsets_len", "null_count"};
+           "null_mask_addr", "null_mask_len", "offsets_addr", "offsets_len", "null_count", "scale"};
   return make_uniq<GetLastGPUBuffersData>();
 }
 
@@ -979,6 +980,7 @@ void SiriusExtension::GetLastGPUBuffersFunction(
     output.SetValue(9, i, Value::BIGINT(static_cast<int64_t>(buf.offsets_addr)));
     output.SetValue(10, i, Value::BIGINT(static_cast<int64_t>(buf.offsets_len)));
     output.SetValue(11, i, Value::INTEGER(buf.null_count));
+    output.SetValue(12, i, Value::INTEGER(buf.scale));
   }
 
   data.finished = true;

@@ -211,6 +211,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             offsets_addr,
             offsets_len,
             null_cnt,
+            col.type().scale(),
           });
         }
 

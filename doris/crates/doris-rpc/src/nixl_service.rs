@@ -261,14 +261,9 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
 
     /// Handle transfer_complete: sender has finished nixl GPU-direct transfer.
     ///
-    /// The sender includes Arrow IPC bytes alongside the GPU transfer. We use
-    /// `arrow_ipc_to_pblock` (same path as bRPC) to construct a proper PBlock
-    /// and feed it into the ExchangeBuffer. This avoids type ID mismatches
-    /// between DuckDB LogicalTypeId and Doris PGenericType::TypeId.
-    ///
-    /// The GPU buffers (now in receiver VRAM) are freed after processing.
-    /// In a future optimization, we'll register GPU buffers directly as DuckDB
-    /// tables, skipping the PBlock round-trip entirely.
+    /// Tries to reconstruct Arrow data from the GPU buffers via D2H copy,
+    /// avoiding the redundant Arrow IPC bytes sent via gRPC. Falls back to
+    /// the IPC bytes if GPU reconstruction fails (e.g., unsupported types).
     #[instrument(skip_all, fields(num_rows, num_buffers, sender_id))]
     async fn transfer_complete(
         &self,
@@ -287,8 +282,9 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             num_buffers = req.dst_buffers.len(),
             num_columns = req.columns.len(),
             sender_id = req.sender_id,
+            has_sub_buffers = !req.dst_null_masks.is_empty(),
             ipc_len = req.arrow_ipc_data.len(),
-            "transfer_complete: nixl transfer done, building PBlock from IPC"
+            "transfer_complete: nixl transfer done"
         );
 
         // Parse query_id from LE bytes.
@@ -303,17 +299,64 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 .unwrap_or([0u8; 8]),
         );
 
-        // Free destination GPU buffers via RAII: deregister from nixl + cuda_free.
+        // Try GPU buffer reconstruction (D2H) before freeing GPU memory.
+        // This must happen BEFORE dropping pending_buffers (which frees GPU memory).
         let pending_key = (query_id_hi, query_id_lo, req.node_id);
+        let ipc_bytes = if !req.dst_null_masks.is_empty() {
+            // Sub-buffer info available — try D2H reconstruction.
+            // Run D2H on a blocking thread to avoid stalling the tokio runtime.
+            let dst_buffers = req.dst_buffers.clone();
+            let dst_null_masks = req.dst_null_masks.clone();
+            let dst_offsets = req.dst_offsets.clone();
+            let columns = req.columns.clone();
+            let null_counts = req.null_counts.clone();
+            let num_rows = req.num_rows;
+
+            let d2h_result = tokio::task::spawn_blocking(move || {
+                crate::gpu_buffer_reconstruct::reconstruct_ipc_from_gpu_buffers(
+                    &dst_buffers,
+                    &dst_null_masks,
+                    &dst_offsets,
+                    &columns,
+                    &null_counts,
+                    num_rows,
+                )
+            })
+            .await
+            .map_err(|e| format!("D2H spawn_blocking: {e}"))
+            .and_then(|r| r);
+
+            match d2h_result {
+                Ok(ipc) => {
+                    info!(
+                        ipc_len = ipc.len(),
+                        "transfer_complete: reconstructed Arrow IPC from GPU buffers (D2H)"
+                    );
+                    ipc
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "GPU buffer reconstruction failed, falling back to gRPC IPC"
+                    );
+                    req.arrow_ipc_data.clone()
+                }
+            }
+        } else {
+            // No sub-buffer info — use gRPC IPC fallback (old protocol).
+            req.arrow_ipc_data.clone()
+        };
+
+        // Now free destination GPU buffers (deregister + cuda_free).
         let removed = self.pending_buffers.lock().unwrap().remove(&pending_key);
         info!(
             freed = removed.as_ref().map_or(0, |v| v.len()),
-            "transfer_complete: released pending GPU buffers (RAII)"
+            "transfer_complete: released pending GPU buffers"
         );
         drop(removed);
 
-        // Convert Arrow IPC to PBlock using the same path as bRPC exchange.
-        let (pblock, _num_rows) = match crate::arrow_to_pblock::arrow_ipc_to_pblock(&req.arrow_ipc_data) {
+        // Convert Arrow IPC to PBlock.
+        let (pblock, _num_rows) = match crate::arrow_to_pblock::arrow_ipc_to_pblock(&ipc_bytes) {
             Ok(result) => result,
             Err(e) => {
                 warn!(error = %e, "arrow_ipc_to_pblock failed in transfer_complete");

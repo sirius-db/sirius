@@ -586,7 +586,7 @@ impl SiriusEngine {
     /// still resident in GPU memory. Returns `Ok(None)` if executed on CPU or buffers
     /// have been freed. Returns `Err` on query failure.
     pub fn get_last_gpu_result_buffers(&self) -> Result<Option<GpuResultInfo>, EngineError> {
-        let sql = "SELECT buffer_id, addr, len, device_id, column_name, type_id, num_rows, null_mask_addr, null_mask_len, offsets_addr, offsets_len, null_count FROM sirius_get_last_gpu_buffers()";
+        let sql = "SELECT buffer_id, addr, len, device_id, column_name, type_id, num_rows, null_mask_addr, null_mask_len, offsets_addr, offsets_len, null_count, scale FROM sirius_get_last_gpu_buffers()";
         let mut stmt = self
             .conn
             .prepare(sql)
@@ -613,6 +613,7 @@ impl SiriusEngine {
             let offsets_addr: i64 = row.get(9).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let offsets_len: i64 = row.get(10).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let null_count: i32 = row.get(11).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let scale: i32 = row.get(12).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
 
             buffer_addrs.push((addr as usize, len as usize, device_id as u64));
             column_info.push((column_name, type_id));
@@ -622,6 +623,7 @@ impl SiriusEngine {
                 offsets_addr: offsets_addr as usize,
                 offsets_len: offsets_len as usize,
                 null_count,
+                scale,
             });
             num_rows_opt = Some(num_rows as u32);
         }
@@ -656,6 +658,8 @@ pub struct GpuColumnBuffers {
     pub offsets_len: usize,
     /// Number of null values in this column.
     pub null_count: i32,
+    /// Decimal scale (from cudf data_type::scale()), 0 for non-decimal types.
+    pub scale: i32,
 }
 
 /// GPU result buffer information for nixl transfers.
