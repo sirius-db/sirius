@@ -185,6 +185,21 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
   }
 
+  /**
+   * @brief Rebind this global state to a new pipeline and scan operator.
+   *
+   * Reuses all cached file metadata and row group partitions, avoiding
+   * footer reads and metadata parsing.  Only the pipeline/operator pointers
+   * and the partition counter are updated.
+   */
+  void rebind(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+              sirius_physical_parquet_scan* scan_op)
+  {
+    set_pipeline(std::move(pipeline));
+    _scan_op = scan_op;
+    _next_rg_partition.store(0, std::memory_order_relaxed);
+  }
+
  private:
   /**
    * @brief Fill the vector of column indices for this scan after projection.
@@ -348,8 +363,6 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
       _task_id(task_id),
       _data_repo(data_repo)
   {
-    auto& l_state_cast = this->_local_state->cast<parquet_scan_task_local_state>();
-    _datasource = cudf::io::datasource::create(g_state->get_file_path(l_state_cast.get_file_idx()));
   }
 
   ~parquet_scan_task() override;
