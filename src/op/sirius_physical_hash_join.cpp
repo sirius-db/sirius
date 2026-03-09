@@ -277,7 +277,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   // Mixed join: has at least one equality condition (for hashing) and at least one inequality
   // condition (for the binary predicate).
-  is_mixed_join = !is_all_inequality_join && (num_equality_conditions < conditions.size());
+  if (!is_all_inequality_join && (num_equality_conditions < conditions.size())) {
+    _join_mode = HASH_JOIN_MODE::MIXED_JOIN;
+  }
 };
 
 //===--------------------------------------------------------------------===//
@@ -345,11 +347,30 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
+// WSM TODO: make this a config variable
+constexpr uint64_t MAX_BUILD_HASH_TABLE_BYTES = 512ULL * 1024ULL * 1024ULL;  // 512MB
+
+void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  if (num_partitions == 1 && build_side_bytes < MAX_BUILD_HASH_TABLE_BYTES &&
+      _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
+    // Switch to a more efficient join strategy for small datasets
+    _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
+    SIRIUS_LOG_DEBUG(
+      "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and build "
+      "side size {} bytes",
+      this->get_operator_id(),
+      num_partitions,
+      build_side_bytes);
+  }
+}
+
 std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_data()
 {
   // Hold the mutex for the entire operation to prevent concurrent pop/get races.
   // A pop on one thread must not remove a batch that another thread's get expects to find.
-  std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
+  std::lock_guard<std::mutex> lg(op_state_mutex);
 
   // One-time initialization: snapshot all batch IDs from both ports.
   if (left_batch_ids.empty() && right_batch_ids.empty()) {
@@ -564,7 +585,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
 
-  if (is_mixed_join) {
+  if (_join_mode == HASH_JOIN_MODE::MIXED_JOIN) {
     // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
     // via a cuDF AST binary predicate on the full input tables.
     auto keys                 = prepare_join_keys(input_batches,

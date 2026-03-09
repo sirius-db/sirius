@@ -40,6 +40,12 @@ class sirius_meta_pipeline;
 
 namespace op {
 
+// STANDARD uses cudf APIs where the build and probe is a single operation.
+// BUILD_PROBE builds the hash table in one step and then probes it in a separate step, which allows
+// for better pipelining with other operators, and allows reusing the hash table. MIXED_JOIN uses
+// cudf's mixed_join API for joins with both equality and inequality conditions.
+enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
+
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
@@ -110,6 +116,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
+  /// @brief This is called by the partition operator to inform the hash join of the number of
+  /// partitions that will be produced by the partition operator, which can be used to make
+  /// decisions about the join execution strategy (e.g., whether to switch to a build-probe strategy
+  /// for small datasets).
+  /// @param num_partitions
+  /// @param build_side_bytes
+  void update_join_exec_mode(int num_partitions, uint64_t build_side_bytes);
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
@@ -125,16 +139,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Becomes a source when it is an external join
   bool is_source() const override { return true; }
 
-  std::mutex batches_to_processed_mutex;
+  std::mutex op_state_mutex;
   std::size_t current_partition_index = 0;
   std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
 
   bool is_all_inequality_join = true;
-  // True when conditions contain both equality conditions (hashed) and inequality conditions
-  // (evaluated via cuDF mixed_join binary predicate).
-  bool is_mixed_join = false;
+
+  HASH_JOIN_MODE _join_mode = HASH_JOIN_MODE::STANDARD;
+  //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;
   std::vector<cudf::size_type> left_key_col_indices;
