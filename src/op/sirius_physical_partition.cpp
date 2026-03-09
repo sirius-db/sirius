@@ -247,8 +247,10 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     // correct number of tasks.
     return _sibling_partition_op->get_next_task_hint();
   } else if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
-    // Ensure that it only has one port
-    if (ports.size() != 1) {
+    // If this is part of a join and its on the probe side, and we have determined the number of
+    // partitions, we have this behave as a pipeline operator and just schedule tasks
+
+    if (ports.size() != 1) {  // Ensure that it only has one port
       throw std::runtime_error("sirius_physical_concat: there should be only one port");
     }
     auto port_ptr = ports.begin()->second;
