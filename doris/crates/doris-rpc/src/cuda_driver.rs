@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use cudarc::driver::{result, sys::CUcontext};
+use cudarc::driver::{result, sys, sys::CUcontext};
 
 /// Wrapper for CUcontext that is Send + Sync.
 ///
@@ -68,4 +68,47 @@ pub fn cuda_free(dev_addr: usize) -> Result<(), String> {
     ensure_cuda_context()?;
     unsafe { result::free_sync(dev_addr as u64) }
         .map_err(|e| format!("cuMemFree(0x{dev_addr:x}): {e}"))
+}
+
+/// Copy GPU memory device-to-device using CUDA driver API.
+pub fn cuda_memcpy_dtod(dst: usize, src: usize, len: usize) -> Result<(), String> {
+    ensure_cuda_context()?;
+    unsafe { result::memcpy_dtod_sync(dst as u64, src as u64, len) }
+        .map_err(|e| format!("cuMemcpyDtoD(dst=0x{dst:x}, src=0x{src:x}, len={len}): {e}"))
+}
+
+/// Query the base address and size of the containing allocation for a device pointer.
+///
+/// For RMM pool sub-allocations, this returns the base of the `cudaMalloc` allocation
+/// that backs the pool — i.e., the entire pool region. This can be registered with
+/// nixl once, allowing all sub-allocations within it to be used directly for transfers.
+pub fn cuda_mem_get_address_range(dev_addr: usize) -> Result<(usize, usize), String> {
+    ensure_cuda_context()?;
+    let mut base: u64 = 0;
+    let mut size: usize = 0;
+    unsafe {
+        sys::cuMemGetAddressRange_v2(&mut base, &mut size, dev_addr as u64)
+    }
+    .result()
+    .map_err(|e| format!("cuMemGetAddressRange(0x{dev_addr:x}): {e}"))?;
+    Ok((base as usize, size))
+}
+
+/// Query the CUDA memory type of a device pointer.
+///
+/// Returns `CU_MEMORYTYPE_DEVICE` (2) for GPU memory, `CU_MEMORYTYPE_HOST` (1) for host.
+/// Useful for verifying whether UCX will recognize a pointer as GPU memory.
+pub fn cuda_pointer_get_memory_type(dev_addr: usize) -> Result<u32, String> {
+    ensure_cuda_context()?;
+    let mut mem_type: u32 = 0;
+    unsafe {
+        sys::cuPointerGetAttribute(
+            &mut mem_type as *mut u32 as *mut std::ffi::c_void,
+            sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            dev_addr as u64,
+        )
+    }
+    .result()
+    .map_err(|e| format!("cuPointerGetAttribute(MEMORY_TYPE, 0x{dev_addr:x}): {e}"))?;
+    Ok(mem_type)
 }

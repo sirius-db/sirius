@@ -24,21 +24,28 @@ message PColumnInfo {
 // Request: sender offers GPU buffers for transfer.
 message PExchangeNixlMetadataRequest {
   bytes nixl_metadata = 1;                    // Sender's nixl agent metadata
-  repeated PGpuBufferDesc src_buffers = 2;    // Source GPU buffer descriptors
+  repeated PGpuBufferDesc src_buffers = 2;    // Source GPU buffer descriptors (data only)
   repeated PColumnInfo columns = 3;           // Column schema
   uint32 num_rows = 4;                        // Row count
   bytes query_id_hi = 5;                      // Query ID (high 64 bits)
   bytes query_id_lo = 6;                      // Query ID (low 64 bits)
   int32 node_id = 7;                          // Exchange node ID
+  // Extended per-column sub-buffers (aligned with src_buffers, addr=0 if absent).
+  repeated PGpuBufferDesc src_null_masks = 8; // Null bitmap buffers (per column)
+  repeated PGpuBufferDesc src_offsets = 9;    // String offset buffers (per column)
+  repeated int32 null_counts = 10;            // Null count per column
 }
 
 // Response: receiver provides destination GPU buffer addresses.
 message PExchangeNixlMetadataResponse {
-  repeated PGpuBufferDesc dst_buffers = 1;    // Destination GPU buffer descriptors
+  repeated PGpuBufferDesc dst_buffers = 1;    // Destination GPU buffer descriptors (data)
   string remote_agent_name = 2;               // Receiver's nixl agent name
   int32 status_code = 3;                      // 0 = success, non-zero = error
   repeated string error_msgs = 4;             // Error messages (if any)
   bytes nixl_metadata = 5;                    // Receiver's nixl agent metadata
+  // Extended per-column destination sub-buffers (aligned with dst_buffers).
+  repeated PGpuBufferDesc dst_null_masks = 6; // Allocated null bitmap buffers
+  repeated PGpuBufferDesc dst_offsets = 7;    // Allocated offset buffers
 }
 
 // Notification: sender tells receiver that nixl transfer is complete.
@@ -46,11 +53,15 @@ message PNixlTransferCompleteRequest {
   bytes query_id_hi = 1;                      // Query ID (high 8 bytes LE)
   bytes query_id_lo = 2;                      // Query ID (low 8 bytes LE)
   int32 node_id = 3;                          // Exchange node ID
-  repeated PGpuBufferDesc dst_buffers = 4;    // Buffers that now have data
+  repeated PGpuBufferDesc dst_buffers = 4;    // Buffers that now have data (data only)
   repeated PColumnInfo columns = 5;           // Column schema
   uint32 num_rows = 6;                        // Row count
   int32 sender_id = 7;                        // Sender's ID
-  bytes arrow_ipc_data = 8;                   // Arrow IPC bytes for PBlock construction
+  bytes arrow_ipc_data = 8;                   // Arrow IPC bytes (fallback)
+  // Extended per-column destination sub-buffers.
+  repeated PGpuBufferDesc dst_null_masks = 9; // Null bitmap buffers
+  repeated PGpuBufferDesc dst_offsets = 10;   // String offset buffers
+  repeated int32 null_counts = 11;            // Null count per column
 }
 
 message PNixlTransferCompleteResponse {

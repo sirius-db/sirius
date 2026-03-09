@@ -1473,6 +1473,9 @@ pub struct PBackendServiceHandler {
     force_cpu: bool,
     nixl_only: bool,
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
+    /// This BE's brpc address as seen by other BEs (advertise_host:brpc_port).
+    /// Used to detect self-transfer (destination == local BE).
+    local_brpc_addr: String,
 }
 
 impl PBackendServiceHandler {
@@ -1494,11 +1497,17 @@ impl PBackendServiceHandler {
             force_cpu,
             nixl_only,
             nixl_agent: None,
+            local_brpc_addr: String::new(),
         }
     }
 
     pub fn with_nixl_agent(mut self, agent: Option<Arc<super::nixl_exchange::NixlExchange>>) -> Self {
         self.nixl_agent = agent;
+        self
+    }
+
+    pub fn with_local_brpc_addr(mut self, addr: String) -> Self {
+        self.local_brpc_addr = addr;
         self
     }
 }
@@ -1602,6 +1611,8 @@ impl PBackendService for PBackendServiceHandler {
                 let force_cpu = self.force_cpu;
                 let nixl_only = self.nixl_only;
                 let nixl_agent = self.nixl_agent.clone();
+                let local_brpc_addr = self.local_brpc_addr.clone();
+                let exchange_buffer = self.exchange_buffer.clone();
 
                 // Spawn async task: wait for exchange data, decode, load, execute.
                 tokio::spawn(async move {
@@ -1886,6 +1897,7 @@ impl PBackendService for PBackendServiceHandler {
                     // If this exchange fragment has destinations and nixl is available,
                     // retain GPU buffers so nixl can use them after query cleanup.
                     let should_retain_exch = exchange_dests.is_some() && nixl_agent.is_some() && !is_cpu_only;
+                    let nixl_agent_for_exch_blocking = if should_retain_exch { nixl_agent.clone() } else { None };
                     let engine_for_release = engine.clone();
 
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
@@ -1902,7 +1914,17 @@ impl PBackendService for PBackendServiceHandler {
                         if is_cpu_only {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         } else {
-                            Ok(crate::nixl_integration::detect_execution_location(ipc_bytes, &engine))
+                            let mut loc = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
+                            if should_retain_exch {
+                                let pool_registered = nixl_agent_for_exch_blocking
+                                    .as_ref()
+                                    .map(|agent| loc.try_register_rmm_pool(agent))
+                                    .unwrap_or(false);
+                                if !pool_registered {
+                                    loc.copy_gpu_buffers_to_cuda_alloc();
+                                }
+                            }
+                            Ok(loc)
                         }
                     })
                     .await;
@@ -1924,6 +1946,7 @@ impl PBackendService for PBackendServiceHandler {
                                 if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
                                     nixl_agent.as_ref(),
                                     location, &dests, query_id, dest_node_id, sender_id, nixl_only,
+                                    &local_brpc_addr, &exchange_buffer,
                                 ).await {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
                                 }
@@ -2129,6 +2152,7 @@ impl PBackendService for PBackendServiceHandler {
             // tell Sirius to retain GPU result buffers past query cleanup
             // so the nixl GPU-direct path can use them.
             let should_retain = exchange_dests.is_some() && self.nixl_agent.is_some();
+            let nixl_agent_for_blocking = if should_retain { self.nixl_agent.clone() } else { None };
 
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
@@ -2148,8 +2172,19 @@ impl PBackendService for PBackendServiceHandler {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                 }
                 let t_detect = std::time::Instant::now();
-                let location = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
+                let mut location = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
                 tracing::info!(detect_ms = t_detect.elapsed().as_millis() as u64, gpu = matches!(location, crate::nixl_integration::ExecutionLocation::Gpu { .. }), "detect_execution_location done");
+                // Try RMM pool registration first (zero-copy path). Falls back to
+                // cuMemAlloc copy if pool registration fails.
+                if should_retain {
+                    let pool_registered = nixl_agent_for_blocking
+                        .as_ref()
+                        .map(|agent| location.try_register_rmm_pool(agent))
+                        .unwrap_or(false);
+                    if !pool_registered {
+                        location.copy_gpu_buffers_to_cuda_alloc();
+                    }
+                }
                 tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
                 Ok(location)
             })
@@ -2192,6 +2227,8 @@ impl PBackendService for PBackendServiceHandler {
                             dest_node_id,
                             sender_id,
                             self.nixl_only,
+                            &self.local_brpc_addr,
+                            &self.exchange_buffer,
                         )
                         .await
                         {
@@ -2698,6 +2735,7 @@ pub async fn start_grpc_server(
     force_cpu: bool,
     nixl_only: bool,
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
+    local_brpc_addr: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use doris_proto::doris::p_backend_service_server::PBackendServiceServer;
     use tokio_stream::wrappers::ReceiverStream;
@@ -2719,7 +2757,7 @@ pub async fn start_grpc_server(
         nixl_only,
     );
 
-    handler = handler.with_nixl_agent(nixl_agent);
+    handler = handler.with_nixl_agent(nixl_agent).with_local_brpc_addr(local_brpc_addr);
 
     let svc = PBackendServiceServer::new(handler);
 
@@ -2737,7 +2775,11 @@ pub async fn start_grpc_server(
             nixl_agent_for_service,
             exchange_buffer.clone(),
         );
-        server_builder = server_builder.add_service(NixlMetadataServiceServer::new(nixl_handler));
+        // Increase message size limits for large Arrow IPC payloads in transfer_complete.
+        let nixl_svc = NixlMetadataServiceServer::new(nixl_handler)
+            .max_decoding_message_size(256 * 1024 * 1024)   // 256 MB
+            .max_encoding_message_size(256 * 1024 * 1024);
+        server_builder = server_builder.add_service(nixl_svc);
         info!("registered NixlMetadataService on gRPC server");
     }
 

@@ -586,7 +586,7 @@ impl SiriusEngine {
     /// still resident in GPU memory. Returns `Ok(None)` if executed on CPU or buffers
     /// have been freed. Returns `Err` on query failure.
     pub fn get_last_gpu_result_buffers(&self) -> Result<Option<GpuResultInfo>, EngineError> {
-        let sql = "SELECT buffer_id, addr, len, device_id, column_name, type_id, num_rows FROM sirius_get_last_gpu_buffers()";
+        let sql = "SELECT buffer_id, addr, len, device_id, column_name, type_id, num_rows, null_mask_addr, null_mask_len, offsets_addr, offsets_len, null_count FROM sirius_get_last_gpu_buffers()";
         let mut stmt = self
             .conn
             .prepare(sql)
@@ -598,6 +598,7 @@ impl SiriusEngine {
 
         let mut buffer_addrs = Vec::new();
         let mut column_info = Vec::new();
+        let mut column_buffers = Vec::new();
         let mut num_rows_opt = None;
 
         while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
@@ -607,9 +608,21 @@ impl SiriusEngine {
             let column_name: String = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let type_id: i32 = row.get(5).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let num_rows: i64 = row.get(6).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let null_mask_addr: i64 = row.get(7).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let null_mask_len: i64 = row.get(8).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let offsets_addr: i64 = row.get(9).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let offsets_len: i64 = row.get(10).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let null_count: i32 = row.get(11).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
 
             buffer_addrs.push((addr as usize, len as usize, device_id as u64));
             column_info.push((column_name, type_id));
+            column_buffers.push(GpuColumnBuffers {
+                null_mask_addr: null_mask_addr as usize,
+                null_mask_len: null_mask_len as usize,
+                offsets_addr: offsets_addr as usize,
+                offsets_len: offsets_len as usize,
+                null_count,
+            });
             num_rows_opt = Some(num_rows as u32);
         }
 
@@ -623,10 +636,26 @@ impl SiriusEngine {
         Ok(Some(GpuResultInfo {
             buffer_addrs,
             column_info,
+            column_buffers,
             num_rows: num_rows_opt.unwrap_or(0),
             schema_ipc,
         }))
     }
+}
+
+/// Per-column extended GPU buffer info (null mask, string offsets).
+#[derive(Debug, Clone, Default)]
+pub struct GpuColumnBuffers {
+    /// Null bitmap GPU address (0 if all-valid).
+    pub null_mask_addr: usize,
+    /// Null bitmap size in bytes.
+    pub null_mask_len: usize,
+    /// String offsets GPU address (0 if not a string column).
+    pub offsets_addr: usize,
+    /// String offsets buffer size in bytes.
+    pub offsets_len: usize,
+    /// Number of null values in this column.
+    pub null_count: i32,
 }
 
 /// GPU result buffer information for nixl transfers.
@@ -636,6 +665,8 @@ pub struct GpuResultInfo {
     pub buffer_addrs: Vec<(usize, usize, u64)>,
     /// Column metadata: (name, type_id).
     pub column_info: Vec<(String, i32)>,
+    /// Extended per-column buffer info (null masks, string offsets).
+    pub column_buffers: Vec<GpuColumnBuffers>,
     /// Number of rows.
     pub num_rows: u32,
     /// Arrow IPC schema bytes.

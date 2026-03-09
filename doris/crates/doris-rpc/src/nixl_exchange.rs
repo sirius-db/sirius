@@ -119,6 +119,16 @@ impl Drop for NixlRegisteredBuffer {
     }
 }
 
+/// Cached RMM pool registration info.
+struct RmmPoolRegistration {
+    /// Base address of the RMM pool's underlying cudaMalloc allocation.
+    base_addr: usize,
+    /// Total size of the pool allocation.
+    size: usize,
+    /// nixl registration handle (deregisters on drop).
+    _handle: RegistrationHandle,
+}
+
 /// Wraps a nixl Agent with cached peer metadata.
 pub struct NixlExchange {
     agent: Agent,
@@ -129,6 +139,10 @@ pub struct NixlExchange {
     /// Starts `true`, set to `false` on first transfer timeout (indicates
     /// UCX cannot handle GPU memory on this system).
     gpu_transfer_enabled: std::sync::atomic::AtomicBool,
+    /// Cached RMM pool registration. Once the pool base is registered with
+    /// nixl, all sub-allocations within it can be used directly for transfers
+    /// without copying to separate cuMemAlloc buffers.
+    rmm_pool_registration: Mutex<Option<RmmPoolRegistration>>,
 }
 
 impl NixlExchange {
@@ -182,6 +196,7 @@ impl NixlExchange {
             backend,
             remote_agents: Mutex::new(HashMap::new()),
             gpu_transfer_enabled: std::sync::atomic::AtomicBool::new(true),
+            rmm_pool_registration: Mutex::new(None),
         })
     }
 
@@ -199,6 +214,122 @@ impl NixlExchange {
         warn!("disabling GPU-direct transfers (will use bRPC fallback)");
         self.gpu_transfer_enabled
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ensure the RMM pool containing `any_rmm_ptr` is registered with nixl.
+    ///
+    /// Uses `cuMemGetAddressRange` to discover the pool's base address and size
+    /// from any sub-allocation pointer. The registration is cached — subsequent
+    /// calls with pointers in the same pool are no-ops.
+    ///
+    /// Returns `true` if the pool is registered (either freshly or from cache),
+    /// `false` if registration failed (caller should fall back to copy path).
+    pub fn ensure_rmm_pool_registered(&self, any_rmm_ptr: usize, device_id: u64) -> bool {
+        use crate::cuda_driver::{cuda_mem_get_address_range, cuda_pointer_get_memory_type};
+
+        // First, verify the pointer is actually device memory.
+        match cuda_pointer_get_memory_type(any_rmm_ptr) {
+            Ok(mem_type) => {
+                // CU_MEMORYTYPE_DEVICE = 2
+                if mem_type != 2 {
+                    warn!(
+                        ptr = format_args!("0x{any_rmm_ptr:x}"),
+                        mem_type,
+                        "RMM pointer is not device memory, cannot register pool"
+                    );
+                    return false;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to query memory type for RMM pointer");
+                return false;
+            }
+        }
+
+        // Discover the pool base address.
+        let (base, size) = match cuda_mem_get_address_range(any_rmm_ptr) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "cuMemGetAddressRange failed for RMM pointer");
+                return false;
+            }
+        };
+
+        let mut pool_reg = self.rmm_pool_registration.lock().unwrap();
+
+        // Already registered for this pool?
+        if let Some(ref reg) = *pool_reg {
+            if reg.base_addr == base && reg.size == size {
+                return true;
+            }
+            // Different pool — drop old registration and re-register.
+            info!(
+                old_base = format_args!("0x{:x}", reg.base_addr),
+                new_base = format_args!("0x{base:x}"),
+                "RMM pool changed, re-registering"
+            );
+        }
+
+        // Register the entire pool region.
+        if let Err(e) = ensure_cuda_context() {
+            warn!(error = %e, "CUDA context init failed in ensure_rmm_pool_registered");
+            return false;
+        }
+
+        let mut opt = match OptArgs::new() {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(error = %e, "OptArgs::new failed");
+                return false;
+            }
+        };
+        if let Err(e) = opt.add_backend(&self.backend) {
+            warn!(error = %e, "add_backend failed");
+            return false;
+        }
+
+        let wrapper = GpuBufferWrapper {
+            addr: base,
+            len: size,
+            device_id,
+        };
+        match self.agent.register_memory(&wrapper, Some(&opt)) {
+            Ok(handle) => {
+                info!(
+                    base = format_args!("0x{base:x}"),
+                    size,
+                    size_mb = size / (1024 * 1024),
+                    "registered RMM pool with nixl"
+                );
+                *pool_reg = Some(RmmPoolRegistration {
+                    base_addr: base,
+                    size,
+                    _handle: handle,
+                });
+                true
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    base = format_args!("0x{base:x}"),
+                    size,
+                    "failed to register RMM pool with nixl"
+                );
+                false
+            }
+        }
+    }
+
+    /// Check if all given GPU buffers fall within the registered RMM pool.
+    pub fn buffers_in_rmm_pool(&self, buffers: &[(usize, usize, u64)]) -> bool {
+        let pool_reg = self.rmm_pool_registration.lock().unwrap();
+        let Some(ref reg) = *pool_reg else {
+            return false;
+        };
+        let pool_end = reg.base_addr + reg.size;
+        buffers.iter().all(|&(addr, len, _)| {
+            addr >= reg.base_addr && addr + len <= pool_end
+        })
     }
 
     /// Register GPU memory buffers with the nixl agent (no ownership transfer).

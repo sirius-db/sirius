@@ -27,12 +27,19 @@ namespace duckdb {
 
 /// Metadata for a single GPU column buffer from the last execution.
 struct GPUBufferInfo {
-  uintptr_t addr;          ///< GPU device pointer.
-  size_t len;              ///< Buffer size in bytes.
+  uintptr_t addr;          ///< GPU device pointer (data buffer).
+  size_t len;              ///< Data buffer size in bytes.
   int device_id;           ///< GPU device ID.
   std::string column_name; ///< Column name from the query plan.
-  int type_id;             ///< GPUColumnTypeId as int.
+  int type_id;             ///< cudf::type_id as int (not GPUColumnTypeId).
   size_t num_rows;         ///< Number of rows in the column.
+
+  // Extended buffer info for complete Arrow reconstruction:
+  uintptr_t null_mask_addr = 0; ///< Null bitmap GPU pointer (0 if all-valid).
+  size_t null_mask_len     = 0; ///< Null bitmap size in bytes.
+  uintptr_t offsets_addr   = 0; ///< String offsets GPU pointer (0 if not string).
+  size_t offsets_len       = 0; ///< Offsets buffer size in bytes.
+  int null_count           = 0; ///< Number of null values.
 };
 
 /// Thread-safe singleton that stores GPU buffer metadata from the most recent

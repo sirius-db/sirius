@@ -33,6 +33,8 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // cudf
+#include <cudf/null_mask.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -155,12 +157,42 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
         for (cudf::size_type i = 0; i < view.num_columns(); i++) {
           cudf::column_view col = view.column(i);
+          size_t nrows = static_cast<size_t>(col.size());
+
+          // Data buffer.
           uintptr_t addr = reinterpret_cast<uintptr_t>(col.data<uint8_t>());
           size_t len = 0;
+
+          // Null mask (validity bitmap).
+          uintptr_t null_mask_addr = 0;
+          size_t null_mask_len = 0;
+          int null_cnt = static_cast<int>(col.null_count());
+          if (col.nullable() && col.null_mask() != nullptr) {
+            null_mask_addr = reinterpret_cast<uintptr_t>(col.null_mask());
+            // cudf bitmask: 1 bit per element, padded to 64-byte boundary.
+            null_mask_len = cudf::bitmask_allocation_size_bytes(col.size());
+          }
+
+          // String offsets (child[0] for STRING type).
+          uintptr_t offsets_addr = 0;
+          size_t offsets_len = 0;
+
           if (cudf::is_fixed_width(col.type())) {
-            len = static_cast<size_t>(col.size()) * cudf::size_of(col.type());
+            len = nrows * cudf::size_of(col.type());
+          } else if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+            // STRING: data ptr = chars buffer, child(0) = offsets (INT32).
+            // Chars size: computed from last offset value.
+            // For now, use the offset range to determine chars size:
+            //   chars_len = offsets[nrows] - offsets[0] (would need D2H to read).
+            //   Approximate: total representation size minus offsets size.
+            auto offsets_col = col.child(0);
+            offsets_addr = reinterpret_cast<uintptr_t>(offsets_col.data<int32_t>());
+            offsets_len = static_cast<size_t>(offsets_col.size()) * sizeof(int32_t);
+            // Chars length: gpu_rep knows the total, but per-column isn't exposed.
+            // Use the full table representation size as upper bound for now.
+            // The receiver will use offsets[nrows] (D2H'd) to determine actual chars size.
+            len = gpu_rep.get_size_in_bytes();
           } else {
-            // Variable-width (e.g. STRING): use total representation size as approximation.
             len = gpu_rep.get_size_in_bytes();
           }
 
@@ -173,7 +205,12 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             device_id,
             std::move(col_name),
             static_cast<int>(col.type().id()),
-            static_cast<size_t>(col.size()),
+            nrows,
+            null_mask_addr,
+            null_mask_len,
+            offsets_addr,
+            offsets_len,
+            null_cnt,
           });
         }
 

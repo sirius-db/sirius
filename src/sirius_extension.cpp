@@ -939,8 +939,14 @@ unique_ptr<FunctionData> SiriusExtension::GetLastGPUBuffersBind(
     LogicalType::VARCHAR,  // column_name
     LogicalType::INTEGER,  // type_id
     LogicalType::BIGINT,   // num_rows
+    LogicalType::BIGINT,   // null_mask_addr
+    LogicalType::BIGINT,   // null_mask_len
+    LogicalType::BIGINT,   // offsets_addr
+    LogicalType::BIGINT,   // offsets_len
+    LogicalType::INTEGER,  // null_count
   };
-  names = {"buffer_id", "addr", "len", "device_id", "column_name", "type_id", "num_rows"};
+  names = {"buffer_id", "addr", "len", "device_id", "column_name", "type_id", "num_rows",
+           "null_mask_addr", "null_mask_len", "offsets_addr", "offsets_len", "null_count"};
   return make_uniq<GetLastGPUBuffersData>();
 }
 
@@ -968,6 +974,11 @@ void SiriusExtension::GetLastGPUBuffersFunction(
     output.SetValue(4, i, Value(buf.column_name));
     output.SetValue(5, i, Value::INTEGER(buf.type_id));
     output.SetValue(6, i, Value::BIGINT(static_cast<int64_t>(buf.num_rows)));
+    output.SetValue(7, i, Value::BIGINT(static_cast<int64_t>(buf.null_mask_addr)));
+    output.SetValue(8, i, Value::BIGINT(static_cast<int64_t>(buf.null_mask_len)));
+    output.SetValue(9, i, Value::BIGINT(static_cast<int64_t>(buf.offsets_addr)));
+    output.SetValue(10, i, Value::BIGINT(static_cast<int64_t>(buf.offsets_len)));
+    output.SetValue(11, i, Value::INTEGER(buf.null_count));
   }
 
   data.finished = true;

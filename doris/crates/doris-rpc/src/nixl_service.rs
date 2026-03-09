@@ -70,14 +70,61 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 status_code: 1,
                 error_msgs: vec!["nixl not available on this BE".to_string()],
                 nixl_metadata: vec![],
+                dst_null_masks: vec![],
+                dst_offsets: vec![],
             }));
         };
 
         // Step 1+2: Allocate and register destination GPU buffers in one operation.
         // Uses cuMemAlloc directly (not the RMM pool) because the RMM processing
         // pool may be at capacity after GPU query execution. RAII handles cleanup.
+        //
+        // Allocate data buffers + sub-buffers (null masks, string offsets) for
+        // each column. Sub-buffers are only allocated when the sender has them.
         let sizes: Vec<_> = req.src_buffers.iter().map(|b| (b.len, b.device_id)).collect();
-        let registered = match agent.allocate_and_register_gpu_buffers(&sizes) {
+
+        // Collect sub-buffer sizes (null_mask and offsets per column).
+        let null_mask_sizes: Vec<_> = req.src_null_masks.iter().map(|b| (b.len, b.device_id)).collect();
+        let offsets_sizes: Vec<_> = req.src_offsets.iter().map(|b| (b.len, b.device_id)).collect();
+
+        // Flatten all non-zero sizes for allocation.
+        let mut all_sizes: Vec<(u64, u64)> = Vec::new();
+        // Track which indices in the flat allocation list correspond to what.
+        // For each column: data_idx, null_mask_idx (or -1), offsets_idx (or -1).
+        let mut buffer_map: Vec<(usize, Option<usize>, Option<usize>)> = Vec::new();
+
+        for (i, &(len, dev)) in sizes.iter().enumerate() {
+            let data_idx = all_sizes.len();
+            all_sizes.push((len, dev));
+
+            let nm_idx = if let Some(&(nm_len, nm_dev)) = null_mask_sizes.get(i) {
+                if nm_len > 0 {
+                    let idx = all_sizes.len();
+                    all_sizes.push((nm_len, nm_dev));
+                    Some(idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let off_idx = if let Some(&(off_len, off_dev)) = offsets_sizes.get(i) {
+                if off_len > 0 {
+                    let idx = all_sizes.len();
+                    all_sizes.push((off_len, off_dev));
+                    Some(idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            buffer_map.push((data_idx, nm_idx, off_idx));
+        }
+
+        let registered = match agent.allocate_and_register_gpu_buffers(&all_sizes) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "failed to allocate/register dst GPU buffers");
@@ -87,18 +134,56 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                     status_code: 1,
                     error_msgs: vec![format!("allocate_and_register: {e}")],
                     nixl_metadata: vec![],
+                    dst_null_masks: vec![],
+                    dst_offsets: vec![],
                 }));
             }
         };
 
-        let dst_buffers: Vec<PGpuBufferDesc> = registered
-            .iter()
-            .map(|b| PGpuBufferDesc {
+        // Build response descriptors from the flat allocation.
+        let mut dst_buffers: Vec<PGpuBufferDesc> = Vec::new();
+        let mut dst_null_masks: Vec<PGpuBufferDesc> = Vec::new();
+        let mut dst_offsets: Vec<PGpuBufferDesc> = Vec::new();
+        let zero_desc = PGpuBufferDesc { addr: 0, len: 0, device_id: 0 };
+
+        for &(data_idx, nm_idx, off_idx) in &buffer_map {
+            let b = &registered[data_idx];
+            dst_buffers.push(PGpuBufferDesc {
                 addr: b.addr() as u64,
                 len: b.len() as u64,
                 device_id: b.device_id(),
-            })
-            .collect();
+            });
+            dst_null_masks.push(match nm_idx {
+                Some(idx) => {
+                    let b = &registered[idx];
+                    PGpuBufferDesc {
+                        addr: b.addr() as u64,
+                        len: b.len() as u64,
+                        device_id: b.device_id(),
+                    }
+                }
+                None => zero_desc.clone(),
+            });
+            dst_offsets.push(match off_idx {
+                Some(idx) => {
+                    let b = &registered[idx];
+                    PGpuBufferDesc {
+                        addr: b.addr() as u64,
+                        len: b.len() as u64,
+                        device_id: b.device_id(),
+                    }
+                }
+                None => zero_desc.clone(),
+            });
+        }
+
+        info!(
+            num_data = dst_buffers.len(),
+            num_null_masks = dst_null_masks.iter().filter(|b| b.addr != 0).count(),
+            num_offsets = dst_offsets.iter().filter(|b| b.addr != 0).count(),
+            total_allocated = registered.len(),
+            "allocated destination GPU buffers (data + sub-buffers)"
+        );
 
         // Store pending buffers for RAII cleanup in transfer_complete.
         let query_id_hi = i64::from_le_bytes(
@@ -131,6 +216,8 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                     status_code: 1,
                     error_msgs: vec![format!("load_remote_metadata: {e}")],
                     nixl_metadata: vec![],
+                    dst_null_masks: vec![],
+                    dst_offsets: vec![],
                 }));
             }
         };
@@ -147,6 +234,8 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                     status_code: 1,
                     error_msgs: vec![format!("get_fresh_metadata: {e}")],
                     nixl_metadata: vec![],
+                    dst_null_masks: vec![],
+                    dst_offsets: vec![],
                 }));
             }
         };
@@ -165,6 +254,8 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             status_code: 0,
             error_msgs: vec![],
             nixl_metadata: receiver_metadata,
+            dst_null_masks,
+            dst_offsets,
         }))
     }
 
