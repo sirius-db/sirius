@@ -63,7 +63,8 @@ void sirius_engine::reset()
 void sirius_engine::insert_repository(
   std::string_view port_id,
   duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline)
+  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
+  op::MemoryBarrierType barrier_type)
 {
   auto next_op            = dependent_pipeline->get_operators().size() == 0
                               ? dependent_pipeline->get_sink().get()
@@ -75,7 +76,7 @@ void sirius_engine::insert_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
   next_op->add_port(port_id,
                     std::make_unique<op::sirius_physical_operator::port>(
-                      op::MemoryBarrierType::FULL,
+                      barrier_type,
                       data_repo_manager.get_repository(op_id, port_id).get(),
                       input_pipeline,
                       dependent_pipeline));
@@ -98,7 +99,8 @@ void sirius_engine::insert_repository(
   std::string_view port_id,
   op::sirius_physical_operator* cur_op,
   duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline)
+  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
+  op::MemoryBarrierType barrier_type)
 {
   auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_data_repository_manager();
@@ -110,7 +112,7 @@ void sirius_engine::insert_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
   next_op->add_port(port_id,
                     std::make_unique<op::sirius_physical_operator::port>(
-                      op::MemoryBarrierType::FULL,
+                      barrier_type,
                       data_repo_manager.get_repository(op_id, port_id).get(),
                       input_pipeline,
                       dependent_pipeline));

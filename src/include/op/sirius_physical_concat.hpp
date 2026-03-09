@@ -48,6 +48,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   bool is_build_concat();
 
+  std::optional<task_creation_hint> get_next_task_hint() override;
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
