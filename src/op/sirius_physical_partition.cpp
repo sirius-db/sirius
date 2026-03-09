@@ -247,7 +247,19 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     // correct number of tasks.
     return _sibling_partition_op->get_next_task_hint();
   } else {
-    return sirius_physical_operator::get_next_task_hint();
+    // Ensure that it only has one port
+    if (ports.size() != 1) {
+      throw std::runtime_error("sirius_physical_concat: there should be only one port");
+    }
+    auto port_ptr = ports.begin()->second;
+    if (port_ptr->repo->total_size() > 0) {
+      return task_creation_hint{TaskCreationHint::READY, this};
+    } else if (port_ptr->src_pipeline && !port_ptr->src_pipeline->is_pipeline_finished()) {
+      auto* producer = &(port_ptr->src_pipeline->get_operators()[0].get());
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    } else {
+      return std::nullopt;
+    }
   }
 }
 

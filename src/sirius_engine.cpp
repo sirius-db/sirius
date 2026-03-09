@@ -999,7 +999,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
         // Full barrier operators — wait for upstream to finish before processing
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
-          insert_repository("default", new_scheduled[i], dependent_pipeline);
+          // if the source is CONCAT, then use partial barrier type
+          if (dependent_pipeline->get_operators().size() > 0 &&
+              dependent_pipeline->get_operators()[0].get().type ==
+                op::SiriusPhysicalOperatorType::CONCAT) {
+            insert_repository(
+              "default", new_scheduled[i], dependent_pipeline, op::MemoryBarrierType::PARTIAL);
+          } else {
+            insert_repository(
+              "default", new_scheduled[i], dependent_pipeline, op::MemoryBarrierType::FULL);
+          }
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
@@ -1131,8 +1140,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
         auto probe_concat_pipeline    = new_scheduled[i]->dependencies[1];
         auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
+        // change probe partition barrier to partial
+        probe_partition_pipeline->get_source()->get_port("default")->type =
+          op::MemoryBarrierType::PARTIAL;
         if (build_partition_pipeline->get_sink()->type ==
             op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+          // partition pipeline only has one operator
           auto& right_delim_join_op =
             build_partition_pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
           auto build_partition_op = right_delim_join_op.partition_join;
@@ -1141,6 +1154,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           build_partition_op->set_sibling_partition_op(&probe_partition_op);
           probe_partition_op.set_sibling_partition_op(build_partition_op);
         } else {
+          // partition pipeline only has one operator, so sink and source are the same
           auto& build_partition_op =
             build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
           auto& probe_partition_op =
