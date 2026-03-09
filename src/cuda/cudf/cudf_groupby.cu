@@ -221,6 +221,33 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
 
   auto keys_table = cudf::table_view(keys_cudf);
 
+  // cudf::distinct uses a hash function that reads STRING offset children as INT32.
+  // Sirius stores offsets as INT64 (non-standard). Passing an INT64-offset STRING
+  // column to cudf::distinct produces wrong hashes — all strings hash as if empty,
+  // so dedup collapses every group to 1 row and COUNT DISTINCT returns 1 everywhere.
+  // Fix: convert any VARCHAR column_view to standard INT32-offset format before
+  // calling cudf::distinct. The INT32 buffer is allocated via customCudaMalloc and
+  // is persistent for the query lifetime, so the returned column_view is safe to use.
+  auto to_distinct_view = [](cudf::column_view const& cv) -> cudf::column_view {
+    if (cv.type().id() != cudf::type_id::STRING) return cv;
+    if (cv.num_children() == 0 || cv.child(0).type().id() == cudf::type_id::INT32) return cv;
+    int32_t* int32_offs = convertUInt64ToInt32(
+      const_cast<uint64_t*>(reinterpret_cast<const uint64_t*>(cv.child(0).data<int64_t>())),
+      static_cast<size_t>(cv.size()) + 1);
+    auto offsets_cv = cudf::column_view(
+      cudf::data_type{cudf::type_id::INT32}, cv.size() + 1, int32_offs, nullptr, 0);
+    return cudf::column_view(
+      cv.type(), cv.size(), cv.data<uint8_t>(), cv.null_mask(), cv.null_count(), 0, {offsets_cv});
+  };
+
+  // Pre-compute INT32-offset versions of group key columns once (they're shared across all
+  // COUNT DISTINCT aggregates in P1 and P1b, so we avoid redundant conversions per aggregate).
+  std::vector<cudf::column_view> keys_cudf_for_distinct;
+  keys_cudf_for_distinct.reserve(num_keys);
+  for (const auto& kcv : keys_cudf) {
+    keys_cudf_for_distinct.push_back(to_distinct_view(kcv));
+  }
+
   // --- Two-phase COUNT DISTINCT optimization (P1) ---
   // When ALL aggregates are COUNT_DISTINCT, use distinct(keys+value) → count_star groupby
   // instead of cudf's sort-based nunique. Avoids materializing sorted order.
@@ -238,9 +265,9 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
 
         std::vector<cudf::column_view> dedup_columns;
         for (int key = 0; key < num_keys; key++) {
-          dedup_columns.push_back(keys_cudf[key]);
+          dedup_columns.push_back(keys_cudf_for_distinct[key]);
         }
-        dedup_columns.push_back(value_view);
+        dedup_columns.push_back(to_distinct_view(value_view));
 
         auto dedup_table = cudf::table_view(dedup_columns);
 
@@ -255,6 +282,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
           effective_dedup_table = null_filtered_owner->view();
         }
 
+        // All columns are keys for deduplication
         std::vector<cudf::size_type> all_key_indices;
         for (int k = 0; k < static_cast<int>(effective_dedup_table.num_columns()); k++) {
           all_key_indices.push_back(k);
@@ -489,10 +517,10 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
         // Phase 1: distinct(group_keys + value), excluding NULL values
         std::vector<cudf::column_view> dedup_columns;
         for (int key = 0; key < num_keys; key++) {
-          dedup_columns.push_back(keys_cudf[key]);
+          dedup_columns.push_back(keys_cudf_for_distinct[key]);
         }
         auto value_view = aggregate_keys[agg]->convertToCudfColumn();
-        dedup_columns.push_back(value_view);
+        dedup_columns.push_back(to_distinct_view(value_view));
 
         auto dedup_table = cudf::table_view(dedup_columns);
 
