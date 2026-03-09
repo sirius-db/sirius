@@ -743,13 +743,11 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
     if (!use_data_batch_apis && expr.children[0]->type == ExpressionType::BOUND_REF) {
       auto& ref = expr.children[0]->Cast<BoundReferenceExpression>();
       auto& col = input_columns[ref.index];
-      if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR && col->data_wrapper.offset != nullptr) {
+      if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
+          col->data_wrapper.offset != nullptr) {
         size_t num_rows = col->row_ids != nullptr ? col->row_id_count : col->column_length;
-        return sirius::StrlenFromOffsets(col->data_wrapper.offset,
-                                        col->row_ids,
-                                        num_rows,
-                                        execution_stream,
-                                        resource_ref);
+        return sirius::StrlenFromOffsets(
+          col->data_wrapper.offset, col->row_ids, num_rows, execution_stream, resource_ref);
       }
     }
     UnaryFunctionDispatcher<UnaryFunctionType::STRLEN> dispatcher(*this);

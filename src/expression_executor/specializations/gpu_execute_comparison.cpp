@@ -314,23 +314,19 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparis
   // P5: empty-string check via offsets on the old gpu_processing path.
   // Rewrites (varchar_col <> '') to offset-based non-empty check, avoiding
   // string char buffer materialization entirely.
-  if (!use_data_batch_apis &&
-      expr.GetExpressionType() == ExpressionType::COMPARE_NOTEQUAL &&
+  if (!use_data_batch_apis && expr.GetExpressionType() == ExpressionType::COMPARE_NOTEQUAL &&
       expr.left->type == ExpressionType::BOUND_REF &&
       expr.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
     auto& right_val = expr.right->Cast<BoundConstantExpression>().value;
-    if (right_val.type().id() == LogicalTypeId::VARCHAR &&
-        !right_val.IsNull() &&
+    if (right_val.type().id() == LogicalTypeId::VARCHAR && !right_val.IsNull() &&
         right_val.GetValue<std::string>().empty()) {
       auto& ref = expr.left->Cast<BoundReferenceExpression>();
       auto& col = input_columns[ref.index];
-      if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR && col->data_wrapper.offset != nullptr) {
+      if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
+          col->data_wrapper.offset != nullptr) {
         size_t num_rows = col->row_ids != nullptr ? col->row_id_count : col->column_length;
-        return sirius::EmptyStrCheck(col->data_wrapper.offset,
-                                    col->row_ids,
-                                    num_rows,
-                                    execution_stream,
-                                    resource_ref);
+        return sirius::EmptyStrCheck(
+          col->data_wrapper.offset, col->row_ids, num_rows, execution_stream, resource_ref);
       }
     }
   }

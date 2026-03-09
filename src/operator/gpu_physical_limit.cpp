@@ -40,18 +40,18 @@ GPUPhysicalStreamingLimit::GPUPhysicalStreamingLimit(vector<LogicalType> types,
 static size_t GetElementSizeBytes(const GPUColumnType& col_type)
 {
   switch (col_type.id()) {
-    case GPUColumnTypeId::BOOLEAN:      return sizeof(uint8_t);
-    case GPUColumnTypeId::INT16:        return sizeof(int16_t);
+    case GPUColumnTypeId::BOOLEAN: return sizeof(uint8_t);
+    case GPUColumnTypeId::INT16: return sizeof(int16_t);
     case GPUColumnTypeId::INT32:
     case GPUColumnTypeId::DATE:
-    case GPUColumnTypeId::FLOAT32:      return sizeof(int32_t);
+    case GPUColumnTypeId::FLOAT32: return sizeof(int32_t);
     case GPUColumnTypeId::INT64:
     case GPUColumnTypeId::FLOAT64:
     case GPUColumnTypeId::TIMESTAMP_SEC:
     case GPUColumnTypeId::TIMESTAMP_MS:
     case GPUColumnTypeId::TIMESTAMP_US:
     case GPUColumnTypeId::TIMESTAMP_NS: return sizeof(int64_t);
-    case GPUColumnTypeId::INT128:       return sizeof(__int128_t);
+    case GPUColumnTypeId::INT128: return sizeof(__int128_t);
     case GPUColumnTypeId::DECIMAL: {
       auto* info = col_type.GetDecimalTypeInfo();
       return info ? info->GetDecimalTypeSize() : sizeof(int64_t);
@@ -84,7 +84,7 @@ OperatorResultType GPUPhysicalStreamingLimit::Execute(
     idx_t skip    = std::min(offset_const, col_len);
     idx_t take    = std::min(limit_const, col_len - skip);
 
-    uint8_t*  new_data   = materialize_column->data_wrapper.data;
+    uint8_t* new_data    = materialize_column->data_wrapper.data;
     uint64_t* new_offset = materialize_column->data_wrapper.offset;
 
     if (skip > 0) {
@@ -95,7 +95,7 @@ OperatorResultType GPUPhysicalStreamingLimit::Execute(
         new_offset = materialize_column->data_wrapper.offset + skip;
       } else {
         size_t elem_size = GetElementSizeBytes(materialize_column->data_wrapper.type);
-        new_data = materialize_column->data_wrapper.data + skip * elem_size;
+        new_data         = materialize_column->data_wrapper.data + skip * elem_size;
       }
     }
 
@@ -113,13 +113,15 @@ OperatorResultType GPUPhysicalStreamingLimit::Execute(
     if (take > 0 &&
         output_relation.columns[col_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
       Allocator& allocator = Allocator::DefaultAllocator();
-      uint64_t* end_pos =
-        reinterpret_cast<uint64_t*>(allocator.AllocateData(sizeof(uint64_t)));
+      uint64_t* end_pos    = reinterpret_cast<uint64_t*>(allocator.AllocateData(sizeof(uint64_t)));
       callCudaMemcpyDeviceToHost<uint64_t>(end_pos, new_offset + take, 1, 0);
       output_relation.columns[col_idx]->data_wrapper.num_bytes = end_pos[0];
     }
     SIRIUS_LOG_DEBUG("Column {} has {} rows (offset={}, take={})",
-                     col_idx, output_relation.columns[col_idx]->column_length, skip, take);
+                     col_idx,
+                     output_relation.columns[col_idx]->column_length,
+                     skip,
+                     take);
   }
 
   return OperatorResultType::FINISHED;

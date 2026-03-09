@@ -15,9 +15,12 @@
  */
 
 #include "operator/strlen_from_offsets.cuh"
-#include <cstdint>
-#include <rmm/device_uvector.hpp>
+
 #include <cudf/column/column.hpp>
+
+#include <rmm/device_uvector.hpp>
+
+#include <cstdint>
 
 namespace duckdb {
 namespace sirius {
@@ -26,46 +29,45 @@ static constexpr int BLOCK_SIZE = 256;
 
 __global__ void strlen_from_offsets_kernel(const uint64_t* __restrict__ offsets,
                                            int32_t* __restrict__ output,
-                                           size_t num_rows) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < num_rows) {
-        output[tid] = static_cast<int32_t>(offsets[tid + 1] - offsets[tid]);
-    }
+                                           size_t num_rows)
+{
+  size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < num_rows) { output[tid] = static_cast<int32_t>(offsets[tid + 1] - offsets[tid]); }
 }
 
 __global__ void strlen_from_offsets_with_rowids_kernel(const uint64_t* __restrict__ offsets,
                                                        const uint64_t* __restrict__ row_ids,
                                                        int32_t* __restrict__ output,
-                                                       size_t num_rows) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < num_rows) {
-        uint64_t rid = row_ids[tid];
-        output[tid] = static_cast<int32_t>(offsets[rid + 1] - offsets[rid]);
-    }
+                                                       size_t num_rows)
+{
+  size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < num_rows) {
+    uint64_t rid = row_ids[tid];
+    output[tid]  = static_cast<int32_t>(offsets[rid + 1] - offsets[rid]);
+  }
 }
 
 std::unique_ptr<cudf::column> StrlenFromOffsets(const uint64_t* offsets,
-                                                 const uint64_t* row_ids,
-                                                 size_t num_rows,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr) {
-    rmm::device_uvector<int32_t> output(num_rows, stream, mr);
+                                                const uint64_t* row_ids,
+                                                size_t num_rows,
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref mr)
+{
+  rmm::device_uvector<int32_t> output(num_rows, stream, mr);
 
-    if (num_rows > 0) {
-        int num_blocks = (num_rows + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        if (row_ids != nullptr) {
-            strlen_from_offsets_with_rowids_kernel<<<num_blocks, BLOCK_SIZE, 0, stream.value()>>>(
-                offsets, row_ids, output.data(), num_rows);
-        } else {
-            strlen_from_offsets_kernel<<<num_blocks, BLOCK_SIZE, 0, stream.value()>>>(
-                offsets, output.data(), num_rows);
-        }
+  if (num_rows > 0) {
+    int num_blocks = (num_rows + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (row_ids != nullptr) {
+      strlen_from_offsets_with_rowids_kernel<<<num_blocks, BLOCK_SIZE, 0, stream.value()>>>(
+        offsets, row_ids, output.data(), num_rows);
+    } else {
+      strlen_from_offsets_kernel<<<num_blocks, BLOCK_SIZE, 0, stream.value()>>>(
+        offsets, output.data(), num_rows);
     }
+  }
 
-    return std::make_unique<cudf::column>(std::move(output),
-                                          rmm::device_buffer(0, stream, mr),
-                                          0);
+  return std::make_unique<cudf::column>(std::move(output), rmm::device_buffer(0, stream, mr), 0);
 }
 
-} // namespace sirius
-} // namespace duckdb
+}  // namespace sirius
+}  // namespace duckdb

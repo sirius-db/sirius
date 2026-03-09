@@ -186,7 +186,12 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
     }
   }
 
-  cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, aggregates.size(), agg_mode, estimated_output_groups);
+  cudf_groupby(group_by_keys,
+               aggregate_keys,
+               num_group_keys,
+               aggregates.size(),
+               agg_mode,
+               estimated_output_groups);
 }
 
 void HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
@@ -477,9 +482,12 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
         throw NotImplementedException(
           "Group by column length or aggregate column length is too large for CuDF");
       } else {
-        HandleGroupByAggregateCuDF(
-          group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys,
-          estimated_cardinality);
+        HandleGroupByAggregateCuDF(group_by_column,
+                                   aggregate_column,
+                                   gpuBufferManager,
+                                   aggregates,
+                                   num_group_keys,
+                                   estimated_cardinality);
       }
     }
   }

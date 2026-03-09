@@ -16,12 +16,14 @@
 
 #pragma once
 
-#include <cstdint>
-#include <cstddef>
-#include <memory>
 #include <cudf/column/column.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 
 namespace duckdb {
 namespace sirius {
@@ -30,10 +32,10 @@ namespace sirius {
 // Computed via offset arithmetic: result[i] = (offsets[i+1] - offsets[i]) > 0.
 // Equivalent to (col <> '') but avoids materializing the string chars buffer.
 std::unique_ptr<cudf::column> EmptyStrCheck(const uint64_t* offsets,
-                                             const uint64_t* row_ids,
-                                             size_t num_rows,
-                                             rmm::cuda_stream_view stream,
-                                             rmm::device_async_resource_ref mr);
+                                            const uint64_t* row_ids,
+                                            size_t num_rows,
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr);
 
-} // namespace sirius
-} // namespace duckdb
+}  // namespace sirius
+}  // namespace duckdb
