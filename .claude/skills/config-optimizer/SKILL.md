@@ -10,8 +10,8 @@ You are tuning sirius configurations for optimal performance on TPC-H datasets a
 ## Configuration Parameters
 - `sirius.executor.pipeline.num_threads`: [1-10] change number of threads(streams) used for gpu tasks in pipeline executor.
 - `sirius.executor.duckdb_scan.num_threads`: [1-10] change number of threads used for duckdb scan operator.
-- `sirius.executor.duckdb_scan.cache`: [true, false] Whether to cahce compressed parquet row groups in pinned memory
-- `sirius.executor.duckdb_scan.cache_decoded_table`: [true, false] Whether to cahce decoded cudf tables in pinned memory
+- `sirius.executor.duckdb_scan.cache`: [true, false] Whether to cache compressed parquet row groups in pinned memory
+- `sirius.executor.duckdb_scan.cache_decoded_table`: [true, false] Whether to cache decoded cudf tables in pinned memory
 - `sirius.executor.duckdb_scan.cache_in_gpu`: [true, false] Whether to cache decoded cudf tables in gpu memory
 - `sirius.operator_params.scan_task_batch_size`: [500MB - 5GB] the batch size in bytes for scan tasks, which determines how much data is processed in each scan task.
 - `sirius.operator_params.concat_batch_bytes`: [500MB - 5GB] the batch size in bytes for concatenation tasks, which determines how much data is processed in each concatenation task.

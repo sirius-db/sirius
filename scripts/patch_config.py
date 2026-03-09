@@ -137,7 +137,9 @@ def apply_one(lines: list[str], dot_path: str, value: str) -> list[str]:
     parent_path = ".".join(parts[:existing_depth])
     insert_at = group_close[parent_path]  # insert before the closing };
 
-    indent = group_content_indent(lines, group_open[parent_path], group_close[parent_path])
+    indent = group_content_indent(
+        lines, group_open[parent_path], group_close[parent_path]
+    )
 
     # Build lines to insert
     new_groups = parts[existing_depth:-1]  # intermediate groups to create
