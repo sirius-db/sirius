@@ -5,34 +5,37 @@
 # parquet files (p16). For multi-BE mode, shared_storage=true distributes
 # partitions across backends.
 #
+# Prerequisites: FE and BE(s) must already be running (see BUILD_DEPLOY_TEST_GUIDE.md).
+#
 # Usage:
-#   ./doris/scripts/run-tpch.sh [--skip-build] [--skip-fe] [--bes 1|2] [--queries 1,2,6]
+#   ./doris/scripts/run-tpch.sh [--skip-build] [--bes 1|2] [--queries 1,2,6]
+#   ./doris/scripts/run-tpch.sh --data-dir /data/tpch/sf10/p16/snappy --queries 1,6
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-COMPOSE_FILE="$PROJECT_ROOT/doris/docker/docker-compose.yml"
 
 # Defaults
 SKIP_BUILD=false
-SKIP_FE=false
 NUM_BES=1
 DATA_DIR="/data/tpch/sf1/p16/snappy"
-FE_HTTP="172.20.80.2:8030"
-FE_CONTAINER="doris-fe"
+FE_HOST="127.0.0.1"
+FE_HTTP_PORT=8030
 QUERY_FILTER=""  # empty = all
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-build) SKIP_BUILD=true; shift ;;
-        --skip-fe)    SKIP_FE=true; shift ;;
         --bes)        NUM_BES="$2"; shift 2 ;;
         --queries)    QUERY_FILTER="$2"; shift 2 ;;
         --data-dir)   DATA_DIR="$2"; shift 2 ;;
+        --fe-host)    FE_HOST="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+FE_HTTP="${FE_HOST}:${FE_HTTP_PORT}"
 
 # Ensure python3 is available (pixi env or system)
 if ! command -v python3 &>/dev/null; then
@@ -48,18 +51,12 @@ fi
 # shared_storage=true even for 1 BE — FE requires backend_id when false
 SHARED_STORAGE="true"
 
-# Use docker exec to reach FE (works around rootless Docker network isolation)
-fe_curl() {
-    docker exec "$FE_CONTAINER" curl "$@"
-}
-
 # Run a SQL statement via FE HTTP API, return JSON response
 fe_query() {
     local sql="$1"
-    # Escape for JSON
     local escaped
     escaped=$(echo "$sql" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    fe_curl -sf "http://$FE_HTTP/api/query/default_cluster/information_schema" \
+    curl -sf "http://${FE_HTTP}/api/query/default_cluster/information_schema" \
         -u root: -H "Content-Type: application/json" \
         -d "{\"stmt\":\"$escaped\"}" 2>/dev/null
 }
@@ -128,73 +125,41 @@ TPCH_QUERIES[22]="select cntrycode, count(*) as numcust, sum(c_acctbal) as totac
 
 # ── Build ────────────────────────────────────────────────────────────────────
 if [[ "$SKIP_BUILD" == false ]]; then
-    echo "==> Building with nixl..."
-    pixi run -e doris-nixl doris-build-nixl
+    echo "==> Building Rust BE..."
+    pixi run -e doris doris-build
 fi
 
-# ── Start cluster ────────────────────────────────────────────────────────────
-start_cluster() {
-    local num_bes="$1"
-
-    if [[ "$SKIP_FE" == false ]]; then
-        echo "==> Starting FE..."
-        docker compose -f "$COMPOSE_FILE" up -d doris-fe
-
-        echo "==> Waiting for FE health..."
-        for i in $(seq 1 120); do
-            if fe_curl -sf "http://$FE_HTTP/api/health" 2>/dev/null | grep -q success; then
-                echo "    FE healthy after ${i}s"
-                break
-            fi
-            if [[ $i -eq 120 ]]; then
-                echo "ERROR: FE did not become healthy within 120s"
-                docker logs doris-fe 2>&1 | tail -10
-                exit 1
-            fi
-            sleep 1
-        done
-
-        echo "==> Starting ${num_bes} BE(s)..."
-        if [[ "$num_bes" -eq 1 ]]; then
-            docker compose -f "$COMPOSE_FILE" up -d sirius-be
-            docker compose -f "$COMPOSE_FILE" stop sirius-be-2 2>/dev/null || true
-        else
-            docker compose -f "$COMPOSE_FILE" up -d sirius-be sirius-be-2
-        fi
-    else
-        echo "==> Waiting for FE health..."
-        for i in $(seq 1 60); do
-            if fe_curl -sf "http://$FE_HTTP/api/health" 2>/dev/null | grep -q success; then
-                echo "    FE healthy after ${i}s"
-                break
-            fi
-            if [[ $i -eq 60 ]]; then
-                echo "ERROR: FE did not become healthy within 60s"
-                exit 1
-            fi
-            sleep 1
-        done
-        # Ensure correct number of BEs
-        if [[ "$num_bes" -eq 1 ]]; then
-            docker compose -f "$COMPOSE_FILE" stop sirius-be-2 2>/dev/null || true
-        fi
+# ── Verify cluster ──────────────────────────────────────────────────────────
+echo "==> Checking FE health..."
+for i in $(seq 1 30); do
+    if curl -sf "http://${FE_HTTP}/api/health" 2>/dev/null | grep -q success; then
+        echo "    FE healthy"
+        break
     fi
+    if [[ $i -eq 30 ]]; then
+        echo "ERROR: FE not reachable at ${FE_HTTP}. Start it first:"
+        echo "  pixi run -e doris-fe doris-fe"
+        exit 1
+    fi
+    sleep 1
+done
 
-    echo "==> Waiting for ${num_bes} BE(s) to register..."
-    for i in $(seq 1 90); do
-        ALIVE_COUNT=$(fe_query "SHOW BACKENDS" 2>/dev/null \
-            | tr -d '\n' | grep -o '"true"' | wc -l || echo 0)
-        ALIVE_COUNT=$(echo "$ALIVE_COUNT" | tr -d '[:space:]')
-        if [[ "$ALIVE_COUNT" -ge "$num_bes" ]]; then
-            echo "    $ALIVE_COUNT BE(s) alive after ${i}s"
-            break
-        fi
-        if [[ $i -eq 90 ]]; then
-            echo "WARNING: Only $ALIVE_COUNT BEs alive after 90s (expected $num_bes)"
-        fi
-        sleep 1
-    done
-}
+echo "==> Checking for ${NUM_BES} alive BE(s)..."
+for i in $(seq 1 30); do
+    ALIVE_COUNT=$(fe_query "SHOW BACKENDS" 2>/dev/null \
+        | tr -d '\n' | grep -o '"true"' | wc -l || echo 0)
+    ALIVE_COUNT=$(echo "$ALIVE_COUNT" | tr -d '[:space:]')
+    if [[ "$ALIVE_COUNT" -ge "$NUM_BES" ]]; then
+        echo "    $ALIVE_COUNT BE(s) alive"
+        break
+    fi
+    if [[ $i -eq 30 ]]; then
+        echo "ERROR: Only $ALIVE_COUNT BEs alive (expected $NUM_BES). Start BE(s) first:"
+        echo "  pixi run -e doris sirius-be"
+        exit 1
+    fi
+    sleep 1
+done
 
 # ── Query runner ─────────────────────────────────────────────────────────────
 PASS_COUNT=0
@@ -220,8 +185,8 @@ run_tpch_query() {
     start_ts=$(date +%s%3N)
 
     local result
-    result=$(timeout "$timeout" docker exec "$FE_CONTAINER" curl -sf \
-        "http://$FE_HTTP/api/query/default_cluster/information_schema" \
+    result=$(timeout "$timeout" curl -sf \
+        "http://${FE_HTTP}/api/query/default_cluster/information_schema" \
         -u root: -H "Content-Type: application/json" \
         -d "{\"stmt\":\"$escaped\"}" 2>/dev/null) || {
         local exit_code=$?
@@ -286,7 +251,6 @@ if len(rows) > 3:
         local err_info="${status#ERR:}"
         printf "  FAIL    %s  (%d.%03ds)\n" "$err_info" $((elapsed/1000)) $((elapsed%1000))
         FAIL_COUNT=$((FAIL_COUNT + 1))
-        # Always check BE health after failure
         wait_for_be
     fi
 }
@@ -310,48 +274,28 @@ wait_for_be_alive() {
     return 1
 }
 
-# Force a clean stop+start cycle. This avoids confusion from Docker auto-restart.
-force_restart_be() {
-    docker compose -f "$COMPOSE_FILE" stop sirius-be >/dev/null 2>&1 || true
-    sleep 2
-    docker compose -f "$COMPOSE_FILE" up -d sirius-be >/dev/null 2>&1 || true
-}
-
-# Called after a query error. Always does a full restart cycle.
+# Called after a query failure — wait for BE to recover (it may have crashed).
 wait_for_be() {
-    printf "  (BE likely crashed, forcing clean restart...)\n"
-    force_restart_be
-    if wait_for_be_alive 1 90; then
-        printf "  (BE recovered)\n"
+    printf "  (waiting for BE to recover...)\n"
+    if wait_for_be_alive 1 60; then
+        printf "  (BE alive)\n"
         sleep 2
     else
-        printf "  WARNING: BE not recovered after 90s\n"
+        printf "  WARNING: BE not recovered after 60s\n"
     fi
 }
 
-# Called before each query. Verifies BE is responsive with a lightweight test.
+# Called before each query. Verifies at least 1 BE is alive.
 ensure_be_running() {
-    local be_status
-    be_status=$(docker inspect sirius-be --format '{{.State.Status}}' 2>/dev/null || echo "missing")
-    if [[ "$be_status" == "running" ]]; then
-        # Verify FE can reach it. Use SHOW BACKENDS since it only touches FE.
-        if [[ "$(count_alive_bes)" -ge 1 ]]; then
-            return
-        fi
-        # Container running but FE doesn't see it — wait for registration
-        printf "  (waiting for BE registration...)\n"
-        if wait_for_be_alive 1 45; then
-            sleep 2
-            return
-        fi
+    if [[ "$(count_alive_bes)" -ge 1 ]]; then
+        return
     fi
-    printf "  (BE not running, starting...)\n"
-    force_restart_be
-    if wait_for_be_alive 1 90; then
+    printf "  (waiting for BE registration...)\n"
+    if wait_for_be_alive 1 30; then
         sleep 2
         return
     fi
-    printf "  WARNING: could not start BE\n"
+    printf "  WARNING: no alive BEs detected\n"
 }
 
 # ── Determine which queries to run ──────────────────────────────────────────
@@ -364,8 +308,6 @@ get_query_list() {
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-start_cluster "$NUM_BES"
-
 # Increase query timeout for complex queries
 fe_query "SET GLOBAL query_timeout = 300" >/dev/null 2>&1 || true
 
@@ -379,7 +321,6 @@ for q in $(get_query_list); do
         echo "  Q${q}: unknown query, skipping"
         continue
     fi
-    # Ensure BE is running before each query (handles crashes from previous query)
     ensure_be_running
     run_tpch_query "$q" "${TPCH_QUERIES[$q]}" 120
 done
@@ -388,7 +329,3 @@ echo ""
 echo "════════════════════════════════════════════════════════════════"
 echo " Summary: PASS=$PASS_COUNT  FAIL=$FAIL_COUNT  TIMEOUT=$TIMEOUT_COUNT"
 echo "════════════════════════════════════════════════════════════════"
-echo ""
-echo "BE logs:     docker logs sirius-be; docker logs sirius-be-2"
-echo "FE logs:     docker logs doris-fe"
-echo "Stop all:    docker compose -f $COMPOSE_FILE down"
