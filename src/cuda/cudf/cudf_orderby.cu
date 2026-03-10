@@ -1067,8 +1067,10 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
     }
   }
 
-  auto keys_table        = cudf::table_view(columns_cudf);
-  auto sorted_order      = cudf::sorted_order(keys_table, orders, null_orders);
+  auto keys_table = cudf::table_view(columns_cudf);
+
+  auto sorted_order = cudf::sorted_order(keys_table, orders, null_orders);
+
   auto sorted_order_view = sorted_order->view();
 
   std::vector<cudf::column_view> projection_cudf;
