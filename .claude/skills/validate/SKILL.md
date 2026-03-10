@@ -77,9 +77,33 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
 
 **Reference commit:** `69e4c6cf` fixed instances of this pattern where `cudf::default_stream()` was accidentally used.
 
+**Typical symptoms:**
+- Data looks like **garbage**: very large numbers, zeros, or partial/stale results rather than logically wrong values
+- Wrong results that are **intermittent** (sometimes correct, sometimes wrong)
+- Results that change between runs with no code changes
+- **More likely to reproduce at larger batch sizes** (GBs) -- small data may complete before the race window opens
+- Results that become correct when GPU concurrency is reduced (fewer threads)
+
 **How to diagnose:**
 
-1. **Quick check with nsys:** Profile the query with `nsys` and examine the stream IDs:
+1. **Quick check with `stream_check`:** Use the `stream_check` LD_PRELOAD library (`utils/stream_check/`) to detect default stream usage at runtime. It intercepts `cudf::get_default_stream()` and logs a full stack trace whenever the default stream is accessed from a monitored thread.
+
+   Build and run:
+   ```bash
+   # Build with stream check enabled
+   CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/release --target stream_check
+
+   # Run the query with stream_check preloaded
+   LD_PRELOAD=build/release/libstream_check.so build/release/duckdb <db_path> <<'EOF'
+   CALL gpu_execution('<QUERY>');
+   EOF
+   ```
+
+   Check the output in `default_stream_traces.log`. Each entry shows the **full call stack** where `cudf::get_default_stream()` was called -- these are the code paths that need to use the correct per-thread stream instead.
+
+   **Note:** `stream_check` is already integrated into Sirius via `src/util/stream_check_wrapper.cpp`. The GPU pipeline executor threads automatically enable detection. If `libstream_check.so` is not preloaded, the wrapper gracefully no-ops.
+
+2. **Check with nsys:** Profile the query with `nsys` and examine the stream IDs:
    ```bash
    nsys profile --stats=true -o /tmp/claude-1000/validate_profile build/<preset>/duckdb <db_path> <<'EOF'
    CALL gpu_execution('<QUERY>');
@@ -87,9 +111,9 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
    ```
    Look at the CUDA stream IDs in the trace. If `cudf::default_stream` (typically stream 0 or the per-thread default stream) appears where it shouldn't, that's the smoking gun.
 
-2. **Narrow to the faulty operator:** Use Phase 2 (data checksums) to identify which operator produces the first mismatch. Print `sum()`/`max()`/`head(10)` of each operator's output and compare against the correct run.
+3. **Narrow to the faulty operator:** Use Phase 2 (data checksums) to identify which operator produces the first mismatch. Print `sum()`/`max()`/`head(10)` of each operator's output and compare against the correct run.
 
-3. **Confirm with `cudaDeviceSynchronize()`:** Once the faulty operator is identified, insert `cudaDeviceSynchronize()` calls inside that operator -- before reads and after writes:
+4. **Confirm with `cudaDeviceSynchronize()`:** Once the faulty operator is identified, insert `cudaDeviceSynchronize()` calls inside that operator -- before reads and after writes:
    ```cpp
    cudaDeviceSynchronize(); // [SIRIUS_DIAG] sync before read
    // ... the suspected read/write ...
@@ -98,13 +122,7 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
    - If the wrong result **disappears** with `cudaDeviceSynchronize()`, the issue is confirmed as a stream sync problem.
    - Then narrow down: remove `cudaDeviceSynchronize()` calls one by one to find the exact operation that needs proper stream synchronization.
 
-4. **Fix:** Replace `cudf::default_stream()` with the correct per-thread CUDA stream in the faulty code path. Or ensure the operation explicitly synchronizes the stream it actually uses. **Never leave `cudaDeviceSynchronize()` in production code** -- it serializes all GPU work and destroys performance. It is only a diagnostic tool.
-
-**Symptoms that suggest stream sync issues:**
-- Wrong results that are **intermittent** (sometimes correct, sometimes wrong)
-- Results that change between runs with no code changes
-- Results that become correct when GPU concurrency is reduced (fewer threads)
-- Data looks like garbage (random values, partial results) rather than logically wrong
+5. **Fix:** Replace `cudf::default_stream()` with the correct per-thread CUDA stream in the faulty code path. Or ensure the operation explicitly synchronizes the stream it actually uses. **Never leave `cudaDeviceSynchronize()` in production code** -- it serializes all GPU work and destroys performance. It is only a diagnostic tool.
 
 ## Key Design Decisions
 
@@ -113,7 +131,8 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
 - All changes tracked via git checkpoints for easy revert
 - For inconsistent results, the skill has patience to run many times until it catches a bad result
 - Each phase requires user confirmation before proceeding
-- Stream sync issues are the #1 cause of validation errors -- always consider this first when results are intermittently wrong
+- Stream sync issues are the #1 cause of validation errors -- always consider this first when results are intermittently wrong or contain garbage data
+- `stream_check` (LD_PRELOAD library in `utils/stream_check/`) is the fastest way to find default stream usage -- run it before inserting manual debug logs
 
 ## Scope
 
