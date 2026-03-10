@@ -121,6 +121,14 @@ void duckdb_scan_executor::set_scan_caching_enabled(bool enabled,
                                                     bool cache_decoded_table,
                                                     bool cache_in_gpu)
 {
+  if (enabled == _caching_enabled && cache_decoded_table == _cache_decoded_table &&
+      cache_in_gpu == _cache_in_gpu) {
+    return;  // No change
+  }
+  {
+    std::lock_guard lock(_cache_mutex);
+    _cache.clear();  // Clear cache when changing caching config
+  }
   _caching_enabled     = enabled;
   _cache_decoded_table = cache_decoded_table;
   _cache_in_gpu        = cache_in_gpu;

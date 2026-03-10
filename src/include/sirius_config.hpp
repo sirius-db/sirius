@@ -88,7 +88,27 @@ struct sirius_config {
 
   [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept { return _cache_in_gpu; }
 
-  void set_cache_in_gpu(bool enabled) noexcept { _cache_in_gpu = enabled; }
+  void set_cache_in_gpu(bool enabled) noexcept
+  {
+    if (enabled) {
+      _cache_in_gpu        = true;
+      _enable_scan_caching = true;
+    } else {
+      _cache_in_gpu = false;
+    }
+  }
+
+  void set_decoded_table_cache(bool enabled) noexcept
+  {
+    if (enabled) {
+      _cache_decoded_table = true;
+      _enable_scan_caching = true;
+    } else {
+      _cache_decoded_table = false;
+    }
+  }
+
+  void set_scan_caching(bool enabled) noexcept { _enable_scan_caching = enabled; }
 
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {

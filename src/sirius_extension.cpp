@@ -692,9 +692,33 @@ static void SetCacheInGpu(ClientContext& context, SetScope scope, Value& paramet
   bool enabled = BooleanValue::Get(parameter);
   auto& cfg    = sirius_ctx->get_config();
   cfg.set_cache_in_gpu(enabled);
-  sirius_ctx->get_pipeline_executor().set_scan_caching_enabled(
-    cfg.is_scan_caching_enabled(), cfg.is_cache_decoded_table_enabled(), enabled);
   SIRIUS_LOG_DEBUG("Updated config cache_in_gpu to {}", enabled);
+}
+
+static void SetCacheDecodedTable(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_decoded_table SET ignored");
+    return;
+  }
+  bool enabled = BooleanValue::Get(parameter);
+  auto& cfg    = sirius_ctx->get_config();
+  cfg.set_decoded_table_cache(enabled);
+  SIRIUS_LOG_DEBUG("Updated config cache_in_gpu to {}", enabled);
+}
+
+static void SetScanCaching(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; scan_caching SET ignored");
+    return;
+  }
+  bool enabled = BooleanValue::Get(parameter);
+  auto& cfg    = sirius_ctx->get_config();
+  cfg.set_scan_caching(enabled);
+  SIRIUS_LOG_DEBUG("Updated config scan_caching to {}", enabled);
 }
 
 static sirius::operator_params* get_operator_params(ClientContext& context)
@@ -859,11 +883,23 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
                             SetConcatBatchBytes);
 
-  config.AddExtensionOption("cache_in_gpu",
+  config.AddExtensionOption("cache_scan_in_gpu",
                             "Whether to cache scan results in GPU memory instead of host memory",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(false),
                             SetCacheInGpu);
+
+  config.AddExtensionOption("cache_scan_decoded_table",
+                            "Whether to cache decoded tables in GPU memory instead of host memory",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(false),
+                            SetCacheDecodedTable);
+
+  config.AddExtensionOption("cache_scan",
+                            "Whether to cache scan results in GPU memory instead of host memory",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(false),
+                            SetScanCaching);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

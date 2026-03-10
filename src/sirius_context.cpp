@@ -89,6 +89,9 @@ void SiriusContext::QueryBegin(ClientContext& context)
   if (config_.is_scan_caching_enabled()) {
     pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
+  pipeline_executor_->set_scan_caching_config(config_.is_scan_caching_enabled(),
+                                              config_.is_cache_decoded_table_enabled(),
+                                              config_.is_cache_in_gpu_enabled());
 
   // Reset task creator state (including scan operator global state map) for the new query
   task_creator_->reset();
@@ -194,9 +197,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   pipeline_executor_->start();
 
   // Configure scan caching based on config
-  pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled(),
-                                               config_.is_cache_decoded_table_enabled(),
-                                               config_.is_cache_in_gpu_enabled());
+  pipeline_executor_->set_scan_caching_config(config_.is_scan_caching_enabled(),
+                                              config_.is_cache_decoded_table_enabled(),
+                                              config_.is_cache_in_gpu_enabled());
 
   is_initialized_ = true;
 }
