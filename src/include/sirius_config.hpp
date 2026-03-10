@@ -88,6 +88,8 @@ struct sirius_config {
 
   [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept { return _cache_in_gpu; }
 
+  void set_cache_in_gpu(bool enabled) noexcept { _cache_in_gpu = enabled; }
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;

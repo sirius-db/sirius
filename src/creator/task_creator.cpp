@@ -152,7 +152,10 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // task creator should never schedule additional scans from downstream.
     // (Parquet scans are fine — they use partition indices that self-limit.)
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      return nullptr;
+      auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
+      if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
+        return nullptr;
+      }
     }
     return get_operator_for_next_task(producer);
   }
@@ -313,7 +316,6 @@ void task_creator::manager_loop()
                                                             std::move(parquet_task_local_state),
                                                             parquet_task_global_state);
             _pipeline_executor->schedule(std::move(parquet_task));
-            // scheduling pipeline task
           }
         } else {
           // need to exhaust input batches until all ports are empty

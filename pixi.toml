@@ -29,7 +29,7 @@ librmm = "*"
 libcurand-dev = "*"
 libconfig = "*"
 libabseil = ">=20260107.0"
-duckdb = ">=1.4.4,<2"
+duckdb = "=1.4.4"
 spdlog = "1.8.*"
 
 [tasks]
