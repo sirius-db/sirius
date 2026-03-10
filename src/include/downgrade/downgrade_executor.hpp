@@ -38,8 +38,6 @@ namespace parallel {
  */
 struct downgrade_repository_info {
   cucascade::shared_data_repository* repo;
-  size_t consumer_operator_id;
-  std::string port_id;
 };
 
 /**

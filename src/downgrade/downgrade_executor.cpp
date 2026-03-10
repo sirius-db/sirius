@@ -92,10 +92,8 @@ void downgrade_executor::monitor_loop()
       if (amount > 0) {
         // Collect all repositories from the manager
         std::vector<downgrade_repository_info> repos;
-        _data_repo_mgr.for_each_repository([&repos](const cucascade::operator_port_key& key,
-                                                    cucascade::shared_data_repository* repo) {
-          repos.push_back({repo, key.operator_id, key.port_id});
-        });
+        _data_repo_mgr.for_each_repository(
+          [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
         if (!repos.empty()) { run_downgrade_pass(std::move(repos), amount); }
       }
     }
@@ -174,8 +172,6 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
     cucascade::shared_data_repository* repo;
     size_t tier_data_size;
     bool is_partitioned;
-    size_t consumer_operator_id;
-    std::string port_id;
   };
 
   std::vector<scored_repo> scored_repos;
@@ -183,11 +179,7 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
     if (!info.repo) continue;
     size_t tier_size = get_repo_data_size_on_tier(info.repo, source_tier);
     if (tier_size == 0) continue;
-    scored_repos.push_back({info.repo,
-                            tier_size,
-                            info.repo->num_partitions() > 1,
-                            info.consumer_operator_id,
-                            info.port_id});
+    scored_repos.push_back({info.repo, tier_size, info.repo->num_partitions() > 1});
   }
 
   std::sort(
@@ -196,13 +188,7 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
       return a.tier_data_size > b.tier_data_size;
     });
 
-  struct downgrade_candidate {
-    std::shared_ptr<cucascade::data_batch> batch;
-    size_t consumer_operator_id;
-    std::string port_id;
-  };
-
-  std::vector<downgrade_candidate> all_candidates;
+  std::vector<std::shared_ptr<cucascade::data_batch>> all_candidates;
   size_t collected_bytes = 0;
 
   // Pass 1: Non-active partitions (last to first)
@@ -215,7 +201,7 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
       auto candidates = collect_candidates_from_partition(
         sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
       for (auto& c : candidates) {
-        all_candidates.push_back({std::move(c), sr.consumer_operator_id, sr.port_id});
+        all_candidates.push_back(std::move(c));
       }
     }
   }
@@ -231,7 +217,7 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
         auto candidates = collect_candidates_from_partition(
           sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
         for (auto& c : candidates) {
-          all_candidates.push_back({std::move(c), sr.consumer_operator_id, sr.port_id});
+          all_candidates.push_back(std::move(c));
         }
       }
     }
@@ -243,18 +229,14 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
     _reservation_manager, _data_repo_mgr, _message_queue);
 
   size_t task_count = 0;
-  for (auto& candidate : all_candidates) {
-    auto data_size =
-      candidate.batch->get_data() ? candidate.batch->get_data()->get_size_in_bytes() : 0;
-    SIRIUS_LOG_TRACE(
-      "[downgrade] scheduling batch {} ({} B) from repo [consumer_op={}, port={}] on tier {}",
-      candidate.batch->get_batch_id(),
-      data_size,
-      candidate.consumer_operator_id,
-      candidate.port_id,
-      static_cast<int>(source_tier));
+  for (auto& batch : all_candidates) {
+    auto data_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
+    SIRIUS_LOG_TRACE("[downgrade] scheduling batch {} ({} B) on tier {}",
+                     batch->get_batch_id(),
+                     data_size,
+                     static_cast<int>(source_tier));
     auto local_state = std::make_unique<downgrade_task_local_state>(
-      duckdb::UUIDv7().GenerateRandomUUID().lower, 0, std::move(candidate.batch));
+      duckdb::UUIDv7().GenerateRandomUUID().lower, 0, std::move(batch));
     auto task = std::make_unique<downgrade_task>(std::move(local_state), global_state);
     schedule_downgrade_task(std::move(task));
     ++task_count;
