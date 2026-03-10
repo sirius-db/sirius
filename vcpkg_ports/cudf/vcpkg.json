@@ -25,10 +25,8 @@
     "zlib",
     "zstd"
   ],
-  "description": "cuDF - GPU DataFrame Library. CUDA C++ library with Apache Arrow compliant data structures",
-  "homepage": "https://github.com/rapidsai/cudf",
   "license": "Apache-2.0",
   "name": "cudf",
   "supports": "linux",
-  "version-string": "26.02.0"
+  "version": "26.02.00"
 }

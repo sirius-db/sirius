@@ -6,7 +6,7 @@ vcpkg_from_github(
   REPO
   rapidsai/rmm
   REF
-  v26.02.00
+  v${VERSION}
   SHA512
   bb66832fc1f9e27b09d3d0058923da4f1b3c34d8898f2247c61b6c79c7c0371349cbb50b83c712f3ccd6cdee9a25e601e527e1827291b57ccf887160196467e6
   HEAD_REF
@@ -18,7 +18,7 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.02.00
+  v${VERSION}
   SHA512
   00d2bb2c005f9e2c4e525af4350c8e8b7d6e67369da9c664c6c3d6080c33d6359b7142a311f3563479f7ac8e1bb0a2a520e8e926719dfeb8e27e49f8cd3e65ca
   HEAD_REF

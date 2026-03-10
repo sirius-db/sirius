@@ -10,8 +10,6 @@
       "name": "vcpkg-cmake-config"
     }
   ],
-  "description": "NUMA support for Linux",
-  "homepage": "https://github.com/numactl/numactl",
   "license": "LGPL-2.1-only",
   "name": "numactl",
   "supports": "linux",

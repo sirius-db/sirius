@@ -44,7 +44,7 @@ if(NOT TARGET nvtx3::nvtx3-cpp)
 endif()
 
 # Set version information
-set(nvtx3_VERSION "3.2.0")
+set(nvtx3_VERSION "${VERSION}")
 set(nvtx3_FOUND TRUE)
 ]])
 
@@ -52,7 +52,7 @@ set(nvtx3_FOUND TRUE)
 file(
   WRITE "${CURRENT_PACKAGES_DIR}/share/nvtx3/nvtx3-config-version.cmake"
   [[
-set(PACKAGE_VERSION "3.2.0")
+set(PACKAGE_VERSION "${VERSION}")
 
 if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)
     set(PACKAGE_VERSION_COMPATIBLE FALSE)

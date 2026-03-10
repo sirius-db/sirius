@@ -6,7 +6,7 @@ vcpkg_from_github(
   REPO
   numactl/numactl
   REF
-  v2.0.19
+  v${VERSION}
   SHA512
   a9aa93bdc6333b620c10ff3573d6ff645ab54beece75e67be8cdddb27d062cc56cea34db342005a171877f85f05eb1d24e43f8466be907ba3b7c8b1f897cd954
   HEAD_REF
@@ -19,6 +19,10 @@ file(COPY "${CMAKE_CURRENT_LIST_DIR}/CMakeLists.txt"
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/config.h.cmake.in"
      DESTINATION "${SOURCE_PATH}")
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/numa.pc.in" DESTINATION "${SOURCE_PATH}")
+
+# Patch project version to match vcpkg.json
+vcpkg_replace_string("${SOURCE_PATH}/CMakeLists.txt" "VERSION 2.0.19"
+                     "VERSION ${VERSION}")
 
 # Disable symbol versioning — .symver directives in static archives cause
 # "undefined version" errors with linkers like mold.

@@ -1,7 +1,5 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "description": "NVIDIA Tools Extension Library (NVTX) - header-only library for annotating GPU applications",
-  "homepage": "https://github.com/NVIDIA/NVTX",
   "license": "Apache-2.0",
   "name": "nvtx3",
   "supports": "linux",

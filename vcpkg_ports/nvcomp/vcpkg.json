@@ -1,6 +1,5 @@
 {
-  "description": "NVIDIA nvCOMP - GPU compression library (proprietary binary distribution)",
-  "homepage": "https://developer.nvidia.com/nvcomp",
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "license": "LicenseRef-Proprietary",
   "name": "nvcomp",
   "supports": "linux",

@@ -11,10 +11,8 @@
     },
     "nvtx3"
   ],
-  "description": "KvikIO - High Performance File IO library for GPUs",
-  "homepage": "https://github.com/rapidsai/kvikio",
   "license": "Apache-2.0",
   "name": "kvikio",
   "supports": "linux",
-  "version-string": "26.02.0"
+  "version": "26.02.00"
 }

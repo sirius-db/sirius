@@ -14,10 +14,8 @@
     "nvtx3",
     "spdlog"
   ],
-  "description": "RAPIDS Memory Manager - GPU memory management library",
-  "homepage": "https://github.com/rapidsai/rmm",
   "license": "Apache-2.0",
   "name": "rmm",
   "supports": "linux",
-  "version-string": "26.02.0"
+  "version": "26.02.00"
 }

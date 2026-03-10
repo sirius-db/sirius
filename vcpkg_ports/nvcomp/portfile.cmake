@@ -1,6 +1,6 @@
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 
-set(NVCOMP_VERSION "5.1.0.21")
+set(NVCOMP_VERSION "${VERSION}")
 set(CUDA_VERSION "12")
 
 if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
@@ -51,7 +51,7 @@ file(
   "
 get_filename_component(PACKAGE_PREFIX_DIR \"\${CMAKE_CURRENT_LIST_DIR}/../../\" ABSOLUTE)
 
-set(nvcomp_VERSION 5.1.0.21)
+set(nvcomp_VERSION ${VERSION})
 set(nvcomp_INCLUDE_DIR \"\${PACKAGE_PREFIX_DIR}/include\")
 set(nvcomp_LIBRARY_DIR \"\${PACKAGE_PREFIX_DIR}/lib\")
 

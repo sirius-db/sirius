@@ -6,7 +6,7 @@ vcpkg_from_github(
   REPO
   rapidsai/kvikio
   REF
-  v26.02.00
+  v${VERSION}
   SHA512
   36405e2cb907b84061789206e9c8dbea95bd0f68dd1762a4e8ca274933018b5c20637fb67be7b6f33109a2666edb2b5359a6b7c9e36bff08d63e5ba8f2a4e57f
   HEAD_REF
@@ -18,7 +18,7 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.02.00
+  v${VERSION}
   SHA512
   00d2bb2c005f9e2c4e525af4350c8e8b7d6e67369da9c664c6c3d6080c33d6359b7142a311f3563479f7ac8e1bb0a2a520e8e926719dfeb8e27e49f8cd3e65ca
   HEAD_REF

@@ -6,7 +6,7 @@ vcpkg_from_github(
   REPO
   rapidsai/cudf
   REF
-  v26.02.00
+  v${VERSION}
   SHA512
   3ec3b2184acce64f87d662bb49571d0bee9101893bfb73073ce13b64c8a4050fbccba35504deaef0726ee647e2c13b375c1c68922f7d5caba2aa18ac159eba68
   HEAD_REF
@@ -18,7 +18,7 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.02.00
+  v${VERSION}
   SHA512
   00d2bb2c005f9e2c4e525af4350c8e8b7d6e67369da9c664c6c3d6080c33d6359b7142a311f3563479f7ac8e1bb0a2a520e8e926719dfeb8e27e49f8cd3e65ca
   HEAD_REF

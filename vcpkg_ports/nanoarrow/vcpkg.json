@@ -10,8 +10,6 @@
       "name": "vcpkg-cmake-config"
     }
   ],
-  "description": "Helpers for Arrow C Data & Arrow C Stream interfaces",
-  "homepage": "https://arrow.apache.org/nanoarrow",
   "license": "Apache-2.0",
   "name": "nanoarrow",
   "supports": "linux",
