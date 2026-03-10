@@ -118,6 +118,8 @@ printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
 echo ".timer on" >> "$TEMP_SQL"
 
 VALID_QUERIES=()
+# Queries where GPU caching must be disabled (too large to fit in GPU memory).
+NO_GPU_CACHE="1 7 9 10 18 19 21"
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
     if [ ! -f "$QUERY_FILE" ]; then
@@ -125,6 +127,15 @@ for q in "${QUERIES[@]}"; do
         continue
     fi
     VALID_QUERIES+=("$q")
+    # Toggle GPU caching per query (SET is SQL but runs before the pair,
+    # so the two iterations remain back-to-back).
+    if [ "$ENGINE" = "sirius" ]; then
+        if echo " $NO_GPU_CACHE " | grep -q " $q "; then
+            echo "SET cache_in_gpu = false;" >> "$TEMP_SQL"
+        else
+            echo "SET cache_in_gpu = true;" >> "$TEMP_SQL"
+        fi
+    fi
     echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
     # Two iterations back-to-back — nothing between them.
     cat "$QUERY_FILE" >> "$TEMP_SQL"
