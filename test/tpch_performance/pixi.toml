@@ -9,6 +9,7 @@ python = ">=3.11"
 cuda-version = "13.*"
 rust = ">=1.89"
 pyarrow = ">=14"
+duckdb-cli = "1.4.4"
 
 [system-requirements]
 cuda = "13"
