@@ -1035,5 +1035,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             stream);
 }
 
+void sirius_physical_hash_join::finalize_operator()
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  _hash_table.reset();
+  _build_table.reset();
+  _built_table_cast_columns.clear();
+  _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+}
+
 }  // namespace op
 }  // namespace sirius
