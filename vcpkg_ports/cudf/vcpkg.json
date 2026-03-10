@@ -1,19 +1,13 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "name": "cudf",
-  "version-string": "26.02.0",
-  "description": "cuDF - GPU DataFrame Library. CUDA C++ library with Apache Arrow compliant data structures",
-  "homepage": "https://github.com/rapidsai/cudf",
-  "license": "Apache-2.0",
-  "supports": "linux",
   "dependencies": [
     {
-      "name": "vcpkg-cmake",
-      "host": true
+      "host": true,
+      "name": "vcpkg-cmake"
     },
     {
-      "name": "vcpkg-cmake-config",
-      "host": true
+      "host": true,
+      "name": "vcpkg-cmake-config"
     },
     "arrow",
     "cccl",
@@ -30,5 +24,11 @@
     "spdlog",
     "zlib",
     "zstd"
-  ]
+  ],
+  "description": "cuDF - GPU DataFrame Library. CUDA C++ library with Apache Arrow compliant data structures",
+  "homepage": "https://github.com/rapidsai/cudf",
+  "license": "Apache-2.0",
+  "name": "cudf",
+  "supports": "linux",
+  "version-string": "26.02.0"
 }

@@ -1,20 +1,20 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "name": "kvikio",
-  "version-string": "26.02.0",
+  "dependencies": [
+    {
+      "host": true,
+      "name": "vcpkg-cmake"
+    },
+    {
+      "host": true,
+      "name": "vcpkg-cmake-config"
+    },
+    "nvtx3"
+  ],
   "description": "KvikIO - High Performance File IO library for GPUs",
   "homepage": "https://github.com/rapidsai/kvikio",
   "license": "Apache-2.0",
+  "name": "kvikio",
   "supports": "linux",
-  "dependencies": [
-    {
-      "name": "vcpkg-cmake",
-      "host": true
-    },
-    {
-      "name": "vcpkg-cmake-config",
-      "host": true
-    },
-    "nvtx3"
-  ]
+  "version-string": "26.02.0"
 }

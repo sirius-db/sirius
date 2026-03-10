@@ -1,5 +1,14 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "builtin-baseline": "ffc071e0c08432c60c9b64f00334c0227667931b",
+  "configuration": {
+    "overlay-ports": [
+      "vcpkg_ports"
+    ],
+    "overlay-triplets": [
+      "vcpkg_triplets"
+    ]
+  },
   "dependencies": [
     "cudf",
     "libconfig",
@@ -7,12 +16,13 @@
     "numactl"
   ],
   "overrides": [
-    { "name": "dlpack", "version": "0.8" },
-    { "name": "flatbuffers", "version": "24.3.25" }
-  ],
-  "configuration": {
-    "overlay-ports": ["vcpkg_ports"],
-    "overlay-triplets": ["vcpkg_triplets"]
-  },
-  "builtin-baseline": "ffc071e0c08432c60c9b64f00334c0227667931b"
+    {
+      "name": "dlpack",
+      "version": "0.8"
+    },
+    {
+      "name": "flatbuffers",
+      "version": "24.3.25"
+    }
+  ]
 }
