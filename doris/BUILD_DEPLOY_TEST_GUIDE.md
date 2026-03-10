@@ -32,9 +32,8 @@ curl -fsSL https://pixi.sh/install.sh | bash
 
 ### Clone and initialize
 ```bash
-git clone --recurse-submodules <repo-url> sirius-doris
+git clone --recurse-submodules --single-branch --branch doris https://github.com/mbrobbel/sirius.git sirius-doris
 cd sirius-doris
-git checkout doris
 ```
 
 If you already cloned without `--recurse-submodules`:
@@ -330,8 +329,8 @@ RUST_LOG=doris_rpc=debug,plan_translator=debug,sirius_ffi=debug,info pixi run -e
 curl -fsSL https://pixi.sh/install.sh | bash
 
 # 2. Clone and init
-git clone --recurse-submodules <repo-url> sirius-doris && cd sirius-doris
-git checkout doris
+git clone --recurse-submodules --single-branch --branch doris https://github.com/mbrobbel/sirius.git sirius-doris
+cd sirius-doris
 
 # 3. Build (all four components)
 pixi run make release              # C++ GPU engine
