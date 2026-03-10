@@ -227,8 +227,12 @@ rm -f "$TEMP_OUTPUT"
 # The combined log is kept in OUTPUT_DIR.
 # ---------------------------------------------------------------------------
 if [ "$ENGINE" = "sirius" ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]} -gt 0 ]; then
-    LOG_FILE="$OUTPUT_DIR/sirius.log"
-    if [ -f "$LOG_FILE" ]; then
+    # spdlog daily sink names files sirius_YYYY-MM-DD.log; find the most recent one.
+    LOG_FILE=""
+    for f in "$OUTPUT_DIR"/sirius*.log; do
+        [ -f "$f" ] && LOG_FILE="$f"
+    done
+    if [ -n "$LOG_FILE" ]; then
         echo ""
         echo "Splitting Sirius log per query..."
         readarray -t QB_LINES < <(grep -n 'QueryBegin: call' "$LOG_FILE" | cut -d: -f1)
