@@ -94,7 +94,6 @@ class downgrade_executor : public itask_executor {
     this->schedule(std::move(downgrade_task));
   }
 
-  void schedule(std::unique_ptr<itask> task) override;
   void worker_loop(int worker_id) override;
   void start() override;
   void stop() override;
@@ -129,8 +128,6 @@ class downgrade_executor : public itask_executor {
                             size_t amount_to_downgrade);
 
  private:
-  downgrade_task* cast_to_downgrade_task(itask* task);
-
   /**
    * @brief Monitor loop that polls the memory space for pressure and triggers downgrades.
    *
