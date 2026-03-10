@@ -34,10 +34,16 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 
 PARQUET_DIR=""
-if [ "${1:-}" = "--parquet-dir" ]; then
-    PARQUET_DIR="$2"
-    shift 2
-fi
+NUM_ITERATIONS=2
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ]; do
+    if [ "$1" = "--parquet-dir" ]; then
+        PARQUET_DIR="$2"
+        shift 2
+    elif [ "$1" = "--iterations" ]; then
+        NUM_ITERATIONS="$2"
+        shift 2
+    fi
+done
 
 if [ $# -lt 3 ]; then
     echo "Usage: $0 [--parquet-dir <path>] <engine> <scale_factor> <query_numbers...>"
@@ -99,7 +105,7 @@ fi
 echo "Running TPC-H queries against SF${SF} parquet data"
 echo "Engine: $ENGINE"
 echo "Parquet dir: $PARQUET_DIR"
-echo "Iterations: 2 (cold + warm)"
+echo "Iterations: $NUM_ITERATIONS (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Queries: ${QUERIES[*]}"
 echo "=========================================="
 
@@ -135,11 +141,11 @@ for q in "${QUERIES[@]}"; do
         fi
     fi
     echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
-    # Two iterations back-to-back — nothing between them.
-    cat "$QUERY_FILE" >> "$TEMP_SQL"
-    printf '\n' >> "$TEMP_SQL"
-    cat "$QUERY_FILE" >> "$TEMP_SQL"
-    printf '\n' >> "$TEMP_SQL"
+    # N iterations back-to-back — nothing between them.
+    for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
+        cat "$QUERY_FILE" >> "$TEMP_SQL"
+        printf '\n' >> "$TEMP_SQL"
+    done
 done
 echo ".print ${END_MARKER}" >> "$TEMP_SQL"
 
@@ -205,10 +211,10 @@ for q in "${VALID_QUERIES[@]}"; do
         cap                                           { print }
     ' "$TEMP_OUTPUT")
 
-    # Save warm-run result only (lines between 1st and 2nd "Run Time" lines).
-    awk '
+    # Save last-iteration result only (lines between the 2nd-to-last and last "Run Time" lines).
+    awk -v n="$NUM_ITERATIONS" '
         /Run Time \(s\):/ { tc++; next }
-        tc == 1           { print }
+        tc == (n - 1)     { print }
     ' <<< "$SECTION" > "$RESULT_FILE"
 
     # Extract per-iteration timings.
@@ -222,8 +228,8 @@ for q in "${VALID_QUERIES[@]}"; do
     } > "$TIMING_FILE"
 
     cold="${TIMES[0]:-N/A}"
-    warm="${TIMES[1]:-N/A}"
-    echo "  Cold: ${cold}s   Warm: ${warm}s"
+    warm="${TIMES[${#TIMES[@]}-1]:-N/A}"
+    echo "  Cold: ${cold}s   Warm: ${warm}s   (${#TIMES[@]} iterations)"
 
     if [ -n "${TIMING_CSV:-}" ] && [ "$cold" != "N/A" ]; then
         echo "${q},${cold}" >> "$TIMING_CSV"

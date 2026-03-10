@@ -246,23 +246,29 @@ while [ $# -gt 1 ]; do
             ENGINES="$2"
             shift 2
             ;;
+        --iterations)
+            NUM_ITERATIONS="$2"
+            shift 2
+            ;;
         *)
             break
             ;;
     esac
 done
 
+NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
+
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] <scale_factor>"
+    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] <scale_factor>"
     echo "       $0 --report <run_dir>"
-    echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius 1000"
+    echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius --iterations 3 1000"
     exit 1
 fi
 
 SF="$1"
 QUERIES=($(seq 1 22))
 
-RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_2iter"
+RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${NUM_ITERATIONS}iter"
 mkdir -p "$RUN_DIR"
 
 # Resolve config: explicit --config / env var / default ~/.sirius/sirius.cfg
@@ -279,7 +285,7 @@ cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
 PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
 
-echo "Scale factor: SF${SF}   Iterations: 2 (cold + warm)"
+echo "Scale factor: SF${SF}   Iterations: ${NUM_ITERATIONS} (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Run directory: $RUN_DIR"
 echo "=========================================="
 echo ""
@@ -412,11 +418,12 @@ for engine in $ENGINES; do
 
     echo ""
     echo "=== Running $engine ==="
-    PARQUET_ARGS=()
+    EXTRA_ARGS=()
     if [ -n "${PARQUET_DIR:-}" ]; then
-        PARQUET_ARGS=(--parquet-dir "$PARQUET_DIR")
+        EXTRA_ARGS+=(--parquet-dir "$PARQUET_DIR")
     fi
-    OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${PARQUET_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
+    EXTRA_ARGS+=(--iterations "$NUM_ITERATIONS")
+    OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log" || true
 done
 
