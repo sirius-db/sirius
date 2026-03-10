@@ -47,7 +47,7 @@ jobs:
       ${{ matrix.environment == 'vcpkg'
         && fromJSON('["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"]')
         || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -61,7 +61,7 @@ jobs:
         with:
           cache: false
           pixi-version: v0.65.0
-          environments: ${{ matrix.environment || 'default' }}
+          environments: ${{ matrix.environment }}
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
@@ -74,6 +74,6 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Build
-        run: pixi run -e ${{ matrix.environment || 'default' }} build ${{ matrix.preset }} 100
+        run: pixi run -e ${{ matrix.environment }} build ${{ matrix.preset }} 100
         env:
           VCPKG_BINARY_SOURCES: ${{ matrix.environment == 'vcpkg' && 'clear;x-gha,readwrite' || '' }}
