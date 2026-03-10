@@ -118,28 +118,55 @@ Common hang causes in Sirius:
 
 ## Segfault Path
 
-When the error is a segmentation fault (SIGSEGV). The process is killed by the OS. This uses binary-search logging, ASan, Compute Sanitizer, and cuda-gdb to pinpoint the crash.
+When the error is a segmentation fault (SIGSEGV) or bus error (SIGBUS). Sirius has a built-in backtrace handler (`src/util/segfault_backtrace_handler.cpp`) that automatically prints a demangled stack trace on crash, so the first step is always to capture that output.
 
-### Phase 1: Immediate-flush log insertion (preferred first method)
+### Phase 1: Capture the automatic backtrace
 
-- Set `SIRIUS_LOG_LEVEL=trace` -- triggers `spdlog::flush_on(trace)` ensuring no log data is lost before crash (see "Why Immediate Flush Matters" below)
-- Create per-run log directory:
-  ```bash
-  export SIRIUS_LOG_LEVEL=trace
-  export SIRIUS_LOG_DIR=build/release/log/run_$(date +%s)
-  mkdir -p $SIRIUS_LOG_DIR
-  ```
-- Insert `SIRIUS_LOG_TRACE("[SIRIUS_DIAG] <location>: reached");` at strategic points
+Sirius installs a signal handler (via `install_segfault_backtrace_handler()`) that catches SIGSEGV/SIGBUS and prints a demangled C++ backtrace to **stderr**. If `SIRIUS_LOG_DIR` is set, it also writes the backtrace to `$SIRIUS_LOG_DIR/segfault_backtrace.txt`.
+
+1. Run the query with trace logging and capture stderr:
+   ```bash
+   export SIRIUS_LOG_LEVEL=trace
+   export SIRIUS_LOG_DIR=build/release/log/run_$(date +%s)
+   mkdir -p $SIRIUS_LOG_DIR
+   build/release/duckdb <db_path> <<'EOF' 2>&1 | tee /tmp/segfault_output.txt
+   CALL gpu_execution('<QUERY>');
+   EOF
+   ```
+
+2. Read the backtrace output. Look for the block between `*** SIGSEGV — backtrace ***` and `*** end backtrace ***`. The output includes:
+   - **Faulting thread ID** -- identifies which thread crashed
+   - **Demangled stack frames** -- shows the full call chain at the crash point
+   - The backtrace is also saved to `$SIRIUS_LOG_DIR/segfault_backtrace.txt`
+
+3. Analyze the backtrace:
+   - Identify the **top frames** in `namespace sirius` -- this is the crash location
+   - Read the source file at that location to understand the crash context
+   - Determine whether the crash is **CPU-side** or **GPU-side** based on the call chain
+   - Cross-reference with known patterns in `common-segfaults.md`
+
+4. Also read the trace log (`$SIRIUS_LOG_DIR/*.log`) to understand the execution path leading up to the crash -- which pipeline, operator, and data was being processed.
+
+**If the backtrace clearly identifies the crash location**, skip to the Crash Analysis Checklist below and then to the Fix Iteration section.
+
+**If the backtrace is insufficient** (e.g., frames are in external libraries without symbols, the crash is in a GPU kernel, or the backtrace points to a generic location like a memory allocator), continue to Phase 1b.
+
+### Phase 1b: Binary-search log insertion (when backtrace is insufficient)
+
+When the automatic backtrace doesn't pinpoint the root cause:
+
+- Insert `SIRIUS_LOG_TRACE("[SIRIUS_DIAG] <location>: reached");` at strategic points around the area identified by the backtrace
 - **Binary search strategy:**
   1. Insert log statements at function entry points across the suspected code path
   2. Rebuild, run -- see which log entry was the last to appear before crash
   3. Insert more log statements within the identified function
   4. Rebuild, run -- narrow down further
   5. Repeat until the exact crashing line is identified
+- `SIRIUS_LOG_LEVEL=trace` triggers `spdlog::flush_on(trace)` ensuring no log data is lost before crash (see "Why Immediate Flush Matters" below)
 
-After Phase 1, use the log analysis to determine whether the crash is likely **CPU-side** or **GPU-side**, then branch:
-- **CPU-side crash** (last log entry is in CPU orchestration code, pipeline scheduling, memory management, etc.) -> **Phase 2a: ASan**
-- **GPU-side crash** (last log entry is before/during a CUDA kernel launch, cuDF call, or GPU memory operation) -> **Phase 2b: Compute Sanitizer**
+After Phase 1/1b, use the analysis to determine whether the crash is likely **CPU-side** or **GPU-side**, then branch:
+- **CPU-side crash** (backtrace/last log entry is in CPU orchestration code, pipeline scheduling, memory management, etc.) -> **Phase 2a: ASan**
+- **GPU-side crash** (backtrace/last log entry is before/during a CUDA kernel launch, cuDF call, or GPU memory operation) -> **Phase 2b: Compute Sanitizer**
 - **Unclear** -> Try Phase 2a first (faster), then Phase 2b if ASan finds nothing
 
 ### Phase 2a: AddressSanitizer -- for CPU-side crashes (ask user before proceeding)
