@@ -65,13 +65,12 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      - name: Cache vcpkg binary packages
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         if: matrix.environment == 'vcpkg'
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
-          restore-keys: vcpkg-
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build
         run: pixi run -e ${{ matrix.environment }} build ${{ matrix.preset }} 100
