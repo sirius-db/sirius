@@ -30,6 +30,7 @@ spdlog = "1.8.*"
 clang-tools = ">=21.1.8,<22"
 
 [tasks]
+substrait-build = { cmd = "make -C substrait release", description = "Build DuckDB substrait extension" }
 
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
 [feature.cuda13.system-requirements]
@@ -61,24 +62,43 @@ clangdev = "*"
 
 [feature.doris.tasks]
 doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris workspace" }
-doris-build = { cmd = "cargo build --release", cwd = "doris", description = "Build doris workspace" }
+nixl-build = { cmd = """bash -c 'set -e
+  NIXL_SRC=$PIXI_PROJECT_ROOT/doris/thirdparty/nixl
+
+  if [ -f "$CONDA_PREFIX/lib/libnixl.so" ]; then
+    echo "nixl already installed in conda prefix"
+    exit 0
+  fi
+
+  echo "==> Building nixl from submodule..."
+  cd "$NIXL_SRC"
+
+  # Patch out Python bindings (no pybind11 needed)
+  sed -i "/subdir..python/s/^/# /" src/bindings/meson.build 2>/dev/null || true
+
+  echo "==> Building nixl with meson (UCX plugin only)..."
+  rm -rf builddir
+  meson setup builddir --prefix="$CONDA_PREFIX" --buildtype=release \
+    -Ducx_path=$CONDA_PREFIX \
+    -Dcudapath_inc=$CONDA_PREFIX/targets/x86_64-linux/include \
+    -Dcudapath_lib=$CONDA_PREFIX/targets/x86_64-linux/lib \
+    -Dcudapath_stub=$CONDA_PREFIX/targets/x86_64-linux/lib/stubs \
+    -Drust=false \
+    -Denable_plugins=UCX \
+    -Dbuild_tests=false \
+    -Dbuild_examples=false
+  cd builddir
+  ninja -j$(nproc)
+  ninja install
+
+  echo "==> nixl installed to $CONDA_PREFIX"
+  ls "$CONDA_PREFIX/lib/"libnixl* 2>/dev/null || true
+'""", description = "Build nixl C++ library from submodule into conda prefix" }
+doris-build = { cmd = "NIXL_PREFIX=$CONDA_PREFIX NIXL_NO_STUBS_FALLBACK=1 cargo build --release", cwd = "doris", depends-on = ["nixl-build"], description = "Build doris workspace (with nixl)" }
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
-doris-build-nixl = { cmd = "NIXL_PREFIX=$PIXI_PROJECT_ROOT/doris/thirdparty/nixl-install NIXL_NO_STUBS_FALLBACK=1 cargo build --release", cwd = "doris", description = "Build doris workspace with nixl GPU exchange" }
 # Start Sirius GPU BEs with offset ports (for running alongside regular Doris BE)
 sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --gpu-cache-size 2GB --gpu-processing-size 2GB --fe 127.0.0.1:9030", description = "Run Sirius GPU BE 1 (ports 19xxx/18xxx)" }
 sirius-be-2 = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 29050 --be-port 29060 --brpc-port 28060 --http-port 28040 --arrow-flight-port 28071 --gpu-cache-size 2GB --gpu-processing-size 2GB --advertise-host 127.0.0.3 --fe 127.0.0.1:9030", description = "Run Sirius GPU BE 2 (ports 29xxx/28xxx)" }
-
-# Host cluster: Doris FE + N Sirius GPU BEs (non-Docker)
-cluster-start = { cmd = "doris/scripts/start-cluster.sh 2", description = "Start fresh cluster: kill old, start FE + 2 Sirius BEs" }
-cluster-start-1 = { cmd = "doris/scripts/start-cluster.sh 1", description = "Start fresh cluster: kill old, start FE + 1 Sirius BE" }
-cluster-stop = { cmd = "doris/scripts/start-cluster.sh --stop", description = "Stop FE + all Sirius BEs" }
-cluster-status = { cmd = "doris/scripts/start-cluster.sh --status", description = "Show FE + BE status" }
-
-# Docker: Doris FE + regular BE + Sirius GPU BE for exchange testing
-doris-docker-up = { cmd = "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock docker compose -f doris/docker/docker-compose.yml -p sirius-doris up -d", description = "Start Doris FE + BE + Sirius BE in Docker" }
-doris-docker-down = { cmd = "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock docker compose -f doris/docker/docker-compose.yml -p sirius-doris down -v", description = "Stop Doris Docker cluster and remove volumes" }
-doris-docker-logs = { cmd = "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock docker compose -f doris/docker/docker-compose.yml -p sirius-doris logs -f", description = "Tail Doris Docker cluster logs" }
-doris-docker-add-sirius = { cmd = "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock docker exec doris-fe mysql -h 172.20.80.2 -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND '172.20.80.4:19050'\"", description = "Register Sirius GPU BE with Doris FE" }
 
 # Doris FE feature: build & run Doris Frontend from source for testing
 [feature.doris-fe.dependencies]
@@ -275,69 +295,10 @@ pkg-config = "*"
 clangdev = "*"
 
 [feature.nixl.tasks]
-nixl-build = { cmd = """bash -c 'set -e
-  NIXL_SRC=doris/thirdparty/nixl
-
-  if [ -f "$CONDA_PREFIX/lib/libnixl.so" ]; then
-    echo "nixl already installed in conda prefix"
-    exit 0
-  fi
-
-  echo "==> Cloning nixl..."
-  if [ ! -d "$NIXL_SRC" ]; then
-    git clone --depth 1 https://github.com/ai-dynamo/nixl.git "$NIXL_SRC"
-  fi
-
-  cd "$NIXL_SRC"
-
-  echo "==> Patching out Python bindings (no pybind11 needed)..."
-  sed -i "/subdir..python/s/^/# /" src/bindings/meson.build
-
-  echo "==> Patching UCX GPU Device API version check (1.21 -> 1.20)..."
-  sed -i "s/UCP_VERSION(1, 21)/UCP_VERSION(1, 20)/" meson.build
-
-  echo "==> Creating stub gdaki.cuh (UCX conda package missing IB CUDA header)..."
-  mkdir -p "$CONDA_PREFIX/include/uct/ib/mlx5/gdaki"
-  cat > "$CONDA_PREFIX/include/uct/ib/mlx5/gdaki/gdaki.cuh" << STUB
-#ifndef UCT_IB_MLX5_GDAKI_CUH
-#define UCT_IB_MLX5_GDAKI_CUH
-#include <uct/api/uct_def.h>
-#include <uct/api/device/uct_device_types.h>
-#include <ucs/sys/device_code.h>
-#include <ucs/type/status.h>
-typedef struct { char _pad; } uct_rc_gda_completion_t;
-template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_put_single(uct_device_ep_h, const uct_device_mem_element_t *, const void *, uint64_t, size_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
-template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_put_multi(uct_device_ep_h, const uct_device_mem_element_t *, unsigned, void *const *, const uint64_t *, const size_t *, uint64_t, uint64_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
-template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_put_multi_partial(uct_device_ep_h, const uct_device_mem_element_t *, const unsigned *, unsigned, void *const *, const uint64_t *, const size_t *, const size_t *, const size_t *, unsigned, uint64_t, uint64_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
-template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_atomic_add(uct_device_ep_h, const uct_device_mem_element_t *, uint64_t, uint64_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
-template<ucs_device_level_t level> UCS_F_DEVICE void uct_rc_mlx5_gda_ep_progress(uct_device_ep_h) {}
-template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_check_completion(uct_device_ep_h, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
-#endif
-STUB
-
-  echo "==> Building nixl with meson (GPU Device API enabled)..."
-  rm -rf builddir
-  meson setup builddir --prefix="$CONDA_PREFIX" --buildtype=release \
-    -Ducx_path=$CONDA_PREFIX \
-    -Dcudapath_inc=$CONDA_PREFIX/targets/x86_64-linux/include \
-    -Dcudapath_lib=$CONDA_PREFIX/targets/x86_64-linux/lib \
-    -Dcudapath_stub=$CONDA_PREFIX/targets/x86_64-linux/lib/stubs \
-    -Drust=false \
-    -Denable_plugins=UCX \
-    -Dbuild_tests=false \
-    -Dbuild_examples=false
-  cd builddir
-  ninja -j$(nproc)
-  ninja install
-
-  echo "==> nixl installed to $CONDA_PREFIX"
-  ls -la "$CONDA_PREFIX/lib/libnixl*"
-'""", description = "Build nixl C++ library from source into conda prefix" }
 
 [environments]
 default = ["cuda13"]
 cuda12 = ["cuda12"]
-doris = ["cuda13", "doris"]
-doris-nixl = ["cuda13", "doris", "nixl"]
+doris = ["cuda13", "doris", "nixl"]
 doris-fe = ["doris-fe"]
 doris-be = ["doris-be"]
