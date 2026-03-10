@@ -150,7 +150,10 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo "--- Filesystem benchmark (read-only, input location) ---"
     if [ -d "$PARQUET_DIR" ]; then
         FIRST_PARQUET=""
-        for f in "$PARQUET_DIR"/lineitem.parquet "$PARQUET_DIR"/lineitem_*.parquet "$PARQUET_DIR"/*.parquet; do
+        for f in "$PARQUET_DIR"/lineitem.parquet \
+                 "$PARQUET_DIR"/lineitem_*.parquet \
+                 "$PARQUET_DIR"/lineitem/*.parquet \
+                 "$PARQUET_DIR"/*.parquet; do
             [ -f "$f" ] && { FIRST_PARQUET="$f"; break; }
         done
         if [ -n "$FIRST_PARQUET" ]; then
