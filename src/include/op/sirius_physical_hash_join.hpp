@@ -26,6 +26,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "sirius_config.hpp"
 #include "utils.hpp"
 
 #include <cstddef>
@@ -57,22 +58,26 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   };
 
  public:
-  sirius_physical_hash_join(duckdb::LogicalOperator& op,
-                            duckdb::unique_ptr<sirius_physical_operator> left,
-                            duckdb::unique_ptr<sirius_physical_operator> right,
-                            duckdb::vector<duckdb::JoinCondition> cond,
-                            duckdb::JoinType join_type,
-                            const duckdb::vector<duckdb::idx_t>& left_projection_map,
-                            const duckdb::vector<duckdb::idx_t>& right_projection_map,
-                            duckdb::vector<duckdb::LogicalType> delim_types,
-                            duckdb::idx_t estimated_cardinality,
-                            duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info);
-  sirius_physical_hash_join(duckdb::LogicalOperator& op,
-                            duckdb::unique_ptr<sirius_physical_operator> left,
-                            duckdb::unique_ptr<sirius_physical_operator> right,
-                            duckdb::vector<duckdb::JoinCondition> cond,
-                            duckdb::JoinType join_type,
-                            duckdb::idx_t estimated_cardinality);
+  sirius_physical_hash_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius_physical_operator> right,
+    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::JoinType join_type,
+    const duckdb::vector<duckdb::idx_t>& left_projection_map,
+    const duckdb::vector<duckdb::idx_t>& right_projection_map,
+    duckdb::vector<duckdb::LogicalType> delim_types,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+  sirius_physical_hash_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius_physical_operator> right,
+    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::JoinType join_type,
+    duckdb::idx_t estimated_cardinality,
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
   //! Scans where we should push generated filters into (if any)
@@ -153,6 +158,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::STANDARD;
   BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
+  uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
   std::unique_ptr<cudf::table>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results

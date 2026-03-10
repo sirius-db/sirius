@@ -155,13 +155,15 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   const duckdb::vector<duckdb::idx_t>& right_projection_map,
   duckdb::vector<duckdb::LogicalType> delim_types,
   duckdb::idx_t estimated_cardinality,
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
+  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
+  uint64_t max_build_hash_table_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
     conditions(std::move(cond)),
     join_type(join_type),
     delim_types(std::move(delim_types))
 {
+  _max_build_hash_table_bytes = max_build_hash_table_bytes;
   reorder_join_conditions(conditions);
 
   filter_pushdown = std::move(pushdown_info_p);
@@ -282,6 +284,28 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
 };
 
+sirius_physical_hash_join::sirius_physical_hash_join(
+  duckdb::LogicalOperator& op,
+  duckdb::unique_ptr<sirius_physical_operator> left,
+  duckdb::unique_ptr<sirius_physical_operator> right,
+  duckdb::vector<duckdb::JoinCondition> cond,
+  duckdb::JoinType join_type,
+  duckdb::idx_t estimated_cardinality,
+  uint64_t max_build_hash_table_bytes)
+  : sirius_physical_hash_join(op,
+                              std::move(left),
+                              std::move(right),
+                              std::move(cond),
+                              join_type,
+                              {},
+                              {},
+                              {},
+                              estimated_cardinality,
+                              nullptr,
+                              max_build_hash_table_bytes)
+{
+}
+
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
@@ -347,13 +371,10 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
-// WSM TODO: make this a config variable
-constexpr uint64_t MAX_BUILD_HASH_TABLE_BYTES = 512ULL * 1024ULL * 1024ULL;  // 512MB
-
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
-  if (num_partitions == 1 && build_side_bytes < MAX_BUILD_HASH_TABLE_BYTES &&
+  if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
       join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::RIGHT_SEMI &&
       join_type != duckdb::JoinType::ANTI && join_type != duckdb::JoinType::RIGHT_ANTI &&
       join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&
