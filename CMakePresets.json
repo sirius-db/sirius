@@ -133,7 +133,6 @@
     {
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
-        "CMAKE_VERBOSE_MAKEFILE": "ON",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
         "VCPKG_BUILD": "ON",
         "VCPKG_INSTALL_OPTIONS": "--clean-buildtrees-after-build",
