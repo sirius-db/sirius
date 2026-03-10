@@ -49,9 +49,7 @@ impl SiriusEngine {
         let conn = duckdb::Connection::open_in_memory_with_flags(config)
             .map_err(|e| EngineError::InitFailed(e.to_string()))?;
 
-        // Try to load locally-built extensions from the Sirius build output.
-        // These are optional: SQL path works without them; Substrait/GPU
-        // paths will fail at call time if the extensions are missing.
+        // Load required DuckDB extensions (substrait + sirius GPU engine).
         //
         // Extension lookup order:
         //   1. SIRIUS_EXTENSION_DIR env var (for Docker/deployment)
@@ -74,14 +72,26 @@ impl SiriusEngine {
                 ),
             )
         };
-        let mut has_substrait = false;
+        // Load extensions — tolerate "already loaded" when the extension is
+        // preloaded by DuckDB's autoload or a previous connection in the same process.
+        // Do NOT tolerate "already loaded in another process" — that means a lock file
+        // conflict and the extension did not actually load.
         if let Err(e) = conn.execute_batch(&format!("LOAD '{}'", substrait_ext)) {
-            eprintln!("warning: substrait extension not loaded: {e}");
-        } else {
-            has_substrait = true;
+            let msg = e.to_string();
+            if msg.contains("already loaded") && !msg.contains("another process") {
+                eprintln!("substrait extension already loaded, continuing");
+            } else {
+                return Err(EngineError::InitFailed(format!("substrait extension: {e}")));
+            }
         }
+        let has_substrait = true;
         if let Err(e) = conn.execute_batch(&format!("LOAD '{}'", sirius_ext)) {
-            eprintln!("warning: sirius extension not loaded: {e}");
+            let msg = e.to_string();
+            if msg.contains("already loaded") && !msg.contains("another process") {
+                eprintln!("sirius extension already loaded, continuing");
+            } else {
+                return Err(EngineError::InitFailed(format!("sirius extension: {e}")));
+            }
         }
 
         // Register an "if" macro so DuckDB can handle Substrait IfThen expressions.
@@ -552,6 +562,31 @@ impl SiriusEngine {
         }
 
         Ok(result)
+    }
+
+    /// Get the RMM processing pool base address and size.
+    ///
+    /// Returns `(base_addr, size, device_id)` for the GPU processing pool.
+    /// Used by nixl to register the pool region for GPU-direct transfers.
+    pub fn get_pool_info(&self) -> Result<Option<(usize, usize, u32)>, EngineError> {
+        let mut stmt = self.conn
+            .prepare("SELECT pool_base, pool_size, device_id FROM sirius_get_pool_info()")
+            .map_err(|e| EngineError::ExecFailed(format!("sirius_get_pool_info: {e}")))?;
+        let batches: Vec<_> = stmt.query_arrow([])
+            .map_err(|e| EngineError::ExecFailed(format!("sirius_get_pool_info: {e}")))?
+            .collect();
+        if batches.is_empty() || batches[0].num_rows() == 0 {
+            return Ok(None);
+        }
+        let batch = &batches[0];
+        use arrow::array::{Int32Array, Int64Array};
+        let base = batch.column(0).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| EngineError::ExecFailed("pool_base not i64".into()))?.value(0) as usize;
+        let size = batch.column(1).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| EngineError::ExecFailed("pool_size not i64".into()))?.value(0) as usize;
+        let device = batch.column(2).as_any().downcast_ref::<Int32Array>()
+            .ok_or_else(|| EngineError::ExecFailed("device_id not i32".into()))?.value(0) as u32;
+        Ok(Some((base, size, device)))
     }
 
     /// Tell Sirius to retain GPU result buffers past query cleanup.

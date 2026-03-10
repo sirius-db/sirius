@@ -73,27 +73,21 @@ fn main() {
         start_time_ms,
     });
 
-    let engine = match SiriusEngine::new() {
-        Ok(e) => {
-            info!("DuckDB engine initialized");
-            // Try to initialize GPU buffers for Sirius GPU execution.
-            match e.init_gpu_buffers(&config.gpu_cache_size, &config.gpu_processing_size) {
-                Ok(()) => info!(cache = %config.gpu_cache_size, processing = %config.gpu_processing_size, "GPU buffers initialized"),
-                Err(err) => warn!(error = %err, "GPU buffer init failed, gpu_execution will fall back to DuckDB CPU"),
-            }
-            if config.no_cpu_fallback {
-                match e.set_no_cpu_fallback() {
-                    Ok(()) => info!("CPU fallback disabled (enable_fallback_check = true)"),
-                    Err(err) => warn!(error = %err, "failed to set enable_fallback_check"),
-                }
-            }
-            Some(Arc::new(Mutex::new(e)))
+    let engine = SiriusEngine::new()
+        .expect("FATAL: engine init failed (substrait + sirius extensions must be loadable)");
+    info!("DuckDB engine initialized");
+    // Initialize GPU buffers for Sirius GPU execution.
+    match engine.init_gpu_buffers(&config.gpu_cache_size, &config.gpu_processing_size) {
+        Ok(()) => info!(cache = %config.gpu_cache_size, processing = %config.gpu_processing_size, "GPU buffers initialized"),
+        Err(err) => warn!(error = %err, "GPU buffer init failed, gpu_execution will fall back to DuckDB CPU"),
+    }
+    if config.no_cpu_fallback {
+        match engine.set_no_cpu_fallback() {
+            Ok(()) => info!("CPU fallback disabled (enable_fallback_check = true)"),
+            Err(err) => warn!(error = %err, "failed to set enable_fallback_check"),
         }
-        Err(e) => {
-            warn!(error = %e, "engine init failed, queries will error");
-            None
-        }
-    };
+    }
+    let engine = Some(Arc::new(Mutex::new(engine)));
 
     let result_store = ResultStore::new();
 
@@ -170,26 +164,27 @@ async fn run(
     exchange_buffer: doris_rpc::exchange_buffer::ExchangeBuffer,
     nixl_agent: Option<std::sync::Arc<doris_rpc::nixl_exchange::NixlExchange>>,
 ) {
+    // Resolve advertise host: explicit flag, or system hostname → IPv4.
+    let advertise_host = match &config.advertise_host {
+        Some(h) => h.clone(),
+        None => {
+            let hostname = std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            // Try to resolve hostname to an IPv4 address
+            tokio::net::lookup_host(format!("{}:0", hostname))
+                .await
+                .ok()
+                .and_then(|mut addrs| addrs.find(|a| a.is_ipv4()))
+                .map(|a| a.ip().to_string())
+                .unwrap_or(hostname)
+        }
+    };
+
     if let Some(fe_addr) = &config.fe {
-        // Default advertise host: resolve system hostname to an IP.
-        let advertise_host = match &config.advertise_host {
-            Some(h) => h.clone(),
-            None => {
-                let hostname = std::process::Command::new("hostname")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
-                // Try to resolve hostname to an IPv4 address
-                tokio::net::lookup_host(format!("{}:0", hostname))
-                    .await
-                    .ok()
-                    .and_then(|mut addrs| addrs.find(|a| a.is_ipv4()))
-                    .map(|a| a.ip().to_string())
-                    .unwrap_or(hostname)
-            }
-        };
         if let Err(e) = register_with_fe(fe_addr, config.heartbeat_port, &advertise_host).await {
             warn!(error = %e, "FE registration failed (BE may already be registered)");
         }
@@ -203,8 +198,15 @@ async fn run(
         }
     });
 
+    // Build the local bRPC address for self-transfer detection in exchange sender.
+    let local_brpc_addr = format!(
+        "{}:{}",
+        advertise_host,
+        config.brpc_port,
+    );
+
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, config.nixl_only, nixl_agent).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, config.nixl_only, nixl_agent, local_brpc_addr).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }
