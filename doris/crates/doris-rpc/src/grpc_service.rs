@@ -829,20 +829,15 @@ fn merge_fragment_plans(
 /// Execution plan: either Substrait bytes or SQL string.
 enum ExecPlan {
     /// Substrait plan eligible for GPU acceleration (has real data tables).
-    /// `sql_fallback`: when GPU Substrait fails, use this SQL instead of from_substrait.
-    /// DuckDB's from_substrait has a column ordering bug for complex joins (optimizer
-    /// reorders join sides but Root.names are applied positionally, causing mismatches).
     Substrait {
         bytes: Vec<u8>,
         sort_limit_sql: Option<String>,
-        sql_fallback: Option<String>,
     },
     /// Substrait plan that should only run on CPU (e.g. VirtualTable-only plans).
     SubstraitCpuOnly {
         bytes: Vec<u8>,
         sort_limit_sql: Option<String>,
     },
-    Sql(String),
     /// SQL that should only run on CPU (e.g. exchange fragments reading pre-computed data).
     /// Skips gpu_execution() which can cause INTERNAL errors on non-GPU tables.
     SqlCpuOnly(String),
@@ -853,15 +848,14 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
     // When force_cpu is set, downgrade GPU plans to CPU-only equivalents.
     if force_cpu {
         let cpu_plan = match plan {
-            ExecPlan::Substrait { bytes, sort_limit_sql, .. } =>
+            ExecPlan::Substrait { bytes, sort_limit_sql } =>
                 ExecPlan::SubstraitCpuOnly { bytes, sort_limit_sql },
-            ExecPlan::Sql(sql) => ExecPlan::SqlCpuOnly(sql),
             other => other, // already CPU-only
         };
         return execute_plan(engine, cpu_plan, no_cpu_fallback, false);
     }
     match plan {
-        ExecPlan::Substrait { bytes, sort_limit_sql, sql_fallback } => {
+        ExecPlan::Substrait { bytes, sort_limit_sql } => {
             // Strip SortRel/FetchRel from Substrait before GPU execution — the Sirius
             // GPU planner doesn't handle ORDER BY/LIMIT operators. The sort/limit SQL
             // wrapper is applied outside via `execute_substrait`.
@@ -883,25 +877,8 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
                     Err(format!("GPU execution failed: {e}"))
                 }
                 Err(e) => {
-                    // Prefer SQL fallback over from_substrait: DuckDB's from_substrait
-                    // has a column ordering bug where Root.names are applied positionally
-                    // but the optimizer reorders join columns, causing data-name mismatches.
-                    if let Some(sql) = sql_fallback {
-                        tracing::warn!(error = %e, "gpu_execution_substrait failed, falling back to SQL");
-                        match engine.execute_gpu(&sql) {
-                            Ok(ipc) => {
-                                tracing::info!("executed via gpu_execution (SQL fallback)");
-                                Ok(ipc)
-                            }
-                            Err(gpu_e) => {
-                                tracing::warn!(error = %gpu_e, "gpu_execution also failed, falling back to direct SQL");
-                                engine.execute_sql(&sql).map_err(|e| e.to_string())
-                            }
-                        }
-                    } else {
-                        tracing::warn!(error = %e, "gpu_execution_substrait failed, falling back to CPU from_substrait");
-                        from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
-                    }
+                    tracing::warn!(error = %e, "gpu_execution_substrait failed, falling back to CPU from_substrait");
+                    from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
                 }
             }
         }
@@ -909,20 +886,6 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
             tracing::info!("executing via CPU from_substrait (no data tables, GPU skipped)");
             from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
         }
-        ExecPlan::Sql(sql) => match engine.execute_gpu(&sql) {
-            Ok(ipc) => {
-                tracing::info!("executed via gpu_execution");
-                Ok(ipc)
-            }
-            Err(e) if no_cpu_fallback => {
-                tracing::error!(error = %e, "gpu_execution failed (no CPU fallback)");
-                Err(format!("GPU execution failed: {e}"))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "gpu_execution failed, falling back to direct SQL");
-                engine.execute_sql(&sql).map_err(|e| e.to_string())
-            }
-        },
         ExecPlan::SqlCpuOnly(sql) => {
             tracing::info!(sql = %sql, "executing via CPU SQL (GPU skipped)");
             engine.execute_sql(&sql).map_err(|e| e.to_string())
@@ -1417,6 +1380,39 @@ fn generate_exchange_agg_merge_sql(
     Some(sql)
 }
 
+/// Generate SQL for UNION_NODE exchange fragments.
+///
+/// DuckDB's `from_substrait` is broken for `SetRel` (UNION): it mishandles the
+/// union operator, producing wrong results or errors. Since UNION_NODE in exchange
+/// fragments just concatenates exchange tables, we bypass substrait and generate
+/// the trivial SQL directly: `SELECT * FROM __EXCHANGE_TABLE_1 UNION ALL SELECT * FROM __EXCHANGE_TABLE_2 ...`
+///
+/// Non-union exchange patterns (plain EXCHANGE_NODE, SORT over exchange, etc.)
+/// go through the normal substrait path.
+fn generate_exchange_union_sql(params: &TPipelineFragmentParams) -> Option<String> {
+    let plan = params.fragment.as_ref()?.plan.as_ref()?;
+    let nodes = &plan.nodes;
+    let root = nodes.first()?;
+    if root.node_type != TPlanNodeType::UNION_NODE {
+        return None;
+    }
+    let num_children = root.num_children as usize;
+    let mut parts = Vec::new();
+    let mut idx = 1; // skip root node
+    for _ in 0..num_children {
+        if idx < nodes.len() {
+            let child = &nodes[idx];
+            parts.push(format!("SELECT * FROM __EXCHANGE_TABLE_{}", child.node_id));
+            idx += 1;
+        }
+    }
+    if !parts.is_empty() {
+        Some(parts.join(" UNION ALL "))
+    } else {
+        None
+    }
+}
+
 /// Extract exchange send destinations from fragment params.
 ///
 /// Returns `(dest_node_id, destinations)` if this fragment's output should be
@@ -1827,54 +1823,27 @@ impl PBackendService for PBackendServiceHandler {
                     // Translate and execute.
                     // Priority order:
                     // 1. AGG(finalize) over exchange: generate merge SQL (SUM/MIN/MAX)
-                    // 2. UNION_NODE / pure EXCHANGE root: SQL path (DuckDB SetRel broken)
+                    // 2. UNION_NODE / pure EXCHANGE root: trivial exchange table SQL (DuckDB SetRel broken for substrait)
                     // 3. Other (SORT/JOIN over exchange): Substrait path
                     let (exec_plan, output_names) =
                         if let Some(merge_sql) = generate_exchange_agg_merge_sql(&params, &table_schemas) {
                             (ExecPlan::SqlCpuOnly(merge_sql), None)
+                        } else if let Some(read_sql) = generate_exchange_union_sql(&params) {
+                            info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
+                            (ExecPlan::SqlCpuOnly(read_sql), None)
                         } else {
-                            let root_is_union = params.fragment.as_ref()
-                                .and_then(|f| f.plan.as_ref())
-                                .and_then(|p| p.nodes.first())
-                                .map(|n| n.node_type == TPlanNodeType::UNION_NODE
-                                    || (n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0))
-                                .unwrap_or(false);
-                            let use_sql = root_is_union;
-                            let has_substrait = !use_sql && engine.lock().unwrap().has_substrait();
-                            if has_substrait {
-                                match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
-                                    Ok(plan) => {
-                                        let exec = if plan.force_cpu_substrait {
-                                            ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
-                                        } else {
-                                            let sql_fb = plan_translator::translate_fragment_to_sql(&params).ok();
-                                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql, sql_fallback: sql_fb }
-                                        };
-                                        (exec, Some(plan.output_names))
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "Substrait translation failed for exchange fragment");
-                                        match plan_translator::translate_fragment_to_sql(&params) {
-                                            Ok(sql) => (ExecPlan::Sql(sql), None),
-                                            Err(e2) => {
-                                                warn!(error = %e2, "SQL translation also failed");
-                                                return;
-                                            }
-                                        }
-                                    }
+                            match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
+                                Ok(plan) => {
+                                    let exec = if plan.force_cpu_substrait {
+                                        ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
+                                    } else {
+                                        ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
+                                    };
+                                    (exec, Some(plan.output_names))
                                 }
-                            } else {
-                                match plan_translator::translate_fragment_to_sql(&params) {
-                                    Ok(sql) => {
-                                        if use_sql {
-                                            info!(sql = %sql, "exchange fragment using CPU-only SQL path");
-                                        }
-                                        (ExecPlan::SqlCpuOnly(sql), None)
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "SQL translation failed for exchange fragment");
-                                        return;
-                                    }
+                                Err(e) => {
+                                    warn!(error = %e, "Substrait translation failed for exchange fragment");
+                                    return;
                                 }
                             }
                         };
@@ -1918,7 +1887,7 @@ impl PBackendService for PBackendServiceHandler {
                             if should_retain_exch {
                                 let pool_registered = nixl_agent_for_exch_blocking
                                     .as_ref()
-                                    .map(|agent| loc.try_register_rmm_pool(agent))
+                                    .map(|agent| loc.try_register_rmm_pool(agent, &engine))
                                     .unwrap_or(false);
                                 if !pool_registered {
                                     loc.copy_gpu_buffers_to_cuda_alloc();
@@ -2067,69 +2036,29 @@ impl PBackendService for PBackendServiceHandler {
                 }
             }
 
-            // Try Substrait translation first, fall back to SQL.
+            // Translate to Substrait plan.
             // Constant-only queries (no data tables) use CPU-only Substrait to avoid
             // GPU engine bugs with VirtualTable plans.
-            // If substrait extension isn't loaded, skip directly to SQL.
             let has_data_tables = !file_scan_infos.is_empty() || !table_schemas.is_empty();
-            let has_substrait = self.engine.as_ref()
-                .map(|e| e.lock().unwrap().has_substrait()).unwrap_or(false);
-            let (exec_plan, output_names, output_indices) = if has_substrait {
+            let (exec_plan, output_names, output_indices) =
                 match plan_translator::translate_fragment(params, &table_schemas, &file_scan_map) {
                     Ok(plan) => {
                         info!(bytes = plan.substrait_bytes.len(), has_data_tables, force_cpu = plan.force_cpu_substrait, "translated to Substrait");
                         let exec = if plan.force_cpu_substrait || !has_data_tables {
                             ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
                         } else {
-                            // Generate SQL fallback for CPU execution.
-                            // DuckDB's from_substrait has a column ordering bug for complex joins
-                            // (optimizer reorders join sides but Root.names are applied positionally).
-                            let sql_fallback = match plan_translator::translate_fragment_to_sql(params) {
-                                Ok(sql) => {
-                                    info!(sql_len = sql.len(), "generated SQL fallback for CPU path");
-                                    Some(sql)
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "SQL fallback generation failed, will use from_substrait");
-                                    None
-                                }
-                            };
-                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql, sql_fallback }
+                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
                         };
                         (exec, Some(plan.output_names), plan.output_column_indices)
                     }
                     Err(e) => {
-                        warn!(error = %e, "Substrait translation failed, trying SQL fallback");
-                        match plan_translator::translate_fragment_to_sql(params) {
-                            Ok(sql) => {
-                                info!(sql = %sql, "translated to SQL (fallback)");
-                                (ExecPlan::Sql(sql), None, None)
-                            }
-                            Err(e2) => {
-                                warn!(error = %e2, "SQL translation also failed");
-                                return Ok(Response::new(PExecPlanFragmentResult {
-                                    status: err_status(&format!("plan translation: {e}")),
-                                    ..Default::default()
-                                }));
-                            }
-                        }
-                    }
-                }
-            } else {
-                match plan_translator::translate_fragment_to_sql(params) {
-                    Ok(sql) => {
-                        info!(sql = %sql, "translated to SQL (no substrait extension)");
-                        (ExecPlan::Sql(sql), None, None)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "SQL translation failed");
+                        warn!(error = %e, "Substrait translation failed");
                         return Ok(Response::new(PExecPlanFragmentResult {
                             status: err_status(&format!("plan translation: {e}")),
                             ..Default::default()
                         }));
                     }
-                }
-            };
+                };
 
             // Execute via Sirius GPU, falling back to DuckDB CPU.
             let engine = match &self.engine {
@@ -2179,7 +2108,7 @@ impl PBackendService for PBackendServiceHandler {
                 if should_retain {
                     let pool_registered = nixl_agent_for_blocking
                         .as_ref()
-                        .map(|agent| location.try_register_rmm_pool(agent))
+                        .map(|agent| location.try_register_rmm_pool(agent, &engine))
                         .unwrap_or(false);
                     if !pool_registered {
                         location.copy_gpu_buffers_to_cuda_alloc();

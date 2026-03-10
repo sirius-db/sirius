@@ -189,12 +189,11 @@ doris/
 │   │   ├── cuda_driver.rs           #   CUDA driver API via dlopen
 │   │   └── fragment_manager.rs      #   Fragment lifecycle tracking
 │   │
-│   ├── plan-translator/             # Doris TPlan → Substrait/SQL (~109 tests)
-│   │   ├── lib.rs                   #   translate_fragment(), translate_to_sql()
+│   ├── plan-translator/             # Doris TPlan → Substrait (~109 tests)
+│   │   ├── lib.rs                   #   translate_fragment()
 │   │   ├── node_translator.rs       #   TPlanNode → Substrait Rel
 │   │   ├── scan_translator.rs       #   FILE_SCAN_NODE → ReadRel(LocalFiles)
 │   │   ├── expr_translator.rs       #   TExpr → Substrait expression
-│   │   ├── sql_generator.rs         #   TPlan → SQL (fallback path)
 │   │   ├── descriptor_table.rs      #   TDescriptorTable parser
 │   │   └── type_mapper.rs           #   Doris ↔ Substrait ↔ Arrow types
 │   │
@@ -337,14 +336,10 @@ PBlock Column Encoding:
   │  │                                │
   │  └─ type_mapper: Doris ↔ Substrait│
   │                                    │
-  │  translate_fragment_to_sql()       │
-  │  └─ sql_generator: TPlan → SQL    │
-  │     (fallback for UNION, EXCHANGE)│
   └────────────────┬───────────────────┘
                    │
                    ▼
   Substrait Plan (protobuf bytes)
-  or SQL string
   │
   ▼
   ┌──────────────────────────────────────┐

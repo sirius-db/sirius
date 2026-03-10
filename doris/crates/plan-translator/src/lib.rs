@@ -21,7 +21,6 @@ pub mod descriptor_table;
 pub mod expr_translator;
 pub mod node_translator;
 pub mod scan_translator;
-pub mod sql_generator;
 #[cfg(test)]
 mod test_helpers;
 pub mod type_mapper;
@@ -105,20 +104,6 @@ impl ExtensionRegistry {
     pub fn into_extensions(self) -> (Vec<SimpleExtensionUri>, Vec<SimpleExtensionDeclaration>) {
         (self.uris, self.functions)
     }
-}
-
-/// Translate a Doris TPipelineFragmentParams into a SQL string for DuckDB execution.
-pub fn translate_fragment_to_sql(params: &TPipelineFragmentParams) -> Result<String> {
-    let fragment = params
-        .fragment
-        .as_ref()
-        .context("TPipelineFragmentParams has no fragment")?;
-    let plan = fragment
-        .plan
-        .as_ref()
-        .context("TPlanFragment has no plan")?;
-
-    sql_generator::plan_to_sql(plan)
 }
 
 /// Compute the output column names of a Substrait Rel tree.
@@ -635,34 +620,6 @@ mod tests {
     use crate::test_helpers::*;
     use doris_thrift::types::TPrimitiveType;
     use substrait::proto::{plan_rel, read_rel, rel, rel_common};
-
-    #[test]
-    fn test_translate_fragment_to_sql_union() {
-        let node = make_union_node(0, 0, vec![vec![int_literal_expr(1), int_literal_expr(2)]]);
-        let plan = make_plan(vec![node]);
-        let desc = make_desc_table(vec![(0, None)], vec![]);
-        let params = make_fragment_params(plan, desc);
-        let sql = translate_fragment_to_sql(&params).unwrap();
-        assert_eq!(sql, "SELECT 1, 2");
-    }
-
-    #[test]
-    fn test_translate_fragment_to_sql_union_all() {
-        let node = make_union_node(
-            0,
-            0,
-            vec![
-                vec![int_literal_expr(1)],
-                vec![int_literal_expr(2)],
-                vec![int_literal_expr(3)],
-            ],
-        );
-        let plan = make_plan(vec![node]);
-        let desc = make_desc_table(vec![(0, None)], vec![]);
-        let params = make_fragment_params(plan, desc);
-        let sql = translate_fragment_to_sql(&params).unwrap();
-        assert_eq!(sql, "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
-    }
 
     #[test]
     fn test_translate_fragment_substrait_union() {
@@ -1536,44 +1493,6 @@ mod tests {
             }
             other => panic!("expected Set, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_union_node_sql_with_scan_children() {
-        // UNION_NODE(2 children) → SQL: child1 UNION ALL child2
-        let mut union_node = make_union_node(0, 0, vec![]);
-        union_node.num_children = 2;
-
-        // Children are EXCHANGE_NODE(0 children) = exchange receivers.
-        let exch1 = make_exchange_node(1, vec![0]);
-        let exch2 = make_exchange_node(3, vec![0]);
-        let plan = make_plan(vec![union_node, exch1, exch2]);
-        let desc = make_desc_table(vec![(0, None)], vec![]);
-        let params = make_fragment_params(plan, desc);
-
-        let sql = translate_fragment_to_sql(&params).unwrap();
-        assert_eq!(
-            sql,
-            "SELECT * FROM __EXCHANGE_TABLE_1 UNION ALL SELECT * FROM __EXCHANGE_TABLE_3"
-        );
-    }
-
-    #[test]
-    fn test_union_node_sql_three_children() {
-        let mut union_node = make_union_node(0, 0, vec![]);
-        union_node.num_children = 3;
-        let e1 = make_exchange_node(1, vec![0]);
-        let e2 = make_exchange_node(2, vec![0]);
-        let e3 = make_exchange_node(3, vec![0]);
-        let plan = make_plan(vec![union_node, e1, e2, e3]);
-        let desc = make_desc_table(vec![(0, None)], vec![]);
-        let params = make_fragment_params(plan, desc);
-
-        let sql = translate_fragment_to_sql(&params).unwrap();
-        assert_eq!(
-            sql,
-            "SELECT * FROM __EXCHANGE_TABLE_1 UNION ALL SELECT * FROM __EXCHANGE_TABLE_2 UNION ALL SELECT * FROM __EXCHANGE_TABLE_3"
-        );
     }
 
     #[test]
