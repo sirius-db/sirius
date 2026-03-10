@@ -327,7 +327,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
         _resource_ref);
     }
     default: {
-      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}", static_cast<int>(cudf_type.id()));
+      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}",
+                       static_cast<int>(cudf_type.id()));
       return std::nullopt;
     }
   }
