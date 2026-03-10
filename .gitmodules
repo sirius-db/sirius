@@ -24,3 +24,4 @@
 [submodule "doris/thirdparty/nixl"]
 	path = doris/thirdparty/nixl
 	url = https://github.com/ai-dynamo/nixl.git
+	ignore = dirty
