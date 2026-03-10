@@ -21,6 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
@@ -105,6 +106,20 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+
+  /**
+   * @brief Convert the scan's DuckDB TableFilterSet into a single bound DuckDB expression
+   * (conjunction of all filters), suitable for passing to
+   * gpu_expression_translator::translate_expression().
+   *
+   * @return nullptr if the filter set is empty or contains only unsupported filter types, otherwise
+   * a bound DuckDB expression.
+   */
+  duckdb::unique_ptr<duckdb::Expression> get_table_filter_expression() const
+  {
+    return scan::convert_table_filters_to_expression(
+      *table_filters, column_ids, returned_types, projection_ids);
+  }
 };
 
 }  // namespace op

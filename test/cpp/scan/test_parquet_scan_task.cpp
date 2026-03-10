@@ -43,6 +43,7 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 
 // standard library
 #include <filesystem>
@@ -65,7 +66,8 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,
   std::string const& parquet_path,
-  duckdb::vector<duckdb::idx_t> projection_ids = {})
+  duckdb::vector<duckdb::idx_t> projection_ids             = {},
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr)
 {
   auto& table_function_entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
     ctx, INVALID_CATALOG, DEFAULT_SCHEMA, "parquet_scan");
@@ -129,11 +131,21 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
                                                                     std::move(column_ids),
                                                                     std::move(projection_ids),
                                                                     std::move(names),
-                                                                    nullptr,
+                                                                    std::move(table_filters),
                                                                     0,
                                                                     std::move(extra_info),
                                                                     duckdb::vector<duckdb::Value>(),
                                                                     std::move(virtual_columns));
+}
+
+static duckdb::unique_ptr<duckdb::TableFilterSet> make_id_constant_filter(
+  duckdb::ExpressionType comparison, int32_t constant)
+{
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto filter =
+    duckdb::make_uniq<duckdb::ConstantFilter>(comparison, duckdb::Value::INTEGER(constant));
+  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter));  // id column
+  return table_filters;
 }
 
 static void write_parquet_from_table_to_path(duckdb::Connection& con,
@@ -296,10 +308,10 @@ static void run_parquet_scan_test(std::string const& table_name,
     uint64_t task_id = 1;
     size_t scheduled = 0;
     while (true) {
-      auto const partition_idx = global_state->get_next_rg_partition_idx();
-      if (!partition_idx.has_value()) { break; }
+      auto partition = global_state->claim_next_rg_partition();
+      if (!partition.has_value()) { break; }
       auto local_state =
-        std::make_unique<op::scan::parquet_scan_task_local_state>(*global_state, *partition_idx);
+        std::make_unique<op::scan::parquet_scan_task_local_state>(std::move(*partition));
       auto reservation = mem_mgr.request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         local_state->get_reserved_compressed_bytes());
@@ -395,10 +407,10 @@ static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
     uint64_t task_id = 1;
     size_t scheduled = 0;
     while (true) {
-      auto const partition_idx = global_state->get_next_rg_partition_idx();
-      if (!partition_idx.has_value()) { break; }
+      auto const partition = global_state->claim_next_rg_partition();
+      if (!partition.has_value()) { break; }
       auto local_state =
-        std::make_unique<op::scan::parquet_scan_task_local_state>(*global_state, *partition_idx);
+        std::make_unique<op::scan::parquet_scan_task_local_state>(std::move(*partition));
       auto reservation = mem_mgr.request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         local_state->get_reserved_compressed_bytes());
@@ -434,6 +446,92 @@ static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
   }
   std::filesystem::remove_all(parquet_dir);
 }
+
+static void run_parquet_scan_test_with_filter(
+  std::string const& table_name,
+  size_t num_rows,
+  size_t expected_rows,
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
+  int num_threads,
+  size_t batch_size,
+  size_t row_group_size                        = 0,
+  duckdb::vector<duckdb::idx_t> projection_ids = {},
+  batch_validator_t validator                  = validate_scanned_batches)
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  create_synthetic_table(con, table_name, num_rows);
+  auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+  auto& mem_mgr    = sirius_ctx->get_memory_manager();
+  auto* mem_space  = get_space(mem_mgr, Tier::HOST);
+  REQUIRE(mem_space != nullptr);
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  auto physical_scan = make_parquet_scan(
+    client_ctx, parquet_path.string(), std::move(projection_ids), std::move(table_filters));
+  REQUIRE(physical_scan);
+
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan.get(), batch_size);
+
+  cucascade::shared_data_repository data_repo;
+
+  sirius::parallel::task_executor_config executor_config{num_threads, false};
+  auto task_queue =
+    std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
+  sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));
+
+  auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
+    executor.start();
+    uint64_t task_id = 1;
+    size_t scheduled = 0;
+    while (true) {
+      auto partition = global_state->claim_next_rg_partition();
+      if (!partition.has_value()) { break; }
+      auto local_state =
+        std::make_unique<op::scan::parquet_scan_task_local_state>(std::move(*partition));
+      auto reservation = mem_mgr.request_reservation(
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+        local_state->get_reserved_compressed_bytes());
+      local_state->set_reservation(std::move(reservation));
+      auto task = std::make_unique<op::scan::parquet_scan_task>(
+        task_id++, &data_repo, std::move(local_state), global_state);
+      executor.schedule(std::move(task));
+      ++scheduled;
+    }
+    while (data_repo.total_size() < scheduled) {
+      std::this_thread::yield();
+    }
+
+    executor.stop();
+    auto batches = drain_data_repo(data_repo);
+    REQUIRE(batches.size() == scheduled);
+    return batches;
+  };
+
+  auto batches = run_scan();
+  validator(batches, expected_rows, mem_mgr, rmm::cuda_stream_default);
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result = con.Query("DROP TABLE " + table_name);
+  REQUIRE(drop_result);
+  REQUIRE(!drop_result->HasError());
+  std::filesystem::remove(parquet_path);
+}
+
+//------------------------------------------------------------------------------//
+// Test cases
+//------------------------------------------------------------------------------//
 
 TEST_CASE("parquet_scan_task - single threaded small table",
           "[parquet_scan_task][single_thread][shared_context]")
@@ -532,4 +630,331 @@ TEST_CASE("parquet_scan_task - multi file full scan five files mixed sizes",
 {
   run_multi_file_parquet_scan_test(
     "parquet_multi_file_five", {1400, 2600, 0, 3100, 900}, 6, 150000, 300);
+}
+
+TEST_CASE("parquet_scan_task - filter prunes all rows", "[parquet_scan_task][filter]")
+{
+  auto table_filters = make_id_constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, 0);
+  run_parquet_scan_test_with_filter(
+    "parquet_filter_none", 10000, 0, std::move(table_filters), 2, 200000, 500);
+}
+
+TEST_CASE("parquet_scan_task - filter keeps prefix rows", "[parquet_scan_task][filter]")
+{
+  constexpr int32_t threshold = 1234;
+  auto table_filters = make_id_constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, threshold);
+  run_parquet_scan_test_with_filter("parquet_filter_prefix",
+                                    8000,
+                                    static_cast<size_t>(threshold),
+                                    std::move(table_filters),
+                                    2,
+                                    200000,
+                                    500);
+}
+
+TEST_CASE("parquet_scan_task - filter actually prunes row groups",
+          "[parquet_scan_task][filter][row_group_pruning]")
+{
+  // With 100000 rows and ROW_GROUP_SIZE=5000, we get exactly 20 row groups.
+  // ids are sequential [0..N), so a filter id < 5000 matches only the first row group.
+
+  constexpr size_t num_rows                   = 100000;
+  constexpr size_t row_group_size             = 5000;
+  constexpr int32_t threshold                 = 5000;
+  constexpr size_t expected_pruned_partitions = 1;  // only the first row group survives
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  create_synthetic_table(con, "parquet_rg_prune", num_rows);
+  auto parquet_path = write_parquet_from_table(con, "parquet_rg_prune", row_group_size);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+  auto& mem_mgr    = sirius_ctx->get_memory_manager();
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  // Build scan WITHOUT filter to get the unfiltered partition count.
+  // Use batch_size=1 so each row group becomes its own partition.
+  auto physical_scan_no_filter = make_parquet_scan(client_ctx, parquet_path.string());
+  REQUIRE(physical_scan_no_filter);
+  auto global_state_no_filter = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan_no_filter.get(), 1);
+  auto const total_partitions = global_state_no_filter->get_num_row_group_partitions();
+  REQUIRE(total_partitions > 1);  // Must have multiple row groups for pruning to be meaningful
+
+  // Build scan WITH filter id < threshold (should match only the first row group)
+  auto table_filters = make_id_constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, threshold);
+  auto physical_scan_filtered =
+    make_parquet_scan(client_ctx, parquet_path.string(), {}, std::move(table_filters));
+  REQUIRE(physical_scan_filtered);
+  auto global_state_filtered = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan_filtered.get(), 1);
+  auto const pruned_partitions = global_state_filtered->get_num_row_group_partitions();
+
+  REQUIRE(pruned_partitions == expected_pruned_partitions);
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result = con.Query("DROP TABLE parquet_rg_prune");
+  REQUIRE(drop_result);
+  REQUIRE(!drop_result->HasError());
+  std::filesystem::remove(parquet_path);
+}
+
+TEST_CASE("parquet_scan_task - filter prunes row groups with decimal comparison",
+          "[parquet_scan_task][filter][row_group_pruning]")
+{
+  // Table has a DECIMAL(10,2) column whose values grow with id, so row-group
+  // statistics let us prune higher-valued row groups with a less-than filter.
+  // 100000 rows / 5000 per row group = 20 row groups.
+  // amount = id * 1.25; filter amount < 6250.00 ⇔ id < 5000 → 1 row group.
+  constexpr size_t num_rows                   = 100000;
+  constexpr size_t row_group_size             = 5000;
+  constexpr size_t expected_pruned_partitions = 1;
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  // Create a table with a decimal column: amount = id * 1.25, stored as DECIMAL(10,2)
+  std::string const table_name = "parquet_rg_prune_decimal";
+  {
+    auto result = con.Query("CREATE TABLE " + table_name + " (id INTEGER, amount DECIMAL(10,2))");
+    REQUIRE(result);
+    REQUIRE(!result->HasError());
+
+    constexpr size_t BATCH_SIZE = 1000;
+    for (size_t start = 0; start < num_rows; start += BATCH_SIZE) {
+      size_t end             = std::min(start + BATCH_SIZE, num_rows);
+      std::string insert_sql = "INSERT INTO " + table_name +
+                               " SELECT i, "
+                               "CAST(i * 1.25 AS DECIMAL(10,2)) "
+                               "FROM generate_series(" +
+                               std::to_string(start) + ", " + std::to_string(end - 1) + ") t(i)";
+      auto result2 = con.Query(insert_sql);
+      REQUIRE(result2);
+      REQUIRE(!result2->HasError());
+    }
+  }
+
+  auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  // Unfiltered partition count (batch_size=1 so each row group is its own partition)
+  auto physical_scan_no_filter = make_parquet_scan(client_ctx, parquet_path.string());
+  REQUIRE(physical_scan_no_filter);
+  auto global_state_no_filter = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan_no_filter.get(), 1);
+  auto const total_partitions = global_state_no_filter->get_num_row_group_partitions();
+  REQUIRE(total_partitions > 1);
+
+  // Filter: amount < 6250.00  (corresponds to id < 5000, i.e. first row group)
+  {
+    auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_LESSTHAN,
+      duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 10, 2));  // 6250.00
+    table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter));   // amount column
+
+    auto physical_scan_filtered =
+      make_parquet_scan(client_ctx, parquet_path.string(), {}, std::move(table_filters));
+    REQUIRE(physical_scan_filtered);
+    auto global_state_filtered = std::make_shared<op::scan::parquet_scan_task_global_state>(
+      nullptr, physical_scan_filtered.get(), 1);
+    auto const pruned_partitions = global_state_filtered->get_num_row_group_partitions();
+
+    REQUIRE(pruned_partitions == expected_pruned_partitions);
+  }
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result2 = con.Query("DROP TABLE " + table_name);
+  REQUIRE(drop_result2);
+  REQUIRE(!drop_result2->HasError());
+  std::filesystem::remove(parquet_path);
+}
+
+TEST_CASE("parquet_scan_task - filter prunes row groups with date comparison",
+          "[parquet_scan_task][filter][row_group_pruning]")
+{
+  // Table has a DATE column whose values grow with id, so row-group statistics
+  // allow pruning with a less-than filter on the date column.
+  // 100000 rows / 5000 per row group = 20 row groups.
+  // dt = '2020-01-01' + id days; filter dt < '2020-01-15' → only the first row group.
+  constexpr size_t num_rows                   = 100000;
+  constexpr size_t row_group_size             = 5000;
+  constexpr size_t expected_pruned_partitions = 1;
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  // Create a table with a date column: dt = DATE '2020-01-01' + INTERVAL (id) DAY
+  std::string const table_name = "parquet_rg_prune_date";
+  {
+    auto result = con.Query("CREATE TABLE " + table_name + " (id INTEGER, dt DATE)");
+    REQUIRE(result);
+    REQUIRE(!result->HasError());
+
+    constexpr size_t BATCH_SIZE = 1000;
+    for (size_t start = 0; start < num_rows; start += BATCH_SIZE) {
+      size_t end             = std::min(start + BATCH_SIZE, num_rows);
+      std::string insert_sql = "INSERT INTO " + table_name +
+                               " SELECT i, "
+                               "DATE '2020-01-01' + INTERVAL (i) DAY "
+                               "FROM generate_series(" +
+                               std::to_string(start) + ", " + std::to_string(end - 1) + ") t(i)";
+      auto result2 = con.Query(insert_sql);
+      REQUIRE(result2);
+      REQUIRE(!result2->HasError());
+    }
+  }
+
+  auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  // Unfiltered partition count
+  auto physical_scan_no_filter = make_parquet_scan(client_ctx, parquet_path.string());
+  REQUIRE(physical_scan_no_filter);
+  auto global_state_no_filter = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan_no_filter.get(), 1);
+  auto const total_partitions = global_state_no_filter->get_num_row_group_partitions();
+  REQUIRE(total_partitions > 1);
+
+  // Filter: dt < DATE '2020-01-15'  (only the first ~14 days, within the first row group)
+  {
+    auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::DATE(2020, 1, 15));
+    table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter));  // dt column
+
+    auto physical_scan_filtered =
+      make_parquet_scan(client_ctx, parquet_path.string(), {}, std::move(table_filters));
+    REQUIRE(physical_scan_filtered);
+    auto global_state_filtered = std::make_shared<op::scan::parquet_scan_task_global_state>(
+      nullptr, physical_scan_filtered.get(), 1);
+    auto const pruned_partitions = global_state_filtered->get_num_row_group_partitions();
+
+    REQUIRE(pruned_partitions == expected_pruned_partitions);
+  }
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result2 = con.Query("DROP TABLE " + table_name);
+  REQUIRE(drop_result2);
+  REQUIRE(!drop_result2->HasError());
+  std::filesystem::remove(parquet_path);
+}
+
+TEST_CASE("parquet_scan_task - filter on non-projected column",
+          "[parquet_scan_task][filter][projection]")
+{
+  // Project only columns {0, 2} (id, price) but filter on column 1 (value).
+  // value = id * 100, so value < 50000 ⇔ id < 500 → 500 rows expected.
+  constexpr int64_t val_threshold = 50000;
+  auto table_filters              = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto filter = duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                          duckdb::Value::BIGINT(val_threshold));
+  table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter));  // value column
+
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 2};  // id, price
+  run_parquet_scan_test_with_filter("parquet_filter_non_proj",
+                                    8000,
+                                    500,
+                                    std::move(table_filters),
+                                    2,
+                                    200000,
+                                    500,
+                                    std::move(projection_ids),
+                                    validate_projected_id_price_batches);
+}
+
+TEST_CASE("parquet_scan_task - filter prunes row groups with multi-column comparison",
+          "[parquet_scan_task][filter][row_group_pruning]")
+{
+  // Uses the standard synthetic table (id INTEGER, value BIGINT, price DOUBLE, name VARCHAR).
+  // Applies two column filters simultaneously:
+  //   id    < 5000   (column 0)
+  //   value < 500000 (column 1, value = id * 100, so value < 500000 ⇔ id < 5000)
+  // Both filters target the first row group only.
+  // 100000 rows / 5000 per row group = 20 row groups; exactly 1 survives.
+
+  constexpr size_t num_rows                   = 100000;
+  constexpr size_t row_group_size             = 5000;
+  constexpr int32_t id_threshold              = 5000;
+  constexpr int64_t val_threshold             = 500000;  // = id_threshold * 100
+  constexpr size_t expected_pruned_partitions = 1;
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  std::string const table_name = "parquet_rg_prune_multi";
+  create_synthetic_table(con, table_name, num_rows);
+  auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  // Unfiltered partition count
+  auto physical_scan_no_filter = make_parquet_scan(client_ctx, parquet_path.string());
+  REQUIRE(physical_scan_no_filter);
+  auto global_state_no_filter = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan_no_filter.get(), 1);
+  auto const total_partitions = global_state_no_filter->get_num_row_group_partitions();
+  REQUIRE(total_partitions > 1);
+
+  // Multi-column filter: id < 5000 AND value < 500000
+  {
+    auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+
+    auto id_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::INTEGER(id_threshold));
+    table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(id_filter));  // id column
+
+    auto val_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::BIGINT(val_threshold));
+    table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(val_filter));  // value column
+
+    auto physical_scan_filtered =
+      make_parquet_scan(client_ctx, parquet_path.string(), {}, std::move(table_filters));
+    REQUIRE(physical_scan_filtered);
+    auto global_state_filtered = std::make_shared<op::scan::parquet_scan_task_global_state>(
+      nullptr, physical_scan_filtered.get(), 1);
+    auto const pruned_partitions = global_state_filtered->get_num_row_group_partitions();
+
+    REQUIRE(pruned_partitions == expected_pruned_partitions);
+  }
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result = con.Query("DROP TABLE " + table_name);
+  REQUIRE(drop_result);
+  REQUIRE(!drop_result->HasError());
+  std::filesystem::remove(parquet_path);
 }

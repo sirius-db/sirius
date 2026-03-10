@@ -27,8 +27,6 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // cudf
-#include "cudf/cudf_utils.hpp"
-
 #include <cudf/utilities/span.hpp>
 
 // rmm
@@ -56,9 +54,10 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
 {
   std::cerr << "convert_host_parquet_to_gpu_with_hybrid_scan" << std::endl;
   // Source stuff
-  auto& host_src             = source.cast<host_parquet_representation>();
-  auto const& rg_byte_ranges = host_src.get_column_chunk_byte_ranges();
-  auto reader                = host_src.get_parquet_reader();
+  auto& host_src              = source.cast<host_parquet_representation>();
+  auto const& rg_byte_ranges  = host_src.get_column_chunk_byte_ranges();
+  auto reader                 = host_src.get_parquet_reader();
+  auto const& pure_filter_ids = host_src.get_pure_filter_ids();
 
   std::vector<cudf::io::text::byte_range_info> contiguous_regions;
   contiguous_regions.reserve(rg_byte_ranges.size());
@@ -74,9 +73,6 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
   rmm::cuda_set_device_raii target_device_raii(target_device_id);
 
   auto const& allocation = host_src.get_column_chunks();
-
-  // The following pattern follows the example here:
-  // https://github.com/rapidsai/cudf/blob/main/cpp/examples/hybrid_scan_io/common_utils.cpp#L160
 
   // Allocate a single device buffer and partition it according to the byte ranges
   std::vector<cudf::device_span<uint8_t const>> column_chunk_spans_d;
@@ -132,27 +128,27 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
 #endif
 
   // Invoke the Parquet reader to materialize the table on GPU
-#if CUDF_VERSION_NUM >= 2604
   auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
     column_chunk_spans_d.data(), column_chunk_spans_d.size());
-  auto result = reader.materialize_all_columns(
-    host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
-#else
-  // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
-  std::vector<rmm::device_buffer> column_chunk_buffers;
-  for (auto const& span : column_chunk_spans_d) {
-    column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
-  }
-  dbuffer.reset();
-  stream.synchronize();
-  auto result = reader->materialize_all_columns(
-    host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
-#endif
-  auto new_table = std::move(result.tbl);  // Discard metadata
+  auto [table, md] = reader->materialize_all_columns(host_src.get_row_group_indices(),
+                                                     column_chunk_spans_h,
+                                                     host_src.get_reader_options(),
+                                                     stream,
+                                                     mr_ref);
   stream.synchronize();
 
+  // Now we need to prune the pure filter columns from the table, if there are any.
+  if (!pure_filter_ids.empty()) {
+    // pure_filter_ids MUST be sorted
+    auto columns = table->release();
+    for (auto id : pure_filter_ids) {
+      columns.erase(columns.begin() + static_cast<ptrdiff_t>(id));
+    }
+    table = std::make_unique<cudf::table>(std::move(columns));
+  }
+
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(new_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+    std::move(table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
 }
 
 /**
@@ -164,7 +160,8 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   cucascade::memory::memory_space const* target_memory_space,
   rmm::cuda_stream_view stream)
 {
-  auto& host_src = source.cast<host_parquet_representation>();
+  auto& host_src              = source.cast<host_parquet_representation>();
+  auto const& pure_filter_ids = host_src.get_pure_filter_ids();
 
   rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
   rmm::cuda_device_id target_device_id(target_memory_space->get_device_id());
@@ -194,11 +191,21 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   opts.set_row_groups({std::vector<cudf::size_type>(host_src.get_row_group_indices().begin(),
                                                     host_src.get_row_group_indices().end())});
 
-  auto result = cudf::io::read_parquet(opts, stream, mr_ref);
+  auto [table, md] = cudf::io::read_parquet(opts, stream, mr_ref);
   stream.synchronize();
 
+  // Now we need to prune the pure filter columns from the table, if there are any.
+  if (!pure_filter_ids.empty()) {
+    // pure_filter_ids MUST be sorted
+    auto columns = table->release();
+    for (auto id : pure_filter_ids) {
+      columns.erase(columns.begin() + static_cast<ptrdiff_t>(id));
+    }
+    table = std::make_unique<cudf::table>(std::move(columns));
+  }
+
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(result.tbl), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+    std::move(table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
 }
 
 /**

@@ -16,6 +16,9 @@
 
 #pragma once
 
+// sirius
+#include <expression_executor/gpu_expression_translator.hpp>
+
 // cucascade
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -42,7 +45,8 @@ namespace sirius {
  * The APIs for this reader are still marked experimental and are likely volatile.
  */
 class host_parquet_representation : public cucascade::idata_representation {
-  using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
+  using hybrid_scan_reader    = cudf::io::parquet::experimental::hybrid_scan_reader;
+  using translated_expression = gpu_expression_translator::translated_expression;
 
  public:
   /**
@@ -70,7 +74,9 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
                               std::size_t size_in_bytes,
                               std::size_t uncompressed_size_in_bytes,
-                              std::shared_ptr<cudf::io::datasource> fallback_datasource)
+                              std::shared_ptr<cudf::io::datasource> fallback_datasource,
+                              std::shared_ptr<translated_expression> filter_expression = nullptr,
+                              std::vector<std::size_t> pure_filter_ids                 = {})
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),
@@ -79,7 +85,9 @@ class host_parquet_representation : public cucascade::idata_representation {
       _column_chunk_byte_ranges(std::move(column_chunk_byte_ranges)),
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
-      _fallback_datasource(fallback_datasource)
+      _fallback_datasource(fallback_datasource),
+      _filter_expression(filter_expression),
+      _pure_filter_ids(std::move(pure_filter_ids))
   {
   }
 
@@ -153,19 +161,7 @@ class host_parquet_representation : public cucascade::idata_representation {
   {
     return _row_group_indices;
   };
-
-  /**
-   * @brief Gets a host span of the row group indices of the row groups represented in the multiple
-   * blocks allocation.
-   *
-   * @return A host span of the row group indices.
-   */
-  [[nodiscard]] cudf::host_span<cudf::size_type const> get_rg_span() const
-  {
-    return cudf::host_span<cudf::size_type const>(_row_group_indices.data(),
-                                                  _row_group_indices.size());
-  };
-
+  
   /**
    * @brief Gets the byte ranges in the multiple blocks allocation representing the column chunks to
    * be read.
@@ -227,6 +223,26 @@ class host_parquet_representation : public cucascade::idata_representation {
     _fallback_datasource = std::move(ds);
   }
 
+  /**
+   * @brief Gets the optional filter expression for filter pushdown.
+   *
+   * @return A shared_ptr to the translated filter expression, or nullptr if not set.
+   */
+  [[nodiscard]] std::shared_ptr<translated_expression> const& get_filter_expression() const
+  {
+    return _filter_expression;
+  }
+
+  /**
+   * @brief Gets the vector of positions of the pure filter columns in the decompressed output.
+   *
+   * @return A const reference to the vector of pure filter column IDs.
+   */
+  [[nodiscard]] std::vector<std::size_t> const& get_pure_filter_ids() const
+  {
+    return _pure_filter_ids;
+  }
+
  private:
   host_parquet_representation(cucascade::memory::memory_space* memory_space,
                               std::shared_ptr<hybrid_scan_reader> parquet_reader,
@@ -235,7 +251,9 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
                               std::size_t size_in_bytes,
                               std::size_t uncompressed_size_in_bytes,
-                              std::shared_ptr<cudf::io::datasource> fallback_datasource)
+                              std::shared_ptr<cudf::io::datasource> fallback_datasource,
+                              std::shared_ptr<translated_expression> filter_expression,
+                              std::vector<std::size_t> pure_filter_ids)
     : idata_representation(*memory_space),
       _parquet_reader(std::move(parquet_reader)),
       _reader_options(std::move(reader_options)),
@@ -243,7 +261,9 @@ class host_parquet_representation : public cucascade::idata_representation {
       _column_chunk_byte_ranges(std::move(column_chunk_byte_ranges)),
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
-      _fallback_datasource(fallback_datasource)
+      _fallback_datasource(fallback_datasource),
+      _filter_expression(filter_expression),
+      _pure_filter_ids(std::move(pure_filter_ids))
   {
   }
 
@@ -256,5 +276,8 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::size_t _size_in_bytes;
   std::size_t _uncompressed_size_in_bytes;
   std::shared_ptr<cudf::io::datasource> _fallback_datasource;
+  std::shared_ptr<translated_expression>
+    _filter_expression;                       // Pins the filter expression to ensure lifetime
+  std::vector<std::size_t> _pure_filter_ids;  // Output positions of pure filter columns
 };
 }  // namespace sirius
