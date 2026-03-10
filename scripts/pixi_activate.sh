@@ -1,11 +1,22 @@
-#!/usr/bin/env sh
-# Sourced by pixi during environment activation — must be POSIX-compatible.
+#!/usr/bin/env bash
+set -euo pipefail
 
-_root="${PIXI_PROJECT_ROOT:-.}"
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  exit 0
+fi
 
-if [ -d "$_root/duckdb" ]; then
-  # Remove stale symlink from dev branch (pointed to ../cmake/CMakePresets.json which
-  # doesn't exist on this branch), then create the file if missing.
-  rm -f "$_root/duckdb/CMakePresets.json"
-  printf '{"version":6,"include":["../CMakePresets.json"]}\n' > "$_root/duckdb/CMakePresets.json"
+clang_cpp="$CONDA_PREFIX/bin/clang-cpp"
+clang_pp="$CONDA_PREFIX/bin/clang++"
+
+if [[ -x "$clang_cpp" && ! -e "$clang_pp" ]]; then
+  ln -s "$clang_cpp" "$clang_pp"
+fi
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cmake_presets_src="$project_root/cmake/CMakePresets.json"
+cmake_presets_dst="$project_root/duckdb/CMakePresets.json"
+
+rm -f "$project_root/duckdb/CMakeUserPresets.json"
+if [[ ! -e "$cmake_presets_dst" ]]; then
+  ln -s "$cmake_presets_src" "$cmake_presets_dst"
 fi

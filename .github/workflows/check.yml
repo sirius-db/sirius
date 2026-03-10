@@ -35,12 +35,25 @@ jobs:
       SCCACHE_GHA_ENABLED: true
     strategy:
       matrix:
-        arch: [x64, arm64]
-        preset: [release, clang-debug]
+        arch:
+          - x64
+          - arm64
+        compiler:
+          - gcc
+          - clang
+        build-type:
+          - release
+          - debug
         environment: [default]
+        exclude:
+          - compiler: gcc
+            build-type: debug
+          - compiler: clang
+            build-type: release
         include:
           - arch: x64
-            preset: release
+            compiler: gcc
+            build-type: release
             environment: vcpkg
       fail-fast: false
     runs-on: >-
@@ -72,5 +85,13 @@ jobs:
           key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
           restore-keys: vcpkg-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build
-        run: pixi run -e ${{ matrix.environment }} build ${{ matrix.preset }} 100
+      - run: make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+        if: matrix.environment != 'vcpkg'
+        env:
+          CUDAARCHS: "100"
+
+      - name: Build (vcpkg)
+        if: matrix.environment == 'vcpkg'
+        run: |
+          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
+          pixi run -e vcpkg cmake --build build/vcpkg-release

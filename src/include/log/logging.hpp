@@ -16,19 +16,6 @@
 
 #pragma once
 
-// fmt 12's chrono header doesn't compile under nvcc, so avoid spdlog in CUDA
-// translation units. The host .cpp files retain full spdlog logging.
-#ifdef __CUDACC__
-
-#define SIRIUS_LOG_TRACE(...) ((void)0)
-#define SIRIUS_LOG_DEBUG(...) ((void)0)
-#define SIRIUS_LOG_INFO(...)  ((void)0)
-#define SIRIUS_LOG_WARN(...)  ((void)0)
-#define SIRIUS_LOG_ERROR(...) ((void)0)
-#define SIRIUS_LOG_FATAL(...) ((void)0)
-
-#else  // !__CUDACC__
-
 #ifndef SPDLOG_ACTIVE_LEVEL
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #else
@@ -48,10 +35,6 @@
 #define SIRIUS_LOG_WARN(...)  SPDLOG_LOGGER_WARN(spdlog::default_logger_raw(), __VA_ARGS__)
 #define SIRIUS_LOG_ERROR(...) SPDLOG_LOGGER_ERROR(spdlog::default_logger_raw(), __VA_ARGS__)
 #define SIRIUS_LOG_FATAL(...) SPDLOG_LOGGER_CRITICAL(spdlog::default_logger_raw(), __VA_ARGS__)
-
-#endif  // __CUDACC__
-
-#ifndef __CUDACC__
 
 namespace duckdb {
 
@@ -116,5 +99,3 @@ inline void InitGlobalLogger(std::string log_file = "")
 }
 
 }  // namespace duckdb
-
-#endif  // !__CUDACC__
