@@ -65,15 +65,13 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      - name: Export vcpkg cache variables
+      - name: Cache vcpkg binary packages
         if: matrix.environment == 'vcpkg'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
+          restore-keys: vcpkg-
 
       - name: Build
         run: pixi run -e ${{ matrix.environment }} build ${{ matrix.preset }} 100
-        env:
-          VCPKG_BINARY_SOURCES: ${{ matrix.environment == 'vcpkg' && 'clear;x-gha,readwrite' || '' }}
