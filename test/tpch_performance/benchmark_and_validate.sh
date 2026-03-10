@@ -24,10 +24,10 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
+#   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
 #
 # Example:
-#   ./test/tpch_performance/benchmark_and_validate.sh 1 3
+#   ./test/tpch_performance/benchmark_and_validate.sh 1
 
 set -uo pipefail
 
@@ -35,17 +35,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_SCRIPT="$SCRIPT_DIR/run_tpch_parquet.sh"
 
-if [ $# -ne 2 ]; then
-    echo "Usage: $0 <scale_factor> <iterations>"
-    echo "Example: $0 1 3"
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <scale_factor>"
+    echo "Example: $0 1"
     exit 1
 fi
 
 SF="$1"
-ITERATIONS="$2"
 QUERIES=($(seq 1 22))
 
-RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${ITERATIONS}iter"
+RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_2iter"
 mkdir -p "$RUN_DIR"
 
 if [ -n "${SIRIUS_CONFIG_FILE:-}" ] && [ -f "${SIRIUS_CONFIG_FILE}" ]; then
@@ -59,7 +58,7 @@ TIMINGS_CSV="$RUN_DIR/timings.csv"
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
 PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
 
-echo "Scale factor: SF${SF}   Iterations: ${ITERATIONS}"
+echo "Scale factor: SF${SF}   Iterations: 2 (cold + warm)"
 echo "Run directory: $RUN_DIR"
 echo "=========================================="
 echo ""
@@ -191,7 +190,7 @@ for engine in sirius duckdb; do
 
     echo ""
     echo "=== Running $engine ==="
-    OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "$engine" "$SF" "$ITERATIONS" "${QUERIES[@]}" \
+    OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log" || true
 done
 
