@@ -64,12 +64,12 @@ All commands run from the **project root** directory.
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.cfg
 
-./test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
+./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
 # Example:
-./test/tpch_performance/benchmark_and_validate.sh 100 3
+./test/tpch_performance/benchmark_and_validate.sh 100
 ```
 
-Each run creates a directory under `runs/<timestamp>_sf<SF>_<N>iter/` containing:
+Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 - `run_info.txt` — git branch/revision, tree clean/dirty, build freshness, hostname, memory, CPUs, GPUs, filesystem read benchmark
 - `run_info.patch` — full git diff when tree is dirty
 - `sirius_config.cfg` — copy of the Sirius config used
@@ -80,19 +80,19 @@ Each run creates a directory under `runs/<timestamp>_sf<SF>_<N>iter/` containing
 
 ### Unified query runner
 
-`run_tpch_parquet.sh` is the core runner used by all benchmarks. It supports both engines, configurable iterations, and auto-generates missing datasets.
+`run_tpch_parquet.sh` is the core runner used by all benchmarks. It runs all queries in a single DuckDB session with 2 iterations each (cold + warm, back-to-back) and auto-generates missing datasets.
 
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.cfg
 
-# Run Sirius with 3 iterations on queries 1-22
-./test/tpch_performance/run_tpch_parquet.sh sirius 100 3 $(seq 1 22)
+# Run Sirius on queries 1-22
+./test/tpch_performance/run_tpch_parquet.sh sirius 100 $(seq 1 22)
 
 # Run DuckDB baseline
-./test/tpch_performance/run_tpch_parquet.sh duckdb 100 3 $(seq 1 22)
+./test/tpch_performance/run_tpch_parquet.sh duckdb 100 $(seq 1 22)
 
 # Use custom parquet directory
-./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 3 1 3 6
+./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
 ```
 
 Environment variables:
@@ -206,7 +206,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | File | Purpose |
 |------|---------|
 | `benchmark_and_validate.sh` | Full DuckDB vs Sirius benchmark with validation and timestamped runs |
-| `run_tpch_parquet.sh` | Unified query runner for both engines (sirius/duckdb) with iterations |
+| `run_tpch_parquet.sh` | Unified query runner for both engines (sirius/duckdb), single-session with cold+warm |
 | `run_tpch_parquet_duckdb.sh` | DuckDB-only baseline runner |
 | `generate_tpch_data.sh` | Generate TPC-H parquet data via tpchgen-rs (auto-builds from source) |
 | `sweep_threads.sh` | Thread configuration sweep (Sirius-only) |

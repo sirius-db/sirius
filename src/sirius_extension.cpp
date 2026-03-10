@@ -682,6 +682,21 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static void SetCacheInGpu(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_in_gpu SET ignored");
+    return;
+  }
+  bool enabled = BooleanValue::Get(parameter);
+  auto& cfg    = sirius_ctx->get_config();
+  cfg.set_cache_in_gpu(enabled);
+  sirius_ctx->get_pipeline_executor().set_scan_caching_enabled(
+    cfg.is_scan_caching_enabled(), cfg.is_cache_decoded_table_enabled(), enabled);
+  SIRIUS_LOG_DEBUG("Updated config cache_in_gpu to {}", enabled);
+}
+
 static sirius::operator_params* get_operator_params(ClientContext& context)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -843,6 +858,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
                             SetConcatBatchBytes);
+
+  config.AddExtensionOption("cache_in_gpu",
+                            "Whether to cache scan results in GPU memory instead of host memory",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(false),
+                            SetCacheInGpu);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

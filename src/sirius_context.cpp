@@ -85,6 +85,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
   sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
   auto query = context.GetCurrentQuery();
+  spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
   if (config_.is_scan_caching_enabled()) {
     pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
@@ -96,6 +97,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd()
 {
+  spdlog::info("QueryEnd");
   query_.reset();
 
   // Drain all downgrade executors before clearing repositories — ensures no downgrade
