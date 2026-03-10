@@ -63,12 +63,10 @@ if [ "$ENGINE" == "sirius" ]; then
     DUCKDB="$SIRIUS_DUCKDB"
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
 else
-    # Use vanilla DuckDB from the pixi environment (no Sirius extension).
-    DUCKDB=$(cd "$SCRIPT_DIR" && pixi run which duckdb 2>/dev/null) || true
-    if [ -z "$DUCKDB" ] || [ ! -x "$DUCKDB" ]; then
-        echo "ERROR: vanilla duckdb not found in pixi env. Run: cd $SCRIPT_DIR && pixi install"
-        exit 1
-    fi
+    # Use the same binary but without Sirius config so the extension doesn't initialize.
+    DUCKDB="$SIRIUS_DUCKDB"
+    unset SIRIUS_CONFIG_FILE 2>/dev/null || true
+    export SIRIUS_CONFIG_FILE=
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 fi
 
@@ -119,7 +117,7 @@ echo ".timer on" >> "$TEMP_SQL"
 
 VALID_QUERIES=()
 # Queries where GPU caching must be disabled (too large to fit in GPU memory).
-NO_GPU_CACHE="1 7 9 10 18 19 21"
+NO_GPU_CACHE="1 7 9 10 17 18 19 21"
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
     if [ ! -f "$QUERY_FILE" ]; then
