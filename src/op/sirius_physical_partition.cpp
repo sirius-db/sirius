@@ -277,9 +277,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     auto& sibling = _sibling_partition_op->Cast<sirius_physical_partition>();
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
-      uint64_t total_bytes;
-      [ _num_partitions, total_bytes ] = determine_num_partitions();
-      sibling._num_partitions          = _num_partitions.value();
+      auto [num_parts, total_bytes] = determine_num_partitions();
+      _num_partitions               = num_parts;
+      sibling._num_partitions       = num_parts;
       SIRIUS_LOG_DEBUG(
         "sirius_physical_partition id {} determined {} partitions from {} bytes on sibling id {} "
         "and {} build "
@@ -293,8 +293,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      uint64_t total_bytes;
-      [ _num_partitions, total_bytes ] = determine_num_partitions();
+      auto [num_parts, total_bytes] = determine_num_partitions();
+      _num_partitions               = num_parts;
       SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions from {} bytes",
                        this->get_operator_id(),
                        _num_partitions.value(),

@@ -45,6 +45,7 @@ namespace op {
 // for better pipelining with other operators, and allows reusing the hash table. MIXED_JOIN uses
 // cudf's mixed_join API for joins with both equality and inequality conditions.
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
+enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULED, BUILT };
 
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
@@ -124,7 +125,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @param build_side_bytes
   void update_join_exec_mode(int num_partitions, uint64_t build_side_bytes);
 
+  std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::optional<task_creation_hint> get_next_task_hint() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -147,7 +151,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode = HASH_JOIN_MODE::STANDARD;
+  HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::STANDARD;
+  BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
+  std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
+  std::unique_ptr<cudf::table>
+    _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
+  std::vector<std::unique_ptr<cudf::column>>
+    _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the
+                                // build table
   //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;
