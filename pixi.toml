@@ -1,57 +1,113 @@
 [workspace]
-channels = ["rapidsai", "conda-forge" ]
+channels = ["rapidsai", "conda-forge"]
 name = "sirius"
 platforms = ["linux-64", "linux-aarch64"]
-requires-pixi = ">=0.59"
+requires-pixi = ">=0.65"
 
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
 
 [dependencies]
-cmake = "4.1.*"
+clang = "21.*"
+clangxx = "21.*"
+clang-tools = "21.*"
+cmake = "4.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
 cxx-compiler = "*"
-make = "*"
-ninja = "*"
-sccache = "*"
-unzip = "*"
-clang = ">=21,<22"
-wget = "*"
-libcudf = "26.02.*"
-librmm = "*"
-libcurand-dev = "*"
-pre-commit = "*"
+duckdb = "1.4.*"
+libabseil = "*"
 libconfig = "*"
-libabseil = ">=20260107.0"
-duckdb = ">=1.4.4,<2"
-clang-tools = ">=21.1.8,<22"
-spdlog = "1.8.*"
-pkg-config = "*"
+libcudf = "26.02.*"
+libcurand-dev = "*"
+librmm = "*"
+make = "*"
 mold = "*"
+ninja = "*"
+pkg-config = "*"
+pre-commit = "*"
+sccache = "*"
+spdlog = "1.8.*"
+unzip = "*"
+wget = "*"
 
-[tasks]
+[tasks.configure]
+args = [
+  { arg = "preset", default = "release", choices = [
+    "debug",
+    "release",
+    "relwithdebinfo",
+    "clang-debug",
+    "clang-release",
+    "clang-relwithdebinfo",
+  ] },
+  { arg = "cudaarchs", default = "" },
+]
+cmd = "{% if cudaarchs %}CUDAARCHS={{ cudaarchs }} {% endif %}cmake -S duckdb --preset {{ preset }}"
+inputs = ["CMakePresets.json", "CMakeLists.txt", "extension_config.cmake"]
+outputs = [
+  "build/{{ preset }}/CMakeCache.txt",
+]
 
-# CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
-[feature.cuda13.system-requirements]
-cuda = "13"
+[tasks.build]
+args = [
+  { arg = "preset", default = "release", choices = [
+    "debug",
+    "release",
+    "relwithdebinfo",
+    "clang-debug",
+    "clang-release",
+    "clang-relwithdebinfo",
+  ] },
+  { arg = "cudaarchs", default = "" },
+]
+cmd = "cmake --build build/{{ preset }}"
+depends-on = [{ task = "configure", args = [{ preset = "{{ preset }}" }, { cudaarchs = "{{ cudaarchs }}" }] }]
+inputs = [
+  "src/**/*.cpp",
+  "src/**/*.cu",
+  "src/**/*.cuh",
+  "src/include/**/*.h",
+  "src/include/**/*.hpp",
+  "test/**/*.cpp",
+  "test/sql/**/*",
+]
 
-[feature.cuda13.dependencies]
-cuda-version = "13.*"
+[tasks.test]
+args = [
+  { arg = "preset", default = "release", choices = [
+    "debug",
+    "release",
+    "relwithdebinfo",
+    "clang-debug",
+    "clang-release",
+    "clang-relwithdebinfo",
+  ] },
+  { arg = "filter", default = "" },
+]
+cmd = "ctest --test-dir build/{{ preset }}/extension/sirius"
+depends-on = [{ task = "build", args = [{ preset = "{{ preset }}" }] }]
 
-[feature.cuda13.activation.env]
-# GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
-CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
+[tasks.clean]
+args = [
+  { arg = "preset", default = "release", choices = [
+    "debug",
+    "release",
+    "relwithdebinfo",
+    "clang-debug",
+    "clang-release",
+    "clang-relwithdebinfo",
+  ] },
+]
+cmd = "rm -rf build/{{ preset }}"
 
-[feature.cuda12.system-requirements]
-cuda = "12"
+[feature.cuda13]
+system-requirements = { cuda = "13" }
+activation.env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120" }
 
-[feature.cuda12.dependencies]
-cuda-version = "12.*"
-
-[feature.cuda12.activation.env]
-# GPU architectures: Turing through Hopper (75, 80, 86, 90a)
-CUDAARCHS = "75-real;80-real;86-real;90a-real"
+[feature.cuda12]
+system-requirements = { cuda = "12" }
+activation.env = { CUDAARCHS = "75-real;80-real;86-real;90a-real" }
 
 [environments]
 default = ["cuda13"]
