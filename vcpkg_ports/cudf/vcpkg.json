@@ -28,5 +28,5 @@
   "license": "Apache-2.0",
   "name": "cudf",
   "supports": "linux",
-  "version": "26.02.00"
+  "version-string": "26.02.00"
 }

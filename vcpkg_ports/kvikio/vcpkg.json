@@ -14,5 +14,5 @@
   "license": "Apache-2.0",
   "name": "kvikio",
   "supports": "linux",
-  "version": "26.02.00"
+  "version-string": "26.02.00"
 }
