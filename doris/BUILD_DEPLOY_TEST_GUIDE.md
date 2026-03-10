@@ -98,11 +98,10 @@ pixi run -e doris-fe doris-fe-start    # builds if needed, then starts
 pixi run -e doris sirius-be
 
 # Terminal 3 (optional): Start GPU BE 2
-rm -f ~/.sirius/sirius.lock   # remove lock from BE 1 (see Troubleshooting)
 pixi run -e doris sirius-be-2
 ```
 
-**Multi-BE lock file note:** The sirius DuckDB extension uses a lock file (`~/.sirius/sirius.lock`) to prevent concurrent access. When running multiple BEs on the same machine, remove the lock file before starting each additional BE.
+The `sirius-be-2` task automatically uses a separate home directory (`/tmp/sirius-be-2`) to avoid lock file conflicts with BE 1 (the sirius extension locks `~/.sirius/sirius.lock` to prevent concurrent access to the same config).
 
 The BE auto-registers with the FE via the `--fe` flag. If registration fails (e.g., FE not ready yet), add it manually:
 ```bash
@@ -309,7 +308,7 @@ RUST_LOG=doris_rpc=debug,plan_translator=debug,sirius_ffi=debug,info pixi run -e
 
 ### Common issues
 - **BE crashes on start ("FATAL: engine init failed")**: The substrait or sirius DuckDB extension failed to load. Verify `build/release/extension/sirius/sirius.duckdb_extension` and `substrait/build/release/extension/substrait/substrait.duckdb_extension` exist and are built for the correct DuckDB version (v1.4.4).
-- **"Extension already loaded in another process"**: Another BE (or crashed BE) holds `~/.sirius/sirius.lock`. Remove it: `rm -f ~/.sirius/sirius.lock`
+- **"Extension already loaded in another process"**: Another BE holds `~/.sirius/sirius.lock`. The `sirius-be-2` pixi task handles this automatically by using a separate home directory. If running BEs manually, use different `HOME` dirs or remove the stale lock: `rm -f ~/.sirius/sirius.lock`
 - **"CUDA error" on startup**: Verify `nvidia-smi` works and CUDA driver version is >= 13.0 (or >= 12.0 for cuda12 env).
 - **BE not appearing in `SHOW BACKENDS`**: Check that `--fe` points to the correct FE address. The BE self-registers via the FE HTTP API on port 8030.
 - **Query hangs/timeout**: `COUNT(*)` without `GROUP BY` causes a GPU hang (known DUMMY_SCAN issue). Use `COUNT(*) ... GROUP BY ...` or add `WHERE` clauses. The GPU engine falls back to CPU for unsupported patterns in default mode.

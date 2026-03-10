@@ -98,7 +98,7 @@ doris-build = { cmd = "NIXL_PREFIX=$CONDA_PREFIX NIXL_NO_STUBS_FALLBACK=1 cargo 
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
 # Start Sirius GPU BEs with offset ports (for running alongside regular Doris BE)
 sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --gpu-cache-size 2GB --gpu-processing-size 2GB --fe 127.0.0.1:9030", description = "Run Sirius GPU BE 1 (ports 19xxx/18xxx)" }
-sirius-be-2 = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 29050 --be-port 29060 --brpc-port 28060 --http-port 28040 --arrow-flight-port 28071 --gpu-cache-size 2GB --gpu-processing-size 2GB --advertise-host 127.0.0.3 --fe 127.0.0.1:9030", description = "Run Sirius GPU BE 2 (ports 29xxx/28xxx)" }
+sirius-be-2 = { cmd = "bash -c 'mkdir -p /tmp/sirius-be-2/.sirius && cp -n ~/.sirius/sirius.cfg /tmp/sirius-be-2/.sirius/ 2>/dev/null; HOME=/tmp/sirius-be-2 exec doris/target/release/sirius-doris-be --heartbeat-port 29050 --be-port 29060 --brpc-port 28060 --http-port 28040 --arrow-flight-port 28071 --gpu-cache-size 2GB --gpu-processing-size 2GB --advertise-host 127.0.0.3 --fe 127.0.0.1:9030'", description = "Run Sirius GPU BE 2 (ports 29xxx/28xxx, separate HOME for lock)" }
 
 # Doris FE feature: build & run Doris Frontend from source for testing
 [feature.doris-fe.dependencies]
