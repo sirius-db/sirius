@@ -41,25 +41,36 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
   const cucascade::memory::memory_space* requested_memory_space,
   rmm::cuda_stream_view stream)
 {
+  using status = cucascade::lock_for_processing_status;
   const auto* target_space =
     requested_memory_space != nullptr ? requested_memory_space : batch->get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
-  auto lock_result = batch->try_to_lock_for_processing(target_space->get_id());
+  // NOTE: only works in single gpu setup
+  // wait for processing in case a shared batch is in transit in another thread.
+  auto lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
 
-  auto cancel_task_if_needed = []() {};
+  auto cancel_task_if_needed = []() {
+    SIRIUS_LOG_ERROR(
+      "gpu_pipeline_task: failed to lock batch for processing and cannot prepare batch for "
+      "processing. This likely means the batch is in transit and there is a bug in "
+      "the in-transit locking logic. Cancelling task to avoid deadlock.");
+  };
 
-  const bool needs_conversion =
-    requested_memory_space != nullptr &&
-    lock_result.status == cucascade::lock_for_processing_status::memory_space_mismatch;
-
-  if (!lock_result.success && needs_conversion) {
+  while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
     try {
       auto& registry = sirius::converter_registry::get();
       switch (requested_memory_space->get_tier()) {
         case cucascade::memory::Tier::GPU: {
           auto prev_state = batch->get_state();
           if (!batch->try_to_lock_for_in_transit()) {
+            auto current_state = batch->get_state();
+            if (current_state == cucascade::batch_state::in_transit) {
+              // If another thread has taken the in_transit lock, wait to acquire the processing
+              // lock.
+              lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
+              continue;
+            }
             cancel_task_if_needed();
             return std::nullopt;
           }
@@ -345,7 +356,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     auto handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     if (!handle) {
-      // Failed to lock (or convert) one of the batches. Caller can retry later.
+      // trick to retry the task
+      throw oom_reschedule_exception(std::move(local_state._input_data),
+                                     0,
+                                     "Failed to lock or prepare batch " +
+                                       std::to_string(batch->get_batch_id()) + " for processing");
       return;
     }
     processing_handles.emplace_back(std::move(*handle));
