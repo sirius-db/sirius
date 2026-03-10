@@ -97,6 +97,9 @@ class sirius_physical_partition : public sirius_physical_operator {
   std::pair<int, uint64_t> determine_num_partitions();
   sirius_physical_operator* _parent_op            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
+  sirius_physical_operator* _hash_join_op =
+    nullptr;  // hash join operator that this partition operator feeds into (optional: for
+              // hash_joins only)
   std::vector<int> _partition_keys;
   /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
   /// cast the key column to this type before hashing.  Used to align hash values when the

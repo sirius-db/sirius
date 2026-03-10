@@ -73,6 +73,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
                                                             bool is_build)
 {
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    _hash_join_op      = op;  // set the hash join operator pointer for later use
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
@@ -278,8 +279,10 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto [num_parts, total_bytes] = determine_num_partitions();
-      _num_partitions               = num_parts;
-      sibling._num_partitions       = num_parts;
+      _hash_join_op->Cast<sirius_physical_hash_join>().update_join_exec_mode(num_parts,
+                                                                             total_bytes);
+      _num_partitions         = num_parts;
+      sibling._num_partitions = num_parts;
       SIRIUS_LOG_DEBUG(
         "sirius_physical_partition id {} determined {} partitions from {} bytes on sibling id {} "
         "and {} build "

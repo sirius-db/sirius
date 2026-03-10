@@ -210,7 +210,9 @@ void gpu_pipeline_executor::manager_loop()
         for (auto* consumer : consumers) {
           // Don't wake up FULL-barrier consumers until the pipeline is completely
           // done — doing so just causes repeated no-op dependency walks (spin loop).
-          if (consumer && !pipeline_done && consumer->has_full_barrier_from(pipeline)) { continue; }
+          // if (consumer && !pipeline_done /*&& consumer->has_full_barrier_from(pipeline)*/) {
+          //   continue;
+          // }
           _task_creator->schedule(consumer);
         }
       }

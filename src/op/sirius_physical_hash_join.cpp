@@ -354,9 +354,9 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (num_partitions == 1 && build_side_bytes < MAX_BUILD_HASH_TABLE_BYTES &&
-      (join_type != duckdb::JoinType::SEMI || join_type != duckdb::JoinType::RIGHT_SEMI ||
-       join_type != duckdb::JoinType::ANTI || join_type != duckdb::JoinType::RIGHT_ANTI ||
-       join_type != duckdb::JoinType::RIGHT) &&
+      join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::RIGHT_SEMI &&
+      join_type != duckdb::JoinType::ANTI && join_type != duckdb::JoinType::RIGHT_ANTI &&
+      join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&
       _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
     // Switch to a more efficient join strategy for small datasets
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
@@ -371,6 +371,7 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
 
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
+  std::lock_guard<std::mutex> lg(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // In build-probe mode, we must build the hash table before we can process any probe batches.
     // If the hash table is not built yet, hint to prioritize building it.
@@ -381,10 +382,13 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         "In sirius_physical_hash_join:get_next_task_hint: missing expected ports in operator " +
         std::to_string(this->get_operator_id()));
     }
+    auto build_size = build_port->repo->total_size();
+    auto probe_size = probe_port->repo->total_size();
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::NOT_BUILT) {
-      if (build_port->repo->total_size() > 0 && probe_port->repo->total_size() > 0) {
+      if (build_size > 0 && probe_size > 0) {
+        _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULING;
         return task_creation_hint{TaskCreationHint::READY, this};
-      } else if (build_port->repo->total_size() == 0) {
+      } else if (build_size == 0) {
         // No build batch available yet, hint to wait for build input data.
         auto* producer = &build_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
@@ -393,7 +397,8 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
-    } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
+    } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING ||
+               _hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
       // Hash table is currently being built, hint to wait for it to be ready.
       auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
@@ -425,7 +430,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       "ports in operator " +
       std::to_string(this->get_operator_id()));
   }
-  if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::NOT_BUILT) {
+  if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING) {
     if (build_port->repo->num_partitions() != 1 || build_port->repo->size(0) != 1 ||
         probe_port->repo->num_partitions() != 1) {
       throw std::runtime_error(
@@ -464,10 +469,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     }
     return std::make_unique<operator_data>(input_batch);
   } else {
-    throw std::runtime_error(
+    SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
-      "build state in operator " +
-      std::to_string(this->get_operator_id()));
+      "build state {} in operator {}",
+      _hash_table_build_state,
+      this->get_operator_id()));
+    return nullptr;
   }
 }
 
@@ -731,10 +738,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
   const auto& input_batches = input_data.get_data_batches();
-  if (input_batches.size() != 2) {
-    throw std::runtime_error("Expected 2 input batches for hash join, got " +
-                             std::to_string(input_batches.size()) + " input batches");
-  }
+
   if (is_all_inequality_join) {
     throw std::runtime_error(
       "Error sirius_physical_hash_join being asked to do all inequality join of type: " +
@@ -764,8 +768,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                // batches to proceed.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
       }
-
-    } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
+    }
+    if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe batches. The probe-side keys will be processed in
       // the same way as the mixed join path, but with an equality-only predicate.
       auto probe_keys_result      = prepare_join_keys(input_batches[0],
@@ -796,12 +800,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       right_full = _build_table->view();
 
     } else {
-      throw std::runtime_error(
-        "In sirius_physical_hash_join::execute: invalid hash table build state in BUILD_PROBE "
-        "mode");
+      throw std::runtime_error(fmt::format(
+        "In sirius_physical_hash_join::execute: invalid hash table build state {} in BUILD_PROBE "
+        "mode for operator id {}",
+        static_cast<int>(_hash_table_build_state),
+        this->get_operator_id()));
     }
 
   } else if (_join_mode == HASH_JOIN_MODE::MIXED_JOIN) {
+    if (input_batches.size() != 2) {
+      throw std::runtime_error("Expected 2 input batches for hash join, got " +
+                               std::to_string(input_batches.size()) + " input batches");
+    }
     left_full  = get_cudf_table_view(*input_batches[0]);
     right_full = get_cudf_table_view(*input_batches[1]);
     // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
@@ -944,6 +954,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                duckdb::JoinTypeToString(join_type));
     }
   } else {  // STANDARD HASH JOIN
+    if (input_batches.size() != 2) {
+      throw std::runtime_error("Expected 2 input batches for hash join, got " +
+                               std::to_string(input_batches.size()) + " input batches");
+    }
     left_full                   = get_cudf_table_view(*input_batches[0]);
     right_full                  = get_cudf_table_view(*input_batches[1]);
     auto left_keys_result       = prepare_join_keys(input_batches[0],

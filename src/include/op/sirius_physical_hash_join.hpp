@@ -45,7 +45,7 @@ namespace op {
 // for better pipelining with other operators, and allows reusing the hash table. MIXED_JOIN uses
 // cudf's mixed_join API for joins with both equality and inequality conditions.
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
-enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULED, BUILT };
+enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT };
 
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
