@@ -18,6 +18,7 @@
 
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -65,6 +66,60 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
     throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join: " +
                              SiriusPhysicalOperatorToString(parent_op->type));
   }
+}
+
+std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
+{
+  std::lock_guard<std::mutex> lg(lock);
+
+  if (ports.size() != 1) {
+    throw std::runtime_error("sirius_physical_concat: there should be only one port");
+  }
+
+  auto port_ptr          = ports.begin()->second;
+  bool pipeline_finished = port_ptr->src_pipeline && port_ptr->src_pipeline->is_pipeline_finished();
+
+  // If the source pipeline is done, we're ready to process whatever data remains
+  if (pipeline_finished) {
+    if (port_ptr->repo->total_size() > 0) {
+      return task_creation_hint{TaskCreationHint::READY, this};
+    }
+    return std::nullopt;
+  } else if (_concat_all) {
+    // if we need to concat all then we need to wait for the pipeline to be finished
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                              &(port_ptr->src_pipeline->get_operators()[0].get())};
+  }
+
+  // Source pipeline still running — check if there is enough data to fire a task early.
+  // "Enough" means: for some partition, simulating get_next_task_input_data would pull a group
+  // of batches AND there would still be at least one batch left in that partition afterward.
+  for (size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
+    auto batch_ids          = port_ptr->repo->get_batch_ids(i);
+    size_t total_batch_size = 0;
+    size_t pulled_count     = 0;
+    for (auto& batch_id : batch_ids) {
+      auto batch      = port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
+      auto batch_size = batch->get_data()->get_size_in_bytes();
+      total_batch_size += batch_size;
+      if (!_concat_all && total_batch_size > _concat_batch_bytes) {
+        // This batch pushes us over the threshold — the loop would stop here.
+        // If we already accumulated batches (pulled_count > 0), the overflowing batch stays,
+        // so there is at least one batch left after the pull.
+        if (pulled_count > 0) { return task_creation_hint{TaskCreationHint::READY, this}; }
+        // If nothing was accumulated yet, the single oversized batch itself would be pulled,
+        // and remaining data is everything after it.
+        if (batch_ids.size() > 1) { return task_creation_hint{TaskCreationHint::READY, this}; }
+        break;
+      } else {
+        pulled_count++;
+      }
+    }
+  }
+
+  // Not enough data yet — wait for more from the source pipeline
+  return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                            &(port_ptr->src_pipeline->get_operators()[0].get())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data()
