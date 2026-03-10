@@ -394,8 +394,9 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // In build-probe mode, we must build the hash table before we can process any probe batches.
-    // If the hash table is not built yet, hint to prioritize building it.
+    // In build-probe mode, we want the first task to be with one batch from either side.
+    // In the first batch we will build the hash table, then we only need batches from the probe
+    // side.
     auto* build_port = get_port("build");
     auto* probe_port = get_port("default");
     if (!build_port || !probe_port) {
@@ -1059,10 +1060,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 void sirius_physical_hash_join::finalize_operator()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
-  _hash_table.reset();
-  _build_table.reset();
-  _built_table_cast_columns.clear();
-  _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+  if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
+    _hash_table.reset();
+    _build_table.reset();
+    _built_table_cast_columns.clear();
+    _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+  }
 }
 
 }  // namespace op
