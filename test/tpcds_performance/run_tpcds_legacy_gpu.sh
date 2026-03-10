@@ -3,11 +3,11 @@
 # Run the 22 TPC-DS queries that execute on GPU via legacy Sirius (gpu_processing).
 #
 # Usage:
-#   ./run_tpcds_gpu.sh <gpu_caching_size> <gpu_processing_size> [options]
+#   ./run_tpcds_legacy_gpu.sh <gpu_caching_size> <gpu_processing_size> [options]
 #
 # Examples:
-#   ./run_tpcds_gpu.sh "1 GB" "2 GB"
-#   ./run_tpcds_gpu.sh "10 GB" "20 GB" --sf 10
+#   ./run_tpcds_legacy_gpu.sh "1 GB" "2 GB"
+#   ./run_tpcds_legacy_gpu.sh "10 GB" "20 GB" --sf 10
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

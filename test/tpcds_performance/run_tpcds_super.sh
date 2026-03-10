@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Run TPC-DS benchmark on legacy Sirius (gpu_processing).
+# Run TPC-DS benchmark on new Sirius (gpu_execution) against parquet files.
 #
-# Requires data to be pre-generated via generate_tpcds_data.sh.
-# Each query runs in its own DuckDB process. Each query is run twice
-# (cold + warm).
+# Uses gpu_execution (new Sirius) — no gpu_buffer_init needed.
+# Creates views from parquet files, then runs each query twice (cold + warm).
 #
 # Usage:
-#   ./run_tpcds_legacy.sh <gpu_caching_size> <gpu_processing_size> [options]
+#   ./run_tpcds_super.sh <parquet_dir> [options]
 #
 # Examples:
-#   ./run_tpcds_legacy.sh "1 GB" "2 GB"
-#   ./run_tpcds_legacy.sh "1 GB" "2 GB" --sf 1 --queries 1 2 3
-#   ./run_tpcds_legacy.sh "10 GB" "20 GB" --sf 10 --queries $(seq 1 99)
-#   ./run_tpcds_legacy.sh "1 GB" "2 GB" --db /data/tpcds_sf1.duckdb
+#   ./run_tpcds_super.sh /data/tpcds_parquet_sf1
+#   ./run_tpcds_super.sh /data/tpcds_parquet_sf10 --queries 3 7 17 25
+#   ./run_tpcds_super.sh /data/tpcds_parquet_sf100 --output-dir /results/sf100
 #
 # Options:
-#   --sf <N>              Scale factor, used to locate database (default: 1)
-#   --db <path>           Override path to DuckDB database file
 #   --queries <N...>      Specific query numbers to run (default: all 1-99)
 #   --output-dir <path>   Directory for results
 # =============================================================================
@@ -27,36 +23,23 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
-EXTENSION="$PROJECT_DIR/build/release/extension/sirius/sirius.duckdb_extension"
 QUERY_DIR="$SCRIPT_DIR/queries"
 
 # --- Parse arguments ---
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 <gpu_caching_size> <gpu_processing_size> [--sf N] [--db path] [--queries N...] [--output-dir path]"
-    echo "Example: $0 '1 GB' '2 GB' --sf 1 --queries 1 2 3"
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <parquet_dir> [--queries N...] [--output-dir path]"
+    echo "Example: $0 /data/tpcds_parquet_sf1 --queries 3 7 17 25"
     exit 1
 fi
 
-GPU_CACHING_SIZE="$1"
-shift
-GPU_PROCESSING_SIZE="$1"
+PARQUET_DIR="$1"
 shift
 
-SF=1
-DB_PATH=""
 OUTPUT_DIR=""
 QUERIES=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --sf)
-            SF="$2"
-            shift 2
-            ;;
-        --db)
-            DB_PATH="$2"
-            shift 2
-            ;;
         --output-dir)
             OUTPUT_DIR="$2"
             shift 2
@@ -75,66 +58,87 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Legacy Sirius uses gpu_buffer_init + gpu_processing; config file interferes
-unset SIRIUS_CONFIG_FILE
-
 # Defaults
-if [ -z "$DB_PATH" ]; then
-    DB_PATH="$PROJECT_DIR/test_datasets/tpcds_sf${SF}.duckdb"
-fi
-
 if [ ${#QUERIES[@]} -eq 0 ]; then
     QUERIES=($(seq 1 99))
 fi
 
 if [ -z "$OUTPUT_DIR" ]; then
-    OUTPUT_DIR="$PROJECT_DIR/tpcds_results_sf${SF}"
+    OUTPUT_DIR="$PROJECT_DIR/tpcds_super_results"
 fi
 mkdir -p "$OUTPUT_DIR"
 
 # --- Validate prerequisites ---
+if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
+    echo "ERROR: SIRIUS_CONFIG_FILE is not set."
+    echo "Super Sirius (gpu_execution) requires a config file."
+    echo "Usage: export SIRIUS_CONFIG_FILE=/path/to/config.cfg"
+    exit 1
+fi
+
+if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
+    echo "ERROR: Config file not found: $SIRIUS_CONFIG_FILE"
+    exit 1
+fi
+
 if [ ! -x "$DUCKDB" ]; then
     echo "ERROR: DuckDB binary not found at $DUCKDB"
     echo "Build first: CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc) make"
     exit 1
 fi
 
-if [ ! -f "$EXTENSION" ]; then
-    echo "ERROR: Sirius extension not found at $EXTENSION"
-    echo "Build first: CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc) make"
-    exit 1
-fi
-
-if [ ! -f "$DB_PATH" ]; then
-    echo "ERROR: Database file not found: $DB_PATH"
-    echo "Generate data first: bash $SCRIPT_DIR/generate_tpcds_data.sh $SF"
+if [ ! -d "$PARQUET_DIR" ]; then
+    echo "ERROR: Parquet directory not found: $PARQUET_DIR"
+    echo "Generate data first: bash $SCRIPT_DIR/generate_tpcds_data.sh <SF> --format parquet"
     exit 1
 fi
 
 if [ ! -d "$QUERY_DIR" ]; then
     echo "ERROR: Query directory not found: $QUERY_DIR"
-    echo "Generate queries first: bash $SCRIPT_DIR/generate_tpcds_data.sh $SF"
+    echo "Generate queries first: bash $SCRIPT_DIR/generate_tpcds_data.sh <SF>"
     exit 1
 fi
+
+# --- Build CREATE VIEW statements for all TPC-DS tables ---
+TPCDS_TABLES=(
+    call_center catalog_page catalog_returns catalog_sales
+    customer customer_address customer_demographics date_dim
+    household_demographics income_band inventory item
+    promotion reason ship_mode store
+    store_returns store_sales time_dim warehouse
+    web_page web_returns web_sales web_site
+)
+
+VIEW_SQL=""
+for TABLE_NAME in "${TPCDS_TABLES[@]}"; do
+    FILES=()
+    for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" \
+             "$PARQUET_DIR/${TABLE_NAME}_"*.parquet \
+             "$PARQUET_DIR/${TABLE_NAME}/"*.parquet; do
+        [ -f "$f" ] && FILES+=("'$f'")
+    done
+    if [ ${#FILES[@]} -eq 0 ]; then
+        echo "WARNING: No parquet files found for table $TABLE_NAME"
+        continue
+    fi
+    FILE_LIST=$(IFS=,; echo "${FILES[*]}")
+    VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet([${FILE_LIST}]);"$'\n'
+done
 
 # --- Initialize output ---
 TIMING_FILE="$OUTPUT_DIR/timings.csv"
 echo "query,run1_time,run1_status,run2_time,run2_status" > "$TIMING_FILE"
 
 echo "=========================================="
-echo "TPC-DS Benchmark — Legacy Sirius (gpu_processing)"
+echo "TPC-DS Benchmark — New Sirius (gpu_execution)"
 echo "=========================================="
-echo "Scale Factor:     $SF"
-echo "Database:         $DB_PATH"
-echo "GPU Caching:      $GPU_CACHING_SIZE"
-echo "GPU Processing:   $GPU_PROCESSING_SIZE"
+echo "Parquet Dir:      $PARQUET_DIR"
 echo "Queries:          ${QUERIES[*]}"
 echo "Output:           $OUTPUT_DIR"
 echo "=========================================="
 echo ""
 
 # parse_timer_output <output_text>
-# Extracts real (wall clock) times from DuckDB .timer output.
 parse_timer_output() {
     echo "$1" | grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+'
 }
@@ -160,24 +164,23 @@ for q in "${QUERIES[@]}"; do
     # Strip trailing semicolons from the query
     CLEANED_SQL=$(echo "$QUERY_SQL" | sed 's/;[[:space:]]*$//')
 
-    # Escape inner double quotes, then wrap with gpu_processing("...")
+    # Escape inner double quotes, then wrap with gpu_execution("...")
     ESCAPED_SQL=$(echo "$CLEANED_SQL" | sed 's/"/\\"/g')
 
-    # Write SQL file using printf to avoid bash heredoc expansion issues
+    # Write SQL file: views, timer, then two runs of gpu_execution
     TEMP_SQL="$OUTPUT_DIR/tmp_q${q}.sql"
     {
-        printf "CALL gpu_buffer_init('%s', '%s');\n" "$GPU_CACHING_SIZE" "$GPU_PROCESSING_SIZE"
+        printf '%s\n' "$VIEW_SQL"
         printf ".timer on\n"
-        printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
-        printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
+        printf 'CALL gpu_execution("%s");\n' "$ESCAPED_SQL"
+        printf 'CALL gpu_execution("%s");\n' "$ESCAPED_SQL"
     } > "$TEMP_SQL"
 
     Q_RESULT_FILE="$OUTPUT_DIR/result_q${q}.txt"
     Q_LOG="$OUTPUT_DIR/log_q${q}.txt"
 
-    # Run in a fresh DuckDB process against the pre-generated database
-    OUTPUT=$("$DUCKDB" "$DB_PATH" < "$TEMP_SQL" 2>&1) || true
-    EXIT_CODE=${PIPESTATUS[0]:-$?}
+    # Run in a fresh DuckDB process (no database file needed — views read parquet)
+    OUTPUT=$("$DUCKDB" < "$TEMP_SQL" 2>&1) || true
 
     echo "$OUTPUT" > "$Q_LOG"
     rm -f "$TEMP_SQL"
