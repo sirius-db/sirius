@@ -222,38 +222,15 @@ impl NixlExchange {
     /// from any sub-allocation pointer. The registration is cached — subsequent
     /// calls with pointers in the same pool are no-ops.
     ///
+    /// Register the RMM processing pool with nixl using base/size from the engine.
+    ///
+    /// The pool info comes from `sirius_get_pool_info()` which queries the
+    /// GPUBufferManager directly — this avoids `cuMemGetAddressRange` which
+    /// can't properly report size for RMM pool sub-allocations.
+    ///
     /// Returns `true` if the pool is registered (either freshly or from cache),
     /// `false` if registration failed (caller should fall back to copy path).
-    pub fn ensure_rmm_pool_registered(&self, any_rmm_ptr: usize, device_id: u64) -> bool {
-        use crate::cuda_driver::{cuda_mem_get_address_range, cuda_pointer_get_memory_type};
-
-        // First, verify the pointer is actually device memory.
-        match cuda_pointer_get_memory_type(any_rmm_ptr) {
-            Ok(mem_type) => {
-                // CU_MEMORYTYPE_DEVICE = 2
-                if mem_type != 2 {
-                    warn!(
-                        ptr = format_args!("0x{any_rmm_ptr:x}"),
-                        mem_type,
-                        "RMM pointer is not device memory, cannot register pool"
-                    );
-                    return false;
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to query memory type for RMM pointer");
-                return false;
-            }
-        }
-
-        // Discover the pool base address.
-        let (base, size) = match cuda_mem_get_address_range(any_rmm_ptr) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "cuMemGetAddressRange failed for RMM pointer");
-                return false;
-            }
-        };
+    pub fn ensure_rmm_pool_registered(&self, base: usize, size: usize, device_id: u64) -> bool {
 
         let mut pool_reg = self.rmm_pool_registration.lock().unwrap();
 

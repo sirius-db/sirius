@@ -53,22 +53,36 @@ impl ExecutionLocation {
 
     /// Try to register the RMM pool with nixl so buffers can be used directly.
     ///
-    /// MUST be called on the same thread where GPU execution happened (inside
-    /// spawn_blocking), while the engine's CUDA context is still active.
+    /// Uses `engine.get_pool_info()` to query the processing pool directly from
+    /// the GPUBufferManager, avoiding `cuMemGetAddressRange` which returns wrong
+    /// sizes for RMM sub-allocations.
     ///
     /// Returns `true` if the pool was registered and copies can be skipped.
     /// On failure, caller should fall back to `copy_gpu_buffers_to_cuda_alloc`.
-    pub fn try_register_rmm_pool(&mut self, nixl_agent: &NixlExchange) -> bool {
+    pub fn try_register_rmm_pool(&mut self, nixl_agent: &NixlExchange, engine: &sirius_ffi::SiriusEngine) -> bool {
         if let Self::Gpu { buffers, rmm_pool_registered, .. } = self {
             if buffers.is_empty() {
                 return false;
             }
-            let first = &buffers[0];
-            if nixl_agent.ensure_rmm_pool_registered(first.addr, first.device_id) {
+            // Query pool info from the Sirius engine (GPUBufferManager).
+            let (base, size, device_id) = match engine.get_pool_info() {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    tracing::warn!("sirius_get_pool_info returned no data");
+                    return false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "sirius_get_pool_info failed");
+                    return false;
+                }
+            };
+            if nixl_agent.ensure_rmm_pool_registered(base, size, device_id as u64) {
                 let buf_tuples: Vec<_> = buffers.iter().map(|b| (b.addr, b.len, b.device_id)).collect();
                 if nixl_agent.buffers_in_rmm_pool(&buf_tuples) {
                     tracing::info!(
                         num_buffers = buffers.len(),
+                        pool_base = format_args!("0x{base:x}"),
+                        pool_size_mb = size / (1024 * 1024),
                         "RMM pool registered, skipping cuMemAlloc copy"
                     );
                     *rmm_pool_registered = true;
@@ -90,7 +104,7 @@ impl ExecutionLocation {
     /// which UCX can reliably use for GPU-direct transfers.
     pub fn copy_gpu_buffers_to_cuda_alloc(&mut self) {
         if let Self::Gpu { buffers, cuda_alloc_addrs, .. } = self {
-            use crate::cuda_driver::{cuda_alloc, cuda_free, cuda_memcpy_dtod};
+            use crate::cuda_driver::{cuda_alloc, cuda_free, cuda_memcpy_dtod_no_ctx as cuda_memcpy_dtod};
             let mut new_buffers = Vec::with_capacity(buffers.len());
             let mut alloc_addrs = Vec::new();
             for b in buffers.iter() {

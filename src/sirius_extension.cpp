@@ -1061,6 +1061,47 @@ void SiriusExtension::ReleaseGPUBuffersFunction(
   data.finished = true;
 }
 
+// --- sirius_get_pool_info() table function ---
+// Returns the RMM processing pool base address and size for nixl GPU-direct registration.
+
+struct GetPoolInfoData : public TableFunctionData {
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> GetPoolInfoBind(
+  ClientContext& context,
+  TableFunctionBindInput& input,
+  vector<LogicalType>& return_types,
+  vector<string>& names)
+{
+  return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::INTEGER};
+  names = {"pool_base", "pool_size", "device_id"};
+  return make_uniq<GetPoolInfoData>();
+}
+
+void GetPoolInfoFunction(
+  ClientContext& context,
+  TableFunctionInput& data_p,
+  DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<GetPoolInfoData>();
+  if (data.finished) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  auto& mgr = GPUBufferManager::GetInstance();
+  // Return pool base address and processing size for GPU 0.
+  auto base = reinterpret_cast<uintptr_t>(mgr.gpuProcessing[0]);
+  auto size = static_cast<int64_t>(mgr.processing_size_per_gpu);
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(base)));
+  output.SetValue(1, 0, Value::BIGINT(size));
+  output.SetValue(2, 0, Value::INTEGER(0));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -1114,6 +1155,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                      GPUAllocateBuffersBind);
   CreateTableFunctionInfo gpu_allocate_buffers_info(gpu_allocate_buffers);
   catalog.CreateTableFunction(transaction, gpu_allocate_buffers_info);
+
+  TableFunction get_pool_info("sirius_get_pool_info",
+                              {},
+                              GetPoolInfoFunction,
+                              GetPoolInfoBind);
+  CreateTableFunctionInfo get_pool_info_info(get_pool_info);
+  catalog.CreateTableFunction(transaction, get_pool_info_info);
 
   TableFunction retain_gpu_buffers("sirius_retain_gpu_buffers",
                                     {},

@@ -70,6 +70,32 @@ pub fn cuda_free(dev_addr: usize) -> Result<(), String> {
         .map_err(|e| format!("cuMemFree(0x{dev_addr:x}): {e}"))
 }
 
+/// Query the allocation base address and size for a device pointer.
+///
+/// Unlike `cuda_mem_get_address_range`, this does NOT switch the CUDA context.
+/// Use when already in the correct context (e.g. inside spawn_blocking after
+/// GPU execution where the engine's CUDA context is active).
+pub fn cuda_mem_get_address_range_no_ctx(dev_addr: usize) -> Result<(usize, usize), String> {
+    let mut base: u64 = 0;
+    let mut size: usize = 0;
+    unsafe {
+        sys::cuMemGetAddressRange_v2(&mut base, &mut size, dev_addr as u64)
+    }
+    .result()
+    .map_err(|e| format!("cuMemGetAddressRange(0x{dev_addr:x}): {e}"))?;
+    Ok((base as usize, size))
+}
+
+/// Copy GPU memory device-to-device without switching CUDA context.
+///
+/// Use when already in the correct context (e.g. inside spawn_blocking after
+/// GPU execution where the engine's CUDA context is active).
+pub fn cuda_memcpy_dtod_no_ctx(dst: usize, src: usize, len: usize) -> Result<(), String> {
+    unsafe { sys::cuMemcpyDtoD_v2(dst as u64, src as u64, len) }
+        .result()
+        .map_err(|e| format!("cuMemcpyDtoD(dst=0x{dst:x}, src=0x{src:x}, len={len}): {e}"))
+}
+
 /// Copy GPU memory device-to-device using CUDA driver API.
 pub fn cuda_memcpy_dtod(dst: usize, src: usize, len: usize) -> Result<(), String> {
     ensure_cuda_context()?;
