@@ -80,8 +80,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Release the partition boundaries table to free GPU memory
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
-  void finalize_operator() override { clear_partition_boundaries(); }
-
  private:
   //! Partition boundary rows (P-1 rows containing sort key column values)
   std::unique_ptr<cudf::table> _partition_boundaries;
