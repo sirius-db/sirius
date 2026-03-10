@@ -16,6 +16,7 @@
 
 #include "downgrade/downgrade_executor.hpp"
 
+#include "duckdb/common/types/uuid.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -26,21 +27,6 @@
 
 namespace sirius {
 namespace parallel {
-
-void downgrade_executor::schedule(std::unique_ptr<itask> task)
-{
-  auto downgrade_task = cast_to_downgrade_task(task.get());
-  if (!downgrade_task) {
-    itask_executor::schedule(std::move(task));
-    return;
-  }
-  itask_executor::schedule(std::move(task));
-}
-
-downgrade_task* downgrade_executor::cast_to_downgrade_task(itask* task)
-{
-  return dynamic_cast<downgrade_task*>(task);
-}
 
 void downgrade_executor::start()
 {
@@ -244,8 +230,13 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
 
   size_t task_count = 0;
   for (auto& batch : all_candidates) {
-    auto local_state =
-      std::make_unique<downgrade_task_local_state>(task_count, 0, std::move(batch));
+    auto data_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
+    SIRIUS_LOG_TRACE("[downgrade] scheduling batch {} ({} B) on tier {}",
+                     batch->get_batch_id(),
+                     data_size,
+                     static_cast<int>(source_tier));
+    auto local_state = std::make_unique<downgrade_task_local_state>(
+      duckdb::UUIDv7().GenerateRandomUUID().lower, 0, std::move(batch));
     auto task = std::make_unique<downgrade_task>(std::move(local_state), global_state);
     schedule_downgrade_task(std::move(task));
     ++task_count;

@@ -15,13 +15,16 @@
  */
 
 #include "downgrade/downgrade_task.hpp"
-// #include "downgrade/downgrade_executor.hpp"
+
 #include "data/sirius_converter_registry.hpp"
+#include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
+
+#include <chrono>
 
 namespace sirius {
 namespace parallel {
@@ -51,6 +54,7 @@ void downgrade_task::execute(rmm::cuda_stream_view stream)
   }
 
   auto data_size = batch->get_data()->get_size_in_bytes();
+  auto t_start   = std::chrono::steady_clock::now();
 
   try {
     auto& mr_manager = _global_state->cast<downgrade_task_global_state>()._reservation_manager;
@@ -70,6 +74,16 @@ void downgrade_task::execute(rmm::cuda_stream_view stream)
 
     // Release the in-transit lock, restoring the batch to its previous state
     batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+
+    auto duration_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+    double throughput_mbs =
+      (duration_ms > 0.0) ? (data_size / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
+    SIRIUS_LOG_TRACE("[downgrade] batch {} done: {} B in {:.2f} ms ({:.1f} MB/s)",
+                     batch->get_batch_id(),
+                     data_size,
+                     duration_ms,
+                     throughput_mbs);
 
     mark_task_completion();
     return;

@@ -331,6 +331,18 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   processing_handles.reserve(local_state._input_data->get_data_batches().size());
 
   for (const auto& batch : local_state._input_data->get_data_batches()) {
+    auto* resident_space = batch->get_memory_space();
+    if (requested_memory_space && resident_space &&
+        resident_space->get_id() != requested_memory_space->get_id()) {
+      SIRIUS_LOG_TRACE(
+        "Pipeline {}: fetching batch {} from tier {} to tier {} for operator {} (id={})",
+        pipeline->get_pipeline_id(),
+        batch->get_batch_id(),
+        static_cast<int>(resident_space->get_tier()),
+        static_cast<int>(requested_memory_space->get_tier()),
+        first_op.get_name(),
+        first_op.get_operator_id());
+    }
     auto handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     if (!handle) {
       // Failed to lock (or convert) one of the batches. Caller can retry later.
