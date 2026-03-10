@@ -105,7 +105,7 @@ void duckdb_scan_executor::set_completion_handler(
 
 void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
 {
-  if (!_caching_enabled) { return; }
+  if (_cache_level == cache_level::NONE) { return; }
   std::hash<std::string> hash_fn;
   auto new_query_hash = hash_fn(query);
   if (new_query_hash == _query_hash) {
@@ -117,24 +117,23 @@ void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query
   _cache.clear();
 }
 
-void duckdb_scan_executor::set_scan_caching_enabled(bool enabled,
-                                                    bool cache_decoded_table,
-                                                    bool cache_in_gpu)
+void duckdb_scan_executor::set_scan_caching_enabled(cache_level level)
 {
-  _caching_enabled     = enabled;
-  _cache_decoded_table = cache_decoded_table;
-  _cache_in_gpu        = cache_in_gpu;
-  _wrap_batch_data     = _caching_enabled && !_cache_in_gpu;
-  SIRIUS_LOG_INFO("Scan caching {} (cache_decoded_table={}, cache_in_gpu={})",
-                  enabled ? "enabled" : "disabled",
-                  cache_decoded_table,
-                  cache_in_gpu);
+  if (level == _cache_level) { return; }
+  {
+    std::lock_guard lock(_cache_mutex);
+    _cache.clear();  // Clear cache when changing caching config
+  }
+  _cache_level = level;
+  std::string level_str;
+  enum_to_string(level, level_str);
+  SIRIUS_LOG_INFO("Scan caching level set to {}", level_str);
 }
 
 void duckdb_scan_executor::prepare_cache_for_scan_operators(
   const std::vector<sirius::op::sirius_physical_operator*>& scan_operators)
 {
-  if (!_caching_enabled) { return; }
+  if (_cache_level == cache_level::NONE) { return; }
 
   std::lock_guard<std::mutex> lock(_cache_mutex);
   _preload_mode = !_cache.empty();
@@ -174,7 +173,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 
   auto clone_batches = [&](const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
                            rmm::cuda_stream_view stream) {
-    if (_cache_in_gpu) { return batches; }
+    if (_cache_level == cache_level::TABLE_GPU) { return batches; }
     std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
     cloned_batches.reserve(batches.size());
     if (is_duckdb_scan) {
@@ -202,7 +201,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
     return cloned_batches;
   };
 
-  if (!_caching_enabled) {
+  if (_cache_level == cache_level::NONE) {
     return task->compute_task(stream);
   } else {
     auto pipe_id = task->get_pipeline_id();
@@ -249,9 +248,11 @@ void duckdb_scan_executor::manager_loop()
     auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
-      if (_caching_enabled || _cache_in_gpu) {
+      if (_cache_level != cache_level::NONE) {
+        bool wrap_batch_data     = _cache_level != cache_level::TABLE_GPU;
+        bool cache_decoded_table = _cache_level == cache_level::TABLE_HOST;
         parquet_task->set_materialized_columns(
-          _wrap_batch_data, _cache_decoded_table, _gpu_memory_space);
+          wrap_batch_data, cache_decoded_table, _gpu_memory_space);
       }
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(

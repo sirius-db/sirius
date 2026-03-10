@@ -254,9 +254,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.executor.pipeline", _gpu_pipeline_executor_config);
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache", _enable_scan_caching);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache_decoded_table", _cache_decoded_table);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache_in_gpu", _cache_in_gpu);
+  config_setter.add_config("sirius.executor.duckdb_scan.cache", _cache_level);
   config_setter.add_config("sirius.operator_params", _operator_params);
 
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
