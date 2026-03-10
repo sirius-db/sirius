@@ -31,7 +31,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DUCKDB="$PROJECT_DIR/build/release/duckdb"
+SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 
 PARQUET_DIR=""
 if [ "${1:-}" = "--parquet-dir" ]; then
@@ -60,8 +60,15 @@ if [ "$ENGINE" != "sirius" ] && [ "$ENGINE" != "duckdb" ]; then
     exit 1
 fi
 if [ "$ENGINE" == "sirius" ]; then
+    DUCKDB="$SIRIUS_DUCKDB"
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
 else
+    # Use vanilla DuckDB from the pixi environment (no Sirius extension).
+    DUCKDB=$(cd "$SCRIPT_DIR" && pixi run which duckdb 2>/dev/null) || true
+    if [ -z "$DUCKDB" ] || [ ! -x "$DUCKDB" ]; then
+        echo "ERROR: vanilla duckdb not found in pixi env. Run: cd $SCRIPT_DIR && pixi install"
+        exit 1
+    fi
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 fi
 
