@@ -127,13 +127,13 @@ for q in "${QUERIES[@]}"; do
         continue
     fi
     VALID_QUERIES+=("$q")
-    # Toggle GPU caching per query (SET is SQL but runs before the pair,
-    # so the two iterations remain back-to-back).
+    # Toggle GPU caching per query.  Bracket the SET with .timer off/on
+    # so it doesn't produce a spurious "Run Time" line in the output.
     if [ "$ENGINE" = "sirius" ]; then
         if echo " $NO_GPU_CACHE " | grep -q " $q "; then
-            echo "SET cache_in_gpu = false;" >> "$TEMP_SQL"
+            printf '.timer off\nSET cache_in_gpu = false;\n.timer on\n' >> "$TEMP_SQL"
         else
-            echo "SET cache_in_gpu = true;" >> "$TEMP_SQL"
+            printf '.timer off\nSET cache_in_gpu = true;\n.timer on\n' >> "$TEMP_SQL"
         fi
     fi
     echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
