@@ -22,9 +22,15 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_hash_join.hpp"
+
+#include <unordered_set>
 
 namespace sirius::planner {
 
@@ -102,6 +108,11 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   profiler.StartPhase(duckdb::MetricsType::PHYSICAL_PLANNER_CREATE_PLAN);
   auto plan = create_plan(*op);
   profiler.EndPhase();
+
+  // Push filter operators through joins when the filter predicates reference
+  // only one side of the join.  This reduces the data volume flowing into joins
+  // and all downstream operators.
+  plan = push_filters_through_joins(std::move(plan));
 
   plan->verify();
   return plan;
@@ -317,6 +328,128 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
 #endif
 
   return plan;
+}
+
+namespace {
+
+/// Collect all BoundReferenceExpression column indices from an expression tree.
+void collect_column_refs(duckdb::Expression& expr, std::unordered_set<duckdb::idx_t>& refs)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    refs.insert(expr.Cast<duckdb::BoundReferenceExpression>().index);
+    return;
+  }
+  duckdb::ExpressionIterator::EnumerateChildren(
+    expr, [&](duckdb::Expression& child) { collect_column_refs(child, refs); });
+}
+
+enum class FilterSide { LEFT, RIGHT, BOTH };
+
+/// Determine whether all column references in the filter expression map to
+/// the left side, right side, or both sides of the hash join.
+FilterSide determine_filter_side(duckdb::Expression& expr,
+                                 const sirius::op::sirius_physical_hash_join& join)
+{
+  std::unordered_set<duckdb::idx_t> refs;
+  collect_column_refs(expr, refs);
+  if (refs.empty()) { return FilterSide::BOTH; }
+
+  auto lhs_count = static_cast<duckdb::idx_t>(join.lhs_output_columns.col_idxs.size());
+  bool has_left  = false;
+  bool has_right = false;
+  for (auto ref : refs) {
+    if (ref < lhs_count) {
+      has_left = true;
+    } else {
+      has_right = true;
+    }
+  }
+
+  if (has_left && !has_right) { return FilterSide::LEFT; }
+  if (!has_left && has_right) { return FilterSide::RIGHT; }
+  return FilterSide::BOTH;
+}
+
+/// Remap BoundReferenceExpression indices so they reference the child table
+/// of the given join side instead of the join output.
+void remap_refs_to_child(duckdb::Expression& expr,
+                         const sirius::op::sirius_physical_hash_join& join,
+                         FilterSide side)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    auto& ref      = expr.Cast<duckdb::BoundReferenceExpression>();
+    auto lhs_count = static_cast<duckdb::idx_t>(join.lhs_output_columns.col_idxs.size());
+    if (side == FilterSide::LEFT) {
+      ref.index = static_cast<duckdb::idx_t>(join.lhs_output_columns.col_idxs[ref.index]);
+    } else {
+      ref.index =
+        static_cast<duckdb::idx_t>(join.rhs_output_columns.col_idxs[ref.index - lhs_count]);
+    }
+    return;
+  }
+  duckdb::ExpressionIterator::EnumerateChildren(
+    expr, [&](duckdb::Expression& child) { remap_refs_to_child(child, join, side); });
+}
+
+}  // anonymous namespace
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::push_filters_through_joins(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> op)
+{
+  if (!op) { return op; }
+
+  // Recursively process children first (bottom-up)
+  for (auto& child : op->children) {
+    child = push_filters_through_joins(std::move(child));
+  }
+
+  // Only interested in FILTER whose immediate child is a HASH_JOIN
+  if (op->type != sirius::op::SiriusPhysicalOperatorType::FILTER || op->children.empty() ||
+      op->children[0]->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    return op;
+  }
+
+  auto& filter = op->Cast<sirius::op::sirius_physical_filter>();
+  auto& join   = op->children[0]->Cast<sirius::op::sirius_physical_hash_join>();
+
+  // MARK joins produce a virtual boolean column that doesn't map to either
+  // child.  OUTER joins introduce NULLs that change filter semantics.  Only
+  // push through join types where output columns map directly to children.
+  if (join.join_type != duckdb::JoinType::INNER && join.join_type != duckdb::JoinType::SEMI &&
+      join.join_type != duckdb::JoinType::ANTI) {
+    return op;
+  }
+
+  auto side = determine_filter_side(*filter.expression, join);
+  if (side == FilterSide::BOTH) { return op; }
+
+  int side_idx = (side == FilterSide::LEFT) ? 0 : 1;
+
+  SIRIUS_LOG_DEBUG("Pushing filter through {} join (id {}) to {} child",
+                   (join.join_type == duckdb::JoinType::ANTI    ? "ANTI"
+                    : join.join_type == duckdb::JoinType::INNER ? "INNER"
+                                                                : "OTHER"),
+                   join.operator_id,
+                   (side == FilterSide::LEFT ? "left" : "right"));
+
+  // Remap the filter expression's column indices to reference the target
+  // child's output instead of the join's output.
+  remap_refs_to_child(*filter.expression, join, side);
+
+  // Update the filter's output types to match the target child
+  op->types = op->children[0]->children[side_idx]->types;
+
+  // Restructure: FILTER(JOIN(L, R)) → JOIN(FILTER(L), R)  or  JOIN(L, FILTER(R))
+  auto join_ptr                = std::move(op->children[0]);
+  op->children[0]              = std::move(join_ptr->children[side_idx]);
+  join_ptr->children[side_idx] = std::move(op);
+
+  // Recursively try to push the filter further through nested joins
+  join_ptr->children[side_idx] =
+    push_filters_through_joins(std::move(join_ptr->children[side_idx]));
+
+  return join_ptr;
 }
 
 }  // namespace sirius::planner
