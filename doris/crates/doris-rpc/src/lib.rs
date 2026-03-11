@@ -21,3 +21,4 @@ pub mod nixl_service;
 #[cfg(test)]
 mod nixl_exchange_mock;
 pub mod pblock_decoder;
+pub mod transfer_engine;
