@@ -224,6 +224,19 @@ struct sirius::config::custom_config_registrar<sirius::operator_params> {
   }
 };
 
+template <>
+struct sirius::config::custom_config_registrar<sirius::op::scan::scan_executor_config> {
+  static void config(sirius::config::configuration_setter& setter,
+                     sirius::op::scan::scan_executor_config& opt)
+  {
+    setter.add_config("cache", opt.cache);
+    setter.add_config(
+      "num_threads", opt.thread_pool_config.num_threads, sirius::config::greater_than<size_t>{0});
+    setter.add_config("thread_name_prefix", opt.thread_pool_config.thread_name_prefix);
+    setter.add_config("cpu_affinity", opt.thread_pool_config.cpu_affinity_list);
+  }
+};
+
 sirius_config::sirius_config()
 {
   cucascade::memory::topology_discovery discovery;
@@ -253,8 +266,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.executor.task_creator", _task_creator_config);
   config_setter.add_config("sirius.executor.pipeline", _gpu_pipeline_executor_config);
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
-  config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache", _cache_level);
+  config_setter.add_config("sirius.executor.duckdb_scan", _scan_executor_config);
   config_setter.add_config("sirius.operator_params", _operator_params);
 
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
@@ -321,7 +333,7 @@ const exec::thread_pool_config& sirius_config::get_task_creator_config() const n
 
 const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
 {
-  return _duckdb_scan_executor_config;
+  return _scan_executor_config.thread_pool_config;
 }
 
 }  // namespace sirius

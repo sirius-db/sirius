@@ -82,22 +82,18 @@ struct sirius_config {
 
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept
   {
-    return _cache_level != op::scan::cache_level::NONE;
+    return _scan_executor_config.cache != op::scan::cache_level::NONE;
   }
 
-  [[nodiscard]] bool is_cache_decoded_table_enabled() const noexcept
+  [[nodiscard]] op::scan::cache_level get_cache_level() const noexcept
   {
-    return _cache_level == op::scan::cache_level::TABLE_HOST;
+    return _scan_executor_config.cache;
   }
 
-  [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept
+  void set_cache_level(op::scan::cache_level level) noexcept
   {
-    return _cache_level == op::scan::cache_level::TABLE_GPU;
+    _scan_executor_config.cache = level;
   }
-
-  [[nodiscard]] op::scan::cache_level get_cache_level() const noexcept { return _cache_level; }
-
-  void set_cache_level(op::scan::cache_level level) noexcept { _cache_level = level; }
 
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
@@ -115,9 +111,7 @@ struct sirius_config {
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::thread_pool_config _downgrade_executor_config{.num_threads        = 4,
                                                       .thread_name_prefix = "downgrade"};
-  exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
-                                                        .thread_name_prefix = "duckdb_scan"};
-  op::scan::cache_level _cache_level = op::scan::cache_level::NONE;
+  op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
 };
 
