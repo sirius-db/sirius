@@ -22,6 +22,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
 namespace sirius {
@@ -130,12 +131,15 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   auto input_table = get_cudf_table_view(*input);
   auto mr          = memory_space.get_default_allocator();
 
-  // Dictionary-encode STRING group keys when the average string is long enough
-  // that replacing variable-length string hashing with fixed-width int32
-  // hashing in the groupby hash table pays off.  Very short strings (< 4 bytes
-  // on average) hash almost as cheaply as int32, so the encode/decode overhead
-  // is not worthwhile.
-  constexpr double dict_encode_min_avg_len = 4.0;
+  // Dictionary-encode STRING group keys when:
+  //  1. Average string length >= 4 bytes (short strings hash nearly as fast as
+  //     int32, so the encode/decode overhead is not worthwhile), AND
+  //  2. NDV / row_count < 10% (high-cardinality columns produce huge
+  //     dictionaries that negate the hashing benefit).
+  // The avg_len check is O(1) (single offset read) and gates the more
+  // expensive HLL-based NDV estimate.
+  constexpr double dict_encode_min_avg_len = 8.0;
+  constexpr double dict_encode_max_ratio   = 0.10;
   std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
   std::vector<cudf::column_view> group_cols;
   group_cols.reserve(group_idx.size());
@@ -145,21 +149,41 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       cudf::strings_column_view scv(col);
       auto avg_len = static_cast<double>(scv.chars_size(stream)) / col.size();
       if (avg_len >= dict_encode_min_avg_len) {
-        auto encoded =
-          cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-        group_cols.push_back(encoded->view());
-        encoded_key_owners.push_back(std::move(encoded));
-        SIRIUS_LOG_DEBUG("local_grouped_agg: dict-encoding key col {} (avg_len={:.1f}, rows={})",
-                         idx,
-                         avg_len,
-                         col.size());
+        cudf::approx_distinct_count adc(cudf::table_view({col}),
+                                        12,
+                                        cudf::null_policy::EXCLUDE,
+                                        cudf::nan_policy::NAN_IS_VALID,
+                                        stream);
+        auto ndv     = adc.estimate(stream);
+        double ratio = static_cast<double>(ndv) / col.size();
+        if (ratio < dict_encode_max_ratio) {
+          auto encoded =
+            cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+          group_cols.push_back(encoded->view());
+          encoded_key_owners.push_back(std::move(encoded));
+          SIRIUS_LOG_DEBUG(
+            "local_grouped_agg: dict-encoding key col {} (avg_len={:.1f}, ndv={}, rows={})",
+            idx,
+            avg_len,
+            ndv,
+            col.size());
+        } else {
+          group_cols.push_back(col);
+          SIRIUS_LOG_DEBUG(
+            "local_grouped_agg: skipping dict-encode for key col {} "
+            "(avg_len={:.1f}, ndv={}, rows={}, ratio={:.4f})",
+            idx,
+            avg_len,
+            ndv,
+            col.size(),
+            ratio);
+        }
       } else {
         group_cols.push_back(col);
         SIRIUS_LOG_DEBUG(
-          "local_grouped_agg: skipping dict-encode for key col {} (avg_len={:.1f}, rows={})",
+          "local_grouped_agg: skipping dict-encode for key col {} (avg_len={:.1f} < 4.0)",
           idx,
-          avg_len,
-          col.size());
+          avg_len);
       }
     } else {
       group_cols.push_back(col);
