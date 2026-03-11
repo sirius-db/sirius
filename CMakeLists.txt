@@ -352,7 +352,8 @@ target_link_libraries(sirius_unittest sirius_extension duckdb_static)
 link_extension_libraries(sirius_unittest "")
 # DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
 # that conflict with inline definitions from headers included in test files.
-target_link_options(sirius_unittest PRIVATE "LINKER:--allow-multiple-definition")
+target_link_options(sirius_unittest PRIVATE
+                    "LINKER:--allow-multiple-definition")
 
 # Precompile Catch2 header (18K lines) once instead of in every test file
 target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
