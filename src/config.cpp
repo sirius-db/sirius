@@ -19,6 +19,7 @@
 namespace duckdb {
 
 bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
+bool Config::USE_PIN_MEM_FOR_CACHING        = false;
 
 bool Config::USE_CUDF_EXPR = true;
 

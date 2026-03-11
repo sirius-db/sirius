@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "config_option.hpp"
 #include "exec/config.hpp"
+#include "op/scan/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -79,16 +80,24 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
 
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _enable_scan_caching; }
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept
+  {
+    return _cache_level != op::scan::cache_level::NONE;
+  }
 
   [[nodiscard]] bool is_cache_decoded_table_enabled() const noexcept
   {
-    return _cache_decoded_table;
+    return _cache_level == op::scan::cache_level::TABLE_HOST;
   }
 
-  [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept { return _cache_in_gpu; }
+  [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept
+  {
+    return _cache_level == op::scan::cache_level::TABLE_GPU;
+  }
 
-  void set_cache_in_gpu(bool enabled) noexcept { _cache_in_gpu = enabled; }
+  [[nodiscard]] op::scan::cache_level get_cache_level() const noexcept { return _cache_level; }
+
+  void set_cache_level(op::scan::cache_level level) noexcept { _cache_level = level; }
 
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
@@ -108,9 +117,7 @@ struct sirius_config {
                                                       .thread_name_prefix = "downgrade"};
   exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
                                                         .thread_name_prefix = "duckdb_scan"};
-  bool _enable_scan_caching = false;
-  bool _cache_decoded_table = false;
-  bool _cache_in_gpu        = false;
+  op::scan::cache_level _cache_level = op::scan::cache_level::NONE;
   operator_params _operator_params;
 };
 
