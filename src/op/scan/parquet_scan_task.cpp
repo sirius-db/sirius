@@ -55,6 +55,10 @@
 
 namespace sirius::op::scan {
 
+// Set this macro to 1 if you are using the hybrid_scan_reader as registered in the HOST->GPU
+// converter.
+#define USE_HYBRID_SCAN_READER 0
+
 namespace detail {
 
 bool selected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
@@ -136,6 +140,36 @@ std::tuple<std::vector<size_t>, std::vector<size_t>> make_selected_column_indice
     }
   }
   return {selected_column_indices, pure_filter_output_positions};
+}
+
+std::vector<byte_range_info> merge_byte_ranges(std::vector<byte_range_info> const& byte_ranges)
+{
+  if (byte_ranges.empty()) { return {}; }
+
+  std::vector<byte_range_info> merged;
+  merged.reserve(byte_ranges.size());
+
+  auto current_start = byte_ranges[0].offset();
+  auto current_end   = current_start + byte_ranges[0].size();
+
+  for (auto const& range : byte_ranges) {
+    auto const range_start = range.offset();
+    auto const range_end   = range_start + range.size();
+
+    if (range_start <= current_end) {
+      // Ranges overlap or are contiguous, extend the current range
+      current_end = std::max(current_end, range_end);
+    } else {
+      // No overlap, push the current range and start a new one
+      merged.emplace_back(current_start, current_end - current_start);
+      current_start = range_start;
+      current_end   = range_end;
+    }
+  }
+  // Push the final range
+  merged.emplace_back(current_start, current_end - current_start);
+
+  return merged;
 }
 
 }  // namespace detail
@@ -388,14 +422,30 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto byte_ranges =
     reader->all_column_chunks_byte_ranges(l_state.get_rg_indices(), g_state.get_options());
 
-  // Read each byte range into the allocation asynchronously
   int64_t bytes_read = 0;
   std::vector<std::future<std::size_t>> read_futures;
+#if USE_HYBRID_SCAN_READER
+  // We need to redefine the byte ranges to reflect the column chunk divisions within the multiple
+  // blocks allocation
+  std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
+  new_byte_ranges.reserve(byte_ranges.size());
+
+  for (auto const& range : byte_ranges) {
+    read_range_into_allocation(
+      range.offset(), range.size(), data_accessor, allocation, read_futures);
+    new_byte_ranges.emplace_back(bytes_read, range.size());
+    bytes_read += range.size();
+  }
+#else
+  // Merge overlapping/contiguous ranges to reduce number of reads
+  byte_ranges = detail::merge_byte_ranges(byte_ranges);
+
   for (auto const& range : byte_ranges) {
     read_range_into_allocation(
       range.offset(), range.size(), data_accessor, allocation, read_futures);
     bytes_read += range.size();
   }
+#endif
   std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
 
   if (bytes_read != l_state.get_reserved_compressed_bytes()) {
@@ -405,7 +455,21 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
       "reserved compressed bytes");
   }
 
-  // Create a data batch with the column chunks
+// Create a data batch with the column chunks
+#if USE_HYBRID_SCAN_READER
+  auto parquet_representation =
+    std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
+                                                  std::move(allocation),
+                                                  std::move(reader),
+                                                  g_state.get_options(),
+                                                  std::move(l_state.get_rg_indices()),
+                                                  std::move(new_byte_ranges),
+                                                  l_state.get_reserved_compressed_bytes(),
+                                                  l_state.get_reserved_uncompressed_bytes(),
+                                                  _datasource,
+                                                  g_state.get_filter_expression(),
+                                                  g_state.get_pure_filter_ids());
+#else
   auto parquet_representation =
     std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
                                                   std::move(allocation),
@@ -418,6 +482,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   _datasource,
                                                   g_state.get_filter_expression(),
                                                   g_state.get_pure_filter_ids());
+#endif
 
   std::shared_ptr<cucascade::data_batch> batch;
   if (_materialized_columns) {
