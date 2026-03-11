@@ -22,7 +22,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
-#include <cudf/stream_compaction.hpp>
+#include <cudf/reduction/approx_distinct_count.hpp>
 
 namespace sirius {
 namespace op {
@@ -140,8 +140,12 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   for (int idx : group_idx) {
     auto col = input_table.column(idx);
     if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
-      auto ndv = cudf::distinct_count(
-        col, cudf::null_policy::EXCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+      cudf::approx_distinct_count adc(cudf::table_view({col}),
+                                      12,
+                                      cudf::null_policy::EXCLUDE,
+                                      cudf::nan_policy::NAN_IS_VALID,
+                                      stream);
+      auto ndv     = adc.estimate(stream);
       double ratio = static_cast<double>(ndv) / col.size();
       if (ratio < dict_encode_max_ratio) {
         auto encoded =
