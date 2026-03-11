@@ -24,13 +24,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
 endif()
 
-# Language standards
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
@@ -68,18 +61,23 @@ endif()
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
+# libconfig++: vcpkg provides it as libconfig::config++ via CMake config;
+# conda-forge provides it only via pkg-config.
 find_package(libconfig CONFIG QUIET)
 if(NOT TARGET libconfig::config++)
+  if(VCPKG_BUILD)
+    message(FATAL_ERROR "VCPKG_BUILD set but libconfig::config++ not found")
+  endif()
   pkg_check_modules(LIBCONFIGPP REQUIRED IMPORTED_TARGET libconfig++)
 endif()
 find_package(absl REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
-# cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
-# as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
-# in the vcpkg installed lib dir, which isn't on the default linker search path.
-# Create an imported target so CMake resolves the bare name to the full path
-# instead of emitting -lnuma.
+# cuCascade - GPU Memory Reservation Library (submodule)
+# cucascade links `numa` as a bare library name (-lnuma). In the vcpkg build the
+# static libnuma.a lives in the vcpkg installed lib dir, which isn't on the
+# default linker search path. Create an imported target so CMake resolves the
+# bare name to the full path instead of emitting -lnuma.
 if(VCPKG_BUILD)
   add_library(numa STATIC IMPORTED)
   set_target_properties(
@@ -274,12 +272,18 @@ set(CUDA_SOURCES
 # cmake-format: on
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
-build_loadable_extension(sirius " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
+build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
-  set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON
-                                              LINKER_LANGUAGE CUDA)
+  set_target_properties(
+    ${_target}
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON
+               CUDA_SEPARABLE_COMPILATION ON
+               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
   # In the vcpkg build, vcpkg include dir must be searched before DuckDB's
   # bundled fmt (which uses duckdb_fmt namespace, incompatible with spdlog).
@@ -292,19 +296,34 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_include_directories(
     ${_target}
-    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
-
-  target_compile_definitions(
-    ${_target}
-    PRIVATE $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">)
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
+
+# Precompiled headers for extension targets
+target_precompile_headers(
+  sirius_extension
+  PRIVATE
+  # STL headers (60+ combined inclusions)
+  <algorithm>
+  <memory>
+  <optional>
+  <string>
+  <string_view>
+  <vector>
+  # Logging (44/139 source files)
+  "src/include/log/logging.hpp"
+  # DuckDB planner (30+ files)
+  <duckdb/planner/expression/bound_reference_expression.hpp>)
+target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
+
+# CMake PCH doesn't apply to nvcc — skip PCH for CUDA sources
+set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
+                                                       ON)
 
 # The conda-forge GCC wrapper hard-codes -rpath <conda_prefix>/lib into every
 # link invocation. Strip it from the loadable extension so the binary only
@@ -349,10 +368,49 @@ else()
   )
 endif()
 
-file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/*.cpp")
-list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_modified_pipeline\\.cpp$")
-list(FILTER TEST_SOURCES EXCLUDE REGEX ".*/test_task_creator\\.cpp$")
+# cmake-format: off
+set(TEST_SOURCES
+    test/cpp/config/test_config.cpp
+    test/cpp/config/test_context.cpp
+    test/cpp/data/test_host_parquet_representation.cpp
+    test/cpp/downgrade/test_downgrade_executor.cpp
+    test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/exec/test_kiosk.cpp
+    test/cpp/expression_executor/test_gpu_expression_executor.cpp
+    test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/memory/test_host_table_utils.cpp
+    test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
+    test/cpp/memory_management/test_cpu_cache.cpp
+    test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+    test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
+    test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
+    test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
+    test/cpp/operator/test_gpu_partition_impl.cpp
+    test/cpp/operator/test_host_table_chunk_reader.cpp
+    test/cpp/operator/test_physical_concat.cpp
+    test/cpp/operator/test_physical_filter.cpp
+    test/cpp/operator/test_physical_limit.cpp
+    test/cpp/operator/test_physical_mark_join.cpp
+    test/cpp/operator/test_physical_merge_sort.cpp
+    test/cpp/operator/test_physical_order.cpp
+    test/cpp/operator/test_physical_partition.cpp
+    test/cpp/operator/test_physical_projection.cpp
+    test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_table_scan.cpp
+    test/cpp/operator/test_physical_top_n.cpp
+    test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/parallel/test_task_executor.cpp
+    test/cpp/pipeline/test_gpu_pipeline_executor.cpp
+    test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_pipeline_executor.cpp
+    test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_parquet_scan_task.cpp
+    test/cpp/scan/test_scan_executor.cpp
+    test/cpp/unittest.cpp
+    test/cpp/utils/sirius_test_env.cpp
+    test/cpp/utils/utils.cpp)
+# cmake-format: on
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 
@@ -366,15 +424,22 @@ target_include_directories(
   PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/operator>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/cudf>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
 
 target_link_libraries(sirius_unittest sirius_extension)
 
+# Precompile Catch2 header (18K lines) once instead of in every test file
+target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
+# unittest.cpp defines CATCH_CONFIG_RUNNER before including catch.hpp, which is
+# incompatible with the PCH (compiled without that define). Exclude it.
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/unittest.cpp"
+                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+
 set_target_properties(
-  sirius_unittest PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                             "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+  sirius_unittest
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
 target_compile_definitions(
   sirius_unittest
@@ -382,6 +447,3 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
-
-enable_testing()
-add_test(NAME sirius COMMAND sirius_unittest)
