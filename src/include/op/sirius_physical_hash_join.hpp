@@ -160,7 +160,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
   uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
-  std::unique_ptr<cudf::table>
+  std::shared_ptr<::cucascade::data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>
     _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the

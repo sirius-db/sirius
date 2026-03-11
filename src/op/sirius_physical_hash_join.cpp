@@ -782,8 +782,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        _build_table =
-          input_batches[1]->get_data()->cast<cucascade::gpu_table_representation>().release_table();
+        _build_table              = input_batches[1];
         _hash_table =
           std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
@@ -818,8 +817,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         throw std::runtime_error("Unsupported join type in BUILD_PROBE mode: " +
                                  duckdb::JoinTypeToString(join_type));
       }
-      left_full  = get_cudf_table_view(*input_batches[0]);
-      right_full = _build_table->view();
+      left_full = get_cudf_table_view(*input_batches[0]);
+      right_full =
+        _build_table->get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
 
     } else {
       throw std::runtime_error(fmt::format(
