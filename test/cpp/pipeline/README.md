@@ -39,13 +39,13 @@ The tests use mock implementations to avoid dependencies on actual GPU hardware:
 These tests are integrated into the main test suite and will run as part of the standard test execution:
 
 ```bash
-# Build and run all tests
-pixi run test
+# Build and run all unit tests
+pixi run unittest
 
 # Or run just the pipeline executor tests using catch2 tags
-./build/release/test/unittest "[pipeline_executor]"
-./build/release/test/unittest "[gpu_pipeline_executor]"
-./build/release/test/unittest "[pipeline_queue]"
+pixi run unittest "[pipeline_executor]"
+pixi run unittest "[gpu_pipeline_executor]"
+pixi run unittest "[pipeline_queue]"
 ```
 
 ## Test Timeouts

@@ -21,12 +21,11 @@ Experiment Setup:
 
 ## Requirements
 
-- Ubuntu >= 22.04
+- Linux (x86_64 or aarch64)
 - NVIDIA Volta™ or higher with compute capability 7.0+
 - CUDA >= 13.0 (driver only — the toolkit is provided by Pixi)
 - Git
 - [Pixi](https://pixi.sh/latest/installation/) (manages all build dependencies: CMake, clang, cuDF, RMM, spdlog, etc.)
-- We recommend at least **16 vCPUs** for faster compilation
 
 ## Building Sirius
 
@@ -95,7 +94,10 @@ To load the ClickBench dataset:
 ```
 
 ## Running Sirius: CLI
-To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
+To run Sirius CLI, start the DuckDB shell with Sirius preloaded (rebuilds if needed):
+```
+pixi run duckdb
+```
 From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
@@ -181,38 +183,32 @@ con.execute('''
 
 ### SQLLogic Tests
 
-Sirius provides a unit test that compares Sirius against DuckDB for correctness across many test queries. Note that these tests are meant to be end to end tests as they run SQL queries using Sirius and compare that against the expected result. To run the unittest, generate the datasets using the method described [here](#generating-and-loading-test-datasets) and run the unittest using the following command:
+Sirius provides SQL logic tests that compare Sirius against DuckDB for correctness. Generate the datasets using the method described [here](#generating-test-datasets), then run:
 ```
-pixi run test
+pixi run sql-test
 ```
 
-To run a specific test run the command from the root directory:
+To run a specific test file:
 ```
-pixi run build
-build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
+pixi run sql-test test/sql/tpch-sirius.test
 ```
 
 ### C++ Tests
 
-Sirius also implements C++ tests for all of the APIs it implements. These tests are meant to be individual unit tests for each of the classes/functions used to run Sirius. You can find examples on how to implement these unit tests in `test/cpp`. You can run all of the unit tests using:
+Sirius also implements C++ unit tests for individual classes and functions. You can find examples in `test/cpp`. To run all unit tests:
 ```
-pixi run build
-build/release/extension/sirius/test/cpp/sirius_unittest
-```
-
-To run tests associated with specific tag or to run a specific test you can execute the the test script like this:
-```
-pixi run build
-build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+pixi run unittest
 ```
 
-Any logs produced during test execution are saved in:
+To run tests by tag or name:
 ```
-build/release/extension/sirius/test/cpp/log
+pixi run unittest "[cpu_cache]"
+pixi run unittest "test_cpu_cache_basic_string_single_col"
 ```
 
-Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.
+All test tasks automatically rebuild if sources have changed. Test logs are saved in `build/<preset>/extension/sirius/test/cpp/log`.
+
+We use [Catch2](https://github.com/catchorg/Catch2) as the testing framework.
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:

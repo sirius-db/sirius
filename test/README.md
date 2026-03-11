@@ -3,9 +3,9 @@ This directory contains all the tests for this extension. The `sql` directory ho
 
 To run the SQLLogicTests:
 ```bash
-pixi run test
+pixi run sql-test
 ```
 or for the debug preset:
 ```bash
-pixi run test debug
+pixi run sql-test debug
 ```

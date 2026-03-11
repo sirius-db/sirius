@@ -53,28 +53,26 @@ cd ..
 
 ### SQL Logic Tests (End-to-End)
 ```bash
-pixi run test                                          # Run all SQLLogicTests
-pixi run test debug                                    # Debug build tests
-
-# Run specific test file
-pixi run build
-build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
+pixi run sql-test                                      # Run all SQLLogicTests
+pixi run sql-test debug                                # Debug build tests
+pixi run sql-test test/sql/tpch-sirius.test            # Run specific test file
 ```
 
 ### C++ Unit Tests
 ```bash
-# Build and run all unit tests
-pixi run build
-build/release/extension/sirius/test/cpp/sirius_unittest
-
-# Run tests with specific tag
-build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-
-# Run specific test
-build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+pixi run unittest                                      # Run all unit tests
+pixi run unittest "[cpu_cache]"                        # Run tests with specific tag
+pixi run unittest "test_cpu_cache_basic_string_single_col"  # Run specific test
 ```
 
-Test logs are saved to: `build/release/extension/sirius/test/cpp/log`
+### Running DuckDB with Sirius
+```bash
+pixi run duckdb                                        # Launch DuckDB CLI with Sirius
+```
+
+All test/run tasks automatically rebuild if sources have changed.
+
+Test logs are saved to: `build/<preset>/extension/sirius/test/cpp/log`
 
 Unit tests use Catch2 framework. Test files are in `test/cpp/` organized by component.
 

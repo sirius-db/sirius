@@ -84,9 +84,52 @@ args = [
     "clang-release",
     "clang-relwithdebinfo",
   ] },
-  { arg = "filter", default = "" },
 ]
 cmd = "ctest --test-dir build/{{ preset }}/extension/sirius"
+depends-on = [{ task = "build", args = [{ preset = "{{ preset }}" }] }]
+
+[tasks.sql-test]
+args = [
+  { arg = "preset", default = "release", choices = [
+    "debug",
+    "release",
+    "relwithdebinfo",
+    "clang-debug",
+    "clang-release",
+    "clang-relwithdebinfo",
+  ] },
+  { arg = "filter", default = "" },
+]
+cmd = "build/{{ preset }}/test/unittest --test-dir .{% if filter %} {{ filter }}{% endif %}"
+depends-on = [{ task = "build", args = [{ preset = "{{ preset }}" }] }]
+
+[tasks.unittest]
+args = [
+  { arg = "preset", default = "release", choices = [
+    "debug",
+    "release",
+    "relwithdebinfo",
+    "clang-debug",
+    "clang-release",
+    "clang-relwithdebinfo",
+  ] },
+  { arg = "filter", default = "" },
+]
+cmd = "build/{{ preset }}/extension/sirius/test/cpp/sirius_unittest{% if filter %} {{ filter }}{% endif %}"
+depends-on = [{ task = "build", args = [{ preset = "{{ preset }}" }] }]
+
+[tasks.duckdb]
+args = [
+  { arg = "preset", default = "release", choices = [
+    "debug",
+    "release",
+    "relwithdebinfo",
+    "clang-debug",
+    "clang-release",
+    "clang-relwithdebinfo",
+  ] },
+]
+cmd = "build/{{ preset }}/duckdb"
 depends-on = [{ task = "build", args = [{ preset = "{{ preset }}" }] }]
 
 [tasks.clean]
