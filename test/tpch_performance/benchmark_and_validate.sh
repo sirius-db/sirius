@@ -230,29 +230,67 @@ fi
 # ---------------------------------------------------------------------------
 # Normal benchmark mode
 # ---------------------------------------------------------------------------
+
+# Parse optional flags
+while [ $# -gt 1 ]; do
+    case "$1" in
+        --config)
+            export SIRIUS_CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --parquet-dir)
+            PARQUET_DIR="$2"
+            shift 2
+            ;;
+        --engines)
+            ENGINES="$2"
+            shift 2
+            ;;
+        --iterations)
+            NUM_ITERATIONS="$2"
+            shift 2
+            ;;
+        --timeout)
+            QUERY_TIMEOUT="$2"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
+QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
+
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 <scale_factor>"
+    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] <scale_factor>"
     echo "       $0 --report <run_dir>"
-    echo "Example: $0 1"
+    echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius --iterations 3 --timeout 120 1000"
     exit 1
 fi
 
 SF="$1"
 QUERIES=($(seq 1 22))
 
-RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_2iter"
+RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${NUM_ITERATIONS}iter"
 mkdir -p "$RUN_DIR"
 
-if [ -n "${SIRIUS_CONFIG_FILE:-}" ] && [ -f "${SIRIUS_CONFIG_FILE}" ]; then
-    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
-else
-    cp "$HOME/.sirius/sirius.cfg" "$RUN_DIR/"
+# Resolve config: explicit --config / env var / default ~/.sirius/sirius.cfg
+if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
+    export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.cfg"
 fi
+if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
+    echo "ERROR: config file not found: $SIRIUS_CONFIG_FILE"
+    exit 1
+fi
+echo "Config file: $SIRIUS_CONFIG_FILE"
+cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
 
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
-PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
 
-echo "Scale factor: SF${SF}   Iterations: 2 (cold + warm)"
+echo "Scale factor: SF${SF}   Iterations: ${NUM_ITERATIONS} (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Run directory: $RUN_DIR"
 echo "=========================================="
 echo ""
@@ -378,13 +416,20 @@ echo "=== Collecting run info and filesystem benchmark ==="
 echo "Run info saved to $RUN_INFO_FILE"
 echo "=========================================="
 
-for engine in sirius duckdb; do
+ENGINES="${ENGINES:-sirius duckdb}"
+for engine in $ENGINES; do
     ENGINE_DIR="$RUN_DIR/$engine"
     mkdir -p "$ENGINE_DIR"
 
     echo ""
     echo "=== Running $engine ==="
-    OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "$engine" "$SF" "${QUERIES[@]}" \
+    EXTRA_ARGS=()
+    if [ -n "${PARQUET_DIR:-}" ]; then
+        EXTRA_ARGS+=(--parquet-dir "$PARQUET_DIR")
+    fi
+    EXTRA_ARGS+=(--iterations "$NUM_ITERATIONS")
+    EXTRA_ARGS+=(--timeout "$QUERY_TIMEOUT")
+    OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log" || true
 done
 

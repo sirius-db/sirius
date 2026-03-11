@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Run TPC-H GPU queries against Parquet files
 #
-# All specified queries run in a single DuckDB session.  Each query is
-# executed twice back-to-back (cold + warm) with nothing in between so
-# that the Sirius scan cache remains valid for the warm run.
+# All specified queries run in a single DuckDB session, wrapped with the
+# `timeout` command so that the entire session is killed if it exceeds
+# the timeout.  Each query is executed twice back-to-back (cold + warm)
+# with nothing in between so that the Sirius scan cache remains valid
+# for the warm run.
 # Per-query results and timings are extracted from the combined output
 # using delimiter markers (.print).
 #
@@ -15,12 +17,12 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/run_tpch_parquet.sh [--parquet-dir <path>] <engine> <scale_factor> <query_numbers...>
+#   ./test/tpch_performance/run_tpch_parquet.sh [--parquet-dir <path>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>
 # with engine = [sirius/duckdb]
 #
 # Example:
 #   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 `seq 1 22`
-#   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 `seq 1 22`
+#   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch --timeout 1200 sirius 100 `seq 1 22`
 #
 # Environment variables:
 #   SIRIUS_CONFIG_FILE - path to Sirius config file (required for sirius engine)
@@ -34,14 +36,25 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 
 PARQUET_DIR=""
-if [ "${1:-}" = "--parquet-dir" ]; then
-    PARQUET_DIR="$2"
-    shift 2
-fi
+NUM_ITERATIONS=2
+SESSION_TIMEOUT=1200
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ]; do
+    if [ "$1" = "--parquet-dir" ]; then
+        PARQUET_DIR="$2"
+        shift 2
+    elif [ "$1" = "--iterations" ]; then
+        NUM_ITERATIONS="$2"
+        shift 2
+    elif [ "$1" = "--timeout" ]; then
+        SESSION_TIMEOUT="$2"
+        shift 2
+    fi
+done
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
+    echo "  --timeout N   Kill the entire DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     exit 1
 fi
 
@@ -63,12 +76,10 @@ if [ "$ENGINE" == "sirius" ]; then
     DUCKDB="$SIRIUS_DUCKDB"
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
 else
-    # Use vanilla DuckDB from the pixi environment (no Sirius extension).
-    DUCKDB=$(cd "$SCRIPT_DIR" && pixi run which duckdb 2>/dev/null) || true
-    if [ -z "$DUCKDB" ] || [ ! -x "$DUCKDB" ]; then
-        echo "ERROR: vanilla duckdb not found in pixi env. Run: cd $SCRIPT_DIR && pixi install"
-        exit 1
-    fi
+    # Use the same binary but without Sirius config so the extension doesn't initialize.
+    DUCKDB="$SIRIUS_DUCKDB"
+    unset SIRIUS_CONFIG_FILE 2>/dev/null || true
+    export SIRIUS_CONFIG_FILE=
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 fi
 
@@ -101,8 +112,13 @@ fi
 echo "Running TPC-H queries against SF${SF} parquet data"
 echo "Engine: $ENGINE"
 echo "Parquet dir: $PARQUET_DIR"
-echo "Iterations: 2 (cold + warm)"
+echo "Iterations: $NUM_ITERATIONS (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Queries: ${QUERIES[*]}"
+if [ "$SESSION_TIMEOUT" -gt 0 ] 2>/dev/null; then
+    echo "Session timeout: ${SESSION_TIMEOUT}s"
+else
+    echo "Session timeout: disabled"
+fi
 echo "=========================================="
 
 # ---------------------------------------------------------------------------
@@ -118,8 +134,13 @@ printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
 echo ".timer on" >> "$TEMP_SQL"
 
 VALID_QUERIES=()
-# Queries where GPU caching must be disabled (too large to fit in GPU memory).
-NO_GPU_CACHE="1 7 9 10 18 19 21"
+# Queries where scan results must be cached in host instead of GPU (too large to fit in GPU memory).
+# Only needed at SF1000+; at smaller scale factors everything fits in GPU memory.
+if [ "$SF" -ge 1000 ] 2>/dev/null; then
+    HOST_CACHE_QUERIES="1 7 9 10 17 18 19 21"
+else
+    HOST_CACHE_QUERIES=""
+fi
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
     if [ ! -f "$QUERY_FILE" ]; then
@@ -127,21 +148,21 @@ for q in "${QUERIES[@]}"; do
         continue
     fi
     VALID_QUERIES+=("$q")
-    # Toggle GPU caching per query.  Bracket the SET with .timer off/on
+    # Set per-query scan cache level.  Bracket the SET with .timer off/on
     # so it doesn't produce a spurious "Run Time" line in the output.
     if [ "$ENGINE" = "sirius" ]; then
-        if echo " $NO_GPU_CACHE " | grep -q " $q "; then
-            printf '.timer off\nSET cache_in_gpu = false;\n.timer on\n' >> "$TEMP_SQL"
+        if echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
+            printf ".timer off\nSET scan_cache_level = 'table_host';\n.timer on\n" >> "$TEMP_SQL"
         else
-            printf '.timer off\nSET cache_in_gpu = true;\n.timer on\n' >> "$TEMP_SQL"
+            printf ".timer off\nSET scan_cache_level = 'table_gpu';\n.timer on\n" >> "$TEMP_SQL"
         fi
     fi
     echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
-    # Two iterations back-to-back — nothing between them.
-    cat "$QUERY_FILE" >> "$TEMP_SQL"
-    printf '\n' >> "$TEMP_SQL"
-    cat "$QUERY_FILE" >> "$TEMP_SQL"
-    printf '\n' >> "$TEMP_SQL"
+    # N iterations back-to-back — nothing between them.
+    for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
+        cat "$QUERY_FILE" >> "$TEMP_SQL"
+        printf '\n' >> "$TEMP_SQL"
+    done
 done
 echo ".print ${END_MARKER}" >> "$TEMP_SQL"
 
@@ -151,20 +172,36 @@ if [ -n "${OUTPUT_DIR:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Run DuckDB once for all queries
+# Run DuckDB once for all queries, with optional session timeout
 # ---------------------------------------------------------------------------
 echo ""
 echo "Running all queries in a single DuckDB session..."
 START_TIME=$(date +%s.%N)
-if [ -n "${OUTPUT_DIR:-}" ]; then
-    FULL_OUTPUT=$(SIRIUS_LOG_DIR="$OUTPUT_DIR" "$DUCKDB" -f "$TEMP_SQL" 2>&1)
+if [ "$SESSION_TIMEOUT" -gt 0 ] 2>/dev/null; then
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        FULL_OUTPUT=$(timeout "$SESSION_TIMEOUT" env SIRIUS_LOG_DIR="$OUTPUT_DIR" "$DUCKDB" -f "$TEMP_SQL" 2>&1)
+    else
+        FULL_OUTPUT=$(timeout "$SESSION_TIMEOUT" "$DUCKDB" -f "$TEMP_SQL" 2>&1)
+    fi
 else
-    FULL_OUTPUT=$("$DUCKDB" -f "$TEMP_SQL" 2>&1)
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        FULL_OUTPUT=$(SIRIUS_LOG_DIR="$OUTPUT_DIR" "$DUCKDB" -f "$TEMP_SQL" 2>&1)
+    else
+        FULL_OUTPUT=$("$DUCKDB" -f "$TEMP_SQL" 2>&1)
+    fi
 fi
+SESSION_EXIT=$?
 END_TIME=$(date +%s.%N)
 
 TOTAL_ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
 echo "Total wall-clock time: ${TOTAL_ELAPSED}s"
+
+if [ "$SESSION_EXIT" -eq 124 ]; then
+    echo "SESSION TIMEOUT: DuckDB was killed after ${SESSION_TIMEOUT}s"
+elif [ "$SESSION_EXIT" -ne 0 ]; then
+    echo "SESSION FAILED: DuckDB exited with code $SESSION_EXIT"
+fi
+
 rm -f "$TEMP_SQL"
 
 # ---------------------------------------------------------------------------
@@ -207,10 +244,24 @@ for q in "${VALID_QUERIES[@]}"; do
         cap                                           { print }
     ' "$TEMP_OUTPUT")
 
-    # Save warm-run result only (lines between 1st and 2nd "Run Time" lines).
-    awk '
+    if [ -z "$SECTION" ]; then
+        # No output for this query — session likely timed out or crashed before reaching it.
+        echo "  NO OUTPUT (session may have timed out or crashed before this query)"
+        echo "no output" > "$RESULT_FILE"
+        {
+            echo "step,runtime_s"
+            for ((i = 0; i < NUM_ITERATIONS; i++)); do
+                echo "iter_$((i + 1)),N/A"
+            done
+        } > "$TIMING_FILE"
+        echo "  Timings written to $TIMING_FILE"
+        continue
+    fi
+
+    # Save last-iteration result only (lines between the 2nd-to-last and last "Run Time" lines).
+    awk -v n="$NUM_ITERATIONS" '
         /Run Time \(s\):/ { tc++; next }
-        tc == 1           { print }
+        tc == (n - 1)     { print }
     ' <<< "$SECTION" > "$RESULT_FILE"
 
     # Extract per-iteration timings.
@@ -224,8 +275,8 @@ for q in "${VALID_QUERIES[@]}"; do
     } > "$TIMING_FILE"
 
     cold="${TIMES[0]:-N/A}"
-    warm="${TIMES[1]:-N/A}"
-    echo "  Cold: ${cold}s   Warm: ${warm}s"
+    warm="${TIMES[${#TIMES[@]}-1]:-N/A}"
+    echo "  Cold: ${cold}s   Warm: ${warm}s   (${#TIMES[@]} iterations)"
 
     if [ -n "${TIMING_CSV:-}" ] && [ "$cold" != "N/A" ]; then
         echo "${q},${cold}" >> "$TIMING_CSV"
