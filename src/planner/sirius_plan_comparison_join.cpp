@@ -58,7 +58,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     default: break;
   }
   //	TODO: Extend PWMJ to handle all comparisons and projection maps
-  bool prefer_range_joins = duckdb::DBConfig::GetSetting<duckdb::PreferRangeJoinsSetting>(context);
+  bool prefer_range_joins = duckdb::Settings::Get<duckdb::PreferRangeJoinsSetting>(context);
   prefer_range_joins      = prefer_range_joins && can_iejoin;
 
   bool is_supported_by_hash_join =

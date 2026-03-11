@@ -25,6 +25,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -889,7 +890,7 @@ static void LoadInternal(ExtensionLoader& loader)
 
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
-  config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
+  config.GetCallbackManager().Register(make_shared_ptr<duckdb::SiriusContextExtensionCallback>());
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
