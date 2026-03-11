@@ -73,11 +73,11 @@ endif()
 find_package(absl REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
-# cuCascade - GPU Memory Reservation Library (submodule)
-# cucascade links `numa` as a bare library name (-lnuma). In the vcpkg build the
-# static libnuma.a lives in the vcpkg installed lib dir, which isn't on the
-# default linker search path. Create an imported target so CMake resolves the
-# bare name to the full path instead of emitting -lnuma.
+# cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
+# as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
+# in the vcpkg installed lib dir, which isn't on the default linker search path.
+# Create an imported target so CMake resolves the bare name to the full path
+# instead of emitting -lnuma.
 if(VCPKG_BUILD)
   add_library(numa STATIC IMPORTED)
   set_target_properties(
