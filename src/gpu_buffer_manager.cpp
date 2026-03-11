@@ -149,9 +149,10 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
     processing_size_per_cpu(processing_size_per_cpu)
 {
   SIRIUS_LOG_INFO(
-    "Initializing GPU buffer manager with params: Use Pin - {}, GPU Cache Size - {}, GPU "
-    "Processing Size - {}, CPU Processing Size - {}",
+    "Initializing GPU buffer manager with params: Use Pin - {}, Use Pin For Caching - {}, GPU "
+    "Cache Size - {}, GPU Processing Size - {}, CPU Processing Size - {}",
     Config::USE_PIN_MEM_FOR_CPU_PROCESSING,
+    Config::USE_PIN_MEM_FOR_CACHING,
     cache_size_per_gpu,
     processing_size_per_gpu,
     processing_size_per_cpu);
@@ -175,26 +176,30 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   SIRIUS_LOG_INFO("Allocated processing size {} in GPU 0", processing_size_per_gpu);
 
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
-    // We cannot allocate exactly all free memory using `cudaMalloc()`
-    size_t free_gpu_mem_size = getFreeGPUMemorySize(gpu) * 0.99;
-    if (free_gpu_mem_size >= cache_size_per_gpu) {
-      gpuCache[gpu]                 = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
+    if (Config::USE_PIN_MEM_FOR_CACHING) {
+      gpuCache[gpu]                 = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
       cpuCache[gpu]                 = nullptr;
       available_gpu_cache_size[gpu] = cache_size_per_gpu;
-      SIRIUS_LOG_INFO("Allocated cache size {} in GPU 0", cache_size_per_gpu);
+      SIRIUS_LOG_INFO("Allocated cache size {} using pinned host memory", cache_size_per_gpu);
     } else {
-      gpuCache[gpu] = callCudaMalloc<uint8_t>(free_gpu_mem_size, gpu);
-      cpuCache[gpu] = allocatePinnedCPUMemory(cache_size_per_gpu - free_gpu_mem_size);
-      available_gpu_cache_size[gpu] = free_gpu_mem_size;
-      SIRIUS_LOG_INFO("Allocated cache size {} for GPU 0 ({} in GPU, {} in CPU)",
-                      cache_size_per_gpu,
-                      free_gpu_mem_size,
-                      cache_size_per_gpu - free_gpu_mem_size);
+      // We cannot allocate exactly all free memory using `cudaMalloc()`
+      size_t free_gpu_mem_size = getFreeGPUMemorySize(gpu) * 0.99;
+      if (free_gpu_mem_size >= cache_size_per_gpu) {
+        gpuCache[gpu]                 = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
+        cpuCache[gpu]                 = nullptr;
+        available_gpu_cache_size[gpu] = cache_size_per_gpu;
+        SIRIUS_LOG_INFO("Allocated cache size {} in GPU 0", cache_size_per_gpu);
+      } else {
+        gpuCache[gpu] = callCudaMalloc<uint8_t>(free_gpu_mem_size, gpu);
+        cpuCache[gpu] = allocatePinnedCPUMemory(cache_size_per_gpu - free_gpu_mem_size);
+        available_gpu_cache_size[gpu] = free_gpu_mem_size;
+        SIRIUS_LOG_INFO("Allocated cache size {} for GPU 0 ({} in GPU, {} in CPU)",
+                        cache_size_per_gpu,
+                        free_gpu_mem_size,
+                        cache_size_per_gpu - free_gpu_mem_size);
+      }
     }
 
-    // gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
-    // gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
-    // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
     gpuProcessingPointer[gpu] = 0;
     gpuCachingPointer[gpu]    = 0;
     cpuCachingPointer[gpu]    = 0;
@@ -206,8 +211,12 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
 GPUBufferManager::~GPUBufferManager()
 {
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
-    callCudaFree<uint8_t>(gpuCache[gpu], gpu);
-    if (cpuCache[gpu] != nullptr) { freePinnedCPUMemory(cpuCache[gpu]); }
+    if (Config::USE_PIN_MEM_FOR_CACHING) {
+      freePinnedCPUMemory(gpuCache[gpu]);
+    } else {
+      callCudaFree<uint8_t>(gpuCache[gpu], gpu);
+      if (cpuCache[gpu] != nullptr) { freePinnedCPUMemory(cpuCache[gpu]); }
+    }
     // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
     mr->deallocate(rmm::cuda_stream_view{}, (void*)gpuProcessing[gpu], processing_size_per_gpu);
   }

@@ -124,11 +124,9 @@ pipeline_executor::get_scan_executor() noexcept
   return *_scan_executor;
 }
 
-void pipeline_executor::set_scan_caching_enabled(bool enabled,
-                                                 bool cache_decoded_table,
-                                                 bool cache_in_gpu)
+void pipeline_executor::set_scan_caching_config(sirius::op::scan::cache_level level)
 {
-  _scan_executor->set_scan_caching_enabled(enabled, cache_decoded_table, cache_in_gpu);
+  _scan_executor->set_scan_caching_enabled(level);
 }
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
@@ -190,8 +188,9 @@ void pipeline_executor::management_eventloop()
       }
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
-      // TODO: implement scan task scheduling when state is owned in the operator itself
-      schedule_next_scan_tasks();
+      // TODO(amin): think about eager scheduling again when state of next tasks are stored in the
+      // operator
+      // schedule_next_scan_tasks();
     }
   }
 }

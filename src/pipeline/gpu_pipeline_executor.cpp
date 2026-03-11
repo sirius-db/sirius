@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
+#include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -205,7 +206,11 @@ void gpu_pipeline_executor::manager_loop()
       }
 
       if (!query_complete && _task_creator) {
+        bool pipeline_done = pipeline && pipeline->is_pipeline_finished();
         for (auto* consumer : consumers) {
+          // Don't wake up FULL-barrier consumers until the pipeline is completely
+          // done — doing so just causes repeated no-op dependency walks (spin loop).
+          if (consumer && !pipeline_done && consumer->has_full_barrier_from(pipeline)) { continue; }
           _task_creator->schedule(consumer);
         }
       }

@@ -31,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -92,8 +93,8 @@ struct config_to_type_traits<T> {
   {
     T enum_value;
     if (!string_to_enum(str_value, enum_value)) {
-      throw std::invalid_argument(
-        fmt::format("Invalid configuration string for enum {}", str_value));
+      throw std::invalid_argument(std::string("Invalid configuration string for enum ") +
+                                  std::string(str_value));
     }
     return enum_value;
   }
@@ -226,7 +227,8 @@ struct config_value_applicator<ValueType> {
     std::string_view str_value = value.c_str();
     // Use the string converter found via ADL
     if (!string_to_enum(str_value, opt)) {
-      throw std::invalid_argument(fmt::format("Invalid configuration string for enum {}", value));
+      throw std::invalid_argument(std::string("Invalid configuration string for enum ") +
+                                  std::string(value.c_str()));
     }
   }
 };
@@ -454,8 +456,8 @@ struct registered_config : config_base {
       T temp_value{};
       config_value_applicator<T>::assign(temp_value, cfg);
       if (!predicate_(temp_value)) {
-        throw std::invalid_argument(
-          fmt::format("Invalid configuration value for option {}", path_.data()));
+        throw std::invalid_argument(std::string("Invalid configuration value for option ") +
+                                    path_.data());
       }
       var_.get_or_create() = std::move(temp_value);
     } else {
@@ -506,8 +508,8 @@ struct registered_config_variant : config_base {
       T temp_value{};
       config_value_applicator<T>::assign(temp_value, cfg);
       if (!predicate_(temp_value)) {
-        throw std::invalid_argument(
-          fmt::format("Invalid configuration value for variant option {}", path_.data()));
+        throw std::invalid_argument(std::string("Invalid configuration value for variant option ") +
+                                    path_.data());
       }
       var_.get_or_create() = std::move(temp_value);
     } else {
@@ -570,7 +572,7 @@ struct registered_config_iterable : config_base {
       // Validate each element if predicate is provided
       if (element_predicate_ && !element_predicate_(v)) {
         throw std::invalid_argument(
-          fmt::format("Invalid element value in configuration array for option {}", path_.data()));
+          std::string("Invalid element value in configuration array for option ") + path_.data());
       }
 
       container.push_back(std::move(v));
@@ -755,12 +757,33 @@ struct configuration_setter {
       const libconfig::Setting* cfg = safe_lookup(setting, path);
 
       if (cfg) {
-        setter->apply(*cfg);
+        try {
+          setter->apply(*cfg);
+        } catch (const std::exception& e) {
+          throw std::runtime_error(
+            fmt::format("Error applying configuration option '{}': {}", path.data(), e.what()));
+        }
       } else if (setter->is_required()) {
-        throw std::invalid_argument(
-          fmt::format("Missing required configuration option: {}", path.data()));
+        throw std::invalid_argument(std::string("Missing required configuration option: ") +
+                                    path.data());
       }
     });
+
+    if (setting.getType() == libconfig::Setting::TypeGroup) {
+      std::unordered_set<std::string> registered_keys;
+      for (const auto& cfg : configs_) {
+        std::string_view path = cfg->path();
+        auto dot_pos          = path.find('.');
+        registered_keys.emplace(dot_pos == std::string_view::npos ? path : path.substr(0, dot_pos));
+      }
+
+      for (int i = 0; i < setting.getLength(); ++i) {
+        std::string key = setting[i].getName();
+        if (!registered_keys.contains(key)) {
+          throw std::runtime_error(fmt::format("Unknown configuration option: '{}'", key));
+        }
+      }
+    }
   }
 
   void write(libconfig::Setting& setting) const

@@ -51,7 +51,8 @@
         "CMAKE_CUDA_HOST_COMPILER": "$env{CONDA_PREFIX}/bin/clang++",
         "CMAKE_CXX_COMPILER": "$env{CONDA_PREFIX}/bin/clang++",
         "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
-        "CMAKE_C_COMPILER": "$env{CONDA_PREFIX}/bin/clang"
+        "CMAKE_C_COMPILER": "$env{CONDA_PREFIX}/bin/clang",
+        "EXPORT_DYNAMIC_SYMBOLS": "OFF"
       },
       "hidden": true,
       "inherits": "base",

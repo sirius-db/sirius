@@ -40,10 +40,10 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS
+set(CUCASCADE_BUILD_SHARED_LIBS
     OFF
     CACHE BOOL "" FORCE)
-set(BUILD_STATIC_LIBS
+set(CUCASCADE_BUILD_STATIC_LIBS
     ON
     CACHE BOOL "" FORCE)
 set(WARNINGS_AS_ERRORS
@@ -217,6 +217,8 @@ set(CUDA_SOURCES
     src/cuda/operator/nested_loop_join.cu
     src/cuda/operator/strings_matching.cu
     src/cuda/operator/substring.cu
+    src/cuda/operator/strlen_from_offsets.cu
+    src/cuda/operator/empty_str_check.cu
     src/cuda/print.cu
     src/cuda/utils.cu)
 # cmake-format: on
@@ -238,10 +240,6 @@ foreach(_target sirius_extension sirius_loadable_extension)
   target_include_directories(
     ${_target}
     PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
-
-  target_compile_definitions(
-    ${_target}
-    PRIVATE $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">)
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade)
