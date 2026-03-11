@@ -26,6 +26,8 @@
 // #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 
 class sirius_engine;
@@ -189,6 +191,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   std::atomic<std::size_t> tasks_created   = 0;
   std::atomic<std::size_t> tasks_completed = 0;
+
+  //! NVTX process-wide range tracking the pipeline's active lifetime
+  std::atomic<bool> _nvtx_range_started{false};
+  nvtxRangeId_t _nvtx_pipeline_range_id{0};
 };
 
 }  // namespace pipeline
