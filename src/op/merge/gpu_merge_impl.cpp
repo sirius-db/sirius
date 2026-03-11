@@ -184,6 +184,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   // row count.  High-cardinality columns (ndv/rows >= 10%) are left as-is
   // because the encode/decode overhead exceeds the hashing benefit.
   constexpr double dict_encode_max_ratio = 0.10;
+  constexpr size_t dict_encode_min_ndv   = 10;
   std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
   std::vector<cudf::column_view> group_cols;
   group_cols.reserve(num_group_cols);
@@ -197,7 +198,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
                                       stream);
       auto ndv     = adc.estimate(stream);
       double ratio = static_cast<double>(ndv) / col.size();
-      if (ratio < dict_encode_max_ratio) {
+      if (ndv >= dict_encode_min_ndv && ratio < dict_encode_max_ratio) {
         auto encoded =
           cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
         group_cols.push_back(encoded->view());
