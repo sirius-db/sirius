@@ -19,6 +19,8 @@
 #include "data/data_batch_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
 
 namespace sirius {
 namespace op {
@@ -123,11 +125,24 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  // Create cudf groupby
   auto input_table = get_cudf_table_view(*input);
+  auto mr          = memory_space.get_default_allocator();
+
+  // Dictionary-encode STRING group keys so the groupby hashes INT32 indices
+  // instead of variable-length strings.
+  std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
   std::vector<cudf::column_view> group_cols;
+  group_cols.reserve(group_idx.size());
   for (int idx : group_idx) {
-    group_cols.push_back(input_table.column(idx));
+    auto col = input_table.column(idx);
+    if (col.type().id() == cudf::type_id::STRING) {
+      auto encoded =
+        cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+      group_cols.push_back(encoded->view());
+      encoded_key_owners.push_back(std::move(encoded));
+    } else {
+      group_cols.push_back(col);
+    }
   }
   cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
 
@@ -192,8 +207,17 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   }
 
   // Call cudf groupby and populate output columns
-  auto groupby_result = grpby_obj.aggregate(requests, stream, memory_space.get_default_allocator());
+  auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
   auto output_cols    = groupby_result.first->release();
+
+  // Decode dictionary-encoded group key columns back to STRING
+  for (size_t i = 0; i < group_idx.size(); i++) {
+    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
+      cudf::dictionary_column_view dict_view(output_cols[i]->view());
+      output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
+    }
+  }
+
   output_cols.resize(group_idx.size() + aggregate_idx.size());
   for (size_t i = 0; i < input_col_order.size(); ++i) {
     int aggregate_col_id     = input_col_order[i];
