@@ -91,7 +91,7 @@ class thread_pool {
         SIRIUS_LOG_ERROR("Exception in thread pool task: {}, {}", e.what(), "closing thread pool");
         stop();
       } catch (...) {
-        SIRIUS_LOG_ERROR("Exception in thread pool task, closing thread pool");
+        SIRIUS_LOG_ERROR("{}", "Exception in thread pool task, closing thread pool");
         stop();
       }
     });
