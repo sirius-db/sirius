@@ -173,6 +173,9 @@ struct custom_config_registrar {
 template <typename ValueType>
 struct config_value_applicator {
   static void assign(ValueType& opt, const libconfig::Setting& value);
+  static void assign(ValueType& opt,
+                     const libconfig::Setting& value,
+                     const std::unordered_set<std::string>& exempt_keys);
 };
 
 template <std::integral ValueType>
@@ -320,8 +323,13 @@ struct config_value_exporter<ListItemType> {
 // ================ configuration options implementation ================= //
 
 struct config_base {
-  virtual ~config_base()                                               = default;
-  virtual void apply(const libconfig::Setting& setting)                = 0;
+  virtual ~config_base()                                = default;
+  virtual void apply(const libconfig::Setting& setting) = 0;
+  virtual void apply(const libconfig::Setting& setting,
+                     const std::unordered_set<std::string>& exempt_keys)
+  {
+    apply(setting);  // default: ignore exempt_keys
+  }
   virtual void write(libconfig::Setting& setting) const                = 0;
   [[nodiscard]] virtual std::string_view path() const noexcept         = 0;
   [[nodiscard]] virtual libconfig::Setting::Type type() const noexcept = 0;
@@ -450,18 +458,34 @@ struct registered_config : config_base {
   {
   }
 
-  void apply(const libconfig::Setting& cfg) override
+  void apply(const libconfig::Setting& cfg) override { apply(cfg, {}); }
+
+  void apply(const libconfig::Setting& cfg,
+             const std::unordered_set<std::string>& exempt_keys) override
   {
+    // Only propagate exempt_keys for custom group types (TypeGroup). Primitives, enums, and
+    // iterables are leaf values that never do the unknown-key check, so exempt_keys don't apply.
+    constexpr bool is_custom_group =
+      !IsBasicConfig<T> && !IsBackInsertableWithValue<T> && !std::is_enum_v<T>;
+
     if (predicate_) {
       T temp_value{};
-      config_value_applicator<T>::assign(temp_value, cfg);
+      if constexpr (is_custom_group) {
+        config_value_applicator<T>::assign(temp_value, cfg, exempt_keys);
+      } else {
+        config_value_applicator<T>::assign(temp_value, cfg);
+      }
       if (!predicate_(temp_value)) {
         throw std::invalid_argument(std::string("Invalid configuration value for option ") +
                                     path_.data());
       }
       var_.get_or_create() = std::move(temp_value);
     } else {
-      config_value_applicator<T>::assign(var_.get_or_create(), cfg);
+      if constexpr (is_custom_group) {
+        config_value_applicator<T>::assign(var_.get_or_create(), cfg, exempt_keys);
+      } else {
+        config_value_applicator<T>::assign(var_.get_or_create(), cfg);
+      }
     }
   }
 
@@ -750,7 +774,8 @@ struct configuration_setter {
     return current;
   }
 
-  void apply(const libconfig::Setting& setting)
+  void apply(const libconfig::Setting& setting,
+             const std::unordered_set<std::string>& parent_exempt_keys = {})
   {
     std::for_each(configs_.begin(), configs_.end(), [&](auto& setter) {
       auto path                     = setter->path();
@@ -758,7 +783,7 @@ struct configuration_setter {
 
       if (cfg) {
         try {
-          setter->apply(*cfg);
+          setter->apply(*cfg, compute_sub_exempt_keys(path));
         } catch (const std::exception& e) {
           throw std::runtime_error(
             fmt::format("Error applying configuration option '{}': {}", path.data(), e.what()));
@@ -779,7 +804,7 @@ struct configuration_setter {
 
       for (int i = 0; i < setting.getLength(); ++i) {
         std::string key = setting[i].getName();
-        if (!registered_keys.contains(key)) {
+        if (!registered_keys.contains(key) && !parent_exempt_keys.contains(key)) {
           throw std::runtime_error(fmt::format("Unknown configuration option: '{}'", key));
         }
       }
@@ -794,6 +819,22 @@ struct configuration_setter {
   }
 
  private:
+  [[nodiscard]] std::unordered_set<std::string> compute_sub_exempt_keys(
+    std::string_view parent_path) const
+  {
+    std::unordered_set<std::string> result;
+    std::string prefix = std::string(parent_path) + ".";
+    for (const auto& cfg : configs_) {
+      std::string_view p = cfg->path();
+      if (p.starts_with(prefix)) {
+        std::string_view remainder = p.substr(prefix.size());
+        auto dot                   = remainder.find('.');
+        result.emplace(dot == std::string_view::npos ? remainder : remainder.substr(0, dot));
+      }
+    }
+    return result;
+  }
+
   std::vector<std::unique_ptr<config_base>> configs_;
 };
 
@@ -805,6 +846,16 @@ void config_value_applicator<ValueType>::assign(ValueType& opt, const libconfig:
   configuration_setter setter;
   custom_config_registrar<ValueType>::config(setter, opt);
   setter.apply(value);
+}
+
+template <typename ValueType>
+void config_value_applicator<ValueType>::assign(ValueType& opt,
+                                                const libconfig::Setting& value,
+                                                const std::unordered_set<std::string>& exempt_keys)
+{
+  configuration_setter setter;
+  custom_config_registrar<ValueType>::config(setter, opt);
+  setter.apply(value, exempt_keys);
 }
 
 template <typename ValueType>
