@@ -161,9 +161,6 @@ class sirius_physical_plan_generator {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups,
     duckdb::optional_ptr<duckdb::vector<duckdb::GroupingSet>> grouping_sets);
 
-  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_filters_through_joins(
-    duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan);
-
   // private:
   bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
