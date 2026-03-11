@@ -496,6 +496,58 @@ TEST_CASE("use nested naming with config", "[config_opt][nested_naming]")
   REQUIRE(favorite_color == ee::color::green);
 }
 
+TEST_CASE("unregistered config key throws runtime_error", "[config_opt][unregistered]")
+{
+  using namespace sirius;
+
+  SECTION("single unregistered key throws")
+  {
+    config::configuration_setter setter;
+    int int_value = 0;
+    setter.add_config("int_value", int_value);
+
+    libconfig::Config libconfig;
+    libconfig.readString(R"(
+        int_value = 42;
+        unknown_key = "surprise";
+    )");
+
+    REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
+  }
+
+  SECTION("all keys registered does not throw")
+  {
+    config::configuration_setter setter;
+    int int_value       = 0;
+    double double_value = 0.0;
+    setter.add_config("int_value", int_value);
+    setter.add_config("double_value", double_value);
+
+    libconfig::Config libconfig;
+    libconfig.readString(R"(
+        int_value = 42;
+        double_value = 3.14;
+    )");
+
+    REQUIRE_NOTHROW(setter.apply(libconfig.getRoot()));
+  }
+
+  SECTION("unregistered key in dotted-path group throws")
+  {
+    config::configuration_setter setter;
+    int value = 0;
+    setter.add_config("group.value", value);
+
+    libconfig::Config libconfig;
+    libconfig.readString(R"(
+        group = { value = 10; };
+        rogue = 99;
+    )");
+
+    REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
+  }
+}
+
 // Test iterable config with element-level validation
 TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
 {

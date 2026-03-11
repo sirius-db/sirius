@@ -31,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -755,12 +756,34 @@ struct configuration_setter {
       const libconfig::Setting* cfg = safe_lookup(setting, path);
 
       if (cfg) {
+        try {
+          setter->apply(*cfg);
+        } catch (const std::exception& e) {
+          throw std::runtime_error(
+            fmt::format("Error applying configuration option '{}': {}", path.data(), e.what()));
+        }
         setter->apply(*cfg);
       } else if (setter->is_required()) {
         throw std::invalid_argument(
           fmt::format("Missing required configuration option: {}", path.data()));
       }
     });
+
+    if (setting.getType() == libconfig::Setting::TypeGroup) {
+      std::unordered_set<std::string> registered_keys;
+      for (const auto& cfg : configs_) {
+        std::string_view path = cfg->path();
+        auto dot_pos          = path.find('.');
+        registered_keys.emplace(dot_pos == std::string_view::npos ? path : path.substr(0, dot_pos));
+      }
+
+      for (int i = 0; i < setting.getLength(); ++i) {
+        std::string key = setting[i].getName();
+        if (!registered_keys.contains(key)) {
+          throw std::runtime_error(fmt::format("Unknown configuration option: '{}'", key));
+        }
+      }
+    }
   }
 
   void write(libconfig::Setting& setting) const
