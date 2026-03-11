@@ -17,8 +17,13 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
+#include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 
 namespace sirius {
 namespace op {
@@ -123,11 +128,66 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  // Create cudf groupby
   auto input_table = get_cudf_table_view(*input);
+  auto mr          = memory_space.get_default_allocator();
+
+  // Dictionary-encode STRING group keys when:
+  //  1. Average string length >= 4 bytes (short strings hash nearly as fast as
+  //     int32, so the encode/decode overhead is not worthwhile), AND
+  //  2. NDV / row_count < 10% (high-cardinality columns produce huge
+  //     dictionaries that negate the hashing benefit).
+  // The avg_len check is O(1) (single offset read) and gates the more
+  // expensive HLL-based NDV estimate.
+  constexpr double dict_encode_min_avg_len = 8.0;
+  constexpr double dict_encode_max_ratio   = 0.10;
+  std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
   std::vector<cudf::column_view> group_cols;
+  group_cols.reserve(group_idx.size());
   for (int idx : group_idx) {
-    group_cols.push_back(input_table.column(idx));
+    auto col = input_table.column(idx);
+    if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
+      cudf::strings_column_view scv(col);
+      auto avg_len = static_cast<double>(scv.chars_size(stream)) / col.size();
+      if (avg_len >= dict_encode_min_avg_len) {
+        cudf::approx_distinct_count adc(cudf::table_view({col}),
+                                        12,
+                                        cudf::null_policy::EXCLUDE,
+                                        cudf::nan_policy::NAN_IS_VALID,
+                                        stream);
+        auto ndv     = adc.estimate(stream);
+        double ratio = static_cast<double>(ndv) / col.size();
+        if (ratio < dict_encode_max_ratio) {
+          auto encoded =
+            cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+          group_cols.push_back(encoded->view());
+          encoded_key_owners.push_back(std::move(encoded));
+          SIRIUS_LOG_DEBUG(
+            "local_grouped_agg: dict-encoding key col {} (avg_len={:.1f}, ndv={}, rows={})",
+            idx,
+            avg_len,
+            ndv,
+            col.size());
+        } else {
+          group_cols.push_back(col);
+          SIRIUS_LOG_DEBUG(
+            "local_grouped_agg: skipping dict-encode for key col {} "
+            "(avg_len={:.1f}, ndv={}, rows={}, ratio={:.4f})",
+            idx,
+            avg_len,
+            ndv,
+            col.size(),
+            ratio);
+        }
+      } else {
+        group_cols.push_back(col);
+        SIRIUS_LOG_DEBUG(
+          "local_grouped_agg: skipping dict-encode for key col {} (avg_len={:.1f} < 4.0)",
+          idx,
+          avg_len);
+      }
+    } else {
+      group_cols.push_back(col);
+    }
   }
   cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
 
@@ -192,8 +252,17 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   }
 
   // Call cudf groupby and populate output columns
-  auto groupby_result = grpby_obj.aggregate(requests, stream, memory_space.get_default_allocator());
+  auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
   auto output_cols    = groupby_result.first->release();
+
+  // Decode dictionary-encoded group key columns back to STRING
+  for (size_t i = 0; i < group_idx.size(); i++) {
+    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
+      cudf::dictionary_column_view dict_view(output_cols[i]->view());
+      output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
+    }
+  }
+
   output_cols.resize(group_idx.size() + aggregate_idx.size());
   for (size_t i = 0; i < input_col_order.size(); ++i) {
     int aggregate_col_id     = input_col_order[i];
