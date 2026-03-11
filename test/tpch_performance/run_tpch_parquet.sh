@@ -17,11 +17,12 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/run_tpch_parquet.sh [--parquet-dir <path>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>
+#   ./test/tpch_performance/run_tpch_parquet.sh [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>
 # with engine = [sirius/duckdb]
 #
 # Example:
 #   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 `seq 1 22`
+#   ./test/tpch_performance/run_tpch_parquet.sh --iterations 5 sirius 100 `seq 1 22`
 #   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch --timeout 1200 sirius 100 `seq 1 22`
 #
 # Environment variables:
@@ -52,9 +53,10 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
 done
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
-    echo "  --timeout N   Kill the entire DuckDB session after N seconds (default: 1200, 0 = no timeout)"
+    echo "  --iterations N  Number of iterations per query (default: 2, 1 cold + N-1 warm)"
+    echo "  --timeout N     Kill the entire DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     exit 1
 fi
 

@@ -7,8 +7,9 @@
 #   ./build/release/duckdb test_datasets/tpch_sf1.duckdb \
 #     -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=1);"
 #
-# Each query runs in its own DuckDB process. Each query is run twice
-# (cold + warm).
+# By default, each query runs in its own DuckDB process (multi-session).
+# Use --single-session to run all queries in one process so GPU-cached
+# data persists across queries. Each query is run twice (cold + warm).
 #
 # Usage:
 #   ./run_tpch_legacy.sh <gpu_caching_size> <gpu_processing_size> [options]
@@ -16,7 +17,7 @@
 # Examples:
 #   ./run_tpch_legacy.sh "1 GB" "2 GB"
 #   ./run_tpch_legacy.sh "1 GB" "2 GB" --sf 1 --queries 1 2 3
-#   ./run_tpch_legacy.sh "10 GB" "20 GB" --sf 10 --queries $(seq 1 22)
+#   ./run_tpch_legacy.sh "10 GB" "20 GB" --sf 10 --single-session
 #   ./run_tpch_legacy.sh "1 GB" "2 GB" --db /data/tpch_sf1.duckdb
 #
 # Options:
@@ -25,6 +26,8 @@
 #   --queries <N...>      Specific query numbers to run (default: all 1-22)
 #   --output-dir <path>   Directory for results
 #   --pin-cache           Use pinned host memory for caching instead of GPU memory
+#   --single-session      Run all queries in one DuckDB process (GPU cache persists)
+#   --cpu-processing-size <size>  Pinned host memory size (default: same as gpu_processing_size)
 # =============================================================================
 
 set -uo pipefail
@@ -37,9 +40,9 @@ QUERY_DIR="$SCRIPT_DIR/tpch_queries/orig"
 
 # --- Parse arguments ---
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <gpu_caching_size> <gpu_processing_size> [--sf N] [--db path] [--queries N...] [--output-dir path] [--pin-cache]"
+    echo "Usage: $0 <gpu_caching_size> <gpu_processing_size> [--sf N] [--db path] [--queries N...] [--output-dir path] [--pin-cache] [--single-session] [--cpu-processing-size SIZE]"
     echo "Example: $0 '1 GB' '2 GB' --sf 1 --queries 1 2 3"
-    echo "         $0 '1 GB' '2 GB' --pin-cache"
+    echo "         $0 '1 GB' '2 GB' --pin-cache --single-session --cpu-processing-size '4 GB'"
     exit 1
 fi
 
@@ -52,6 +55,8 @@ SF=1
 DB_PATH=""
 OUTPUT_DIR=""
 PIN_CACHE=false
+SINGLE_SESSION=false
+CPU_PROCESSING_SIZE=""
 QUERIES=()
 
 while [ $# -gt 0 ]; do
@@ -72,6 +77,14 @@ while [ $# -gt 0 ]; do
             PIN_CACHE=true
             shift
             ;;
+        --single-session)
+            SINGLE_SESSION=true
+            shift
+            ;;
+        --cpu-processing-size)
+            CPU_PROCESSING_SIZE="$2"
+            shift 2
+            ;;
         --queries)
             shift
             while [ $# -gt 0 ] && [[ "$1" != --* ]]; do
@@ -88,6 +101,11 @@ done
 
 # Legacy Sirius uses gpu_buffer_init + gpu_processing; config file interferes
 unset SIRIUS_CONFIG_FILE
+
+# Default CPU processing size to GPU processing size
+if [ -z "$CPU_PROCESSING_SIZE" ]; then
+    CPU_PROCESSING_SIZE="$GPU_PROCESSING_SIZE"
+fi
 
 # Defaults
 if [ -z "$DB_PATH" ]; then
@@ -132,6 +150,11 @@ fi
 TIMING_FILE="$OUTPUT_DIR/timings.csv"
 echo "query,run1_time,run1_status,run2_time,run2_status" > "$TIMING_FILE"
 
+SESSION_MODE="multi (fresh process per query)"
+if [ "$SINGLE_SESSION" = true ]; then
+    SESSION_MODE="single (GPU cache persists across queries)"
+fi
+
 echo "=========================================="
 echo "TPC-H Benchmark — Legacy Sirius (gpu_processing)"
 echo "=========================================="
@@ -139,9 +162,11 @@ echo "Scale Factor:     $SF"
 echo "Database:         $DB_PATH"
 echo "GPU Caching:      $GPU_CACHING_SIZE"
 echo "GPU Processing:   $GPU_PROCESSING_SIZE"
+echo "CPU Processing:   $CPU_PROCESSING_SIZE"
 echo "Cache Mode:       $([ "$PIN_CACHE" = true ] && echo "pinned host memory" || echo "GPU memory")"
 echo "Queries:          ${QUERIES[*]}"
 echo "Output:           $OUTPUT_DIR"
+echo "Session:          $SESSION_MODE"
 echo "=========================================="
 echo ""
 
@@ -151,85 +176,193 @@ parse_timer_output() {
     echo "$1" | grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+'
 }
 
-# --- Run each query ---
-for q in "${QUERIES[@]}"; do
-    QUERY_FILE="$QUERY_DIR/q${q}.sql"
-    if [ ! -f "$QUERY_FILE" ]; then
-        echo "WARNING: Query file not found: $QUERY_FILE, skipping Q${q}"
-        echo "${q},-1,SKIP,-1,SKIP" >> "$TIMING_FILE"
-        continue
-    fi
+# =============================================================================
+# Multi-session mode: each query in its own DuckDB process
+# =============================================================================
+run_multi_session() {
+    for q in "${QUERIES[@]}"; do
+        QUERY_FILE="$QUERY_DIR/q${q}.sql"
+        if [ ! -f "$QUERY_FILE" ]; then
+            echo "WARNING: Query file not found: $QUERY_FILE, skipping Q${q}"
+            echo "${q},-1,SKIP,-1,SKIP" >> "$TIMING_FILE"
+            continue
+        fi
 
-    QUERY_SQL=$(cat "$QUERY_FILE")
-    if [ -z "$QUERY_SQL" ]; then
-        echo "WARNING: Query ${q} is empty, skipping"
-        echo "${q},-1,EMPTY,-1,EMPTY" >> "$TIMING_FILE"
-        continue
-    fi
+        QUERY_SQL=$(cat "$QUERY_FILE")
+        if [ -z "$QUERY_SQL" ]; then
+            echo "WARNING: Query ${q} is empty, skipping"
+            echo "${q},-1,EMPTY,-1,EMPTY" >> "$TIMING_FILE"
+            continue
+        fi
 
-    echo "--- Query ${q} ---"
+        echo "--- Query ${q} ---"
 
-    # Strip trailing semicolons from the query
-    CLEANED_SQL=$(echo "$QUERY_SQL" | sed 's/;[[:space:]]*$//')
+        # Strip trailing semicolons from the query
+        CLEANED_SQL=$(echo "$QUERY_SQL" | sed 's/;[[:space:]]*$//')
+        # Escape inner double quotes, then wrap with gpu_processing("...")
+        ESCAPED_SQL=$(echo "$CLEANED_SQL" | sed 's/"/\\"/g')
 
-    # Escape inner double quotes, then wrap with gpu_processing("...")
-    ESCAPED_SQL=$(echo "$CLEANED_SQL" | sed 's/"/\\"/g')
+        # Write SQL file using printf to avoid bash heredoc expansion issues
+        TEMP_SQL="$OUTPUT_DIR/tmp_q${q}.sql"
+        {
+            if [ "$PIN_CACHE" = true ]; then
+                printf "SET use_pin_memory_for_caching = true;\n"
+            fi
+            printf "CALL gpu_buffer_init('%s', '%s', pinned_memory_size='%s');\n" "$GPU_CACHING_SIZE" "$GPU_PROCESSING_SIZE" "$CPU_PROCESSING_SIZE"
+            printf ".timer on\n"
+            printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
+            printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
+        } > "$TEMP_SQL"
 
-    # Write SQL file using printf to avoid bash heredoc expansion issues
-    TEMP_SQL="$OUTPUT_DIR/tmp_q${q}.sql"
+        Q_RESULT_FILE="$OUTPUT_DIR/result_q${q}.txt"
+        Q_LOG="$OUTPUT_DIR/log_q${q}.txt"
+
+        # Run in a fresh DuckDB process against the pre-generated database
+        OUTPUT=$("$DUCKDB" "$DB_PATH" < "$TEMP_SQL" 2>&1) || true
+
+        echo "$OUTPUT" > "$Q_LOG"
+        rm -f "$TEMP_SQL"
+
+        # Parse timer output — expect two "Run Time" lines
+        readarray -t TIMES < <(parse_timer_output "$OUTPUT")
+
+        RUN1_TIME="${TIMES[0]:--1}"
+        RUN2_TIME="${TIMES[1]:--1}"
+
+        # Check for errors in the output
+        HAS_ERROR=$(echo "$OUTPUT" | grep -ci "error" || true)
+
+        if [ "$HAS_ERROR" -gt 0 ] && [ "$RUN1_TIME" = "-1" ]; then
+            ERROR_MSG=$(echo "$OUTPUT" | grep -i "error" | head -1)
+            echo "  Run 1: FAILED — $ERROR_MSG"
+            echo "  Run 2: FAILED"
+            echo "${q},${RUN1_TIME},FAILED,${RUN2_TIME},FAILED" >> "$TIMING_FILE"
+        else
+            RUN1_STATUS="OK"
+            RUN2_STATUS="OK"
+
+            if [ "$RUN1_TIME" = "-1" ]; then
+                RUN1_STATUS="NO_TIMER"
+            fi
+            if [ "$RUN2_TIME" = "-1" ]; then
+                RUN2_STATUS="NO_TIMER"
+            fi
+
+            echo "  Run 1 (cold): ${RUN1_TIME}s  [${RUN1_STATUS}]"
+            echo "  Run 2 (warm): ${RUN2_TIME}s  [${RUN2_STATUS}]"
+            echo "${q},${RUN1_TIME},${RUN1_STATUS},${RUN2_TIME},${RUN2_STATUS}" >> "$TIMING_FILE"
+        fi
+
+        # Save query result (output minus timer lines)
+        echo "$OUTPUT" | grep -v "Run Time (s):" > "$Q_RESULT_FILE"
+    done
+}
+
+# =============================================================================
+# Single-session mode: all queries in one DuckDB process
+# =============================================================================
+run_single_session() {
+    # Build a single SQL file for the entire session
+    MASTER_SQL="$OUTPUT_DIR/master_session.sql"
     {
         if [ "$PIN_CACHE" = true ]; then
             printf "SET use_pin_memory_for_caching = true;\n"
         fi
         printf "CALL gpu_buffer_init('%s', '%s');\n" "$GPU_CACHING_SIZE" "$GPU_PROCESSING_SIZE"
         printf ".timer on\n"
-        printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
-        printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
-    } > "$TEMP_SQL"
 
-    Q_RESULT_FILE="$OUTPUT_DIR/result_q${q}.txt"
-    Q_LOG="$OUTPUT_DIR/log_q${q}.txt"
+        for q in "${QUERIES[@]}"; do
+            QUERY_FILE="$QUERY_DIR/q${q}.sql"
+            if [ ! -f "$QUERY_FILE" ]; then
+                continue
+            fi
 
-    # Run in a fresh DuckDB process against the pre-generated database
-    OUTPUT=$("$DUCKDB" "$DB_PATH" < "$TEMP_SQL" 2>&1) || true
-    EXIT_CODE=${PIPESTATUS[0]:-$?}
+            QUERY_SQL=$(cat "$QUERY_FILE")
+            if [ -z "$QUERY_SQL" ]; then
+                continue
+            fi
 
-    echo "$OUTPUT" > "$Q_LOG"
-    rm -f "$TEMP_SQL"
+            CLEANED_SQL=$(echo "$QUERY_SQL" | sed 's/;[[:space:]]*$//')
+            ESCAPED_SQL=$(echo "$CLEANED_SQL" | sed 's/"/\\"/g')
 
-    # Parse timer output — expect two "Run Time" lines
-    readarray -t TIMES < <(parse_timer_output "$OUTPUT")
+            printf ".print ===QUERY_START_%s===\n" "$q"
+            printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
+            printf ".print ===QUERY_MID_%s===\n" "$q"
+            printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
+            printf ".print ===QUERY_END_%s===\n" "$q"
+        done
+    } > "$MASTER_SQL"
 
-    RUN1_TIME="${TIMES[0]:--1}"
-    RUN2_TIME="${TIMES[1]:--1}"
+    # Run single DuckDB session
+    FULL_LOG="$OUTPUT_DIR/session_log.txt"
+    FULL_OUTPUT=$("$DUCKDB" "$DB_PATH" < "$MASTER_SQL" 2>&1) || true
+    echo "$FULL_OUTPUT" > "$FULL_LOG"
+    rm -f "$MASTER_SQL"
 
-    # Check for errors in the output
-    HAS_ERROR=$(echo "$OUTPUT" | grep -ci "error" || true)
-
-    if [ "$HAS_ERROR" -gt 0 ] && [ "$RUN1_TIME" = "-1" ]; then
-        ERROR_MSG=$(echo "$OUTPUT" | grep -i "error" | head -1)
-        echo "  Run 1: FAILED — $ERROR_MSG"
-        echo "  Run 2: FAILED"
-        echo "${q},${RUN1_TIME},FAILED,${RUN2_TIME},FAILED" >> "$TIMING_FILE"
-    else
-        RUN1_STATUS="OK"
-        RUN2_STATUS="OK"
-
-        if [ "$RUN1_TIME" = "-1" ]; then
-            RUN1_STATUS="NO_TIMER"
+    # Parse per-query output from the single session
+    for q in "${QUERIES[@]}"; do
+        QUERY_FILE="$QUERY_DIR/q${q}.sql"
+        if [ ! -f "$QUERY_FILE" ]; then
+            echo "WARNING: Query file not found: $QUERY_FILE, skipping Q${q}"
+            echo "${q},-1,SKIP,-1,SKIP" >> "$TIMING_FILE"
+            continue
         fi
-        if [ "$RUN2_TIME" = "-1" ]; then
-            RUN2_STATUS="NO_TIMER"
+
+        QUERY_SQL=$(cat "$QUERY_FILE")
+        if [ -z "$QUERY_SQL" ]; then
+            echo "WARNING: Query ${q} is empty, skipping"
+            echo "${q},-1,EMPTY,-1,EMPTY" >> "$TIMING_FILE"
+            continue
         fi
 
-        echo "  Run 1 (cold): ${RUN1_TIME}s  [${RUN1_STATUS}]"
-        echo "  Run 2 (warm): ${RUN2_TIME}s  [${RUN2_STATUS}]"
-        echo "${q},${RUN1_TIME},${RUN1_STATUS},${RUN2_TIME},${RUN2_STATUS}" >> "$TIMING_FILE"
-    fi
+        echo "--- Query ${q} ---"
 
-    # Save query result (output minus timer lines)
-    echo "$OUTPUT" | grep -v "Run Time (s):" > "$Q_RESULT_FILE"
-done
+        Q_OUTPUT=$(echo "$FULL_OUTPUT" | sed -n "/===QUERY_START_${q}===/,/===QUERY_END_${q}===/p")
+        Q_RUN1=$(echo "$Q_OUTPUT" | sed -n "/===QUERY_START_${q}===/,/===QUERY_MID_${q}===/p")
+        Q_RUN2=$(echo "$Q_OUTPUT" | sed -n "/===QUERY_MID_${q}===/,/===QUERY_END_${q}===/p")
+
+        Q_LOG="$OUTPUT_DIR/log_q${q}.txt"
+        echo "$Q_OUTPUT" > "$Q_LOG"
+
+        RUN1_TIME=$(parse_timer_output "$Q_RUN1")
+        RUN2_TIME=$(parse_timer_output "$Q_RUN2")
+        RUN1_TIME="${RUN1_TIME:--1}"
+        RUN2_TIME="${RUN2_TIME:--1}"
+
+        HAS_ERROR=$(echo "$Q_OUTPUT" | grep -ci "error" || true)
+
+        if [ "$HAS_ERROR" -gt 0 ] && [ "$RUN1_TIME" = "-1" ]; then
+            ERROR_MSG=$(echo "$Q_OUTPUT" | grep -i "error" | head -1)
+            echo "  Run 1: FAILED — $ERROR_MSG"
+            echo "  Run 2: FAILED"
+            echo "${q},${RUN1_TIME},FAILED,${RUN2_TIME},FAILED" >> "$TIMING_FILE"
+        else
+            RUN1_STATUS="OK"
+            RUN2_STATUS="OK"
+
+            if [ "$RUN1_TIME" = "-1" ]; then
+                RUN1_STATUS="NO_TIMER"
+            fi
+            if [ "$RUN2_TIME" = "-1" ]; then
+                RUN2_STATUS="NO_TIMER"
+            fi
+
+            echo "  Run 1 (cold): ${RUN1_TIME}s  [${RUN1_STATUS}]"
+            echo "  Run 2 (warm): ${RUN2_TIME}s  [${RUN2_STATUS}]"
+            echo "${q},${RUN1_TIME},${RUN1_STATUS},${RUN2_TIME},${RUN2_STATUS}" >> "$TIMING_FILE"
+        fi
+
+        Q_RESULT_FILE="$OUTPUT_DIR/result_q${q}.txt"
+        echo "$Q_OUTPUT" | grep -v "Run Time (s):\|===QUERY_" > "$Q_RESULT_FILE"
+    done
+}
+
+# --- Run benchmark ---
+if [ "$SINGLE_SESSION" = true ]; then
+    run_single_session
+else
+    run_multi_session
+fi
 
 # --- Summary ---
 echo ""
@@ -260,3 +393,4 @@ echo ""
 echo "Timings:  $TIMING_FILE"
 echo "Results:  $OUTPUT_DIR/result_q*.txt"
 echo "Logs:     $OUTPUT_DIR/log_q*.txt"
+[ "$SINGLE_SESSION" = true ] && echo "Session:  $OUTPUT_DIR/session_log.txt"

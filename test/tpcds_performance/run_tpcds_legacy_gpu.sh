@@ -5,9 +5,12 @@
 # Usage:
 #   ./run_tpcds_legacy_gpu.sh <gpu_caching_size> <gpu_processing_size> [options]
 #
+# All options from run_tpcds_legacy.sh are supported, including --single-session.
+#
 # Examples:
 #   ./run_tpcds_legacy_gpu.sh "1 GB" "2 GB"
 #   ./run_tpcds_legacy_gpu.sh "10 GB" "20 GB" --sf 10
+#   ./run_tpcds_legacy_gpu.sh "10 GB" "20 GB" --sf 10 --single-session
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
