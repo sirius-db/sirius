@@ -18,8 +18,17 @@ pub struct NixlMetadataServiceHandler {
     nixl_agent: Option<Arc<NixlExchange>>,
     exchange_buffer: ExchangeBuffer,
     /// Pending GPU buffers awaiting transfer_complete. RAII cleanup on removal:
-    /// deregisters from nixl + frees GPU memory in correct order.
-    pending_buffers: Mutex<HashMap<(i64, i64, i32), Vec<NixlRegisteredBuffer>>>,
+    /// - Registered: deregisters from nixl + frees GPU memory
+    /// - Staged: releases leases (staging buffer reclaims space when all drop)
+    pending_buffers: Mutex<HashMap<(i64, i64, i32), PendingDstBuffers>>,
+}
+
+/// Holds destination GPU buffers until transfer_complete.
+enum PendingDstBuffers {
+    /// cuMemAlloc + registered individually — RAII deregisters + frees.
+    Registered(Vec<NixlRegisteredBuffer>),
+    /// Staging buffer sub-allocations — leases release space on drop.
+    Staged(Vec<crate::gpu_staging_buffer::StagingLease>),
 }
 
 impl NixlMetadataServiceHandler {
@@ -75,12 +84,11 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             }));
         };
 
-        // Step 1+2: Allocate and register destination GPU buffers in one operation.
-        // Uses cuMemAlloc directly (not the RMM pool) because the RMM processing
-        // pool may be at capacity after GPU query execution. RAII handles cleanup.
+        // Step 1+2: Allocate destination GPU buffers for nixl transfer.
         //
-        // Allocate data buffers + sub-buffers (null masks, string offsets) for
-        // each column. Sub-buffers are only allocated when the sender has them.
+        // Try the staging buffer first (pre-registered, avoids per-transfer
+        // cuMemAlloc+register overhead). Fall back to allocate_and_register
+        // if the staging buffer overflows or is not available.
         let sizes: Vec<_> = req.src_buffers.iter().map(|b| (b.len, b.device_id)).collect();
 
         // Collect sub-buffer sizes (null_mask and offsets per column).
@@ -124,20 +132,72 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             buffer_map.push((data_idx, nm_idx, off_idx));
         }
 
-        let registered = match agent.allocate_and_register_gpu_buffers(&all_sizes) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "failed to allocate/register dst GPU buffers");
-                return Ok(Response::new(PExchangeNixlMetadataResponse {
-                    dst_buffers: vec![],
-                    remote_agent_name: String::new(),
-                    status_code: 1,
-                    error_msgs: vec![format!("allocate_and_register: {e}")],
-                    nixl_metadata: vec![],
-                    dst_null_masks: vec![],
-                    dst_offsets: vec![],
-                }));
+        // Try staging buffer first, then fall back to cuMemAlloc+register.
+        enum DstBuffers {
+            Staged(Vec<crate::gpu_staging_buffer::StagingLease>),
+            Registered(Vec<NixlRegisteredBuffer>),
+        }
+
+        let dst = match agent.staging() {
+            Some(staging) => {
+                match staging.try_allocate(&all_sizes) {
+                    Ok(leases) => {
+                        info!(
+                            num = leases.len(),
+                            staging_used = staging.stats().used,
+                            "receiver: allocated dst buffers from staging buffer"
+                        );
+                        DstBuffers::Staged(leases)
+                    }
+                    Err(e) => {
+                        info!(error = %e, "receiver: staging overflow, falling back to cuMemAlloc");
+                        match agent.allocate_and_register_gpu_buffers(&all_sizes) {
+                            Ok(r) => DstBuffers::Registered(r),
+                            Err(e) => {
+                                warn!(error = %e, "failed to allocate/register dst GPU buffers");
+                                return Ok(Response::new(PExchangeNixlMetadataResponse {
+                                    dst_buffers: vec![],
+                                    remote_agent_name: String::new(),
+                                    status_code: 1,
+                                    error_msgs: vec![format!("allocate_and_register: {e}")],
+                                    nixl_metadata: vec![],
+                                    dst_null_masks: vec![],
+                                    dst_offsets: vec![],
+                                }));
+                            }
+                        }
+                    }
+                }
             }
+            None => {
+                match agent.allocate_and_register_gpu_buffers(&all_sizes) {
+                    Ok(r) => DstBuffers::Registered(r),
+                    Err(e) => {
+                        warn!(error = %e, "failed to allocate/register dst GPU buffers");
+                        return Ok(Response::new(PExchangeNixlMetadataResponse {
+                            dst_buffers: vec![],
+                            remote_agent_name: String::new(),
+                            status_code: 1,
+                            error_msgs: vec![format!("allocate_and_register: {e}")],
+                            nixl_metadata: vec![],
+                            dst_null_masks: vec![],
+                            dst_offsets: vec![],
+                        }));
+                    }
+                }
+            }
+        };
+
+        // Helper to get (addr, len, device_id) for a buffer at index.
+        let get_buf = |idx: usize| -> (usize, usize, u64) {
+            match &dst {
+                DstBuffers::Staged(leases) => (leases[idx].addr(), leases[idx].len(), leases[idx].device_id()),
+                DstBuffers::Registered(regs) => (regs[idx].addr(), regs[idx].len(), regs[idx].device_id()),
+            }
+        };
+        let total_allocated = match &dst {
+            DstBuffers::Staged(l) => l.len(),
+            DstBuffers::Registered(r) => r.len(),
         };
 
         // Build response descriptors from the flat allocation.
@@ -147,41 +207,43 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         let zero_desc = PGpuBufferDesc { addr: 0, len: 0, device_id: 0 };
 
         for &(data_idx, nm_idx, off_idx) in &buffer_map {
-            let b = &registered[data_idx];
+            let (addr, len, dev) = get_buf(data_idx);
             dst_buffers.push(PGpuBufferDesc {
-                addr: b.addr() as u64,
-                len: b.len() as u64,
-                device_id: b.device_id(),
+                addr: addr as u64,
+                len: len as u64,
+                device_id: dev,
             });
             dst_null_masks.push(match nm_idx {
                 Some(idx) => {
-                    let b = &registered[idx];
+                    let (addr, len, dev) = get_buf(idx);
                     PGpuBufferDesc {
-                        addr: b.addr() as u64,
-                        len: b.len() as u64,
-                        device_id: b.device_id(),
+                        addr: addr as u64,
+                        len: len as u64,
+                        device_id: dev,
                     }
                 }
                 None => zero_desc.clone(),
             });
             dst_offsets.push(match off_idx {
                 Some(idx) => {
-                    let b = &registered[idx];
+                    let (addr, len, dev) = get_buf(idx);
                     PGpuBufferDesc {
-                        addr: b.addr() as u64,
-                        len: b.len() as u64,
-                        device_id: b.device_id(),
+                        addr: addr as u64,
+                        len: len as u64,
+                        device_id: dev,
                     }
                 }
                 None => zero_desc.clone(),
             });
         }
 
+        let used_staging = matches!(&dst, DstBuffers::Staged(_));
         info!(
             num_data = dst_buffers.len(),
             num_null_masks = dst_null_masks.iter().filter(|b| b.addr != 0).count(),
             num_offsets = dst_offsets.iter().filter(|b| b.addr != 0).count(),
-            total_allocated = registered.len(),
+            total_allocated,
+            used_staging,
             "allocated destination GPU buffers (data + sub-buffers)"
         );
 
@@ -199,10 +261,14 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 .unwrap_or([0u8; 8]),
         );
         let pending_key = (query_id_hi, query_id_lo, req.node_id);
+        let pending = match dst {
+            DstBuffers::Staged(leases) => PendingDstBuffers::Staged(leases),
+            DstBuffers::Registered(regs) => PendingDstBuffers::Registered(regs),
+        };
         self.pending_buffers
             .lock()
             .unwrap()
-            .insert(pending_key, registered);
+            .insert(pending_key, pending);
 
         // Step 3: Load sender's metadata (force-load since sender registered new buffers).
         let remote_name = match agent.force_load_remote_metadata(&peer, &req.nixl_metadata) {
@@ -222,8 +288,10 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             }
         };
 
-        // Step 4: Get fresh receiver metadata (includes newly registered dst buffers).
-        let receiver_metadata = match agent.get_fresh_metadata() {
+        // Step 4: Get receiver metadata.
+        // When staging buffer is used, memory layout is stable → use cached metadata.
+        // Otherwise, get fresh metadata (includes newly registered dst buffers).
+        let receiver_metadata = match if used_staging { agent.get_metadata() } else { agent.get_fresh_metadata() } {
             Ok(md) => md,
             Err(e) => {
                 self.pending_buffers.lock().unwrap().remove(&pending_key);
@@ -349,8 +417,14 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
 
         // Now free destination GPU buffers (deregister + cuda_free).
         let removed = self.pending_buffers.lock().unwrap().remove(&pending_key);
+        let (freed_count, was_staged) = match &removed {
+            Some(PendingDstBuffers::Registered(r)) => (r.len(), false),
+            Some(PendingDstBuffers::Staged(s)) => (s.len(), true),
+            None => (0, false),
+        };
         info!(
-            freed = removed.as_ref().map_or(0, |v| v.len()),
+            freed = freed_count,
+            was_staged,
             "transfer_complete: released pending GPU buffers"
         );
         drop(removed);

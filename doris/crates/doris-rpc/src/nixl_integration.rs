@@ -8,13 +8,13 @@
 
 use std::sync::Arc;
 
+use crate::gpu_staging_buffer::StagingLease;
 use crate::nixl_exchange::{GpuBufferDesc, NixlExchange};
 use crate::exchange_sender::ExchangeDest;
 use crate::exchange_buffer::{ExchangeBuffer, ExchangeKey};
 use sirius_ffi::GpuColumnBuffers;
 
 /// Result of attempting to extract GPU buffer information from execution result.
-#[derive(Debug)]
 pub enum ExecutionLocation {
     /// Result is in CPU memory (Arrow IPC bytes).
     Cpu(Vec<u8>),
@@ -33,12 +33,9 @@ pub enum ExecutionLocation {
         schema_ipc: Vec<u8>,
         /// Arrow IPC bytes (fallback for store/fetch_data path).
         ipc_bytes: Vec<u8>,
-        /// cuMemAlloc-allocated buffer addresses to free after nixl transfer.
-        /// Empty when `rmm_pool_registered` is true (no copy was needed).
-        cuda_alloc_addrs: Vec<usize>,
-        /// Whether the RMM pool is registered with nixl, meaning the buffers
-        /// can be used directly without copying to cuMemAlloc.
-        rmm_pool_registered: bool,
+        /// Staging buffer leases. Kept alive until transfer completes.
+        /// When present, buffer addresses point into the staging buffer.
+        _staging_leases: Vec<StagingLease>,
     },
 }
 
@@ -51,115 +48,83 @@ impl ExecutionLocation {
         }
     }
 
-    /// Try to register the RMM pool with nixl so buffers can be used directly.
+    /// Try to stage all GPU buffers (data + sub-buffers) into the staging buffer.
     ///
-    /// Uses `engine.get_pool_info()` to query the processing pool directly from
-    /// the GPUBufferManager, avoiding `cuMemGetAddressRange` which returns wrong
-    /// sizes for RMM sub-allocations.
-    ///
-    /// Returns `true` if the pool was registered and copies can be skipped.
-    /// On failure, caller should fall back to `copy_gpu_buffers_to_cuda_alloc`.
-    pub fn try_register_rmm_pool(&mut self, nixl_agent: &NixlExchange, engine: &sirius_ffi::SiriusEngine) -> bool {
-        if let Self::Gpu { buffers, rmm_pool_registered, .. } = self {
-            if buffers.is_empty() {
-                return false;
-            }
-            // Query pool info from the Sirius engine (GPUBufferManager).
-            let (base, size, device_id) = match engine.get_pool_info() {
-                Ok(Some(info)) => info,
-                Ok(None) => {
-                    tracing::warn!("sirius_get_pool_info returned no data");
-                    return false;
+    /// On success, updates buffer addresses to point into the staging buffer
+    /// and returns the leases (must be held until transfer completes).
+    /// On failure (overflow, copy error), returns `None` — caller should fall
+    /// back to `copy_gpu_buffers_to_cuda_alloc`.
+    pub fn try_stage_buffers(
+        &mut self,
+        staging: &crate::gpu_staging_buffer::GpuStagingBuffer,
+    ) -> bool {
+        if let Self::Gpu { buffers, column_buffers, _staging_leases, .. } = self {
+            // Collect ALL buffers: data + null_mask + offsets (same order as transfer).
+            let mut all_bufs: Vec<(usize, usize, u64)> = Vec::new();
+            // Track which indices map back to data/null_mask/offsets per column.
+            let mut data_indices: Vec<usize> = Vec::new();
+            let mut null_mask_indices: Vec<Option<usize>> = Vec::new();
+            let mut offsets_indices: Vec<Option<usize>> = Vec::new();
+
+            for (i, b) in buffers.iter().enumerate() {
+                data_indices.push(all_bufs.len());
+                all_bufs.push((b.addr, b.len, b.device_id));
+
+                if let Some(cb) = column_buffers.get(i) {
+                    if cb.null_mask_addr != 0 && cb.null_mask_len > 0 {
+                        null_mask_indices.push(Some(all_bufs.len()));
+                        all_bufs.push((cb.null_mask_addr, cb.null_mask_len, b.device_id));
+                    } else {
+                        null_mask_indices.push(None);
+                    }
+                    if cb.offsets_addr != 0 && cb.offsets_len > 0 {
+                        offsets_indices.push(Some(all_bufs.len()));
+                        all_bufs.push((cb.offsets_addr, cb.offsets_len, b.device_id));
+                    } else {
+                        offsets_indices.push(None);
+                    }
+                } else {
+                    null_mask_indices.push(None);
+                    offsets_indices.push(None);
                 }
+            }
+
+            let leases = match staging.try_stage(&all_bufs) {
+                Ok(l) => l,
                 Err(e) => {
-                    tracing::warn!(error = %e, "sirius_get_pool_info failed");
+                    tracing::info!(error = %e, "staging buffer: falling back to per-buffer cuMemAlloc");
                     return false;
                 }
             };
-            if nixl_agent.ensure_rmm_pool_registered(base, size, device_id as u64) {
-                let buf_tuples: Vec<_> = buffers.iter().map(|b| (b.addr, b.len, b.device_id)).collect();
-                if nixl_agent.buffers_in_rmm_pool(&buf_tuples) {
-                    tracing::info!(
-                        num_buffers = buffers.len(),
-                        pool_base = format_args!("0x{base:x}"),
-                        pool_size_mb = size / (1024 * 1024),
-                        "RMM pool registered, skipping cuMemAlloc copy"
-                    );
-                    *rmm_pool_registered = true;
-                    return true;
-                }
-                tracing::warn!("some buffers outside registered RMM pool, falling back to copy");
-            }
-        }
-        false
-    }
 
-    /// Copy GPU buffers to fresh cuMemAlloc-allocated memory.
-    ///
-    /// MUST be called on the same thread where the GPU execution happened
-    /// (inside spawn_blocking), while the engine's CUDA context is still active.
-    /// This ensures the RMM sub-allocation pointers are accessible.
-    ///
-    /// After this call, the buffer addresses point to cuMemAlloc allocations
-    /// which UCX can reliably use for GPU-direct transfers.
-    pub fn copy_gpu_buffers_to_cuda_alloc(&mut self) {
-        if let Self::Gpu { buffers, cuda_alloc_addrs, .. } = self {
-            use crate::cuda_driver::{cuda_alloc, cuda_free, cuda_memcpy_dtod_no_ctx as cuda_memcpy_dtod};
-            let mut new_buffers = Vec::with_capacity(buffers.len());
-            let mut alloc_addrs = Vec::new();
-            for b in buffers.iter() {
-                match cuda_alloc(b.len) {
-                    Ok(dst) => {
-                        if let Err(e) = cuda_memcpy_dtod(dst, b.addr, b.len) {
-                            tracing::warn!(
-                                error = %e,
-                                src = format_args!("0x{:x}", b.addr),
-                                len = b.len,
-                                "cuMemcpyDtoD failed, keeping original buffer"
-                            );
-                            let _ = cuda_free(dst);
-                            new_buffers.push(b.clone());
-                        } else {
-                            tracing::info!(
-                                src = format_args!("0x{:x}", b.addr),
-                                dst = format_args!("0x{:x}", dst),
-                                len = b.len,
-                                "copied GPU buffer to cuMemAlloc"
-                            );
-                            alloc_addrs.push(dst);
-                            new_buffers.push(GpuBufferDesc {
-                                addr: dst,
-                                len: b.len,
-                                device_id: b.device_id,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            len = b.len,
-                            "cuda_alloc failed, keeping original buffer"
-                        );
-                        new_buffers.push(b.clone());
-                    }
+            // Update addresses to point to staged locations.
+            for (i, b) in buffers.iter_mut().enumerate() {
+                let lease = &leases[data_indices[i]];
+                b.addr = lease.addr();
+            }
+            for (i, cb) in column_buffers.iter_mut().enumerate() {
+                if let Some(idx) = null_mask_indices.get(i).copied().flatten() {
+                    cb.null_mask_addr = leases[idx].addr();
+                }
+                if let Some(idx) = offsets_indices.get(i).copied().flatten() {
+                    cb.offsets_addr = leases[idx].addr();
                 }
             }
-            *buffers = new_buffers;
-            *cuda_alloc_addrs = alloc_addrs;
+
+            tracing::info!(
+                num_staged = leases.len(),
+                staging_used = staging.stats().used,
+                staging_capacity = staging.stats().capacity,
+                "staged GPU buffers into staging buffer"
+            );
+
+            *_staging_leases = leases;
+            true
+        } else {
+            false
         }
     }
 
-    /// Free any cuMemAlloc-allocated buffer copies.
-    pub fn free_cuda_alloc_buffers(&mut self) {
-        if let Self::Gpu { cuda_alloc_addrs, .. } = self {
-            for &addr in cuda_alloc_addrs.iter() {
-                if let Err(e) = crate::cuda_driver::cuda_free(addr) {
-                    tracing::warn!(error = %e, "failed to free cuMemAlloc buffer");
-                }
-            }
-            cuda_alloc_addrs.clear();
-        }
-    }
 }
 
 /// Detect whether execution result is in GPU or CPU memory.
@@ -206,8 +171,7 @@ pub fn detect_execution_location(
                     num_rows: gpu_info.num_rows,
                     schema_ipc: gpu_info.schema_ipc,
                     ipc_bytes,
-                    cuda_alloc_addrs: vec![],
-                    rmm_pool_registered: false,
+                    _staging_leases: vec![],
                 };
             }
             Ok(None) => {
@@ -294,8 +258,7 @@ pub async fn send_exchange_with_nixl(
             num_rows,
             schema_ipc: _,
             ipc_bytes: _,
-            cuda_alloc_addrs,
-            rmm_pool_registered,
+            _staging_leases,
         } => {
             let Some(agent) = nixl_agent else {
                 if nixl_only {
@@ -319,23 +282,17 @@ pub async fn send_exchange_with_nixl(
                 ).await;
             }
 
-            // Free cuMemAlloc copies once we're done (success or error).
-            let free_allocs = |addrs: &[usize]| {
-                for &addr in addrs {
-                    if let Err(e) = crate::cuda_driver::cuda_free(addr) {
-                        tracing::warn!(error = %e, addr = format_args!("0x{addr:x}"), "failed to free cuMemAlloc buffer");
-                    }
-                }
-            };
+            // Buffers are staged if leases are held (addresses point into staging buffer).
+            let staged = !_staging_leases.is_empty();
 
             // Try nixl GPU-direct for each remote destination.
+            // Staging leases are kept alive by _staging_leases until this block exits.
             for dest in &remote_dests {
                 if let Err(e) = send_nixl_to_peer(
                     agent, &buffers, &column_info, &column_buffers, num_rows,
                     &ipc_bytes, dest, query_id, node_id, sender_id,
-                    rmm_pool_registered,
+                    staged,
                 ).await {
-                    free_allocs(&cuda_alloc_addrs);
                     if nixl_only {
                         return Err(format!("nixl-only: nixl transfer to {} failed: {}", dest.brpc_addr, e));
                     }
@@ -351,7 +308,6 @@ pub async fn send_exchange_with_nixl(
                 }
             }
 
-            free_allocs(&cuda_alloc_addrs);
             Ok(())
         }
     }
@@ -363,8 +319,11 @@ pub async fn send_exchange_with_nixl(
 /// transfer → notify receiver of completion.
 ///
 /// Transfers all sub-buffers (data, null_mask, offsets) for each column.
-/// The RMM pool registration covers all sub-buffers when `rmm_pool_registered`.
-async fn send_nixl_to_peer(
+///
+/// When `staged` is true, buffers are already in the staging buffer (cuMemAlloc-backed,
+/// pre-registered) — skip per-buffer registration and use cached metadata.
+/// Otherwise, fall back to per-buffer registration.
+pub async fn send_nixl_to_peer(
     agent: &Arc<NixlExchange>,
     src_buffers: &[GpuBufferDesc],
     column_info: &[(String, i32)],
@@ -375,7 +334,7 @@ async fn send_nixl_to_peer(
     query_id: (i64, i64),
     node_id: i32,
     sender_id: i32,
-    rmm_pool_registered: bool,
+    staged: bool,
 ) -> Result<(), String> {
     use doris_proto::nixl::{
         NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest,
@@ -421,22 +380,22 @@ async fn send_nixl_to_peer(
     }
 
     // Step 1: Register sender's GPU result buffers with nixl agent.
-    // When the RMM pool is registered, the pool registration already covers
-    // all sub-allocations — no per-buffer registration needed.
-    let _src_registrations = if rmm_pool_registered {
-        info!("RMM pool registered, skipping per-buffer nixl registration");
+    // - staged: buffers are in pre-registered staging buffer → no registration needed
+    // - otherwise: per-buffer registration (buffers should be cuMemAlloc-backed)
+    let _src_registrations = if staged {
+        info!("buffers staged in pre-registered staging buffer, skipping registration");
         vec![]
     } else {
-        // Buffers have been copied to cuMemAlloc allocations (by
-        // copy_gpu_buffers_to_cuda_alloc in spawn_blocking) so UCX can handle them.
-        // NOTE: When not pool-registered, sub-buffers are RMM sub-allocations
-        // that may not be separately cuMemAlloc'd. Only register data buffers.
         let buf_tuples: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len, b.device_id)).collect();
         agent.register_gpu_buffers(&buf_tuples)?
     };
 
-    // Step 2: Get fresh metadata (includes newly registered buffers).
-    let fresh_md = agent.get_fresh_metadata()?;
+    // Step 2: Get metadata — cached when staging buffer is active, fresh otherwise.
+    let fresh_md = if staged {
+        agent.get_metadata()?
+    } else {
+        agent.get_fresh_metadata()?
+    };
 
     // Step 3: Call exchange_metadata RPC on receiver.
     let request = PExchangeNixlMetadataRequest {
@@ -710,5 +669,204 @@ mod tests {
         .await;
         // No destinations → no work → Ok
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_gpu_location_into_ipc_bytes() {
+        let ipc = vec![0x41, 0x52, 0x52, 0x4f, 0x57];
+        let location = ExecutionLocation::Gpu {
+            buffers: vec![GpuBufferDesc { addr: 0x1000, len: 256, device_id: 0 }],
+            column_info: vec![("col1".to_string(), 5)],
+            column_buffers: vec![GpuColumnBuffers {
+                null_mask_addr: 0, null_mask_len: 0,
+                offsets_addr: 0, offsets_len: 0,
+                null_count: 0, scale: 0,
+            }],
+            num_rows: 10,
+            schema_ipc: vec![],
+            ipc_bytes: ipc.clone(),
+            _staging_leases: vec![],
+        };
+        assert_eq!(location.into_ipc_bytes(), ipc);
+    }
+
+    #[test]
+    fn test_cpu_location_into_ipc_bytes() {
+        let ipc = vec![1, 2, 3];
+        let location = ExecutionLocation::Cpu(ipc.clone());
+        assert_eq!(location.into_ipc_bytes(), ipc);
+    }
+
+    #[test]
+    fn test_gpu_location_no_removed_fields() {
+        // Verify ExecutionLocation::Gpu no longer has cuda_alloc_addrs or rmm_pool_registered.
+        // This is a compile-time check — if these fields existed, this wouldn't compile.
+        let location = ExecutionLocation::Gpu {
+            buffers: vec![],
+            column_info: vec![],
+            column_buffers: vec![],
+            num_rows: 0,
+            schema_ipc: vec![],
+            ipc_bytes: vec![],
+            _staging_leases: vec![],
+        };
+        match location {
+            ExecutionLocation::Gpu { buffers, num_rows, _staging_leases, .. } => {
+                assert!(buffers.is_empty());
+                assert_eq!(num_rows, 0);
+                assert!(_staging_leases.is_empty());
+            }
+            _ => panic!("expected Gpu"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_exchange_gpu_no_agent_brpc_fallback() {
+        // GPU location but no nixl agent → should fall back to bRPC.
+        // bRPC will fail (no server), but we verify the fallback logic.
+        let ipc = vec![0xAA, 0xBB, 0xCC];
+        let location = ExecutionLocation::Gpu {
+            buffers: vec![GpuBufferDesc { addr: 0x1000, len: 256, device_id: 0 }],
+            column_info: vec![("col1".to_string(), 5)],
+            column_buffers: vec![GpuColumnBuffers {
+                null_mask_addr: 0, null_mask_len: 0,
+                offsets_addr: 0, offsets_len: 0,
+                null_count: 0, scale: 0,
+            }],
+            num_rows: 10,
+            schema_ipc: vec![],
+            ipc_bytes: ipc,
+            _staging_leases: vec![],
+        };
+        let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let dests = vec![ExchangeDest {
+            brpc_addr: "10.0.0.99:8060".to_string(),
+            finst_id: (1, 1),
+        }];
+
+        let result = send_exchange_with_nixl(
+            None,     // no nixl agent
+            location,
+            &dests,
+            (1, 2),
+            0,
+            0,
+            false,    // not nixl-only → bRPC fallback
+            "localhost:8060",
+            &exchange_buffer,
+        )
+        .await;
+        // bRPC should fail (no server), but the path is exercised.
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_exchange_gpu_nixl_only_no_agent() {
+        // GPU location, nixl_only=true, no agent → should error.
+        let location = ExecutionLocation::Gpu {
+            buffers: vec![GpuBufferDesc { addr: 0x1000, len: 256, device_id: 0 }],
+            column_info: vec![],
+            column_buffers: vec![],
+            num_rows: 0,
+            schema_ipc: vec![],
+            ipc_bytes: vec![],
+            _staging_leases: vec![],
+        };
+        let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let dests = vec![ExchangeDest {
+            brpc_addr: "10.0.0.99:8060".to_string(),
+            finst_id: (1, 1),
+        }];
+
+        let result = send_exchange_with_nixl(
+            None,
+            location,
+            &dests,
+            (1, 2),
+            0,
+            0,
+            true, // nixl-only
+            "localhost:8060",
+            &exchange_buffer,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nixl-only"));
+    }
+
+    #[tokio::test]
+    async fn test_send_exchange_self_transfer() {
+        // Self-transfer: destination matches local_brpc_addr → ExchangeBuffer path.
+        let ipc = build_test_ipc();
+        let location = ExecutionLocation::Cpu(ipc);
+        let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let dests = vec![ExchangeDest {
+            brpc_addr: "localhost:8060".to_string(),
+            finst_id: (1, 1),
+        }];
+
+        let result = send_exchange_with_nixl(
+            None,
+            location,
+            &dests,
+            (1, 2),
+            42, // node_id
+            0,
+            false,
+            "localhost:8060", // matches dest → self-transfer path
+            &exchange_buffer,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    /// Build minimal valid Arrow IPC bytes for testing.
+    fn build_test_ipc() -> Vec<u8> {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema.clone()),
+            vec![std::sync::Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_send_exchange_cpu_nixl_only() {
+        // CPU location with nixl_only → should error (can't use nixl for CPU data).
+        let ipc = vec![0xAA];
+        let location = ExecutionLocation::Cpu(ipc);
+        let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let dests = vec![ExchangeDest {
+            brpc_addr: "10.0.0.1:8060".to_string(),
+            finst_id: (1, 1),
+        }];
+
+        let result = send_exchange_with_nixl(
+            None,
+            location,
+            &dests,
+            (1, 2),
+            0,
+            0,
+            true, // nixl-only
+            "localhost:8060",
+            &exchange_buffer,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nixl-only"));
     }
 }

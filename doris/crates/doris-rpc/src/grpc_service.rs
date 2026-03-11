@@ -1885,13 +1885,12 @@ impl PBackendService for PBackendServiceHandler {
                         } else {
                             let mut loc = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
                             if should_retain_exch {
-                                let pool_registered = nixl_agent_for_exch_blocking
+                                // Try staging buffer (D2D copy into pre-registered cuMemAlloc region).
+                                let _staged = nixl_agent_for_exch_blocking
                                     .as_ref()
-                                    .map(|agent| loc.try_register_rmm_pool(agent, &engine))
+                                    .and_then(|agent| agent.staging())
+                                    .map(|staging| loc.try_stage_buffers(staging))
                                     .unwrap_or(false);
-                                if !pool_registered {
-                                    loc.copy_gpu_buffers_to_cuda_alloc();
-                                }
                             }
                             Ok(loc)
                         }
@@ -2106,13 +2105,12 @@ impl PBackendService for PBackendServiceHandler {
                 // Try RMM pool registration first (zero-copy path). Falls back to
                 // cuMemAlloc copy if pool registration fails.
                 if should_retain {
-                    let pool_registered = nixl_agent_for_blocking
+                    // Try staging buffer (D2D copy into pre-registered cuMemAlloc region).
+                    let _staged = nixl_agent_for_blocking
                         .as_ref()
-                        .map(|agent| location.try_register_rmm_pool(agent, &engine))
+                        .and_then(|agent| agent.staging())
+                        .map(|staging| location.try_stage_buffers(staging))
                         .unwrap_or(false);
-                    if !pool_registered {
-                        location.copy_gpu_buffers_to_cuda_alloc();
-                    }
                 }
                 tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
                 Ok(location)

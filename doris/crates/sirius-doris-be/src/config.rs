@@ -63,4 +63,11 @@ pub struct BeConfig {
     /// Useful for debugging/iterating on the nixl exchange path.
     #[arg(long, default_value_t = false)]
     pub nixl_only: bool,
+
+    /// GPU staging buffer size for nixl transfers (e.g. "512MB", "1GB").
+    /// When set, a fixed GPU buffer is allocated via cuMemAlloc and registered
+    /// with nixl once at startup, avoiding per-transfer alloc+register cycles.
+    /// Set to "0" to disable (falls back to per-transfer cuMemAlloc).
+    #[arg(long, default_value = "512MB")]
+    pub gpu_staging_size: String,
 }

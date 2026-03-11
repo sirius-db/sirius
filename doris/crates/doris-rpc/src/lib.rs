@@ -12,6 +12,7 @@ pub mod exchange_buffer;
 pub mod exchange_sender;
 pub mod fragment_manager;
 pub mod gpu_buffer_reconstruct;
+pub mod gpu_staging_buffer;
 pub mod grpc_service;
 pub mod heartbeat_service;
 pub mod nixl_exchange;

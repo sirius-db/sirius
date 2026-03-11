@@ -44,6 +44,24 @@ async fn register_with_fe(fe_addr: &str, heartbeat_port: u16, advertise_host: &s
     Ok(())
 }
 
+/// Parse a size string like "512MB", "1GB", "0" into bytes. Returns None for "0".
+fn parse_size(s: &str) -> Option<usize> {
+    let s = s.trim();
+    if s == "0" {
+        return None;
+    }
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix("GB") {
+        (n.trim(), 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n.trim(), 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n.trim(), 1024)
+    } else {
+        (s, 1)
+    };
+    num_str.parse::<usize>().ok().map(|n| n * multiplier)
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -125,17 +143,26 @@ fn main() {
     let exchange_buffer = doris_rpc::exchange_buffer::ExchangeBuffer::new();
 
     // Initialize nixl agent for GPU-direct exchange (optional, graceful fallback).
+    let staging_size = parse_size(&config.gpu_staging_size);
     let nixl_agent = {
         let agent_name = format!(
             "sirius-be-{}:{}",
             config.advertise_host.as_deref().unwrap_or("localhost"),
             config.brpc_port
         );
-        doris_rpc::nixl_exchange::NixlExchange::try_new(&agent_name)
+        doris_rpc::nixl_exchange::NixlExchange::try_new_with_staging(
+            &agent_name,
+            staging_size,
+        )
             .map(|a| std::sync::Arc::new(a))
     };
-    if nixl_agent.is_some() {
-        info!("nixl GPU-direct exchange enabled");
+    if let Some(ref agent) = nixl_agent {
+        let has_staging = agent.staging().is_some();
+        info!(
+            has_staging,
+            staging_size_mb = staging_size.map(|s| s / (1024 * 1024)),
+            "nixl GPU-direct exchange enabled"
+        );
     } else {
         info!("nixl not available, using bRPC exchange fallback");
     }

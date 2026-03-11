@@ -39,6 +39,7 @@ use nixl_sys::{
 use tracing::{info, warn};
 
 use crate::cuda_driver::{cuda_alloc, cuda_free, ensure_cuda_context};
+use crate::gpu_staging_buffer::GpuStagingBuffer;
 
 /// Wrapper for a GPU memory region that implements nixl registration traits.
 #[derive(Debug)]
@@ -120,15 +121,6 @@ impl Drop for NixlRegisteredBuffer {
 }
 
 /// Cached RMM pool registration info.
-struct RmmPoolRegistration {
-    /// Base address of the RMM pool's underlying cudaMalloc allocation.
-    base_addr: usize,
-    /// Total size of the pool allocation.
-    size: usize,
-    /// nixl registration handle (deregisters on drop).
-    _handle: RegistrationHandle,
-}
-
 /// Wraps a nixl Agent with cached peer metadata.
 pub struct NixlExchange {
     agent: Agent,
@@ -139,18 +131,28 @@ pub struct NixlExchange {
     /// Starts `true`, set to `false` on first transfer timeout (indicates
     /// UCX cannot handle GPU memory on this system).
     gpu_transfer_enabled: std::sync::atomic::AtomicBool,
-    /// Cached RMM pool registration. Once the pool base is registered with
-    /// nixl, all sub-allocations within it can be used directly for transfers
-    /// without copying to separate cuMemAlloc buffers.
-    rmm_pool_registration: Mutex<Option<RmmPoolRegistration>>,
+    /// Pre-allocated GPU staging buffer for nixl transfers. When present,
+    /// source buffers are D2D-copied into this cuMemAlloc-backed region
+    /// instead of doing per-transfer cuMemAlloc+register cycles.
+    staging: Option<GpuStagingBuffer>,
+    /// Cached nixl metadata from startup (valid when using staging buffer,
+    /// since the registered memory region doesn't change).
+    cached_metadata: Mutex<Option<Vec<u8>>>,
 }
 
 impl NixlExchange {
     /// Create a new NixlExchange agent.
     ///
     /// Initializes the UCX backend for GPU-direct transfers.
+    /// If `staging_size` is `Some(n)`, allocates an n-byte GPU staging buffer
+    /// and registers it with nixl once at startup.
     /// Returns `None` if nixl initialization fails (fallback to bRPC).
     pub fn try_new(agent_name: &str) -> Option<Self> {
+        Self::try_new_with_staging(agent_name, None)
+    }
+
+    /// Create with an optional staging buffer size.
+    pub fn try_new_with_staging(agent_name: &str, staging_size: Option<usize>) -> Option<Self> {
         let mut cfg = AgentConfig::default();
         // Default pthr_delay_us=0 causes 100% CPU spin. Use 100µs polling interval.
         cfg.pthr_delay_us = 100;
@@ -191,13 +193,77 @@ impl NixlExchange {
             "nixl agent initialized with UCX backend"
         );
 
-        Some(Self {
+        // Try to create staging buffer if requested.
+        let staging = staging_size.and_then(|size| {
+            if size == 0 {
+                return None;
+            }
+            match GpuStagingBuffer::new(size, 0, &agent, &backend) {
+                Ok(buf) => {
+                    info!(size, size_mb = size / (1024 * 1024), "GPU staging buffer ready");
+                    Some(buf)
+                }
+                Err(e) => {
+                    warn!(error = %e, size, "failed to create GPU staging buffer, will use per-transfer alloc");
+                    None
+                }
+            }
+        });
+
+        let exchange = Self {
             agent,
             backend,
             remote_agents: Mutex::new(HashMap::new()),
             gpu_transfer_enabled: std::sync::atomic::AtomicBool::new(true),
-            rmm_pool_registration: Mutex::new(None),
-        })
+            staging,
+            cached_metadata: Mutex::new(None),
+        };
+
+        // Cache startup metadata if staging buffer is present (memory layout is stable).
+        if exchange.staging.is_some() {
+            match exchange.agent.get_local_md() {
+                Ok(md) => {
+                    info!(md_len = md.len(), "cached nixl metadata (staging buffer registered)");
+                    *exchange.cached_metadata.lock().unwrap() = Some(md);
+                }
+                Err(e) => warn!(error = %e, "failed to cache startup metadata"),
+            }
+        }
+
+        Some(exchange)
+    }
+
+    /// Access the nixl Agent (for staging buffer creation etc.).
+    pub fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    /// Access the nixl Backend.
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    /// Access the GPU staging buffer, if allocated.
+    pub fn staging(&self) -> Option<&GpuStagingBuffer> {
+        self.staging.as_ref()
+    }
+
+    /// Get cached metadata (from startup, when staging buffer is registered).
+    /// Returns `None` if no cached metadata is available.
+    pub fn get_cached_metadata(&self) -> Option<Vec<u8>> {
+        self.cached_metadata.lock().unwrap().clone()
+    }
+
+    /// Get metadata: cached if staging buffer is present, otherwise fresh.
+    ///
+    /// When the staging buffer is registered, the memory layout is stable,
+    /// so we can reuse the startup metadata. When per-buffer registration
+    /// changes the memory map, we need fresh metadata.
+    pub fn get_metadata(&self) -> Result<Vec<u8>, String> {
+        if let Some(cached) = self.get_cached_metadata() {
+            return Ok(cached);
+        }
+        self.get_fresh_metadata()
     }
 
     /// Whether GPU-direct transfers (RDMA/UCX) are available.
@@ -221,94 +287,6 @@ impl NixlExchange {
     /// Uses `cuMemGetAddressRange` to discover the pool's base address and size
     /// from any sub-allocation pointer. The registration is cached — subsequent
     /// calls with pointers in the same pool are no-ops.
-    ///
-    /// Register the RMM processing pool with nixl using base/size from the engine.
-    ///
-    /// The pool info comes from `sirius_get_pool_info()` which queries the
-    /// GPUBufferManager directly — this avoids `cuMemGetAddressRange` which
-    /// can't properly report size for RMM pool sub-allocations.
-    ///
-    /// Returns `true` if the pool is registered (either freshly or from cache),
-    /// `false` if registration failed (caller should fall back to copy path).
-    pub fn ensure_rmm_pool_registered(&self, base: usize, size: usize, device_id: u64) -> bool {
-
-        let mut pool_reg = self.rmm_pool_registration.lock().unwrap();
-
-        // Already registered for this pool?
-        if let Some(ref reg) = *pool_reg {
-            if reg.base_addr == base && reg.size == size {
-                return true;
-            }
-            // Different pool — drop old registration and re-register.
-            info!(
-                old_base = format_args!("0x{:x}", reg.base_addr),
-                new_base = format_args!("0x{base:x}"),
-                "RMM pool changed, re-registering"
-            );
-        }
-
-        // Register the entire pool region.
-        if let Err(e) = ensure_cuda_context() {
-            warn!(error = %e, "CUDA context init failed in ensure_rmm_pool_registered");
-            return false;
-        }
-
-        let mut opt = match OptArgs::new() {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, "OptArgs::new failed");
-                return false;
-            }
-        };
-        if let Err(e) = opt.add_backend(&self.backend) {
-            warn!(error = %e, "add_backend failed");
-            return false;
-        }
-
-        let wrapper = GpuBufferWrapper {
-            addr: base,
-            len: size,
-            device_id,
-        };
-        match self.agent.register_memory(&wrapper, Some(&opt)) {
-            Ok(handle) => {
-                info!(
-                    base = format_args!("0x{base:x}"),
-                    size,
-                    size_mb = size / (1024 * 1024),
-                    "registered RMM pool with nixl"
-                );
-                *pool_reg = Some(RmmPoolRegistration {
-                    base_addr: base,
-                    size,
-                    _handle: handle,
-                });
-                true
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    base = format_args!("0x{base:x}"),
-                    size,
-                    "failed to register RMM pool with nixl"
-                );
-                false
-            }
-        }
-    }
-
-    /// Check if all given GPU buffers fall within the registered RMM pool.
-    pub fn buffers_in_rmm_pool(&self, buffers: &[(usize, usize, u64)]) -> bool {
-        let pool_reg = self.rmm_pool_registration.lock().unwrap();
-        let Some(ref reg) = *pool_reg else {
-            return false;
-        };
-        let pool_end = reg.base_addr + reg.size;
-        buffers.iter().all(|&(addr, len, _)| {
-            addr >= reg.base_addr && addr + len <= pool_end
-        })
-    }
-
     /// Register GPU memory buffers with the nixl agent (no ownership transfer).
     ///
     /// Returns `NixlRegisteredBuffer` handles with `owns_memory: false` — the
