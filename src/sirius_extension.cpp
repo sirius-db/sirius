@@ -622,8 +622,7 @@ static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& param
 static void SetUsePinMemoryForCaching(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::USE_PIN_MEM_FOR_CACHING = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}",
-                   Config::USE_PIN_MEM_FOR_CACHING);
+  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}", Config::USE_PIN_MEM_FOR_CACHING);
 }
 
 static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parameter)
