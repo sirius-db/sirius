@@ -619,6 +619,12 @@ static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& param
                    Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
 }
 
+static void SetUsePinMemoryForCaching(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::USE_PIN_MEM_FOR_CACHING = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}", Config::USE_PIN_MEM_FOR_CACHING);
+}
+
 static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
@@ -761,6 +767,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CPU_PROCESSING),
                             SetUsePinMemory);
+
+  config.AddExtensionOption(
+    "use_pin_memory_for_caching",
+    "Whether or not the cache buffer is allocated with pinned host memory instead of GPU memory",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CACHING),
+    SetUsePinMemoryForCaching);
 
   // Add in config option for expression executor
   config.AddExtensionOption("use_cudf_expr",

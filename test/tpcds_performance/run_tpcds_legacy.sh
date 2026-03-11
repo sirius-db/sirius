@@ -20,6 +20,7 @@
 #   --db <path>           Override path to DuckDB database file
 #   --queries <N...>      Specific query numbers to run (default: all 1-99)
 #   --output-dir <path>   Directory for results
+#   --pin-cache           Use pinned host memory for caching instead of GPU memory
 # =============================================================================
 
 set -uo pipefail
@@ -32,8 +33,9 @@ QUERY_DIR="$SCRIPT_DIR/queries"
 
 # --- Parse arguments ---
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <gpu_caching_size> <gpu_processing_size> [--sf N] [--db path] [--queries N...] [--output-dir path]"
+    echo "Usage: $0 <gpu_caching_size> <gpu_processing_size> [--sf N] [--db path] [--queries N...] [--output-dir path] [--pin-cache]"
     echo "Example: $0 '1 GB' '2 GB' --sf 1 --queries 1 2 3"
+    echo "         $0 '1 GB' '2 GB' --pin-cache"
     exit 1
 fi
 
@@ -45,6 +47,7 @@ shift
 SF=1
 DB_PATH=""
 OUTPUT_DIR=""
+PIN_CACHE=false
 QUERIES=()
 
 while [ $# -gt 0 ]; do
@@ -60,6 +63,10 @@ while [ $# -gt 0 ]; do
         --output-dir)
             OUTPUT_DIR="$2"
             shift 2
+            ;;
+        --pin-cache)
+            PIN_CACHE=true
+            shift
             ;;
         --queries)
             shift
@@ -128,6 +135,7 @@ echo "Scale Factor:     $SF"
 echo "Database:         $DB_PATH"
 echo "GPU Caching:      $GPU_CACHING_SIZE"
 echo "GPU Processing:   $GPU_PROCESSING_SIZE"
+echo "Cache Mode:       $([ "$PIN_CACHE" = true ] && echo "pinned host memory" || echo "GPU memory")"
 echo "Queries:          ${QUERIES[*]}"
 echo "Output:           $OUTPUT_DIR"
 echo "=========================================="
@@ -166,6 +174,9 @@ for q in "${QUERIES[@]}"; do
     # Write SQL file using printf to avoid bash heredoc expansion issues
     TEMP_SQL="$OUTPUT_DIR/tmp_q${q}.sql"
     {
+        if [ "$PIN_CACHE" = true ]; then
+            printf "SET use_pin_memory_for_caching = true;\n"
+        fi
         printf "CALL gpu_buffer_init('%s', '%s');\n" "$GPU_CACHING_SIZE" "$GPU_PROCESSING_SIZE"
         printf ".timer on\n"
         printf 'CALL gpu_processing("%s");\n' "$ESCAPED_SQL"
