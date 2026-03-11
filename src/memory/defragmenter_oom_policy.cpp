@@ -17,9 +17,11 @@
 
 #include "memory/defragmenter_oom_policy.hpp"
 
-#include <rmm/error.hpp>
+#include "cuda_runtime_api.h"
 
 #include <cuda_runtime.h>
+
+#include <cucascade/memory/error.hpp>
 
 namespace sirius {
 namespace memory {
@@ -27,8 +29,7 @@ namespace memory {
 namespace {
 
 /**
- * @brief Returns true if the default CUDA memory pool for the current device appears
- * fragmented, meaning enough memory is reserved but not in use to satisfy @p bytes.
+ * @brief Returns true if @p pool appears fragmented for an allocation of @p bytes.
  *
  * Fragmentation is detected by comparing `cudaMemPoolAttrReservedMemCurrent`
  * (total bytes held by the pool from the driver) against
@@ -36,14 +37,8 @@ namespace {
  * If the gap between the two is at least @p bytes the pool holds enough free,
  * fragmented blocks that a trim may consolidate into a single contiguous region.
  */
-bool is_pool_fragmented(std::size_t bytes)
+bool is_pool_fragmented(cudaMemPool_t pool, std::size_t bytes)
 {
-  int device{};
-  if (cudaGetDevice(&device) != cudaSuccess) { return false; }
-
-  cudaMemPool_t pool{};
-  if (cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) { return false; }
-
   std::uint64_t reserved{};
   std::uint64_t used{};
 
@@ -54,25 +49,8 @@ bool is_pool_fragmented(std::size_t bytes)
     return false;
   }
 
-  // There is at least `bytes` worth of reserved-but-unused (fragmented) memory.
-  return reserved > used && (reserved - used) >= bytes;
-}
-
-/**
- * @brief Trims the default CUDA memory pool for the current device, releasing all
- * reserved-but-unused memory back to the driver.
- */
-void trim_pool()
-{
-  int device{};
-  if (cudaGetDevice(&device) != cudaSuccess) { return; }
-
-  cudaMemPool_t pool{};
-  if (cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) { return; }
-
-  // Keep zero bytes — release all free blocks to the driver so the driver can
-  // reassemble them into larger contiguous regions for the retry.
-  cudaMemPoolTrimTo(pool, /*minBytesToKeep=*/0);
+  // There is at least `10 X bytes` worth of reserved-but-unused (fragmented) memory.
+  return reserved > used && (reserved - used) >= 10 * bytes;
 }
 
 }  // namespace
@@ -84,12 +62,32 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
                                              std::exception_ptr eptr,
                                              RetryFunc retry_function)
 {
-  // Only attempt defragmentation when the pool holds enough free-but-fragmented
-  // memory to satisfy the request. If the GPU simply doesn't have enough memory,
-  // trimming won't help and we rethrow immediately.
-  if (!is_pool_fragmented(bytes)) { std::rethrow_exception(eptr); }
+  // Only cucascade_out_of_memory carries a pool handle we can inspect and trim.
+  // Any other exception type is rethrown immediately.
+  cucascade::memory::cucascade_out_of_memory* oom_ex{};
+  try {
+    std::rethrow_exception(eptr);
+  } catch (cucascade::memory::cucascade_out_of_memory& ex) {
+    oom_ex = &ex;
+  } catch (...) {
+    std::rethrow_exception(eptr);
+  }
 
-  trim_pool();
+  if (oom_ex->error_kind != cucascade::memory::MemoryError::ALLOCATION_FAILED) {
+    // The requested allocation size exceeds the pool's maximum allocation size, so no amount
+    // of trimming will help. Surface the error to the caller immediately.
+    std::rethrow_exception(eptr);
+  }
+
+  // If the pool doesn't look fragmented, trimming won't help — bail out.
+  if (oom_ex->pool_handle && !is_pool_fragmented(oom_ex->pool_handle, bytes)) {
+    std::rethrow_exception(eptr);
+  }
+
+  // Release all free, fragmented blocks back to the driver so it can reassemble
+  // them into larger contiguous regions for the retry.
+  cudaMemPoolTrimTo(oom_ex->pool_handle, /*minBytesToKeep=*/0);
+  cudaDeviceSynchronize();  // Ensure that the trim operation is complete before retrying.
 
   try {
     return retry_function(bytes, stream);
