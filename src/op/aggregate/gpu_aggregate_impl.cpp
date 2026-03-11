@@ -17,10 +17,12 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/stream_compaction.hpp>
 
 namespace sirius {
 namespace op {
@@ -128,18 +130,39 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   auto input_table = get_cudf_table_view(*input);
   auto mr          = memory_space.get_default_allocator();
 
-  // Dictionary-encode STRING group keys so the groupby hashes INT32 indices
-  // instead of variable-length strings.
+  // Dictionary-encode STRING group keys when cardinality is low relative to
+  // row count.  High-cardinality columns (ndv/rows >= 10%) are left as-is
+  // because the encode/decode overhead exceeds the hashing benefit.
+  constexpr double dict_encode_max_ratio = 0.10;
   std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
   std::vector<cudf::column_view> group_cols;
   group_cols.reserve(group_idx.size());
   for (int idx : group_idx) {
     auto col = input_table.column(idx);
-    if (col.type().id() == cudf::type_id::STRING) {
-      auto encoded =
-        cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-      group_cols.push_back(encoded->view());
-      encoded_key_owners.push_back(std::move(encoded));
+    if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
+      auto ndv = cudf::distinct_count(
+        col, cudf::null_policy::EXCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+      double ratio = static_cast<double>(ndv) / col.size();
+      if (ratio < dict_encode_max_ratio) {
+        auto encoded =
+          cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+        group_cols.push_back(encoded->view());
+        encoded_key_owners.push_back(std::move(encoded));
+        SIRIUS_LOG_DEBUG(
+          "local_grouped_agg: dict-encoding key col {} (ndv={}, rows={}, ratio={:.4f})",
+          idx,
+          ndv,
+          col.size(),
+          ratio);
+      } else {
+        group_cols.push_back(col);
+        SIRIUS_LOG_DEBUG(
+          "local_grouped_agg: skipping dict-encode for key col {} (ndv={}, rows={}, ratio={:.4f})",
+          idx,
+          ndv,
+          col.size(),
+          ratio);
+      }
     } else {
       group_cols.push_back(col);
     }
