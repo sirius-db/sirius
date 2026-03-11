@@ -43,7 +43,7 @@ Analyze build errors, suggest fixes, rebuild, and iterate until the build succee
 
 3. **Run the build:**
    ```bash
-   CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make <preset> 2>&1 | tail -200
+   pixi run build <preset> 2>&1 | tail -200
    ```
 
 4. **If build succeeds:** Report success and exit.
@@ -83,4 +83,4 @@ See `error-patterns.md` in this directory for a catalog of known Sirius build er
 - Always present each fix as a draft for review before applying (in interactive mode)
 - Track which files were modified so changes can be reverted
 - If a clean build is needed, suggest `rm -rf build` but confirm with user first (destructive)
-- Reduce parallelism if OOM during build: `CMAKE_BUILD_PARALLEL_LEVEL=4 make`
+- Reduce parallelism if OOM during build: `CMAKE_BUILD_PARALLEL_LEVEL=4 pixi run build`

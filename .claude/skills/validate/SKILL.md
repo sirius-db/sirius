@@ -91,7 +91,7 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
    Build and run:
    ```bash
    # Build with stream check enabled
-   CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/release --target stream_check
+   pixi run -- cmake --build build/release --target stream_check
 
    # Run the query with stream_check preloaded
    LD_PRELOAD=build/release/libstream_check.so build/release/duckdb <db_path> <<'EOF'

@@ -177,7 +177,7 @@ Summarize Phase 1 findings. Offer ASan when the crash appears to be a CPU-side m
 
 - Build with `clang-debug` (ASan is on by default in Debug builds):
   ```bash
-  CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make clang-debug
+  pixi run build clang-debug
   ```
 - Run the reproduction case:
   ```bash
@@ -217,9 +217,9 @@ Fallback when ASan and Compute Sanitizer don't find the issue, or when you need 
   - `relwithdebinfo` (recommended) -- optimized with debug symbols, faster execution
   - `clang-debug` -- unoptimized, best for stepping through code line-by-line
   ```bash
-  CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make relwithdebinfo
+  pixi run build relwithdebinfo
   # or for full debug:
-  CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make clang-debug
+  pixi run build clang-debug
   ```
 - Run with cuda-gdb (replace `<preset>` with chosen preset):
   ```bash

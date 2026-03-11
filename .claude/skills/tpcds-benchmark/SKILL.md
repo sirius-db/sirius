@@ -260,7 +260,7 @@ Each query runs twice:
 ## Before Running
 
 - **Ask the user** for any paths you don't know. Do NOT assume paths.
-- Ensure the DuckDB binary is built: `CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make`
+- Ensure the DuckDB binary is built: `pixi run build`
 - For Super Sirius: ensure `SIRIUS_CONFIG_FILE` is set
 - For Legacy Sirius: the config is automatically unset, no action needed
 - Query files must exist in `test/tpcds_performance/queries/` — run `generate_tpcds_data.sh` first

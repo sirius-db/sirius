@@ -67,9 +67,10 @@ inputs = [
   "src/**/*.cpp",
   "src/**/*.cu",
   "src/**/*.cuh",
-  "src/include/**/*.h",
-  "src/include/**/*.hpp",
+  "src/**/*.h",
+  "src/**/*.hpp",
   "test/**/*.cpp",
+  "test/**/*.hpp",
   "test/sql/**/*",
 ]
 

@@ -19,18 +19,14 @@ Experiment Setup:
 
 ![Performance](sirius-perf.png)
 
-## Supported OS/GPU/CUDA/CMake
+## Requirements
+
 - Ubuntu >= 22.04
 - NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 13.0
-- CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
-- libcudf >= 26.04
-- We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
-
-### Requirements
-
-- Git (to clone the repo)
-- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+- CUDA >= 13.0 (driver only — the toolkit is provided by Pixi)
+- Git
+- [Pixi](https://pixi.sh/latest/installation/) (manages all build dependencies: CMake, clang, cuDF, RMM, spdlog, etc.)
+- We recommend at least **16 vCPUs** for faster compilation
 
 ## Building Sirius
 
@@ -41,18 +37,27 @@ cd sirius
 ```
 The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 
-There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed. Start a shell in the environment with:
+Pixi manages all build dependencies (CUDA toolkit, cuDF, CMake, clang, etc.). Start a shell in the environment with:
 ```
 pixi shell
 ```
-The environment activation handles setting up everything needed to build and test.
 
-To build Sirius:
+To build Sirius (release by default):
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+pixi run build
 ```
 
-Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
+Other build presets are available:
+```
+pixi run build debug              # Debug build
+pixi run build relwithdebinfo     # Release with debug symbols (for profiling)
+pixi run build clang-debug        # Clang debug build (for sanitizers)
+```
+
+If building consumes too much memory, reduce ninja parallelism:
+```
+CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run build
+```
 
 Optionally, to use the Python API in Sirius, we also need to build the duckdb-python package with the following commands:
 ```
@@ -66,36 +71,24 @@ python3 -m venv --prompt duckdb .venv
 source .venv/bin/activate
 ```
 
-## Generating and Loading test datasets
+## Generating test datasets
 
-### TPC-H Dataset
-
-To generate the TPC-H dataset
+A setup script generates both TPC-H (SF1) and ClickBench datasets in one step:
 ```
-cd test_datasets
-unzip tpch-dbgen.zip
-cd tpch-dbgen
-./dbgen -s 1 && mkdir s1 && mv *.tbl s1  # this generates dataset of SF1
-cd ../../
+./setup_test_datasets.sh
 ```
 
-To load the TPC-H dataset to duckdb:
+This creates the necessary data files under `test_datasets/`. The script is idempotent — it skips datasets that already exist.
+
+### Loading datasets into DuckDB
+
+To load the TPC-H dataset:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
 .read scripts/tpch_load.sql
 ```
 
-### ClickBench Dataset
-
-To download the dataset run:
-```
-cd test_datasets
-wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
-gzip -d test_hits.tsv.gz
-cd ..
-```
-
-To load the dataset to duckdb:
+To load the ClickBench dataset:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
 .read scripts/clickbench_load_duckdb.sql
@@ -190,12 +183,12 @@ con.execute('''
 
 Sirius provides a unit test that compares Sirius against DuckDB for correctness across many test queries. Note that these tests are meant to be end to end tests as they run SQL queries using Sirius and compare that against the expected result. To run the unittest, generate the datasets using the method described [here](#generating-and-loading-test-datasets) and run the unittest using the following command:
 ```
-make test
+pixi run test
 ```
 
 To run a specific test run the command from the root directory:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+pixi run build
 build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 ```
 
@@ -203,13 +196,13 @@ build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 
 Sirius also implements C++ tests for all of the APIs it implements. These tests are meant to be individual unit tests for each of the classes/functions used to run Sirius. You can find examples on how to implement these unit tests in `test/cpp`. You can run all of the unit tests using:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+pixi run build
 build/release/extension/sirius/test/cpp/sirius_unittest
 ```
 
 To run tests associated with specific tag or to run a specific test you can execute the the test script like this:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+pixi run build
 build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
 build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
 ```

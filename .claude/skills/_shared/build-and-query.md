@@ -18,12 +18,11 @@ All skills support three build presets:
 
 **Build command pattern (always use pixi):**
 ```bash
-cd /home/bwyogatama/sirius
-pixi run -e clang make release
+pixi run build release
 # or
-pixi run -e clang make relwithdebinfo
+pixi run build relwithdebinfo
 # or
-pixi run -e clang make clang-debug
+pixi run build clang-debug
 ```
 
 **Important:** Always build inside a pixi environment. Pixi manages all dependencies (CUDA toolkit, cuDF, clang, sccache, etc.) via `pixi.toml`.
@@ -39,13 +38,13 @@ DuckDB's CMake has `ENABLE_SANITIZER=TRUE` by default, which adds `-fsanitize=ad
 
 **To explicitly disable ASan in debug builds** (e.g., when using TSan instead):
 ```bash
-pixi run -e clang make clang-debug EXTRA_CMAKE_FLAGS="-DENABLE_SANITIZER=0"
+EXTRA_CMAKE_FLAGS="-DENABLE_SANITIZER=0" pixi run build clang-debug
 ```
 
 **ASan vs TSan -- mutually exclusive:**
 ASan and TSan cannot be used simultaneously. DuckDB will warn and disable ASan if both are enabled. Use separate builds:
 - ASan build: `clang-debug` (default, no extra flags)
-- TSan build: `clang-debug` with `EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON -DENABLE_SANITIZER=0"`
+- TSan build: `EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON -DENABLE_SANITIZER=0" pixi run build clang-debug`
 
 **ASan runtime options:**
 ```bash

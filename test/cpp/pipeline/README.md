@@ -40,7 +40,7 @@ These tests are integrated into the main test suite and will run as part of the 
 
 ```bash
 # Build and run all tests
-make test
+pixi run test
 
 # Or run just the pipeline executor tests using catch2 tags
 ./build/release/test/unittest "[pipeline_executor]"

@@ -10,7 +10,7 @@
 ```bash
 export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
 rm -rf build
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
+pixi run build
 ```
 
 ## CUDA Architecture Mismatch
@@ -85,8 +85,7 @@ git submodule update --init --recursive
 **Fix:**
 ```bash
 pixi shell
-source setup_sirius.sh
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
+pixi run build
 ```
 
 ## OOM During Build
@@ -97,5 +96,5 @@ CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 
 **Fix:**
 ```bash
-CMAKE_BUILD_PARALLEL_LEVEL=4 make
+CMAKE_BUILD_PARALLEL_LEVEL=4 pixi run build
 ```
