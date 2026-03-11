@@ -185,7 +185,7 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
                                                      host_src.get_device_id());  // NUMA node id
 
   auto data_source = std::make_unique<sirius::op::scan::prefetched_data_source>(
-    std::move(ranges), host_src.get_fallback_datasource());
+    std::move(ranges), host_src.get_file_size(), host_src.get_fallback_datasource());
 
   // Point the reader options at our in-memory datasource and call cudf::io::read_parquet.
   auto opts = host_src.get_reader_options();
@@ -262,6 +262,7 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     std::move(host_src.get_column_chunk_byte_ranges()),
     data_size,
     host_src.get_uncompressed_size_in_bytes(),
+    host_src.get_file_size(),
     host_src.get_fallback_datasource());
 }
 
