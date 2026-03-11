@@ -930,7 +930,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::VARCHAR,
                             Value("none"),
                             SetCacheScanLevel);
-                            
+
   config.AddExtensionOption("max_build_hash_table_bytes",
                             "Maximum size a build-side table can be where it will create a "
                             "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
