@@ -250,6 +250,10 @@ while [ $# -gt 1 ]; do
             NUM_ITERATIONS="$2"
             shift 2
             ;;
+        --timeout)
+            QUERY_TIMEOUT="$2"
+            shift 2
+            ;;
         *)
             break
             ;;
@@ -257,11 +261,12 @@ while [ $# -gt 1 ]; do
 done
 
 NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
+QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] <scale_factor>"
+    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] <scale_factor>"
     echo "       $0 --report <run_dir>"
-    echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius --iterations 3 1000"
+    echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius --iterations 3 --timeout 120 1000"
     exit 1
 fi
 
@@ -423,6 +428,7 @@ for engine in $ENGINES; do
         EXTRA_ARGS+=(--parquet-dir "$PARQUET_DIR")
     fi
     EXTRA_ARGS+=(--iterations "$NUM_ITERATIONS")
+    EXTRA_ARGS+=(--timeout "$QUERY_TIMEOUT")
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log" || true
 done
