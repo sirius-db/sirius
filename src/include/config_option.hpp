@@ -762,7 +762,6 @@ struct configuration_setter {
           throw std::runtime_error(
             fmt::format("Error applying configuration option '{}': {}", path.data(), e.what()));
         }
-        setter->apply(*cfg);
       } else if (setter->is_required()) {
         throw std::invalid_argument(
           fmt::format("Missing required configuration option: {}", path.data()));

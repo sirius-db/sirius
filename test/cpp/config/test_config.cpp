@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <exception>
 #include <optional>
+#include <stdexcept>
 #include <variant>
 
 TEST_CASE("use configuration basic setters", "[config_opt][basic]")
@@ -181,7 +182,7 @@ TEST_CASE("use configuration basic setters with condition", "[config_opt][condit
           string_value = "config setter test";
     )");
 
-  REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::invalid_argument);
+  REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
   REQUIRE(int_value == 0);  // value should not be changed due to validation failure
 }
 
@@ -593,7 +594,7 @@ TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
     setter.add_config("numbers", numbers, [](const int& val) { return val > 0; });
 
     // This should throw because -5 fails validation
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 
   SECTION("Element validation with custom predicate")
@@ -651,7 +652,7 @@ TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
 
     setter.add_config("fractions", fractions, sirius::config::fraction<double>{});
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 }
 
@@ -690,7 +691,7 @@ TEST_CASE("Variant config validates the value", "[config_opt][validation][varian
     setter.add_variant_config<int>(
       "port", port_or_name, [](const int& val) { return val > 0 && val <= 65535; });
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 
   SECTION("Variant with string alternative and validation")
@@ -722,7 +723,7 @@ TEST_CASE("Variant config validates the value", "[config_opt][validation][varian
     setter.add_variant_config<std::string>(
       "name", port_or_name, [](const std::string& val) { return !val.empty(); });
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 
   SECTION("Variant with between validator")
@@ -751,6 +752,40 @@ TEST_CASE("Variant config validates the value", "[config_opt][validation][varian
 
     setter.add_variant_config<int>("percentage", value, config::between<int>{0, 100});
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
+  }
+}
+
+TEST_CASE("Unknown config keys throw runtime_error", "[config_opt][unknown_key]")
+{
+  using namespace sirius;
+
+  SECTION("Unregistered key in config throws")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("known_key", libconfig::Setting::TypeInt)   = 42;
+    cfg.getRoot().add("unknown_key", libconfig::Setting::TypeInt) = 99;
+
+    int known_val = 0;
+    config::configuration_setter setter;
+    setter.add_config("known_key", known_val);
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
+  }
+
+  SECTION("All keys registered does not throw")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("key_a", libconfig::Setting::TypeInt) = 1;
+    cfg.getRoot().add("key_b", libconfig::Setting::TypeInt) = 2;
+
+    int a = 0, b = 0;
+    config::configuration_setter setter;
+    setter.add_config("key_a", a);
+    setter.add_config("key_b", b);
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(a == 1);
+    REQUIRE(b == 2);
   }
 }
