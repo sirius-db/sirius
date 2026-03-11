@@ -17,6 +17,7 @@
 #define CATCH_CONFIG_RUNNER
 
 #include "catch.hpp"
+#include "config.hpp"
 #include "log/logging.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -87,7 +88,8 @@ int main(int argc, char* argv[])
 {
   // Initialize the logger
   std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
-  InitGlobalLogger(log_dir + "/sirius_unittest.log");
+  Config::LOG_DIR     = log_dir;
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
 
   // Create shared test environments. Both start PAUSED and are only activated
   // by the listener for tests with the matching tag. This avoids GPU memory

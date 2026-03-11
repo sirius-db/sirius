@@ -759,6 +759,27 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
+static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_LEVEL = StringValue::Get(parameter);
+  SetGlobalLogLevel(Config::LOG_LEVEL);
+  SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
+}
+
+static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_DIR = StringValue::Get(parameter);
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
+}
+
+static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -863,6 +884,23 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
+
+  // Logging configuration
+  config.AddExtensionOption("sirius_log_level",
+                            "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_LEVEL),
+                            SetLogLevel);
+  config.AddExtensionOption("sirius_log_dir",
+                            "Directory for Sirius log files",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_DIR),
+                            SetLogDir);
+  config.AddExtensionOption("sirius_log_flush_seconds",
+                            "Interval in seconds between automatic log flushes",
+                            LogicalType::INTEGER,
+                            Value::INTEGER(Config::LOG_FLUSH_SECONDS),
+                            SetLogFlushSeconds);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
