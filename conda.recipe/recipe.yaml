@@ -1,0 +1,60 @@
+context:
+  version: "0.1.0"
+
+package:
+  name: sirius-duckdb
+  version: ${{ version }}
+
+source:
+  - git: ..
+    branch: rattler
+
+build:
+  number: 0
+  script: build.sh
+  string: cuda${{ cuda_version }}_h${{ hash }}
+
+requirements:
+  build:
+    - ${{ compiler('c') }}
+    - ${{ compiler('cxx') }}
+    - cmake >=4.1
+    - ninja
+    - pkg-config
+    - cuda-nvcc
+    - cuda-version =${{ cuda_version }}
+  ignore_run_exports:
+    by_name:
+      - libabseil
+      - libcurand
+      - cuda-cudart
+  host:
+    - libcudf >=26.02.00,<26.03
+    - librmm
+    - spdlog >=1.8,<1.9
+    - libconfig
+    - libabseil >=20260107.0
+    - cuda-cudart-dev
+    - cuda-nvml-dev
+    - libcurand-dev
+    - cuda-version =${{ cuda_version }}
+    - numactl
+  run:
+    - libcudf >=26.02.00
+    - librmm
+    - spdlog >=1.8
+    - cuda-version >=${{ cuda_version }}
+    - duckdb =1.4.4
+  run_constraints:
+    - __cuda >=${{ cuda_version }}
+
+tests:
+  - script:
+      - test -f $PREFIX/lib/sirius.duckdb_extension
+      - test -f $PREFIX/etc/conda/activate.d/sirius-duckdb.sh
+      - test -f $PREFIX/etc/conda/deactivate.d/sirius-duckdb.sh
+
+about:
+  license: Apache-2.0
+  license_file: LICENSE
+  summary: GPU-native SQL engine as a DuckDB extension

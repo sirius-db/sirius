@@ -30,5 +30,8 @@ cufile.log
 !.pixi/config.toml
 compile_commands.json
 
+# rattler-build output
+output/
+
 # Zed editor settings
 .zed
