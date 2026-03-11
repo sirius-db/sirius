@@ -749,7 +749,8 @@ class TableScanGetSizeTask : public BaseExecutorTask {
     auto& l_state_scan = l_state->Cast<GPUTableScanLocalSourceState>();
     TableFunctionInput data(
       op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
-    auto chunk = make_uniq<DataChunk>();
+    data.async_result = AsyncResultType::IMPLICIT;
+    auto chunk        = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
 
     while (true) {
@@ -822,7 +823,8 @@ class TableScanCoalesceTask : public BaseExecutorTask {
     auto& l_state_scan = l_state->Cast<GPUTableScanLocalSourceState>();
     TableFunctionInput data(
       op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
-    auto chunk = make_uniq<DataChunk>();
+    data.async_result = AsyncResultType::IMPLICIT;
+    auto chunk        = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
     uint64_t row_offset_aligned, row_offset_unaligned;
     vector<uint64_t> column_data_offsets_aligned, column_data_offsets_unaligned;
@@ -1465,6 +1467,7 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext& exec_cont
 
   TableFunctionInput data(
     bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
+  data.async_result = AsyncResultType::IMPLICIT;
 
   if (function.function) {
     auto start           = std::chrono::high_resolution_clock::now();
