@@ -243,45 +243,18 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
     } catch (const rmm::out_of_memory&) {
-      SIRIUS_LOG_WARN("Pipeline {}: OOM at operator {} (id={}, index {}/{}), retrying once",
-                      pipeline->get_pipeline_id(),
-                      op.get_name(),
-                      op.get_operator_id(),
-                      i,
-                      operators.size());
-      try {
-        SIRIUS_LOG_WARN(
-          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), trimming memory pool and "
-          "retrying operator)",
-          pipeline->get_pipeline_id(),
-          op.get_name(),
-          op.get_operator_id(),
-          i,
-          operators.size());
-        cudaMemPool_t pool{};
-        if (cudaDeviceGetDefaultMemPool(&pool,
-                                        operator_input_output_data->get_data_batches()[0]
-                                          ->get_memory_space()
-                                          ->get_device_id()) == cudaSuccess) {
-          cudaMemPoolTrimTo(pool, 0);
-          cudaDeviceSynchronize();
-        }
-        operator_input_output_data = run_one_operator(
-          op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
-      } catch (const rmm::out_of_memory&) {
-        SIRIUS_LOG_WARN(
-          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), rescheduling task {}",
-          pipeline->get_pipeline_id(),
-          op.get_name(),
-          op.get_operator_id(),
-          i,
-          operators.size(),
-          _task_id);
-        throw oom_reschedule_exception(
-          std::move(operator_input_output_data),
-          i,
-          "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
-      }
+      SIRIUS_LOG_WARN(
+        "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), rescheduling task {}",
+        pipeline->get_pipeline_id(),
+        op.get_name(),
+        op.get_operator_id(),
+        i,
+        operators.size(),
+        _task_id);
+      throw oom_reschedule_exception(
+        std::move(operator_input_output_data),
+        i,
+        "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
     }
   }
   return operator_input_output_data;
