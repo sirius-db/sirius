@@ -275,8 +275,13 @@ for q in "${VALID_QUERIES[@]}"; do
     } > "$TIMING_FILE"
 
     cold="${TIMES[0]:-N/A}"
-    warm="${TIMES[${#TIMES[@]}-1]:-N/A}"
-    echo "  Cold: ${cold}s   Warm: ${warm}s   (${#TIMES[@]} iterations)"
+    warm="N/A"
+    for ((i = 1; i < ${#TIMES[@]}; i++)); do
+        if [ "$warm" = "N/A" ] || (( $(echo "${TIMES[$i]} < $warm" | bc -l) )); then
+            warm="${TIMES[$i]}"
+        fi
+    done
+    echo "  Cold: ${cold}s   Warm(best): ${warm}s   (${#TIMES[@]} iterations)"
 
     if [ -n "${TIMING_CSV:-}" ] && [ "$cold" != "N/A" ]; then
         echo "${q},${cold}" >> "$TIMING_CSV"
