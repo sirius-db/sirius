@@ -25,7 +25,7 @@
  */
 
 // sirius
-#include <cudf_utils.hpp>
+#include <cudf/cudf_utils.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>

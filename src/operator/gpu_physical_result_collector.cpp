@@ -16,16 +16,16 @@
 
 #include "operator/gpu_physical_result_collector.hpp"
 
-#include "cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
-#include "gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "utils.hpp"
 
 namespace duckdb {

@@ -17,9 +17,6 @@
 #include "op/sirius_physical_limit.hpp"
 
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
-#include "operator/gpu_materialize.hpp"
 
 #include <cudf/copying.hpp>
 
@@ -90,9 +87,9 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     // Check if limit is already exhausted
     if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
 
-    auto input_table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto view        = input_table.view();
-    auto num_rows    = static_cast<int64_t>(view.num_rows());
+    auto& input_table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    auto view         = input_table.view();
+    auto num_rows     = static_cast<int64_t>(view.num_rows());
 
     if (num_rows == 0) { continue; }
 

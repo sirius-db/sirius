@@ -16,27 +16,15 @@
 
 #include "gpu_context.hpp"
 
-#include "duckdb.hpp"
-#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
-#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
-#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
-#include "duckdb/main/relation.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
-#include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
 #include "sirius_extension.hpp"
-
-#include <stdio.h>
-
-#include <iostream>
 
 namespace duckdb {
 

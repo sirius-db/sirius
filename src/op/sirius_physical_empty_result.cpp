@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_empty_result.hpp"
 
-#include "log/logging.hpp"
-
 namespace sirius {
 namespace op {
 

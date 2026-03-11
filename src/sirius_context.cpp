@@ -19,20 +19,22 @@
 #include "config.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "exec/config.hpp"
 #include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 
+#include <cudf/utilities/pinned_memory.hpp>
+
 #include <cuda_runtime_api.h>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
-#include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -80,10 +82,15 @@ SiriusContext::~SiriusContext() noexcept
 
 void SiriusContext::QueryBegin(ClientContext& context)
 {
+  // Reset operator ID counter so each query starts from 0
+  sirius::op::sirius_physical_operator::next_operator_id.store(0);
+
   auto query = context.GetCurrentQuery();
+  spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
   if (config_.is_scan_caching_enabled()) {
     pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
+  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
 
   // Reset task creator state (including scan operator global state map) for the new query
   task_creator_->reset();
@@ -92,6 +99,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd()
 {
+  spdlog::info("QueryEnd");
   query_.reset();
 
   // Drain all downgrade executors before clearing repositories — ensures no downgrade
@@ -131,6 +139,27 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
+  // Configure cuDF to use our pinned slab allocator for small internal host buffers
+  // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
+  // the pageable H2D transfers that cuDF issues by default.
+  {
+    auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (!host_spaces.empty()) {
+      auto* fsmr = host_spaces[0]
+                     ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+      if (fsmr != nullptr) {
+        small_pinned_allocator_ =
+          std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr);
+        prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
+        prev_pinned_mr_        = cudf::set_pinned_memory_resource(*small_pinned_allocator_);
+        cudf::set_allocate_host_as_pinned_threshold(
+          cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+        spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
+                     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+      }
+    }
+  }
+
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
@@ -167,7 +196,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   pipeline_executor_->start();
 
   // Configure scan caching based on config
-  pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled());
+  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
 
   is_initialized_ = true;
 }
@@ -191,6 +220,18 @@ void SiriusContext::terminate()
   // sync, the subsequent cudaFreeHost inside the memory manager destructor
   // can deadlock against a new cudaHostAlloc from the next SiriusContext.
   cudaDeviceSynchronize();
+
+  // Restore the previous cuDF pinned memory resource and threshold before destroying the
+  // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
+  if (prev_pinned_mr_.has_value()) {
+    cudf::set_pinned_memory_resource(*prev_pinned_mr_);
+    cudf::set_allocate_host_as_pinned_threshold(prev_pinned_threshold_);
+    prev_pinned_mr_.reset();
+  }
+
+  // Release the slab allocator before tearing down the memory manager, since
+  // its owned_allocations_ will return blocks back to the fixed_size_host_memory_resource.
+  small_pinned_allocator_.reset();
 
   memory_manager_->shutdown();
   memory_manager_.reset();

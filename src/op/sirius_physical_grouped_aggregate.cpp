@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 

@@ -25,12 +25,10 @@
 #include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "expression_executor/gpu_expression_translator.hpp"
-#include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 

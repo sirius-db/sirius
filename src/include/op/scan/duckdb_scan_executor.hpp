@@ -21,11 +21,13 @@
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/kiosk.hpp"
 #include "exec/thread_pool.hpp"
+#include "op/scan/config.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
 #include <memory>
@@ -144,18 +146,21 @@ class duckdb_scan_executor {
   void cache_scan_results_for_query(const std::string& query);
 
   /**
-   * @brief Enable or disable scan result caching
+   * @brief Configure scan result caching level
    *
-   * @param enabled True to enable caching, false to disable
+   * @param level The cache level to use
    */
-  void set_scan_caching_enabled(bool enabled);
+  void set_scan_caching_enabled(cache_level level);
 
   /**
    * @brief Check if scan result caching is enabled
    *
    * @return True if caching is enabled, false otherwise
    */
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _caching_enabled; }
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept
+  {
+    return _cache_level != cache_level::NONE;
+  }
 
   /**
    * @brief Prepare cache for scan operators
@@ -190,12 +195,13 @@ class duckdb_scan_executor {
   mutable std::mutex _cache_mutex;
   std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
   std::size_t _query_hash{0};
-  bool _caching_enabled{false};
+  cache_level _cache_level{cache_level::NONE};
   bool _preload_mode{false};
 
   std::atomic<bool> _running{false};
   exec::thread_pool_config _config;
   exec::kiosk _kiosk;
+  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
   std::unique_ptr<exec::thread_pool> _thread_pool;
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
   std::thread _manager_thread;
@@ -203,6 +209,7 @@ class duckdb_scan_executor {
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   sirius::pipeline::completion_handler* _completion_handler{nullptr};
+  cucascade::memory::memory_space* _gpu_memory_space{nullptr};
 };
 
 }  // namespace sirius::op::scan

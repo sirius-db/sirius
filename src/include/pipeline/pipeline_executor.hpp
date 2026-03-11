@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/config.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
@@ -127,11 +128,11 @@ class pipeline_executor {
   [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
 
   /**
-   * @brief Enable or disable scan result caching
+   * @brief Configure scan result caching level
    *
-   * @param enabled True to enable caching, false to disable
+   * @param level The cache level to use
    */
-  void set_scan_caching_enabled(bool enabled);
+  void set_scan_caching_config(sirius::op::scan::cache_level level);
 
   /**
    * @brief Set the priority scan operators
@@ -154,6 +155,13 @@ class pipeline_executor {
    * @return A future that will be satisfied when the query completes.
    */
   std::future<void> start_query();
+
+  /**
+   * @brief Terminate the query execution and report the error to duckdb.
+   *
+   * @param error The error to report.
+   */
+  void terminate_query(std::exception_ptr error);
 
  private:
   void management_eventloop();

@@ -17,7 +17,6 @@
 #include "op/sirius_physical_order.hpp"
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
 #include "op/order/gpu_order_impl.hpp"
 
 #include <nvtx3/nvtx3.hpp>

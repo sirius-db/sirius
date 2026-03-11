@@ -16,6 +16,16 @@
 
 #pragma once
 
+#ifdef __CUDACC__
+// nvcc cannot compile spdlog/fmt chrono headers — provide no-op macros
+#define SIRIUS_LOG_TRACE(...)
+#define SIRIUS_LOG_DEBUG(...)
+#define SIRIUS_LOG_INFO(...)
+#define SIRIUS_LOG_WARN(...)
+#define SIRIUS_LOG_ERROR(...)
+#define SIRIUS_LOG_FATAL(...)
+#else  // !__CUDACC__
+
 #ifndef SPDLOG_ACTIVE_LEVEL
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #else
@@ -33,6 +43,9 @@
 #define SIRIUS_LOG_WARN(...)  SPDLOG_LOGGER_WARN(spdlog::default_logger_raw(), __VA_ARGS__)
 #define SIRIUS_LOG_ERROR(...) SPDLOG_LOGGER_ERROR(spdlog::default_logger_raw(), __VA_ARGS__)
 #define SIRIUS_LOG_FATAL(...) SPDLOG_LOGGER_CRITICAL(spdlog::default_logger_raw(), __VA_ARGS__)
+
+#endif  // __CUDACC__
+#ifndef __CUDACC__
 
 namespace duckdb {
 
@@ -77,3 +90,5 @@ inline void SetGlobalLogLevel(const std::string& log_level_str)
 }
 
 }  // namespace duckdb
+
+#endif  // !__CUDACC__

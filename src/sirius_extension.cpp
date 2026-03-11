@@ -19,9 +19,6 @@
 
 #include "config.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "duckdb.hpp"
-#include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
-#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -35,7 +32,6 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
@@ -46,6 +42,7 @@
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
+#include "util/segfault_backtrace.hpp"
 
 #include <cstdlib>
 
@@ -376,12 +373,6 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
 
-  // cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT.
-  // Downcast to BIGINT so all downstream operators and the result collector use a supported type.
-  for (auto& type : planner.types) {
-    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
-  }
-
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
@@ -628,6 +619,12 @@ static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& param
                    Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
 }
 
+static void SetUsePinMemoryForCaching(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::USE_PIN_MEM_FOR_CACHING = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}", Config::USE_PIN_MEM_FOR_CACHING);
+}
+
 static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
@@ -689,6 +686,25 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
 {
   Config::MODIFIED_PIPELINE = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
+}
+
+static void SetCacheScanLevel(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_scan_level SET ignored");
+    return;
+  }
+  auto level_str = StringValue::Get(parameter);
+  sirius::op::scan::cache_level level;
+  if (!sirius::op::scan::string_to_enum(level_str, level)) {
+    throw InvalidInputException(
+      "Invalid cache_scan_level '{}'. Valid values: none, table_gpu, table_host, parquet",
+      level_str);
+  }
+  auto& cfg = sirius_ctx->get_config();
+  cfg.set_cache_level(level);
+  SIRIUS_LOG_DEBUG("Updated config cache_scan_level to {}", level_str);
 }
 
 static sirius::operator_params* get_operator_params(ClientContext& context)
@@ -772,6 +788,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CPU_PROCESSING),
                             SetUsePinMemory);
+
+  config.AddExtensionOption(
+    "use_pin_memory_for_caching",
+    "Whether or not the cache buffer is allocated with pinned host memory instead of GPU memory",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CACHING),
+    SetUsePinMemoryForCaching);
 
   // Add in config option for expression executor
   config.AddExtensionOption("use_cudf_expr",
@@ -890,10 +913,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
                             SetConcatBatchBytes);
+
+  config.AddExtensionOption("scan_cache_level",
+                            "Scan result caching level: none, table_gpu, table_host, parquet",
+                            LogicalType::VARCHAR,
+                            Value("none"),
+                            SetCacheScanLevel);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  sirius::util::install_segfault_backtrace_handler();
+
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
   config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());

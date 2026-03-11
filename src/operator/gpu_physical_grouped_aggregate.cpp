@@ -19,8 +19,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_materialize.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "utils.hpp"
 
 namespace duckdb {
@@ -113,7 +113,8 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
                                 vector<shared_ptr<GPUColumn>>& aggregate_keys,
                                 GPUBufferManager* gpuBufferManager,
                                 const vector<unique_ptr<Expression>>& aggregates,
-                                int num_group_keys)
+                                int num_group_keys,
+                                idx_t estimated_output_groups)
 {
   AggregationType* agg_mode =
     gpuBufferManager->customCudaHostAlloc<AggregationType>(aggregates.size());
@@ -185,7 +186,12 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
     }
   }
 
-  cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, aggregates.size(), agg_mode);
+  cudf_groupby(group_by_keys,
+               aggregate_keys,
+               num_group_keys,
+               aggregates.size(),
+               agg_mode,
+               estimated_output_groups);
 }
 
 void HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
@@ -476,8 +482,12 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
         throw NotImplementedException(
           "Group by column length or aggregate column length is too large for CuDF");
       } else {
-        HandleGroupByAggregateCuDF(
-          group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+        HandleGroupByAggregateCuDF(group_by_column,
+                                   aggregate_column,
+                                   gpuBufferManager,
+                                   aggregates,
+                                   num_group_keys,
+                                   estimated_cardinality);
       }
     }
   }

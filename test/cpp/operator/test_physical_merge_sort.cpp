@@ -17,7 +17,6 @@
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb/planner/bound_query_node.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_merge_sort.hpp>
 #include <op/sirius_physical_order.hpp>
