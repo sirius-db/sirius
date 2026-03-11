@@ -343,6 +343,8 @@ void SiriusContext::throw_if_not_initialized() const
 
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
+  if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
+  if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
   InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
   read_config_file_if_exists();
 }
