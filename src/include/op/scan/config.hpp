@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exec/config.hpp"
+
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -57,5 +59,11 @@ inline bool enum_to_string(cache_level level, std::string& s)
   }
   return false;
 }
+
+struct scan_executor_config {
+  cache_level cache = cache_level::NONE;
+  exec::thread_pool_config thread_pool_config{.num_threads        = 4,
+                                              .thread_name_prefix = "scan_executor"};
+};
 
 }  // namespace sirius::op::scan
