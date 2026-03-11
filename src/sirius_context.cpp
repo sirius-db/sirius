@@ -174,10 +174,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     auto spaces        = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& dg_cfg = config_.get_downgrade_executor_config();
     for (auto* space : spaces) {
-      sirius::parallel::task_executor_config executor_config{
-        dg_cfg.num_threads, false, dg_cfg.cpu_affinity_list};
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
-        std::move(executor_config),
+        dg_cfg,
         *data_repository_manager_,
         space->get_id(),
         const_cast<cucascade::memory::memory_space*>(space),

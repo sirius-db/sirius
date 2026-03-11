@@ -19,7 +19,9 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "log/logging.hpp"
 
-#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_device.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <optional>
@@ -28,18 +30,46 @@
 namespace sirius {
 namespace parallel {
 
+downgrade_executor::downgrade_executor(
+  exec::thread_pool_config config,
+  cucascade::shared_data_repository_manager& data_repo_mgr,
+  cucascade::memory::memory_space_id space_id,
+  cucascade::memory::memory_space* memory_space,
+  sirius::memory::sirius_memory_reservation_manager& reservation_manager)
+  : _config(std::move(config)),
+    _kiosk(_config.num_threads),
+    _data_repo_mgr(data_repo_mgr),
+    _space_id(space_id),
+    _memory_space(memory_space),
+    _reservation_manager(reservation_manager)
+{
+  if (_memory_space) {
+    _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
+      rmm::cuda_device_id{_memory_space->get_device_id()}, _config.num_threads);
+  }
+}
+
+downgrade_executor::~downgrade_executor() { stop(); }
+
+void downgrade_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
+{
+  _task_queue.push(std::move(task));
+}
+
 void downgrade_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  on_start();
-  // Tell the queue how many workers to wake on close()
-  auto* dq = dynamic_cast<downgrade_task_queue*>(_task_queue.get());
-  if (dq) { dq->set_num_workers(_config.num_threads); }
-  _threads.reserve(_config.num_threads);
-  for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.emplace_back(&downgrade_executor::worker_loop, this, i);
+  absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
+  if (_memory_space) {
+    auto device_id  = _memory_space->get_device_id();
+    per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
   }
+  _thread_pool    = std::make_unique<exec::thread_pool>(_config.num_threads,
+                                                     _config.thread_name_prefix,
+                                                     _config.cpu_affinity_list,
+                                                     std::move(per_thread_init));
+  _manager_thread = std::thread(&downgrade_executor::manager_loop, this);
   _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
 }
 
@@ -54,31 +84,39 @@ void downgrade_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  on_stop();
+  _kiosk.stop();
+  _task_queue.interrupt();
   if (_monitor_thread.joinable()) { _monitor_thread.join(); }
-  for (auto& thread : _threads) {
-    if (thread.joinable()) { thread.join(); }
-  }
-  _threads.clear();
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+  _kiosk.wait_all();
+  if (_thread_pool) { _thread_pool->stop(); }
 }
 
-void downgrade_executor::worker_loop(int worker_id)
+void downgrade_executor::manager_loop()
 {
-  // cudaMemcpyBatchAsync requires a real (non-default) CUDA stream
-  rmm::cuda_stream stream;
-
-  while (true) {
-    if (!_running.load()) { break; }
-    auto task = _task_queue->pull();
-    if (task == nullptr) { break; }
-    try {
-      task->execute(stream);
-    } catch (const std::exception& e) {
-      // Downgrade failures are non-fatal — log and continue to the next task.
-      // Do NOT call on_task_error() here: it calls stop() from within the worker
-      // thread, which tries to join itself and causes a deadlock.
-      SIRIUS_LOG_ERROR("[downgrade] worker {} task failed: {}", worker_id, e.what());
+  while (_running.load()) {
+    auto ticket = _kiosk.acquire();  // block until a thread is available
+    if (!ticket.is_valid()) {
+      SIRIUS_LOG_INFO("[downgrade] kiosk interrupted, stopping manager loop");
+      break;
     }
+    auto task = _task_queue.pop();  // block until a task is available
+    if (!task) {
+      SIRIUS_LOG_INFO("[downgrade] task queue interrupted, stopping manager loop");
+      break;
+    }
+    auto exc_stream = _stream_pool->acquire_stream(
+      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+    _thread_pool->schedule([task       = std::move(task),
+                            ticket     = std::move(ticket),
+                            exc_stream = std::move(exc_stream)]() mutable {
+      try {
+        task->execute(exc_stream);
+      } catch (const std::exception& e) {
+        // Downgrade failures are non-fatal — log and continue.
+        SIRIUS_LOG_ERROR("[downgrade] task execution failed: {}", e.what());
+      }
+    });
   }
 }
 
@@ -238,7 +276,7 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
     auto local_state = std::make_unique<downgrade_task_local_state>(
       duckdb::UUIDv7().GenerateRandomUUID().lower, 0, std::move(batch));
     auto task = std::make_unique<downgrade_task>(std::move(local_state), global_state);
-    schedule_downgrade_task(std::move(task));
+    schedule(std::move(task));
     ++task_count;
   }
 
