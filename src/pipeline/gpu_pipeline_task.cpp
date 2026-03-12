@@ -20,6 +20,8 @@
 #include "log/logging.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -29,6 +31,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <format>
 #include <optional>
 
 namespace sirius {
@@ -157,6 +160,9 @@ std::unique_ptr<op::operator_data> run_one_operator(op::sirius_physical_operator
                                                     size_t num_operators,
                                                     std::string& batch_sizes)
 {
+  auto nvtx_label = std::format(
+    "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
+  nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
   auto start                = std::chrono::high_resolution_clock::now();
   auto operator_output_data = op.execute(operator_input_data, stream);
   stream.synchronize();
@@ -292,6 +298,11 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
   auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto sink_operators = pipeline->get_sink();
   if (sink_operators) {
+    auto nvtx_label = std::format("Pipeline {}: {} (id={}) sink",
+                                  pipeline->get_pipeline_id(),
+                                  sink_operators->get_name(),
+                                  sink_operators->get_operator_id());
+    nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
     sink_operators.get()->sink(output_data, stream);
     auto const sink_end = std::chrono::high_resolution_clock::now();
@@ -313,6 +324,19 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto operators    = pipeline->get_operators();
   auto& first_op    = operators[local_state._start_operator_index].get();
+
+  std::string op_chain;
+  auto source_op = pipeline->get_source();
+  if (source_op) { op_chain += std::format("{} -> ", source_op->get_name()); }
+  for (size_t i = 0; i < operators.size(); i++) {
+    op_chain += operators[i].get().get_name();
+    if (i + 1 < operators.size()) { op_chain += " -> "; }
+  }
+  auto sink_op = pipeline->get_sink();
+  if (sink_op) { op_chain += std::format(" -> {}", sink_op->get_name()); }
+  auto nvtx_label =
+    std::format("Pipeline {} Task {} [{}]", pipeline->get_pipeline_id(), _task_id, op_chain);
+  nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
 
   auto const prepare_start = std::chrono::high_resolution_clock::now();
   auto reservation         = local_state.release_reservation();
