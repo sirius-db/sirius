@@ -619,6 +619,12 @@ static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& param
                    Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
 }
 
+static void SetUsePinMemoryForCaching(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::USE_PIN_MEM_FOR_CACHING = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}", Config::USE_PIN_MEM_FOR_CACHING);
+}
+
 static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
@@ -682,19 +688,23 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
-static void SetCacheInGpu(ClientContext& context, SetScope scope, Value& parameter)
+static void SetCacheScanLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
-    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_in_gpu SET ignored");
+    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_scan_level SET ignored");
     return;
   }
-  bool enabled = BooleanValue::Get(parameter);
-  auto& cfg    = sirius_ctx->get_config();
-  cfg.set_cache_in_gpu(enabled);
-  sirius_ctx->get_pipeline_executor().set_scan_caching_enabled(
-    cfg.is_scan_caching_enabled(), cfg.is_cache_decoded_table_enabled(), enabled);
-  SIRIUS_LOG_DEBUG("Updated config cache_in_gpu to {}", enabled);
+  auto level_str = StringValue::Get(parameter);
+  sirius::op::scan::cache_level level;
+  if (!sirius::op::scan::string_to_enum(level_str, level)) {
+    throw InvalidInputException(
+      "Invalid cache_scan_level '{}'. Valid values: none, table_gpu, table_host, parquet",
+      level_str);
+  }
+  auto& cfg = sirius_ctx->get_config();
+  cfg.set_cache_level(level);
+  SIRIUS_LOG_DEBUG("Updated config cache_scan_level to {}", level_str);
 }
 
 static sirius::operator_params* get_operator_params(ClientContext& context)
@@ -746,7 +756,39 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
+  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
+}
+
+static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_LEVEL = StringValue::Get(parameter);
+  SetGlobalLogLevel(Config::LOG_LEVEL);
+  SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
+}
+
+static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_DIR = StringValue::Get(parameter);
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
+}
+
+static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
+}
+
+static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
+  params->validate_and_fix();
+  SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
+                   params->max_build_hash_table_bytes);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -757,6 +799,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CPU_PROCESSING),
                             SetUsePinMemory);
+
+  config.AddExtensionOption(
+    "use_pin_memory_for_caching",
+    "Whether or not the cache buffer is allocated with pinned host memory instead of GPU memory",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CACHING),
+    SetUsePinMemoryForCaching);
 
   // Add in config option for expression executor
   config.AddExtensionOption("use_cudf_expr",
@@ -847,6 +896,23 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
 
+  // Logging configuration
+  config.AddExtensionOption("sirius_log_level",
+                            "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_LEVEL),
+                            SetLogLevel);
+  config.AddExtensionOption("sirius_log_dir",
+                            "Directory for Sirius log files",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_DIR),
+                            SetLogDir);
+  config.AddExtensionOption("sirius_log_flush_seconds",
+                            "Interval in seconds between automatic log flushes",
+                            LogicalType::INTEGER,
+                            Value::INTEGER(Config::LOG_FLUSH_SECONDS),
+                            SetLogFlushSeconds);
+
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
@@ -859,11 +925,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
                             SetConcatBatchBytes);
 
-  config.AddExtensionOption("cache_in_gpu",
-                            "Whether to cache scan results in GPU memory instead of host memory",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(false),
-                            SetCacheInGpu);
+  config.AddExtensionOption("scan_cache_level",
+                            "Scan result caching level: none, table_gpu, table_host, parquet",
+                            LogicalType::VARCHAR,
+                            Value("none"),
+                            SetCacheScanLevel);
+
+  config.AddExtensionOption("max_build_hash_table_bytes",
+                            "Maximum size a build-side table can be where it will create a "
+                            "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
+                            SetMaxBuildHashTableBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

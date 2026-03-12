@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace duckdb {
 
@@ -27,6 +28,7 @@ namespace duckdb {
 struct Config {
   // For gpu buffer manager
   static bool USE_PIN_MEM_FOR_CPU_PROCESSING;  // use_pin_memory
+  static bool USE_PIN_MEM_FOR_CACHING;         // use_pin_memory_for_caching
 
   // For expression executor
   static bool USE_CUDF_EXPR;  // use_cudf_expr
@@ -53,6 +55,22 @@ struct Config {
 
   // Whether to fall back to duckdb execution after an error is detected
   static bool ENABLE_DUCKDB_FALLBACK;
+
+  // For duckdb scan task:
+  //  - the default batch size
+  //  - the default varchar size for estimating rows per batch
+  // TODO: probably want to use sirius config for these two values
+  static uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE;
+  static uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE;
+
+  // For sort partitioning:
+  //  - max bytes per sort partition (0 = auto based on 33% GPU memory)
+  static uint64_t MAX_SORT_PARTITION_BYTES;
+
+  // Logging configuration
+  static std::string LOG_LEVEL;
+  static std::string LOG_DIR;
+  static int LOG_FLUSH_SECONDS;
 };
 
 }  // namespace duckdb

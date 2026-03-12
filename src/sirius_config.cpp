@@ -221,6 +221,20 @@ struct sirius::config::custom_config_registrar<sirius::operator_params> {
     setter.add_config("max_sort_partition_bytes", opt.max_sort_partition_bytes);
     setter.add_config("hash_partition_bytes", opt.hash_partition_bytes);
     setter.add_config("concat_batch_bytes", opt.concat_batch_bytes);
+    setter.add_config("max_build_hash_table_bytes", opt.max_build_hash_table_bytes);
+  }
+};
+
+template <>
+struct sirius::config::custom_config_registrar<sirius::op::scan::scan_executor_config> {
+  static void config(sirius::config::configuration_setter& setter,
+                     sirius::op::scan::scan_executor_config& opt)
+  {
+    setter.add_config("cache", opt.cache);
+    setter.add_config(
+      "num_threads", opt.thread_pool_config.num_threads, sirius::config::greater_than<size_t>{0});
+    setter.add_config("thread_name_prefix", opt.thread_pool_config.thread_name_prefix);
+    setter.add_config("cpu_affinity", opt.thread_pool_config.cpu_affinity_list);
   }
 };
 
@@ -253,10 +267,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.executor.task_creator", _task_creator_config);
   config_setter.add_config("sirius.executor.pipeline", _gpu_pipeline_executor_config);
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
-  config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache", _enable_scan_caching);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache_decoded_table", _cache_decoded_table);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache_in_gpu", _cache_in_gpu);
+  config_setter.add_config("sirius.executor.duckdb_scan", _scan_executor_config);
   config_setter.add_config("sirius.operator_params", _operator_params);
 
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
@@ -271,6 +282,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     throw std::runtime_error(
       "Failed to load Sirius configuration from file: " + config_path.string() + " " + e.what());
   }
+
+  _operator_params.validate_and_fix();
 
   // std::cerr << "Loaded Sirius configuration from file: " << config_path << std::endl;
 
@@ -323,7 +336,7 @@ const exec::thread_pool_config& sirius_config::get_task_creator_config() const n
 
 const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
 {
-  return _duckdb_scan_executor_config;
+  return _scan_executor_config.thread_pool_config;
 }
 
 }  // namespace sirius

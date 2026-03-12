@@ -21,6 +21,7 @@
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/kiosk.hpp"
 #include "exec/thread_pool.hpp"
+#include "op/scan/config.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/task_request.hpp"
@@ -145,20 +146,21 @@ class duckdb_scan_executor {
   void cache_scan_results_for_query(const std::string& query);
 
   /**
-   * @brief Enable or disable scan result caching
+   * @brief Configure scan result caching level
    *
-   * @param enabled True to enable caching, false to disable
+   * @param level The cache level to use
    */
-  void set_scan_caching_enabled(bool enabled,
-                                bool cache_decoded_table = false,
-                                bool cache_in_gpu        = false);
+  void set_scan_caching_enabled(cache_level level);
 
   /**
    * @brief Check if scan result caching is enabled
    *
    * @return True if caching is enabled, false otherwise
    */
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _caching_enabled; }
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept
+  {
+    return _cache_level != cache_level::NONE;
+  }
 
   /**
    * @brief Prepare cache for scan operators
@@ -193,10 +195,7 @@ class duckdb_scan_executor {
   mutable std::mutex _cache_mutex;
   std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
   std::size_t _query_hash{0};
-  bool _caching_enabled{false};
-  bool _cache_decoded_table{false};
-  bool _wrap_batch_data{false};
-  bool _cache_in_gpu{false};
+  cache_level _cache_level{cache_level::NONE};
   bool _preload_mode{false};
 
   std::atomic<bool> _running{false};
