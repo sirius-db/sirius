@@ -142,8 +142,10 @@ class duckdb_scan_executor {
    * @brief Cache scan results for the given query
    *
    * @param query The query string to cache results for
+   * @return True if this is a re-execution of the same query (cache hit),
+   *         false if the query changed (cache miss / cleared).
    */
-  void cache_scan_results_for_query(const std::string& query);
+  [[nodiscard]] bool cache_scan_results_for_query(const std::string& query);
 
   /**
    * @brief Configure scan result caching level
@@ -161,6 +163,13 @@ class duckdb_scan_executor {
   {
     return _cache_level != cache_level::NONE;
   }
+
+  /**
+   * @brief Check if the scan executor is in preload mode (cache is hot).
+   *
+   * @return True if preload mode is active, false otherwise.
+   */
+  [[nodiscard]] bool is_preload_mode() const noexcept { return _preload_mode; }
 
   /**
    * @brief Prepare cache for scan operators

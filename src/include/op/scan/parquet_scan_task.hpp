@@ -185,6 +185,46 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
   }
 
+  /**
+   * @brief Rebind this global state to a new pipeline and scan operator.
+   *
+   * Reuses all cached file metadata and row group partitions, avoiding
+   * footer reads and metadata parsing.  Only the pipeline/operator pointers
+   * and the partition counter are updated.
+   */
+  void rebind(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+              sirius_physical_parquet_scan* scan_op)
+  {
+    set_pipeline(std::move(pipeline));
+    _scan_op = scan_op;
+    _next_rg_partition.store(0, std::memory_order_relaxed);
+    scan_op->has_more_partitions.store(true, std::memory_order_relaxed);
+    scan_op->exhausted.store(false, std::memory_order_relaxed);
+  }
+
+  /**
+   * @brief Get the file size for the given file index.
+   */
+  [[nodiscard]] size_t get_file_size(size_t file_idx) const { return _file_sizes[file_idx]; }
+
+  /**
+   * @brief Get the total number of parquet metadata bytes (header + footer + trailer)
+   * that must be cached alongside the column-chunk data for file @p file_idx.
+   */
+  [[nodiscard]] size_t get_metadata_byte_size(size_t file_idx) const
+  {
+    return _metadata_byte_sizes[file_idx];
+  }
+
+  /**
+   * @brief Get the file offset where the parquet footer begins for file @p file_idx.
+   * The footer range covers [footer_offset, file_size).
+   */
+  [[nodiscard]] size_t get_footer_offset(size_t file_idx) const
+  {
+    return _footer_offsets[file_idx];
+  }
+
  private:
   /**
    * @brief Fill the vector of column indices for this scan after projection.
@@ -211,6 +251,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
   cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
+
+  std::vector<size_t> _file_sizes;           ///< Per-file total file size in bytes
+  std::vector<size_t> _metadata_byte_sizes;  ///< Per-file header+footer+trailer bytes
+  std::vector<size_t> _footer_offsets;       ///< Per-file offset where footer begins
 
   std::vector<std::vector<size_t>>
     _row_group_uncompressed_bytes;  ///< Per-(file,row-group) uncompressed bytes
@@ -348,8 +392,6 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
       _task_id(task_id),
       _data_repo(data_repo)
   {
-    auto& l_state_cast = this->_local_state->cast<parquet_scan_task_local_state>();
-    _datasource = cudf::io::datasource::create(g_state->get_file_path(l_state_cast.get_file_idx()));
   }
 
   ~parquet_scan_task() override;

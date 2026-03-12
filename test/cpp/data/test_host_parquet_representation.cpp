@@ -225,6 +225,7 @@ struct parquet_test_fixture {
                                                          _original_byte_ranges,
                                                          size_in_bytes,
                                                          uncompressed_size_in_bytes,
+                                                         _datasource->size(),
                                                          _datasource);
   }
 
@@ -602,6 +603,7 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
                                                             byte_ranges,
                                                             total_size,
                                                             total_size * 2,
+                                                            datasource->size(),
                                                             datasource);
 
   auto stream     = gpu_space->acquire_stream();

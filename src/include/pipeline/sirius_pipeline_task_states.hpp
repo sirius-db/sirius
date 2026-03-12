@@ -52,6 +52,11 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
   [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
 
+  void set_pipeline(duckdb::shared_ptr<sirius_pipeline> pipeline)
+  {
+    _pipeline = std::move(pipeline);
+  }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
 };

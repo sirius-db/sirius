@@ -32,8 +32,10 @@
 namespace sirius::op::scan {
 
 prefetched_data_source::prefetched_data_source(
-  std::unique_ptr<cache_ranges> ranges, std::shared_ptr<cudf::io::datasource> fallback_source)
-  : ranges_(std::move(ranges)), fallback_(std::move(fallback_source))
+  std::unique_ptr<cache_ranges> ranges,
+  std::size_t file_size,
+  std::shared_ptr<cudf::io::datasource> fallback_source)
+  : ranges_(std::move(ranges)), file_size_(file_size), fallback_(std::move(fallback_source))
 {
 }
 
@@ -197,7 +199,7 @@ std::future<size_t> prefetched_data_source::device_read_async(size_t offset,
 
 size_t prefetched_data_source::size() const
 {
-  // If a fallback datasource is present, report its size (it covers the full file).
+  if (file_size_ > 0) return file_size_;
   if (fallback_) return fallback_->size();
   return ranges_->max_offset();
 }

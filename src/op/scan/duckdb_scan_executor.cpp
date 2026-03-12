@@ -103,18 +103,19 @@ void duckdb_scan_executor::set_completion_handler(
   _completion_handler = handler;
 }
 
-void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
+bool duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
 {
-  if (_cache_level == cache_level::NONE) { return; }
+  if (_cache_level == cache_level::NONE) { return false; }
   std::hash<std::string> hash_fn;
   auto new_query_hash = hash_fn(query);
   if (new_query_hash == _query_hash) {
     SIRIUS_LOG_INFO("Scan results for query already cached, preloading: {}", query);
-    return;
+    return true;
   }
   SIRIUS_LOG_INFO("Caching scan results for query: {}", query);
   _query_hash = new_query_hash;
   _cache.clear();
+  return false;
 }
 
 void duckdb_scan_executor::set_scan_caching_enabled(cache_level level)
