@@ -66,7 +66,6 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
   _scan_operator_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
-  _parquet_scan_operator_global_state_map.clear();
 
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
@@ -84,16 +83,21 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-      const auto& op_params =
-        _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-          ->get_config()
-          .get_operator_params();
-      _parquet_scan_operator_global_state_map.emplace(
-        operator_id,
-        std::make_shared<op::scan::parquet_scan_task_global_state>(
-          pipeline,
-          &source_operator->Cast<op::sirius_physical_parquet_scan>(),
-          op_params.scan_task_batch_size));
+      auto it = _parquet_scan_operator_global_state_map.find(operator_id);
+      if (it != _parquet_scan_operator_global_state_map.end()) {
+        it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
+      } else {
+        const auto& op_params =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+            ->get_config()
+            .get_operator_params();
+        _parquet_scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::parquet_scan_task_global_state>(
+            pipeline,
+            &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+            op_params.scan_task_batch_size));
+      }
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
@@ -109,11 +113,11 @@ void task_creator::drain_pending_tasks()
   _kiosk.wait_all();
 }
 
-void task_creator::reset()
+void task_creator::reset(bool keep_parquet_metadata)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _scan_operator_global_state_map.clear();
-  _parquet_scan_operator_global_state_map.clear();
+  if (!keep_parquet_metadata) { _parquet_scan_operator_global_state_map.clear(); }
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();

@@ -198,6 +198,8 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     set_pipeline(std::move(pipeline));
     _scan_op = scan_op;
     _next_rg_partition.store(0, std::memory_order_relaxed);
+    scan_op->has_more_partitions.store(true, std::memory_order_relaxed);
+    scan_op->exhausted.store(false, std::memory_order_relaxed);
   }
 
  private:

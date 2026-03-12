@@ -142,8 +142,10 @@ class duckdb_scan_executor {
    * @brief Cache scan results for the given query
    *
    * @param query The query string to cache results for
+   * @return True if this is a re-execution of the same query (cache hit),
+   *         false if the query changed (cache miss / cleared).
    */
-  void cache_scan_results_for_query(const std::string& query);
+  [[nodiscard]] bool cache_scan_results_for_query(const std::string& query);
 
   /**
    * @brief Configure scan result caching level
