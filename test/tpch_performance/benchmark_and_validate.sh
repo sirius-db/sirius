@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # benchmark_and_validate.sh
 #
 # Runs all 22 TPC-H queries for both sirius and duckdb, compares results,
