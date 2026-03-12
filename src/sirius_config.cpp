@@ -221,6 +221,7 @@ struct sirius::config::custom_config_registrar<sirius::operator_params> {
     setter.add_config("max_sort_partition_bytes", opt.max_sort_partition_bytes);
     setter.add_config("hash_partition_bytes", opt.hash_partition_bytes);
     setter.add_config("concat_batch_bytes", opt.concat_batch_bytes);
+    setter.add_config("max_build_hash_table_bytes", opt.max_build_hash_table_bytes);
   }
 };
 
@@ -281,6 +282,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     throw std::runtime_error(
       "Failed to load Sirius configuration from file: " + config_path.string() + " " + e.what());
   }
+
+  _operator_params.validate_and_fix();
 
   // std::cerr << "Loaded Sirius configuration from file: " << config_path << std::endl;
 

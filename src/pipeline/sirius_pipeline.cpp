@@ -308,7 +308,12 @@ void sirius_pipeline::update_pipeline_status()
     // done atomically.
     if (limit_exhausted ||
         (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
-      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
+      if (tasks_created.load() == tasks_completed.load()) {
+        pipeline_finished.store(true);
+        for (auto& op : get_operators()) {
+          op.get().finalize_operator();
+        }
+      }
     }
   }
 }
