@@ -66,10 +66,31 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
   _scan_operator_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
-  // Parquet map is NOT cleared here — it may hold cached metadata from a
-  // previous iteration.  Entries are either rebound or freshly created below.
 
+  // Check whether every parquet scan in this query already has a cached
+  // global state.  If so, this is a re-execution of the same query and we
+  // can rebind (reuse cached file metadata, avoiding footer reads).
+  // If any operator_id is missing, this is a different query — clear the
+  // map to prevent stale metadata from a previous query being reused
+  // (operator_ids can collide across different queries).
   const auto& pipelines = query.get_pipelines();
+
+  bool can_rebind = !_parquet_scan_operator_global_state_map.empty();
+  if (can_rebind) {
+    for (const auto& pipeline : pipelines) {
+      auto source_operator = pipeline->get_source();
+      if (source_operator &&
+          source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+        if (_parquet_scan_operator_global_state_map.find(source_operator->get_operator_id()) ==
+            _parquet_scan_operator_global_state_map.end()) {
+          can_rebind = false;
+          break;
+        }
+      }
+    }
+  }
+  if (!can_rebind) { _parquet_scan_operator_global_state_map.clear(); }
+
   for (const auto& pipeline : pipelines) {
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) { continue; }
@@ -87,8 +108,6 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
       auto it = _parquet_scan_operator_global_state_map.find(operator_id);
       if (it != _parquet_scan_operator_global_state_map.end()) {
-        // Reuse cached file metadata — just rebind to the new pipeline/operator
-        // and reset the partition counter.
         it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
       } else {
         const auto& op_params =
