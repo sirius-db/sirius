@@ -31,10 +31,11 @@ namespace sirius {
 namespace config {
 struct configuration_setter;
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE   = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256LL;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES   = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES     = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
 
 }  // namespace config
 
@@ -56,6 +57,19 @@ struct operator_params {
 
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+
+  /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
+  /// This value must be smaller than concat_batch_bytes
+  uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Ensures max_build_hash_table_bytes < concat_batch_bytes.
+  /// If violated, clamps max_build_hash_table_bytes to concat_batch_bytes - 1.
+  void validate_and_fix()
+  {
+    if (concat_batch_bytes > 0 && max_build_hash_table_bytes >= concat_batch_bytes) {
+      max_build_hash_table_bytes = concat_batch_bytes - 1;
+    }
+  }
 };
 
 struct sirius_config {

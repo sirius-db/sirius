@@ -73,6 +73,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
                                                             bool is_build)
 {
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    _hash_join_op      = op;  // set the hash join operator pointer for later use
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
@@ -214,7 +215,7 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   }
 }
 
-int sirius_physical_partition::determine_num_partitions()
+std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
 {
   if (ports.find("default") == ports.end()) {
     throw std::runtime_error(
@@ -228,7 +229,8 @@ int sirius_physical_partition::determine_num_partitions()
     auto batch = repo->get_data_batch_by_id(batch_id, std::nullopt, 0);
     if (batch && batch->get_data()) { total_bytes += batch->get_data()->get_size_in_bytes(); }
   }
-  return static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+  int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+  return std::make_pair(num_partitions, total_bytes);
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -276,23 +278,30 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     auto& sibling = _sibling_partition_op->Cast<sirius_physical_partition>();
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
-      _num_partitions         = determine_num_partitions();
-      sibling._num_partitions = _num_partitions.value();
+      auto [num_parts, total_bytes] = determine_num_partitions();
+      _hash_join_op->Cast<sirius_physical_hash_join>().update_join_exec_mode(num_parts,
+                                                                             total_bytes);
+      _num_partitions         = num_parts;
+      sibling._num_partitions = num_parts;
       SIRIUS_LOG_DEBUG(
-        "sirius_physical_partition id {} determined {} partitions on sibling id {} and {} build "
+        "sirius_physical_partition id {} determined {} partitions from {} bytes on sibling id {} "
+        "and {} build "
         "side",
         this->get_operator_id(),
         _num_partitions.value(),
+        total_bytes,
         _sibling_partition_op->get_operator_id(),
         (_is_build ? "is" : "is not"));
     }
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      _num_partitions = determine_num_partitions();
-      SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions",
+      auto [num_parts, total_bytes] = determine_num_partitions();
+      _num_partitions               = num_parts;
+      SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions from {} bytes",
                        this->get_operator_id(),
-                       _num_partitions.value());
+                       _num_partitions.value(),
+                       total_bytes);
     }
   }
   return sirius_physical_operator::get_next_task_input_data();

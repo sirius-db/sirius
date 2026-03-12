@@ -67,6 +67,8 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
   //! Get the sample operator
   sirius_physical_sort_sample* get_sample_op() const { return _sample_op; }
 
+  void finalize_operator() override;
+
  private:
   sirius_physical_sort_sample* _sample_op = nullptr;
 };

@@ -164,5 +164,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   return std::make_unique<operator_data>(output_batches);
 }
 
+void sirius_physical_sort_partition::finalize_operator()
+{
+  if (_sample_op) { _sample_op->clear_partition_boundaries(); }
+}
+
 }  // namespace op
 }  // namespace sirius
