@@ -26,6 +26,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <format>
+
 namespace sirius {
 namespace pipeline {
 
@@ -331,12 +333,13 @@ void sirius_pipeline::mark_task_created()
   bool expected = false;
   if (_nvtx_range_started.compare_exchange_strong(expected, true)) {
     nvtxEventAttributes_t attr{};
-    attr.version      = NVTX_VERSION;
-    attr.size         = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-    attr.messageType  = NVTX_MESSAGE_TYPE_ASCII;
-    std::string label = "Pipeline " + std::to_string(pipeline_id) + ": " +
-                        (source ? source->get_name() : "?") + " -> " +
-                        (sink ? sink->get_name() : "?");
+    attr.version            = NVTX_VERSION;
+    attr.size               = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.messageType        = NVTX_MESSAGE_TYPE_ASCII;
+    auto label              = std::format("Pipeline {}: {} -> {}",
+                             pipeline_id,
+                             source ? source->get_name() : "?",
+                             sink ? sink->get_name() : "?");
     attr.message.ascii      = label.c_str();
     _nvtx_pipeline_range_id = nvtxRangeStartEx(&attr);
   }
