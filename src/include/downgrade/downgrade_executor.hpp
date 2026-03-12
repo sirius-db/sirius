@@ -24,11 +24,12 @@
 #include "parallel/task.hpp"
 #include "task_completion.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
 #include <memory>
@@ -157,7 +158,7 @@ class downgrade_executor {
   std::unique_ptr<exec::thread_pool> _thread_pool;
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
   std::thread _manager_thread;
-  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
+  cudaStream_t _stream{nullptr};
   std::thread _monitor_thread;
 
   cucascade::shared_data_repository_manager& _data_repo_mgr;

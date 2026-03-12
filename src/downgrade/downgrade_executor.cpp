@@ -20,8 +20,7 @@
 #include "log/logging.hpp"
 
 #include <rmm/cuda_device.hpp>
-
-#include <cuda_runtime_api.h>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -43,10 +42,7 @@ downgrade_executor::downgrade_executor(
     _memory_space(memory_space),
     _reservation_manager(reservation_manager)
 {
-  if (_memory_space) {
-    _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
-      rmm::cuda_device_id{_memory_space->get_device_id()}, _config.num_threads);
-  }
+  if (_memory_space) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
 }
 
 downgrade_executor::~downgrade_executor() { stop(); }
@@ -64,6 +60,7 @@ void downgrade_executor::start()
   if (_memory_space) {
     auto device_id  = _memory_space->get_device_id();
     per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
+    if (!_stream) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
   }
   _thread_pool    = std::make_unique<exec::thread_pool>(_config.num_threads,
                                                      _config.thread_name_prefix,
@@ -90,6 +87,10 @@ void downgrade_executor::stop()
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _kiosk.wait_all();
   if (_thread_pool) { _thread_pool->stop(); }
+  if (_stream) {
+    cudaStreamDestroy(_stream);
+    _stream = nullptr;
+  }
 }
 
 void downgrade_executor::manager_loop()
@@ -105,13 +106,11 @@ void downgrade_executor::manager_loop()
       SIRIUS_LOG_INFO("[downgrade] task queue interrupted, stopping manager loop");
       break;
     }
-    auto exc_stream = _stream_pool->acquire_stream(
-      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-    _thread_pool->schedule([task       = std::move(task),
-                            ticket     = std::move(ticket),
-                            exc_stream = std::move(exc_stream)]() mutable {
+    _thread_pool->schedule([task   = std::move(task),
+                            ticket = std::move(ticket),
+                            stream = rmm::cuda_stream_view{_stream}]() mutable {
       try {
-        task->execute(exc_stream);
+        task->execute(stream);
       } catch (const std::exception& e) {
         // Downgrade failures are non-fatal — log and continue.
         SIRIUS_LOG_ERROR("[downgrade] task execution failed: {}", e.what());
