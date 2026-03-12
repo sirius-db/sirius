@@ -8,6 +8,7 @@ requires-pixi = ">=0.59"
 scripts = ["scripts/pixi_activate.sh"]
 
 [dependencies]
+bc = "*"
 cmake = "4.1.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
