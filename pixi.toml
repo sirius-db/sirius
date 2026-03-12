@@ -29,6 +29,7 @@ clang-tools = ">=21.1.8,<22"
 spdlog = "1.8.*"
 pkg-config = "*"
 mold = "*"
+sqlite = ">=3.52.0,<4"
 
 [tasks]
 
