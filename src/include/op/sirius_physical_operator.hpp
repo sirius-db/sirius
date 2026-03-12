@@ -231,6 +231,9 @@ class sirius_physical_operator {
   virtual void build_pipelines(pipeline::sirius_pipeline& current,
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
+  //! Called when the pipeline this operator belongs to finishes. Override to release resources.
+  virtual void finalize_operator() {}
+
  public:
   template <class TARGET>
   TARGET& Cast()

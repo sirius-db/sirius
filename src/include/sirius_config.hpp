@@ -31,10 +31,11 @@ namespace sirius {
 namespace config {
 struct configuration_setter;
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE   = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256LL;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES   = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES     = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
 
 }  // namespace config
 
@@ -56,6 +57,19 @@ struct operator_params {
 
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+
+  /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
+  /// This value must be smaller than concat_batch_bytes
+  uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Ensures max_build_hash_table_bytes < concat_batch_bytes.
+  /// If violated, clamps max_build_hash_table_bytes to concat_batch_bytes - 1.
+  void validate_and_fix()
+  {
+    if (concat_batch_bytes > 0 && max_build_hash_table_bytes >= concat_batch_bytes) {
+      max_build_hash_table_bytes = concat_batch_bytes - 1;
+    }
+  }
 };
 
 struct sirius_config {
@@ -82,22 +96,18 @@ struct sirius_config {
 
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept
   {
-    return _cache_level != op::scan::cache_level::NONE;
+    return _scan_executor_config.cache != op::scan::cache_level::NONE;
   }
 
-  [[nodiscard]] bool is_cache_decoded_table_enabled() const noexcept
+  [[nodiscard]] op::scan::cache_level get_cache_level() const noexcept
   {
-    return _cache_level == op::scan::cache_level::TABLE_HOST;
+    return _scan_executor_config.cache;
   }
 
-  [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept
+  void set_cache_level(op::scan::cache_level level) noexcept
   {
-    return _cache_level == op::scan::cache_level::TABLE_GPU;
+    _scan_executor_config.cache = level;
   }
-
-  [[nodiscard]] op::scan::cache_level get_cache_level() const noexcept { return _cache_level; }
-
-  void set_cache_level(op::scan::cache_level level) noexcept { _cache_level = level; }
 
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
@@ -115,9 +125,7 @@ struct sirius_config {
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::thread_pool_config _downgrade_executor_config{.num_threads        = 4,
                                                       .thread_name_prefix = "downgrade"};
-  exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
-                                                        .thread_name_prefix = "duckdb_scan"};
-  op::scan::cache_level _cache_level = op::scan::cache_level::NONE;
+  op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
 };
 

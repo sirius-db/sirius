@@ -277,15 +277,19 @@ RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${NUM_ITERATIONS}i
 mkdir -p "$RUN_DIR"
 
 # Resolve config: explicit --config / env var / default ~/.sirius/sirius.cfg
-if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
-    export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.cfg"
+# Only required when running the sirius engine.
+ENGINES="${ENGINES:-sirius duckdb}"
+if [[ " $ENGINES " == *" sirius "* ]]; then
+    if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
+        export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.cfg"
+    fi
+    if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
+        echo "ERROR: config file not found: $SIRIUS_CONFIG_FILE"
+        exit 1
+    fi
+    echo "Config file: $SIRIUS_CONFIG_FILE"
+    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
 fi
-if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
-    echo "ERROR: config file not found: $SIRIUS_CONFIG_FILE"
-    exit 1
-fi
-echo "Config file: $SIRIUS_CONFIG_FILE"
-cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
 
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
 PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
@@ -416,7 +420,6 @@ echo "=== Collecting run info and filesystem benchmark ==="
 echo "Run info saved to $RUN_INFO_FILE"
 echo "=========================================="
 
-ENGINES="${ENGINES:-sirius duckdb}"
 for engine in $ENGINES; do
     ENGINE_DIR="$RUN_DIR/$engine"
     mkdir -p "$ENGINE_DIR"

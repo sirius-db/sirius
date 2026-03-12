@@ -756,6 +756,7 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
+  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
@@ -778,6 +779,16 @@ static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& pa
   Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
   SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
+}
+
+static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
+  params->validate_and_fix();
+  SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
+                   params->max_build_hash_table_bytes);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -919,6 +930,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::VARCHAR,
                             Value("none"),
                             SetCacheScanLevel);
+
+  config.AddExtensionOption("max_build_hash_table_bytes",
+                            "Maximum size a build-side table can be where it will create a "
+                            "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
+                            SetMaxBuildHashTableBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

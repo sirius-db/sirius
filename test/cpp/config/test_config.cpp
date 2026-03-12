@@ -756,6 +756,64 @@ TEST_CASE("Variant config validates the value", "[config_opt][validation][varian
   }
 }
 
+// Config type that only registers "name" — used to test dotted-path coexistence
+struct partial_name_config {
+  std::string name;
+};
+
+template <>
+struct sirius::config::custom_config_registrar<partial_name_config> {
+  static void config(sirius::config::configuration_setter& setter, partial_name_config& opt)
+  {
+    setter.add_config("name", opt.name);
+  }
+};
+
+TEST_CASE("Dotted-path and nested config coexist without false unknown-key error",
+          "[config_opt][dotted_path_and_nested]")
+{
+  using namespace sirius;
+
+  SECTION("Parent dotted-path key is exempt from nested config unknown-key check")
+  {
+    // The parent registers:
+    //   "block.extra" -> int (dotted path, handled by parent)
+    //   "block"       -> partial_name_config (nested, only knows "name")
+    // "block" in the config file has both "name" and "extra".
+    // Without the fix this would throw because the nested setter for partial_name_config
+    // doesn't know about "extra".
+
+    libconfig::Config cfg;
+    auto& block = cfg.getRoot().add("block", libconfig::Setting::TypeGroup);
+    block.add("name", libconfig::Setting::TypeString) = "hello";
+    block.add("extra", libconfig::Setting::TypeInt)   = 99;
+
+    partial_name_config named{};
+    int extra = 0;
+    config::configuration_setter setter;
+    setter.add_config("block.extra", extra);
+    setter.add_config("block", named);
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(named.name == "hello");
+    REQUIRE(extra == 99);
+  }
+
+  SECTION("Truly unknown key inside nested block still throws")
+  {
+    libconfig::Config cfg;
+    auto& block = cfg.getRoot().add("block", libconfig::Setting::TypeGroup);
+    block.add("name", libconfig::Setting::TypeString)     = "hello";
+    block.add("unknown_key", libconfig::Setting::TypeInt) = 7;
+
+    partial_name_config named{};
+    config::configuration_setter setter;
+    setter.add_config("block", named);
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
+  }
+}
+
 TEST_CASE("Unknown config keys throw runtime_error", "[config_opt][unknown_key]")
 {
   using namespace sirius;
