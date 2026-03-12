@@ -70,8 +70,8 @@ cache_ranges::cache_ranges(std::vector<range> ranges,
   total_packed_bytes_ = running;
 }
 
-std::vector<std::span<const std::byte>> cache_ranges::get_ranges(std::size_t query_offset,
-                                                                 std::size_t query_size) const
+std::optional<std::vector<std::span<const std::byte>>> cache_ranges::get_ranges(
+  std::size_t query_offset, std::size_t query_size) const
 {
   if (query_size == 0) return {};
 
@@ -84,7 +84,7 @@ std::vector<std::span<const std::byte>> cache_ranges::get_ranges(std::size_t que
     // Find the range that contains cur_offset.
     auto idx = find_range(cur_offset);
     if (idx == ranges_.size()) {
-      throw std::out_of_range("cache_ranges::get_ranges: offset not covered by any cached range");
+      return std::nullopt;  // offset not covered by any cached range
     }
 
     auto const& r         = ranges_[idx];
@@ -93,7 +93,7 @@ std::vector<std::span<const std::byte>> cache_ranges::get_ranges(std::size_t que
     if (cur_offset + remaining > range_end) {
       // The query spans beyond a single cached range – we only
       // support queries that are fully covered by the cache.
-      throw std::out_of_range("cache_ranges::get_ranges: query extends beyond a cached range");
+      return std::nullopt;  // query extends beyond a cached range
     }
 
     // How many bytes into range r is cur_offset?
