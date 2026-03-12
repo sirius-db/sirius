@@ -19,7 +19,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "gpu_physical_plan_generator.hpp"
-#include <gpu_physical_as_of_join.hpp>
+#include "operator/gpu_physical_as_of_join.hpp"
 #include "operator/gpu_physical_hash_join.hpp"
 #include "operator/gpu_physical_nested_loop_join.hpp"
 

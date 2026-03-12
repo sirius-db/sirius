@@ -219,7 +219,8 @@ set(CUDA_SOURCES
     src/cuda/operator/strings_matching.cu
     src/cuda/operator/substring.cu
     src/cuda/print.cu
-    src/cuda/utils.cu)
+    src/cuda/utils.cu
+    src/cuda/operator/as_of_join.cu)
 # cmake-format: on
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
