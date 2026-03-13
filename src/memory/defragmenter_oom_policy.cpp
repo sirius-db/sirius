@@ -80,7 +80,7 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
   }
 
   // If the pool doesn't look fragmented, trimming won't help — bail out.
-  if (oom_ex->pool_handle && !is_pool_fragmented(oom_ex->pool_handle, bytes)) {
+  if (!oom_ex->pool_handle || !is_pool_fragmented(oom_ex->pool_handle, bytes)) {
     std::rethrow_exception(eptr);
   }
 
