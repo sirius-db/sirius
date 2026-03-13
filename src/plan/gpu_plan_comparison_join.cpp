@@ -37,11 +37,11 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanAsOfJoin(LogicalCo
   right->estimated_cardinality = rhs_cardinality;
 
   auto join = make_uniq<GPUPhysicalAsOfJoin>(op,
-                                                   std::move(left),
-                                                   std::move(right),
-                                                   std::move(op.conditions),
-                                                   op.join_type,
-                                                   op.estimated_cardinality);
+                                             std::move(left),
+                                             std::move(right),
+                                             std::move(op.conditions),
+                                             op.join_type,
+                                             op.estimated_cardinality);
   return join;
 }
 

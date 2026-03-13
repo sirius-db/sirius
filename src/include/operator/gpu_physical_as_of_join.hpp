@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
- //Delete before commit
- //Independent compilation:  nvcc -c src/cuda/operator/as_of_join.cu -Isrc/include -Isrc/include/cudf -I.pixi/envs/default/include/ -I.pixi/envs/default/include/rapids/ -Ibuild/release/extension/sirius/_deps/spdlog_ep/src/spdlog_ep/include -I./duckdb/src/include -Isrc/include/operator  
+// Delete before commit
+// Independent compilation:  nvcc -c src/cuda/operator/as_of_join.cu -Isrc/include
+// -Isrc/include/cudf -I.pixi/envs/default/include/ -I.pixi/envs/default/include/rapids/
+// -Ibuild/release/extension/sirius/_deps/spdlog_ep/src/spdlog_ep/include -I./duckdb/src/include
+// -Isrc/include/operator
 
 #pragma once
 
@@ -33,15 +36,17 @@
 namespace duckdb {
 
 template <typename T>
-void asOfJoinNestedLoop(T** left_data,
-                    T** right_data,
-                    uint64_t*& row_ids_left,
-                    uint64_t*& row_ids_right,
-                    uint64_t*& count,
-                    uint64_t left_size,
-                    uint64_t right_size,
-                    int* condition_mode,
-                    int num_keys);
+void asOfJoinNestedLoop(int64_t* left_data_timestamp,
+                        int64_t* right_data_timestamp,
+                        T* left_data_value,
+                        T* right_data_value,
+                        uint64_t*& row_ids_left,
+                        uint64_t*& row_ids_right,
+                        uint64_t*& count,
+                        uint64_t left_size,
+                        uint64_t right_size,
+                        int* condition_mode,
+                        int num_keys);
 
 //! PhysicalAsOfJoin represents an as of join between two tables
 class GPUPhysicalAsOfJoin : public GPUPhysicalOperator {
@@ -50,19 +55,19 @@ class GPUPhysicalAsOfJoin : public GPUPhysicalOperator {
 
  public:
   GPUPhysicalAsOfJoin(LogicalOperator& op,
-                            unique_ptr<GPUPhysicalOperator> left,
-                            unique_ptr<GPUPhysicalOperator> right,
-                            vector<JoinCondition> cond,
-                            JoinType join_type,
-                            idx_t estimated_cardinality,
-                            unique_ptr<JoinFilterPushdownInfo> pushdown_info_p);
+                      unique_ptr<GPUPhysicalOperator> left,
+                      unique_ptr<GPUPhysicalOperator> right,
+                      vector<JoinCondition> cond,
+                      JoinType join_type,
+                      idx_t estimated_cardinality,
+                      unique_ptr<JoinFilterPushdownInfo> pushdown_info_p);
 
   GPUPhysicalAsOfJoin(LogicalOperator& op,
-                            unique_ptr<GPUPhysicalOperator> left,
-                            unique_ptr<GPUPhysicalOperator> right,
-                            vector<JoinCondition> cond,
-                            JoinType join_type,
-                            idx_t estimated_cardinality);
+                      unique_ptr<GPUPhysicalOperator> left,
+                      unique_ptr<GPUPhysicalOperator> right,
+                      vector<JoinCondition> cond,
+                      JoinType join_type,
+                      idx_t estimated_cardinality);
 
   vector<JoinCondition> conditions;
   //! The types of the join keys

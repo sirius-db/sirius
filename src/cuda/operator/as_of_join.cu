@@ -16,20 +16,22 @@
 
 #include "cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
-#include "operator/gpu_physical_as_of_join.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_as_of_join.hpp"
 
 namespace duckdb {
 
 // TODO: Currently only support a single key
 template <typename T, int B, int I>
-__global__ void as_of_join_nested_loop_count(T* left_keys,
-                                 T* right_keys,
-                                 uint64_t* offset_each_thread,
-                                 unsigned long long* total_count,
-                                 uint64_t left_size,
-                                 uint64_t right_size,
-                                 int condition_mode)
+__global__ void as_of_join_nested_loop_count(int64_t* left_keys_timestamp,
+                                             int64_t* right_keys_timestamp,
+                                             T* left_keys_value,
+                                             T* right_keys_value,
+                                             uint64_t* offset_each_thread,
+                                             unsigned long long* total_count,
+                                             uint64_t left_size,
+                                             uint64_t right_size,
+                                             int condition_mode)
 {
   typedef cub::BlockScan<int, B> BlockScanInt;
 
@@ -62,24 +64,29 @@ __global__ void as_of_join_nested_loop_count(T* left_keys,
       for (int i = 0; i < right_size; i++) {
         bool local_found = 1;
         if (condition_mode == 0 &&
-            left_keys[tile_offset + threadIdx.x + ITEM * B] != right_keys[i]) {
+            left_keys_value[tile_offset + threadIdx.x + ITEM * B] != right_keys_value[i]) {
           local_found = 0;
         } else if (condition_mode == 1 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] == right_keys[i]) {
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] == right_keys_value[i]) {
           local_found = 0;
         } else if (condition_mode == 2 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] >= right_keys[i]) {
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] >= right_keys_value[i]) {
           local_found = 0;
         } else if (condition_mode == 3 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] <= right_keys_value[i]) {
           local_found = 0;
         } else if (condition_mode == 4 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] < right_keys[i]) {
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] < right_keys_value[i]) {
           local_found = 0;
         }
 
         // There can only be one right element for each left in the end result of the as of join
-        if (local_found) { items_count[ITEM] = 1; }
+        if (local_found) {
+          if (left_keys_timestamp[tile_offset + threadIdx.x + ITEM * B] >=
+              right_keys_timestamp[i]) {
+            items_count[ITEM] = 1;
+          }
+        }
       }
 
       t_count += items_count[ITEM];
@@ -110,14 +117,16 @@ __global__ void as_of_join_nested_loop_count(T* left_keys,
 }
 
 template <typename T, int B, int I>
-__global__ void as_of_join_nested_loop(T* left_keys,
-                           T* right_keys,
-                           uint64_t* offset_each_thread,
-                           uint64_t* row_ids_left,
-                           uint64_t* row_ids_right,
-                           uint64_t left_size,
-                           uint64_t right_size,
-                           int condition_mode)
+__global__ void as_of_join_nested_loop(int64_t* left_keys_timestamp,
+                                       int64_t* right_keys_timestamp,
+                                       T* left_keys_value,
+                                       T* right_keys_value,
+                                       uint64_t* offset_each_thread,
+                                       uint64_t* row_ids_left,
+                                       uint64_t* row_ids_right,
+                                       uint64_t left_size,
+                                       uint64_t right_size,
+                                       int condition_mode)
 {
   uint64_t tile_size   = B * I;
   uint64_t tile_offset = blockIdx.x * tile_size;
@@ -138,26 +147,27 @@ __global__ void as_of_join_nested_loop(T* left_keys,
 
     if (threadIdx.x + (ITEM * B) < num_tile_items) {
       for (int i = 0; i < right_size; i++) {
-        bool local_found = 1;
+        bool local_found = false;
         if (condition_mode == 0 &&
-            left_keys[tile_offset + threadIdx.x + ITEM * B] != right_keys[i]) {
-          local_found = 0;
+            left_keys_value[tile_offset + threadIdx.x + ITEM * B] == right_keys_value[i]) {
+          local_found = true;
         } else if (condition_mode == 1 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] == right_keys[i]) {
-          local_found = 0;
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] != right_keys_value[i]) {
+          local_found = true;
         } else if (condition_mode == 2 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] >= right_keys[i]) {
-          local_found = 0;
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] > right_keys_value[i]) {
+          local_found = true;
         } else if (condition_mode == 3 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
-          local_found = 0;
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] < right_keys_value[i]) {
+          local_found = true;
         } else if (condition_mode == 4 &&
-                   left_keys[tile_offset + threadIdx.x + ITEM * B] < right_keys[i]) {
-          local_found = 0;
+                   left_keys_value[tile_offset + threadIdx.x + ITEM * B] >= right_keys_value[i]) {
+          local_found = true;
         }
 
-        if (local_found && ((condition_mode == 3 || condition_mode == 4) ||
-                            right_keys[i] > right_keys[mostRecentTimestampIndex])) {
+        if (local_found &&
+            (left_keys_timestamp[tile_offset + threadIdx.x + ITEM * B] >= right_keys_timestamp[i] &&
+             right_keys_value[i] > right_keys_value[mostRecentTimestampIndex])) {
           mostRecentTimestampIndex = i;
         }
       }
@@ -171,51 +181,87 @@ __global__ void as_of_join_nested_loop(T* left_keys,
   }
 }
 
-template __global__ void as_of_join_nested_loop_count<int32_t, BLOCK_THREADS, 1>(int32_t* left_keys,
-                                                                    int32_t* right_keys,
-                                                                    uint64_t* offset_each_thread,
-                                                                    unsigned long long* total_count,
-                                                                    uint64_t left_size,
-                                                                    uint64_t right_size,
-                                                                    int condition_mode);
-
-template __global__ void as_of_join_nested_loop_count<uint64_t, BLOCK_THREADS, 1>(
-  uint64_t* left_keys,
-  uint64_t* right_keys,
+template __global__ void as_of_join_nested_loop_count<int32_t, BLOCK_THREADS, 1>(
+  int64_t* left_keys_timestamp,
+  int64_t* right_keys_timestamp,
+  int32_t* left_keys_value,
+  int32_t* right_keys_value,
   uint64_t* offset_each_thread,
   unsigned long long* total_count,
   uint64_t left_size,
   uint64_t right_size,
   int condition_mode);
 
-template __global__ void as_of_join_nested_loop<double, BLOCK_THREADS, 1>(double* left_keys,
-                                                              double* right_keys,
-                                                              uint64_t* offset_each_thread,
-                                                              uint64_t* row_ids_left,
-                                                              uint64_t* row_ids_right,
-                                                              uint64_t left_size,
-                                                              uint64_t right_size,
-                                                              int condition_mode);
+template __global__ void as_of_join_nested_loop_count<double, BLOCK_THREADS, 1>(
+  int64_t* left_keys_timestamp,
+  int64_t* right_keys_timestamp,
+  double* left_keys_value,
+  double* right_keys_value,
+  uint64_t* offset_each_thread,
+  unsigned long long* total_count,
+  uint64_t left_size,
+  uint64_t right_size,
+  int condition_mode);
 
-template __global__ void as_of_join_nested_loop<uint64_t, BLOCK_THREADS, 1>(uint64_t* left_keys,
-                                                                uint64_t* right_keys,
-                                                                uint64_t* offset_each_thread,
-                                                                uint64_t* row_ids_left,
-                                                                uint64_t* row_ids_right,
-                                                                uint64_t left_size,
-                                                                uint64_t right_size,
-                                                                int condition_mode);
+template __global__ void as_of_join_nested_loop_count<uint32_t, BLOCK_THREADS, 1>(
+  int64_t* left_keys_timestamp,
+  int64_t* right_keys_timestamp,
+  uint32_t* left_keys_value,
+  uint32_t* right_keys_value,
+  uint64_t* offset_each_thread,
+  unsigned long long* total_count,
+  uint64_t left_size,
+  uint64_t right_size,
+  int condition_mode);
+
+template __global__ void as_of_join_nested_loop<double, BLOCK_THREADS, 1>(
+  int64_t* left_keys_timestamp,
+  int64_t* right_keys_timestamp,
+  double* left_keys_value,
+  double* right_keys_value,
+  uint64_t* offset_each_thread,
+  uint64_t* row_ids_left,
+  uint64_t* row_ids_right,
+  uint64_t left_size,
+  uint64_t right_size,
+  int condition_mode);
+
+template __global__ void as_of_join_nested_loop<int64_t, BLOCK_THREADS, 1>(
+  int64_t* left_keys_timestamp,
+  int64_t* right_keys_timestamp,
+  int64_t* left_keys_value,
+  int64_t* right_keys_value,
+  uint64_t* offset_each_thread,
+  uint64_t* row_ids_left,
+  uint64_t* row_ids_right,
+  uint64_t left_size,
+  uint64_t right_size,
+  int condition_mode);
+
+template __global__ void as_of_join_nested_loop<int32_t, BLOCK_THREADS, 1>(
+  int64_t* left_keys_timestamp,
+  int64_t* right_keys_timestamp,
+  int32_t* left_keys_value,
+  int32_t* right_keys_value,
+  uint64_t* offset_each_thread,
+  uint64_t* row_ids_left,
+  uint64_t* row_ids_right,
+  uint64_t left_size,
+  uint64_t right_size,
+  int condition_mode);
 
 template <typename T>
-void asOfJoinNestedLoop(T** left_data,
-              T** right_data,
-              uint64_t*& row_ids_left,
-              uint64_t*& row_ids_right,
-              uint64_t*& count,
-              uint64_t left_size,
-              uint64_t right_size,
-              int* condition_mode,
-              int num_keys)
+void asOfJoinNestedLoop(int64_t* left_data_timestamp,
+                        int64_t* right_data_timestamp,
+                        T* left_data_value,
+                        T* right_data_value,
+                        uint64_t*& row_ids_left,
+                        uint64_t*& row_ids_right,
+                        uint64_t*& count,
+                        uint64_t left_size,
+                        uint64_t right_size,
+                        int* condition_mode,
+                        int num_keys)
 {
   CHECK_ERROR();
   SETUP_TIMING();
@@ -239,8 +285,10 @@ void asOfJoinNestedLoop(T** left_data,
   // TODO: Currently only support a single key
   CHECK_ERROR();
   as_of_join_nested_loop_count<T, BLOCK_THREADS, 1>
-    <<<(left_size + tile_items - 1) / tile_items, BLOCK_THREADS>>>(left_data[0],
-                                                                   right_data[0],
+    <<<(left_size + tile_items - 1) / tile_items, BLOCK_THREADS>>>(left_data_timestamp,
+                                                                   right_data_timestamp,
+                                                                   left_data_value,
+                                                                   right_data_value,
                                                                    offset_each_thread,
                                                                    (unsigned long long*)count,
                                                                    left_size,
@@ -257,8 +305,10 @@ void asOfJoinNestedLoop(T** left_data,
   row_ids_left  = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
   row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
   as_of_join_nested_loop<T, BLOCK_THREADS, 1>
-    <<<(left_size + tile_items - 1) / tile_items, BLOCK_THREADS>>>(left_data[0],
-                                                                   right_data[0],
+    <<<(left_size + tile_items - 1) / tile_items, BLOCK_THREADS>>>(left_data_timestamp,
+                                                                   right_data_timestamp,
+                                                                   left_data_value,
+                                                                   right_data_value,
                                                                    offset_each_thread,
                                                                    row_ids_left,
                                                                    row_ids_right,
@@ -273,24 +323,52 @@ void asOfJoinNestedLoop(T** left_data,
   STOP_TIMER();
 }
 
-template void asOfJoinNestedLoop<int32_t>(int32_t** left_data,
-                                int32_t** right_data,
-                                uint64_t*& row_ids_left,
-                                uint64_t*& row_ids_right,
-                                uint64_t*& count,
-                                uint64_t left_size,
-                                uint64_t right_size,
-                                int* condition_mode,
-                                int num_keys);
+template void asOfJoinNestedLoop<int32_t>(int64_t* left_data_timestamp,
+                                          int64_t* right_data_timestamp,
+                                          int32_t* left_data_value,
+                                          int32_t* right_data_value,
+                                          uint64_t*& row_ids_left,
+                                          uint64_t*& row_ids_right,
+                                          uint64_t*& count,
+                                          uint64_t left_size,
+                                          uint64_t right_size,
+                                          int* condition_mode,
+                                          int num_keys);
 
-template void asOfJoinNestedLoop<uint64_t>(uint64_t** left_data,
-                                 uint64_t** right_data,
-                                 uint64_t*& row_ids_left,
-                                 uint64_t*& row_ids_right,
-                                 uint64_t*& count,
-                                 uint64_t left_size,
-                                 uint64_t right_size,
-                                 int* condition_mode,
-                                 int num_keys);
+template void asOfJoinNestedLoop<int64_t>(int64_t* left_data_timestamp,
+                                          int64_t* right_data_timestamp,
+                                          int64_t* left_data_value,
+                                          int64_t* right_data_value,
+                                          uint64_t*& row_ids_left,
+                                          uint64_t*& row_ids_right,
+                                          uint64_t*& count,
+                                          uint64_t left_size,
+                                          uint64_t right_size,
+                                          int* condition_mode,
+                                          int num_keys);
+
+template void asOfJoinNestedLoop<float>(int64_t* left_data_timestamp,
+                                        int64_t* right_data_timestamp,
+                                        float* left_data_value,
+                                        float* right_data_value,
+                                        uint64_t*& row_ids_left,
+                                        uint64_t*& row_ids_right,
+                                        uint64_t*& count,
+                                        uint64_t left_size,
+                                        uint64_t right_size,
+                                        int* condition_mode,
+                                        int num_keys);
+
+template void asOfJoinNestedLoop<double>(int64_t* left_data_timestamp,
+                                         int64_t* right_data_timestamp,
+                                         double* left_data_value,
+                                         double* right_data_value,
+                                         uint64_t*& row_ids_left,
+                                         uint64_t*& row_ids_right,
+                                         uint64_t*& count,
+                                         uint64_t left_size,
+                                         uint64_t right_size,
+                                         int* condition_mode,
+                                         int num_keys);
 
 }  // namespace duckdb

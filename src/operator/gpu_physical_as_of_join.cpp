@@ -29,11 +29,11 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "operator/gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
-#include "operator/gpu_physical_hash_join.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 #include "operator/gpu_physical_nested_loop_join.hpp"
 
 namespace duckdb {
@@ -46,21 +46,37 @@ void ResolveTypeAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
                          uint64_t*& row_ids_right,
                          const vector<JoinCondition>& conditions,
                          JoinType join_type,
-                         GPUBufferManager* gpuBufferManager)
+                         GPUBufferManager* gpuBufferManager,
+                         int timestamp_key_index,
+                         int value_key_index)
 {
-  int num_keys   = conditions.size();
-  T** left_data  = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
-  T** right_data = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
+  int num_keys = conditions.size();
 
-  for (int key = 0; key < num_keys; key++) {
-    left_data[key]  = reinterpret_cast<T*>(left_keys[key]->data_wrapper.data);
-    right_data[key] = reinterpret_cast<T*>(right_keys[key]->data_wrapper.data);
+  if (num_keys != 2) {
+    throw NotImplementedException(
+      "As of join currently only support 2 keys. One key is the timestamp, the other is the value");
   }
+
+  T* left_value  = gpuBufferManager->customCudaHostAlloc<T>(1);
+  T* right_value = gpuBufferManager->customCudaHostAlloc<T>(1);
+
+  left_value  = reinterpret_cast<T*>(left_keys[value_key_index]->data_wrapper.data);
+  right_value = reinterpret_cast<T*>(right_keys[value_key_index]->data_wrapper.data);
+
+  int64_t* left_timestamp  = gpuBufferManager->customCudaHostAlloc<int64_t>(1);
+  int64_t* right_timestamp = gpuBufferManager->customCudaHostAlloc<int64_t>(1);
+
+  left_timestamp  = reinterpret_cast<int64_t*>(left_keys[timestamp_key_index]->data_wrapper.data);
+  right_timestamp = reinterpret_cast<int64_t*>(right_keys[timestamp_key_index]->data_wrapper.data);
+
   size_t left_size  = left_keys[0]->column_length;
   size_t right_size = right_keys[0]->column_length;
 
-  int* condition_mode = gpuBufferManager->customCudaHostAlloc<int>(num_keys);
+  int* condition_mode = gpuBufferManager->customCudaHostAlloc<int>(1);
   for (int key = 0; key < num_keys; key++) {
+    if(key==timestamp_key_index){
+      continue;
+    }
     if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL ||
         conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
       condition_mode[key] = 0;
@@ -71,26 +87,29 @@ void ResolveTypeAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
       condition_mode[key] = 2;
     } else if (conditions[key].comparison == ExpressionType::COMPARE_GREATERTHAN) {
       condition_mode[key] = 3;
-    } else if(conditions[key].comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+    } else if (conditions[key].comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
       condition_mode[key] = 4;
-    }
-    else {
-      throw NotImplementedException("Unsupported comparison type: "+(ExpressionTypeToString(conditions[key].comparison)));
+    } else {
+      throw NotImplementedException("Unsupported comparison type: " +
+                                    (ExpressionTypeToString(conditions[key].comparison)));
     }
   }
 
   // TODO: Need to handle special case for unique keys for better performance
   if (join_type == JoinType::INNER) {
     // printGPUColumn<T>(left_data, 100, 0);
-    asOfJoinNestedLoop<T>(left_data,
-                right_data,
-                row_ids_left,
-                row_ids_right,
-                count,
-                left_size,
-                right_size,
-                condition_mode,
-                num_keys);
+
+    asOfJoinNestedLoop<T>(left_timestamp,
+                          right_timestamp,
+                          left_value,
+                          right_value,
+                          row_ids_left,
+                          row_ids_right,
+                          count,
+                          left_size,
+                          right_size,
+                          condition_mode,
+                          num_keys);
   } else {
     throw NotImplementedException("Unsupported join type");
   }
@@ -105,23 +124,78 @@ void HandleAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
                     JoinType join_type,
                     GPUBufferManager* gpuBufferManager)
 {
-  switch (left_keys[0]->data_wrapper.type.id()) {
-    case GPUColumnTypeId::TIMESTAMP_SEC:
-    case GPUColumnTypeId::TIMESTAMP_MS:
-    case GPUColumnTypeId::TIMESTAMP_US:
-    case GPUColumnTypeId::TIMESTAMP_NS:
-      ResolveTypeAsOfJoin<int32_t>(left_keys,
+  int i            = 0;
+  bool value_found = false;
+  do {
+    switch (left_keys[i]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
+        ResolveTypeAsOfJoin<int32_t>(left_keys,
+                                     right_keys,
+                                     count,
+                                     row_ids_left,
+                                     row_ids_right,
+                                     conditions,
+                                     join_type,
+                                     gpuBufferManager,
+                                     i == 0 ? i + 1 : i - 1,
+                                     i);
+        value_found = true;
+
+        break;
+      case GPUColumnTypeId::INT64:
+        ResolveTypeAsOfJoin<int64_t>(left_keys,
+                                     right_keys,
+                                     count,
+                                     row_ids_left,
+                                     row_ids_right,
+                                     conditions,
+                                     join_type,
+                                     gpuBufferManager,
+                                     i == 0 ? i + 1 : i - 1,
+                                     i);
+        value_found = true;
+
+        break;
+      case GPUColumnTypeId::FLOAT32:
+        ResolveTypeAsOfJoin<float>(left_keys,
+                                   right_keys,
+                                   count,
+                                   row_ids_left,
+                                   row_ids_right,
+                                   conditions,
+                                   join_type,
+                                   gpuBufferManager,
+                                   i == 0 ? i + 1 : i - 1,
+                                   i);
+        value_found = true;
+
+        break;
+      case GPUColumnTypeId::FLOAT64:
+        ResolveTypeAsOfJoin<double>(left_keys,
                                     right_keys,
                                     count,
                                     row_ids_left,
                                     row_ids_right,
                                     conditions,
                                     join_type,
-                                    gpuBufferManager);
-      break;
-    default:
-      throw NotImplementedException("Unsupported sirius column type in `HandleAsOfJoin`: %d",
-                                    static_cast<int>(left_keys[0]->data_wrapper.type.id()));
+                                    gpuBufferManager,
+                                    i == 0 ? i + 1 : i - 1,
+                                    i);
+        value_found = true;
+        break;
+
+      case GPUColumnTypeId::TIMESTAMP_SEC:
+      case GPUColumnTypeId::TIMESTAMP_MS:
+      case GPUColumnTypeId::TIMESTAMP_US:
+      case GPUColumnTypeId::TIMESTAMP_NS:
+      default: break;
+    }
+    i++;
+  } while (i < left_keys.size());
+
+  if (!value_found) {
+    throw NotImplementedException("Unsupported sirius column type in `HandleAsOfJoin`: %d",
+                                  static_cast<int>(left_keys[0]->data_wrapper.type.id()));
   }
 }
 
@@ -416,7 +490,7 @@ OperatorResultType GPUPhysicalAsOfJoin::ResolveComplexJoin(
                              output_relation,
                              rhs_output_columns,
                              input_relation.column_count,
-                             count[0],
+                             count[0], 
                              row_ids_right,
                              gpuBufferManager,
                              false);

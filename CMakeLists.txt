@@ -218,6 +218,7 @@ set(CUDA_SOURCES
     src/cuda/operator/nested_loop_join.cu
     src/cuda/operator/strings_matching.cu
     src/cuda/operator/substring.cu
+    src/cuda/operator/as_of_join.cu
     src/cuda/print.cu
     src/cuda/utils.cu
     src/cuda/operator/as_of_join.cu)
