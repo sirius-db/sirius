@@ -31,8 +31,8 @@ jobs:
         with:
           cache: false
           pixi-version: v0.65.0
-          run-install: false
-          global-install: pre-commit
+          global-environments: |
+            pre-commit
 
       - run: pre-commit run --show-diff-on-failure --all-files
 
