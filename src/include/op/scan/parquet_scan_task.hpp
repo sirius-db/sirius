@@ -187,29 +187,43 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
   }
 
-  /** @brief Get a shared_ptr that pins the translated AST filter expression alive.
-   *
-   * This is passed to host_parquet_representation so the filter expression (which
-   * parquet_reader_options stores as a reference) survives until materialization.
-   *
-   * @return A shared_ptr to the translated filter expression (may be null if no filter). */
+  /** @brief Get a shared_ptr that pins the translated AST filter expression alive. */
   [[nodiscard]] std::shared_ptr<gpu_expression_translator::translated_expression>
   get_filter_expression() const
   {
     return _translated_filter;
   }
 
-  /**
-   * @brief Get output positions for pure filter columns.
-   *
-   * These positions refer to the column order produced by the parquet reader for the
-   * selected/projection column set.
-   *
-   * @return A const reference to the vector of pure filter column positions.
-   */
+  /** @brief Get output positions for pure filter columns. */
   [[nodiscard]] std::vector<std::size_t> const& get_pure_filter_ids() const
   {
     return _pure_filter_ids;
+  }
+
+  /**
+   * @brief Rebind this global state to a new pipeline and scan operator.
+   * Reuses all cached file metadata and row group partitions.
+   */
+  void rebind(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+              sirius_physical_parquet_scan* scan_op)
+  {
+    set_pipeline(std::move(pipeline));
+    _scan_op = scan_op;
+    _next_rg_partition.store(0, std::memory_order_relaxed);
+    scan_op->has_more_partitions.store(true, std::memory_order_relaxed);
+    scan_op->exhausted.store(false, std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] size_t get_file_size(size_t file_idx) const { return _file_sizes[file_idx]; }
+
+  [[nodiscard]] size_t get_metadata_byte_size(size_t file_idx) const
+  {
+    return _metadata_byte_sizes[file_idx];
+  }
+
+  [[nodiscard]] size_t get_footer_offset(size_t file_idx) const
+  {
+    return _footer_offsets[file_idx];
   }
 
  private:
@@ -231,6 +245,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
                          ///< materialization
   std::vector<std::size_t>
     _pure_filter_ids;  ///< The output positions of pure filter columns in the reader output
+
+  std::vector<size_t> _file_sizes;           ///< Per-file total file size in bytes
+  std::vector<size_t> _metadata_byte_sizes;  ///< Per-file header+footer+trailer bytes
+  std::vector<size_t> _footer_offsets;       ///< Per-file offset where footer begins
 
   std::vector<row_group_range> _row_group_partitions;  ///< Row-group partitions for tasks
   std::atomic<std::size_t> _next_rg_partition{0};      ///< Number of local states created
@@ -357,8 +375,6 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
       _task_id(task_id),
       _data_repo(data_repo)
   {
-    auto& l_state_cast = this->_local_state->cast<parquet_scan_task_local_state>();
-    _datasource = cudf::io::datasource::create(g_state->get_file_path(l_state_cast.get_file_idx()));
   }
 
   ~parquet_scan_task() override;

@@ -27,9 +27,12 @@ namespace sirius::op::scan {
 
 class prefetched_data_source : public cudf::io::datasource {
  public:
+  // file_size is the original parquet file size; used by size() so cuDF
+  // can compute footer offsets without a fallback datasource.
   // If fallback_source is provided, any offset that is not covered by cache_ranges will be
   // fetched from fallback_source instead of throwing.
   explicit prefetched_data_source(std::unique_ptr<cache_ranges> ranges,
+                                  std::size_t file_size,
                                   std::shared_ptr<cudf::io::datasource> fallback_source = nullptr);
 
   ~prefetched_data_source() override;
@@ -70,6 +73,7 @@ class prefetched_data_source : public cudf::io::datasource {
                                     rmm::cuda_stream_view stream);
 
   std::unique_ptr<cache_ranges> ranges_;
+  std::size_t file_size_;
   std::shared_ptr<cudf::io::datasource> fallback_;
   std::atomic<size_t> total_bytes_read_from_cache_{0};
   std::atomic<size_t> total_bytes_read_from_fallback_{0};

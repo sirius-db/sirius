@@ -54,6 +54,7 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
                                                        _column_chunk_byte_ranges,
                                                        _size_in_bytes,
                                                        _uncompressed_size_in_bytes,
+                                                       _file_size,
                                                        _fallback_datasource,
                                                        _filter_expression,
                                                        _pure_filter_ids);
@@ -71,6 +72,7 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::sh
                                     _column_chunk_byte_ranges,
                                     _size_in_bytes,
                                     _uncompressed_size_in_bytes,
+                                    _file_size,
                                     _fallback_datasource,
                                     _filter_expression,
                                     _pure_filter_ids));
