@@ -235,6 +235,7 @@ fi
 
 # Parse optional flags
 DUCKDB_RESULTS_DIR=""
+DUCKDB_MULTI_SESSION=false
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
@@ -261,6 +262,10 @@ while [ $# -gt 1 ]; do
             DUCKDB_RESULTS_DIR="$2"
             shift 2
             ;;
+        --multi-session)
+            DUCKDB_MULTI_SESSION=true
+            shift
+            ;;
         *)
             break
             ;;
@@ -271,10 +276,11 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] <scale_factor>"
+    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] <scale_factor>"
     echo "       $0 --report <run_dir>"
     echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius --iterations 3 --timeout 120 1000"
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
+    echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
     exit 1
 fi
 
@@ -484,6 +490,9 @@ for engine in $ENGINES; do
     fi
     EXTRA_ARGS+=(--iterations "$NUM_ITERATIONS")
     EXTRA_ARGS+=(--timeout "$QUERY_TIMEOUT")
+    if [ "$DUCKDB_MULTI_SESSION" = true ] && [ "$engine" = "duckdb" ]; then
+        EXTRA_ARGS+=(--multi-session)
+    fi
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log" || true
 done
