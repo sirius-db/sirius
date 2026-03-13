@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
+#include "memory/defragmenter_oom_policy.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -260,47 +261,21 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
     } catch (const rmm::out_of_memory&) {
-      SIRIUS_LOG_WARN("Pipeline {}: OOM at operator {} (id={}, index {}/{}), retrying once",
-                      pipeline->get_pipeline_id(),
-                      op.get_name(),
-                      op.get_operator_id(),
-                      i,
-                      operators.size());
-      try {
-        SIRIUS_LOG_WARN(
-          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), trimming memory pool and "
-          "retrying operator)",
-          pipeline->get_pipeline_id(),
-          op.get_name(),
-          op.get_operator_id(),
-          i,
-          operators.size());
-        cudaMemPool_t pool{};
-        if (cudaDeviceGetDefaultMemPool(&pool,
-                                        operator_input_output_data->get_data_batches()[0]
-                                          ->get_memory_space()
-                                          ->get_device_id()) == cudaSuccess) {
-          cudaMemPoolTrimTo(pool, 0);
-          cudaDeviceSynchronize();
-        }
-        operator_input_output_data = run_one_operator(
-          op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
-      } catch (const rmm::out_of_memory&) {
-        SIRIUS_LOG_WARN(
-          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), rescheduling task {}",
-          pipeline->get_pipeline_id(),
-          op.get_name(),
-          op.get_operator_id(),
-          i,
-          operators.size(),
-          _task_id);
-        throw oom_reschedule_exception(
-          std::move(operator_input_output_data),
-          i,
-          "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
-      }
+      SIRIUS_LOG_WARN(
+        "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), rescheduling task {}",
+        pipeline->get_pipeline_id(),
+        op.get_name(),
+        op.get_operator_id(),
+        i,
+        operators.size(),
+        _task_id);
+      throw oom_reschedule_exception(
+        std::move(operator_input_output_data),
+        i,
+        "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
     }
   }
+
   return operator_input_output_data;
 }
 
@@ -355,7 +330,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
-  allocator->attach_reservation_to_tracker(stream, std::move(reservation), nullptr, nullptr);
+  allocator->attach_reservation_to_tracker(
+    stream, std::move(reservation), nullptr, std::make_unique<memory::defragmenter_oom_policy>());
   absl::Cleanup source_closer = [allocator, stream]() {
     allocator->reset_stream_reservation(stream);
   };
