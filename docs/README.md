@@ -24,7 +24,7 @@ Experiment Setup:
 - NVIDIA Volta™ or higher with compute capability 7.0+
 - CUDA >= 13.0
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
-- libcudf >= 26.04
+- libcudf (stable)
 - We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
 ### Requirements
