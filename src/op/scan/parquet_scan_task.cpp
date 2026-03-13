@@ -300,14 +300,15 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       if (translated) {
         _translated_filter = std::make_shared<gpu_expression_translator::translated_expression>(
           std::move(*translated));
-        _reader_options.set_filter(_translated_filter->back());
+        // Do not set filter on _reader_options: we only use it for row group pruning below.
       }
     }
   }
 
-  // Get the selected column indices for projection
+  // Get the selected column indices for projection (no pure filter columns; we only prune row
+  // groups, not filter during scan).
   auto [selected_column_indices, pure_filter_positions] =
-    detail::make_selected_column_indices(*scan_op, filter_idxs);
+    detail::make_selected_column_indices(*scan_op, {});
   _pure_filter_ids = std::move(pure_filter_positions);
   std::unordered_set<std::size_t> pure_filter_pos_set(_pure_filter_ids.begin(),
                                                       _pure_filter_ids.end());
@@ -360,9 +361,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
         "[parquet_scan_task_global_state] Before filtering, file {} has {} row groups",
         _file_paths[file_idx],
         row_group_indices.size());
-      // Prune row groups with filter pushdown using metadata statistics.
+      // Prune row groups using metadata statistics only; do not set filter on _reader_options.
+      auto pruning_options = _reader_options;
+      pruning_options.set_filter(_translated_filter->back());
       row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
-        row_group_indices, _reader_options, rmm::cuda_stream_default);
+        row_group_indices, pruning_options, rmm::cuda_stream_default);
       SIRIUS_LOG_INFO("[parquet_scan_task_global_state] After filtering, file {} has {} row groups",
                       _file_paths[file_idx],
                       row_group_indices.size());
@@ -535,9 +538,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   l_state.get_reserved_compressed_bytes(),
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   file_size,
-                                                  _datasource,
-                                                  g_state.get_filter_expression(),
-                                                  g_state.get_pure_filter_ids());
+                                                  _datasource);
 #else
   auto parquet_representation =
     std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
@@ -549,9 +550,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   l_state.get_reserved_compressed_bytes(),
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   file_size,
-                                                  _datasource,
-                                                  g_state.get_filter_expression(),
-                                                  g_state.get_pure_filter_ids());
+                                                  _datasource);
 #endif
 
   std::shared_ptr<cucascade::data_batch> batch;
