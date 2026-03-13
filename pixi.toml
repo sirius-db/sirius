@@ -79,7 +79,7 @@ nixl-build = { cmd = """bash -c 'set -e
 
   echo "==> Building nixl with meson (UCX plugin only)..."
   rm -rf builddir
-  meson setup builddir --prefix="$CONDA_PREFIX" --buildtype=release \
+  meson setup builddir --prefix="$CONDA_PREFIX" --libdir=lib --buildtype=release \
     -Ducx_path=$CONDA_PREFIX \
     -Dcudapath_inc=$CONDA_PREFIX/targets/x86_64-linux/include \
     -Dcudapath_lib=$CONDA_PREFIX/targets/x86_64-linux/lib \
