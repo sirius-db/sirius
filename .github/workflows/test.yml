@@ -91,3 +91,16 @@ jobs:
             echo "Test failures detected!"
             exit 1
           fi
+
+      - name: TPC-H performance snapshot
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.cfg
+        run: |
+          ./test/tpch_performance/benchmark_and_validate.sh 1
+          RUN_DIR=$(ls -td runs/*/ | head -1)
+          {
+            echo "## TPC-H Performance (SF1)"
+            echo '```'
+            cat "$RUN_DIR/comparison.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
