@@ -106,6 +106,13 @@ void duckdb_scan_executor::set_completion_handler(
 bool duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
 {
   if (_cache_level == cache_level::NONE) { return false; }
+  // Only track queries that go through the Sirius GPU execution path.
+  // Other SQL statements (SET, INSERT, etc.) don't produce scan tasks
+  // and should not invalidate the cache.
+  if (query.find("gpu_execution") == std::string::npos &&
+      query.find("gpu_processing") == std::string::npos) {
+    return false;
+  }
   std::hash<std::string> hash_fn;
   auto new_query_hash = hash_fn(query);
   if (new_query_hash == _query_hash) {

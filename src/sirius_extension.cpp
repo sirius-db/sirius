@@ -18,6 +18,10 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
+
+// Forward-declare CUDA profiler API functions (linked via libcudart).
+extern "C" int cudaProfilerStart();
+extern "C" int cudaProfilerStop();
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
@@ -585,6 +589,50 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   data.finished = true;
 }
 
+static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
+                                             TableFunctionBindInput& input,
+                                             vector<LogicalType>& return_types,
+                                             vector<string>& names)
+{
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return nullptr;
+}
+
+struct ProfilerFunctionData : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> ProfilerInit(ClientContext& context,
+                                                         TableFunctionInitInput& input)
+{
+  return make_uniq<ProfilerFunctionData>();
+}
+
+static void ProfilerStartFunction(ClientContext& context,
+                                  TableFunctionInput& data_p,
+                                  DataChunk& output)
+{
+  auto& data = data_p.global_state->Cast<ProfilerFunctionData>();
+  if (data.finished) return;
+  cudaProfilerStart();
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
+static void ProfilerStopFunction(ClientContext& context,
+                                 TableFunctionInput& data_p,
+                                 DataChunk& output)
+{
+  auto& data = data_p.global_state->Cast<ProfilerFunctionData>();
+  if (data.finished) return;
+  cudaProfilerStop();
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -610,6 +658,17 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  // Profiler control functions for nsys --capture-range=cudaProfilerApi
+  TableFunction profiler_start(
+    "profiler_start", {}, ProfilerStartFunction, ProfilerBind, ProfilerInit);
+  CreateTableFunctionInfo profiler_start_info(profiler_start);
+  catalog.CreateTableFunction(transaction, profiler_start_info);
+
+  TableFunction profiler_stop(
+    "profiler_stop", {}, ProfilerStopFunction, ProfilerBind, ProfilerInit);
+  CreateTableFunctionInfo profiler_stop_info(profiler_stop);
+  catalog.CreateTableFunction(transaction, profiler_stop_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

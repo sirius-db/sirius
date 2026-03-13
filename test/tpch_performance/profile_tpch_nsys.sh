@@ -37,6 +37,7 @@ DUCKDB="${DUCKDB:-$PROJECT_DIR/build/release/duckdb}"
 ITERATIONS=${ITERATIONS:-2}
 # Per-query timeout in seconds (covers both iterations + nsys overhead).
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-90}
+SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <scale_factor> [query_numbers...]"
@@ -107,6 +108,7 @@ echo "Timeout      : ${QUERY_TIMEOUT}s per query"
 echo "Queries      : ${QUERIES[*]}"
 echo "Output dir   : $OUTPUT_DIR"
 echo "Config       : ${SIRIUS_CONFIG_FILE:-<not set>}"
+echo "Cache level  : ${SCAN_CACHE_LEVEL:-<default>}"
 echo "nsys version : $(nsys --version 2>&1 | head -1)"
 echo "============================================"
 echo ""
@@ -171,13 +173,24 @@ for q in "${QUERIES[@]}"; do
     printf "INSERT INTO _timings VALUES (0, 'start', current_timestamp);\n" >> "$TEMP_SQL"
 
     printf '%s\n' "$VIEW_SQL" >> "$TEMP_SQL"
+    if [ -n "$SCAN_CACHE_LEVEL" ]; then
+        printf "SET scan_cache_level = '%s';\n" "$SCAN_CACHE_LEVEL" >> "$TEMP_SQL"
+    fi
     printf "INSERT INTO _timings VALUES (1, 'views', current_timestamp);\n" >> "$TEMP_SQL"
 
     for ((i = 1; i <= ITERATIONS; i++)); do
+        # Start nsys capture before hot iterations (skip cold run)
+        if [ "$i" -eq 2 ]; then
+            printf "CALL profiler_start();\n" >> "$TEMP_SQL"
+        fi
         cat "$QUERY_FILE" >> "$TEMP_SQL"
         printf "\nINSERT INTO _timings VALUES (%d, 'iter_%d', current_timestamp);\n" \
             $((i + 1)) "$i" >> "$TEMP_SQL"
     done
+    # Stop nsys capture after all iterations
+    if [ "$ITERATIONS" -ge 2 ]; then
+        printf "CALL profiler_stop();\n" >> "$TEMP_SQL"
+    fi
 
     # Extract per-step timings
     cat >> "$TEMP_SQL" <<EOF
@@ -200,11 +213,20 @@ EOF
     #   --cudabacktrace=none : no CUDA backtraces (less overhead)
     #   --export=sqlite      : also export .sqlite for easy analysis
     START_TIME=$(date +%s.%N)
+    # Use cudaProfilerApi capture range when we have multiple iterations,
+    # so nsys only captures hot runs (profiler_start/stop injected in SQL).
+    # With a single iteration, capture everything.
+    if [ "$ITERATIONS" -ge 2 ]; then
+        CAPTURE_ARGS="--capture-range=cudaProfilerApi --capture-range-end=stop"
+    else
+        CAPTURE_ARGS=""
+    fi
     timeout "$QUERY_TIMEOUT" \
     nsys profile \
         --trace=cuda,nvtx \
         --sample=none \
         --cudabacktrace=none \
+        $CAPTURE_ARGS \
         --output="$NSYS_OUTPUT" \
         --force-overwrite=true \
         --stats=false \

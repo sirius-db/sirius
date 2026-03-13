@@ -39,7 +39,8 @@ SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 PARQUET_DIR=""
 NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
-while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ]; do
+SCAN_CACHE_LEVEL=""
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--cache-level" ]; do
     if [ "$1" = "--parquet-dir" ]; then
         PARQUET_DIR="$2"
         shift 2
@@ -48,6 +49,9 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
         shift 2
     elif [ "$1" = "--timeout" ]; then
         SESSION_TIMEOUT="$2"
+        shift 2
+    elif [ "$1" = "--cache-level" ]; then
+        SCAN_CACHE_LEVEL="$2"
         shift 2
     fi
 done
@@ -153,7 +157,10 @@ for q in "${QUERIES[@]}"; do
     # Set per-query scan cache level.  Bracket the SET with .timer off/on
     # so it doesn't produce a spurious "Run Time" line in the output.
     if [ "$ENGINE" = "sirius" ]; then
-        if echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
+        if [ -n "$SCAN_CACHE_LEVEL" ]; then
+            # Explicit --cache-level overrides all per-query defaults
+            printf ".timer off\nSET scan_cache_level = '%s';\n.timer on\n" "$SCAN_CACHE_LEVEL" >> "$TEMP_SQL"
+        elif echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
             printf ".timer off\nSET scan_cache_level = 'table_host';\n.timer on\n" >> "$TEMP_SQL"
         else
             printf ".timer off\nSET scan_cache_level = 'table_gpu';\n.timer on\n" >> "$TEMP_SQL"
