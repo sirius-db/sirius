@@ -132,8 +132,8 @@ struct StringMatchingDispatcher {
 
         auto like = cudf::strings::like(
           cudf::strings_column_view(input_view),
-          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref),
-          cudf::string_scalar("", true, executor.execution_stream, executor.resource_ref),
+          std::string_view(match_str),
+          std::string_view(),
           executor.execution_stream,
           executor.resource_ref);
 
@@ -161,9 +161,8 @@ struct StringMatchingDispatcher {
         }
         return cudf::strings::like(
           cudf::strings_column_view(input_view),
-          cudf::string_scalar(
-            "%" + match_str + "%", true, executor.execution_stream, executor.resource_ref),
-          cudf::string_scalar("", true, executor.execution_stream, executor.resource_ref),
+          std::string_view("%" + match_str + "%"),
+          std::string_view(),
           executor.execution_stream,
           executor.resource_ref);
 #else
