@@ -222,10 +222,19 @@ build/release/extension/sirius/test/cpp/log
 Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.
 
 ## Logging
-Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:
-```
-export SIRIUS_LOG_DIR={PATH for logging}
+Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
+
+Log directory and level can be initialized via environment variables before loading the extension:
+```bash
+export SIRIUS_LOG_DIR=/path/to/logs
 export SIRIUS_LOG_LEVEL=debug
+```
+
+Both can also be configured at runtime via DuckDB's `SET` command:
+```sql
+SET sirius_log_dir = '/path/to/logs';
+SET sirius_log_level = 'debug';
+SET sirius_log_flush_seconds = 1;
 ```
 
 ## Limitations

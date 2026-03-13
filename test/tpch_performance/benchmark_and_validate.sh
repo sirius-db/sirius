@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # benchmark_and_validate.sh
 #
 # Runs all 22 TPC-H queries for both sirius and duckdb, compares results,
@@ -26,10 +26,12 @@
 #   export SIRIUS_CONFIG_FILE=...
 #   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --report <run_dir>
+#   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results <run_dir> <scale_factor>
 #
 # Example:
 #   ./test/tpch_performance/benchmark_and_validate.sh 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf1_2iter
+#   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results runs/2026-03-10_12-00-00_sf1_2iter 1
 
 set -uo pipefail
 
@@ -232,6 +234,7 @@ fi
 # ---------------------------------------------------------------------------
 
 # Parse optional flags
+DUCKDB_RESULTS_DIR=""
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
@@ -254,6 +257,10 @@ while [ $# -gt 1 ]; do
             QUERY_TIMEOUT="$2"
             shift 2
             ;;
+        --duckdb-results)
+            DUCKDB_RESULTS_DIR="$2"
+            shift 2
+            ;;
         *)
             break
             ;;
@@ -264,9 +271,10 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] <scale_factor>"
+    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] <scale_factor>"
     echo "       $0 --report <run_dir>"
     echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius --iterations 3 --timeout 120 1000"
+    echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     exit 1
 fi
 
@@ -277,21 +285,63 @@ RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${NUM_ITERATIONS}i
 mkdir -p "$RUN_DIR"
 
 # Resolve config: explicit --config / env var / default ~/.sirius/sirius.cfg
-if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
-    export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.cfg"
+# Only required when running the sirius engine.
+ENGINES="${ENGINES:-sirius duckdb}"
+if [[ " $ENGINES " == *" sirius "* ]]; then
+    if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
+        export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.cfg"
+    fi
+    if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
+        echo "ERROR: config file not found: $SIRIUS_CONFIG_FILE"
+        exit 1
+    fi
+    echo "Config file: $SIRIUS_CONFIG_FILE"
+    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
 fi
-if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
-    echo "ERROR: config file not found: $SIRIUS_CONFIG_FILE"
-    exit 1
+
+# ---------------------------------------------------------------------------
+# --duckdb-results: reuse previously stored DuckDB results for validation.
+# Resolves the path, copies results into the new run dir, and removes duckdb
+# from the engines list so it is not re-run.
+# ---------------------------------------------------------------------------
+if [ -n "$DUCKDB_RESULTS_DIR" ]; then
+    # Resolve relative paths against PROJECT_DIR/runs/ as a convenience.
+    if [ ! -d "$DUCKDB_RESULTS_DIR" ] && [ -d "$PROJECT_DIR/runs/$DUCKDB_RESULTS_DIR" ]; then
+        DUCKDB_RESULTS_DIR="$PROJECT_DIR/runs/$DUCKDB_RESULTS_DIR"
+    fi
+    # Accept either a run directory (with duckdb/ inside) or the duckdb/ directory itself.
+    if [ -d "$DUCKDB_RESULTS_DIR/duckdb" ]; then
+        DUCKDB_RESULTS_DIR="$DUCKDB_RESULTS_DIR/duckdb"
+    fi
+    if [ ! -d "$DUCKDB_RESULTS_DIR" ]; then
+        echo "ERROR: DuckDB results directory not found: $DUCKDB_RESULTS_DIR"
+        exit 1
+    fi
+    # Verify it contains at least one query result.
+    DUCKDB_RESULT_COUNT=0
+    for d in "$DUCKDB_RESULTS_DIR"/q*; do
+        [ -d "$d" ] && [ -f "$d/result.txt" ] && (( DUCKDB_RESULT_COUNT++ ))
+    done
+    if [ "$DUCKDB_RESULT_COUNT" -eq 0 ]; then
+        echo "ERROR: no query results (q*/result.txt) found in $DUCKDB_RESULTS_DIR"
+        exit 1
+    fi
+
+    echo "Using stored DuckDB results from: $DUCKDB_RESULTS_DIR ($DUCKDB_RESULT_COUNT queries)"
+    cp -a "$DUCKDB_RESULTS_DIR" "$RUN_DIR/duckdb"
+
+    # Remove duckdb from the engines list since we already have its results.
+    ENGINES=$(echo "$ENGINES" | sed 's/\bduckdb\b//g' | xargs)
 fi
-echo "Config file: $SIRIUS_CONFIG_FILE"
-cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
 
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
 PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
 
 echo "Scale factor: SF${SF}   Iterations: ${NUM_ITERATIONS} (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Run directory: $RUN_DIR"
+if [ -n "${DUCKDB_RESULTS_DIR:-}" ]; then
+    echo "DuckDB results: reusing from $DUCKDB_RESULTS_DIR"
+fi
 echo "=========================================="
 echo ""
 read -r -p "Optional note about this run (press Enter to skip): " RUN_NOTE
@@ -311,6 +361,12 @@ echo "=== Collecting run info and filesystem benchmark ==="
         echo "(none)"
     fi
     echo ""
+
+    if [ -n "${DUCKDB_RESULTS_DIR:-}" ]; then
+        echo "--- DuckDB results ---"
+        echo "source: $DUCKDB_RESULTS_DIR (copied, not re-run)"
+        echo ""
+    fi
 
     echo "--- Git ---"
     if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
@@ -416,7 +472,6 @@ echo "=== Collecting run info and filesystem benchmark ==="
 echo "Run info saved to $RUN_INFO_FILE"
 echo "=========================================="
 
-ENGINES="${ENGINES:-sirius duckdb}"
 for engine in $ENGINES; do
     ENGINE_DIR="$RUN_DIR/$engine"
     mkdir -p "$ENGINE_DIR"

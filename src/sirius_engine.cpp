@@ -41,6 +41,8 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius_context.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/data_repository_manager.hpp>
 
 #include <stdexcept>
@@ -186,6 +188,8 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
+  nvtx3::scoped_range nvtx_range{"sirius::query"};
+
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");

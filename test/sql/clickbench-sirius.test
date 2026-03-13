@@ -18,6 +18,7 @@
 
 # Load required extensions
 require sirius
+require parquet
 
 # Load clickbench data
 

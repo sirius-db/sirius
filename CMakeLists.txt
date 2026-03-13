@@ -241,10 +241,6 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
 
-  target_compile_definitions(
-    ${_target}
-    PRIVATE $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">)
-
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade)
 

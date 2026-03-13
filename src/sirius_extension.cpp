@@ -767,7 +767,39 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
+  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
+}
+
+static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_LEVEL = StringValue::Get(parameter);
+  SetGlobalLogLevel(Config::LOG_LEVEL);
+  SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
+}
+
+static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_DIR = StringValue::Get(parameter);
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
+}
+
+static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
+}
+
+static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
+  params->validate_and_fix();
+  SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
+                   params->max_build_hash_table_bytes);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -875,6 +907,23 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
 
+  // Logging configuration
+  config.AddExtensionOption("sirius_log_level",
+                            "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_LEVEL),
+                            SetLogLevel);
+  config.AddExtensionOption("sirius_log_dir",
+                            "Directory for Sirius log files",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_DIR),
+                            SetLogDir);
+  config.AddExtensionOption("sirius_log_flush_seconds",
+                            "Interval in seconds between automatic log flushes",
+                            LogicalType::INTEGER,
+                            Value::INTEGER(Config::LOG_FLUSH_SECONDS),
+                            SetLogFlushSeconds);
+
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
@@ -892,6 +941,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::VARCHAR,
                             Value("none"),
                             SetCacheScanLevel);
+
+  config.AddExtensionOption("max_build_hash_table_bytes",
+                            "Maximum size a build-side table can be where it will create a "
+                            "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
+                            SetMaxBuildHashTableBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
