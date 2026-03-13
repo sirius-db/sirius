@@ -14,11 +14,10 @@
  * limitations under the License.
  */
 
-#include "pipeline/gpu_pipeline_task.hpp"
-
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
