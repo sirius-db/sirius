@@ -30,7 +30,7 @@ spdlog = "1.8.*"
 clang-tools = ">=21.1.8,<22"
 
 [tasks]
-substrait-build = { cmd = "make -C substrait release", description = "Build DuckDB substrait extension" }
+substrait-build = { cmd = "make -C substrait release GEN=ninja", description = "Build DuckDB substrait extension" }
 
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
 [feature.cuda13.system-requirements]
