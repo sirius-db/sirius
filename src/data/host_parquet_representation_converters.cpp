@@ -27,6 +27,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // cudf
+#include <cudf/cudf_utils.hpp>
 #include <cudf/utilities/span.hpp>
 
 // rmm
@@ -74,7 +75,8 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
 
   auto const& allocation = host_src.get_column_chunks();
 
-  // Allocate a single device buffer and partition it according to the byte ranges
+#if CUDF_VERSION_NUM >= 2604
+  // 26.04+: single device buffer, host_span<device_span>, 5-arg materialize_all_columns with mr_ref
   std::vector<cudf::device_span<uint8_t const>> column_chunk_spans_d;
   std::unique_ptr<rmm::device_buffer> dbuffer =
     std::make_unique<rmm::device_buffer>(host_src.get_size_in_bytes(), stream, mr_ref);
@@ -88,7 +90,6 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
                       return sum + byte_range.size();
                     });
 
-  // Copy HOST data to GPU with a single async batch copy.
   size_t bytes_copied = 0;
   std::vector<void*> dst_ptrs;
   std::vector<void*> src_ptrs;
@@ -105,16 +106,13 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
     bytes_copied += bytes_to_copy;
   }
 
-// Try to do batch copy if cudaMemcpyBatchAsync is possible, otherwise fall back to individual
-// async copies
 #if CUDART_VERSION >= 13000
   cudaStream_t stream_handle = (stream.value() != nullptr && stream.value() != cudaStreamLegacy)
                                  ? stream.value()
                                  : cudaStreamPerThread;
   cudaMemcpyAttributes attr{};
   attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-  attr.srcLocHint     = {cudaMemLocationTypeHost,
-                         host_src.get_device_id()};  // this is numa node id for pinned host
+  attr.srcLocHint     = {cudaMemLocationTypeHost, host_src.get_device_id()};
   attr.dstLocHint     = {cudaMemLocationTypeDevice, target_memory_space->get_device_id()};
   attr.flags          = cudaMemcpyFlagDefault;
   RMM_CUDA_TRY(::cudaMemcpyBatchAsync(
@@ -127,7 +125,6 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
   }
 #endif
 
-  // Invoke the Parquet reader to materialize the table on GPU
   auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
     column_chunk_spans_d.data(), column_chunk_spans_d.size());
   auto [table, md] = reader->materialize_all_columns(host_src.get_row_group_indices(),
@@ -135,6 +132,37 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu_wit
                                                      host_src.get_reader_options(),
                                                      stream,
                                                      mr_ref);
+#else
+  // 26.02: vector<rmm::device_buffer> per chunk, 4-arg materialize_all_columns (no mr_ref)
+  std::vector<rmm::device_buffer> column_chunk_buffers;
+  column_chunk_buffers.reserve(contiguous_regions.size());
+  size_t host_offset = 0;
+  for (auto const& byte_range : contiguous_regions) {
+    rmm::device_buffer buf(byte_range.size(), stream, mr_ref);
+    size_t remaining       = byte_range.size();
+    size_t copy_dst_offset = 0;
+    size_t copy_src_offset = host_offset;
+    while (remaining > 0) {
+      auto const& block        = allocation->at(copy_src_offset / allocation->block_size());
+      auto const block_offset  = copy_src_offset % allocation->block_size();
+      auto const bytes_to_copy = std::min(allocation->block_size() - block_offset, remaining);
+      RMM_CUDA_TRY(::cudaMemcpyAsync(static_cast<uint8_t*>(buf.data()) + copy_dst_offset,
+                                     reinterpret_cast<uint8_t const*>(block.data() + block_offset),
+                                     bytes_to_copy,
+                                     cudaMemcpyHostToDevice,
+                                     stream.value()));
+      remaining -= bytes_to_copy;
+      copy_dst_offset += bytes_to_copy;
+      copy_src_offset += bytes_to_copy;
+    }
+    column_chunk_buffers.push_back(std::move(buf));
+    host_offset += byte_range.size();
+  }
+  auto [table, md] = reader->materialize_all_columns(host_src.get_row_group_indices(),
+                                                     std::move(column_chunk_buffers),
+                                                     host_src.get_reader_options(),
+                                                     stream);
+#endif
   stream.synchronize();
 
   // Now we need to prune the pure filter columns from the table, if there are any.
