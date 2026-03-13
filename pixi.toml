@@ -61,8 +61,8 @@ thrift-compiler = ">=0.22"
 clangdev = "*"
 sysroot_linux-64 = ">=2.32"
 
-[feature.doris.activation.env]
-LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
+[feature.doris.activation]
+scripts = ["scripts/doris_activate.sh"]
 
 [feature.doris.tasks]
 doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris workspace" }
