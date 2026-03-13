@@ -82,7 +82,7 @@ void ResolveTypeAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
   // TODO: Need to handle special case for unique keys for better performance
   if (join_type == JoinType::INNER) {
     // printGPUColumn<T>(left_data, 100, 0);
-    asOfJoin<T>(left_data,
+    asOfJoinNestedLoop<T>(left_data,
                 right_data,
                 row_ids_left,
                 row_ids_right,

@@ -33,7 +33,7 @@
 namespace duckdb {
 
 template <typename T>
-void asOfJoin(T** left_data,
+void asOfJoinNestedLoop(T** left_data,
                     T** right_data,
                     uint64_t*& row_ids_left,
                     uint64_t*& row_ids_right,

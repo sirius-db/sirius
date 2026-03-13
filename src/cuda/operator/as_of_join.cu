@@ -23,7 +23,7 @@ namespace duckdb {
 
 // TODO: Currently only support a single key
 template <typename T, int B, int I>
-__global__ void as_of_join_count(T* left_keys,
+__global__ void as_of_join_nested_loop_count(T* left_keys,
                                  T* right_keys,
                                  uint64_t* offset_each_thread,
                                  unsigned long long* total_count,
@@ -110,7 +110,7 @@ __global__ void as_of_join_count(T* left_keys,
 }
 
 template <typename T, int B, int I>
-__global__ void as_of_join(T* left_keys,
+__global__ void as_of_join_nested_loop(T* left_keys,
                            T* right_keys,
                            uint64_t* offset_each_thread,
                            uint64_t* row_ids_left,
@@ -171,7 +171,7 @@ __global__ void as_of_join(T* left_keys,
   }
 }
 
-template __global__ void as_of_join_count<int32_t, BLOCK_THREADS, 1>(int32_t* left_keys,
+template __global__ void as_of_join_nested_loop_count<int32_t, BLOCK_THREADS, 1>(int32_t* left_keys,
                                                                     int32_t* right_keys,
                                                                     uint64_t* offset_each_thread,
                                                                     unsigned long long* total_count,
@@ -179,7 +179,7 @@ template __global__ void as_of_join_count<int32_t, BLOCK_THREADS, 1>(int32_t* le
                                                                     uint64_t right_size,
                                                                     int condition_mode);
 
-template __global__ void as_of_join_count<uint64_t, BLOCK_THREADS, 1>(
+template __global__ void as_of_join_nested_loop_count<uint64_t, BLOCK_THREADS, 1>(
   uint64_t* left_keys,
   uint64_t* right_keys,
   uint64_t* offset_each_thread,
@@ -188,7 +188,7 @@ template __global__ void as_of_join_count<uint64_t, BLOCK_THREADS, 1>(
   uint64_t right_size,
   int condition_mode);
 
-template __global__ void as_of_join<double, BLOCK_THREADS, 1>(double* left_keys,
+template __global__ void as_of_join_nested_loop<double, BLOCK_THREADS, 1>(double* left_keys,
                                                               double* right_keys,
                                                               uint64_t* offset_each_thread,
                                                               uint64_t* row_ids_left,
@@ -197,7 +197,7 @@ template __global__ void as_of_join<double, BLOCK_THREADS, 1>(double* left_keys,
                                                               uint64_t right_size,
                                                               int condition_mode);
 
-template __global__ void as_of_join<uint64_t, BLOCK_THREADS, 1>(uint64_t* left_keys,
+template __global__ void as_of_join_nested_loop<uint64_t, BLOCK_THREADS, 1>(uint64_t* left_keys,
                                                                 uint64_t* right_keys,
                                                                 uint64_t* offset_each_thread,
                                                                 uint64_t* row_ids_left,
@@ -207,7 +207,7 @@ template __global__ void as_of_join<uint64_t, BLOCK_THREADS, 1>(uint64_t* left_k
                                                                 int condition_mode);
 
 template <typename T>
-void asOfJoin(T** left_data,
+void asOfJoinNestedLoop(T** left_data,
               T** right_data,
               uint64_t*& row_ids_left,
               uint64_t*& row_ids_right,
@@ -238,7 +238,7 @@ void asOfJoin(T** left_data,
 
   // TODO: Currently only support a single key
   CHECK_ERROR();
-  as_of_join_count<T, BLOCK_THREADS, 1>
+  as_of_join_nested_loop_count<T, BLOCK_THREADS, 1>
     <<<(left_size + tile_items - 1) / tile_items, BLOCK_THREADS>>>(left_data[0],
                                                                    right_data[0],
                                                                    offset_each_thread,
@@ -256,7 +256,7 @@ void asOfJoin(T** left_data,
 
   row_ids_left  = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
   row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-  as_of_join<T, BLOCK_THREADS, 1>
+  as_of_join_nested_loop<T, BLOCK_THREADS, 1>
     <<<(left_size + tile_items - 1) / tile_items, BLOCK_THREADS>>>(left_data[0],
                                                                    right_data[0],
                                                                    offset_each_thread,
@@ -273,7 +273,7 @@ void asOfJoin(T** left_data,
   STOP_TIMER();
 }
 
-template void asOfJoin<int32_t>(int32_t** left_data,
+template void asOfJoinNestedLoop<int32_t>(int32_t** left_data,
                                 int32_t** right_data,
                                 uint64_t*& row_ids_left,
                                 uint64_t*& row_ids_right,
@@ -283,7 +283,7 @@ template void asOfJoin<int32_t>(int32_t** left_data,
                                 int* condition_mode,
                                 int num_keys);
 
-template void asOfJoin<uint64_t>(uint64_t** left_data,
+template void asOfJoinNestedLoop<uint64_t>(uint64_t** left_data,
                                  uint64_t** right_data,
                                  uint64_t*& row_ids_left,
                                  uint64_t*& row_ids_right,
