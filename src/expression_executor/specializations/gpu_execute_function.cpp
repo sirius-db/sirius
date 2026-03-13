@@ -130,12 +130,11 @@ struct StringMatchingDispatcher {
                     MatchType == StringMatchingType::NOT_LIKE) {
         std::vector<std::string> match_terms = string_split(match_str, SPLIT_DELIMITER);
 
-        auto like = cudf::strings::like(
-          cudf::strings_column_view(input_view),
-          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref),
-          cudf::string_scalar("", true, executor.execution_stream, executor.resource_ref),
-          executor.execution_stream,
-          executor.resource_ref);
+        auto like = cudf::strings::like(cudf::strings_column_view(input_view),
+                                        std::string_view(match_str),
+                                        std::string_view(),
+                                        executor.execution_stream,
+                                        executor.resource_ref);
 
         // LIKE or NOT LIKE?
         if constexpr (MatchType == StringMatchingType::LIKE) {
@@ -159,13 +158,11 @@ struct StringMatchingDispatcher {
             executor.execution_stream,
             executor.resource_ref);
         }
-        return cudf::strings::like(
-          cudf::strings_column_view(input_view),
-          cudf::string_scalar(
-            "%" + match_str + "%", true, executor.execution_stream, executor.resource_ref),
-          cudf::string_scalar("", true, executor.execution_stream, executor.resource_ref),
-          executor.execution_stream,
-          executor.resource_ref);
+        return cudf::strings::like(cudf::strings_column_view(input_view),
+                                   std::string_view("%" + match_str + "%"),
+                                   std::string_view(),
+                                   executor.execution_stream,
+                                   executor.resource_ref);
 #else
         return cudf::strings::contains(
           input->view(),
