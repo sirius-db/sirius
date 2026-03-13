@@ -272,6 +272,13 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   }
 
   for (size_t i = start_index; i < operators.size(); i++) {
+    std::string batch_sizes = "";
+    size_t total_bytes      = 0;
+    for (auto& batch : operator_input_output_data->get_data_batches()) {
+      auto view = get_cudf_table_view(*batch);
+      batch_sizes += std::to_string(view.num_rows()) + "  ";
+      total_bytes += batch->get_data()->get_size_in_bytes();
+    }
     auto& op = operators[i].get();
     try {
       operator_input_output_data = run_one_operator(
