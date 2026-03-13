@@ -243,6 +243,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::shared_ptr<gpu_expression_translator::translated_expression>
     _translated_filter;  ///< The translated filter expression, if any, to keep alive for
                          ///< materialization
+  std::vector<std::string> _filter_column_names;   ///< Column names referenced by the filter (for
+                                                   ///< pruning options so stats can be resolved)
+  std::vector<std::string> _pruning_column_names;  ///< Column list for pruning_options when
+                                                   ///< projected + filter (reader columns + filter)
   std::vector<std::size_t>
     _pure_filter_ids;  ///< The output positions of pure filter columns in the reader output
 

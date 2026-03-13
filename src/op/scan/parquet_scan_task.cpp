@@ -42,7 +42,9 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+#if CUDF_VERSION_NUM >= 2604
 #include <cudf/io/parquet_io_utils.hpp>
+#endif
 #include <cudf/io/parquet_schema.hpp>
 
 // standard library
@@ -300,6 +302,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       if (translated) {
         _translated_filter = std::make_shared<gpu_expression_translator::translated_expression>(
           std::move(*translated));
+        // Store filter column names so pruning_options can include them for stats lookup.
+        for (duckdb::idx_t ref_index : filter_idxs) {
+          auto const primary_idx = scan_op->column_ids[ref_index].GetPrimaryIndex();
+          _filter_column_names.push_back(scan_op->names[primary_idx]);
+        }
         // Do not set filter on _reader_options: we only use it for row group pruning below.
       }
     }
@@ -321,7 +328,21 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
                   [&scan_op, &selected_columns](std::size_t col_idx) {
                     selected_columns.push_back(scan_op->names[col_idx]);
                   });
+    // For row group pruning, options must include filter columns so stats can be resolved.
+    if (_translated_filter && !_filter_column_names.empty()) {
+      _pruning_column_names = selected_columns;
+      for (std::string const& name : _filter_column_names) {
+        if (std::find(_pruning_column_names.begin(), _pruning_column_names.end(), name) ==
+            _pruning_column_names.end()) {
+          _pruning_column_names.push_back(name);
+        }
+      }
+    }
+#if CUDF_VERSION_NUM >= 2604
     _reader_options.set_column_names(std::move(selected_columns));
+#else
+    _reader_options.set_columns(std::move(selected_columns));
+#endif
   }
 
   // Construct the file readers and parse the metadata
@@ -362,7 +383,16 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
         _file_paths[file_idx],
         row_group_indices.size());
       // Prune row groups using metadata statistics only; do not set filter on _reader_options.
+      // When we have a projection, _reader_options has only projected columns; include filter
+      // columns in pruning_options so libcudf can resolve the filter to column statistics.
       auto pruning_options = _reader_options;
+      if (!_pruning_column_names.empty()) {
+#if CUDF_VERSION_NUM >= 2604
+        pruning_options.set_column_names(_pruning_column_names);
+#else
+        pruning_options.set_columns(_pruning_column_names);
+#endif
+      }
       pruning_options.set_filter(_translated_filter->back());
       row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
         row_group_indices, pruning_options, rmm::cuda_stream_default);
