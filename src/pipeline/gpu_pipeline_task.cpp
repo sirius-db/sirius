@@ -27,6 +27,7 @@
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
@@ -164,13 +165,14 @@ void validate_operator_output_types(const op::operator_data* data,
   }
 }
 
-std::unique_ptr<op::operator_data> run_one_operator(op::sirius_physical_operator& op,
-                                                    const op::operator_data& operator_input_data,
-                                                    rmm::cuda_stream_view stream,
-                                                    const sirius_pipeline* pipeline,
-                                                    size_t op_index,
-                                                    size_t num_operators,
-                                                    std::string& batch_sizes)
+std::unique_ptr<op::operator_data> run_one_operator(
+  op::sirius_physical_operator& op,
+  const op::operator_data& operator_input_data,
+  rmm::cuda_stream_view stream,
+  const sirius_pipeline* pipeline,
+  size_t op_index,
+  size_t num_operators,
+  cucascade::memory::reservation_aware_resource_adaptor* allocator)
 {
   auto nvtx_label = std::format(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
@@ -178,22 +180,30 @@ std::unique_ptr<op::operator_data> run_one_operator(op::sirius_physical_operator
   auto start                = std::chrono::high_resolution_clock::now();
   auto operator_output_data = op.execute(operator_input_data, stream);
   stream.synchronize();
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  batch_sizes   = "";
+  auto end            = std::chrono::high_resolution_clock::now();
+  auto duration       = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  batch_sizes         = "";
+  size_t output_bytes = 0;
   for (auto& batch : operator_output_data->get_data_batches()) {
     auto view = get_cudf_table_view(*batch);
     batch_sizes += std::to_string(view.num_rows()) + "  ";
+    output_bytes += batch->get_data()->get_size_in_bytes();
   }
+  auto peak_bytes = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
   SIRIUS_LOG_TRACE(
-    "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
-    "{:.2f} ms",
+    "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, "
+    "output size: {} bytes ({:.2f} MB), execution time: "
+    "{:.2f} ms, peak allocated: {} bytes ({:.2f} MB)",
     pipeline->get_pipeline_id(),
     op.get_name(),
     op.get_operator_id(),
     operator_output_data ? operator_output_data->get_data_batches().size() : 0u,
     batch_sizes,
-    duration.count() / 1000.0);
+    output_bytes,
+    static_cast<double>(output_bytes) / (1024.0 * 1024.0),
+    duration.count() / 1000.0,
+    peak_bytes,
+    static_cast<double>(peak_bytes) / (1024.0 * 1024.0));
   validate_operator_output_types(operator_output_data.get(), op);
   return operator_output_data;
 }
@@ -244,31 +254,54 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                     operators.size());
   }
 
-  std::string batch_sizes = "";
-  for (auto& batch : operator_input_output_data->get_data_batches()) {
-    auto view = get_cudf_table_view(*batch);
-    batch_sizes += std::to_string(view.num_rows()) + "  ";
-  }
   for (size_t i = start_index; i < operators.size(); i++) {
+    std::string batch_sizes = "";
+    size_t total_bytes      = 0;
+    for (auto& batch : operator_input_output_data->get_data_batches()) {
+      auto view = get_cudf_table_view(*batch);
+      batch_sizes += std::to_string(view.num_rows()) + "  ";
+      total_bytes += batch->get_data()->get_size_in_bytes();
+    }
     auto& op = operators[i].get();
-    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) executing on {} batches with num row: {}",
-                     pipeline->get_pipeline_id(),
-                     op.get_name(),
-                     op.get_operator_id(),
-                     operator_input_output_data->get_data_batches().size(),
-                     batch_sizes);
+    SIRIUS_LOG_TRACE(
+      "Pipeline {}: operator {} (id={}) executing on {} batches with num rows: {}, "
+      "input size: {} bytes ({:.2f} MB)",
+      pipeline->get_pipeline_id(),
+      op.get_name(),
+      op.get_operator_id(),
+      operator_input_output_data->get_data_batches().size(),
+      batch_sizes,
+      total_bytes,
+      static_cast<double>(total_bytes) / (1024.0 * 1024.0));
     try {
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
     } catch (const rmm::out_of_memory&) {
+      auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      size_t requested_bytes = 0;
+      size_t global_usage = 0;
+      if (auto const* cc_oom =
+              dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+        requested_bytes = cc_oom->requested_bytes;
+        global_usage = cc_oom->global_usage;
+              }
       SIRIUS_LOG_WARN(
-        "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), rescheduling task {}",
-        pipeline->get_pipeline_id(),
-        op.get_name(),
-        op.get_operator_id(),
-        i,
-        operators.size(),
-        _task_id);
+            "Pipeline {}: OOM at operator {} (id={}, index {}/{}), "
+            "requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
+            "peak allocated {} bytes ({:.2f} MB), "
+            "rescheduling task {}",
+            pipeline->get_pipeline_id(),
+            op.get_name(),
+            op.get_operator_id(),
+            i,
+            operators.size(),
+            requested_bytes,
+            static_cast<double>(requested_bytes) / (1024.0 * 1024.0),
+            global_usage,
+            static_cast<double>(global_usage) / (1024.0 * 1024.0),
+            peak_bytes,
+            static_cast<double>(peak_bytes) / (1024.0 * 1024.0),
+          _task_id);
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
         i,
@@ -380,6 +413,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
+  _allocator       = allocator;
   auto output_data = compute_task(stream);
 
   if (output_data) { publish_output(*output_data, stream); }

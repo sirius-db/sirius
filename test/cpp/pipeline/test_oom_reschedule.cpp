@@ -58,7 +58,7 @@ namespace {
 constexpr std::size_t kGpuCapacity     = 1100ULL * 1024 * 1024;  // 1100 MB
 constexpr std::size_t kReservationSize = 50ULL * 1024 * 1024;    // 50 MB
 constexpr std::size_t kAllocationBytes = 400ULL * 1024 * 1024;   // 400 MB
-constexpr auto kHoldDuration           = std::chrono::milliseconds(800);
+constexpr auto kHoldDuration           = std::chrono::milliseconds(30);
 
 //------------------------------------------------------------------------------
 // Test global state — shared across all tasks
