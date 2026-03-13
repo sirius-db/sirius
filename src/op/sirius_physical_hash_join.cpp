@@ -375,8 +375,7 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::RIGHT_SEMI &&
-      join_type != duckdb::JoinType::ANTI && join_type != duckdb::JoinType::RIGHT_ANTI &&
+      join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI &&
       join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&
       _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
     // Switch to a more efficient join strategy for small datasets
@@ -783,8 +782,13 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         _build_table              = input_batches[1];
-        _hash_table =
-          std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
+        if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI) {
+          _filtered_hash_table = std::make_unique<cudf::filtered_join>(
+            build_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+        } else {
+          _hash_table =
+            std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
+        }
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
                                // batches to proceed.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
@@ -813,6 +817,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         auto result   = _hash_table->full_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
         right_indices = std::move(result.second);
+      } else if (join_type == duckdb::JoinType::SEMI) {
+        left_indices = _filtered_hash_table->semi_join(probe_keys, stream);
+      } else if (join_type == duckdb::JoinType::ANTI) {
+        left_indices = _filtered_hash_table->anti_join(probe_keys, stream);
       } else {
         throw std::runtime_error("Unsupported join type in BUILD_PROBE mode: " +
                                  duckdb::JoinTypeToString(join_type));
@@ -1062,6 +1070,7 @@ void sirius_physical_hash_join::finalize_operator()
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
+    _filtered_hash_table.reset();
     _build_table.reset();
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
