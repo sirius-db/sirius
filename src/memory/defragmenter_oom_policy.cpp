@@ -29,16 +29,18 @@ namespace memory {
 namespace {
 
 /**
- * @brief Returns true if @p pool appears fragmented for an allocation of @p bytes.
+ * @brief Returns true if pool appears fragmented for an allocation of bytes.
  *
  * Fragmentation is detected by comparing `cudaMemPoolAttrReservedMemCurrent`
  * (total bytes held by the pool from the driver) against
  * `cudaMemPoolAttrUsedMemCurrent` (bytes actively in use by live allocations).
- * If the gap between the two is at least @p bytes the pool holds enough free,
+ * If the gap between the two is at least bytes the pool holds enough free,
  * fragmented blocks that a trim may consolidate into a single contiguous region.
  */
 bool is_pool_fragmented(cudaMemPool_t pool, std::size_t bytes)
 {
+  if (!pool) return false;
+
   std::uint64_t reserved{};
   std::uint64_t used{};
 
