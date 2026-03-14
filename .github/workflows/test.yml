@@ -5,7 +5,6 @@
 #     - Explicitly allowed third-party actions:
 #       prefix-dev/setup-pixi@*
 #       mozilla-actions/sccache-action@*
-#       pre-commit/action@*
 #     - Require actions to be pinned to a full-length commit SHA: NO
 #
 # Adding a new action? You must:
