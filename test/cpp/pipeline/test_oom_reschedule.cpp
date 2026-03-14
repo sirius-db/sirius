@@ -46,10 +46,13 @@ namespace {
 constexpr std::size_t kGpuCapacity     = 1100ULL * 1024 * 1024;  // 1100 MB
 constexpr std::size_t kReservationSize = 50ULL * 1024 * 1024;    // 50 MB
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 constexpr std::size_t kAllocationBytes = 400ULL * 1024 * 1024;   // 400 MB
 constexpr auto kHoldDuration           = std::chrono::milliseconds(30);
 >>>>>>> fd62b65d (Limiting the number of retries no a PR. ALso adding draining tasks when there is an error to prevent hangs)
+=======
+>>>>>>> d95fdbb5 (added new unit test and addressed PR review comment)
 
 //------------------------------------------------------------------------------
 // Test global state — shared across all tasks
