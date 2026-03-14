@@ -228,6 +228,17 @@ Logs are essential for debugging GPU execution, memory allocation, and pipeline 
 
 ## Development Guidelines
 
+### Loading Library Context for Implementation Tasks
+
+**Before implementing new features, operators, or significant bug fixes**, always run `/module-context <task description>` first. This loads the relevant API documentation for cudf, rmm, duckdb, cucascade, and libkvikio modules so you have accurate function signatures, parameter types, and existing usage patterns. The module docs live in `.claude/skills/module-discover/docs/` and contain detailed API references extracted from the actual library headers.
+
+This is especially important for tasks involving:
+- GPU operators (joins, aggregations, sorting, filters, projections)
+- Memory management (reservations, pools, streams, spilling)
+- Data I/O (parquet scanning, datasources)
+- Expression evaluation (AST, unary/binary ops, type casting)
+- Pipeline execution (tasks, executors, data batches)
+
 ### Fallback Strategy
 
 Sirius gracefully falls back to DuckDB CPU execution when:
@@ -350,6 +361,8 @@ Sirius includes Claude Code skills for performance analysis and dataset manageme
 | Dataset Manager | `/dataset-manager` | Manages TPC-H parquet datasets — generate at any scale factor, consolidate files, inspect layout, optimize row groups. |
 | Optimization Advisor | `/optimization-advisor` | Maps GPU hotspots from nsys profiles to source functions, detects efficiency bottlenecks, sync overhead, and parallelism opportunities. |
 | TPC-DS Benchmark | `/tpcds-benchmark` | Runs TPC-DS benchmarks on Legacy Sirius, Super Sirius, or DuckDB CPU baseline — generate data, execute queries, and compare results. |
+| Module Context | `/module-context` | **Auto-loaded before implementation tasks.** Identifies which dependency modules are relevant to a task and loads their API docs (signatures, descriptions, usage examples). |
+| Module Discover | `/module-discover` | Analyzes a dependency library, divides it into modules, and generates LLM-consumable API documentation. Run once per library to populate docs. |
 
 **Useful debugging tools:**
 - `tools/parse_pipeline_log.py`: Parses Sirius pipeline logs to show per-operator row counts for debugging incorrect query results.
