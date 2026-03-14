@@ -101,8 +101,10 @@ void gpu_pipeline_executor::manager_loop()
     auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
     if (!gpu_task) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
-      _completion_handler->report_error(
-        "GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      if (_completion_handler) {
+        _completion_handler->report_error(
+          "GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      }
       break;
     }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
@@ -118,9 +120,11 @@ void gpu_pipeline_executor::manager_loop()
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
-      _completion_handler->report_error(
-        "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
-        std::to_string(gpu_task->get_task_id()));
+      if (_completion_handler) {
+        _completion_handler->report_error(
+          "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
+          std::to_string(gpu_task->get_task_id()));
+      }
       break;
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
@@ -129,9 +133,11 @@ void gpu_pipeline_executor::manager_loop()
     } else {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
                        gpu_task->get_task_id());
-      _completion_handler->report_error(
-        "GPU Pipeline Executor: Failed to cast local state for task " +
-        std::to_string(gpu_task->get_task_id()));
+      if (_completion_handler) {
+        _completion_handler->report_error(
+          "GPU Pipeline Executor: Failed to cast local state for task " +
+          std::to_string(gpu_task->get_task_id()));
+      }
       break;
     }
     auto output_consumers = gpu_task->get_output_consumers();
@@ -147,7 +153,7 @@ void gpu_pipeline_executor::manager_loop()
       try {
         task->execute(exc_stream);
       } catch (oom_reschedule_exception& oom) {
-        if (_completion_handler->has_error()) {
+        if (_completion_handler && _completion_handler->has_error()) {
           // If the completion handler is already in an error state, then we can just return and not
           // try to reschedule
           return;
@@ -300,13 +306,15 @@ void gpu_pipeline_executor::drain_and_wait()
   _kiosk.wait_all();
 
   // Re-enable the kiosk so the restarted manager can acquire tickets again.
-  _kiosk.reset_stopped();
+  _kiosk.resume();
 
   // Reset the queue and restart the manager so the executor is ready for
   // the next query.
   _task_queue.reset();
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
+
+bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
 
 void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
 {

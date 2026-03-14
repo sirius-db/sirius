@@ -114,7 +114,7 @@ void duckdb_scan_executor::drain_and_wait()
   _kiosk.wait_all();
 
   // Re-enable the kiosk and queue so the executor is ready for the next query.
-  _kiosk.reset_stopped();
+  _kiosk.resume();
   _task_queue.reset();
   _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
 }

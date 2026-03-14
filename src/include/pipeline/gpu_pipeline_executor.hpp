@@ -128,6 +128,16 @@ class gpu_pipeline_executor {
   void drain_and_wait();
 
   /**
+   * @brief Check if the internal task queue is empty.
+   *
+   * Useful for verifying that drain_and_wait() has fully cleared the queue.
+   * Only reliable when the executor is quiescent (no concurrent producers).
+   *
+   * @return true if the task queue contains no pending tasks.
+   */
+  [[nodiscard]] bool is_task_queue_empty() const noexcept;
+
+  /**
    * @brief Set the completion handler for query completion signaling
    *
    * @param handler Pointer to the completion handler
