@@ -103,14 +103,15 @@ shared_ptr<GPUColumn> ResolveTypeMaterializeString(shared_ptr<GPUColumn> column,
 shared_ptr<GPUColumn> HandleMaterializeExpression(shared_ptr<GPUColumn> column,
                                                   GPUBufferManager* gpuBufferManager)
 {
-  SIRIUS_LOG_DEBUG("HandleMaterializeExpression: type={}, column_length={}, row_ids={}, "
-                   "row_id_count={}, validity_mask={}, is_string={}",
-                   static_cast<int>(column->data_wrapper.type.id()),
-                   column->column_length,
-                   (void*)column->row_ids,
-                   column->row_id_count,
-                   (void*)column->data_wrapper.validity_mask,
-                   column->data_wrapper.is_string_data);
+  SIRIUS_LOG_DEBUG(
+    "HandleMaterializeExpression: type={}, column_length={}, row_ids={}, "
+    "row_id_count={}, validity_mask={}, is_string={}",
+    static_cast<int>(column->data_wrapper.type.id()),
+    column->column_length,
+    (void*)column->row_ids,
+    column->row_id_count,
+    (void*)column->data_wrapper.validity_mask,
+    column->data_wrapper.is_string_data);
   switch (column->data_wrapper.type.id()) {
     case GPUColumnTypeId::INT16:
       return ResolveTypeMaterializeExpression<int16_t>(column, gpuBufferManager);
