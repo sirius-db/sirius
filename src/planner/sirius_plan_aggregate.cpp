@@ -100,6 +100,9 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
   // get the base columns by projecting over the projection_ids/column_ids
   if (!table_scan.projection_ids.empty()) {
     for (auto& partition_col : partition_columns) {
+      if (partition_col >= table_scan.projection_ids.size()) {
+        return false;
+      }
       partition_col = table_scan.projection_ids[partition_col];
     }
   }

@@ -154,6 +154,14 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     // The batch columns are in column_ids order (as produced by DUCKDB_SCAN).
     // projection_ids are indices into column_ids that specify which columns to keep.
     // We select the first expected_output_columns entries from projection_ids.
+    SIRIUS_LOG_DEBUG("TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
+                     "column_ids.size()={}",
+                     expected_output_columns,
+                     projection_ids.size(),
+                     column_ids.size());
+    for (duckdb::idx_t i = 0; i < projection_ids.size(); i++) {
+      SIRIUS_LOG_DEBUG("  projection_ids[{}] = {}", i, projection_ids[i]);
+    }
     std::vector<std::shared_ptr<cucascade::data_batch>> projected_batches;
     projected_batches.reserve(output_batches.size());
 
@@ -165,10 +173,16 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       auto table    = gpu_rep.release_table();
       auto columns  = table->release();
 
+      SIRIUS_LOG_DEBUG("TABLE_SCAN batch columns.size()={}", columns.size());
+
       // Select only the output columns by using projection_ids as indices
       std::vector<std::unique_ptr<cudf::column>> selected;
       selected.reserve(expected_output_columns);
       for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
+        if (projection_ids[i] >= columns.size()) {
+          SIRIUS_LOG_ERROR("TABLE_SCAN projection OOB: projection_ids[{}]={} >= columns.size()={}",
+                           i, projection_ids[i], columns.size());
+        }
         selected.push_back(std::move(columns[projection_ids[i]]));
       }
 
