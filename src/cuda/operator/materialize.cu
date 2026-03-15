@@ -20,8 +20,16 @@
 
 #include <chrono>
 #include <cmath>
+#include <cudf/join/join.hpp>
 
 namespace duckdb {
+
+// Sentinel value for unmatched rows in LEFT/RIGHT/OUTER JOINs.
+// cudf::JoinNoMatch is the sentinel for unmatched rows (currently INT32_MIN).
+// After convertInt32ToUInt64 (sign-extension to 64-bit), we compare against
+// this converted value in all materialize kernels to avoid OOB access.
+constexpr uint64_t INVALID_ROW_ID = static_cast<uint64_t>(
+    static_cast<int64_t>(cudf::JoinNoMatch));
 
 __device__ uint32_t warp_bitmask_set(uint32_t bitset)
 {
@@ -57,11 +65,16 @@ __global__ void materialize_expression_with_null(
 #pragma unroll
   for (int ITEM = 0; ITEM < I; ++ITEM) {
     if (threadIdx.x + ITEM * B < num_tile_items) {
-      uint64_t items_ids                           = row_ids[tile_offset + threadIdx.x + ITEM * B];
-      uint64_t word_offset                         = items_ids / 32;
-      uint64_t bit_offset                          = items_ids % 32;
-      isvalid[ITEM]                                = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
-      result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
+      uint64_t items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
+      if (items_ids != INVALID_ROW_ID) {
+        uint64_t word_offset                         = items_ids / 32;
+        uint64_t bit_offset                          = items_ids % 32;
+        isvalid[ITEM]                                = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
+        result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
+      } else {
+        isvalid[ITEM]                                = 0;
+        result[tile_offset + threadIdx.x + ITEM * B] = static_cast<T>(0);
+      }
     }
   }
 
@@ -87,12 +100,17 @@ __global__ void materialize_offset_with_null(uint64_t* offset,
   bool isvalid = 0;
   if (tid < N) {
     uint64_t copy_row_id = row_ids[tid];
-    uint64_t new_length  = offset[copy_row_id + 1] - offset[copy_row_id];
-    result_length[tid]   = new_length;
+    if (copy_row_id != INVALID_ROW_ID) {
+      uint64_t new_length  = offset[copy_row_id + 1] - offset[copy_row_id];
+      result_length[tid]   = new_length;
 
-    uint64_t word_offset = copy_row_id / 32;
-    uint64_t bit_offset  = copy_row_id % 32;
-    isvalid              = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
+      uint64_t word_offset = copy_row_id / 32;
+      uint64_t bit_offset  = copy_row_id % 32;
+      isvalid              = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
+    } else {
+      result_length[tid] = 0;
+      isvalid            = 0;
+    }
   }
 
   uint32_t set = warp_bitmask_set(isvalid);
@@ -115,8 +133,12 @@ __global__ void materialize_without_null(const T* a, T* result, uint64_t* row_id
 #pragma unroll
   for (int ITEM = 0; ITEM < I; ++ITEM) {
     if (threadIdx.x + ITEM * B < num_tile_items) {
-      uint64_t items_ids                           = row_ids[tile_offset + threadIdx.x + ITEM * B];
-      result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
+      uint64_t items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
+      if (items_ids != INVALID_ROW_ID) {
+        result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
+      } else {
+        result[tile_offset + threadIdx.x + ITEM * B] = static_cast<T>(0);
+      }
     }
   }
 }
@@ -129,8 +151,12 @@ __global__ void materialize_offset(uint64_t* offset,
   size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid < N) {
     uint64_t copy_row_id = row_ids[tid];
-    uint64_t new_length  = offset[copy_row_id + 1] - offset[copy_row_id];
-    result_length[tid]   = new_length;
+    if (copy_row_id != INVALID_ROW_ID) {
+      uint64_t new_length  = offset[copy_row_id + 1] - offset[copy_row_id];
+      result_length[tid]   = new_length;
+    } else {
+      result_length[tid] = 0;
+    }
   }
 }
 
@@ -146,7 +172,9 @@ __global__ void materialize_string_per_warp(const uint8_t* __restrict__ data,
   size_t lane             = threadIdx.x % WARP_SIZE;
   if (warp_id >= num_rows) return;
 
-  uint64_t copy_row_id      = row_ids[warp_id];
+  uint64_t copy_row_id = row_ids[warp_id];
+  if (copy_row_id == INVALID_ROW_ID) return;  // NULL row from LEFT JOIN — nothing to copy
+
   uint64_t input_start_idx  = input_offset[copy_row_id];
   uint64_t input_length     = input_offset[copy_row_id + 1] - input_start_idx;
   uint64_t output_start_idx = materialized_offset[warp_id];
@@ -219,11 +247,15 @@ __global__ void materialize_string_per_thread(uint8_t* data,
 {
   size_t tid = threadIdx.x + size_t(blockIdx.x) * blockDim.x;
   if (tid < num_rows) {
-    uint64_t copy_row_id      = row_ids[tid];
-    uint64_t input_start_idx  = input_offset[copy_row_id];
-    uint64_t input_length     = input_offset[copy_row_id + 1] - input_offset[copy_row_id];
-    uint64_t output_start_idx = materialized_offset[tid];
-    memcpy(result + output_start_idx, data + input_start_idx, input_length * sizeof(uint8_t));
+    uint64_t copy_row_id = row_ids[tid];
+    if (copy_row_id != INVALID_ROW_ID) {
+      uint64_t input_start_idx  = input_offset[copy_row_id];
+      uint64_t input_length     = input_offset[copy_row_id + 1] - input_offset[copy_row_id];
+      uint64_t output_start_idx = materialized_offset[tid];
+      memcpy(result + output_start_idx, data + input_start_idx, input_length * sizeof(uint8_t));
+    }
+    // INVALID_ROW_ID: result_length was already set to 0 in materialize_offset,
+    // so output_start_idx == next row's offset — nothing to copy.
   }
 }
 
@@ -276,7 +308,7 @@ void materializeWithoutNull(T* a, T*& result, uint64_t* row_ids, uint64_t result
   }
   SETUP_TIMING();
   START_TIMER();
-  SIRIUS_LOG_DEBUG("Launching Materialize Kernel");
+  SIRIUS_LOG_DEBUG("Launching materializeWithoutNull Kernel, result_len={}", result_len);
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   result                             = gpuBufferManager->customCudaMalloc<T>(result_len, 0, 0);
   int tile_items                     = BLOCK_THREADS * ITEMS_PER_THREAD;
@@ -328,8 +360,9 @@ void materializeExpression(T* a,
 
   CHECK_ERROR();
   cudaDeviceSynchronize();
-  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
-  if (mask != nullptr) { gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(mask), 0); }
+  // NOTE: Do NOT free 'a' (input data) or 'mask' here. Multiple columns may share the same
+  // underlying data pointers (e.g., when a table is self-joined). Freeing here causes
+  // use-after-free for subsequent materializations of columns sharing the same data.
   CHECK_ERROR();
   STOP_TIMER();
 }
@@ -407,7 +440,7 @@ void materializeString(uint8_t* data,
   }
   SETUP_TIMING();
   START_TIMER();
-  SIRIUS_LOG_DEBUG("Launching Materialize String Kernel");
+  SIRIUS_LOG_DEBUG("Launching Materialize String Kernel with result_len={}, mask={}", result_len, (void*)mask);
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   // allocate temp memory and copying keys
   uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
@@ -477,9 +510,10 @@ void materializeString(uint8_t* data,
 
   gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(temp_len), 0);
   gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
-  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(data), 0);
-  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset), 0);
-  if (mask != nullptr) { gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(mask), 0); }
+  // NOTE: Do NOT free data, offset, or mask here. Multiple columns may share the same
+  // underlying data pointers (e.g., when a table is self-joined as both e1 and e2).
+  // Freeing here causes use-after-free for the second column's materialization.
+  // The processing pool is cleaned up at query end.
   CHECK_ERROR();
   STOP_TIMER();
 }
