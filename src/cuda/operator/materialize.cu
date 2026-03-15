@@ -18,9 +18,10 @@
 #include "gpu_columns.hpp"
 #include "log/logging.hpp"
 
+#include <cudf/join/join.hpp>
+
 #include <chrono>
 #include <cmath>
-#include <cudf/join/join.hpp>
 
 namespace duckdb {
 
@@ -28,8 +29,7 @@ namespace duckdb {
 // cudf::JoinNoMatch is the sentinel for unmatched rows (currently INT32_MIN).
 // After convertInt32ToUInt64 (sign-extension to 64-bit), we compare against
 // this converted value in all materialize kernels to avoid OOB access.
-constexpr uint64_t INVALID_ROW_ID = static_cast<uint64_t>(
-    static_cast<int64_t>(cudf::JoinNoMatch));
+constexpr uint64_t INVALID_ROW_ID = static_cast<uint64_t>(static_cast<int64_t>(cudf::JoinNoMatch));
 
 __device__ uint32_t warp_bitmask_set(uint32_t bitset)
 {
@@ -67,9 +67,9 @@ __global__ void materialize_expression_with_null(
     if (threadIdx.x + ITEM * B < num_tile_items) {
       uint64_t items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
       if (items_ids != INVALID_ROW_ID) {
-        uint64_t word_offset                         = items_ids / 32;
-        uint64_t bit_offset                          = items_ids % 32;
-        isvalid[ITEM]                                = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
+        uint64_t word_offset = items_ids / 32;
+        uint64_t bit_offset  = items_ids % 32;
+        isvalid[ITEM]        = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
         result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
       } else {
         isvalid[ITEM]                                = 0;
@@ -101,8 +101,8 @@ __global__ void materialize_offset_with_null(uint64_t* offset,
   if (tid < N) {
     uint64_t copy_row_id = row_ids[tid];
     if (copy_row_id != INVALID_ROW_ID) {
-      uint64_t new_length  = offset[copy_row_id + 1] - offset[copy_row_id];
-      result_length[tid]   = new_length;
+      uint64_t new_length = offset[copy_row_id + 1] - offset[copy_row_id];
+      result_length[tid]  = new_length;
 
       uint64_t word_offset = copy_row_id / 32;
       uint64_t bit_offset  = copy_row_id % 32;
@@ -152,8 +152,8 @@ __global__ void materialize_offset(uint64_t* offset,
   if (tid < N) {
     uint64_t copy_row_id = row_ids[tid];
     if (copy_row_id != INVALID_ROW_ID) {
-      uint64_t new_length  = offset[copy_row_id + 1] - offset[copy_row_id];
-      result_length[tid]   = new_length;
+      uint64_t new_length = offset[copy_row_id + 1] - offset[copy_row_id];
+      result_length[tid]  = new_length;
     } else {
       result_length[tid] = 0;
     }
@@ -440,7 +440,8 @@ void materializeString(uint8_t* data,
   }
   SETUP_TIMING();
   START_TIMER();
-  SIRIUS_LOG_DEBUG("Launching Materialize String Kernel with result_len={}, mask={}", result_len, (void*)mask);
+  SIRIUS_LOG_DEBUG(
+    "Launching Materialize String Kernel with result_len={}, mask={}", result_len, (void*)mask);
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   // allocate temp memory and copying keys
   uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
