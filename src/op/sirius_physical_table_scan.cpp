@@ -65,11 +65,51 @@ sirius_physical_table_scan::sirius_physical_table_scan(
 {
 }
 
+/// Build a mapping from column_ids index to batch column position.
+///
+/// The parquet scan (make_selected_column_indices) produces batch columns in
+/// column_ids order, but only for indices present in projection_ids.
+/// For example, if column_ids has 5 entries and projection_ids = {1, 3}:
+///   batch position 0 → column_ids[1]
+///   batch position 1 → column_ids[3]
+///
+/// Returns a vector of size column_ids_count where:
+///   result[i] = batch position of column_ids[i], or idx_t(-1) if not projected.
+///
+/// When projection_ids is empty, every column_ids entry maps to its own index.
+static std::vector<duckdb::idx_t> build_batch_column_map(
+  const duckdb::vector<duckdb::idx_t>& projection_ids,
+  duckdb::idx_t column_ids_count)
+{
+  constexpr auto NOT_PROJECTED = static_cast<duckdb::idx_t>(-1);
+  std::vector<duckdb::idx_t> map(column_ids_count, NOT_PROJECTED);
+
+  if (projection_ids.empty()) {
+    for (duckdb::idx_t i = 0; i < column_ids_count; i++) {
+      map[i] = i;
+    }
+    return map;
+  }
+
+  // Sort projected indices — this matches the iteration order in
+  // make_selected_column_indices which walks column_ids[0..N) and
+  // includes only indices present in the projected set.
+  std::vector<duckdb::idx_t> sorted(projection_ids.begin(), projection_ids.end());
+  std::sort(sorted.begin(), sorted.end());
+
+  for (duckdb::idx_t batch_pos = 0; batch_pos < sorted.size(); batch_pos++) {
+    if (sorted[batch_pos] < column_ids_count) {
+      map[sorted[batch_pos]] = batch_pos;
+    }
+  }
+  return map;
+}
+
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<duckdb::LogicalType>& returned_types,
-  const duckdb::vector<duckdb::idx_t>& projection_ids)
+  const std::vector<duckdb::idx_t>& batch_column_map)
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
 
@@ -101,46 +141,23 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
                      col_type.ToString(),
                      static_cast<int>(filter->filter_type));
 
-    // The batch columns are produced by the parquet scan in column_ids order,
-    // but ONLY for columns that are in projection_ids.
-    // We need to find the actual position of this column in the batch.
-    // If projection_ids is non-empty, the batch only contains projected columns,
-    // so we need to map column_index to its position among projected columns.
-    duckdb::idx_t batch_column_index;
-    if (!projection_ids.empty()) {
-      // Find the position of column_index in the sorted projected columns
-      // The parquet scan produces columns in column_ids order for indices in projection_ids
-      std::vector<duckdb::idx_t> sorted_projected(projection_ids.begin(), projection_ids.end());
-      std::sort(sorted_projected.begin(), sorted_projected.end());
-      auto it = std::find(sorted_projected.begin(), sorted_projected.end(), column_index);
-      if (it == sorted_projected.end()) {
-        throw std::runtime_error(
-          std::format("TABLE_SCAN filter: column_index ({}) not found in projection_ids",
-                      column_index));
-      }
-      batch_column_index = std::distance(sorted_projected.begin(), it);
-    } else {
-      batch_column_index = column_index;
+    auto batch_column_index = batch_column_map[column_index];
+    if (batch_column_index == static_cast<duckdb::idx_t>(-1)) {
+      throw std::runtime_error(
+        std::format("TABLE_SCAN filter: column_index ({}) not in projected batch", column_index));
     }
 
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: batch_column_index={}", batch_column_index);
 
-    // Create column reference for this filter - uses the batch column index
     auto column_ref =
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(col_type, batch_column_index);
-
-    // Convert filter to expression
     auto expr = filter->ToExpression(*column_ref);
     filter_expressions.push_back(std::move(expr));
   }
 
-  // No filters to apply
   if (filter_expressions.empty()) { return nullptr; }
-
-  // Single filter - return directly without conjunction wrapper
   if (filter_expressions.size() == 1) { return std::move(filter_expressions[0]); }
 
-  // Multiple filters - wrap in CONJUNCTION_AND
   auto conjunction =
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
   for (auto& expr : filter_expressions) {
@@ -155,17 +172,20 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
+  // Build the column_ids index → batch position mapping once.
+  // Both filter expression construction and post-filter projection use this.
+  auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
+
   duckdb::unique_ptr<duckdb::Expression> filter_expr;
   if (table_filters) {
     filter_expr = convert_table_filters_to_expression(
-      *table_filters, column_ids, returned_types, projection_ids);
+      *table_filters, column_ids, returned_types, batch_column_map);
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
 
   if (filter_expr != nullptr) {
-    // The executor uses the data_batch API to filter rows according to `expression`.
     duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
     for (size_t batch_idx = 0; batch_idx < input_batches.size(); batch_idx++) {
       auto const& batch = input_batches[batch_idx];
@@ -179,9 +199,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     }
   }
 
-  // After filtering, we may need to project away filter-only columns.
-  // The 'types' member indicates the expected output columns (not including filter-only columns).
-  // If we have more columns than expected output types, we need to project.
+  // After filtering, project away filter-only columns if the batch has more
+  // columns than the operator's output type list expects.
   duckdb::idx_t expected_output_columns = types.size();
   bool needs_projection                 = false;
 
@@ -193,17 +212,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (needs_projection) {
-    // The batch columns are in column_ids order (as produced by the parquet scan).
-    // projection_ids are indices into column_ids that specify which columns to keep.
-    // We select the first expected_output_columns entries from projection_ids.
     SIRIUS_LOG_DEBUG("TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
                      "column_ids.size()={}",
                      expected_output_columns,
                      projection_ids.size(),
                      column_ids.size());
-    for (duckdb::idx_t i = 0; i < projection_ids.size(); i++) {
-      SIRIUS_LOG_DEBUG("  projection_ids[{}] = {}", i, projection_ids[i]);
-    }
 
     if (expected_output_columns > projection_ids.size()) {
       throw std::runtime_error(
@@ -219,29 +232,27 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     for (auto& batch : output_batches) {
       if (!batch) { continue; }
 
-      // Release the table from the batch (zero-copy: we're the sole consumer)
       auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
       auto table    = gpu_rep.release_table();
       auto columns  = table->release();
 
-      SIRIUS_LOG_DEBUG("TABLE_SCAN batch columns.size()={}", columns.size());
-
-      // Select only the output columns by using projection_ids as indices
+      // Select output columns using the batch column map.
+      // projection_ids[0..expected_output_columns) are the output columns
+      // in the order the downstream operator expects.
       std::vector<std::unique_ptr<cudf::column>> selected;
       selected.reserve(expected_output_columns);
       for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
-        if (projection_ids[i] >= columns.size()) {
+        auto batch_idx = batch_column_map[projection_ids[i]];
+        if (batch_idx == static_cast<duckdb::idx_t>(-1) || batch_idx >= columns.size()) {
           throw std::runtime_error(
-            std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} >= columns.size()={}, "
-                        "expected_output_columns={}, projection_ids.size()={}, column_ids.size()={}",
+            std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
+                        "columns.size()={}",
                         i,
                         projection_ids[i],
-                        columns.size(),
-                        expected_output_columns,
-                        projection_ids.size(),
-                        column_ids.size()));
+                        batch_idx,
+                        columns.size()));
         }
-        selected.push_back(std::move(columns[projection_ids[i]]));
+        selected.push_back(std::move(columns[batch_idx]));
       }
 
       auto projected_table = std::make_unique<cudf::table>(std::move(selected));
