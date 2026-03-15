@@ -78,8 +78,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
 ///
 /// When projection_ids is empty, every column_ids entry maps to its own index.
 static std::vector<duckdb::idx_t> build_batch_column_map(
-  const duckdb::vector<duckdb::idx_t>& projection_ids,
-  duckdb::idx_t column_ids_count)
+  const duckdb::vector<duckdb::idx_t>& projection_ids, duckdb::idx_t column_ids_count)
 {
   constexpr auto NOT_PROJECTED = static_cast<duckdb::idx_t>(-1);
   std::vector<duckdb::idx_t> map(column_ids_count, NOT_PROJECTED);
@@ -98,9 +97,7 @@ static std::vector<duckdb::idx_t> build_batch_column_map(
   std::sort(sorted.begin(), sorted.end());
 
   for (duckdb::idx_t batch_pos = 0; batch_pos < sorted.size(); batch_pos++) {
-    if (sorted[batch_pos] < column_ids_count) {
-      map[sorted[batch_pos]] = batch_pos;
-    }
+    if (sorted[batch_pos] < column_ids_count) { map[sorted[batch_pos]] = batch_pos; }
   }
   return map;
 }
@@ -212,11 +209,12 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (needs_projection) {
-    SIRIUS_LOG_DEBUG("TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
-                     "column_ids.size()={}",
-                     expected_output_columns,
-                     projection_ids.size(),
-                     column_ids.size());
+    SIRIUS_LOG_DEBUG(
+      "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
+      "column_ids.size()={}",
+      expected_output_columns,
+      projection_ids.size(),
+      column_ids.size());
 
     if (expected_output_columns > projection_ids.size()) {
       throw std::runtime_error(
