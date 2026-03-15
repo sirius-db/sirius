@@ -184,10 +184,12 @@ void gpu_pipeline_executor::manager_loop()
         return;
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
+        if (_task_creator) { _task_creator->stop(); }
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         return;
       } catch (...) {
         SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
+        if (_task_creator) { _task_creator->stop(); }
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         return;
       }
