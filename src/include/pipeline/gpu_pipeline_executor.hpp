@@ -117,6 +117,27 @@ class gpu_pipeline_executor {
   void drain_leftover_tasks();
 
   /**
+   * @brief Drain all in-flight tasks after a query error.
+   *
+   * Interrupts the task queue so the manager loop exits, waits for all
+   * in-flight thread-pool tasks to complete (via kiosk), then resets the
+   * queue and restarts the manager thread so the executor is ready for the
+   * next query.  Must only be called after report_error() has been issued
+   * (i.e. in the execute() error path, before QueryEnd clears repositories).
+   */
+  void drain_and_wait();
+
+  /**
+   * @brief Check if the internal task queue is empty.
+   *
+   * Useful for verifying that drain_and_wait() has fully cleared the queue.
+   * Only reliable when the executor is quiescent (no concurrent producers).
+   *
+   * @return true if the task queue contains no pending tasks.
+   */
+  [[nodiscard]] bool is_task_queue_empty() const noexcept;
+
+  /**
    * @brief Set the completion handler for query completion signaling
    *
    * @param handler Pointer to the completion handler

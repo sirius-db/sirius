@@ -97,6 +97,28 @@ void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_
 
 void duckdb_scan_executor::drain_leftover_tasks() { _task_queue.drain(); }
 
+void duckdb_scan_executor::drain_and_wait()
+{
+  // Stop the kiosk so the manager_loop's acquire() returns an invalid ticket
+  // (the manager may be blocked there when all thread-pool slots are full).
+  _kiosk.stop();
+
+  // Interrupt pop() so the manager_loop sees a nullptr and breaks out.
+  _task_queue.interrupt();
+  _task_queue.drain();
+
+  // Join the manager thread so we know it has exited.
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+
+  // Wait for all in-flight thread-pool tasks to finish.
+  _kiosk.wait_all();
+
+  // Re-enable the kiosk and queue so the executor is ready for the next query.
+  _kiosk.resume();
+  _task_queue.reset();
+  _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
+}
+
 void duckdb_scan_executor::set_completion_handler(
   sirius::pipeline::completion_handler* handler) noexcept
 {

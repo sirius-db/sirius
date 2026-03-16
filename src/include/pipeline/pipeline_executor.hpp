@@ -163,6 +163,17 @@ class pipeline_executor {
    */
   void terminate_query(std::exception_ptr error);
 
+  /**
+   * @brief Drain all in-flight tasks after a query error.
+   *
+   * Drains the top-level task queue and waits for each GPU executor to finish
+   * all in-flight thread-pool tasks.  After this call it is safe for QueryEnd
+   * to destroy data repositories without causing a use-after-free in executing
+   * tasks.  Each GPU executor's manager thread is restarted so the executor is
+   * ready for the next query.
+   */
+  void drain_after_error();
+
  private:
   void management_eventloop();
 
