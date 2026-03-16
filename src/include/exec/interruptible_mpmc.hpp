@@ -132,7 +132,7 @@ class interruptible_mpmc {
   /**
    * Resets the queue state to active (useful for restarting workers).
    */
-  void reset() { _is_active.store(true, std::memory_order_relaxed); }
+  void reactivate() { _is_active.store(true, std::memory_order_relaxed); }
 };
 
 }  // namespace sirius::exec
