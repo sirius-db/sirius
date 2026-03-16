@@ -48,7 +48,14 @@ namespace op {
 // for better pipelining with other operators, and allows reusing the hash table. MIXED_JOIN uses
 // cudf's mixed_join API for joins with both equality and inequality conditions.
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
-enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
+enum class BUILD_HASH_TABLE_STATE {
+  NOT_BUILT,
+  SCHEDULING,
+  SCHEDULED,
+  BUILT,
+  FINALIZING,
+  DESTROYED
+};
 
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
@@ -163,7 +170,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
   std::unique_ptr<cudf::filtered_join>
-    _filtered_hash_table;  // filtered hash object for SEMI/ANTI in BUILD_PROBE mode
+    _filtered_hash_table;  // filtered hash object for SEMI/ANTI/RIGHT_SEMI/RIGHT_ANTI/MARK
+  std::unique_ptr<cudf::column>
+    _build_match_bitmap;  // BOOL8 bitmap tracking matched build rows for RIGHT_SEMI/RIGHT_ANTI
   std::shared_ptr<::cucascade::data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>

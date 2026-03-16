@@ -20,6 +20,7 @@
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
 #include "cudf/join/mixed_join.hpp"
+#include "cudf/stream_compaction.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/types.hpp"
 #include "cudf/unary.hpp"
@@ -375,9 +376,7 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI &&
-      join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&
-      _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
+      join_type != duckdb::JoinType::RIGHT && _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
     // Switch to a more efficient join strategy for small datasets
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
     SIRIUS_LOG_DEBUG(
@@ -424,14 +423,20 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
-      // Hash table is built, we can process probe only batches.
       if (ports["default"]->repo->total_size() > 0) {
         return task_creation_hint{TaskCreationHint::READY, this};
+      } else if ((join_type == duckdb::JoinType::RIGHT_SEMI ||
+                  join_type == duckdb::JoinType::RIGHT_ANTI) &&
+                 probe_port->src_pipeline->is_pipeline_finished()) {
+        _hash_table_build_state = BUILD_HASH_TABLE_STATE::FINALIZING;
+        return task_creation_hint{TaskCreationHint::READY, this};
       } else {
-        // No probe batch available yet, hint to wait for probe input data.
         auto* producer = &ports["default"]->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
+    } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::FINALIZING) {
+      auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     } else {
       throw std::runtime_error(
         "Invalid hash table build state in sirius_physical_hash_join::get_next_task_hint");
@@ -476,8 +481,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "partition in operator " +
         std::to_string(this->get_operator_id()));
     }
-    // If the hash table has already been build, we only send the probe side. The hash table should
-    // already be built and we can perform the join with the probe side batches.
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     auto batch = probe_port->repo->pop_data_batch(::cucascade::batch_state::task_created);
     if (batch) {
@@ -489,6 +492,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         std::to_string(this->get_operator_id()));
     }
     return std::make_unique<operator_data>(input_batch);
+  } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::FINALIZING) {
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
   } else {
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
@@ -770,6 +775,27 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
+    if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::FINALIZING) {
+      auto build_view =
+        _build_table->get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
+      auto selected = build_view.select(rhs_output_columns.col_idxs);
+
+      std::unique_ptr<cudf::table> result;
+      if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+        result = cudf::apply_boolean_mask(selected, _build_match_bitmap->view(), stream);
+      } else {
+        auto negated =
+          cudf::unary_operation(_build_match_bitmap->view(), cudf::unary_operator::NOT, stream);
+        result = cudf::apply_boolean_mask(selected, negated->view(), stream);
+      }
+      {
+        std::lock_guard<std::mutex> lg(op_state_mutex);
+        _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+      }
+      return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
+        make_data_batch(std::move(result), *_build_table->get_memory_space())});
+    }
+
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
       auto build_keys_result      = prepare_join_keys(input_batches[1],
                                                  right_key_col_indices,
@@ -782,21 +808,30 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         _build_table              = input_batches[1];
-        if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI) {
+        if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI ||
+            join_type == duckdb::JoinType::MARK) {
           _filtered_hash_table = std::make_unique<cudf::filtered_join>(
             build_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+        } else if (join_type == duckdb::JoinType::RIGHT_SEMI ||
+                   join_type == duckdb::JoinType::RIGHT_ANTI) {
+          _hash_table =
+            std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
+          auto num_build_rows = _build_table->get_data()
+                                  ->cast<cucascade::gpu_table_representation>()
+                                  .get_table()
+                                  .view()
+                                  .num_rows();
+          cudf::numeric_scalar<bool> false_scalar(false, true, stream);
+          _build_match_bitmap = cudf::make_column_from_scalar(false_scalar, num_build_rows, stream);
         } else {
           _hash_table =
             std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
         }
-        stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
-                               // batches to proceed.
+        stream.synchronize();
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
       }
     }
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
-      // Hash table is built, we can process probe batches. The probe-side keys will be processed in
-      // the same way as the mixed join path, but with an equality-only predicate.
       auto probe_keys_result      = prepare_join_keys(input_batches[0],
                                                  left_key_col_indices,
                                                  cast_necessary,
@@ -805,7 +840,64 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
-      if (join_type == duckdb::JoinType::INNER) {
+      if (join_type == duckdb::JoinType::RIGHT_SEMI || join_type == duckdb::JoinType::RIGHT_ANTI) {
+        auto join_result            = _hash_table->inner_join(probe_keys, {}, stream);
+        auto& matched_build_indices = join_result.second;
+        if (matched_build_indices->size() > 0) {
+          cudf::numeric_scalar<bool> true_scalar(true, true, stream);
+          cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
+                                        static_cast<cudf::size_type>(matched_build_indices->size()),
+                                        matched_build_indices->data(),
+                                        nullptr,
+                                        0,
+                                        0,
+                                        {});
+          auto true_col = cudf::make_column_from_scalar(
+            true_scalar, static_cast<cudf::size_type>(matched_build_indices->size()), stream);
+          auto true_table     = cudf::table_view({true_col->view()});
+          auto target_table   = cudf::table_view({_build_match_bitmap->view()});
+          auto scatter_result = cudf::scatter(true_table, scatter_map, target_table, stream);
+          _build_match_bitmap = std::move(scatter_result->release()[0]);
+        }
+
+        auto* probe_port = get_port("default");
+        if (probe_port->repo->total_size() == 0 &&
+            probe_port->src_pipeline->is_pipeline_finished()) {
+          // All probe data consumed — produce final output from bitmap.
+          auto build_view = _build_table->get_data()
+                              ->cast<cucascade::gpu_table_representation>()
+                              .get_table()
+                              .view();
+          auto selected = build_view.select(rhs_output_columns.col_idxs);
+
+          std::unique_ptr<cudf::table> final_result;
+          if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+            final_result = cudf::apply_boolean_mask(selected, _build_match_bitmap->view(), stream);
+          } else {
+            auto negated =
+              cudf::unary_operation(_build_match_bitmap->view(), cudf::unary_operator::NOT, stream);
+            final_result = cudf::apply_boolean_mask(selected, negated->view(), stream);
+          }
+          {
+            std::lock_guard<std::mutex> lg(op_state_mutex);
+            _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+          }
+          return std::make_unique<operator_data>(
+            std::vector<std::shared_ptr<::cucascade::data_batch>>{
+              make_data_batch(std::move(final_result), *_build_table->get_memory_space())});
+        }
+
+        // More probe batches to come — return empty result for now.
+        right_indices = std::make_unique<rmm::device_uvector<cudf::size_type>>(0, stream);
+        left_full     = get_cudf_table_view(*input_batches[0]);
+        right_full =
+          _build_table->get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
+      } else if (join_type == duckdb::JoinType::MARK) {
+        auto semi_indices = _filtered_hash_table->semi_join(probe_keys, stream);
+        left_full         = get_cudf_table_view(*input_batches[0]);
+        return resolve_mark_join_result(
+          *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
+      } else if (join_type == duckdb::JoinType::INNER) {
         auto result   = _hash_table->inner_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
         right_indices = std::move(result.second);
@@ -825,11 +917,13 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         throw std::runtime_error("Unsupported join type in BUILD_PROBE mode: " +
                                  duckdb::JoinTypeToString(join_type));
       }
-      left_full = get_cudf_table_view(*input_batches[0]);
-      right_full =
-        _build_table->get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
-
-    } else {
+      if (join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI &&
+          join_type != duckdb::JoinType::MARK) {
+        left_full = get_cudf_table_view(*input_batches[0]);
+        right_full =
+          _build_table->get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
+      }
+    } else if (_hash_table_build_state != BUILD_HASH_TABLE_STATE::BUILT) {
       throw std::runtime_error(fmt::format(
         "In sirius_physical_hash_join::execute: invalid hash table build state {} in BUILD_PROBE "
         "mode for operator id {}",
@@ -1071,6 +1165,7 @@ void sirius_physical_hash_join::finalize_operator()
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
     _filtered_hash_table.reset();
+    _build_match_bitmap.reset();
     _build_table.reset();
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
