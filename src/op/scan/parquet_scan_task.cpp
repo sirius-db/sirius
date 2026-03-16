@@ -410,11 +410,22 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 #endif
       }
       pruning_options.set_filter(_translated_filter->back());
-      row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
+      auto const row_group_count_before = row_group_indices.size();
+      row_group_indices                 = readers[file_idx]->filter_row_groups_with_stats(
         row_group_indices, pruning_options, rmm::cuda_stream_default);
       SIRIUS_LOG_INFO("[parquet_scan_task_global_state] After filtering, file {} has {} row groups",
                       _file_paths[file_idx],
                       row_group_indices.size());
+      // If pruning removed all row groups, stats may be missing or incompatible; fall back to
+      // reading all row groups to avoid wrong empty results and pipeline stall.
+      if (row_group_indices.empty() && row_group_count_before > 0) {
+        SIRIUS_LOG_WARN(
+          "[parquet_scan_task_global_state] Pruning returned 0 row groups for file {} (had {}); "
+          "falling back to unpruned to avoid empty result",
+          _file_paths[file_idx],
+          row_group_count_before);
+        row_group_indices = readers[file_idx]->all_row_groups(_reader_options);
+      }
     } else if (try_filter && !logged_no_filter) {
       SIRIUS_LOG_INFO(
         "[parquet_scan_task_global_state] No translated filter; skipping row group pruning (file "
