@@ -132,6 +132,15 @@ class duckdb_scan_executor {
   void drain_leftover_tasks();
 
   /**
+   * @brief Drain tasks and wait for all in-flight work to complete.
+   *
+   * Interrupts the manager loop so it releases its kiosk ticket, waits for
+   * all in-flight thread-pool tasks, then restarts the manager so the
+   * executor is ready for the next query.  Used during error cleanup.
+   */
+  void drain_and_wait();
+
+  /**
    * @brief Set the completion handler for query completion signaling
    *
    * @param handler Pointer to the completion handler

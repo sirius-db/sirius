@@ -202,12 +202,16 @@ void sirius_engine::execute()
   try {
     future.get();
   } catch (const std::exception& e) {
-    /// todo(bobbi) we should handle the error properly, clean the query context and then return the
-    /// error to duckdb
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
+    // clear_all_repositories() immediately after execute() throws; without
+    // this drain, tasks still running in the thread pool hold raw pointers to
+    // those repositories and cause a use-after-free / heap corruption.
+    sirius_ctx->get_pipeline_executor().drain_after_error();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
+    sirius_ctx->get_pipeline_executor().drain_after_error();
     throw;
   }
 }

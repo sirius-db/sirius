@@ -97,6 +97,28 @@ void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_
 
 void duckdb_scan_executor::drain_leftover_tasks() { _task_queue.drain(); }
 
+void duckdb_scan_executor::drain_and_wait()
+{
+  // Stop the kiosk so the manager_loop's acquire() returns an invalid ticket
+  // (the manager may be blocked there when all thread-pool slots are full).
+  _kiosk.stop();
+
+  // Interrupt pop() so the manager_loop sees a nullptr and breaks out.
+  _task_queue.interrupt();
+  _task_queue.drain();
+
+  // Join the manager thread so we know it has exited.
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+
+  // Wait for all in-flight thread-pool tasks to finish.
+  _kiosk.wait_all();
+
+  // Re-enable the kiosk and queue so the executor is ready for the next query.
+  _kiosk.resume();
+  _task_queue.reset();
+  _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
+}
+
 void duckdb_scan_executor::set_completion_handler(
   sirius::pipeline::completion_handler* handler) noexcept
 {
@@ -106,6 +128,13 @@ void duckdb_scan_executor::set_completion_handler(
 bool duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
 {
   if (_cache_level == cache_level::NONE) { return false; }
+  // Only track queries that go through the Sirius GPU execution path.
+  // Other SQL statements (SET, INSERT, etc.) don't produce scan tasks
+  // and should not invalidate the cache.
+  if (query.find("gpu_execution") == std::string::npos &&
+      query.find("gpu_processing") == std::string::npos) {
+    return false;
+  }
   std::hash<std::string> hash_fn;
   auto new_query_hash = hash_fn(query);
   if (new_query_hash == _query_hash) {

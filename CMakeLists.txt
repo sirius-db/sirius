@@ -85,6 +85,7 @@ set(EXTENSION_SOURCES
     src/gpu_physical_plan_generator.cpp
     src/gpu_pipeline.cpp
     src/gpu_query_result.cpp
+    src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
