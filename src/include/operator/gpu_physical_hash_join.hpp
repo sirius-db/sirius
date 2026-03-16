@@ -47,6 +47,13 @@ void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
                          uint64_t*& count,
                          bool unique_build_keys = false);
 
+void cudf_hash_full_join(vector<shared_ptr<GPUColumn>>& probe_keys,
+                         vector<shared_ptr<GPUColumn>>& build_keys,
+                         int num_keys,
+                         uint64_t*& row_ids_left,
+                         uint64_t*& row_ids_right,
+                         uint64_t*& count);
+
 void cudf_mixed_or_conditional_inner_join(vector<shared_ptr<GPUColumn>>& probe_columns,
                                           vector<shared_ptr<GPUColumn>>& build_columns,
                                           const vector<JoinCondition>& conditions,
@@ -172,6 +179,10 @@ class GPUPhysicalHashJoin : public GPUPhysicalOperator {
   mutable bool unique_build_keys = false;
 
   mutable bool unique_probe_keys = false;
+
+  //! Set to true when FULL OUTER JOIN is handled via cudf in Execute()
+  //! (all indices including unmatched build rows are already emitted)
+  mutable bool outer_join_handled_in_execute = false;
 
   OperatorResultType Execute(GPUIntermediateRelation& input_relation,
                              GPUIntermediateRelation& output_relation) const override;
