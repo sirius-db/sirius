@@ -287,8 +287,16 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   //===----------Filters----------===//
   std::vector<duckdb::idx_t> filter_idxs;  ///< Positions in column_ids
   if (try_filter) {
+    SIRIUS_LOG_INFO(
+      "[parquet_scan_task_global_state] Table has {} filter(s), attempting translation for row "
+      "group pruning",
+      scan_op->table_filters->filters.size());
     auto duckdb_expr = _scan_op->get_table_filter_expression();
-    if (duckdb_expr) {
+    if (!duckdb_expr) {
+      SIRIUS_LOG_WARN(
+        "[parquet_scan_task_global_state] get_table_filter_expression() returned null; row group "
+        "pruning will be skipped");
+    } else {
       // Name resolver: BoundReferenceExpression::index is a position in column_ids.
       // We collect ref_index (not primary_idx) to match with domain of projection_ids.
       auto name_resolver = [&scan_op, &filter_idxs](duckdb::idx_t ref_index) -> std::string {
@@ -307,7 +315,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
           auto const primary_idx = scan_op->column_ids[ref_index].GetPrimaryIndex();
           _filter_column_names.push_back(scan_op->names[primary_idx]);
         }
+        SIRIUS_LOG_INFO(
+          "[parquet_scan_task_global_state] Filter translated for pruning ({} filter column(s))",
+          _filter_column_names.size());
         // Do not set filter on _reader_options: we only use it for row group pruning below.
+      } else {
+        SIRIUS_LOG_WARN(
+          "[parquet_scan_task_global_state] translate_expression_with_names failed; row group "
+          "pruning will be skipped");
       }
     }
   }
@@ -375,6 +390,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
                 });
 
   // Partition the row groups
+  bool logged_no_filter = false;
   for (std::size_t file_idx = 0; file_idx < _file_paths.size(); ++file_idx) {
     auto row_group_indices = readers[file_idx]->all_row_groups(_reader_options);
     if (_translated_filter) {
@@ -399,6 +415,13 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       SIRIUS_LOG_INFO("[parquet_scan_task_global_state] After filtering, file {} has {} row groups",
                       _file_paths[file_idx],
                       row_group_indices.size());
+    } else if (try_filter && !logged_no_filter) {
+      SIRIUS_LOG_INFO(
+        "[parquet_scan_task_global_state] No translated filter; skipping row group pruning (file "
+        "{} has {} row groups)",
+        _file_paths[file_idx],
+        row_group_indices.size());
+      logged_no_filter = true;
     }
     auto const& file_metadata = _file_metadatas[file_idx];
 
