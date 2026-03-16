@@ -16,6 +16,10 @@
 
 #include "planner/query.hpp"
 
+#include "op/sirius_physical_partition.hpp"
+
+#include <algorithm>
+
 namespace sirius::planner {
 
 query::query(sirius_pipeline_hashmap pipeline_hashmap)
@@ -51,6 +55,20 @@ void query::build_indices()
       _operator_to_pipeline[&op_ref.get()] = pipeline;
     }
   }
+
+  // Prioritize build-side scans: hash join build partitions must complete before
+  // probe partitions can determine num_partitions, so starting build-side I/O
+  // first reduces the critical path.
+  std::stable_sort(_scan_operators.begin(), _scan_operators.end(), [this](auto* a, auto* b) {
+    auto is_build_scan = [this](op::sirius_physical_operator* scan_op) {
+      auto it = _operator_to_pipeline.find(scan_op);
+      if (it == _operator_to_pipeline.end()) { return false; }
+      auto sink = it->second->get_sink();
+      return sink && sink->type == op::SiriusPhysicalOperatorType::PARTITION &&
+             sink->Cast<op::sirius_physical_partition>().is_build_partition();
+    };
+    return is_build_scan(a) > is_build_scan(b);
+  });
 }
 
 const duckdb::vector<op::sirius_physical_operator*>& query::get_scan_operators() const

@@ -161,7 +161,15 @@ std::future<void> pipeline_executor::start_query()
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  schedule_next_scan_tasks();
+  // Schedule all scans. Build-side scans appear first (sorted in query::build_indices()),
+  // so their I/O tasks are enqueued before probe-side scans.
+  {
+    std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+    while (!_priority_scans.empty()) {
+      _task_creator->schedule(_priority_scans.front());
+      _priority_scans.pop();
+    }
+  }
 
   return future;
 }
