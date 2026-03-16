@@ -397,6 +397,12 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   ~parquet_scan_task() override;
 
   //===----------Methods----------===//
+
+  /**
+   * @brief Execute the parquet scan task and record memory metrics.
+   */
+  void execute(rmm::cuda_stream_view stream) override;
+
   /**
    * @brief Compute the parquet scan task and produce a host_parquet_representation.
    *
@@ -424,8 +430,12 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    */
   [[nodiscard]] size_t get_estimated_reservation_size() const override
   {
-    auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
-    return l_state.get_reserved_compressed_bytes();
+    auto& l_state         = this->_local_state->cast<parquet_scan_task_local_state>();
+    auto current_estimate = l_state.get_reserved_compressed_bytes();
+    auto& g_state         = this->_global_state->cast<parquet_scan_task_global_state>();
+    auto refined          = g_state.get_memory_history().estimate_peak_memory(current_estimate);
+    if (refined) { return *refined; }
+    return current_estimate;
   }
 
   /**

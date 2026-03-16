@@ -17,6 +17,7 @@
 #pragma once
 
 #include "parallel/task.hpp"
+#include "pipeline/pipeline_memory_history.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/memory/memory_reservation.hpp>
@@ -57,8 +58,18 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
     _pipeline = std::move(pipeline);
   }
 
+  /**
+   * @brief Get the memory history for this pipeline's tasks.
+   *
+   * Used to record and query historical memory consumption patterns so that
+   * future tasks can make better reservation estimates.
+   */
+  pipeline_memory_history& get_memory_history() { return _memory_history; }
+  const pipeline_memory_history& get_memory_history() const { return _memory_history; }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
+  pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
 };
 
 /**

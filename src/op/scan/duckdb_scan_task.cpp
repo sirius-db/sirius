@@ -529,7 +529,20 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto output_data = compute_task(stream);
+  auto estimated_bytes = get_estimated_reservation_size();
+  auto output_data     = compute_task(stream);
+
+  // Record memory metrics for future reservation estimates.
+  // Scan tasks don't have peak memory tracking, so use output size as proxy.
+  if (output_data) {
+    std::size_t output_bytes = 0;
+    for (const auto& batch : output_data->get_data_batches()) {
+      if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+    }
+    auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
+    g_state.get_memory_history().record({estimated_bytes, output_bytes, output_bytes});
+  }
+
   if (output_data) { publish_output(*output_data, stream); }
 }
 

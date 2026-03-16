@@ -414,11 +414,21 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
   _allocator       = allocator;
+  auto input_bytes = get_input_size();
   auto output_data = compute_task(stream);
 
+  // Record memory metrics for future reservation estimates
+  if (output_data) {
+    auto peak_bytes          = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+    std::size_t output_bytes = 0;
+    for (const auto& batch : output_data->get_data_batches()) {
+      if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+    }
+    auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+    global.get_memory_history().record({input_bytes, peak_bytes, output_bytes});
+  }
+
   if (output_data) { publish_output(*output_data, stream); }
-  // 4. After each cudf operator, get peak total bytes to collect statistics
-  // 5. Push output batches to the data repository
 
   // Processing handles are automatically released here when they go out of scope
 }
@@ -437,8 +447,12 @@ std::size_t gpu_pipeline_task::get_input_size() const
 
 std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 {
-  // WSM TODO: this is a placeholder for the actual reservation size
-  return get_input_size() * 1;
+  auto input_size = get_input_size();
+  auto& global    = _global_state->cast<gpu_pipeline_task_global_state>();
+  auto estimate   = global.get_memory_history().estimate_peak_memory(input_size);
+  if (estimate) { return *estimate; }
+  // Fallback: no history yet (first batch in pipeline)
+  return input_size * 2;
 }
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()

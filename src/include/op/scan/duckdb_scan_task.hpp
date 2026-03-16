@@ -490,8 +490,12 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
 
   std::size_t get_estimated_reservation_size() const override
   {
-    return this->_local_state->cast<duckdb_scan_task_local_state>()
-      .get_estimated_reservation_size();
+    auto current_estimate =
+      this->_local_state->cast<duckdb_scan_task_local_state>().get_estimated_reservation_size();
+    auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
+    auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
+    if (refined) { return *refined; }
+    return current_estimate;
   }
 
   /// @brief Get the output consumer operators for this task.
