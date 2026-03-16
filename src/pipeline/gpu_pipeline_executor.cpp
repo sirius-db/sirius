@@ -101,18 +101,30 @@ void gpu_pipeline_executor::manager_loop()
     auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
     if (!gpu_task) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
-      _completion_handler->report_error(
-        "GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      if (_completion_handler) {
+        _completion_handler->report_error(
+          "GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      }
       break;
     }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
+    SIRIUS_LOG_TRACE(
+      "GPU Pipeline Executor: Acquiring memory reservation of {} bytes for task {}. Memory "
+      "available: {}, total reserved: {}, max: {}",
+      bytes_needs,
+      gpu_task->get_task_id(),
+      _memory_space->get_available_memory(),
+      _memory_space->get_total_reserved_memory(),
+      _memory_space->get_max_memory());
     auto reservation = _memory_space->make_reservation(bytes_needs);
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
-      _completion_handler->report_error(
-        "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
-        std::to_string(gpu_task->get_task_id()));
+      if (_completion_handler) {
+        _completion_handler->report_error(
+          "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
+          std::to_string(gpu_task->get_task_id()));
+      }
       break;
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
@@ -121,9 +133,11 @@ void gpu_pipeline_executor::manager_loop()
     } else {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
                        gpu_task->get_task_id());
-      _completion_handler->report_error(
-        "GPU Pipeline Executor: Failed to cast local state for task " +
-        std::to_string(gpu_task->get_task_id()));
+      if (_completion_handler) {
+        _completion_handler->report_error(
+          "GPU Pipeline Executor: Failed to cast local state for task " +
+          std::to_string(gpu_task->get_task_id()));
+      }
       break;
     }
     auto output_consumers = gpu_task->get_output_consumers();
@@ -139,9 +153,11 @@ void gpu_pipeline_executor::manager_loop()
       try {
         task->execute(exc_stream);
       } catch (oom_reschedule_exception& oom) {
-        SIRIUS_LOG_WARN("GPU Pipeline Executor: OOM reschedule, resuming from operator index {}",
-                        oom.get_resume_operator_index());
-
+        if (_completion_handler && _completion_handler->has_error()) {
+          // If the completion handler is already in an error state, then we can just return and not
+          // try to reschedule
+          return;
+        }
         auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
         if (!gpu_task) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for OOM reschedule");
@@ -151,6 +167,42 @@ void gpu_pipeline_executor::manager_loop()
           }
           return;
         }
+
+        // Determine retry count and original task ID for this rescheduled attempt.
+        auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
+        uint32_t next_retry_count = 1;
+        uint64_t orig_task_id     = gpu_task->get_task_id();
+        if (cur_local && cur_local->retry_count > 0) {
+          next_retry_count = cur_local->retry_count + 1;
+          orig_task_id     = cur_local->original_task_id;
+        }
+
+        static constexpr uint32_t MAX_OOM_RETRIES = 10;
+        if (next_retry_count > MAX_OOM_RETRIES) {
+          SIRIUS_LOG_ERROR(
+            "GPU Pipeline Executor: task {} (original task {}) exceeded {} OOM retries at "
+            "operator index {} — terminating query",
+            gpu_task->get_task_id(),
+            orig_task_id,
+            MAX_OOM_RETRIES,
+            oom.get_resume_operator_index());
+          if (_completion_handler) {
+            _completion_handler->report_error(std::make_exception_ptr(
+              std::runtime_error("GPU pipeline task exceeded maximum OOM retry limit (" +
+                                 std::to_string(MAX_OOM_RETRIES) + ") for original task " +
+                                 std::to_string(orig_task_id))));
+          }
+          return;
+        }
+
+        SIRIUS_LOG_WARN(
+          "GPU Pipeline Executor: OOM reschedule (retry {}/{}) for task {} (original task {}), "
+          "resuming from operator index {}",
+          next_retry_count,
+          MAX_OOM_RETRIES,
+          gpu_task->get_task_id(),
+          orig_task_id,
+          oom.get_resume_operator_index());
 
         // Mark old task as rescheduled so its destructor skips mark_task_completed().
         // The rescheduled task will handle completion instead.
@@ -169,6 +221,9 @@ void gpu_pipeline_executor::manager_loop()
         // Build the rescheduled task via virtual factory (preserves derived type).
         auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
           std::move(intermediate_data), oom.get_resume_operator_index());
+        new_local_state->retry_count      = next_retry_count;
+        new_local_state->original_task_id = orig_task_id;
+
         auto new_task_id =
           _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
         auto new_task = gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
@@ -229,6 +284,37 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
 }
 
 void gpu_pipeline_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
+void gpu_pipeline_executor::drain_and_wait()
+{
+  // Stop the kiosk so acquire() unblocks immediately with an invalid ticket.
+  // This is necessary when the manager loop is blocked at acquire() (i.e. all
+  // thread-pool slots are full) — interrupting the task queue alone won't help.
+  _kiosk.stop();
+
+  // Interrupt pop() so the manager_loop sees a nullptr return and breaks out
+  // of its while loop (within at most the 10 ms poll interval in pop()).
+  _task_queue.interrupt();
+  _task_queue.drain();
+
+  // Join the manager thread so we know it has exited (it will have seen either
+  // an invalid ticket from the stopped kiosk or a nullptr from the interrupted queue).
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+
+  // Wait for all in-flight thread-pool tasks to finish (each holds a kiosk
+  // ticket that is released when the lambda completes).
+  _kiosk.wait_all();
+
+  // Re-enable the kiosk so the restarted manager can acquire tickets again.
+  _kiosk.resume();
+
+  // Reset the queue and restart the manager so the executor is ready for
+  // the next query.
+  _task_queue.reset();
+  _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
+}
+
+bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
 
 void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
 {
