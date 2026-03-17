@@ -490,15 +490,6 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
-  SIRIUS_LOG_INFO(
-    "update_join_exec_mode id {} join_type={} num_partitions={} build_side_bytes={} "
-    "current_mode={} max_build_bytes={}",
-    this->get_operator_id(),
-    duckdb::JoinTypeToString(join_type),
-    num_partitions,
-    build_side_bytes,
-    static_cast<int>(_join_mode),
-    _max_build_hash_table_bytes);
   if (num_partitions == 1 && join_type != duckdb::JoinType::RIGHT &&
       _join_mode != HASH_JOIN_MODE::BUILD_PROBE) {
     bool has_inequality = (num_equality_conditions < conditions.size());
@@ -513,13 +504,9 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
       // Keep STANDARD mode.
     } else if (!has_inequality || join_type == duckdb::JoinType::INNER) {
       _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
-      SIRIUS_LOG_INFO(
-        "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and "
-        "build side size {} bytes{}",
-        this->get_operator_id(),
-        num_partitions,
-        build_side_bytes,
-        has_inequality ? " (with inequality post-filter)" : "");
+      SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {} switching to BUILD_PROBE mode{}",
+                       this->get_operator_id(),
+                       has_inequality ? " (with inequality post-filter)" : "");
     }
   }
 }
@@ -907,13 +894,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       "Error sirius_physical_hash_join being asked to do all inequality join of type: " +
       duckdb::JoinTypeToString(join_type));
   }
-
-  SIRIUS_LOG_INFO("hash_join::execute id {} join_type={} mode={} build_state={} batches={}",
-                  this->get_operator_id(),
-                  duckdb::JoinTypeToString(join_type),
-                  static_cast<int>(_join_mode),
-                  static_cast<int>(_hash_table_build_state),
-                  input_batches.size());
 
   cudf::table_view left_full, right_full;
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
