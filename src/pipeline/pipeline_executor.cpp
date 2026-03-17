@@ -180,6 +180,28 @@ void pipeline_executor::terminate_query(std::exception_ptr error)
   stop();
 }
 
+void pipeline_executor::drain_after_error()
+{
+  SIRIUS_LOG_INFO("pipeline_executor: draining after error");
+  // Drain the top-level task queue so management_eventloop doesn't dispatch
+  // stale tasks from the failed query.
+  _task_queue.drain();
+
+  // Stop the scan executor's manager loop, wait for in-flight scan tasks to
+  // finish, then restart the manager for the next query.  We must use
+  // drain_and_wait() (not just drain + wait_all) because the scan manager
+  // thread holds a kiosk ticket while blocked on pop(); without interrupting
+  // the queue and stopping the kiosk first, wait_all() deadlocks.
+  _scan_executor->drain_and_wait();
+
+  // Interrupt each GPU executor's manager loop, wait for in-flight thread-pool
+  // tasks to finish, then restart the manager for the next query.
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->drain_and_wait();
+  }
+  SIRIUS_LOG_INFO("pipeline_executor: DONE draining after error");
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
