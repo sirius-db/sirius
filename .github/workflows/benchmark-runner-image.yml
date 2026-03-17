@@ -100,9 +100,10 @@ jobs:
           build-args: |
             BAKE_SCCACHE=${{ steps.flags.outputs.bake }}
             SIRIUS_REF=dev
-          # Layer cache scoped per arch so amd64 and arm64 don't collide
-          cache-from: type=gha,scope=benchmark-runner-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=benchmark-runner-${{ matrix.arch }}
+          # Layer cache stored in the registry (not GHA cache) to avoid consuming
+          # the 10 GB GHA cache limit. Scoped per arch so amd64 and arm64 don't collide.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:cache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:cache-${{ matrix.arch }},mode=max
 
       - name: Export digest
         run: |
