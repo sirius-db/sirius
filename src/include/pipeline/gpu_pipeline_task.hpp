@@ -82,6 +82,17 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
    * @return const cucascade::memory::reservation* Pointer to the reservation, or nullptr
    */
   const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
+
+  [[nodiscard]] std::size_t get_task_consumption_basis() const override
+  {
+    std::size_t input_size = 0;
+    if (_input_data) {
+      for (const auto& batch : _input_data->get_data_batches()) {
+        if (batch && batch->get_data()) { input_size += batch->get_data()->get_size_in_bytes(); }
+      }
+    }
+    return input_size;
+  }
 };
 
 /**

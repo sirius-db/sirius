@@ -447,9 +447,10 @@ std::size_t gpu_pipeline_task::get_input_size() const
 
 std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 {
-  auto input_size = get_input_size();
-  auto& global    = _global_state->cast<gpu_pipeline_task_global_state>();
-  auto estimate   = global.get_memory_history().estimate_peak_memory(input_size);
+  auto input_size =
+    _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
+  auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
+  auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
   if (estimate) { return *estimate; }
   // Fallback: no history yet (first batch in pipeline)
   return input_size * 2;

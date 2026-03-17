@@ -339,6 +339,11 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    */
   [[nodiscard]] size_t get_reserved_compressed_bytes() const { return _reserved_compressed_bytes; }
 
+  [[nodiscard]] std::size_t get_task_consumption_basis() const override
+  {
+    return get_reserved_compressed_bytes();
+  }
+
   /**
    * @brief Get the vector of row group indices assigned to this local state.
    *
@@ -430,10 +435,10 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    */
   [[nodiscard]] size_t get_estimated_reservation_size() const override
   {
-    auto& l_state         = this->_local_state->cast<parquet_scan_task_local_state>();
-    auto current_estimate = l_state.get_reserved_compressed_bytes();
-    auto& g_state         = this->_global_state->cast<parquet_scan_task_global_state>();
-    auto refined          = g_state.get_memory_history().estimate_peak_memory(current_estimate);
+    auto current_estimate =
+      this->_local_state->cast<parquet_scan_task_local_state>().get_task_consumption_basis();
+    auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
+    auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
     if (refined) { return *refined; }
     return current_estimate;
   }

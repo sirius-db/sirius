@@ -305,10 +305,12 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
     size_t default_varchar_size   = sirius::config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
-  [[nodiscard]] std::size_t get_estimated_reservation_size() const noexcept
+  [[nodiscard]] std::size_t get_approximate_batch_size() const noexcept
   {
     return _approximate_batch_size;
   }
+
+  std::size_t get_task_consumption_basis() const override { return get_approximate_batch_size(); }
 
   //===----------Methods----------===//
   /**
@@ -491,7 +493,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   std::size_t get_estimated_reservation_size() const override
   {
     auto current_estimate =
-      this->_local_state->cast<duckdb_scan_task_local_state>().get_estimated_reservation_size();
+      this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
     auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
     auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
     if (refined) { return *refined; }

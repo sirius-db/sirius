@@ -114,6 +114,17 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
     _reservation = std::move(res);
   }
 
+  /**
+   * @brief Get the basis for estimating task memory consumption.
+   *
+   * This method allows for different task types to provide their own logic for providing something
+   * as a starting point for memory reservation estimation.
+   *
+   * @return The value to use as the basis for memory consumption estimation (e.g., input data size,
+   * number of rows, etc.)
+   */
+  [[nodiscard]] virtual std::size_t get_task_consumption_basis() const = 0;
+
  protected:
   /**
    * @brief Protected default constructor.
