@@ -498,11 +498,13 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
     build_side_bytes,
     static_cast<int>(_join_mode),
     _max_build_hash_table_bytes);
-  if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      join_type != duckdb::JoinType::RIGHT && _join_mode != HASH_JOIN_MODE::BUILD_PROBE) {
+  // num_partitions == 1 guarantees the partition operator decided the data fits in GPU memory.
+  // No additional size check is needed — BUILD_PROBE uses less peak memory than MIXED_JOIN or
+  // STANDARD (which materialise both sides at once), since it only holds the build table + one
+  // probe batch at a time.
+  if (num_partitions == 1 && join_type != duckdb::JoinType::RIGHT &&
+      _join_mode != HASH_JOIN_MODE::BUILD_PROBE) {
     bool has_inequality = (num_equality_conditions < conditions.size());
-    // For mixed joins (equality + inequality), enable BUILD_PROBE only for INNER where
-    // inequality conditions can be applied as a post-filter on equality-matched rows.
     if (!has_inequality || join_type == duckdb::JoinType::INNER) {
       _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
       SIRIUS_LOG_INFO(
