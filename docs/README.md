@@ -22,9 +22,9 @@ Experiment Setup:
 ## Supported OS/GPU/CUDA/CMake
 - Ubuntu >= 22.04
 - NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 13.0
+- CUDA >= 13.0 (requires NVIDIA driver >= 570)
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
-- libcudf >= 26.04
+- libcudf (stable)
 - We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
 ### Requirements
@@ -75,7 +75,7 @@ To generate the TPC-H dataset
 cd test_datasets
 unzip tpch-dbgen.zip
 cd tpch-dbgen
-./dbgen -s 1 && mkdir s1 && mv *.tbl s1  # this generates dataset of SF1
+./dbgen -s 1 && mkdir -p s1 && mv *.tbl s1  # this generates dataset of SF1
 cd ../../
 ```
 

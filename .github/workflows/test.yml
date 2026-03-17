@@ -5,7 +5,6 @@
 #     - Explicitly allowed third-party actions:
 #       prefix-dev/setup-pixi@*
 #       mozilla-actions/sccache-action@*
-#       pre-commit/action@*
 #     - Require actions to be pinned to a full-length commit SHA: NO
 #
 # Adding a new action? You must:
@@ -71,7 +70,7 @@ jobs:
           pixi-version: v0.65.0
           activate-environment: true
 
-      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
 
       - name: Extract build artifacts
         run: tar -xf build.tar
@@ -83,6 +82,8 @@ jobs:
         run: |
           ./setup_test_datasets.sh
           chmod -R a+r test_datasets/
+          mkdir -p test_datasets/tpch_parquet_sf1
+          ./build/release/duckdb -f scripts/tpch_to_parquet.sql
 
       - name: Run sqllogic tests
         run: |
@@ -91,3 +92,17 @@ jobs:
             echo "Test failures detected!"
             exit 1
           fi
+
+      - name: TPC-H performance snapshot
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.cfg
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
+        run: |
+          ./test/tpch_performance/benchmark_and_validate.sh 1
+          RUN_DIR=$(ls -td runs/*/ | head -1)
+          {
+            echo "## TPC-H Performance (SF1)"
+            echo '```'
+            cat "$RUN_DIR/comparison.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

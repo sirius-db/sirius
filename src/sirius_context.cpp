@@ -87,13 +87,13 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
   auto query = context.GetCurrentQuery();
   spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+  bool query_cache_hit = false;
   if (config_.is_scan_caching_enabled()) {
-    pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+    query_cache_hit = pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
   pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
 
-  // Reset task creator state (including scan operator global state map) for the new query
-  task_creator_->reset();
+  task_creator_->reset(query_cache_hit);
   task_creator_->set_client_context(context);
 }
 

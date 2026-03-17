@@ -17,11 +17,12 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/run_tpch_parquet.sh [--parquet-dir <path>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>
+#   ./test/tpch_performance/run_tpch_parquet.sh [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>
 # with engine = [sirius/duckdb]
 #
 # Example:
 #   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 `seq 1 22`
+#   ./test/tpch_performance/run_tpch_parquet.sh --iterations 5 sirius 100 `seq 1 22`
 #   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch --timeout 1200 sirius 100 `seq 1 22`
 #
 # Environment variables:
@@ -38,7 +39,8 @@ SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 PARQUET_DIR=""
 NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
-while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ]; do
+SCAN_CACHE_LEVEL=""
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--cache-level" ]; do
     if [ "$1" = "--parquet-dir" ]; then
         PARQUET_DIR="$2"
         shift 2
@@ -48,13 +50,17 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
     elif [ "$1" = "--timeout" ]; then
         SESSION_TIMEOUT="$2"
         shift 2
+    elif [ "$1" = "--cache-level" ]; then
+        SCAN_CACHE_LEVEL="$2"
+        shift 2
     fi
 done
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
-    echo "  --timeout N   Kill the entire DuckDB session after N seconds (default: 1200, 0 = no timeout)"
+    echo "  --iterations N  Number of iterations per query (default: 2, 1 cold + N-1 warm)"
+    echo "  --timeout N     Kill the entire DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     exit 1
 fi
 
@@ -151,7 +157,10 @@ for q in "${QUERIES[@]}"; do
     # Set per-query scan cache level.  Bracket the SET with .timer off/on
     # so it doesn't produce a spurious "Run Time" line in the output.
     if [ "$ENGINE" = "sirius" ]; then
-        if echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
+        if [ -n "$SCAN_CACHE_LEVEL" ]; then
+            # Explicit --cache-level overrides all per-query defaults
+            printf ".timer off\nSET scan_cache_level = '%s';\n.timer on\n" "$SCAN_CACHE_LEVEL" >> "$TEMP_SQL"
+        elif echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
             printf ".timer off\nSET scan_cache_level = 'table_host';\n.timer on\n" >> "$TEMP_SQL"
         else
             printf ".timer off\nSET scan_cache_level = 'table_gpu';\n.timer on\n" >> "$TEMP_SQL"
@@ -275,8 +284,13 @@ for q in "${VALID_QUERIES[@]}"; do
     } > "$TIMING_FILE"
 
     cold="${TIMES[0]:-N/A}"
-    warm="${TIMES[${#TIMES[@]}-1]:-N/A}"
-    echo "  Cold: ${cold}s   Warm: ${warm}s   (${#TIMES[@]} iterations)"
+    warm="N/A"
+    for ((i = 1; i < ${#TIMES[@]}; i++)); do
+        if [ "$warm" = "N/A" ] || (( $(echo "${TIMES[$i]} < $warm" | bc -l) )); then
+            warm="${TIMES[$i]}"
+        fi
+    done
+    echo "  Cold: ${cold}s   Warm(best): ${warm}s   (${#TIMES[@]} iterations)"
 
     if [ -n "${TIMING_CSV:-}" ] && [ "$cold" != "N/A" ]; then
         echo "${q},${cold}" >> "$TIMING_CSV"
