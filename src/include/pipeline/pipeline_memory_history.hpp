@@ -1,0 +1,134 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+namespace sirius::pipeline {
+
+/**
+ * @brief A single observation from one completed task.
+ *
+ * For GPU pipeline tasks, estimated_bytes is the input data size.
+ * For scan tasks, estimated_bytes is the pre-history reservation estimate
+ * (e.g. approximate_batch_size or reserved_compressed_bytes).
+ */
+struct task_memory_record {
+  std::size_t estimated_bytes;    ///< Pre-history estimation basis
+  std::size_t peak_memory_bytes;  ///< Actual peak allocated bytes during execution
+  std::size_t output_bytes;       ///< Total output data size
+};
+
+/**
+ * @brief Thread-safe collection of memory records for a single pipeline.
+ *
+ * Stores a bounded ring buffer of recent task_memory_records and provides
+ * an estimation function that uses historical ratios to predict peak memory
+ * consumption for a new task given its estimation basis.
+ */
+class pipeline_memory_history {
+ public:
+  pipeline_memory_history() = default;
+
+  /**
+   * @brief Record a completed task's memory metrics.
+   *
+   * Thread-safe. May be called concurrently from multiple executor threads.
+   *
+   * @param rec The memory record to store.
+   */
+  void record(task_memory_record rec)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_records.size() < kMaxRecords) {
+      _records.push_back(rec);
+    } else {
+      _records[_write_pos] = rec;
+      _write_pos           = (_write_pos + 1) % kMaxRecords;
+    }
+  }
+
+  /**
+   * @brief Estimate peak memory for a new task given its estimation basis.
+   *
+   * Uses a weighted average of historical peak/estimated ratios, where records
+   * with similar estimation bases receive higher weight. Applies a 20% safety
+   * margin and clamps to a minimum of estimated_bytes.
+   *
+   * @param estimated_bytes The estimation basis for the new task.
+   * @return The estimated peak memory in bytes, or nullopt if no history exists.
+   */
+  [[nodiscard]] std::optional<std::size_t> estimate_peak_memory(std::size_t estimated_bytes) const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (_records.empty() || estimated_bytes == 0) { return std::nullopt; }
+
+    double weighted_ratio_sum = 0.0;
+    double weight_sum         = 0.0;
+
+    for (const auto& rec : _records) {
+      if (rec.estimated_bytes == 0) { continue; }
+
+      double ratio =
+        static_cast<double>(rec.peak_memory_bytes) / static_cast<double>(rec.estimated_bytes);
+
+      // Weight by proximity of estimation basis: records with similar sizes
+      // are more predictive. Uses log-ratio distance so that 50MB vs 100MB
+      // has the same weight decay as 500MB vs 1000MB.
+      double log_ratio = std::abs(
+        std::log(static_cast<double>(rec.estimated_bytes) / static_cast<double>(estimated_bytes)));
+      double weight = 1.0 / (1.0 + log_ratio);
+
+      weighted_ratio_sum += ratio * weight;
+      weight_sum += weight;
+    }
+
+    if (weight_sum == 0.0) { return std::nullopt; }
+
+    double avg_ratio = weighted_ratio_sum / weight_sum;
+
+    // Apply 20% safety margin
+    auto result = static_cast<std::size_t>(static_cast<double>(estimated_bytes) * avg_ratio);
+
+    // Never estimate less than the estimation basis itself
+    return std::max(result, estimated_bytes);
+  }
+
+  /**
+   * @brief Get the number of records currently stored.
+   */
+  [[nodiscard]] std::size_t size() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _records.size();
+  }
+
+ private:
+  static constexpr std::size_t kMaxRecords = 64;
+
+  mutable std::mutex _mutex;
+  std::vector<task_memory_record> _records;
+  std::size_t _write_pos = 0;
+};
+
+}  // namespace sirius::pipeline
