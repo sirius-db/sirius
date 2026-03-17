@@ -1,0 +1,151 @@
+# NOTICE - Actions permissions policy (Settings > Actions > General):
+#   - "Allow sirius-db, and select non-sirius-db, actions and reusable workflows"
+#     - Allow actions created by GitHub: YES (covers actions/*)
+#     - Allow actions by Marketplace verified creators: NO
+#     - Explicitly allowed third-party actions:
+#       prefix-dev/setup-pixi@*
+#       mozilla-actions/sccache-action@*
+#       pre-commit/action@*
+#       docker/login-action@*
+#       docker/setup-buildx-action@*
+#       docker/build-push-action@*
+#     - Require actions to be pinned to a full-length commit SHA: NO
+#
+# Adding a new action? You must:
+#   1. Pin it to a full-length commit SHA (e.g. uses: owner/repo@<40-char-sha> # vX.Y.Z)
+#   2. If it is not from sirius-db, GitHub, or the explicitly allowed third-party actions above, add it to the
+#      project-level allowlist above before merging
+name: Build benchmark runner image
+
+# Triggers:
+#   - Dockerfile changes merged to dev: rebuild toolchain layer only (no cache bake)
+#   - Nightly cron: rebuild with fresh sccache from latest dev
+#   - Manual dispatch: supports on-demand rebuilds and cache bake override
+on:
+  push:
+    branches: [dev]
+    paths: ['.github/docker/benchmark-runner/**']
+  schedule:
+    - cron: '0 2 * * *'  # 02:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      bake_sccache:
+        description: 'Bake sccache from dev into the image'
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}/benchmark-runner
+
+jobs:
+  # Build each arch natively to avoid slow QEMU emulation.
+  # Each job pushes its image by digest, which the merge job combines into
+  # a single multi-arch manifest. Docker and act pull the right variant automatically.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # Pass digests to the merge job via outputs (one per arch)
+      digest-amd64: ${{ matrix.arch == 'amd64' && steps.build.outputs.digest || '' }}
+      digest-arm64: ${{ matrix.arch == 'arm64' && steps.build.outputs.digest || '' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Determine whether to bake sccache
+        id: flags
+        run: |
+          # Bake sccache on nightly cron or when explicitly requested via workflow_dispatch
+          if [ "${{ github.event_name }}" = "schedule" ] || \
+             [ "${{ inputs.bake_sccache }}" = "true" ]; then
+            echo "bake=true" >> $GITHUB_OUTPUT
+          else
+            echo "bake=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .github/docker/benchmark-runner
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          # Push by digest — the merge job creates the named tag
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true
+          build-args: |
+            BAKE_SCCACHE=${{ steps.flags.outputs.bake }}
+            SIRIUS_REF=dev
+          # Layer cache scoped per arch so amd64 and arm64 don't collide
+          cache-from: type=gha,scope=benchmark-runner-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=benchmark-runner-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Merge per-arch digests into a single multi-arch manifest under :latest
+  merge:
+    runs-on: ubuntu-22.04
+    needs: build
+    permissions:
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          # Build the list of per-arch image references from the digest files
+          IMAGES=$(printf "${{ env.IMAGE }}@sha256:%s " *)
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE }}:latest \
+            --tag ${{ env.IMAGE }}:${{ github.sha }} \
+            $IMAGES
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:latest
