@@ -18,10 +18,15 @@
 name: Build benchmark runner image
 
 # Triggers:
+#   - PRs touching the Dockerfile or this workflow: validate the build before merge
 #   - Dockerfile changes merged to dev: rebuild toolchain layer only (no cache bake)
 #   - Nightly cron: rebuild with fresh sccache from latest dev
 #   - Manual dispatch: supports on-demand rebuilds and cache bake override
 on:
+  pull_request:
+    paths:
+      - '.github/docker/benchmark-runner/**'
+      - '.github/workflows/benchmark-runner-image.yml'
   push:
     branches: [dev]
     paths: ['.github/docker/benchmark-runner/**']
@@ -142,10 +147,22 @@ jobs:
         run: |
           # Build the list of per-arch image references from the digest files
           IMAGES=$(printf "${{ env.IMAGE }}@sha256:%s " *)
-          docker buildx imagetools create \
-            --tag ${{ env.IMAGE }}:latest \
-            --tag ${{ env.IMAGE }}:${{ github.sha }} \
-            $IMAGES
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PRs push to :pr-latest (single overwritten tag) for testing; :latest is not touched
+            docker buildx imagetools create \
+              --tag ${{ env.IMAGE }}:pr-latest \
+              $IMAGES
+          else
+            docker buildx imagetools create \
+              --tag ${{ env.IMAGE }}:latest \
+              --tag ${{ env.IMAGE }}:${{ github.sha }} \
+              $IMAGES
+          fi
 
       - name: Inspect manifest
-        run: docker buildx imagetools inspect ${{ env.IMAGE }}:latest
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            docker buildx imagetools inspect ${{ env.IMAGE }}:pr-latest
+          else
+            docker buildx imagetools inspect ${{ env.IMAGE }}:latest
+          fi
