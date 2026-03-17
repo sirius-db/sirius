@@ -44,6 +44,7 @@ cuda-version = "13.*"
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
 CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
+VCPKG_CUDA_VERSION = "13"
 
 [feature.cuda12.system-requirements]
 cuda = "12"
@@ -54,6 +55,7 @@ cuda-version = "12.*"
 [feature.cuda12.activation.env]
 # GPU architectures: Turing through Hopper (75, 80, 86, 90a)
 CUDAARCHS = "75-real;80-real;86-real;90a-real"
+VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]
 bison = "*"

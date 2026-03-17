@@ -13,5 +13,6 @@
   "license": "Apache-2.0",
   "name": "cccl",
   "supports": "linux",
-  "version": "3.2.0"
+  "version": "3.2.0",
+  "port-version": 1
 }

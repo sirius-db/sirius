@@ -41,4 +41,23 @@ file(GLOB LIBCUDACXX_CMAKE_FILES "${SOURCE_PATH}/lib/cmake/libcudacxx/*")
 file(INSTALL ${LIBCUDACXX_CMAKE_FILES}
      DESTINATION "${CURRENT_PACKAGES_DIR}/share/libcudacxx")
 
+# Fix header-search.cmake files: upstream configs expect headers relative to
+# the CCCL source tree (e.g. ../../../libcudacxx/include). In vcpkg, all
+# headers are installed to ${prefix}/include, so fix the paths.
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/libcudacxx/libcudacxx-header-search.cmake"
+  [[${CMAKE_CURRENT_LIST_DIR}/../../../libcudacxx/include]]
+  [[${CMAKE_CURRENT_LIST_DIR}/../../include]]
+)
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/thrust/thrust-header-search.cmake"
+  [[${CMAKE_CURRENT_LIST_DIR}/../../../thrust]]
+  [[${CMAKE_CURRENT_LIST_DIR}/../../include]]
+)
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/cub/cub-header-search.cmake"
+  [[${CMAKE_CURRENT_LIST_DIR}/../../../cub]]
+  [[${CMAKE_CURRENT_LIST_DIR}/../../include]]
+)
+
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
