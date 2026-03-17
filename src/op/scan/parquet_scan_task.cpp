@@ -260,11 +260,15 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
                     projected_columns.emplace_back(scan_op->names[col_idx]);
                   });
 
+    // libcudf hybrid_scan rejects an empty column list ("No columns selected"). If the
+    // selected set is empty (e.g. plan shape with LIMIT/OFFSET), read all columns instead.
+    if (!projected_columns.empty()) {
 #if CUDF_VERSION_NUM >= 2604
-    _reader_options.set_column_names(std::move(projected_columns));
+      _reader_options.set_column_names(std::move(projected_columns));
 #else
-    _reader_options.set_columns(std::move(projected_columns));
+      _reader_options.set_columns(std::move(projected_columns));
 #endif
+    }
   }
 
   // Compute the byte counts per row group for the selected columns for task partitioning

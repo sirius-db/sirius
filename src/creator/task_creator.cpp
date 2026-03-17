@@ -144,14 +144,19 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
       throw std::runtime_error(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
-    // WSM TODO: how do we handle other ports that are not default?
+    SIRIUS_LOG_INFO("[SCHED] {} (op={}) READY -> producer {} (op={})",
+                    node->get_name(),
+                    node->get_operator_id(),
+                    hint.value().producer->get_name(),
+                    hint.value().producer->get_operator_id());
     return hint.value().producer;
   } else if (hint.has_value() &&
              hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
     auto* producer = hint.value().producer;
-    // DuckDB scan tasks create their own continuations internally, so the
-    // task creator should never schedule additional scans from downstream.
-    // (Parquet scans are fine — they use partition indices that self-limit.)
+    SIRIUS_LOG_INFO("[SCHED] {} (op={}) WAITING -> producer {}",
+                    node->get_name(),
+                    node->get_operator_id(),
+                    producer ? producer->get_name() : "null");
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
       auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
       if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
@@ -214,9 +219,14 @@ void task_creator::manager_loop()
     auto node = request->node;
     if (node == nullptr) { continue; }
 
+    SIRIUS_LOG_INFO(
+      "[SCHED] schedule request for {} (op={})", node->get_name(), node->get_operator_id());
     node = get_operator_for_next_task(node);
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      SIRIUS_LOG_INFO("[SCHED]   -> resolved to null, skipping");
+      continue;
+    }
 
     // Schedule the task creation work on the thread pool
     _thread_pool->schedule([this, node, ticket = std::move(ticket)]() mutable {
@@ -279,8 +289,10 @@ void task_creator::manager_loop()
                                                // repositories
             std::move(scan_task_local_state),
             scan_task_global_state);
-          pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
-                                          // with the task creation
+          SIRIUS_LOG_INFO("[TASK] DUCKDB_SCAN pipeline={} op={}",
+                          pipeline->get_pipeline_id(),
+                          node->get_operator_id());
+          pipeline->mark_task_created();
           _pipeline_executor->schedule(std::move(scan_task));
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
           size_t operator_id             = node->get_operator_id();
@@ -290,14 +302,25 @@ void task_creator::manager_loop()
           auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
           if (!partition_idx.has_value()) {
             pipeline->mark_task_completed();
+            SIRIUS_LOG_INFO("[TASK] PARQUET_SCAN pipeline={} op={} exhausted (finished={})",
+                            pipeline->get_pipeline_id(),
+                            operator_id,
+                            pipeline->is_pipeline_finished());
             if (pipeline->is_pipeline_finished()) {
               auto output_consumers = pipeline->get_output_consumers();
               for (auto& output_consumer : output_consumers) {
+                SIRIUS_LOG_INFO("[TASK]   -> scheduling consumer {} (op={})",
+                                output_consumer->get_name(),
+                                output_consumer->get_operator_id());
                 schedule(output_consumer);
               }
             }
             return;
           }
+          SIRIUS_LOG_INFO("[TASK] PARQUET_SCAN pipeline={} op={} partition={}",
+                          pipeline->get_pipeline_id(),
+                          operator_id,
+                          *partition_idx);
           if (!parquet_task_global_state->has_more_partitions()) {
             parquet_scan->has_more_partitions = false;
           }
@@ -316,30 +339,33 @@ void task_creator::manager_loop()
                                                           parquet_task_global_state);
           _pipeline_executor->schedule(std::move(parquet_task));
         } else {
-          // need to exhaust input batches until all ports are empty
+          int batch_count = 0;
           while (!node->all_ports_empty()) {
-            // Mark task created BEFORE popping data from ports to prevent a race
-            // condition where update_pipeline_status() sees empty ports and matching
-            // task counters, prematurely marking the pipeline as finished.
             pipeline->mark_task_created();
 
             auto input_data = node->get_next_task_input_data();
             if (!input_data || input_data->get_data_batches().empty()) {
-              // No data was available (e.g., another thread already consumed it).
-              // Balance the counter. mark_task_completed() calls update_pipeline_status()
-              // which is correct: if all ports are truly empty and all real tasks have
-              // completed, the pipeline should finish.
               pipeline->mark_task_completed();
+              SIRIUS_LOG_INFO(
+                "[TASK] GPU pipeline={} {} (op={}) no-data after {} batches (finished={})",
+                pipeline->get_pipeline_id(),
+                node->get_name(),
+                node->get_operator_id(),
+                batch_count,
+                pipeline->is_pipeline_finished());
               if (pipeline->is_pipeline_finished()) {
                 auto output_consumers = pipeline->get_output_consumers();
                 for (auto& output_consumer : output_consumers) {
+                  SIRIUS_LOG_INFO("[TASK]   -> scheduling consumer {} (op={})",
+                                  output_consumer->get_name(),
+                                  output_consumer->get_operator_id());
                   this->schedule(output_consumer);
                 }
               }
               break;
             }
+            batch_count++;
 
-            // Check to see if you need to create a new global state for this operator
             size_t operator_id                  = node->get_operator_id();
             auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
 
@@ -351,6 +377,13 @@ void task_creator::manager_loop()
                                                             std::move(local_state),
                                                             gpu_pipeline_task_global_state);
             _pipeline_executor->schedule(std::move(task));
+          }
+          if (batch_count > 0) {
+            SIRIUS_LOG_INFO("[TASK] GPU pipeline={} {} (op={}) created {} tasks",
+                            pipeline->get_pipeline_id(),
+                            node->get_name(),
+                            node->get_operator_id(),
+                            batch_count);
           }
         }
       } catch (const std::exception& e) {
