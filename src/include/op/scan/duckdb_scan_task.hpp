@@ -310,7 +310,10 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
     return _approximate_batch_size;
   }
 
-  std::size_t get_task_consumption_basis() const override { return get_approximate_batch_size(); }
+  [[nodiscard]] std::size_t get_task_consumption_basis() const override
+  {
+    return get_approximate_batch_size();
+  }
 
   //===----------Methods----------===//
   /**

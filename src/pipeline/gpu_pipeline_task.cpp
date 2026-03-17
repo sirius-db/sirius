@@ -360,6 +360,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto const prepare_start = std::chrono::high_resolution_clock::now();
   auto reservation         = local_state.release_reservation();
   if (!reservation) { throw std::runtime_error("GPU pipeline task requires a memory reservation"); }
+  auto reservation_bytes = reservation->size();
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
@@ -414,7 +415,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
   _allocator       = allocator;
-  auto input_bytes = get_input_size();
+  auto input_basis = local_state.get_task_consumption_basis();
   auto output_data = compute_task(stream);
 
   // Record memory metrics for future reservation estimates
@@ -425,7 +426,15 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-    global.get_memory_history().record({input_bytes, peak_bytes, output_bytes});
+    global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
+    SIRIUS_LOG_TRACE(
+      "Pipeline {}: memory history record - input_basis={}, output_bytes={}, reservation_bytes={}, "
+      "peak_bytes={}",
+      pipeline->get_pipeline_id(),
+      input_basis,
+      output_bytes,
+      reservation_bytes,
+      peak_bytes);
   }
 
   if (output_data) { publish_output(*output_data, stream); }
@@ -451,6 +460,11 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
     _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
   auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
   auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: estimated reservation size - input_size={}, estimate={}",
+    _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_pipeline_id(),
+    input_size,
+    estimate ? *estimate : 0);
   if (estimate) { return *estimate; }
   // Fallback: no history yet (first batch in pipeline)
   return input_size * 2;

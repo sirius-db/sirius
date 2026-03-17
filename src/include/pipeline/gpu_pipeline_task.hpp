@@ -76,6 +76,11 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
 
+  // We want to cache the estimation basis, because its going to be calculated from the inputs, but
+  // if the inputs change due to preparing for processing then we will loose this information and we
+  // can't then provide it to the operator history
+  mutable std::optional<std::size_t> _estimation_basis = std::nullopt;
+
   /**
    * @brief Get a const pointer to the reservation (non-owning).
    *
@@ -85,13 +90,15 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
+    if (_estimation_basis) { return *_estimation_basis; }
     std::size_t input_size = 0;
     if (_input_data) {
       for (const auto& batch : _input_data->get_data_batches()) {
         if (batch && batch->get_data()) { input_size += batch->get_data()->get_size_in_bytes(); }
       }
     }
-    return input_size;
+    _estimation_basis = input_size;
+    return *_estimation_basis;
   }
 };
 

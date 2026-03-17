@@ -22,6 +22,7 @@
 
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
+#include <log/logging.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
@@ -551,6 +552,11 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
+
+  SIRIUS_LOG_TRACE("Pipeline {}: duckdb_scan_task compute_task starting, operator={} (id={})",
+                   get_pipeline_id(),
+                   g_state._op.get_name(),
+                   g_state._op.get_operator_id());
 
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.

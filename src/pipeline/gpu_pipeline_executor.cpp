@@ -109,8 +109,10 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
     SIRIUS_LOG_TRACE(
-      "GPU Pipeline Executor: Acquiring memory reservation of {} bytes for task {}. Memory "
+      "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
+      "{}. Memory "
       "available: {}, total reserved: {}, max: {}",
+      gpu_task->get_pipeline_id(),
       bytes_needs,
       gpu_task->get_task_id(),
       _memory_space->get_available_memory(),
