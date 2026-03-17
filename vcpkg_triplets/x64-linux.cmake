@@ -7,8 +7,8 @@ set(VCPKG_CMAKE_SYSTEM_NAME Linux)
 # Only build release to speed up builds
 set(VCPKG_BUILD_TYPE release)
 
-# CUDA version for ports that need version-specific binaries (e.g. nvcomp).
-# Set via VCPKG_CUDA_VERSION env var; defaults to 13.
+# CUDA version for ports that need version-specific binaries (e.g. nvcomp). Set
+# via VCPKG_CUDA_VERSION env var; defaults to 13.
 if(DEFINED ENV{VCPKG_CUDA_VERSION})
   set(VCPKG_CUDA_VERSION $ENV{VCPKG_CUDA_VERSION})
 else()
