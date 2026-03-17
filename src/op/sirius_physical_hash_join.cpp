@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
+#include "cudf/binaryop.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
@@ -51,6 +52,119 @@ static void collect_bound_ref_indices(duckdb::Expression& expr,
   }
   duckdb::ExpressionIterator::EnumerateChildren(
     expr, [&](duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
+}
+
+/// Extract the column index from a join condition expression (handles BOUND_REF and BOUND_CAST).
+static cudf::size_type extract_condition_col_index(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    return static_cast<cudf::size_type>(expr.Cast<duckdb::BoundReferenceExpression>().index);
+  }
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
+    return extract_condition_col_index(*expr.Cast<duckdb::BoundCastExpression>().child);
+  }
+  throw std::runtime_error(
+    "Cannot extract column index from inequality condition expression of class " +
+    std::to_string(static_cast<int>(expr.GetExpressionClass())));
+}
+
+/// Map a DuckDB comparison type to a cuDF binary operator for inequality post-filtering.
+static cudf::binary_operator comparison_to_binary_op(duckdb::ExpressionType cmp)
+{
+  switch (cmp) {
+    case duckdb::ExpressionType::COMPARE_NOTEQUAL: return cudf::binary_operator::NOT_EQUAL;
+    case duckdb::ExpressionType::COMPARE_LESSTHAN: return cudf::binary_operator::LESS;
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN: return cudf::binary_operator::GREATER;
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      return cudf::binary_operator::LESS_EQUAL;
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+      return cudf::binary_operator::GREATER_EQUAL;
+    default:
+      throw std::runtime_error("Unsupported comparison for inequality post-filter: " +
+                               duckdb::ExpressionTypeToString(cmp));
+  }
+}
+
+/// Evaluate inequality join conditions on equality-matched row pairs and filter the index vectors
+/// in-place. After this call, left_indices and right_indices contain only the pairs that satisfy
+/// all inequality conditions.
+static void apply_inequality_post_filter(
+  duckdb::vector<duckdb::JoinCondition> const& conditions,
+  std::size_t num_equality_conditions,
+  cudf::table_view probe_full,
+  cudf::table_view build_full,
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>>& left_indices,
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>>& right_indices,
+  rmm::cuda_stream_view stream)
+{
+  if (left_indices->size() == 0) { return; }
+
+  auto const num_matched = static_cast<cudf::size_type>(left_indices->size());
+  cudf::column_view left_map(
+    cudf::data_type(cudf::type_id::INT32), num_matched, left_indices->data(), nullptr, 0, 0, {});
+  cudf::column_view right_map(
+    cudf::data_type(cudf::type_id::INT32), num_matched, right_indices->data(), nullptr, 0, 0, {});
+
+  std::unique_ptr<cudf::column> combined_mask;
+
+  for (std::size_t i = num_equality_conditions; i < conditions.size(); i++) {
+    auto const& cond   = conditions[i];
+    auto left_col_idx  = extract_condition_col_index(*cond.left);
+    auto right_col_idx = extract_condition_col_index(*cond.right);
+
+    auto left_gathered  = cudf::gather(cudf::table_view({probe_full.column(left_col_idx)}),
+                                      left_map,
+                                      cudf::out_of_bounds_policy::DONT_CHECK,
+                                      stream);
+    auto right_gathered = cudf::gather(cudf::table_view({build_full.column(right_col_idx)}),
+                                       right_map,
+                                       cudf::out_of_bounds_policy::DONT_CHECK,
+                                       stream);
+
+    auto op          = comparison_to_binary_op(cond.comparison);
+    auto cond_result = cudf::binary_operation(left_gathered->get_column(0).view(),
+                                              right_gathered->get_column(0).view(),
+                                              op,
+                                              cudf::data_type(cudf::type_id::BOOL8),
+                                              stream);
+
+    if (combined_mask) {
+      combined_mask = cudf::binary_operation(combined_mask->view(),
+                                             cond_result->view(),
+                                             cudf::binary_operator::BITWISE_AND,
+                                             cudf::data_type(cudf::type_id::BOOL8),
+                                             stream);
+    } else {
+      combined_mask = std::move(cond_result);
+    }
+  }
+
+  // Filter the index pairs using the combined mask.
+  cudf::table_view indices_table({left_map, right_map});
+  auto filtered      = cudf::apply_boolean_mask(indices_table, combined_mask->view(), stream);
+  auto filtered_cols = filtered->release();
+
+  // Move filtered data into new device_uvectors.
+  auto new_left = std::make_unique<rmm::device_uvector<cudf::size_type>>(
+    static_cast<std::size_t>(filtered_cols[0]->view().size()), stream);
+  auto new_right = std::make_unique<rmm::device_uvector<cudf::size_type>>(
+    static_cast<std::size_t>(filtered_cols[1]->view().size()), stream);
+
+  if (new_left->size() > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(new_left->data(),
+                                  filtered_cols[0]->view().data<cudf::size_type>(),
+                                  new_left->size() * sizeof(cudf::size_type),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(new_right->data(),
+                                  filtered_cols[1]->view().data<cudf::size_type>(),
+                                  new_right->size() * sizeof(cudf::size_type),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.value()));
+  }
+
+  left_indices  = std::move(new_left);
+  right_indices = std::move(new_right);
 }
 
 bool sirius_physical_hash_join::are_conditions_supported(
@@ -385,14 +499,20 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
     static_cast<int>(_join_mode),
     _max_build_hash_table_bytes);
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      join_type != duckdb::JoinType::RIGHT && _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
-    _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
-    SIRIUS_LOG_INFO(
-      "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and build "
-      "side size {} bytes",
-      this->get_operator_id(),
-      num_partitions,
-      build_side_bytes);
+      join_type != duckdb::JoinType::RIGHT && _join_mode != HASH_JOIN_MODE::BUILD_PROBE) {
+    bool has_inequality = (num_equality_conditions < conditions.size());
+    // For mixed joins (equality + inequality), enable BUILD_PROBE only for INNER where
+    // inequality conditions can be applied as a post-filter on equality-matched rows.
+    if (!has_inequality || join_type == duckdb::JoinType::INNER) {
+      _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
+      SIRIUS_LOG_INFO(
+        "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and "
+        "build side size {} bytes{}",
+        this->get_operator_id(),
+        num_partitions,
+        build_side_bytes,
+        has_inequality ? " (with inequality post-filter)" : "");
+    }
   }
 }
 
@@ -916,6 +1036,20 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         auto result   = _hash_table->inner_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
         right_indices = std::move(result.second);
+        if (num_equality_conditions < conditions.size()) {
+          auto probe_full = get_cudf_table_view(*input_batches[0]);
+          auto build_full = _build_table->get_data()
+                              ->cast<cucascade::gpu_table_representation>()
+                              .get_table()
+                              .view();
+          apply_inequality_post_filter(conditions,
+                                       num_equality_conditions,
+                                       probe_full,
+                                       build_full,
+                                       left_indices,
+                                       right_indices,
+                                       stream);
+        }
       } else if (join_type == duckdb::JoinType::LEFT) {
         auto result   = _hash_table->left_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
