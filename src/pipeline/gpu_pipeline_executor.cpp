@@ -172,9 +172,9 @@ void gpu_pipeline_executor::manager_loop()
         auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
         uint32_t next_retry_count = 1;
         uint64_t orig_task_id     = gpu_task->get_task_id();
-        if (cur_local && cur_local->retry_count > 0) {
+        if (cur_local && cur_local->original_task_id.has_value()) {
           next_retry_count = cur_local->retry_count + 1;
-          orig_task_id     = cur_local->original_task_id;
+          orig_task_id     = cur_local->original_task_id.value();
         }
 
         static constexpr uint32_t MAX_OOM_RETRIES = 10;
@@ -295,7 +295,6 @@ void gpu_pipeline_executor::drain_and_wait()
   // Interrupt pop() so the manager_loop sees a nullptr return and breaks out
   // of its while loop (within at most the 10 ms poll interval in pop()).
   _task_queue.interrupt();
-  _task_queue.drain();
 
   // Join the manager thread so we know it has exited (it will have seen either
   // an invalid ticket from the stopped kiosk or a nullptr from the interrupted queue).
@@ -305,12 +304,12 @@ void gpu_pipeline_executor::drain_and_wait()
   // ticket that is released when the lambda completes).
   _kiosk.wait_all();
 
-  // Re-enable the kiosk so the restarted manager can acquire tickets again.
-  _kiosk.resume();
+  // Clear any remaining tasks from the queue.
+  _task_queue.drain();
 
-  // Reset the queue and restart the manager so the executor is ready for
-  // the next query.
-  _task_queue.reset();
+  // Re-enable the kiosk and queue so the executor is ready for the next query.
+  _kiosk.resume();
+  _task_queue.reactivate();
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 

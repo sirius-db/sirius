@@ -105,7 +105,6 @@ void duckdb_scan_executor::drain_and_wait()
 
   // Interrupt pop() so the manager_loop sees a nullptr and breaks out.
   _task_queue.interrupt();
-  _task_queue.drain();
 
   // Join the manager thread so we know it has exited.
   if (_manager_thread.joinable()) { _manager_thread.join(); }
@@ -113,9 +112,12 @@ void duckdb_scan_executor::drain_and_wait()
   // Wait for all in-flight thread-pool tasks to finish.
   _kiosk.wait_all();
 
+  // Clear any remaining tasks from the queue.
+  _task_queue.drain();
+
   // Re-enable the kiosk and queue so the executor is ready for the next query.
   _kiosk.resume();
-  _task_queue.reset();
+  _task_queue.reactivate();
   _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
 }
 
