@@ -140,12 +140,23 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
   auto scans = query->get_scan_operators();
   _scan_executor->prepare_cache_for_scan_operators(scans);
 
+  // In preload mode, inject cached DuckDB scan data directly into pipelines,
+  // bypassing the entire scan task infrastructure (global state init, local
+  // state, compute_task).  Only non-preloaded scans go through the normal path.
+  _preloaded_consumers = _scan_executor->preload_into_pipelines(scans);
+
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   while (!_priority_scans.empty()) {
     _priority_scans.pop();
   }
   for (auto* scan : scans) {
     _priority_scans.push(scan);
+  }
+  // In preload mode, all scans are served from cache — no tasks to schedule
+  if (_scan_executor->is_preload_mode()) {
+    while (!_priority_scans.empty()) {
+      _priority_scans.pop();
+    }
   }
 }
 
@@ -162,6 +173,12 @@ std::future<void> pipeline_executor::start_query()
   }
 
   schedule_next_scan_tasks();
+
+  // Schedule downstream consumers from preloaded DuckDB scans
+  for (auto* consumer : _preloaded_consumers) {
+    _task_creator->schedule(consumer);
+  }
+  _preloaded_consumers.clear();
 
   return future;
 }

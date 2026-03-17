@@ -191,6 +191,25 @@ class duckdb_scan_executor {
   void prepare_cache_for_scan_operators(
     const std::vector<sirius::op::sirius_physical_operator*>& scan_operators);
 
+  /**
+   * @brief Inject cached scan data directly into pipeline data repositories.
+   *
+   * In preload mode, this bypasses the entire scan task infrastructure
+   * (global state init, local state, compute_task) and pushes cached
+   * data_batch objects straight into the downstream operator ports.
+   *
+   * For each scan operator (DuckDB or parquet) whose data is cached:
+   *   1. Cached batches are cloned or shared based on cache level
+   *   2. All batches are pushed to the sink's downstream repos
+   *   3. The scan operator is marked exhausted / pipeline finished
+   *
+   * @param scan_operators All scan operators in the current query
+   * @return Downstream consumer operators that should be scheduled,
+   *         or empty if not in preload mode.
+   */
+  std::vector<op::sirius_physical_operator*> preload_into_pipelines(
+    const std::vector<op::sirius_physical_operator*>& scan_operators);
+
  private:
   /**
    * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
@@ -204,6 +223,35 @@ class duckdb_scan_executor {
 
   std::unique_ptr<op::operator_data> get_scan_output(pipeline::sirius_pipeline_itask* task,
                                                      rmm::cuda_stream_view stream);
+
+  /// Identifies the type of scan for cache cloning dispatch.
+  enum class scan_type { DUCKDB, PARQUET };
+
+  /**
+   * @brief Clone or share cached batches based on cache level and scan type.
+   *
+   * Single source of truth for the cloning strategy:
+   *   - TABLE_GPU: zero-copy (return as-is)
+   *   - Other levels + DUCKDB: deep clone via data_batch::clone()
+   *   - Other levels + PARQUET: shallow_clone() on host representations
+   *
+   * @param batches The cached batch vector to clone
+   * @param type    The scan type that produced these batches
+   * @param stream  CUDA stream for async copy (used by clone)
+   * @return Cloned or shared batch vector ready for pipeline injection
+   */
+  std::vector<std::shared_ptr<cucascade::data_batch>> clone_cached_batches(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
+    scan_type type,
+    rmm::cuda_stream_view stream);
+
+  /**
+   * @brief Mark a scan operator's pipeline as finished for preload.
+   *
+   * Sets the appropriate exhausted/has_more_partitions flag based on
+   * scan type, then calls update_pipeline_status().
+   */
+  static void mark_scan_pipeline_finished(op::sirius_physical_operator* scan_op);
 
   struct cache_entry {
     std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;

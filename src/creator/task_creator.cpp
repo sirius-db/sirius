@@ -75,6 +75,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
 
     if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+      // In preload mode, DuckDB scans are served from cache — skip creating
+      // global state (which calls init_global and acquires DuckDB locks).
+      if (_pipeline_executor->get_scan_executor().is_preload_mode()) { continue; }
       _scan_operator_global_state_map.emplace(
         operator_id,
         std::make_shared<op::scan::duckdb_scan_task_global_state>(
@@ -83,6 +86,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+      // In preload mode, all scans are served from cache — skip rebind (which
+      // resets has_more_partitions) and skip constructor (which reads footers).
+      if (_pipeline_executor->get_scan_executor().is_preload_mode()) { continue; }
       auto it = _parquet_scan_operator_global_state_map.find(operator_id);
       if (it != _parquet_scan_operator_global_state_map.end()) {
         it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
@@ -129,9 +135,13 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   if (node == nullptr) { return nullptr; }
 
   if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-    size_t operator_id             = node->get_operator_id();
-    auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
-    if (parquet_task_global_state->has_more_partitions()) {
+    size_t operator_id = node->get_operator_id();
+    auto it            = _parquet_scan_operator_global_state_map.find(operator_id);
+    if (it == _parquet_scan_operator_global_state_map.end()) {
+      // Preloaded scan — no global state exists, no more tasks to create
+      return nullptr;
+    }
+    if (it->second->has_more_partitions()) {
       return node;
     } else {
       return nullptr;
@@ -153,8 +163,12 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // task creator should never schedule additional scans from downstream.
     // (Parquet scans are fine — they use partition indices that self-limit.)
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
-      if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
+      auto it = _scan_operator_global_state_map.find(producer->get_operator_id());
+      if (it == _scan_operator_global_state_map.end()) {
+        // Preloaded scan — no global state exists, no more tasks to create
+        return nullptr;
+      }
+      if (it->second->is_source_drained() || !it->second->can_create_more_tasks()) {
         return nullptr;
       }
     }

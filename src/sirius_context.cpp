@@ -87,11 +87,13 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
   auto query = context.GetCurrentQuery();
   spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+  // Propagate cache level to the scan executor BEFORE checking for cache hits,
+  // so the first query in a session can populate the cache.
+  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
   bool query_cache_hit = false;
   if (config_.is_scan_caching_enabled()) {
     query_cache_hit = pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
-  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
 
   task_creator_->reset(query_cache_hit);
   task_creator_->set_client_context(context);
