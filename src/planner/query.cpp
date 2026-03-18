@@ -18,15 +18,15 @@
 
 namespace sirius::planner {
 
-query::query(sirius_pipeline_hashmap pipeline_hashmap)
-  : _pipeline_hashmap(std::move(pipeline_hashmap))
+query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines)
+  : _pipelines(std::move(pipelines))
 {
   build_indices();
 }
 
 void query::build_indices()
 {
-  for (auto& pipeline : _pipeline_hashmap._vec) {
+  for (auto& pipeline : _pipelines) {
     for (auto& op : pipeline->get_operators()) {
       op.get().set_pipeline(pipeline);
     }
@@ -67,9 +67,7 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_phy
 
 const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& query::get_pipelines() const
 {
-  return _pipeline_hashmap._vec;
+  return _pipelines;
 }
-
-sirius_pipeline_hashmap& query::get_pipeline_hashmap() { return _pipeline_hashmap; }
 
 }  // namespace sirius::planner

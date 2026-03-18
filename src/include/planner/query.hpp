@@ -19,7 +19,6 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius_pipeline_hashmap.hpp"
 
 namespace sirius::planner {
 
@@ -35,10 +34,9 @@ class query {
   /**
    * @brief Construct a new query object.
    *
-   * @param pipeline_hashmap The pipeline hashmap containing the ordered pipelines
-   *                         required to execute this query.
+   * @param pipelines The ordered pipelines required to execute this query.
    */
-  explicit query(sirius_pipeline_hashmap pipeline_hashmap);
+  explicit query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines);
 
   ~query() = default;
 
@@ -52,9 +50,6 @@ class query {
 
   /**
    * @brief Get the scan operators in pipeline execution order.
-   *
-   * Returns a vector of pointers to scan operators in the order they appear
-   * in the sirius_pipeline_hashmap.
    *
    * @return Reference to the vector of pointers to scan operators.
    */
@@ -72,26 +67,16 @@ class query {
   /**
    * @brief Get all pipelines in execution order.
    *
-   * Returns the pipelines in the order they appear in the sirius_pipeline_hashmap,
-   * which represents the required execution order for query completion.
-   *
    * @return Reference to the vector of pipelines in execution order.
    */
   [[nodiscard]] const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& get_pipelines()
     const;
 
-  /**
-   * @brief Get the underlying pipeline hashmap.
-   *
-   * @return Reference to the pipeline hashmap.
-   */
-  [[nodiscard]] sirius_pipeline_hashmap& get_pipeline_hashmap();
-
  private:
-  //! Builds the internal data structures from the pipeline hashmap
+  //! Builds the internal data structures from the pipelines
   void build_indices();
 
-  sirius_pipeline_hashmap _pipeline_hashmap;
+  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> _pipelines;
   //! Cached scan operators in pipeline execution order
   duckdb::vector<op::sirius_physical_operator*> _scan_operators;
   //! Map from operator pointer to its containing pipeline
