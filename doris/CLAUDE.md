@@ -24,6 +24,30 @@ pixi run substrait-build
 
 ## Running
 
+### Cluster startup (preferred — handles FE, BE registration, GPU memory, lock files)
+
+```bash
+# Start FE + 2 Sirius GPU BEs (handles cleanup, registration, health checks)
+pixi run -e doris -- bash doris/scripts/start-cluster.sh 2
+
+# Check status
+pixi run -e doris -- bash doris/scripts/start-cluster.sh --status
+
+# Stop everything
+pixi run -e doris -- bash doris/scripts/start-cluster.sh --stop
+```
+
+The script:
+- Kills any previous FE/BEs, cleans lock files
+- Starts FE (via pixi doris-fe env for JAVA_HOME), waits for health
+- Drops stale backends from FE
+- Starts N BEs with separate HOME dirs (avoids sirius.lock conflicts)
+- Waits for all BEs to register and become alive
+- Config: `~/.sirius/sirius.cfg` is copied to each BE's HOME. For 2 BEs,
+  set `usage_limit_fraction ≤ 0.3` to avoid GPU OOM.
+
+### Manual startup (individual terminals)
+
 ```bash
 pixi run -e doris-fe doris-fe-start      # FE (terminal 1)
 pixi run -e doris sirius-be              # BE 1 (terminal 2)
@@ -32,6 +56,19 @@ pixi run -e doris-fe doris-fe-add-sirius # manual FE registration if needed
 ```
 
 Connect: `pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root`
+
+### GPU warmup (required before queries)
+
+First query triggers GPU pipeline compilation (~30s). FE times out at 30s.
+Always warm up each BE individually before running real queries:
+
+```bash
+# Get backend IDs
+pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root -N -e "SHOW BACKENDS" | awk -F'\t' '{print "id="$1, "host="$2, "alive="$10}'
+
+# Warm up each BE (use SELECT *, NOT count(*) — count gets optimized away)
+pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root -e "SET query_timeout=600; SELECT * FROM local(\"file_path\"=\"/data/tpch/sf1/snappy/nation.parquet\", \"format\"=\"parquet\", \"backend_id\"=\"BE_ID\") LIMIT 5"
+```
 
 ## Testing
 
@@ -43,10 +80,28 @@ pixi run -e doris -- cargo test -p plan-translator
 pixi run -e doris -- cargo test --workspace
 
 # End-to-end TPC-H (requires running FE + BE)
-./doris/scripts/run-tpch.sh --skip-build --queries 1,6,14
+pixi run -e doris -- bash doris/scripts/run-tpch.sh --skip-build --queries 1,6,14
 ```
 
-TPC-H data at `/data/tpch/sf{1,10,100,1000}/snappy/*.parquet`.
+TPC-H data: `/data/tpch/sf{1,10,100,1000}/snappy/*.parquet` (single files),
+`/data/tpch/sf1/p16/snappy/{table}/` (16 partitions per table).
+
+### Distributed query testing
+
+Use `shared_storage=true` with partitioned data for multi-BE queries. The FE
+splits individual files across BEs (directory paths are expanded by the BE's
+glob RPC). Always use SQL files for queries (inline `-e` breaks on commas):
+
+```bash
+cat > /tmp/test.sql << 'EOSQL'
+SET query_timeout = 600;
+SELECT l_returnflag, COUNT(*) FROM local(
+  "file_path"="/data/tpch/sf1/p16/snappy/lineitem/",
+  "format"="parquet", "shared_storage"="true"
+) GROUP BY l_returnflag ORDER BY l_returnflag;
+EOSQL
+pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root < /tmp/test.sql
+```
 
 ## Workspace Crates
 
