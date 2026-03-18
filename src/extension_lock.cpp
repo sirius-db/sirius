@@ -18,11 +18,12 @@
 
 #include <fcntl.h>     // for open, O_CREAT, O_CLOEXEC, etc.
 #include <sys/file.h>  // for flock
-#include <unistd.h>    // for close
+#include <unistd.h>    // for close, getpid
 
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -38,17 +39,43 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
                              "': " + std::strerror(errno));
   }
 
+  // Write our PID to the lock file so we can detect same-process re-acquisition.
+  pid_t our_pid = getpid();
+  std::string pid_str = std::to_string(our_pid) + "\n";
+  (void)write(fd_, pid_str.c_str(), pid_str.size());
+
   // Try to acquire an exclusive lock on the file
   if (flock(fd_, LOCK_EX | LOCK_NB) == -1) {
     int err = errno;
-    close(fd_);  // cleanup before throw
-    fd_ = -1;
 
     if (err == EWOULDBLOCK) {
+      // Check if the lock is held by the same process (another DuckDB instance
+      // in the same process, e.g. when multiple test files run in one binary).
+      // Read the PID from the lock file via a separate fd.
+      int check_fd = open(lock_path_.c_str(), O_RDONLY | O_CLOEXEC);
+      if (check_fd != -1) {
+        char buf[32] = {};
+        ssize_t n = read(check_fd, buf, sizeof(buf) - 1);
+        ::close(check_fd);
+        if (n > 0) {
+          pid_t holder_pid = static_cast<pid_t>(std::strtol(buf, nullptr, 10));
+          if (holder_pid == our_pid) {
+            // Same process — allow it. The existing lock holder will release it
+            // when its extension_lock is destroyed.
+            close(fd_);
+            fd_ = -1;
+            return;
+          }
+        }
+      }
+      close(fd_);
+      fd_ = -1;
       throw std::runtime_error("Extension '" + extension_name +
                                "' is already loaded in another process." +
                                std::string(" (Lock file: ") + lock_path_ + ")");
     } else {
+      close(fd_);
+      fd_ = -1;
       throw std::runtime_error("Failed to lock file: " + std::string(std::strerror(err)));
     }
   }

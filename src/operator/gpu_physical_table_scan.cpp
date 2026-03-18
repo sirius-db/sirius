@@ -1001,7 +1001,11 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext& exec_c
   string table_name;
   for (const auto& it : to_string_result) {
     if (it.first.compare("Table") == 0) {
-      table_name = it.second;
+      // DuckDB v1.5.0 returns a fully qualified name (e.g. "memory.main.hits").
+      // Extract just the table name (last dot-separated component).
+      auto& qualified = it.second;
+      auto dot        = qualified.rfind('.');
+      table_name      = (dot == string::npos) ? qualified : qualified.substr(dot + 1);
       break;
     }
   }
@@ -1439,7 +1443,11 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext& exec_cont
   string table_name;
   for (const auto& it : to_string_result) {
     if (it.first.compare("Table") == 0) {
-      table_name = it.second;
+      // DuckDB v1.5.0 returns a fully qualified name (e.g. "memory.main.hits").
+      // Extract just the table name (last dot-separated component).
+      auto& qualified = it.second;
+      auto dot        = qualified.rfind('.');
+      table_name      = (dot == string::npos) ? qualified : qualified.substr(dot + 1);
       break;
     }
   }
@@ -1734,7 +1742,11 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
   string table_name;
   for (const auto& it : to_string_result) {
     if (it.first.compare("Table") == 0) {
-      table_name = it.second;
+      // DuckDB v1.5.0 returns a fully qualified name (e.g. "memory.main.hits").
+      // Extract just the table name (last dot-separated component).
+      auto& qualified = it.second;
+      auto dot        = qualified.rfind('.');
+      table_name      = (dot == string::npos) ? qualified : qualified.substr(dot + 1);
       break;
     }
   }
