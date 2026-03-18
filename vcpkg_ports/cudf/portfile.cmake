@@ -30,9 +30,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-logger
   REF
-  4c72b598f99c8aa06af49468b3fc82f3931c6bf6
+  v0.2.3
   SHA512
-  5d5997354d3811f6598d1c40296afe88110bdd9e7496ae860e4d3b85528f5d776b70efe3e35cb91d308e4f23e05e04ffa734f05f7b0ed1cdb3278366b0a8309a
+  eb7b5ebf6289d10307b8a34d9d1469ffcb63e9371e9dd5ccbda0351923b920ebae8220ceaa8d1d52c9bed57200f35921a6365a5f9a25a209a98314f75195310c
   HEAD_REF
   main)
 
@@ -54,9 +54,9 @@ vcpkg_from_github(
   REPO
   bshoshany/thread-pool
   REF
-  097aa718f25d44315cadb80b407144ad455ee4f9
+  v4.1.0
   SHA512
-  94177c61c5161c3cb5d088058d999239fb8bc446100e948bb9bbae44b73d0a020240c39d5232b13a628b56e233cb55a29e70baa69e511c73a6ba6a2505de1250
+  4908f00def23082e7ddc0b24a710e53b3fde51b02188e79cfcd9dabb22627ebd1b6e5b3c4bf1b366eae79660c26878cc034c171747c3d0b7ef8a98c85a77033b
   HEAD_REF
   master)
 
@@ -99,9 +99,9 @@ vcpkg_from_github(
   REPO
   google/googletest
   REF
-  6910c9d9165801d8827d628cb72eb7ea9dd538c5
+  v1.16.0
   SHA512
-  5cb681fb2c1b3283c4c4f3dc31878fda9c3134bb09643c19a38245f41aa2d55ea4c28f802ae5e5862c05452fec004f9aa0a2b4d3e937755949c217330bff9135
+  bec8dad2a5abbea8e9e5f0ceedd8c9dbdb8939e9f74785476b0948f21f5db5901018157e78387e106c6717326558d6642fc0e39379c62af57bf1205a9df8a18b
   HEAD_REF
   main)
 
@@ -159,11 +159,6 @@ vcpkg_cmake_configure(
 
 vcpkg_cmake_install()
 
-# Remove CPM-installed cuco files that conflict with standalone cuco:x64-linux
-# port
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/include/cuco")
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib/cmake/cuco")
-
 # Remove CPM-installed zstd files that conflict with standalone zstd:x64-linux
 # port
 file(REMOVE "${CURRENT_PACKAGES_DIR}/include/zdict.h")
@@ -171,6 +166,13 @@ file(REMOVE "${CURRENT_PACKAGES_DIR}/include/zstd.h")
 file(REMOVE "${CURRENT_PACKAGES_DIR}/include/zstd_errors.h")
 file(REMOVE "${CURRENT_PACKAGES_DIR}/lib/libzstd.a")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib/pkgconfig")
+
+# Move CPM-installed cuco cmake config to share/ before vcpkg_cmake_config_fixup
+# which cleans lib/cmake/. cuco is built as part of cudf via CPM, not as a
+# separate vcpkg port, but cudf-dependencies.cmake calls find_dependency(cuco).
+file(INSTALL "${CURRENT_PACKAGES_DIR}/lib/cmake/cuco/"
+     DESTINATION "${CURRENT_PACKAGES_DIR}/share/cuco")
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib/cmake/cuco")
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME cudf CONFIG_PATH lib/cmake/cudf)
 
