@@ -21,4 +21,5 @@ if [[ ! -e "$cmake_presets_dst" ]]; then
   ln -s "$cmake_presets_src" "$cmake_presets_dst"
 fi
 
+mkdir -p build
 pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh
