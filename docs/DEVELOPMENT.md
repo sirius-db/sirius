@@ -1,4 +1,4 @@
-# Developing CLion
+# Developing Sirius
 
 Since SiriusDB is an extension to DuckDB, the CMake project source is actually the `duckdb` directory (a submodule of
 this project), which then pulls in SiriusDB as an extension. We use
@@ -39,6 +39,51 @@ activated.
       duplicate the preset profiles to make the use our custom toolchain, as they use the `Default` toolchain by
       default.
 - Click `Apply` to save the changes. CLion should now properly configure the project, allowing you to build and debug.
+
+### Alternate setup using CLion
+
+An alternate way to use CLion with the pixi-provided tools (compilers, CMake, ninja, etc.) is
+to launch CLion from a shell where the pixi environment is already active, so
+that the CLion process inherits the correct `PATH` and environment variables. This works best when one is only using
+CLion natively on a machine directly, and not via remote connections.
+
+#### Launching CLion within the pixi environment
+
+Quit all existing CLion instances (more on that below), then inside the
+sirius root dir
+
+```bash
+pixi shell
+/path/to/clion.sh .
+```
+
+Where `/path/to/clion.sh` is the **real** CLion launcher, not the JetBrains
+Toolbox wrapper (again, more info below). For a typical Toolbox install
+on Linux this is along the lines of:
+
+```
+~/.local/share/JetBrains/Toolbox/apps/clion/ch-0/<version>/bin/clion.sh
+```
+
+You can add a shell function to your `~/.bashrc` (or equivalent) for
+convenience:
+
+```bash
+real_clion() {
+    /path/to/clion.sh "$@"
+}
+```
+
+Then the workflow simply becomes:
+
+```bash
+pixi shell
+real_clion .
+```
+
+In this case, the Default toolchain can be used as it -- verify it has properly inherited the pixi env: Open settings,
+under `Build, Execution, Deployment > Toolchains > Default`, the `C Compiler` and `C++ Compiler` should have detected
+the pixi env compilers which can be verified by hovering over the `Detected ...` box.
 
 ### Gotchas
 
