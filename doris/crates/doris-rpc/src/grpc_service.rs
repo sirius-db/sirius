@@ -2664,8 +2664,34 @@ impl PBackendService for PBackendServiceHandler {
                 }
             }
         } else {
-            // No wildcards — just stat the single path.
+            // No wildcards — stat the path.
             match std::fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => {
+                    // Directory: enumerate files inside it so the FE can
+                    // distribute individual file scan ranges across BEs.
+                    match std::fs::read_dir(path) {
+                        Ok(entries) => {
+                            for entry in entries.flatten() {
+                                if let Ok(m) = entry.metadata() {
+                                    if m.is_file() {
+                                        let file_path = if had_scheme {
+                                            format!("file://{}", entry.path().display())
+                                        } else {
+                                            entry.path().display().to_string()
+                                        };
+                                        files.push(p_glob_response::PFileInfo {
+                                            file: Some(file_path),
+                                            size: Some(m.len() as i64),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(pattern = %pattern, error = %e, "glob: failed to read directory");
+                        }
+                    }
+                }
                 Ok(meta) => {
                     files.push(p_glob_response::PFileInfo {
                         file: Some(pattern.clone()),
