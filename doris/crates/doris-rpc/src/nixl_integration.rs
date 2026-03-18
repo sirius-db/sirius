@@ -12,6 +12,7 @@ use crate::gpu_staging_buffer::StagingLease;
 use crate::nixl_exchange::{GpuBufferDesc, NixlExchange};
 use crate::exchange_sender::ExchangeDest;
 use crate::exchange_buffer::{ExchangeBuffer, ExchangeKey};
+use crate::hash_partitioner::{ExchangeInfo, PartitionStrategy};
 use sirius_ffi::GpuColumnBuffers;
 
 /// Result of attempting to extract GPU buffer information from execution result.
@@ -193,28 +194,46 @@ pub fn detect_execution_location(
 ///
 /// Self-transfer (destination is `local_brpc_addr`) uses a local fast-path:
 /// IPC → PBlock → ExchangeBuffer, bypassing both nixl and bRPC entirely.
+///
+/// For `Hash` partition strategy, rows are hashed by partition columns and each
+/// destination receives only its partition's rows. For `Broadcast`, all
+/// destinations receive all rows (existing behavior).
 pub async fn send_exchange_with_nixl(
     nixl_agent: Option<&Arc<NixlExchange>>,
     location: ExecutionLocation,
-    destinations: &[ExchangeDest],
+    exch_info: &ExchangeInfo,
     query_id: (i64, i64),
-    node_id: i32,
     sender_id: i32,
     nixl_only: bool,
     local_brpc_addr: &str,
     exchange_buffer: &ExchangeBuffer,
+    desc_tbl_slots: Option<&[(i32, String)]>,
 ) -> Result<(), String> {
-    // Split destinations into local (self) and remote.
-    let (local_dests, remote_dests): (Vec<ExchangeDest>, Vec<ExchangeDest>) = destinations
-        .iter()
-        .cloned()
-        .partition(|d| d.brpc_addr == local_brpc_addr);
+    let destinations = &exch_info.destinations;
+    let node_id = exch_info.dest_node_id;
 
     // Extract IPC bytes (needed for both local and remote paths).
     let ipc_bytes = match &location {
         ExecutionLocation::Cpu(bytes) => bytes.clone(),
         ExecutionLocation::Gpu { ipc_bytes, .. } => ipc_bytes.clone(),
     };
+
+    // For hash-partitioned exchange, split the data per destination first,
+    // then route each partition's data to its destination (local or remote).
+    if let PartitionStrategy::Hash { ref partition_exprs, num_destinations, use_crc32c } = exch_info.partition {
+        return send_hash_partitioned(
+            nixl_agent, &location, &ipc_bytes, destinations, query_id, node_id,
+            sender_id, nixl_only, local_brpc_addr, exchange_buffer,
+            partition_exprs, num_destinations, use_crc32c, desc_tbl_slots,
+        ).await;
+    }
+
+    // Broadcast / Random: send all rows to all destinations (existing behavior).
+    // Split destinations into local (self) and remote.
+    let (local_dests, remote_dests): (Vec<ExchangeDest>, Vec<ExchangeDest>) = destinations
+        .iter()
+        .cloned()
+        .partition(|d| d.brpc_addr == local_brpc_addr);
 
     // Handle local (self-transfer) destinations via ExchangeBuffer.
     for dest in &local_dests {
@@ -311,6 +330,135 @@ pub async fn send_exchange_with_nixl(
             Ok(())
         }
     }
+}
+
+/// Hash-partitioned exchange: split data by partition columns and route each
+/// partition to its assigned destination.
+#[allow(clippy::too_many_arguments)]
+async fn send_hash_partitioned(
+    _nixl_agent: Option<&Arc<NixlExchange>>,
+    _location: &ExecutionLocation,
+    ipc_bytes: &[u8],
+    destinations: &[ExchangeDest],
+    query_id: (i64, i64),
+    node_id: i32,
+    sender_id: i32,
+    _nixl_only: bool,
+    local_brpc_addr: &str,
+    exchange_buffer: &ExchangeBuffer,
+    partition_exprs: &[doris_thrift::exprs::TExpr],
+    num_destinations: usize,
+    use_crc32c: bool,
+    desc_tbl_slots: Option<&[(i32, String)]>,
+) -> Result<(), String> {
+    use crate::hash_partitioner::{compute_dest_assignments, resolve_partition_columns, split_by_destination};
+
+    // Decode IPC bytes into Arrow RecordBatch for hashing.
+    let batch = ipc_to_record_batch(ipc_bytes)?;
+
+    let slots = desc_tbl_slots
+        .ok_or_else(|| "hash partition requires descriptor table slots".to_string())?;
+
+    let (col_indices, doris_types) = resolve_partition_columns(
+        partition_exprs, slots, batch.schema().as_ref(),
+    )?;
+
+    tracing::info!(
+        num_rows = batch.num_rows(),
+        num_dests = num_destinations,
+        partition_cols = ?col_indices,
+        use_crc32c,
+        "hash-partitioning exchange data"
+    );
+
+    let assignments = compute_dest_assignments(
+        &batch, &col_indices, num_destinations, use_crc32c, &doris_types,
+    );
+    let partitions = split_by_destination(&batch, &assignments, num_destinations)?;
+
+    // Log partition distribution.
+    let row_counts: Vec<usize> = partitions.iter()
+        .map(|p| p.as_ref().map_or(0, |b| b.num_rows()))
+        .collect();
+    tracing::info!(?row_counts, "hash partition distribution");
+
+    // Send each partition to its destination.
+    for (dest_idx, (dest, partition_batch)) in destinations.iter().zip(partitions.iter()).enumerate() {
+        let is_local = dest.brpc_addr == local_brpc_addr;
+        let key = ExchangeKey { query_id, node_id };
+
+        if is_local {
+            // Self-transfer via ExchangeBuffer.
+            if let Some(batch) = partition_batch {
+                let part_ipc = record_batch_to_ipc(batch)?;
+                let (pblock, _) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&part_ipc)
+                    .map_err(|e| format!("hash partition self-transfer pblock: {e}"))?;
+                exchange_buffer.add_block(&key, sender_id, Some(pblock), false);
+            }
+            // Always send EOS.
+            exchange_buffer.add_block(&key, sender_id, None, true);
+            tracing::info!(dest_idx, dest = %dest.brpc_addr, "hash partition self-transfer complete");
+        } else {
+            // Remote transfer via bRPC.
+            // TODO(phase 4): GPU-direct nixl per-partition path.
+            if let Some(batch) = partition_batch {
+                let part_ipc = record_batch_to_ipc(batch)?;
+                let (pblock, _) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&part_ipc)
+                    .map_err(|e| format!("hash partition bRPC pblock: {e}"))?;
+                crate::exchange_sender::send_transmit_block(
+                    dest, query_id, node_id, sender_id, Some(pblock), false, 0,
+                ).await.map_err(|e| format!("hash partition send data to {}: {e}", dest.brpc_addr))?;
+            }
+            // Always send EOS.
+            crate::exchange_sender::send_transmit_block(
+                dest, query_id, node_id, sender_id, None, true, 1,
+            ).await.map_err(|e| format!("hash partition send EOS to {}: {e}", dest.brpc_addr))?;
+            tracing::info!(dest_idx, dest = %dest.brpc_addr, "hash partition bRPC send complete");
+        }
+    }
+
+    Ok(())
+}
+
+/// Decode Arrow IPC bytes into a RecordBatch.
+fn ipc_to_record_batch(ipc_bytes: &[u8]) -> Result<arrow::record_batch::RecordBatch, String> {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(ipc_bytes);
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| format!("IPC stream reader: {e}"))?;
+
+    let batches: Vec<_> = reader
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("IPC read batches: {e}"))?;
+
+    if batches.is_empty() {
+        return Err("no batches in IPC stream".to_string());
+    }
+
+    // Concatenate all batches if multiple (usually just one).
+    if batches.len() == 1 {
+        Ok(batches.into_iter().next().unwrap())
+    } else {
+        arrow::compute::concat_batches(&batches[0].schema(), &batches)
+            .map_err(|e| format!("concat IPC batches: {e}"))
+    }
+}
+
+/// Encode a RecordBatch to Arrow IPC stream bytes.
+fn record_batch_to_ipc(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, String> {
+    use arrow::ipc::writer::StreamWriter;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
+            .map_err(|e| format!("IPC writer: {e}"))?;
+        writer.write(batch).map_err(|e| format!("IPC write batch: {e}"))?;
+        writer.finish().map_err(|e| format!("IPC finish: {e}"))?;
+    }
+    Ok(buf)
 }
 
 /// Send GPU data to a single peer via nixl.
@@ -627,6 +775,15 @@ mod tests {
         // 3. Match on Gpu variant to extract buffer descriptors
     }
 
+    /// Build a broadcast ExchangeInfo for testing.
+    fn make_broadcast_exch_info(dests: Vec<ExchangeDest>, node_id: i32) -> ExchangeInfo {
+        ExchangeInfo {
+            dest_node_id: node_id,
+            destinations: dests,
+            partition: PartitionStrategy::Broadcast,
+        }
+    }
+
     #[test]
     fn test_exchange_dest_structure() {
         let dest = ExchangeDest {
@@ -654,17 +811,18 @@ mod tests {
         let ipc = vec![0xAA, 0xBB, 0xCC];
         let location = ExecutionLocation::Cpu(ipc);
         let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let exch_info = make_broadcast_exch_info(vec![], 0);
 
         let result = send_exchange_with_nixl(
             None,
             location,
-            &[], // no destinations
+            &exch_info,
             (1, 2),
-            0,
             0,
             false,
             "localhost:8060",
             &exchange_buffer,
+            None,
         )
         .await;
         // No destinations → no work → Ok
@@ -743,17 +901,18 @@ mod tests {
             brpc_addr: "10.0.0.99:8060".to_string(),
             finst_id: (1, 1),
         }];
+        let exch_info = make_broadcast_exch_info(dests, 0);
 
         let result = send_exchange_with_nixl(
             None,     // no nixl agent
             location,
-            &dests,
+            &exch_info,
             (1, 2),
-            0,
             0,
             false,    // not nixl-only → bRPC fallback
             "localhost:8060",
             &exchange_buffer,
+            None,
         )
         .await;
         // bRPC should fail (no server), but the path is exercised.
@@ -777,17 +936,18 @@ mod tests {
             brpc_addr: "10.0.0.99:8060".to_string(),
             finst_id: (1, 1),
         }];
+        let exch_info = make_broadcast_exch_info(dests, 0);
 
         let result = send_exchange_with_nixl(
             None,
             location,
-            &dests,
+            &exch_info,
             (1, 2),
-            0,
             0,
             true, // nixl-only
             "localhost:8060",
             &exchange_buffer,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -804,17 +964,18 @@ mod tests {
             brpc_addr: "localhost:8060".to_string(),
             finst_id: (1, 1),
         }];
+        let exch_info = make_broadcast_exch_info(dests, 42);
 
         let result = send_exchange_with_nixl(
             None,
             location,
-            &dests,
+            &exch_info,
             (1, 2),
-            42, // node_id
             0,
             false,
             "localhost:8060", // matches dest → self-transfer path
             &exchange_buffer,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -853,17 +1014,18 @@ mod tests {
             brpc_addr: "10.0.0.1:8060".to_string(),
             finst_id: (1, 1),
         }];
+        let exch_info = make_broadcast_exch_info(dests, 0);
 
         let result = send_exchange_with_nixl(
             None,
             location,
-            &dests,
+            &exch_info,
             (1, 2),
-            0,
             0,
             true, // nixl-only
             "localhost:8060",
             &exchange_buffer,
+            None,
         )
         .await;
         assert!(result.is_err());

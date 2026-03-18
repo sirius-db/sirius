@@ -14,6 +14,7 @@ pub mod fragment_manager;
 pub mod gpu_buffer_reconstruct;
 pub mod gpu_staging_buffer;
 pub mod grpc_service;
+pub mod hash_partitioner;
 pub mod heartbeat_service;
 pub mod nixl_exchange;
 pub mod nixl_integration;

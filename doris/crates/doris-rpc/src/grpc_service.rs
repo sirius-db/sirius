@@ -14,6 +14,8 @@ use doris_proto::doris::*;
 use doris_thrift::data_sinks::TDataSinkType;
 use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TPipelineFragmentParamsList};
 use doris_thrift::plan_nodes::{TFileFormatType, TPlanNode, TPlanNodeType};
+
+use super::hash_partitioner::{partition_strategy_from_thrift, ExchangeInfo};
 use result_formatter::result_store::{FinstId, ResultStore};
 use sirius_ffi::SiriusEngine;
 
@@ -1413,14 +1415,14 @@ fn generate_exchange_union_sql(params: &TPipelineFragmentParams) -> Option<Strin
     }
 }
 
-/// Extract exchange send destinations from fragment params.
+/// Extract exchange send destinations and partition strategy from fragment params.
 ///
-/// Returns `(dest_node_id, destinations)` if this fragment's output should be
-/// sent to remote BEs via transmit_block. Returns `None` for result sinks
-/// (where FE fetches data directly) or when destinations are empty.
+/// Returns `ExchangeInfo` if this fragment's output should be sent to remote BEs
+/// via transmit_block. Returns `None` for result sinks (where FE fetches data
+/// directly) or when destinations are empty.
 fn extract_exchange_destinations(
     params: &TPipelineFragmentParams,
-) -> Option<(i32, Vec<ExchangeDest>)> {
+) -> Option<ExchangeInfo> {
     // Check if fragment has a DATA_STREAM_SINK output
     let fragment = params.fragment.as_ref()?;
     let output_sink = fragment.output_sink.as_ref()?;
@@ -1457,7 +1459,35 @@ fn extract_exchange_destinations(
         return None;
     }
 
-    Some((dest_node_id, dests))
+    // Extract partition strategy from TDataStreamSink.output_partition.
+    let output_partition = &stream_sink.output_partition;
+    let enable_new_shuffle = params
+        .query_options
+        .as_ref()
+        .and_then(|qo| qo.enable_new_shuffle_hash_method)
+        .unwrap_or(false);
+
+    let partition = partition_strategy_from_thrift(
+        &output_partition.type_,
+        &output_partition.partition_exprs,
+        dests.len(),
+        enable_new_shuffle,
+    );
+
+    if !matches!(partition, super::hash_partitioner::PartitionStrategy::Broadcast) {
+        tracing::info!(
+            dest_node_id,
+            num_dests = dests.len(),
+            partition_type = ?output_partition.type_,
+            "extracted hash-partitioned exchange"
+        );
+    }
+
+    Some(ExchangeInfo {
+        dest_node_id,
+        destinations: dests,
+        partition,
+    })
 }
 
 pub struct PBackendServiceHandler {
@@ -1859,6 +1889,13 @@ impl PBackendService for PBackendServiceHandler {
                     // Check if this exchange fragment also needs to forward results.
                     let exchange_dests = extract_exchange_destinations(&params);
 
+                    // Extract slot descriptors for hash partition column resolution.
+                    let desc_tbl_slots: Option<Vec<(i32, String)>> = params
+                        .desc_tbl
+                        .as_ref()
+                        .and_then(|dt| dt.slot_descriptors.as_ref())
+                        .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
+
                     // Extract sender_id from local_params (each BE gets a unique sender_id
                     // for the same fragment, so the receiver's ExchangeBuffer can distinguish senders).
                     let sender_id = params.local_params.as_ref()
@@ -1917,12 +1954,13 @@ impl PBackendService for PBackendServiceHandler {
 
                     match exec_result {
                         Ok(Ok(location)) => {
-                            if let Some((dest_node_id, dests)) = exchange_dests {
+                            if let Some(exch_info) = exchange_dests {
                                 let query_id = (params.query_id.hi, params.query_id.lo);
                                 if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
                                     nixl_agent.as_ref(),
-                                    location, &dests, query_id, dest_node_id, sender_id, nixl_only,
+                                    location, &exch_info, query_id, sender_id, nixl_only,
                                     &local_brpc_addr, &exchange_buffer,
+                                    desc_tbl_slots.as_deref(),
                                 ).await {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
                                 }
@@ -2139,7 +2177,7 @@ impl PBackendService for PBackendServiceHandler {
 
             match exec_result {
                 Ok(Ok(location)) => {
-                    if let Some((dest_node_id, dests)) = exchange_dests {
+                    if let Some(exch_info) = exchange_dests {
                         // Send result to remote BEs via nixl GPU-direct or bRPC fallback.
                         let query_id = (params.query_id.hi, params.query_id.lo);
                         let sender_id = params
@@ -2150,20 +2188,26 @@ impl PBackendService for PBackendServiceHandler {
                             .unwrap_or(0);
                         info!(
                             %finst_id,
-                            dest_node_id,
-                            num_dests = dests.len(),
+                            dest_node_id = exch_info.dest_node_id,
+                            num_dests = exch_info.destinations.len(),
                             "sending execution result to exchange destinations"
                         );
+                        // Extract slot descriptors for hash partition column resolution.
+                        let desc_tbl_slots: Option<Vec<(i32, String)>> = params
+                            .desc_tbl
+                            .as_ref()
+                            .and_then(|dt| dt.slot_descriptors.as_ref())
+                            .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
                         if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
                             self.nixl_agent.as_ref(),
                             location,
-                            &dests,
+                            &exch_info,
                             query_id,
-                            dest_node_id,
                             sender_id,
                             self.nixl_only,
                             &self.local_brpc_addr,
                             &self.exchange_buffer,
+                            desc_tbl_slots.as_deref(),
                         )
                         .await
                         {
@@ -3059,11 +3103,11 @@ mod tests {
             },
         ]);
 
-        let (dest_node_id, dests) = extract_exchange_destinations(&params).unwrap();
-        assert_eq!(dest_node_id, 7);
-        assert_eq!(dests.len(), 1);
-        assert_eq!(dests[0].brpc_addr, "192.168.1.1:8060");
-        assert_eq!(dests[0].finst_id, (10, 20));
+        let info = extract_exchange_destinations(&params).unwrap();
+        assert_eq!(info.dest_node_id, 7);
+        assert_eq!(info.destinations.len(), 1);
+        assert_eq!(info.destinations[0].brpc_addr, "192.168.1.1:8060");
+        assert_eq!(info.destinations[0].finst_id, (10, 20));
     }
 
     #[test]
@@ -3081,8 +3125,8 @@ mod tests {
             },
         ]);
 
-        let (_, dests) = extract_exchange_destinations(&params).unwrap();
-        assert_eq!(dests[0].brpc_addr, "10.0.0.1:9060");
+        let info = extract_exchange_destinations(&params).unwrap();
+        assert_eq!(info.destinations[0].brpc_addr, "10.0.0.1:9060");
     }
 
     #[test]
@@ -3110,11 +3154,11 @@ mod tests {
             },
         ]);
 
-        let (node_id, dests) = extract_exchange_destinations(&params).unwrap();
-        assert_eq!(node_id, 5);
-        assert_eq!(dests.len(), 2);
-        assert_eq!(dests[0].brpc_addr, "be1:8060");
-        assert_eq!(dests[1].brpc_addr, "be2:8060");
+        let info = extract_exchange_destinations(&params).unwrap();
+        assert_eq!(info.dest_node_id, 5);
+        assert_eq!(info.destinations.len(), 2);
+        assert_eq!(info.destinations[0].brpc_addr, "be1:8060");
+        assert_eq!(info.destinations[1].brpc_addr, "be2:8060");
     }
 
     // --- merge_fragment_plans ---
