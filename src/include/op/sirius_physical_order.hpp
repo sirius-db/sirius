@@ -58,9 +58,8 @@ class sirius_physical_order : public sirius_physical_operator {
     return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
-  std::unique_ptr<operator_data> execute(
-    const operator_data& input_data,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

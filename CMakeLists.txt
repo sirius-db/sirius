@@ -59,7 +59,6 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/downgrade/downgrade_queue.cpp
     src/downgrade/downgrade_task.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_executor_state.cpp

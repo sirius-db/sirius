@@ -92,7 +92,7 @@ std::shared_ptr<data_batch> sort_batch(const std::shared_ptr<data_batch>& batch,
                                  copy_orders(orders),
                                  duckdb::vector<duckdb::idx_t>(projections),
                                  0);
-  auto result = order_op.execute(operator_data({batch}));
+  auto result = order_op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(result->get_data_batches().size() == 1);
   return result->get_data_batches()[0];
 }
@@ -124,7 +124,7 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 1-column batches ascending
 
   sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch1, batch2}));
+  auto out = op.execute(operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -155,7 +155,7 @@ TEST_CASE("sirius_physical_merge_sort merges 3 sorted 1-column batches descendin
 
   sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch1, batch2, batch3}));
+  auto out = op.execute(operator_data({batch1, batch2, batch3}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -191,7 +191,7 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 2-column batches by col0 a
 
   sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch1, batch2}));
+  auto out = op.execute(operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -235,7 +235,7 @@ TEST_CASE("sirius_physical_merge_sort merges 2-column batches sorted by 2 keys",
                                 duckdb::vector<duckdb::idx_t>(projections),
                                 0);
 
-  auto out = op.execute(operator_data({sorted1, sorted2}));
+  auto out = op.execute(operator_data({sorted1, sorted2}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -275,7 +275,7 @@ TEST_CASE("sirius_physical_merge_sort merges 3-column batches sorted by col0, re
 
   sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch1, batch2}));
+  auto out = op.execute(operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -322,7 +322,7 @@ TEST_CASE("sirius_physical_merge_sort 3 columns sorted by col0 asc + col1 desc",
                                 duckdb::vector<duckdb::idx_t>(projections),
                                 0);
 
-  auto out = op.execute(operator_data({sorted1, sorted2}));
+  auto out = op.execute(operator_data({sorted1, sorted2}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -360,7 +360,7 @@ TEST_CASE("sirius_physical_merge_sort single batch passthrough", "[physical_merg
 
   sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -388,7 +388,7 @@ TEST_CASE("sirius_physical_merge_sort skips null batches", "[physical_merge_sort
   sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, batch1, nullptr, batch2, nullptr};
-  auto out = op.execute(operator_data(inputs));
+  auto out = op.execute(operator_data(inputs), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -410,7 +410,7 @@ TEST_CASE("sirius_physical_merge_sort returns empty for all-null inputs", "[phys
   sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, nullptr};
-  auto out = op.execute(operator_data(inputs));
+  auto out = op.execute(operator_data(inputs), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().empty());
 }
 
@@ -439,7 +439,7 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
 
   sirius_physical_merge_sort op(&order_op);
 
-  auto out = op.execute(operator_data({batch1, batch2}));
+  auto out = op.execute(operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();

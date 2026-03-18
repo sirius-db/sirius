@@ -18,7 +18,7 @@
 
 #include "config.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "parallel/task_executor.hpp"
+#include "parallel/task.hpp"
 #include "task_completion.hpp"
 
 #include <cucascade/data/data_batch.hpp>

@@ -110,7 +110,7 @@ downgrade_executor make_test_executor(cucascade::shared_data_repository_manager&
                                       cucascade::memory::memory_space* gpu_space,
                                       sirius::memory::sirius_memory_reservation_manager& mem_mgr)
 {
-  task_executor_config config{1, false};
+  sirius::exec::thread_pool_config config{1, "downgrade"};
   return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
