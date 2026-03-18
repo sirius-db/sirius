@@ -18,10 +18,12 @@
 
 #include "expression_executor/gpu_expression_executor.hpp"
 
+#include <cudf/concatenate.hpp>
 #include <cudf/table/table.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
 namespace sirius {
@@ -111,7 +113,36 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  const auto& raw_input_batches = input_data.get_data_batches();
+
+  // When multiple small batches are coalesced into a single task, concatenate
+  // their GPU tables into one large table. This improves GPU utilization by
+  // issuing fewer, larger kernel launches instead of looping over many small
+  // batches individually.
+  std::unique_ptr<operator_data> concatenated_holder;
+  const auto* input_batches_ptr = &raw_input_batches;
+  if (raw_input_batches.size() > 1) {
+    std::vector<cudf::table_view> table_views;
+    table_views.reserve(raw_input_batches.size());
+    cucascade::memory::memory_space* space = nullptr;
+    for (const auto& batch : raw_input_batches) {
+      if (batch && batch->get_data()) {
+        auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
+        table_views.push_back(gpu_rep.get_table().view());
+        if (!space) { space = batch->get_memory_space(); }
+      }
+    }
+    if (table_views.size() > 1 && space) {
+      auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
+      auto concat_rep =
+        std::make_unique<cucascade::gpu_table_representation>(std::move(concatenated), *space);
+      auto concat_batch   = std::make_shared<cucascade::data_batch>(0, std::move(concat_rep));
+      concatenated_holder = std::make_unique<operator_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(concat_batch)});
+      input_batches_ptr = &concatenated_holder->get_data_batches();
+    }
+  }
+  const auto& input_batches = *input_batches_ptr;
 
   duckdb::unique_ptr<duckdb::Expression> filter_expr;
   if (table_filters) {
