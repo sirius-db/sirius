@@ -305,8 +305,8 @@ rm -f "$TEMP_OUTPUT"
 # Split the Sirius log into per-query segments.
 #
 # The log contains "QueryBegin: call gpu_execution(...)" lines for each
-# iteration.  We group every 2 consecutive gpu_execution QueryBegin entries
-# (cold + warm) into one query segment and copy it to Q_DIR/sirius.log.
+# iteration.  We group every NUM_ITERATIONS consecutive QueryBegin entries
+# (one per iteration) into one query segment and copy it to Q_DIR/sirius.log.
 # The combined log is kept in OUTPUT_DIR.
 # ---------------------------------------------------------------------------
 if [ "$ENGINE" = "sirius" ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]} -gt 0 ]; then
@@ -317,14 +317,14 @@ if [ "$ENGINE" = "sirius" ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]
     done
     if [ -n "$LOG_FILE" ]; then
         echo ""
-        echo "Splitting Sirius log per query..."
+        echo "Splitting Sirius log per query (${NUM_ITERATIONS} iterations per query)..."
         readarray -t QB_LINES < <(grep -n 'QueryBegin: call' "$LOG_FILE" | cut -d: -f1)
         TOTAL_LOG_LINES=$(wc -l < "$LOG_FILE")
 
         for ((i = 0; i < ${#VALID_QUERIES[@]}; i++)); do
             q="${VALID_QUERIES[$i]}"
-            start_idx=$((i * 2))
-            next_idx=$(((i + 1) * 2))
+            start_idx=$((i * NUM_ITERATIONS))
+            next_idx=$(((i + 1) * NUM_ITERATIONS))
 
             [ "$start_idx" -ge "${#QB_LINES[@]}" ] && continue
             start_line="${QB_LINES[$start_idx]}"
