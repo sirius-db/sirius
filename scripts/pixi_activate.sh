@@ -20,3 +20,5 @@ rm -f "$project_root/duckdb/CMakeUserPresets.json"
 if [[ ! -e "$cmake_presets_dst" ]]; then
   ln -s "$cmake_presets_src" "$cmake_presets_dst"
 fi
+
+pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh
