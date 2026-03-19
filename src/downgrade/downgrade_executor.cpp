@@ -56,6 +56,8 @@ void downgrade_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  _kiosk.resume();
+  _task_queue.reactivate();
   absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space) {
     auto device_id  = _memory_space->get_device_id();
