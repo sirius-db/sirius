@@ -40,7 +40,7 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
   }
 
   // Write our PID to the lock file so we can detect same-process re-acquisition.
-  pid_t our_pid = getpid();
+  pid_t our_pid       = getpid();
   std::string pid_str = std::to_string(our_pid) + "\n";
   (void)write(fd_, pid_str.c_str(), pid_str.size());
 
@@ -55,7 +55,7 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
       int check_fd = open(lock_path_.c_str(), O_RDONLY | O_CLOEXEC);
       if (check_fd != -1) {
         char buf[32] = {};
-        ssize_t n = read(check_fd, buf, sizeof(buf) - 1);
+        ssize_t n    = read(check_fd, buf, sizeof(buf) - 1);
         ::close(check_fd);
         if (n > 0) {
           pid_t holder_pid = static_cast<pid_t>(std::strtol(buf, nullptr, 10));
