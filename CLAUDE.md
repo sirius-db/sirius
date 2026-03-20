@@ -128,7 +128,7 @@ Sirius has two parallel execution modes, both coexisting in `src/`:
 - Executor: `src/gpu_executor.cpp`
 - Memory: requires `gpu_buffer_init()` before use; uses `GPUBufferManager` and `GPUContext`
 
-**New Sirius** (`gpu_execution`):
+**New Sirius / Super Sirius** (`gpu_execution`):
 - Uses `namespace sirius`
 - Entry point: `CALL gpu_execution('SELECT ...')`
 - Physical plan generator: `sirius_physical_plan_generator` (`src/planner/sirius_physical_plan_generator.cpp`)
@@ -145,6 +145,32 @@ Sirius has two parallel execution modes, both coexisting in `src/`:
 - `src/cuda/`: CUDA kernels (cuDF wrappers, expression dispatch)
 
 New development should target the **new Sirius** (`namespace sirius` / `gpu_execution`) code path.
+
+### Super Sirius Documentation
+
+Comprehensive documentation for the new Sirius code path lives in `docs/super-sirius/`. **Read these docs before modifying Super Sirius code** — they cover the execution model, pipeline splitting rules, operator behavior, and configuration in detail.
+
+| Document | Covers |
+|----------|--------|
+| [README](docs/super-sirius/README.md) | Index and reading order |
+| [Architecture Overview](docs/super-sirius/architecture-overview.md) | Component diagram, ownership hierarchy, thread model |
+| [Execution Flow](docs/super-sirius/execution-flow.md) | End-to-end query trace from SQL to GPU results |
+| [Physical Plan Generation](docs/super-sirius/physical-plan-generation.md) | DuckDB→Sirius operator mapping, pipeline construction, **pipeline splitting rules with barrier types** |
+| [Operators](docs/super-sirius/operators.md) | All physical operators — scan, streaming, blocking, pipeline breakers |
+| [Pipeline Execution](docs/super-sirius/pipeline-execution.md) | Task execution, GPU executor, OOM handling, completion |
+| [Task Creator](docs/super-sirius/task-creator.md) | Hint chain, per-operator overrides, scan scheduling |
+| [Scan](docs/super-sirius/scan.md) | Scan subsystem — DuckDB scan, Parquet scan, caching modes |
+| [Memory Management](docs/super-sirius/memory-management.md) | GPU/host/disk tiers, cuCascade, reservations, downgrade |
+| [Data Management](docs/super-sirius/data-management.md) | Data batches, repositories, ports |
+| [Configuration](docs/super-sirius/configuration.md) | Config file format, operator params, thread pools |
+| [Optimizations](docs/super-sirius/optimizations.md) | Filter pushdown, projection elision, BUILD_PROBE mode |
+| [Expression Executor](docs/super-sirius/expression-executor.md) | GPU expression evaluation via cuDF |
+
+Key concepts from the docs:
+- **After pipeline finalization**, `operators` contains ALL operators (source to sink inclusive); `source` and `sink` are just aliases for `operators[0]` and `operators.back()`
+- **Pipeline splitting** in `initialize_internal()` inserts PARTITION, CONCAT, SORT_SAMPLE, MERGE_* operators with data repositories between pipelines
+- **Barrier types**: `FULL` (wait for all upstream), `PARTIAL` (only PARTITION→CONCAT), `PIPELINE` (streaming — scans, ORDER_BY→SORT_SAMPLE)
+- **Repositories** are always between pipelines, never in the middle of one
 
 ### Execution Flow
 
