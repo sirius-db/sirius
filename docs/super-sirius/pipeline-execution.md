@@ -22,12 +22,16 @@ Each operator's `execute()` method is called in sequence by `compute_task()`. Af
 Pipelines are connected through **ports** on operators. When a sink pushes output into ports, a **task creator** monitors data availability and creates `gpu_pipeline_task` objects. These tasks are scheduled on the `gpu_pipeline_executor`, which manages GPU memory, CUDA streams, and a thread pool.
 
 ```
-Pipeline A                          Pipeline B
-[scan] -> [filter] -> [hash_build]  [hash_probe] -> [projection] -> [result_collector]
-                           |                |
-                           +--- port -------+
-                         (data_repository)
+Pipeline 1                  Pipeline 2        Pipeline 3
+[HASH_GROUP_BY]  --repo(FULL)--->  [PARTITION]  --repo(FULL)--->  [MERGE_GROUP_BY]
+                   port "default"                 port "default"
+                 (data_repository)              (data_repository)
 ```
+
+For example, in a GROUP BY query after pipeline splitting (see [Physical Plan Generation](physical-plan-generation.md#hash_group_by)):
+- Pipeline 1 performs partial aggregation, pushing results into a data repository with `FULL` barrier
+- Pipeline 2 partitions the partial aggregates
+- Pipeline 3 merges partitioned results into the final output
 
 ## Physical Operators
 

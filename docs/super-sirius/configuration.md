@@ -22,6 +22,57 @@ config.load_from_file("/path/to/config.cfg");  // Optional
 
 If no config file is provided, all parameters use defaults.
 
+### Example Config File
+
+```cfg
+sirius = {
+  topology = {
+    num_gpus = 1;
+  };
+  memory = {
+    gpu = {
+      usage_limit_fraction = 0.9;
+      reservation_limit_fraction = 1.0;
+      downgrade_trigger_fraction = 0.8;
+      downgrade_stop_fraction = 0.6;
+    };
+    host = {
+      capacity_bytes = 471200000000;
+      initial_number_pools = 785;
+      pool_size = 512;
+      block_size = 1048576;
+    };
+  };
+  executor = {
+    pipeline = {
+      num_threads = 4;
+      thread_name_prefix = "sirius_pipeline_executor";
+    };
+    downgrade = {
+      num_threads = 1;
+      thread_name_prefix = "sirius_downgrade_executor";
+    };
+    duckdb_scan = {
+      num_threads = 4;
+      thread_name_prefix = "sirius_scan_executor";
+      cache = true;
+      cache_decoded_table = true;
+      cache_in_gpu = false;
+    };
+    task_creator = {
+      num_threads = 2;
+    };
+  };
+  operator_params = {
+    scan_task_batch_size = 5368709120;     // 5 GB
+    default_scan_task_varchar_size = 256;
+    max_sort_partition_bytes = 0;          // 0 = auto (33% GPU memory)
+    hash_partition_bytes = 5368709120;     // 5 GB
+    concat_batch_bytes = 5368709120;       // 5 GB
+  };
+};
+```
+
 ## Operator Parameters
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct

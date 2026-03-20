@@ -190,15 +190,15 @@ After this step:
 
 After meta-pipeline construction, `sirius_engine::initialize_internal()` applies Sirius-specific pipeline splitting. Each split introduces new operators and **data repositories between pipelines**. Repositories are never placed in the middle of a pipeline — they always connect the sink of one pipeline to the source of the next.
 
-In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` (source), C is `operators.back()` (sink), and B is intermediate. After finalization, each operator appears **exactly once** in its pipeline's `operators` list. `--repo(BARRIER, "port")--->` denotes a data repository connecting the sink of one pipeline to the source of the next.
+In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` (source), C is `operators.back()` (sink), and B is intermediate. After finalization, each operator appears **exactly once** in its pipeline's `operators` list. Solid edges denote data repositories connecting pipelines, labeled with the barrier type (e.g., `FULL`, `PARTIAL`, `PIPELINE`). Dashed edges indicate internal pushes within an operator's `sink()` method.
 
 ### TABLE_SCAN Splitting
 
 TABLE_SCAN is replaced with DUCKDB_SCAN or PARQUET_SCAN. A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
 
-```
-Scan Pipeline:  [DUCKDB_SCAN]  --repo(PIPELINE, "scan")--> Main Pipeline
-Main Pipeline:  [TABLE_SCAN, filter, ..., sink]
+```mermaid
+graph LR
+    SP["Scan Pipeline<br/>[DUCKDB_SCAN]"] -->|"PIPELINE, 'scan'"| MP["Main Pipeline<br/>[TABLE_SCAN, filter, ..., sink]"]
 ```
 
 The DUCKDB_SCAN (or PARQUET_SCAN) is the sole operator in the scan pipeline. TABLE_SCAN stays at `operators[0]` of the main pipeline (line 391). The repository uses `PIPELINE` barrier on the `"scan"` port.
@@ -207,19 +207,25 @@ The DUCKDB_SCAN (or PARQUET_SCAN) is the sole operator in the scan pipeline. TAB
 
 When HASH_JOIN appears as an intermediate operator, a PARTITION and CONCAT are inserted before it, each in its own pipeline:
 
+**Before:**
+```mermaid
+graph LR
+    P["[scan, filter, HASH_JOIN, projection, ..., sink]"]
 ```
-Before: [scan, filter, HASH_JOIN, projection, ..., sink]
 
-After (join is NOT the first intermediate operator):
-  Pipeline 1:          [scan, ..., op_before_join]    --repo(FULL)-----> Partition Pipeline
-  Partition Pipeline:  [PARTITION]                     --repo(PARTIAL)--> Concat Pipeline
-  Concat Pipeline:     [CONCAT]                        --repo(FULL)-----> Main Pipeline
-  Main Pipeline:       [HASH_JOIN, projection, ..., sink]
+**After (join is NOT the first intermediate operator):**
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., op_before_join]"] -->|"FULL"| PP["Partition Pipeline<br/>[PARTITION]"]
+    PP -->|"PARTIAL"| CP["Concat Pipeline<br/>[CONCAT]"]
+    CP -->|"FULL"| MP["Main Pipeline<br/>[HASH_JOIN, projection, ..., sink]"]
+```
 
-After (join IS the first intermediate operator):
-  Partition Pipeline:  [PARTITION]                     --repo(PARTIAL)--> Concat Pipeline
-  Concat Pipeline:     [CONCAT]                        --repo(FULL)-----> Main Pipeline
-  Main Pipeline:       [HASH_JOIN, projection, ..., sink]
+**After (join IS the first intermediate operator):**
+```mermaid
+graph LR
+    PP["Partition Pipeline<br/>[PARTITION]"] -->|"PARTIAL"| CP["Concat Pipeline<br/>[CONCAT]"]
+    CP -->|"FULL"| MP["Main Pipeline<br/>[HASH_JOIN, projection, ..., sink]"]
 ```
 
 - When the join is not the first intermediate operator, Pipeline 1 is created with all operators before the join; the last one becomes the sink (acts as a pipeline breaker so PARTITION can see total input size). The repository from Pipeline 1 to Partition Pipeline uses `FULL` barrier (intermediate operator as sink — default)
@@ -234,13 +240,18 @@ For multiple joins in the same pipeline, the pattern repeats — each join gets 
 
 When HASH_JOIN is the sink of a pipeline (build side), the same PARTITION → CONCAT pattern is applied. There is always a pipeline breaker before PARTITION so that the total input size is known for determining partition count:
 
+**Before:**
+```mermaid
+graph LR
+    P["[scan, op1, ..., opN, HASH_JOIN(sink)]"]
 ```
-Before: [scan, op1, ..., opN, HASH_JOIN(sink)]
 
-After:
-  Pipeline 1:          [scan, ..., opN]               --repo(FULL)-----> Partition Pipeline
-  Partition Pipeline:  [PARTITION]                     --repo(PARTIAL)--> Concat Pipeline
-  Concat Pipeline:     [CONCAT]                        --repo(FULL, "build")--> Pipeline with HASH_JOIN
+**After:**
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., opN]"] -->|"FULL"| PP["Partition Pipeline<br/>[PARTITION]"]
+    PP -->|"PARTIAL"| CP["Concat Pipeline<br/>[CONCAT]"]
+    CP -->|"FULL, 'build'"| JP["Pipeline with HASH_JOIN"]
 ```
 
 - Pipeline 1's sink is the last intermediate operator before HASH_JOIN (pipeline breaker); it connects to the Partition Pipeline with `FULL` barrier (default)
@@ -250,11 +261,12 @@ After:
 
 ### ORDER_BY → 4-Phase Sort
 
-```
-Pipeline 1:  [scan, ..., ORDER_BY]      --repo(PIPELINE)--> Pipeline 2
-Pipeline 2:  [SORT_SAMPLE]              --repo(PIPELINE)--> Pipeline 3
-Pipeline 3:  [SORT_PARTITION]           --repo(FULL)------> Pipeline 4
-Pipeline 4:  [MERGE_SORT]              --repo(FULL)------> downstream
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., ORDER_BY]"] -->|"PIPELINE"| P2["Pipeline 2<br/>[SORT_SAMPLE]"]
+    P2 -->|"PIPELINE"| P3["Pipeline 3<br/>[SORT_PARTITION]"]
+    P3 -->|"FULL"| P4["Pipeline 4<br/>[MERGE_SORT]"]
+    P4 -->|"FULL"| DS["downstream"]
 ```
 
 1. **Pipeline 1**: Current pipeline keeps ORDER_BY as sink (local sort per batch)
@@ -264,10 +276,11 @@ Pipeline 4:  [MERGE_SORT]              --repo(FULL)------> downstream
 
 ### HASH_GROUP_BY
 
-```
-Pipeline 1:  [scan, ..., HASH_GROUP_BY]  --repo(FULL)-------> Pipeline 2
-Pipeline 2:  [PARTITION]                 --repo(FULL)-------> Pipeline 3
-Pipeline 3:  [MERGE_GROUP_BY]           --repo(FULL)-------> downstream
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., HASH_GROUP_BY]"] -->|"FULL"| P2["Pipeline 2<br/>[PARTITION]"]
+    P2 -->|"FULL"| P3["Pipeline 3<br/>[MERGE_GROUP_BY]"]
+    P3 -->|"FULL"| DS["downstream"]
 ```
 
 1. **Pipeline 1**: Current pipeline keeps HASH_GROUP_BY as sink (partial aggregation per batch). `FULL` barrier (HASH_GROUP_BY falls to default wiring)
@@ -276,18 +289,20 @@ Pipeline 3:  [MERGE_GROUP_BY]           --repo(FULL)-------> downstream
 
 ### UNGROUPED_AGGREGATE
 
-```
-Pipeline 1:  [scan, ..., UNGROUPED_AGGREGATE]  --repo(FULL)--> Pipeline 2
-Pipeline 2:  [MERGE_AGGREGATE]                --repo(FULL)--> downstream
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., UNGROUPED_AGGREGATE]"] -->|"FULL"| P2["Pipeline 2<br/>[MERGE_AGGREGATE]"]
+    P2 -->|"FULL"| DS["downstream"]
 ```
 
 No PARTITION needed. MERGE_AGGREGATE collects partial aggregates from Pipeline 1.
 
 ### TOP_N
 
-```
-Pipeline 1:  [scan, ..., TOP_N]          --repo(FULL)--> Pipeline 2
-Pipeline 2:  [MERGE_TOP_N]              --repo(FULL)--> downstream
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., TOP_N]"] -->|"FULL"| P2["Pipeline 2<br/>[MERGE_TOP_N]"]
+    P2 -->|"FULL"| DS["downstream"]
 ```
 
 MERGE_TOP_N merges local top-N results.
@@ -306,16 +321,17 @@ In the constructor, RIGHT_DELIM_JOIN extracts the RHS child from the internal jo
 
 When `operators.size() > 0` (intermediate operators before the delim join), a pipeline breaker is inserted:
 
+```mermaid
+graph LR
+    PP["Pipeline Pre<br/>[source, ..., last_op]"] -->|"FULL"| PD["Pipeline Delim<br/>[RIGHT_DELIM_JOIN]"]
+    PD -.->|"FULL (partition_join)"| CP["Concat Pipeline<br/>[CONCAT]"]
+    PD -.->|"FULL (distinct)"| PDP["PD Pipeline<br/>[PARTITION]"]
+    CP -->|"FULL, 'build'"| PR["Probe Pipeline<br/>(at internal HASH_JOIN)"]
+    PDP -->|"FULL"| MR["Merge Pipeline<br/>[MERGE_GROUP_BY]"]
+    MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
 ```
-Pipeline Pre:     [source, ..., last_op]        --repo(FULL)-------------> Pipeline Delim
-Pipeline Delim:   [RIGHT_DELIM_JOIN]
-  RIGHT_DELIM_JOIN.sink() internally pushes to:
-    partition_join  --repo(FULL, "default")--> Concat Pipeline
-    distinct        --repo(FULL, "default")--> PD Pipeline
-Concat Pipeline:  [CONCAT]                     --repo(FULL, "build")----> Probe Pipeline (at internal HASH_JOIN)
-PD Pipeline:      [PARTITION]                   --repo(FULL, "default")--> Merge Pipeline
-Merge Pipeline:   [MERGE_GROUP_BY]             --repo(FULL, "default")--> Downstream (DELIM_SCAN pipelines)
-```
+
+Dashed edges indicate internal pushes from `RIGHT_DELIM_JOIN.sink()` to `partition_join` and `distinct`.
 
 When `operators.size() == 0` (no intermediate operators), no pipeline breaker is needed — the current pipeline keeps RIGHT_DELIM_JOIN as its sink directly.
 
@@ -327,14 +343,15 @@ When `operators.size() == 0` (no intermediate operators), no pipeline breaker is
 
 In the constructor, LEFT_DELIM_JOIN extracts the LHS child from the internal join and replaces it with a `column_data_scan`. The extracted LHS becomes `children[0]`, built via a child meta-pipeline. Unlike RIGHT_DELIM_JOIN, **no pipeline breaker** is created and **no partition_join/concat pair** is needed — the `column_data_scan` directly feeds downstream pipelines.
 
+```mermaid
+graph LR
+    PM["Pipeline Main<br/>[source, ..., LEFT_DELIM_JOIN]"] -.->|"FULL (column_data_scan)"| DW["Downstream<br/>(probe pipeline reads cached LHS data)"]
+    PM -.->|"FULL (distinct)"| PDP["PD Pipeline<br/>[PARTITION]"]
+    PDP -->|"FULL"| MR["Merge Pipeline<br/>[MERGE_GROUP_BY]"]
+    MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
 ```
-Pipeline Main:    [source, ..., LEFT_DELIM_JOIN]
-  LEFT_DELIM_JOIN.sink() internally pushes to:
-    column_data_scan  --repo(FULL, "default")--> Downstream (probe pipeline reads cached LHS data)
-    distinct          --repo(FULL, "default")--> PD Pipeline
-PD Pipeline:      [PARTITION]                   --repo(FULL, "default")--> Merge Pipeline
-Merge Pipeline:   [MERGE_GROUP_BY]             --repo(FULL, "default")--> Downstream (DELIM_SCAN pipelines)
-```
+
+Dashed edges indicate internal pushes from `LEFT_DELIM_JOIN.sink()` to `column_data_scan` and `distinct`.
 
 - `column_data_scan` caches the input data so the internal HASH_JOIN's probe side can scan it
 - The internal HASH_JOIN is built into the probe pipeline via `join->build_pipelines()` with `build_rhs=true`, so its build side (the correlated subquery) gets a normal child meta-pipeline with standard HASH_JOIN splitting

@@ -107,8 +107,13 @@ Three execution modes:
 | `MIXED_JOIN` | Equality + inequality conditions on disjoint columns | `cudf::mixed_join()` with cuDF AST |
 
 Build/probe state machine for BUILD_PROBE mode:
-```
-NOT_BUILT → SCHEDULING → SCHEDULED → BUILT → DESTROYED
+```mermaid
+stateDiagram-v2
+    direction LR
+    NOT_BUILT --> SCHEDULING
+    SCHEDULING --> SCHEDULED
+    SCHEDULED --> BUILT
+    BUILT --> DESTROYED
 ```
 
 Key members:

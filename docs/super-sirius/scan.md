@@ -176,13 +176,6 @@ Cache decoded (decompressed) table in host memory. Stored as `cached_host_data_r
 ### `TABLE_GPU`
 Cache decoded table in GPU memory. Fastest — no data movement needed for GPU execution. Highest memory cost.
 
-### Query Hash Matching
-
-Cache hit/miss detection uses query hash:
-- If query hash matches previous run → PRELOAD mode (use cached data)
-- If query hash changes → CACHE mode (clear and rebuild cache)
-- Per-operator caching: each scan operator has its own cache entry
-
 ## Data Representations
 
 ### `host_data_representation`
