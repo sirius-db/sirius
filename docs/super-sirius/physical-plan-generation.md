@@ -211,7 +211,7 @@ When HASH_JOIN appears as an intermediate operator, a PARTITION and CONCAT are i
 Before: [scan, filter, HASH_JOIN, projection, ..., sink]
 
 After (join is NOT the first intermediate operator):
-  Pipeline 1:          [scan, ..., op_before_join]    --repo(PARTIAL)--> Partition Pipeline
+  Pipeline 1:          [scan, ..., op_before_join]    --repo(FULL)-----> Partition Pipeline
   Partition Pipeline:  [PARTITION]                     --repo(PARTIAL)--> Concat Pipeline
   Concat Pipeline:     [CONCAT]                        --repo(FULL)-----> Main Pipeline
   Main Pipeline:       [HASH_JOIN, projection, ..., sink]
@@ -222,10 +222,10 @@ After (join IS the first intermediate operator):
   Main Pipeline:       [HASH_JOIN, projection, ..., sink]
 ```
 
-- When the join is not the first intermediate operator, Pipeline 1 is created with all operators before the join; the last one becomes the sink (acts as a pipeline breaker so PARTITION can see total input size)
+- When the join is not the first intermediate operator, Pipeline 1 is created with all operators before the join; the last one becomes the sink (acts as a pipeline breaker so PARTITION can see total input size). The repository from Pipeline 1 to Partition Pipeline uses `FULL` barrier (intermediate operator as sink — default)
 - When the join IS the first intermediate operator (`join_pos == 0`), the partition pipeline starts from the current source directly (no Pipeline 1)
 - PARTITION and CONCAT are each in their own single-operator pipeline
-- The repository from PARTITION uses `PARTIAL` barrier (since the downstream source is CONCAT — line 1014)
+- The repository from PARTITION uses `PARTIAL` barrier (since the downstream is CONCAT — line 1014)
 - The repository from CONCAT to the main pipeline uses `FULL` barrier (default)
 
 For multiple joins in the same pipeline, the pattern repeats — each join gets its own PARTITION → CONCAT pair, with subsequent ones using the previous CONCAT as their starting point.
@@ -238,11 +238,13 @@ When HASH_JOIN is the sink of a pipeline (build side), the same PARTITION → CO
 Before: [scan, op1, ..., opN, HASH_JOIN(sink)]
 
 After:
-  Pipeline 1:          [scan, ..., opN]               (opN becomes sink / pipeline breaker)
+  Pipeline 1:          [scan, ..., opN]               --repo(FULL)-----> Partition Pipeline
   Partition Pipeline:  [PARTITION]                     --repo(PARTIAL)--> Concat Pipeline
   Concat Pipeline:     [CONCAT]                        --repo(FULL, "build")--> Pipeline with HASH_JOIN
 ```
 
+- Pipeline 1's sink is the last intermediate operator before HASH_JOIN (pipeline breaker); it connects to the Partition Pipeline with `FULL` barrier (default)
+- PARTITION → CONCAT uses `PARTIAL` barrier (downstream is CONCAT — line 1014)
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
 - The probe and build PARTITION operators are linked as siblings for partition count coordination
 
@@ -264,12 +266,12 @@ Pipeline 4:  [MERGE_SORT]              --repo(FULL)------> downstream
 
 ```
 Pipeline 1:  [scan, ..., HASH_GROUP_BY]  --repo(FULL)-------> Pipeline 2
-Pipeline 2:  [PARTITION]                 --repo(PARTIAL)----> Pipeline 3
+Pipeline 2:  [PARTITION]                 --repo(FULL)-------> Pipeline 3
 Pipeline 3:  [MERGE_GROUP_BY]           --repo(FULL)-------> downstream
 ```
 
-1. **Pipeline 1**: Current pipeline keeps HASH_GROUP_BY as sink (partial aggregation per batch)
-2. **Pipeline 2**: PARTITION. Repository from HASH_GROUP_BY uses `FULL` barrier; repository to MERGE_GROUP_BY uses `PARTIAL` barrier
+1. **Pipeline 1**: Current pipeline keeps HASH_GROUP_BY as sink (partial aggregation per batch). `FULL` barrier (HASH_GROUP_BY falls to default wiring)
+2. **Pipeline 2**: PARTITION. Repository to MERGE_GROUP_BY uses `FULL` barrier (downstream is not CONCAT — `PARTIAL` is only used when PARTITION feeds directly into CONCAT)
 3. **Pipeline 3**: MERGE_GROUP_BY. Downstream pipelines updated to use MERGE_GROUP_BY as source
 
 ### UNGROUPED_AGGREGATE
@@ -292,17 +294,62 @@ MERGE_TOP_N merges local top-N results.
 
 ### DELIM_JOIN
 
-Complex splitting for correlated subqueries. For RIGHT_DELIM_JOIN with intermediate operators:
+Complex splitting for correlated subqueries. Both LEFT and RIGHT variants contain two internal operators:
+- `join` — the actual HASH_JOIN (one child replaced with a scan of cached data)
+- `distinct` — a HASH_GROUP_BY that produces deduplicated data for DELIM_SCAN operators in the correlated subquery
+
+When the delim join's `sink()` is called, it pushes data to both internal operators simultaneously. The distinct output is then partitioned and merged externally. Additionally, the internal HASH_JOIN undergoes standard probe-side and build-side splitting (documented in the [HASH_JOIN](#hash_join-probe-side) sections above).
+
+#### RIGHT_DELIM_JOIN
+
+In the constructor, RIGHT_DELIM_JOIN extracts the RHS child from the internal join and replaces it with a `dummy_scan`. The extracted RHS becomes `children[0]` of the delim join, built via a child meta-pipeline. A `partition_join` (PARTITION, is_build=true) is created during `initialize_internal()` to partition data for the actual join's build side.
+
+When `operators.size() > 0` (intermediate operators before the delim join), a pipeline breaker is inserted:
 
 ```
-Pipeline Pre:       [scan, ..., last_op]             (last_op becomes sink)
-Pipeline Delim:     [RIGHT_DELIM_JOIN]
-  partition_join    --repo(FULL)--> Concat Pipeline: [CONCAT]
-  distinct_op       --repo(FULL)--> Partition Distinct Pipeline: [PARTITION_DISTINCT]
-Partition Distinct: [PARTITION_DISTINCT]             --repo(PARTIAL)--> Merge Pipeline: [MERGE_GROUP_BY]
+Pipeline Pre:     [source, ..., last_op]        --repo(FULL)-------------> Pipeline Delim
+Pipeline Delim:   [RIGHT_DELIM_JOIN]
+  RIGHT_DELIM_JOIN.sink() internally pushes to:
+    partition_join  --repo(FULL, "default")--> Concat Pipeline
+    distinct        --repo(FULL, "default")--> PD Pipeline
+Concat Pipeline:  [CONCAT]                     --repo(FULL, "build")----> Probe Pipeline (at internal HASH_JOIN)
+PD Pipeline:      [PARTITION]                   --repo(FULL, "default")--> Merge Pipeline
+Merge Pipeline:   [MERGE_GROUP_BY]             --repo(FULL, "default")--> Downstream (DELIM_SCAN pipelines)
 ```
 
-LEFT_DELIM_JOIN follows a similar pattern but uses `column_data_scan` instead of `partition_join`.
+When `operators.size() == 0` (no intermediate operators), no pipeline breaker is needed — the current pipeline keeps RIGHT_DELIM_JOIN as its sink directly.
+
+- The CONCAT is a build concat (`is_build=true`); it connects to the internal HASH_JOIN's `"build"` port in the probe pipeline
+- The probe and build `partition_join` operators are linked as siblings for partition count coordination
+- `partition_join` also receives a `FULL` barrier port on the same repository as the delim join (line 88–94 in `insert_repository`)
+
+#### LEFT_DELIM_JOIN
+
+In the constructor, LEFT_DELIM_JOIN extracts the LHS child from the internal join and replaces it with a `column_data_scan`. The extracted LHS becomes `children[0]`, built via a child meta-pipeline. Unlike RIGHT_DELIM_JOIN, **no pipeline breaker** is created and **no partition_join/concat pair** is needed — the `column_data_scan` directly feeds downstream pipelines.
+
+```
+Pipeline Main:    [source, ..., LEFT_DELIM_JOIN]
+  LEFT_DELIM_JOIN.sink() internally pushes to:
+    column_data_scan  --repo(FULL, "default")--> Downstream (probe pipeline reads cached LHS data)
+    distinct          --repo(FULL, "default")--> PD Pipeline
+PD Pipeline:      [PARTITION]                   --repo(FULL, "default")--> Merge Pipeline
+Merge Pipeline:   [MERGE_GROUP_BY]             --repo(FULL, "default")--> Downstream (DELIM_SCAN pipelines)
+```
+
+- `column_data_scan` caches the input data so the internal HASH_JOIN's probe side can scan it
+- The internal HASH_JOIN is built into the probe pipeline via `join->build_pipelines()` with `build_rhs=true`, so its build side (the correlated subquery) gets a normal child meta-pipeline with standard HASH_JOIN splitting
+- `build_join_pipelines` adds the internal HASH_JOIN as an operator in the probe pipeline, with `column_data_scan` as its source: `[column_data_scan, HASH_JOIN, ..., outer_sink]`
+
+#### Key Differences
+
+| Aspect | RIGHT_DELIM_JOIN | LEFT_DELIM_JOIN |
+|--------|-----------------|-----------------|
+| Side eliminated | RHS | LHS |
+| Internal join child replaced | RHS → `dummy_scan` | LHS → `column_data_scan` |
+| Pipeline breaker | Yes (if intermediate ops exist) | Never |
+| Build-side data path | `partition_join` → CONCAT → HASH_JOIN "build" port | Standard HASH_JOIN build splitting (correlated subquery) |
+| `build_join_pipelines` call | `build_rhs=false` (build data via partition_join/concat) | `build_rhs=true` (build via child meta-pipeline) |
+| Cached data scan | N/A | `column_data_scan` feeds probe side |
 
 ## Part 4: Port Wiring
 
