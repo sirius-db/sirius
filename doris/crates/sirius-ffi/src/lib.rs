@@ -725,7 +725,7 @@ fn arrow_type_to_duckdb_sql(dt: &arrow::datatypes::DataType) -> String {
         DataType::UInt16 => "USMALLINT".to_string(),
         DataType::UInt32 => "UINTEGER".to_string(),
         DataType::UInt64 => "UBIGINT".to_string(),
-        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
         DataType::Float64 => "DOUBLE".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR".to_string(),
         DataType::Binary | DataType::LargeBinary => "BLOB".to_string(),
@@ -733,7 +733,23 @@ fn arrow_type_to_duckdb_sql(dt: &arrow::datatypes::DataType) -> String {
         DataType::Date32 => "DATE".to_string(),
         DataType::Date64 => "DATE".to_string(),
         DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
-        _ => "VARCHAR".to_string(), // fallback
+        DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
+        DataType::Duration(_) => "INTERVAL".to_string(),
+        DataType::Interval(_) => "INTERVAL".to_string(),
+        DataType::List(f) | DataType::LargeList(f) => {
+            format!("{}[]", arrow_type_to_duckdb_sql(f.data_type()))
+        }
+        DataType::Struct(fields) => {
+            let cols: Vec<String> = fields
+                .iter()
+                .map(|f| format!("\"{}\" {}", f.name(), arrow_type_to_duckdb_sql(f.data_type())))
+                .collect();
+            format!("STRUCT({})", cols.join(", "))
+        }
+        other => {
+            tracing::warn!(arrow_type = ?other, "arrow_type_to_duckdb_sql: unmapped type, falling back to VARCHAR");
+            "VARCHAR".to_string()
+        }
     }
 }
 

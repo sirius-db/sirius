@@ -89,6 +89,9 @@ fn main() {
         arrow_flight_port: config.arrow_flight_port as i32,
         version: version.clone(),
         start_time_ms,
+        // Placeholder: resolved to actual IP/hostname in run() before gRPC starts.
+        // Heartbeat/backend services don't use this field.
+        advertise_host: config.advertise_host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
     });
 
     let engine = SiriusEngine::new()
@@ -210,6 +213,12 @@ async fn run(
                 .unwrap_or(hostname)
         }
     };
+
+    // Update BeState with the resolved advertise_host for Arrow Flight responses.
+    let grpc_state = Arc::new(BeState {
+        advertise_host: advertise_host.clone(),
+        ..(*grpc_state).clone()
+    });
 
     if let Some(fe_addr) = &config.fe {
         if let Err(e) = register_with_fe(fe_addr, config.heartbeat_port, &advertise_host).await {

@@ -16,7 +16,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
-use crate::result_store::{FinstId, ResultStore};
+use crate::result_store::{FinstId, ResultEntry, ResultStore};
 
 type BoxStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -60,8 +60,15 @@ impl FlightService for SiriusFlightService {
             Status::not_found(format!("no result for finst_id {finst_id}"))
         })?;
 
+        let (schema, batches) = match entry.as_ref() {
+            ResultEntry::Ok { schema, batches } => (schema, batches.clone()),
+            ResultEntry::Error(msg) => {
+                return Err(Status::internal(format!("query failed: {msg}")));
+            }
+        };
+
         let flight_data =
-            batches_to_flight_data(&entry.schema, entry.batches.clone())
+            batches_to_flight_data(schema, batches)
                 .map_err(|e| Status::internal(format!("failed to convert to flight data: {e}")))?;
 
         let stream = futures::stream::iter(flight_data.into_iter().map(Ok));

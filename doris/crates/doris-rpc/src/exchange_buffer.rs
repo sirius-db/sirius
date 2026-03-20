@@ -13,6 +13,10 @@ use tokio::sync::Notify;
 use doris_proto::doris::PBlock;
 
 /// Key identifying an exchange stream: (query_id, dest_node_id).
+///
+/// Assumption: each (query_id, node_id) pair uniquely identifies an exchange stream.
+/// This holds as long as FE sends `parallel_instances = 1` per fragment. If FE ever
+/// sends `parallel_instances > 1`, the key would need a fragment-instance dimension.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct ExchangeKey {
     /// query_id as (hi, lo) pair.
@@ -35,13 +39,21 @@ struct ExchangeEntry {
 #[derive(Clone)]
 pub struct ExchangeBuffer {
     entries: Arc<DashMap<ExchangeKey, ExchangeEntry>>,
+    /// Tracks cancelled query IDs so async tasks can detect cancellation.
+    cancelled: Arc<DashMap<(i64, i64), ()>>,
 }
 
 impl ExchangeBuffer {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(DashMap::new()),
+            cancelled: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Check if a query has been cancelled.
+    pub fn is_cancelled(&self, query_hi: i64, query_lo: i64) -> bool {
+        self.cancelled.contains_key(&(query_hi, query_lo))
     }
 
     /// Register an exchange before data arrives.
@@ -113,6 +125,31 @@ impl ExchangeBuffer {
                 entry.notify.notify_one();
             }
         }
+    }
+
+    /// Cancel all exchange entries for a query.
+    ///
+    /// Marks the query as cancelled, removes all entries, and notifies any waiters
+    /// so async exchange tasks unblock and can check `is_cancelled()`.
+    pub fn cancel_query(&self, query_hi: i64, query_lo: i64) {
+        self.cancelled.insert((query_hi, query_lo), ());
+        let keys_to_remove: Vec<ExchangeKey> = self
+            .entries
+            .iter()
+            .filter(|e| e.key().query_id == (query_hi, query_lo))
+            .map(|e| e.key().clone())
+            .collect();
+        for key in &keys_to_remove {
+            if let Some((_, entry)) = self.entries.remove(key) {
+                // Wake any waiting tasks so they see the entry is gone.
+                entry.notify.notify_one();
+            }
+        }
+    }
+
+    /// Clear the cancelled flag for a query (e.g. after cleanup is done).
+    pub fn clear_cancelled(&self, query_hi: i64, query_lo: i64) {
+        self.cancelled.remove(&(query_hi, query_lo));
     }
 
     /// Take all buffered blocks for a key, removing the entry.
@@ -296,5 +333,28 @@ mod tests {
         // Data should be available.
         let blocks = buf.take(&k);
         assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_cancel_query_removes_entries() {
+        let buf = ExchangeBuffer::new();
+        let k1 = key(10, 20, 1);
+        let k2 = key(10, 20, 3);
+        let k_other = key(99, 88, 1);
+
+        buf.register(k1.clone(), 1);
+        buf.register(k2.clone(), 1);
+        buf.register(k_other.clone(), 1);
+
+        buf.add_block(&k1, 0, Some(empty_block()), false);
+        buf.add_block(&k2, 0, Some(empty_block()), false);
+        buf.add_block(&k_other, 0, Some(empty_block()), false);
+
+        // Cancel query (10, 20) — should remove k1 and k2, keep k_other.
+        buf.cancel_query(10, 20);
+
+        assert!(buf.take(&k1).is_empty());
+        assert!(buf.take(&k2).is_empty());
+        assert_eq!(buf.take(&k_other).len(), 1);
     }
 }

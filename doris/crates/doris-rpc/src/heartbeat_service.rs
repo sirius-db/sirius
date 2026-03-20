@@ -21,6 +21,8 @@ pub struct BeState {
     pub arrow_flight_port: i32,
     pub version: String,
     pub start_time_ms: i64,
+    /// Advertised host/IP for this BE (used in Arrow Flight schema responses).
+    pub advertise_host: String,
 }
 
 /// Handler implementation for HeartbeatService.

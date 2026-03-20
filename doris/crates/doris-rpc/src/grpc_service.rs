@@ -217,8 +217,15 @@ fn arrow_type_to_doris(dt: &arrow::datatypes::DataType) -> PTypeDesc {
                 PScalarType { r#type: 31, len: None, precision: Some(p), scale: Some(s) } // DECIMAL128I
             }
         }
-        // Default to STRING for any other type
-        _ => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None },
+        DataType::Binary | DataType::LargeBinary => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (binary as string)
+        DataType::Time32(_) | DataType::Time64(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (no native Doris TIME)
+        DataType::Duration(_) | DataType::Interval(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING
+        DataType::List(_) | DataType::LargeList(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (array as string)
+        DataType::Struct(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (struct as string)
+        other => {
+            warn!(arrow_type = ?other, "arrow_type_to_doris: unmapped type, falling back to STRING");
+            PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }
+        }
     };
     PTypeDesc {
         types: vec![PTypeNode {
@@ -1316,7 +1323,10 @@ fn generate_exchange_agg_merge_sql(
         return None;
     }
 
-    let table_name = format!("__EXCHANGE_TABLE_{}", exch.node_id);
+    // Look up the exchange table using the query-scoped name.
+    // table_schemas keys are already query-scoped via exchange_table_name().
+    let query_lo = params.query_id.lo;
+    let table_name = exchange_table_name(query_lo, exch.node_id);
     let columns = table_schemas.get(&table_name)?;
 
     // Determine grouping columns: first N columns are GROUP BY keys.
@@ -1382,12 +1392,20 @@ fn generate_exchange_agg_merge_sql(
     Some(sql)
 }
 
+/// Build a unique exchange table name scoped to a query.
+///
+/// Uses the low 32 bits of query_id.lo as a hex prefix to avoid collisions
+/// when concurrent queries use the same node_id.
+fn exchange_table_name(query_lo: i64, node_id: i32) -> String {
+    format!("__EXCH_{:08x}_{}", query_lo as u32, node_id)
+}
+
 /// Generate SQL for UNION_NODE exchange fragments.
 ///
 /// DuckDB's `from_substrait` is broken for `SetRel` (UNION): it mishandles the
 /// union operator, producing wrong results or errors. Since UNION_NODE in exchange
 /// fragments just concatenates exchange tables, we bypass substrait and generate
-/// the trivial SQL directly: `SELECT * FROM __EXCHANGE_TABLE_1 UNION ALL SELECT * FROM __EXCHANGE_TABLE_2 ...`
+/// the trivial SQL directly: `SELECT * FROM __EXCH_... UNION ALL SELECT * FROM __EXCH_...`
 ///
 /// Non-union exchange patterns (plain EXCHANGE_NODE, SORT over exchange, etc.)
 /// go through the normal substrait path.
@@ -1398,13 +1416,15 @@ fn generate_exchange_union_sql(params: &TPipelineFragmentParams) -> Option<Strin
     if root.node_type != TPlanNodeType::UNION_NODE {
         return None;
     }
+    let query_lo = params.query_id.lo;
     let num_children = root.num_children as usize;
     let mut parts = Vec::new();
     let mut idx = 1; // skip root node
     for _ in 0..num_children {
         if idx < nodes.len() {
             let child = &nodes[idx];
-            parts.push(format!("SELECT * FROM __EXCHANGE_TABLE_{}", child.node_id));
+            let tbl = exchange_table_name(query_lo, child.node_id);
+            parts.push(format!("SELECT * FROM \"{}\"", tbl));
             idx += 1;
         }
     }
@@ -1589,6 +1609,22 @@ impl PBackendService for PBackendServiceHandler {
 
         info!(num_fragments = all_params.len(), "deserialized fragment params");
 
+        // Capture the result-sink fragment's instance ID BEFORE merge.
+        // The result-sink fragment is fragment_id=0 (EXCHANGE_NODE at root with 0 children,
+        // or the single fragment if there's only one). After merge, local_params[0] may
+        // belong to a different fragment, so we must capture this first.
+        let query_id_key = FinstId {
+            hi: all_params[0].query_id.hi,
+            lo: all_params[0].query_id.lo,
+        };
+        let result_sink_finst_id = all_params.iter()
+            .find(|p| p.fragment_id == Some(0))
+            .or_else(|| all_params.first())
+            .and_then(|p| p.local_params.as_ref())
+            .and_then(|lp| lp.first())
+            .map(|p| FinstId { hi: p.fragment_instance_id.hi, lo: p.fragment_instance_id.lo })
+            .filter(|id| id.hi != query_id_key.hi || id.lo != query_id_key.lo);
+
         // Merge multi-fragment plans for single-BE execution.
         // This replaces EXCHANGE_NODE(0 children) in intermediate fragments with
         // the leaf (scan) fragment's plan, producing a single executable plan.
@@ -1600,15 +1636,13 @@ impl PBackendService for PBackendServiceHandler {
 
         // Process each merged fragment.
         for params in &merged_params {
-            // Determine the finst_id to store the result under.
-            // FE always calls fetch_data with the query_id, regardless of how
-            // many BEs or fragments are involved. Fragment instance IDs differ
-            // from query_id (e.g., query_id=...e81, fragment instance=...e82),
-            // so we must always use query_id for the result key.
+            // Primary key: query_id (FE uses this with enableParallelResultSink=true).
             let finst_id = FinstId {
                 hi: params.query_id.hi,
                 lo: params.query_id.lo,
             };
+            // Secondary key: result-sink fragment's instance ID, captured before merge.
+            let fragment_finst_id = result_sink_finst_id;
 
             // Check for unresolved exchange nodes (receive data from other BEs).
             let exchange_node_ids = has_unresolved_exchanges(params);
@@ -1654,6 +1688,15 @@ impl PBackendService for PBackendServiceHandler {
                     for notify in &notifies {
                         notify.notified().await;
                     }
+
+                    // Check if query was cancelled while we were waiting.
+                    if buffer.is_cancelled(query_id.0, query_id.1) {
+                        info!(%finst_id, "exchange task cancelled");
+                        store.store_error(finst_id, fragment_finst_id, "query cancelled".to_string());
+                        buffer.clear_cancelled(query_id.0, query_id.1);
+                        return;
+                    }
+
                     info!(%finst_id, "all exchange data received, proceeding with execution");
 
                     // Decode PBlocks and register exchange tables.
@@ -1661,10 +1704,7 @@ impl PBackendService for PBackendServiceHandler {
                     for &node_id in &exchange_node_ids {
                         let key = ExchangeKey { query_id, node_id };
                         let blocks = buffer.take(&key);
-                        let table_name = format!(
-                            "__EXCHANGE_TABLE_{}",
-                            node_id
-                        );
+                        let table_name = exchange_table_name(query_id.1, node_id);
 
                         if blocks.is_empty() {
                             info!(table = %table_name, "exchange has no blocks, creating empty table");
@@ -1717,6 +1757,7 @@ impl PBackendService for PBackendServiceHandler {
                             Ok(d) => d,
                             Err(e) => {
                                 warn!(error = %e, table = %table_name, "failed to decode PBlocks");
+                                store.store_error(finst_id, fragment_finst_id, format!("decode PBlocks for {table_name}: {e}"));
                                 return;
                             }
                         };
@@ -1771,6 +1812,7 @@ impl PBackendService for PBackendServiceHandler {
                                     decoded.num_rows, &column_data_csv,
                                 ) {
                                     warn!(error = %e2, table = %table_name, "SQL VALUES fallback also failed");
+                                    store.store_error(finst_id, fragment_finst_id, format!("register exchange table {table_name}: {e2}"));
                                     return;
                                 }
                                 if let Ok(cols) = engine_guard.get_table_columns(&table_name) {
@@ -1794,6 +1836,7 @@ impl PBackendService for PBackendServiceHandler {
                             &table_name, &ipc_bytes,
                         ) {
                             warn!(error = %e, table = %table_name, "IPC registration failed");
+                            store.store_error(finst_id, fragment_finst_id, format!("IPC registration for {table_name}: {e}"));
                             return;
                         }
 
@@ -1807,6 +1850,17 @@ impl PBackendService for PBackendServiceHandler {
                             }
                         }
                         drop(engine_guard);
+                    }
+
+                    // Force DuckDB to commit any pending exchange table transactions.
+                    // DuckDB's from_substrait() creates a new connection whose MVCC
+                    // snapshot may not include tables from the current connection's
+                    // auto-commit transactions. An explicit no-op query forces the
+                    // transaction boundary so new connections see all tables.
+                    if !table_schemas.is_empty() {
+                        let eng = engine.lock().unwrap();
+                        let _ = eng.execute_sql("SELECT 42");
+                        drop(eng);
                     }
 
                     // Also register any file tables.
@@ -1835,6 +1889,7 @@ impl PBackendService for PBackendServiceHandler {
                                             &fsi.table_name, &fsi.files[0].path, &fsi.format, &empty,
                                         ) {
                                             warn!(error = %e, table = %fsi.table_name, "failed to register file table");
+                                            store.store_error(finst_id, fragment_finst_id, format!("register file table '{}': {e}", fsi.table_name));
                                             return;
                                         }
                                         if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
@@ -1848,6 +1903,7 @@ impl PBackendService for PBackendServiceHandler {
                                     &fsi.table_name, &fsi.files[0].path, &fsi.format, &empty,
                                 ) {
                                     warn!(error = %e, table = %fsi.table_name, "failed to register file table");
+                                    store.store_error(finst_id, fragment_finst_id, format!("register file table '{}': {e}", fsi.table_name));
                                     return;
                                 }
                                 if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
@@ -1881,6 +1937,7 @@ impl PBackendService for PBackendServiceHandler {
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "Substrait translation failed for exchange fragment");
+                                    store.store_error(finst_id, fragment_finst_id, format!("Substrait translation: {e}"));
                                     return;
                                 }
                             }
@@ -1985,6 +2042,12 @@ impl PBackendService for PBackendServiceHandler {
                                 if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {
                                     warn!(error = %e, %finst_id, "failed to store exchange result");
                                 } else {
+                                    // Also store under fragment instance ID for non-parallel-sink FE.
+                                    if let Some(fid) = fragment_finst_id {
+                                        if let Some(entry) = store.get(&finst_id) {
+                                            store.store_alias(fid, finst_id, entry);
+                                        }
+                                    }
                                     info!(%finst_id, "exchange fragment execution complete");
                                 }
                             }
@@ -1992,10 +2055,12 @@ impl PBackendService for PBackendServiceHandler {
                         Ok(Err(e)) => {
                             release_retained_exch();
                             warn!(error = %e, %finst_id, "exchange fragment execution failed");
+                            store.store_error(finst_id, fragment_finst_id, format!("exchange execution: {e}"));
                         }
                         Err(e) => {
                             release_retained_exch();
                             warn!(error = %e, "exchange fragment spawn_blocking panicked");
+                            store.store_error(finst_id, fragment_finst_id, format!("exchange task panicked: {e}"));
                         }
                     }
                 });
@@ -2230,6 +2295,12 @@ impl PBackendService for PBackendServiceHandler {
                                 ..Default::default()
                             }));
                         }
+                        // Also store under fragment instance ID for non-parallel-sink FE.
+                        if let Some(fid) = fragment_finst_id {
+                            if let Some(entry) = store.get(&finst_id) {
+                                store.store_alias(fid, finst_id, entry);
+                            }
+                        }
                         info!(%finst_id, "execution complete, result stored");
                     }
                 }
@@ -2258,6 +2329,14 @@ impl PBackendService for PBackendServiceHandler {
         }))
     }
 
+    /// Two-phase execution: prepare phase.
+    ///
+    /// Doris FE uses a two-phase protocol: `prepare` → `start`. In Sirius, `prepare`
+    /// immediately executes the full plan (async exchange tasks wait on Notify regardless).
+    /// This is intentionally different from regular Doris BEs where `prepare` sets up
+    /// pipeline tasks and `start` triggers them. If Sirius ever needs to support
+    /// pipelined execution or coordinated multi-fragment startup, this would need to
+    /// actually defer execution to `start`.
     async fn exec_plan_fragment_prepare(
         &self,
         request: Request<PExecPlanFragmentRequest>,
@@ -2265,24 +2344,36 @@ impl PBackendService for PBackendServiceHandler {
         self.exec_plan_fragment(request).await
     }
 
+    /// Two-phase execution: start phase.
+    ///
+    /// No-op because `prepare` already triggered execution. Async exchange tasks
+    /// wait on `Notify` (exchange data arrival), not on the `start` signal.
     async fn exec_plan_fragment_start(
         &self,
         request: Request<PExecPlanFragmentStartRequest>,
     ) -> Result<Response<PExecPlanFragmentResult>, Status> {
         let req = request.into_inner();
-        info!(query_id = ?req.query_id, "exec_plan_fragment_start");
+        info!(query_id = ?req.query_id, "exec_plan_fragment_start (no-op: already executed by prepare)");
         Ok(Response::new(PExecPlanFragmentResult {
             status: ok_status(),
             ..Default::default()
         }))
     }
 
+    /// Cancel a running query fragment.
+    ///
+    /// Cleans up exchange buffer entries and result store entries for the query,
+    /// unblocking any async exchange tasks waiting on Notify.
     async fn cancel_plan_fragment(
         &self,
         request: Request<PCancelPlanFragmentRequest>,
     ) -> Result<Response<PCancelPlanFragmentResult>, Status> {
         let req = request.into_inner();
         info!(query_id = ?req.query_id, fragment_id = ?req.fragment_id, "cancel_plan_fragment");
+        if let Some(qid) = &req.query_id {
+            self.exchange_buffer.cancel_query(qid.hi, qid.lo);
+            self.result_store.remove_query(qid.hi, qid.lo);
+        }
         Ok(Response::new(PCancelPlanFragmentResult {
             status: ok_status(),
         }))
@@ -2379,7 +2470,7 @@ impl PBackendService for PBackendServiceHandler {
         Ok(Response::new(PFetchArrowFlightSchemaResult {
             status: Some(ok_status()),
             schema: Some(schema_bytes),
-            be_arrow_flight_ip: Some(b"127.0.0.1".to_vec()),
+            be_arrow_flight_ip: Some(self.state.advertise_host.as_bytes().to_vec()),
             be_arrow_flight_port: Some(self.state.arrow_flight_port),
         }))
     }
@@ -2407,6 +2498,17 @@ impl PBackendService for PBackendServiceHandler {
                 }));
             }
         };
+
+        // Check if the result is an error from async execution.
+        if let Some(err_msg) = entry.error_message() {
+            warn!(%finst_id, error = %err_msg, "fetch_data: returning error from async execution");
+            self.result_store.remove(&finst_id);
+            return Ok(Response::new(PFetchDataResult {
+                status: err_status(err_msg),
+                eos: Some(true),
+                ..Default::default()
+            }));
+        }
 
         // Convert Arrow data to MySQL text protocol rows and wrap in TResultBatch.
         let mysql_rows = entry.to_mysql_rows();
@@ -2478,7 +2580,7 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
-        let file_path = {
+        let (file_path, file_format) = {
             use thrift::protocol::{TCompactInputProtocol, TBinaryInputProtocol, TSerializable};
             use thrift::transport::TBufferedReadTransport;
 
@@ -2487,6 +2589,36 @@ impl PBackendService for PBackendServiceHandler {
                 first_bytes = ?&scan_range_bytes[..scan_range_bytes.len().min(64)],
                 "fetch_table_schema: raw scan_range bytes"
             );
+
+            // Helper: extract path and format from a deserialized TFileScanRange.
+            let extract = |fsr: &doris_thrift::plan_nodes::TFileScanRange| -> (Option<String>, Option<String>) {
+                let path_from_ranges = fsr.ranges
+                    .as_ref()
+                    .and_then(|r| r.first())
+                    .and_then(|rd| rd.path.clone());
+                let path_from_params = fsr.params
+                    .as_ref()
+                    .and_then(|p| p.properties.as_ref())
+                    .and_then(|props| props.get("file_path").cloned());
+
+                // Extract format from range desc's format_type field.
+                let format = fsr.ranges
+                    .as_ref()
+                    .and_then(|r| r.first())
+                    .and_then(|rd| rd.format_type.as_ref())
+                    .map(|ft| match *ft {
+                        TFileFormatType::FORMAT_PARQUET => "parquet".to_string(),
+                        TFileFormatType::FORMAT_ORC => "orc".to_string(),
+                        TFileFormatType::FORMAT_JSON => "json".to_string(),
+                        TFileFormatType::FORMAT_CSV_PLAIN => "csv".to_string(),
+                        other => {
+                            warn!(format_type = ?other, "fetch_table_schema: unknown format_type, defaulting to parquet");
+                            "parquet".to_string()
+                        }
+                    });
+
+                (path_from_ranges.or(path_from_params), format)
+            };
 
             // Try compact first, then binary protocol.
             let transport = TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes.clone())));
@@ -2499,29 +2631,10 @@ impl PBackendService for PBackendServiceHandler {
                         has_params = fsr.params.is_some(),
                         "fetch_table_schema: deserialized TFileScanRange"
                     );
-                    // Try to get path from ranges first, then from params.properties
-                    let path_from_ranges = fsr.ranges
-                        .as_ref()
-                        .and_then(|r| r.first())
-                        .and_then(|rd| {
-                            info!(path = ?rd.path, "fetch_table_schema: range desc");
-                            rd.path.clone()
-                        });
-
-                    // Also check params.properties for file_path
-                    let path_from_params = fsr.params
-                        .as_ref()
-                        .and_then(|p| {
-                            info!(props = ?p.properties, "fetch_table_schema: scan params");
-                            p.properties.as_ref()
-                        })
-                        .and_then(|props| props.get("file_path").cloned());
-
-                    path_from_ranges.or(path_from_params)
+                    extract(&fsr)
                 }
                 Err(e) => {
                     warn!(error = %e, "fetch_table_schema: compact deser failed, trying binary");
-                    // Try binary protocol.
                     let transport = TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes)));
                     let mut protocol = TBinaryInputProtocol::new(transport, true);
                     match doris_thrift::plan_nodes::TFileScanRange::read_from_in_protocol(&mut protocol) {
@@ -2531,19 +2644,11 @@ impl PBackendService for PBackendServiceHandler {
                                 num_ranges = fsr.ranges.as_ref().map(|r| r.len()).unwrap_or(0),
                                 "fetch_table_schema: deserialized TFileScanRange (binary)"
                             );
-                            let path_from_ranges = fsr.ranges
-                                .as_ref()
-                                .and_then(|r| r.first())
-                                .and_then(|rd| rd.path.clone());
-                            let path_from_params = fsr.params
-                                .as_ref()
-                                .and_then(|p| p.properties.as_ref())
-                                .and_then(|props| props.get("file_path").cloned());
-                            path_from_ranges.or(path_from_params)
+                            extract(&fsr)
                         }
                         Err(e2) => {
                             warn!(error = %e2, "fetch_table_schema: binary deser also failed");
-                            None
+                            (None, None)
                         }
                     }
                 }
@@ -2564,7 +2669,23 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
-        info!(path = %file_path, "fetch_table_schema: reading schema");
+        // Determine file format: from TFileScanRange, or infer from file extension.
+        let format = file_format.unwrap_or_else(|| {
+            let ext_format = if file_path.ends_with(".parquet") || file_path.ends_with(".pq") {
+                "parquet"
+            } else if file_path.ends_with(".csv") || file_path.ends_with(".tsv") {
+                "csv"
+            } else if file_path.ends_with(".json") || file_path.ends_with(".jsonl") {
+                "json"
+            } else if file_path.ends_with(".orc") {
+                "orc"
+            } else {
+                warn!(path = %file_path, "fetch_table_schema: no format_type in scan range, inferring parquet from extension");
+                "parquet"
+            };
+            ext_format.to_string()
+        });
+        info!(path = %file_path, format = %format, "fetch_table_schema: reading schema");
 
         // Use DuckDB to read the file schema via a LIMIT 0 query (gets schema without data).
         let engine = match &self.engine {
@@ -2581,7 +2702,7 @@ impl PBackendService for PBackendServiceHandler {
             let engine = engine.lock().unwrap();
             // Get schema via prepared statement metadata (no data read needed).
             let ipc_bytes = engine
-                .get_file_schema_ipc(&file_path, "parquet")
+                .get_file_schema_ipc(&file_path, &format)
                 .map_err(|e| e.to_string())?;
 
             if ipc_bytes.is_empty() {
@@ -3348,5 +3469,23 @@ mod tests {
         let merged = merge_fragment_plans(&[root, leaf]);
         // per_exch_num_senders[0] = 2 > 1 leaf → skip merge.
         assert_eq!(merged.len(), 2);
+    }
+
+    // --- exchange_table_name ---
+
+    #[test]
+    fn test_exchange_table_name_unique_per_query() {
+        let name1 = exchange_table_name(0x12345678, 1);
+        let name2 = exchange_table_name(0xABCDEF01, 1);
+        // Same node_id, different queries → different table names.
+        assert_ne!(name1, name2);
+        assert!(name1.starts_with("__EXCH_"));
+        assert!(name1.ends_with("_1"));
+    }
+
+    #[test]
+    fn test_exchange_table_name_format() {
+        let name = exchange_table_name(0x00FF00FF, 42);
+        assert_eq!(name, "__EXCH_00ff00ff_42");
     }
 }

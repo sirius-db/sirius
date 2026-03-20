@@ -49,19 +49,45 @@ impl FinstId {
     }
 }
 
-/// A stored query result: schema + record batches.
-pub struct ResultEntry {
-    pub schema: SchemaRef,
-    pub batches: Vec<RecordBatch>,
+/// A stored query result: either successful (schema + record batches) or an error.
+pub enum ResultEntry {
+    /// Successful result with Arrow schema and record batches.
+    Ok {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    },
+    /// Error result — async execution failed.
+    Error(String),
 }
 
 impl ResultEntry {
+    /// Returns `true` if this entry is an error.
+    pub fn is_error(&self) -> bool {
+        matches!(self, ResultEntry::Error(_))
+    }
+
+    /// Returns the error message if this entry is an error.
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            ResultEntry::Error(msg) => Some(msg),
+            ResultEntry::Ok { .. } => None,
+        }
+    }
+
     /// Serialize just the Arrow schema as IPC bytes (for `fetch_arrow_flight_schema`).
     pub fn schema_ipc_bytes(&self) -> Result<Vec<u8>, arrow::error::ArrowError> {
+        let schema = match self {
+            ResultEntry::Ok { schema, .. } => schema,
+            ResultEntry::Error(msg) => {
+                return Err(arrow::error::ArrowError::InvalidArgumentError(
+                    format!("result is an error: {msg}"),
+                ));
+            }
+        };
         let mut buf = Vec::new();
         {
             let mut writer =
-                StreamWriter::try_new_with_options(&mut buf, &self.schema, IpcWriteOptions::default())?;
+                StreamWriter::try_new_with_options(&mut buf, schema, IpcWriteOptions::default())?;
             writer.finish()?;
         }
         Ok(buf)
@@ -69,7 +95,10 @@ impl ResultEntry {
 
     /// Total row count across all batches.
     pub fn num_rows(&self) -> usize {
-        self.batches.iter().map(|b| b.num_rows()).sum()
+        match self {
+            ResultEntry::Ok { batches, .. } => batches.iter().map(|b| b.num_rows()).sum(),
+            ResultEntry::Error(_) => 0,
+        }
     }
 
     /// Convert all batches to MySQL text protocol rows.
@@ -77,8 +106,12 @@ impl ResultEntry {
     /// Each returned `Vec<u8>` is one row: a concatenation of length-encoded
     /// column value strings (or 0xFB for NULL).
     pub fn to_mysql_rows(&self) -> Vec<Vec<u8>> {
+        let batches = match self {
+            ResultEntry::Ok { batches, .. } => batches,
+            ResultEntry::Error(_) => return Vec::new(),
+        };
         let mut rows = Vec::with_capacity(self.num_rows());
-        for batch in &self.batches {
+        for batch in batches {
             for row_idx in 0..batch.num_rows() {
                 let mut row_buf = Vec::new();
                 for col_idx in 0..batch.num_columns() {
@@ -123,9 +156,15 @@ fn mysql_encode_string(s: &str, buf: &mut Vec<u8>) {
 /// Thread-safe via DashMap. Shared between the gRPC handler
 /// (writes results, serves schemas) and the Arrow Flight service
 /// (reads and streams record batches).
+///
+/// Supports dual-key storage: a result can be stored under both a primary key
+/// (query_id) and an alias key (fragment_instance_id). The alias map ensures
+/// that remove/cancel operations clean up both keys atomically.
 #[derive(Clone)]
 pub struct ResultStore {
     results: Arc<DashMap<FinstId, Arc<ResultEntry>>>,
+    /// Maps alias → primary so removal of either cleans up both.
+    aliases: Arc<DashMap<FinstId, FinstId>>,
     /// Notifies waiters when any result is stored.
     notify: Arc<Notify>,
 }
@@ -134,6 +173,7 @@ impl ResultStore {
     pub fn new() -> Self {
         Self {
             results: Arc::new(DashMap::new()),
+            aliases: Arc::new(DashMap::new()),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -142,6 +182,15 @@ impl ResultStore {
     ///
     /// Parses the IPC stream to extract schema + record batches.
     pub fn store_ipc_result(&self, id: FinstId, ipc_bytes: &[u8]) -> Result<(), String> {
+        const LARGE_RESULT_THRESHOLD: usize = 100 * 1024 * 1024; // 100 MB
+        if ipc_bytes.len() > LARGE_RESULT_THRESHOLD {
+            warn!(
+                %id,
+                size_mb = ipc_bytes.len() / (1024 * 1024),
+                "result exceeds 100MB — entire result is materialized in memory"
+            );
+        }
+
         let cursor = Cursor::new(ipc_bytes);
         let reader = StreamReader::try_new(cursor, None)
             .map_err(|e| format!("failed to parse Arrow IPC stream: {e}"))?;
@@ -156,7 +205,7 @@ impl ResultStore {
 
         debug!(%id, batches = batches.len(), "stored result");
         self.results
-            .insert(id, Arc::new(ResultEntry { schema, batches }));
+            .insert(id, Arc::new(ResultEntry::Ok { schema, batches }));
         self.notify.notify_waiters();
         Ok(())
     }
@@ -165,7 +214,34 @@ impl ResultStore {
     pub fn store_result(&self, id: FinstId, schema: SchemaRef, batches: Vec<RecordBatch>) {
         debug!(%id, batch_count = batches.len(), "stored result");
         self.results
-            .insert(id, Arc::new(ResultEntry { schema, batches }));
+            .insert(id, Arc::new(ResultEntry::Ok { schema, batches }));
+        self.notify.notify_waiters();
+    }
+
+    /// Store an error result so `fetch_data`/`wait_for` resolve immediately
+    /// instead of timing out. If `alias` is provided, stores under both keys.
+    pub fn store_error(&self, id: FinstId, alias: Option<FinstId>, msg: String) {
+        warn!(%id, error = %msg, "stored error result");
+        let entry = Arc::new(ResultEntry::Error(msg));
+        self.results.insert(id, entry.clone());
+        if let Some(alias_id) = alias {
+            self.results.insert(alias_id, entry);
+            self.aliases.insert(alias_id, id);
+            self.aliases.insert(id, alias_id);
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Store the same result entry under an additional key (alias).
+    ///
+    /// Used to store results under both query_id and fragment_instance_id,
+    /// so FE can find them regardless of `enableParallelResultSink` setting.
+    /// The alias mapping is tracked so `remove` and `remove_query` clean up both.
+    pub fn store_alias(&self, alias_id: FinstId, primary_id: FinstId, entry: Arc<ResultEntry>) {
+        debug!(%alias_id, %primary_id, "stored alias");
+        self.results.insert(alias_id, entry);
+        self.aliases.insert(alias_id, primary_id);
+        self.aliases.insert(primary_id, alias_id);
         self.notify.notify_waiters();
     }
 
@@ -192,9 +268,14 @@ impl ResultStore {
         }
     }
 
-    /// Remove a result (after it has been consumed or cancelled).
+    /// Remove a result and its alias (after it has been consumed or cancelled).
     pub fn remove(&self, id: &FinstId) -> bool {
         let removed = self.results.remove(id).is_some();
+        // Also remove the paired alias, if any.
+        if let Some((_, partner)) = self.aliases.remove(id) {
+            self.results.remove(&partner);
+            self.aliases.remove(&partner);
+        }
         if removed {
             debug!(%id, "removed result");
         } else {
@@ -203,10 +284,25 @@ impl ResultStore {
         removed
     }
 
-    /// Remove all results for a given query (matching hi part).
+    /// Remove all results for a given query, including any aliases.
     pub fn remove_query(&self, query_hi: i64, query_lo: i64) {
-        self.results
-            .retain(|id, _| id.hi != query_hi || id.lo != query_lo);
+        // Collect alias partners before removing, so we clean up both sides.
+        let alias_partners: Vec<FinstId> = self.aliases.iter()
+            .filter(|e| {
+                let k = e.key();
+                k.hi == query_hi && k.lo == query_lo
+            })
+            .map(|e| *e.value())
+            .collect();
+
+        self.results.retain(|id, _| id.hi != query_hi || id.lo != query_lo);
+        self.aliases.retain(|id, _| id.hi != query_hi || id.lo != query_lo);
+
+        // Remove partner entries (they may have different hi/lo).
+        for partner in alias_partners {
+            self.results.remove(&partner);
+            self.aliases.remove(&partner);
+        }
     }
 
     /// Number of stored results.
