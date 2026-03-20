@@ -40,8 +40,10 @@ extern "C" int cudaProfilerStop();
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
 #include "gpu_buffer_manager.hpp"
+#ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#endif
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -55,13 +57,12 @@ namespace duckdb {
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
-struct GPUTableFunctionData : public TableFunctionData {
-  GPUTableFunctionData() = default;
-  shared_ptr<Relation> plan;
-  shared_ptr<GPUPreparedStatementData> gpu_prepared;
+struct SiriusTableFunctionData : public TableFunctionData {
+  SiriusTableFunctionData() = default;
+  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<GPUContext> gpu_context;
+  unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -141,12 +142,14 @@ struct GPUTableFunctionData : public TableFunctionData {
   }
 };
 
-struct SiriusTableFunctionData : public TableFunctionData {
-  SiriusTableFunctionData() = default;
-  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
+#ifdef SIRIUS_ENABLE_LEGACY
+struct GPUTableFunctionData : public TableFunctionData {
+  GPUTableFunctionData() = default;
+  shared_ptr<Relation> plan;
+  shared_ptr<GPUPreparedStatementData> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<::sirius::sirius_interface> sirius_iface;
+  unique_ptr<GPUContext> gpu_context;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -342,6 +345,17 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
   output.Reference(*result_chunk);
   return;
 }
+
+static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog& catalog)
+{
+  TableFunction gpu_processing(
+    "gpu_processing", {LogicalType::VARCHAR}, SiriusExtension::GPUProcessingFunction,
+    SiriusExtension::GPUProcessingBind);
+  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
+  catalog.CreateTableFunction(transaction, gpu_processing_info);
+}
+#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
   ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
@@ -645,11 +659,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
   catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-  TableFunction gpu_processing(
-    "gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
-  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
-  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(transaction, gpu_processing_info);
+#ifdef SIRIUS_ENABLE_LEGACY
+  RegisterLegacyGPUFunctions(transaction, catalog);
+#endif
 
   TableFunction gpu_execution("gpu_execution",
                               {LogicalType::VARCHAR},

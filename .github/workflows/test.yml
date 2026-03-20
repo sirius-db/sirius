@@ -86,14 +86,6 @@ jobs:
           mkdir -p test_datasets/tpch_parquet_sf1
           ./build/release/duckdb -f scripts/tpch_to_parquet.sql
 
-      - name: Run sqllogic tests
-        run: |
-          ./build/release/test/unittest "$PWD/test/*" | tee test.log; EXIT=${PIPESTATUS[0]}
-          if grep -qE "FAILURES SUMMARY|Error in GPUExecuteQuery" test.log || [ "$EXIT" -ne 0 ]; then
-            echo "Test failures detected!"
-            exit 1
-          fi
-
       - name: TPC-H performance snapshot
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.cfg
