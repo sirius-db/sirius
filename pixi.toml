@@ -8,10 +8,11 @@ requires-pixi = ">=0.65"
 scripts = ["scripts/pixi_activate.sh"]
 
 [dependencies]
+bc = "*"
 clang = "21.*"
 clangxx = "21.*"
 clang-tools = "21.*"
-cmake = "4.*"
+cmake = "4.1.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
 cxx-compiler = "*"
@@ -28,6 +29,7 @@ pkg-config = "*"
 pre-commit = "*"
 sccache = "*"
 spdlog = "1.8.*"
+sqlite = ">=3.52.0,<4"
 unzip = "*"
 wget = "*"
 

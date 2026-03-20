@@ -23,7 +23,7 @@ Experiment Setup:
 
 - Linux (x86_64 or aarch64)
 - NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 13.0 (driver only — the toolkit is provided by Pixi)
+- CUDA >= 13.0 (driver only, requires NVIDIA driver >= 570 — the toolkit is provided by Pixi)
 - Git
 - [Pixi](https://pixi.sh/latest/installation/) (manages all build dependencies: CMake, clang, cuDF, RMM, spdlog, etc.)
 
@@ -211,10 +211,19 @@ All test tasks automatically rebuild if sources have changed. Test logs are save
 We use [Catch2](https://github.com/catchorg/Catch2) as the testing framework.
 
 ## Logging
-Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:
-```
-export SIRIUS_LOG_DIR={PATH for logging}
+Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
+
+Log directory and level can be initialized via environment variables before loading the extension:
+```bash
+export SIRIUS_LOG_DIR=/path/to/logs
 export SIRIUS_LOG_LEVEL=debug
+```
+
+Both can also be configured at runtime via DuckDB's `SET` command:
+```sql
+SET sirius_log_dir = '/path/to/logs';
+SET sirius_log_level = 'debug';
+SET sirius_log_flush_seconds = 1;
 ```
 
 ## Limitations

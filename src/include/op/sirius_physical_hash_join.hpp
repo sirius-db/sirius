@@ -26,6 +26,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "sirius_config.hpp"
 #include "utils.hpp"
 
 #include <cstddef>
@@ -40,6 +41,13 @@ class sirius_meta_pipeline;
 
 namespace op {
 
+// STANDARD uses cudf APIs where the build and probe is a single operation.
+// BUILD_PROBE builds the hash table in one step and then probes it in a separate step, which allows
+// for better pipelining with other operators, and allows reusing the hash table. MIXED_JOIN uses
+// cudf's mixed_join API for joins with both equality and inequality conditions.
+enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
+enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
+
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
@@ -50,22 +58,26 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   };
 
  public:
-  sirius_physical_hash_join(duckdb::LogicalOperator& op,
-                            duckdb::unique_ptr<sirius_physical_operator> left,
-                            duckdb::unique_ptr<sirius_physical_operator> right,
-                            duckdb::vector<duckdb::JoinCondition> cond,
-                            duckdb::JoinType join_type,
-                            const duckdb::vector<duckdb::idx_t>& left_projection_map,
-                            const duckdb::vector<duckdb::idx_t>& right_projection_map,
-                            duckdb::vector<duckdb::LogicalType> delim_types,
-                            duckdb::idx_t estimated_cardinality,
-                            duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info);
-  sirius_physical_hash_join(duckdb::LogicalOperator& op,
-                            duckdb::unique_ptr<sirius_physical_operator> left,
-                            duckdb::unique_ptr<sirius_physical_operator> right,
-                            duckdb::vector<duckdb::JoinCondition> cond,
-                            duckdb::JoinType join_type,
-                            duckdb::idx_t estimated_cardinality);
+  sirius_physical_hash_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius_physical_operator> right,
+    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::JoinType join_type,
+    const duckdb::vector<duckdb::idx_t>& left_projection_map,
+    const duckdb::vector<duckdb::idx_t>& right_projection_map,
+    duckdb::vector<duckdb::LogicalType> delim_types,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+  sirius_physical_hash_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius_physical_operator> right,
+    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::JoinType join_type,
+    duckdb::idx_t estimated_cardinality,
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
   //! Scans where we should push generated filters into (if any)
@@ -110,7 +122,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
+  /// @brief This is called by the partition operator to inform the hash join of the number of
+  /// partitions that will be produced by the partition operator, which can be used to make
+  /// decisions about the join execution strategy (e.g., whether to switch to a build-probe strategy
+  /// for small datasets).
+  /// @param num_partitions
+  /// @param build_side_bytes
+  void update_join_exec_mode(int num_partitions, uint64_t build_side_bytes);
+
+  std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::optional<task_creation_hint> get_next_task_hint() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -125,16 +148,24 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Becomes a source when it is an external join
   bool is_source() const override { return true; }
 
-  std::mutex batches_to_processed_mutex;
+  std::mutex op_state_mutex;
   std::size_t current_partition_index = 0;
   std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
 
   bool is_all_inequality_join = true;
-  // True when conditions contain both equality conditions (hashed) and inequality conditions
-  // (evaluated via cuDF mixed_join binary predicate).
-  bool is_mixed_join = false;
+
+  HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::STANDARD;
+  BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
+  uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+  std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
+  std::shared_ptr<::cucascade::data_batch>
+    _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
+  std::vector<std::unique_ptr<cudf::column>>
+    _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the
+                                // build table
+  //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;
   std::vector<cudf::size_type> left_key_col_indices;
@@ -156,6 +187,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  public:
   // Sink Interface
   bool is_sink() const override { return true; }
+
+  void finalize_operator() override;
 };
 
 }  // namespace op

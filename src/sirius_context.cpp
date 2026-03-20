@@ -16,6 +16,7 @@
 
 #include "sirius_context.hpp"
 
+#include "config.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "extension_lock.hpp"
@@ -86,13 +87,13 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
   auto query = context.GetCurrentQuery();
   spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+  bool query_cache_hit = false;
   if (config_.is_scan_caching_enabled()) {
-    pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+    query_cache_hit = pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
   pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
 
-  // Reset task creator state (including scan operator global state map) for the new query
-  task_creator_->reset();
+  task_creator_->reset(query_cache_hit);
   task_creator_->set_client_context(context);
 }
 
@@ -173,10 +174,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     auto spaces        = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& dg_cfg = config_.get_downgrade_executor_config();
     for (auto* space : spaces) {
-      sirius::parallel::task_executor_config executor_config{
-        dg_cfg.num_threads, false, dg_cfg.cpu_affinity_list};
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
-        std::move(executor_config),
+        dg_cfg,
         *data_repository_manager_,
         space->get_id(),
         const_cast<cucascade::memory::memory_space*>(space),
@@ -342,7 +341,9 @@ void SiriusContext::throw_if_not_initialized() const
 
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
-  InitGlobalLogger();
+  if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
+  if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
   read_config_file_if_exists();
 }
 

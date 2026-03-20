@@ -70,6 +70,7 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
                               std::size_t size_in_bytes,
                               std::size_t uncompressed_size_in_bytes,
+                              std::size_t file_size,
                               std::shared_ptr<cudf::io::datasource> fallback_datasource)
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
@@ -79,6 +80,7 @@ class host_parquet_representation : public cucascade::idata_representation {
       _column_chunk_byte_ranges(std::move(column_chunk_byte_ranges)),
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
+      _file_size(file_size),
       _fallback_datasource(fallback_datasource)
   {
   }
@@ -218,6 +220,11 @@ class host_parquet_representation : public cucascade::idata_representation {
   }
 
   /**
+   * @brief Gets the original parquet file size in bytes.
+   */
+  [[nodiscard]] std::size_t get_file_size() const { return _file_size; }
+
+  /**
    * @brief Sets the fallback datasource for uncached byte ranges.
    *
    * @param ds A shared_ptr to the fallback datasource.
@@ -235,6 +242,7 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
                               std::size_t size_in_bytes,
                               std::size_t uncompressed_size_in_bytes,
+                              std::size_t file_size,
                               std::shared_ptr<cudf::io::datasource> fallback_datasource)
     : idata_representation(*memory_space),
       _parquet_reader(std::move(parquet_reader)),
@@ -243,6 +251,7 @@ class host_parquet_representation : public cucascade::idata_representation {
       _column_chunk_byte_ranges(std::move(column_chunk_byte_ranges)),
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
+      _file_size(file_size),
       _fallback_datasource(fallback_datasource)
   {
   }
@@ -255,6 +264,7 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::vector<cudf::io::text::byte_range_info> _column_chunk_byte_ranges;
   std::size_t _size_in_bytes;
   std::size_t _uncompressed_size_in_bytes;
+  std::size_t _file_size{0};
   std::shared_ptr<cudf::io::datasource> _fallback_datasource;
 };
 }  // namespace sirius

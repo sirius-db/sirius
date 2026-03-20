@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <exception>
 #include <optional>
+#include <stdexcept>
 #include <variant>
 
 TEST_CASE("use configuration basic setters", "[config_opt][basic]")
@@ -181,7 +182,7 @@ TEST_CASE("use configuration basic setters with condition", "[config_opt][condit
           string_value = "config setter test";
     )");
 
-  REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::invalid_argument);
+  REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
   REQUIRE(int_value == 0);  // value should not be changed due to validation failure
 }
 
@@ -496,6 +497,58 @@ TEST_CASE("use nested naming with config", "[config_opt][nested_naming]")
   REQUIRE(favorite_color == ee::color::green);
 }
 
+TEST_CASE("unregistered config key throws runtime_error", "[config_opt][unregistered]")
+{
+  using namespace sirius;
+
+  SECTION("single unregistered key throws")
+  {
+    config::configuration_setter setter;
+    int int_value = 0;
+    setter.add_config("int_value", int_value);
+
+    libconfig::Config libconfig;
+    libconfig.readString(R"(
+        int_value = 42;
+        unknown_key = "surprise";
+    )");
+
+    REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
+  }
+
+  SECTION("all keys registered does not throw")
+  {
+    config::configuration_setter setter;
+    int int_value       = 0;
+    double double_value = 0.0;
+    setter.add_config("int_value", int_value);
+    setter.add_config("double_value", double_value);
+
+    libconfig::Config libconfig;
+    libconfig.readString(R"(
+        int_value = 42;
+        double_value = 3.14;
+    )");
+
+    REQUIRE_NOTHROW(setter.apply(libconfig.getRoot()));
+  }
+
+  SECTION("unregistered key in dotted-path group throws")
+  {
+    config::configuration_setter setter;
+    int value = 0;
+    setter.add_config("group.value", value);
+
+    libconfig::Config libconfig;
+    libconfig.readString(R"(
+        group = { value = 10; };
+        rogue = 99;
+    )");
+
+    REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
+  }
+}
+
 // Test iterable config with element-level validation
 TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
 {
@@ -541,7 +594,7 @@ TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
     setter.add_config("numbers", numbers, [](const int& val) { return val > 0; });
 
     // This should throw because -5 fails validation
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 
   SECTION("Element validation with custom predicate")
@@ -599,7 +652,7 @@ TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
 
     setter.add_config("fractions", fractions, sirius::config::fraction<double>{});
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 }
 
@@ -638,7 +691,7 @@ TEST_CASE("Variant config validates the value", "[config_opt][validation][varian
     setter.add_variant_config<int>(
       "port", port_or_name, [](const int& val) { return val > 0 && val <= 65535; });
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 
   SECTION("Variant with string alternative and validation")
@@ -670,7 +723,7 @@ TEST_CASE("Variant config validates the value", "[config_opt][validation][varian
     setter.add_variant_config<std::string>(
       "name", port_or_name, [](const std::string& val) { return !val.empty(); });
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
   }
 
   SECTION("Variant with between validator")
@@ -699,6 +752,98 @@ TEST_CASE("Variant config validates the value", "[config_opt][validation][varian
 
     setter.add_variant_config<int>("percentage", value, config::between<int>{0, 100});
 
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
+  }
+}
+
+// Config type that only registers "name" — used to test dotted-path coexistence
+struct partial_name_config {
+  std::string name;
+};
+
+template <>
+struct sirius::config::custom_config_registrar<partial_name_config> {
+  static void config(sirius::config::configuration_setter& setter, partial_name_config& opt)
+  {
+    setter.add_config("name", opt.name);
+  }
+};
+
+TEST_CASE("Dotted-path and nested config coexist without false unknown-key error",
+          "[config_opt][dotted_path_and_nested]")
+{
+  using namespace sirius;
+
+  SECTION("Parent dotted-path key is exempt from nested config unknown-key check")
+  {
+    // The parent registers:
+    //   "block.extra" -> int (dotted path, handled by parent)
+    //   "block"       -> partial_name_config (nested, only knows "name")
+    // "block" in the config file has both "name" and "extra".
+    // Without the fix this would throw because the nested setter for partial_name_config
+    // doesn't know about "extra".
+
+    libconfig::Config cfg;
+    auto& block = cfg.getRoot().add("block", libconfig::Setting::TypeGroup);
+    block.add("name", libconfig::Setting::TypeString) = "hello";
+    block.add("extra", libconfig::Setting::TypeInt)   = 99;
+
+    partial_name_config named{};
+    int extra = 0;
+    config::configuration_setter setter;
+    setter.add_config("block.extra", extra);
+    setter.add_config("block", named);
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(named.name == "hello");
+    REQUIRE(extra == 99);
+  }
+
+  SECTION("Truly unknown key inside nested block still throws")
+  {
+    libconfig::Config cfg;
+    auto& block = cfg.getRoot().add("block", libconfig::Setting::TypeGroup);
+    block.add("name", libconfig::Setting::TypeString)     = "hello";
+    block.add("unknown_key", libconfig::Setting::TypeInt) = 7;
+
+    partial_name_config named{};
+    config::configuration_setter setter;
+    setter.add_config("block", named);
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
+  }
+}
+
+TEST_CASE("Unknown config keys throw runtime_error", "[config_opt][unknown_key]")
+{
+  using namespace sirius;
+
+  SECTION("Unregistered key in config throws")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("known_key", libconfig::Setting::TypeInt)   = 42;
+    cfg.getRoot().add("unknown_key", libconfig::Setting::TypeInt) = 99;
+
+    int known_val = 0;
+    config::configuration_setter setter;
+    setter.add_config("known_key", known_val);
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
+  }
+
+  SECTION("All keys registered does not throw")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("key_a", libconfig::Setting::TypeInt) = 1;
+    cfg.getRoot().add("key_b", libconfig::Setting::TypeInt) = 2;
+
+    int a = 0, b = 0;
+    config::configuration_setter setter;
+    setter.add_config("key_a", a);
+    setter.add_config("key_b", b);
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(a == 1);
+    REQUIRE(b == 2);
   }
 }

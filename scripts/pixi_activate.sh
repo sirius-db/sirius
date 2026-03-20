@@ -9,3 +9,6 @@ if [ -d "$_root/duckdb" ]; then
   rm -f "$_root/duckdb/CMakePresets.json"
   printf '{"version":6,"include":["../CMakePresets.json"]}\n' > "$_root/duckdb/CMakePresets.json"
 fi
+
+mkdir -p build
+pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh
