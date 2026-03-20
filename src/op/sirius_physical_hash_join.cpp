@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
+#include "cudf/concatenate.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
@@ -453,20 +454,27 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       std::to_string(this->get_operator_id()));
   }
   if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING) {
-    if (build_port->repo->num_partitions() != 1 || build_port->repo->size(0) != 1 ||
+    if (build_port->repo->num_partitions() != 1 || build_port->repo->size(0) < 1 ||
         probe_port->repo->num_partitions() != 1) {
       throw std::runtime_error(
         "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected exactly 1 "
-        "partition and 1 batch in default (build) port in operator " +
+        "partition and at least 1 batch in build port in operator " +
         std::to_string(this->get_operator_id()));
     }
-    // When the hash table is not build yet, we will send both the build and probe side. To build
-    // the hash table and perform the first join.
+    // When the hash table is not built yet, send the probe batch and all available build batches.
+    // Multiple build batches will be concatenated in execute() before building the hash table.
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     auto probe_batch = probe_port->repo->pop_data_batch(::cucascade::batch_state::task_created);
-    auto build_batch = build_port->repo->pop_data_batch(::cucascade::batch_state::task_created);
     input_batch.push_back(std::move(probe_batch));
-    input_batch.push_back(std::move(build_batch));
+    while (build_port->repo->size(0) > 0) {
+      auto build_batch =
+        build_port->repo->pop_data_batch(::cucascade::batch_state::task_created, 0);
+      if (build_batch) {
+        input_batch.push_back(std::move(build_batch));
+      } else {
+        break;
+      }
+    }
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
     return std::make_unique<operator_data>(input_batch);
 
@@ -772,7 +780,22 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
-      auto build_keys_result      = prepare_join_keys(input_batches[1],
+      std::shared_ptr<cucascade::data_batch> build_batch;
+      if (input_batches.size() == 2) {
+        build_batch = input_batches[1];
+      } else {
+        // Multiple build batches: concatenate before building the hash table.
+        std::vector<cudf::table_view> build_views;
+        build_views.reserve(input_batches.size() - 1);
+        for (size_t i = 1; i < input_batches.size(); ++i) {
+          build_views.push_back(get_cudf_table_view(*input_batches[i]));
+        }
+        auto& memory_space = *input_batches[1]->get_memory_space();
+        auto concat_table =
+          cudf::concatenate(build_views, stream, memory_space.get_default_allocator());
+        build_batch = make_data_batch(std::move(concat_table), memory_space);
+      }
+      auto build_keys_result      = prepare_join_keys(build_batch,
                                                  right_key_col_indices,
                                                  cast_necessary,
                                                  key_casts,
@@ -782,7 +805,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        _build_table              = input_batches[1];
+        _build_table              = std::move(build_batch);
         _hash_table =
           std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
