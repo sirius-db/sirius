@@ -314,8 +314,6 @@ void duckdb_scan_executor::manager_loop()
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
       try {
-        SIRIUS_LOG_TRACE("Pipeline {}: scan executor scheduling scan task",
-                         scan_task->get_pipeline_id());
         auto consumers = scan_task->get_output_consumers();
         {
           auto output_data = get_scan_output(scan_task, stream);

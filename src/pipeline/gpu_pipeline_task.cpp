@@ -109,13 +109,7 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
       }
 
       lock_result = batch->try_to_lock_for_processing(requested_memory_space->get_id());
-    } catch (const rmm::out_of_memory& oom) {
-      SIRIUS_LOG_ERROR("gpu_pipeline_task: failed to lock batch for processing due to OOM.");
-      throw;
-    } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR(
-        "gpu_pipeline_task: failed to lock batch for processing due to unknown error: {}",
-        e.what());
+    } catch (...) {
       throw;
     }
   }
@@ -423,10 +417,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       throw;
     }
     if (!handle) {
-      SIRIUS_LOG_ERROR("Pipeline {}: failed to lock or prepare batch {} for processing, state: {}",
-                       pipeline->get_pipeline_id(),
-                       batch->get_batch_id(),
-                       static_cast<int>(batch->get_state()));
       // trick to retry the task
       throw oom_reschedule_exception(std::move(local_state._input_data),
                                      0,
@@ -512,13 +502,6 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
     _local_state->cast<gpu_pipeline_task_local_state>().get_bytes_to_materialize_input();
   auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
   auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
-  SIRIUS_LOG_TRACE(
-    "Pipeline {}: estimated reservation size - input_size={}, estimate={}, "
-    "bytes_to_materialize_input={}",
-    _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_pipeline_id(),
-    input_size,
-    estimate ? *estimate : 0,
-    bytes_to_materialize_input);
   if (estimate) { return *estimate + bytes_to_materialize_input; }
   // Fallback: no history yet (first batch in pipeline)
   return input_size * 2 + bytes_to_materialize_input;

@@ -553,11 +553,6 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  SIRIUS_LOG_TRACE("Pipeline {}: duckdb_scan_task compute_task starting, operator={} (id={})",
-                   get_pipeline_id(),
-                   g_state._op.get_name(),
-                   g_state._op.get_operator_id());
-
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),

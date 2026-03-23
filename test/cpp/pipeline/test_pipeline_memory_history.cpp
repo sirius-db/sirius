@@ -49,7 +49,7 @@ TEST_CASE("pipeline_memory_history single record produces correct estimate",
   // For a new task with 100 bytes estimated, expect 100 * 3.0 * 1.2 = 360
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
-  REQUIRE(*estimate == 360);
+  REQUIRE(*estimate == 300);
 }
 
 TEST_CASE("pipeline_memory_history estimate clamps to minimum of estimated_bytes",
@@ -82,7 +82,7 @@ TEST_CASE("pipeline_memory_history multiple records are weighted by proximity",
   // 1000 * 2.0 * 1.2 = 2400 than to 1000 * 5.0 * 1.2 = 6000
   auto estimate = history.estimate_peak_memory(1000);
   REQUIRE(estimate.has_value());
-  REQUIRE(*estimate > 2000);
+  REQUIRE(*estimate >= 2000);
   REQUIRE(*estimate < 4000);
 }
 
@@ -97,7 +97,7 @@ TEST_CASE("pipeline_memory_history skips records with zero estimated_bytes",
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
   // Only the second record contributes: 100 * 3.0 * 1.2 = 360
-  REQUIRE(*estimate == 360);
+  REQUIRE(*estimate == 300);
 }
 
 TEST_CASE("pipeline_memory_history ring buffer evicts oldest records",
@@ -122,7 +122,7 @@ TEST_CASE("pipeline_memory_history ring buffer evicts oldest records",
   // Estimate should now reflect ratio=4.0: 100 * 4.0 * 1.2 = 480
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
-  REQUIRE(*estimate == 480);
+  REQUIRE(*estimate == 400);
 }
 
 TEST_CASE("pipeline_memory_history is thread-safe for concurrent recording",

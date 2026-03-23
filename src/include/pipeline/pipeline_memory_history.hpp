@@ -71,8 +71,7 @@ class pipeline_memory_history {
    * @brief Estimate peak memory for a new task given its estimation basis.
    *
    * Uses a weighted average of historical peak/estimated ratios, where records
-   * with similar estimation bases receive higher weight. Applies a 20% safety
-   * margin and clamps to a minimum of estimated_bytes.
+   * with similar estimation bases receive higher weight.
    *
    * @param estimated_bytes The estimation basis for the new task.
    * @return The estimated peak memory in bytes, or nullopt if no history exists.
@@ -107,7 +106,6 @@ class pipeline_memory_history {
 
     double avg_ratio = weighted_ratio_sum / weight_sum;
 
-    // Apply 20% safety margin
     auto result = static_cast<std::size_t>(static_cast<double>(estimated_bytes) * avg_ratio);
 
     // Never estimate less than the estimation basis itself

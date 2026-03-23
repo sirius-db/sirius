@@ -408,15 +408,6 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
 
-  SIRIUS_LOG_TRACE(
-    "Pipeline {}: parquet_scan_task compute_task starting, task_id={}, file_idx={}, "
-    "compressed_bytes={}, uncompressed_bytes={}",
-    get_pipeline_id(),
-    _task_id,
-    l_state.get_file_idx(),
-    l_state.get_reserved_compressed_bytes(),
-    l_state.get_reserved_uncompressed_bytes());
-
   if (!_datasource) {
     _datasource = cudf::io::datasource::create(g_state.get_file_path(l_state.get_file_idx()));
   }
