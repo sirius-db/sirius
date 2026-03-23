@@ -2016,7 +2016,7 @@ impl PBackendService for PBackendServiceHandler {
                     // because the GPU engine doesn't support AGG finalize or UNION operations.
                     // GPU-resident tables will be D2H-copied by DuckDB's ScanDataDuckDB when
                     // the Substrait plan runs via from_substrait (CPU path).
-                    let _has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
+                    let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
                         table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
                     });
 
@@ -2026,18 +2026,27 @@ impl PBackendService for PBackendServiceHandler {
                             info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
                             (ExecPlan::SqlCpuOnly(read_sql), None)
                         } else {
-                            let has_gpu_tables = has_gpu_tables || exchange_node_ids.iter().any(|&nid| {
+                            let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
                                 table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
                             });
 
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    // Exchange fragments use CPU Substrait. Even when tables are
-                                    // GPU-resident, the GPU engine doesn't support AGG finalize.
-                                    // DuckDB's from_substrait handles INTERMEDIATE_TO_RESULT phase.
-                                    let exec = ExecPlan::SubstraitCpuOnly {
-                                        bytes: plan.substrait_bytes,
-                                        sort_limit_sql: plan.sort_limit_sql,
+                                    // Use GPU for exchange fragments — the GPU scan reads from
+                                    // GPUBufferManager (for packed GPU tables) or DuckDB (for PBlock
+                                    // tables, which get H2D copied by ScanDataDuckDB).
+                                    // The from_substrait transformer already handles AGG finalize
+                                    // (INTERMEDIATE_TO_RESULT phase rewrites count→sum).
+                                    let exec = if plan.force_cpu_substrait {
+                                        ExecPlan::SubstraitCpuOnly {
+                                            bytes: plan.substrait_bytes,
+                                            sort_limit_sql: plan.sort_limit_sql,
+                                        }
+                                    } else {
+                                        ExecPlan::Substrait {
+                                            bytes: plan.substrait_bytes,
+                                            sort_limit_sql: plan.sort_limit_sql,
+                                        }
                                     };
                                     (exec, Some(plan.output_names))
                                 }
