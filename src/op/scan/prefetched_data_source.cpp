@@ -32,8 +32,10 @@
 namespace sirius::op::scan {
 
 prefetched_data_source::prefetched_data_source(
-  std::unique_ptr<cache_ranges> ranges, std::shared_ptr<cudf::io::datasource> fallback_source)
-  : ranges_(std::move(ranges)), fallback_(std::move(fallback_source))
+  std::unique_ptr<cache_ranges> ranges,
+  std::size_t file_size,
+  std::shared_ptr<cudf::io::datasource> fallback_source)
+  : ranges_(std::move(ranges)), file_size_(file_size), fallback_(std::move(fallback_source))
 {
 }
 
@@ -51,17 +53,20 @@ size_t prefetched_data_source::host_read(size_t offset, size_t size, uint8_t* ds
 {
   if (size == 0) return 0;
 
-  try {
-    auto spans          = ranges_->get_ranges(offset, size);
+  auto spans = ranges_->get_ranges(offset, size);
+  if (spans.has_value()) {
     size_t bytes_copied = 0;
-    for (auto const& span : spans) {
+    for (auto const& span : spans.value()) {
       std::memcpy(dst + bytes_copied, span.data(), span.size());
       bytes_copied += span.size();
     }
     total_bytes_read_from_cache_.fetch_add(size, std::memory_order_relaxed);
     return bytes_copied;
-  } catch (std::out_of_range const&) {
-    if (!fallback_) throw;
+  } else {
+    if (!fallback_) {
+      throw std::out_of_range(
+        "prefetched_data_source::host_read: offset not covered by cache and no fallback source");
+    }
     size_t bytes_read = fallback_->host_read(offset, size, dst);
     total_bytes_read_from_fallback_.fetch_add(bytes_read, std::memory_order_relaxed);
     return bytes_read;
@@ -94,25 +99,28 @@ std::unique_ptr<cudf::io::datasource::buffer> prefetched_data_source::device_rea
 prefetched_data_source::copy_result prefetched_data_source::enqueue_device_copies(
   size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
-  std::vector<std::span<const std::byte>> spans;
-  try {
-    spans = ranges_->get_ranges(offset, size);
-  } catch (std::out_of_range const&) {
-    if (!fallback_) throw;
-
-    size_t bytes_read = 0;
-    if (fallback_->supports_device_read()) {
-      bytes_read = fallback_->device_read(offset, size, dst, stream);
+  auto spans_opt = ranges_->get_ranges(offset, size);
+  if (!spans_opt.has_value()) {
+    if (!fallback_) {
+      throw std::out_of_range(
+        "prefetched_data_source::enqueue_device_copies: offset not covered by cache and no "
+        "fallback source");
     } else {
-      auto host_buf = fallback_->host_read(offset, size);
-      RMM_CUDA_TRY(::cudaMemcpyAsync(
-        dst, host_buf->data(), host_buf->size(), cudaMemcpyHostToDevice, stream.value()));
-      bytes_read = host_buf->size();
+      size_t bytes_read = 0;
+      if (fallback_->supports_device_read()) {
+        bytes_read = fallback_->device_read(offset, size, dst, stream);
+      } else {
+        auto host_buf = fallback_->host_read(offset, size);
+        RMM_CUDA_TRY(::cudaMemcpyAsync(
+          dst, host_buf->data(), host_buf->size(), cudaMemcpyHostToDevice, stream.value()));
+        bytes_read = host_buf->size();
+      }
+      total_bytes_read_from_fallback_.fetch_add(bytes_read, std::memory_order_relaxed);
+      return {bytes_read, stream.value()};
     }
-    total_bytes_read_from_fallback_.fetch_add(bytes_read, std::memory_order_relaxed);
-    return {bytes_read, stream.value()};
   }
 
+  std::vector<std::span<const std::byte>> spans = std::move(spans_opt.value());
   std::vector<void*> src_ptrs;
   std::vector<void*> dst_ptrs;
   std::vector<size_t> counts;
@@ -191,7 +199,7 @@ std::future<size_t> prefetched_data_source::device_read_async(size_t offset,
 
 size_t prefetched_data_source::size() const
 {
-  // If a fallback datasource is present, report its size (it covers the full file).
+  if (file_size_ > 0) return file_size_;
   if (fallback_) return fallback_->size();
   return ranges_->max_offset();
 }

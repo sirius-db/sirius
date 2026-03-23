@@ -58,9 +58,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
-  std::unique_ptr<operator_data> execute(
-    const operator_data& input_data,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 
   //! Override to wait for N batches before returning READY
   std::optional<task_creation_hint> get_next_task_hint() override;
@@ -76,6 +75,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Override the maximum bytes per partition (0 = use default GPU memory-based calculation)
   void set_max_partition_bytes(size_t bytes) { _max_partition_bytes_override = bytes; }
+
+  //! Release the partition boundaries table to free GPU memory
+  void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
  private:
   //! Partition boundary rows (P-1 rows containing sort key column values)

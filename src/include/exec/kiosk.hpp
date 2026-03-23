@@ -69,6 +69,15 @@ class kiosk {
     cv_.notify_all();
   }
 
+  // Re-enable the kiosk after a stop() so it can accept new tickets.
+  // Must only be called once all outstanding tickets have been released
+  // (i.e. after wait_all() has returned).
+  void resume()
+  {
+    std::lock_guard lock(mutex_);
+    stopped_ = false;
+  }
+
   // Blocking: acquire a ticket (waits if bounded and at capacity)
   [[nodiscard]] ticket acquire();
 

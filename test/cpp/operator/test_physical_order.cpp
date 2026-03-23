@@ -105,7 +105,7 @@ TEST_CASE("sirius_physical_order sorts 1 column ascending", "[physical_order]")
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -133,7 +133,7 @@ TEST_CASE("sirius_physical_order sorts 1 column descending", "[physical_order]")
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -167,7 +167,7 @@ TEST_CASE("sirius_physical_order sorts by col0, returns both columns", "[physica
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -203,7 +203,7 @@ TEST_CASE("sirius_physical_order sorts by 2 keys (asc, desc)", "[physical_order]
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -237,7 +237,7 @@ TEST_CASE("sirius_physical_order projects only col1 when sorting by col0", "[phy
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -273,7 +273,7 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc, return all", "[phy
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -317,7 +317,7 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc + col1 desc, return
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -352,7 +352,7 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0, project col1 and col2 
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch}));
+  auto out = op.execute(operator_data({batch}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -389,7 +389,7 @@ TEST_CASE("sirius_physical_order handles multiple batches", "[physical_order]")
 
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(operator_data({batch1, batch2}));
+  auto out = op.execute(operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 2);
 
   // Each batch is independently sorted
@@ -421,7 +421,7 @@ TEST_CASE("sirius_physical_order handles null input batches", "[physical_order]"
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, batch, nullptr};
-  auto out = op.execute(operator_data(inputs));
+  auto out = op.execute(operator_data(inputs), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().size() == 1);
 
   auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -443,6 +443,6 @@ TEST_CASE("sirius_physical_order returns empty for all-null inputs", "[physical_
   sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, nullptr};
-  auto out = op.execute(operator_data(inputs));
+  auto out = op.execute(operator_data(inputs), cudf::get_default_stream());
   REQUIRE(out->get_data_batches().empty());
 }

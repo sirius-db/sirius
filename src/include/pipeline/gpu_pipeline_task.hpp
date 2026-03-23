@@ -26,6 +26,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -70,12 +71,16 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   std::unique_ptr<op::operator_data> _input_data;  ///< Input data batches for the pipeline
   size_t _start_operator_index = 0;  ///< Operator index to resume from (0 = start of pipeline)
 
+  /// Number of times this task has been retried due to OOM (0 = first attempt).
+  uint32_t retry_count = 0;
+  /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
+  std::optional<uint64_t> original_task_id = std::nullopt;
+
   /**
    * @brief Get a const pointer to the reservation (non-owning).
    *
    * @return const cucascade::memory::reservation* Pointer to the reservation, or nullptr
    */
-  // WSM TODO: remove this method?
   const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
 };
 
@@ -208,7 +213,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
  private:
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;
-  bool _oom_rescheduled = false;
+  bool _oom_rescheduled                                             = false;
+  cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
 };
 
 }  // namespace pipeline

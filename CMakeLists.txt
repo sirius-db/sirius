@@ -40,10 +40,10 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS
+set(CUCASCADE_BUILD_SHARED_LIBS
     OFF
     CACHE BOOL "" FORCE)
-set(BUILD_STATIC_LIBS
+set(CUCASCADE_BUILD_STATIC_LIBS
     ON
     CACHE BOOL "" FORCE)
 set(WARNINGS_AS_ERRORS
@@ -59,7 +59,6 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/downgrade/downgrade_queue.cpp
     src/downgrade/downgrade_task.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_executor_state.cpp
@@ -85,6 +84,7 @@ set(EXTENSION_SOURCES
     src/gpu_physical_plan_generator.cpp
     src/gpu_pipeline.cpp
     src/gpu_query_result.cpp
+    src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
@@ -240,10 +240,6 @@ foreach(_target sirius_extension sirius_loadable_extension)
   target_include_directories(
     ${_target}
     PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
-
-  target_compile_definitions(
-    ${_target}
-    PRIVATE $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">)
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade)

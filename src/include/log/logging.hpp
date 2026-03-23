@@ -16,6 +16,16 @@
 
 #pragma once
 
+#ifdef __CUDACC__
+// nvcc cannot compile spdlog/fmt chrono headers — provide no-op macros
+#define SIRIUS_LOG_TRACE(...)
+#define SIRIUS_LOG_DEBUG(...)
+#define SIRIUS_LOG_INFO(...)
+#define SIRIUS_LOG_WARN(...)
+#define SIRIUS_LOG_ERROR(...)
+#define SIRIUS_LOG_FATAL(...)
+#else  // !__CUDACC__
+
 #ifndef SPDLOG_ACTIVE_LEVEL
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #else
@@ -25,8 +35,6 @@
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
 
-#include <cstdlib>
-#include <optional>
 #include <string>
 
 #define SIRIUS_LOG_TRACE(...) SPDLOG_LOGGER_TRACE(spdlog::default_logger_raw(), __VA_ARGS__)
@@ -36,66 +44,51 @@
 #define SIRIUS_LOG_ERROR(...) SPDLOG_LOGGER_ERROR(spdlog::default_logger_raw(), __VA_ARGS__)
 #define SIRIUS_LOG_FATAL(...) SPDLOG_LOGGER_CRITICAL(spdlog::default_logger_raw(), __VA_ARGS__)
 
+#endif  // __CUDACC__
+#ifndef __CUDACC__
+
 namespace duckdb {
 
-inline constexpr int SIRIUS_LOG_FLUSH_SEC         = 3;
-inline constexpr const char* SIRIUS_LOG_LEVEL_ENV = "SIRIUS_LOG_LEVEL";
-inline constexpr const char* SIRIUS_LOG_DIR_ENV   = "SIRIUS_LOG_DIR";
-
-inline std::optional<std::string> GetEnvVar(const std::string& name)
+inline spdlog::level::level_enum ParseLogLevel(const std::string& level_str)
 {
-  const char* val = std::getenv(name.c_str());
-  if (val) {
-    return std::string(val);
-  } else {
-    return std::nullopt;
-  }
-}
-
-inline spdlog::level::level_enum GetLogLevel()
-{
-  auto log_level_str = GetEnvVar(SIRIUS_LOG_LEVEL_ENV);
-  if (log_level_str.has_value()) {
-    if (*log_level_str == "trace") return spdlog::level::trace;
-    if (*log_level_str == "debug") return spdlog::level::debug;
-    if (*log_level_str == "info") return spdlog::level::info;
-    if (*log_level_str == "warn") return spdlog::level::warn;
-    if (*log_level_str == "error") return spdlog::level::err;
-    if (*log_level_str == "critical") return spdlog::level::critical;
-    if (*log_level_str == "off") return spdlog::level::off;
-  }
+  if (level_str == "trace") return spdlog::level::trace;
+  if (level_str == "debug") return spdlog::level::debug;
+  if (level_str == "info") return spdlog::level::info;
+  if (level_str == "warn") return spdlog::level::warn;
+  if (level_str == "error") return spdlog::level::err;
+  if (level_str == "critical") return spdlog::level::critical;
+  if (level_str == "off") return spdlog::level::off;
   return spdlog::level::info;
 }
 
-inline std::string GetLogDir()
+inline void InitGlobalLogger(const std::string& log_level_str,
+                             const std::string& log_dir,
+                             int flush_seconds)
 {
-  auto log_dir_str = GetEnvVar(SIRIUS_LOG_DIR_ENV);
-  if (log_dir_str.has_value()) { return *log_dir_str; }
-  return SIRIUS_DEFAULT_LOG_DIR;
-}
-
-inline void InitGlobalLogger(std::string log_file = "")
-{
-  // Log file
-  if (log_file.empty()) {
-    auto log_dir = GetLogDir();
-    log_file     = log_dir + "/sirius.log";
-  }
+  auto log_file  = log_dir + "/sirius.log";
   auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
   file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
-  // Logger
+  auto log_level = ParseLogLevel(log_level_str);
   auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
-  auto log_level = GetLogLevel();
   logger->set_level(log_level);
   spdlog::set_default_logger(logger);
-  spdlog::set_level(log_level);  // Also set the global level
-  auto log_level_str = GetEnvVar(SIRIUS_LOG_LEVEL_ENV);
-  if (log_level_str.has_value()) {
-    spdlog::flush_on(log_level);
-  } else {
-    spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
-  }
+  spdlog::set_level(log_level);
+  spdlog::flush_every(std::chrono::seconds(flush_seconds));
+}
+
+inline void SetGlobalLogFlush(int flush_seconds)
+{
+  spdlog::flush_every(std::chrono::seconds(flush_seconds));
+}
+
+inline void SetGlobalLogLevel(const std::string& log_level_str)
+{
+  auto log_level = ParseLogLevel(log_level_str);
+  spdlog::set_level(log_level);
+  if (auto logger = spdlog::default_logger()) { logger->set_level(log_level); }
 }
 
 }  // namespace duckdb
+
+#endif  // !__CUDACC__

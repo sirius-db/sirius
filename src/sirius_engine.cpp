@@ -41,6 +41,8 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius_context.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/data_repository_manager.hpp>
 
 #include <stdexcept>
@@ -186,24 +188,29 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
+  nvtx3::scoped_range nvtx_range{"sirius::query"};
+
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
 
-  // Create the query with the pipeline hashmap
-  sirius_pipeline_hashmap pipeline_map(new_scheduled);
-  sirius_ctx->create_query(std::move(pipeline_map));
+  // Create the query with the pipelines
+  sirius_ctx->create_query(std::move(new_scheduled));
   auto future = sirius_ctx->get_pipeline_executor().start_query();
   try {
     future.get();
   } catch (const std::exception& e) {
-    /// todo(bobbi) we should handle the error properly, clean the query context and then return the
-    /// error to duckdb
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
+    // clear_all_repositories() immediately after execute() throws; without
+    // this drain, tasks still running in the thread pool hold raw pointers to
+    // those repositories and cause a use-after-free / heap corruption.
+    sirius_ctx->get_pipeline_executor().drain_after_error();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
+    sirius_ctx->get_pipeline_executor().drain_after_error();
     throw;
   }
 }
