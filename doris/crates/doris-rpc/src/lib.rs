@@ -20,6 +20,8 @@ pub mod nixl_exchange;
 pub mod nixl_integration;
 pub mod nixl_service;
 #[cfg(test)]
+mod exchange_integration_tests;
+#[cfg(test)]
 mod nixl_exchange_mock;
 pub mod pblock_decoder;
 pub mod transfer_engine;

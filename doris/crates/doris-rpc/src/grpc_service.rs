@@ -1341,6 +1341,49 @@ fn generate_exchange_agg_merge_sql(
         return None;
     }
 
+    // Determine permutation: the exchange table columns may be in a different
+    // order than the AGG_FINAL's aggregate_functions. Compute the mapping from
+    // AGG_FINAL order → exchange table column positions using slot_ref → slot_id
+    // matching (same logic as node_translator.rs reordering).
+    let measure_permutation: Vec<usize> = {
+        use doris_thrift::exprs::TExprNodeType;
+
+        // Get materialized slots for the exchange node's input tuple,
+        // sorted by column_pos (matches DuckDB table column order).
+        let input_tuple_id = *exch.row_tuples.first().unwrap_or(&0);
+        let mut input_slots: Vec<(i32, i32)> = params.desc_tbl.as_ref()
+            .and_then(|dt| dt.slot_descriptors.as_ref())
+            .map(|slots| {
+                slots.iter()
+                    .filter(|s| s.parent == input_tuple_id && s.is_materialized)
+                    .map(|s| (s.id, s.column_pos))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        input_slots.sort_by_key(|&(_, pos)| pos);
+        let input_slot_ids: Vec<i32> = input_slots.iter().map(|&(id, _)| id).collect();
+
+        if input_slot_ids.len() > num_grouping {
+            let measure_slots = &input_slot_ids[num_grouping..];
+            let mut perm = Vec::new();
+            let mut all_found = true;
+            for agg_fn in &agg_node.aggregate_functions {
+                let slot_id = agg_fn.nodes.iter()
+                    .find(|n| n.node_type == TExprNodeType::SLOT_REF)
+                    .and_then(|n| n.slot_ref.as_ref())
+                    .map(|sr| sr.slot_id);
+                if let Some(sid) = slot_id {
+                    if let Some(pos) = measure_slots.iter().position(|&s| s == sid) {
+                        perm.push(pos);
+                    } else { all_found = false; break; }
+                } else { all_found = false; break; }
+            }
+            if all_found { perm } else { (0..num_agg_fns).collect() }
+        } else {
+            (0..num_agg_fns).collect()
+        }
+    };
+
     // Build SELECT list.
     let mut select_parts = Vec::new();
 
@@ -1349,9 +1392,10 @@ fn generate_exchange_agg_merge_sql(
         select_parts.push(format!("\"{}\"", col));
     }
 
-    // Aggregate columns: apply merge function.
+    // Aggregate columns: apply merge function, using the permutation to
+    // map AGG_FINAL's aggregate_functions[i] → exchange table column position.
     for (i, agg_fn_expr) in agg_node.aggregate_functions.iter().enumerate() {
-        let col_idx = num_grouping + i;
+        let col_idx = num_grouping + measure_permutation[i];
         let col = &columns[col_idx];
 
         // Extract function name from the aggregate expression root node.
@@ -1916,7 +1960,8 @@ impl PBackendService for PBackendServiceHandler {
 
                     // Translate and execute.
                     // Priority order:
-                    // 1. AGG(finalize) over exchange: generate merge SQL (SUM/MIN/MAX)
+                    // 1. AGG(finalize) over exchange: generate merge SQL (SUM/MIN/MAX).
+                    //    Substrait can't handle finalize semantics (it re-runs COUNT instead of SUM).
                     // 2. UNION_NODE / pure EXCHANGE root: trivial exchange table SQL (DuckDB SetRel broken for substrait)
                     // 3. Other (SORT/JOIN over exchange): Substrait path
                     let (exec_plan, output_names) =

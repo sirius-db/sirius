@@ -97,12 +97,20 @@ fn translate_node(
             return Ok(children.into_iter().next().unwrap());
         }
         if children.is_empty() {
-            // No children: this is an exchange receiver. The data will be
-            // loaded into a table named "__EXCHANGE_TABLE_{node_id}" by the
-            // exchange handling code in grpc_service.rs. The full table name
-            // (with query_id prefix) is set at execution time; the plan
-            // translator uses the table_schemas map to get the actual name.
-            let exchange_table_name = format!("__EXCHANGE_TABLE_{}", node.node_id);
+            // No children: this is an exchange receiver. The data is loaded
+            // into a DuckDB table by grpc_service.rs. The table name is
+            // query-scoped (e.g. "__EXCH_{query_lo_hex}_{node_id}") and
+            // passed via table_schemas. Look up by node_id suffix.
+            // Match query-scoped exchange table name: __EXCH_{hex8}_{node_id}
+            // or legacy __EXCHANGE_TABLE_{node_id}. Use precise suffix to
+            // avoid ambiguity (e.g. node 4 vs 14).
+            let suffix_a = format!("__EXCH_") ;  // query-scoped prefix
+            let suffix_b = format!("_{}", node.node_id);
+            let exchange_table_name = table_schemas.keys()
+                .find(|k| k.starts_with(&suffix_a) && k.ends_with(&suffix_b))
+                .or_else(|| table_schemas.keys().find(|k| *k == &format!("__EXCHANGE_TABLE_{}", node.node_id)))
+                .cloned()
+                .unwrap_or_else(|| format!("__EXCHANGE_TABLE_{}", node.node_id));
 
             // Build schema from the exchange node's output tuple.
             let tuple_id = *node
