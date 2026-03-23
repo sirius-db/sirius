@@ -2,6 +2,6 @@ cuda_version:
   - "12"
   - "13"
 cudf_host_constraint:
-  - ">=26.02.00,<26.03"
+  - ">=26.06.00a0,<26.07"
 cudf_run_constraint:
-  - ">=26.02.00"
+  - ">=26.06.00a0"

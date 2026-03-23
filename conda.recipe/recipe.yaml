@@ -29,7 +29,7 @@ requirements:
       - libcurand
       - cuda-cudart
   host:
-    - libcudf >=26.02.00,<26.03
+    - libcudf ${{ cudf_host_constraint }}
     - librmm
     - spdlog >=1.8,<1.9
     - libconfig
@@ -40,7 +40,7 @@ requirements:
     - cuda-version =${{ cuda_version }}
     - numactl
   run:
-    - libcudf >=26.02.00
+    - libcudf ${{ cudf_run_constraint }}
     - librmm
     - spdlog >=1.8
     - cuda-version >=${{ cuda_version }}
