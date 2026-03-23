@@ -1,0 +1,51 @@
+# NOTICE - Actions permissions policy (Settings > Actions > General):
+#   - "Allow sirius-db, and select non-sirius-db, actions and reusable workflows"
+#     - Allow actions created by GitHub: YES (covers actions/*)
+#     - Allow actions by Marketplace verified creators: NO
+#     - Explicitly allowed third-party actions:
+#       prefix-dev/setup-pixi@*
+#       prefix-dev/rattler-build-action@*
+#       mozilla-actions/sccache-action@*
+#     - Require actions to be pinned to a full-length commit SHA: NO
+#
+# Adding a new action? You must:
+#   1. Pin it to a full-length commit SHA (e.g. uses: owner/repo@<40-char-sha> # vX.Y.Z)
+#   2. If it is not from sirius-db, GitHub, or the explicitly allowed third-party actions above, add it to the
+#      project-level allowlist above before merging
+name: Conda
+
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch:
+          - x64
+          - arm64
+        channel:
+          - stable
+          - nightly
+      fail-fast: false
+    runs-on: ${{ format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - uses: prefix-dev/rattler-build-action@91928848ad1ec2025fb7fdd6c018a88ad31e3609 # v0.2.36
+        with:
+          rattler-build-version: v0.61.1
+          artifact-name: conda-${{ matrix.channel }}-${{ matrix.arch }}
+          build-args: >-
+            --config-file conda.recipe/rattler-build${{ case(matrix.channel == 'nightly', '-nightly', '') }}.toml
+            ${{ case(matrix.channel == 'nightly', '--variant-config conda.recipe/variants-nightly.yaml', '') }}
