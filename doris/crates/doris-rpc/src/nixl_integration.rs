@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::gpu_staging_buffer::StagingLease;
 use crate::nixl_exchange::{GpuBufferDesc, NixlExchange};
 use crate::exchange_sender::ExchangeDest;
-use crate::exchange_buffer::{ExchangeBuffer, ExchangeKey};
+use crate::exchange_buffer::{ExchangeBuffer, ExchangeKey, PackedGpuExchange};
 use crate::hash_partitioner::{ExchangeInfo, PartitionStrategy};
 use sirius_ffi::GpuColumnBuffers;
 
@@ -291,6 +291,12 @@ pub async fn send_exchange_with_nixl(
         ).await;
     }
 
+    // Extract packed info from location (if available).
+    let (packed_metadata, buffers) = match &location {
+        ExecutionLocation::Gpu { packed_metadata, buffers, .. } => (packed_metadata.as_deref(), buffers.as_slice()),
+        _ => (None, &[][..]),
+    };
+
     // Broadcast / Random: send all rows to all destinations (existing behavior).
     // Split destinations into local (self) and remote.
     let (local_dests, remote_dests): (Vec<ExchangeDest>, Vec<ExchangeDest>) = destinations
@@ -300,6 +306,31 @@ pub async fn send_exchange_with_nixl(
 
     // Handle local (self-transfer) destinations via ExchangeBuffer.
     for dest in &local_dests {
+        let key = ExchangeKey { query_id, node_id };
+
+        // If packed GPU data is available, store it directly — no PBlock needed.
+        if let Some(ref md) = packed_metadata {
+            if let Some(buf) = buffers.first() {
+                tracing::info!(
+                    dest = %dest.brpc_addr,
+                    gpu_addr = format_args!("0x{:x}", buf.addr),
+                    gpu_size = buf.len,
+                    "self-transfer: packed GPU path (zero copies)"
+                );
+                exchange_buffer.store_packed_gpu(
+                    key.clone(),
+                    PackedGpuExchange {
+                        gpu_addr: buf.addr,
+                        gpu_size: buf.len,
+                        cudf_metadata: md.to_vec(),
+                    },
+                );
+                exchange_buffer.add_block(&key, sender_id, None, true);
+                tracing::info!(dest = %dest.brpc_addr, sender_id, "self-transfer: complete (GPU-direct)");
+                continue;
+            }
+        }
+
         tracing::info!(
             dest = %dest.brpc_addr,
             sender_id,
@@ -307,7 +338,6 @@ pub async fn send_exchange_with_nixl(
         );
         let (pblock, _num_rows) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&ipc_bytes)
             .map_err(|e| format!("self-transfer arrow_ipc_to_pblock: {e}"))?;
-        let key = ExchangeKey { query_id, node_id };
         exchange_buffer.add_block(&key, sender_id, Some(pblock), false);
         exchange_buffer.add_block(&key, sender_id, None, true);
         tracing::info!(

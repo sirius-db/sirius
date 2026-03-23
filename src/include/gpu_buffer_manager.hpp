@@ -154,6 +154,13 @@ class GPUBufferManager {
   void RetainAllocation(void* ptr, int gpu);
   size_t ReleaseRetainedBuffers();
 
+  /// Register an external GPU table from a cudf::table_view (zero-copy).
+  /// Column data pointers reference the caller's GPU memory (e.g. nixl staging buffer).
+  /// The caller must ensure the backing memory outlives the table entry.
+  void registerExternalTable(const string& table_name,
+                             const cudf::table_view& view,
+                             const vector<string>& column_names);
+
  private:
   // Private constructor
   GPUBufferManager(size_t cache_size_per_gpu,

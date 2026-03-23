@@ -1757,18 +1757,23 @@ impl PBackendService for PBackendServiceHandler {
                                 gpu_size = packed.gpu_size,
                                 "registering packed GPU exchange table (zero CPU copies)"
                             );
+                            // register_packed_table: cudf::unpack → GPUBufferManager::tables
+                            // + schema-only DuckDB table. Called from spawn_blocking context
+                            // (engine lock held, no nested DuckDB queries in progress).
                             let engine_guard = engine.lock().unwrap();
                             match engine_guard.register_packed_table(
                                 &table_name, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
                             ) {
                                 Ok(()) => {
-                                    info!(table = %table_name, "packed GPU table registered on GPU");
                                     match engine_guard.get_table_columns(&table_name) {
-                                        Ok(cols) => { table_schemas.insert(table_name, cols); }
-                                        Err(e) => warn!(error = %e, "failed to get packed table columns"),
+                                        Ok(cols) => {
+                                            info!(table = %table_name, cols = cols.len(),
+                                                  "packed GPU table registered (zero CPU copies)");
+                                            table_schemas.insert(table_name, cols);
+                                        }
+                                        Err(e) => warn!(error = %e, "get_table_columns after GPU registration"),
                                     }
                                     drop(engine_guard);
-                                    // Take (and discard) any PBlocks that may have arrived.
                                     let _ = buffer.take(&key);
                                     continue;
                                 }
@@ -2001,13 +2006,31 @@ impl PBackendService for PBackendServiceHandler {
                             info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
                             (ExecPlan::SqlCpuOnly(read_sql), None)
                         } else {
+                            // Track whether any exchange tables are GPU-resident (from packed nixl transfer).
+                            let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
+                                let k = ExchangeKey { query_id, node_id: nid };
+                                // If we registered a packed GPU table (above), it's in GPUBufferManager.
+                                // Check table_schemas — if a table was registered via packed path,
+                                // it was added to table_schemas above.
+                                table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
+                            });
+
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    // Exchange fragments always use CPU: they read from exchange
-                                    // tables (not parquet), so GPU scan pipeline has no operators.
-                                    let exec = ExecPlan::SubstraitCpuOnly {
-                                        bytes: plan.substrait_bytes,
-                                        sort_limit_sql: plan.sort_limit_sql,
+                                    // Use GPU execution if exchange tables are GPU-resident
+                                    // (registered via cudf::unpack into GPUBufferManager).
+                                    // Otherwise use CPU (tables are in DuckDB storage from PBlock path).
+                                    let exec = if has_gpu_tables {
+                                        info!("exchange fragment using GPU execution (GPU-resident tables)");
+                                        ExecPlan::Substrait {
+                                            bytes: plan.substrait_bytes,
+                                            sort_limit_sql: plan.sort_limit_sql,
+                                        }
+                                    } else {
+                                        ExecPlan::SubstraitCpuOnly {
+                                            bytes: plan.substrait_bytes,
+                                            sort_limit_sql: plan.sort_limit_sql,
+                                        }
                                     };
                                     (exec, Some(plan.output_names))
                                 }

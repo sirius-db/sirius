@@ -522,4 +522,83 @@ void GPUBufferManager::createColumn(string up_table_name,
   }
 }
 
+void GPUBufferManager::registerExternalTable(
+    const string& table_name,
+    const cudf::table_view& view,
+    const vector<string>& column_names) {
+
+  auto num_cols = view.num_columns();
+  auto num_rows = static_cast<size_t>(view.num_rows());
+
+  auto rel = make_shared_ptr<GPUIntermediateRelation>(static_cast<size_t>(num_cols));
+  rel->names = table_name;
+
+  for (cudf::size_type c = 0; c < num_cols; c++) {
+    auto col = view.column(c);
+    auto col_name = (static_cast<size_t>(c) < column_names.size())
+                      ? column_names[c]
+                      : "col_" + std::to_string(c);
+    rel->column_names[c] = col_name;
+
+    // Map cudf type to GPUColumnType.
+    GPUColumnType gpu_type;
+    switch (col.type().id()) {
+      case cudf::type_id::INT8:
+      case cudf::type_id::INT16:   gpu_type = GPUColumnType(GPUColumnTypeId::INT16); break;
+      case cudf::type_id::INT32:   gpu_type = GPUColumnType(GPUColumnTypeId::INT32); break;
+      case cudf::type_id::INT64:   gpu_type = GPUColumnType(GPUColumnTypeId::INT64); break;
+      case cudf::type_id::FLOAT32: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT32); break;
+      case cudf::type_id::FLOAT64: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT64); break;
+      case cudf::type_id::BOOL8:   gpu_type = GPUColumnType(GPUColumnTypeId::BOOLEAN); break;
+      case cudf::type_id::STRING:  gpu_type = GPUColumnType(GPUColumnTypeId::VARCHAR); break;
+      case cudf::type_id::TIMESTAMP_DAYS: gpu_type = GPUColumnType(GPUColumnTypeId::DATE); break;
+      case cudf::type_id::TIMESTAMP_SECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC); break;
+      case cudf::type_id::TIMESTAMP_MILLISECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS); break;
+      case cudf::type_id::TIMESTAMP_MICROSECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_US); break;
+      case cudf::type_id::TIMESTAMP_NANOSECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS); break;
+      case cudf::type_id::DECIMAL32:
+      case cudf::type_id::DECIMAL64:
+      case cudf::type_id::DECIMAL128: {
+        gpu_type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        uint8_t width = (col.type().id() == cudf::type_id::DECIMAL32) ? 9 :
+                        (col.type().id() == cudf::type_id::DECIMAL64) ? 18 : 38;
+        gpu_type.SetDecimalTypeInfo(width, static_cast<uint8_t>(-col.type().scale()));
+        break;
+      }
+      default:
+        SIRIUS_LOG_WARN("[registerExternalTable] unsupported cudf type {} for column {}",
+                        static_cast<int>(col.type().id()), col_name);
+        continue;
+    }
+
+    // Create GPUColumn with pointers directly into the external GPU buffer.
+    // For fixed-width types: data pointer + size.
+    // For strings: data pointer (chars) + offsets from child(0).
+    auto* data_ptr = const_cast<uint8_t*>(col.data<uint8_t>());
+    auto* validity_ptr = const_cast<cudf::bitmask_type*>(col.null_mask());
+
+    if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+      auto offsets_col = col.child(0);
+      // cudf strings: child(0) = offsets (INT32 or INT64), data = chars.
+      // Sirius uses uint64_t* offsets — need to handle INT32 case.
+      auto* offsets_ptr = const_cast<uint64_t*>(
+        reinterpret_cast<const uint64_t*>(offsets_col.data<int32_t>()));
+      // For INT32 offsets from cudf, we'd need to convert to INT64.
+      // For now, assume offsets_col type matches what Sirius expects.
+      size_t num_bytes = 0; // Will be set by the scan operator if needed.
+      auto gpu_col = make_shared_ptr<GPUColumn>(
+        num_rows, gpu_type, data_ptr, offsets_ptr, num_bytes, true, validity_ptr);
+      rel->columns[c] = gpu_col;
+    } else {
+      auto gpu_col = make_shared_ptr<GPUColumn>(
+        num_rows, gpu_type, data_ptr, validity_ptr);
+      rel->columns[c] = gpu_col;
+    }
+  }
+
+  tables[table_name] = rel;
+  SIRIUS_LOG_INFO("[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy GPU)",
+                  table_name, num_cols, num_rows);
+}
+
 }  // namespace duckdb

@@ -1508,42 +1508,59 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 
       SIRIUS_LOG_INFO("[register_packed_table] unpacked: {} cols, {} rows", num_cols, num_rows);
 
-      // Store per-column GPU pointers from the unpacked view in LastGPUBuffers.
-      // The exchange async task can then read these to build the DuckDB table
-      // without going through PBlock encode/decode.
-      std::vector<GPUBufferInfo> gpu_infos;
-      for (int c = 0; c < num_cols; c++) {
-        auto col = view.column(c);
-        GPUBufferInfo info;
-        info.addr = reinterpret_cast<uintptr_t>(col.data<uint8_t>());
-        if (cudf::is_fixed_width(col.type())) {
-          info.len = static_cast<size_t>(col.size()) * cudf::size_of(col.type());
-        } else {
-          info.len = 0; // Variable-width: handled by offsets
+      // Register the unpacked table_view directly in GPUBufferManager::tables.
+      // Column pointers reference the packed buffer (zero-copy).
+      // GPU scan operators will read directly from these pointers.
+      if (buffer_is_initialized) {
+        auto& mgr = GPUBufferManager::GetInstance();
+        vector<string> col_names;
+        for (int c = 0; c < num_cols; c++) {
+          col_names.push_back("col_" + std::to_string(c));
         }
-        info.device_id = 0;
-        info.column_name = "col_" + std::to_string(c);
-        info.type_id = static_cast<int>(col.type().id());
-        info.num_rows = static_cast<size_t>(col.size());
-        info.null_count = static_cast<int>(col.null_count());
-        if (col.nullable() && col.null_mask()) {
-          info.null_mask_addr = reinterpret_cast<uintptr_t>(col.null_mask());
-          info.null_mask_len = cudf::bitmask_allocation_size_bytes(col.size());
-        }
-        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
-          auto offsets_col = col.child(0);
-          info.offsets_addr = reinterpret_cast<uintptr_t>(offsets_col.data<int32_t>());
-          info.offsets_len = static_cast<size_t>(offsets_col.size()) * sizeof(int32_t);
-          // Chars buffer = head_data (col.data()) with size derived from offsets.
-          info.len = gpu_size; // Upper bound — receiver will use offsets to trim.
-        }
-        info.scale = col.type().scale();
-        gpu_infos.push_back(std::move(info));
+        mgr.registerExternalTable(table_name, view, col_names);
       }
-      // Store so Rust can retrieve via sirius_get_last_gpu_buffers().
-      LastGPUBuffers::GetInstance().Store(std::move(gpu_infos));
-      SIRIUS_LOG_INFO("[register_packed_table] stored {} column GPU pointers from unpacked view",
-                      num_cols);
+
+      // Create schema-only DuckDB table for Substrait NamedTable resolution.
+      // GPU scan reads from GPUBufferManager, not DuckDB storage.
+      string col_defs;
+      for (int c = 0; c < num_cols; c++) {
+        if (c > 0) col_defs += ", ";
+        auto col = view.column(c);
+        string dtype;
+        switch (col.type().id()) {
+          case cudf::type_id::INT8: dtype = "TINYINT"; break;
+          case cudf::type_id::INT16: dtype = "SMALLINT"; break;
+          case cudf::type_id::INT32: dtype = "INTEGER"; break;
+          case cudf::type_id::INT64: dtype = "BIGINT"; break;
+          case cudf::type_id::FLOAT32: dtype = "FLOAT"; break;
+          case cudf::type_id::FLOAT64: dtype = "DOUBLE"; break;
+          case cudf::type_id::BOOL8: dtype = "BOOLEAN"; break;
+          case cudf::type_id::STRING: dtype = "VARCHAR"; break;
+          case cudf::type_id::TIMESTAMP_DAYS: dtype = "DATE"; break;
+          case cudf::type_id::TIMESTAMP_SECONDS:
+          case cudf::type_id::TIMESTAMP_MILLISECONDS:
+          case cudf::type_id::TIMESTAMP_MICROSECONDS:
+          case cudf::type_id::TIMESTAMP_NANOSECONDS: dtype = "TIMESTAMP"; break;
+          case cudf::type_id::DECIMAL32:
+          case cudf::type_id::DECIMAL64:
+          case cudf::type_id::DECIMAL128: {
+            int prec = (col.type().id() == cudf::type_id::DECIMAL32) ? 9 :
+                       (col.type().id() == cudf::type_id::DECIMAL64) ? 18 : 38;
+            dtype = "DECIMAL(" + std::to_string(prec) + "," + std::to_string(-col.type().scale()) + ")";
+            break;
+          }
+          default: dtype = "VARCHAR"; break;
+        }
+        col_defs += "\"col_" + std::to_string(c) + "\" " + dtype;
+      }
+      auto create_sql = "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
+      auto qr = ctx.Query(create_sql, false);
+      if (qr->HasError()) {
+        SIRIUS_LOG_WARN("[register_packed_table] CREATE TABLE failed: {}", qr->GetError());
+      } else {
+        SIRIUS_LOG_INFO("[register_packed_table] '{}': {} cols, {} rows (GPU zero-copy + DuckDB schema)",
+                        table_name, num_cols, num_rows);
+      }
 
       return make_uniq<RegisterPackedData>();
     };
