@@ -183,6 +183,52 @@ impl GpuStagingBuffer {
             })?;
             let staged_addr = self.base_addr + offset;
 
+            // Log memory diagnostics for the first buffer to debug D2D failures.
+            if leases.is_empty() {
+                let src_type = super::cuda_driver::cuda_pointer_get_memory_type(src_addr);
+                let dst_type = super::cuda_driver::cuda_pointer_get_memory_type(staged_addr);
+                let src_range = super::cuda_driver::cuda_mem_get_address_range(src_addr);
+                // Check if src is a managed/VMM pointer by querying device ordinal.
+                let src_device: Result<u32, String> = {
+                    super::cuda_driver::ensure_cuda_context().ok();
+                    let mut dev: u32 = 0;
+                    unsafe {
+                        cudarc::driver::sys::cuPointerGetAttribute(
+                            &mut dev as *mut u32 as *mut std::ffi::c_void,
+                            cudarc::driver::sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                            src_addr as u64,
+                        )
+                    }
+                    .result()
+                    .map(|_| dev)
+                    .map_err(|e| format!("{e}"))
+                };
+                let src_managed: Result<u32, String> = {
+                    let mut val: u32 = 0;
+                    unsafe {
+                        cudarc::driver::sys::cuPointerGetAttribute(
+                            &mut val as *mut u32 as *mut std::ffi::c_void,
+                            cudarc::driver::sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_IS_MANAGED,
+                            src_addr as u64,
+                        )
+                    }
+                    .result()
+                    .map(|_| val)
+                    .map_err(|e| format!("{e}"))
+                };
+                tracing::info!(
+                    src_addr = format_args!("0x{src_addr:x}"),
+                    dst_addr = format_args!("0x{staged_addr:x}"),
+                    len,
+                    src_mem_type = ?src_type,
+                    dst_mem_type = ?dst_type,
+                    src_range = ?src_range,
+                    src_device = ?src_device,
+                    src_managed = ?src_managed,
+                    "staging D2D copy: pointer diagnostics"
+                );
+            }
+
             // D2D copy from source (RMM) to staging (cuMemAlloc).
             if let Err(e) = cuda_memcpy_dtod(staged_addr, src_addr, len) {
                 // Roll back this lease and any previous ones.

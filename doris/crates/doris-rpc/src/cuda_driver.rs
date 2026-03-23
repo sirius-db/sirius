@@ -96,11 +96,39 @@ pub fn cuda_memcpy_dtod_no_ctx(dst: usize, src: usize, len: usize) -> Result<(),
         .map_err(|e| format!("cuMemcpyDtoD(dst=0x{dst:x}, src=0x{src:x}, len={len}): {e}"))
 }
 
-/// Copy GPU memory device-to-device using CUDA driver API.
+/// Copy GPU memory device-to-device.
+///
+/// RMM pool sub-allocations use CUDA VMM (cuMemCreate/cuMemMap) internally,
+/// which neither cuMemcpyDtoD nor cudaMemcpy(D2D) can handle directly.
+/// Workaround: bounce through host memory (D2H → H2D).
 pub fn cuda_memcpy_dtod(dst: usize, src: usize, len: usize) -> Result<(), String> {
-    ensure_cuda_context()?;
-    unsafe { result::memcpy_dtod_sync(dst as u64, src as u64, len) }
-        .map_err(|e| format!("cuMemcpyDtoD(dst=0x{dst:x}, src=0x{src:x}, len={len}): {e}"))
+    use cudarc::runtime::sys as rt;
+    // D2H: src GPU → host buffer
+    let mut host_buf = vec![0u8; len];
+    let err = unsafe {
+        rt::cudaMemcpy(
+            host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            src as *const std::ffi::c_void,
+            len,
+            rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+        )
+    };
+    if err != rt::cudaError_t::cudaSuccess {
+        return Err(format!("cudaMemcpy D2H(src=0x{src:x}, len={len}): {err:?}"));
+    }
+    // H2D: host buffer → dst GPU
+    let err = unsafe {
+        rt::cudaMemcpy(
+            dst as *mut std::ffi::c_void,
+            host_buf.as_ptr() as *const std::ffi::c_void,
+            len,
+            rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+        )
+    };
+    if err != rt::cudaError_t::cudaSuccess {
+        return Err(format!("cudaMemcpy H2D(dst=0x{dst:x}, len={len}): {err:?}"));
+    }
+    Ok(())
 }
 
 /// Query the base address and size of the containing allocation for a device pointer.
