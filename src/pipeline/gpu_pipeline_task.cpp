@@ -388,8 +388,32 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
         first_op.get_name(),
         first_op.get_operator_id());
     }
-    auto handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
+    std::optional<cucascade::data_batch_processing_handle> handle;
+    try {
+      handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
+    } catch (const rmm::out_of_memory& oom) {
+      SIRIUS_LOG_ERROR("Pipeline {}: OOM at batch {} preparing for processing, state: {}",
+                       pipeline->get_pipeline_id(),
+                       batch->get_batch_id(),
+                       static_cast<int>(batch->get_state()));
+      throw oom_reschedule_exception(std::move(local_state._input_data),
+                                     0,
+                                     "Failed to lock or prepare batch " +
+                                       std::to_string(batch->get_batch_id()) + " for processing");
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "Unknown error: {};  in lock or prepare for pipeline {}, batch {}, state: {}",
+        e.what(),
+        pipeline->get_pipeline_id(),
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+      throw;
+    }
     if (!handle) {
+      SIRIUS_LOG_ERROR("Pipeline {}: failed to lock or prepare batch {} for processing, state: {}",
+                       pipeline->get_pipeline_id(),
+                       batch->get_batch_id(),
+                       static_cast<int>(batch->get_state()));
       // trick to retry the task
       throw oom_reschedule_exception(std::move(local_state._input_data),
                                      0,
