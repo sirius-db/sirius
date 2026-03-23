@@ -2102,16 +2102,14 @@ impl PBackendService for PBackendServiceHandler {
                         } else {
                             let mut loc = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
                             if should_retain_exch {
-                                if let Some(staging) = nixl_agent_for_exch_blocking.as_ref().and_then(|a| a.staging()) {
-                                    match engine.stage_gpu_buffers(staging.base_addr()) {
-                                        Ok(staged) => {
-                                            tracing::info!(num_staged = staged.len(), "C++ staged GPU buffers for exchange");
-                                            loc.apply_staging(staging.base_addr(), &staged);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "C++ stage_gpu_buffers failed for exchange");
-                                        }
+                                // Get packed GPU buffer from cudf::chunked_pack (written to send staging).
+                                match engine.get_packed_gpu() {
+                                    Ok(Some((addr, size, metadata))) => {
+                                        tracing::info!(addr = format_args!("0x{addr:x}"), size, "packed GPU for exchange forward");
+                                        loc.set_packed_gpu(addr, size, metadata);
                                     }
+                                    Ok(None) => tracing::info!("no packed GPU data for exchange forward"),
+                                    Err(e) => tracing::warn!(error = %e, "get_packed_gpu failed for exchange"),
                                 }
                             }
                             Ok(loc)

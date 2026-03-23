@@ -1030,7 +1030,14 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext& exec_c
   }
 
   if (all_cached) {
-    SIRIUS_LOG_DEBUG("Early terminating from GetDataDuckdbOpt because all cols are cached");
+    // Set num_rows from the cached table — needed by downstream GPU operators.
+    string up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+    auto table_it = gpuBufferManager->tables.find(up_table_name);
+    if (table_it != gpuBufferManager->tables.end() && !table_it->second->columns.empty()) {
+      num_rows = table_it->second->columns[0]->column_length;
+      SIRIUS_LOG_INFO("GetDataDuckDBOpt: all cached, num_rows={} from GPUBufferManager", num_rows);
+    }
     return SourceResultType::FINISHED;
   }
 

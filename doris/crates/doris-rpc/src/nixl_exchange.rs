@@ -260,6 +260,26 @@ impl NixlExchange {
         Ok(())
     }
 
+    /// Register a send staging buffer with nixl (for outgoing transfers).
+    /// This buffer is separate from the recv staging (used for incoming transfers).
+    /// The send buffer is where cudf::chunked_pack writes packed GPU data.
+    pub fn register_send_staging(&self, addr: usize, size: usize) -> Result<(), String> {
+        use crate::gpu_staging_buffer::GpuStagingBuffer;
+        // Just register with nixl — no bump allocator needed (C++ manages this buffer).
+        let _send_staging = GpuStagingBuffer::from_existing(addr, size, 0, &self.agent, &self.backend)?;
+        // Re-cache metadata after registering the new memory region.
+        match self.agent.get_local_md() {
+            Ok(md) => {
+                info!(md_len = md.len(), "cached nixl metadata (send + recv staging registered)");
+                *self.cached_metadata.lock().unwrap() = Some(md);
+            }
+            Err(e) => warn!(error = %e, "failed to re-cache metadata after send staging"),
+        }
+        // Keep the registration alive by leaking it (startup-only, lives for process lifetime).
+        std::mem::forget(_send_staging);
+        Ok(())
+    }
+
     /// Access the nixl Agent (for staging buffer creation etc.).
     pub fn agent(&self) -> &Agent {
         &self.agent
