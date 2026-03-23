@@ -103,6 +103,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
     }
   }
+  _num_scans_in_plan =
+    _scan_operator_global_state_map.size() + _parquet_scan_operator_global_state_map.size();
 }
 
 void task_creator::drain_pending_tasks()
@@ -286,8 +288,6 @@ void task_creator::manager_loop()
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
           auto* parquet_scan             = &node->Cast<op::sirius_physical_parquet_scan>();
-          size_t const num_scans_in_plan =
-            _scan_operator_global_state_map.size() + _parquet_scan_operator_global_state_map.size();
           while (true) {
             pipeline->mark_task_created();
             auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
@@ -322,7 +322,7 @@ void task_creator::manager_loop()
 
             // If there is only a single scan in the plan, continue creating scan tasks to create
             // I/O parallelism. Otherwise, let the plan drive the creation of more tasks.
-            if (num_scans_in_plan >= 2) { break; }
+            if (_num_scans_in_plan >= 2) { break; }
           }
         } else {
           // need to exhaust input batches until all ports are empty
