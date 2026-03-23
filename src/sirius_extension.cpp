@@ -1484,13 +1484,16 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   {
     struct RegisterPackedData : public TableFunctionData {
       bool finished = false;
+      int64_t num_rows = 0;
+      string create_table_sql;
     };
     auto bind = [](ClientContext& ctx, TableFunctionBindInput& input,
                     vector<LogicalType>& return_types, vector<string>& names)
       -> unique_ptr<FunctionData> {
-      return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
-      names = {"status", "num_rows"};
+      return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
+      names = {"status", "num_rows", "create_table_sql"};
 
+      auto result = make_uniq<RegisterPackedData>();
       string table_name = input.inputs[0].GetValue<string>();
       auto gpu_addr = static_cast<uintptr_t>(input.inputs[1].GetValue<int64_t>());
       auto gpu_size = static_cast<size_t>(input.inputs[2].GetValue<int64_t>());
@@ -1520,8 +1523,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
         mgr.registerExternalTable(table_name, view, col_names);
       }
 
-      // Create schema-only DuckDB table for Substrait NamedTable resolution.
-      // GPU scan reads from GPUBufferManager, not DuckDB storage.
+      // Build CREATE TABLE SQL for the Rust caller to execute.
+      // Cannot run ctx.Query() here (deadlocks inside table function bind).
       string col_defs;
       for (int c = 0; c < num_cols; c++) {
         if (c > 0) col_defs += ", ";
@@ -1553,23 +1556,18 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
         }
         col_defs += "\"col_" + std::to_string(c) + "\" " + dtype;
       }
-      auto create_sql = "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
-      auto qr = ctx.Query(create_sql, false);
-      if (qr->HasError()) {
-        SIRIUS_LOG_WARN("[register_packed_table] CREATE TABLE failed: {}", qr->GetError());
-      } else {
-        SIRIUS_LOG_INFO("[register_packed_table] '{}': {} cols, {} rows (GPU zero-copy + DuckDB schema)",
-                        table_name, num_cols, num_rows);
-      }
+      result->create_table_sql = "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
+      result->num_rows = static_cast<int64_t>(num_rows);
 
-      return make_uniq<RegisterPackedData>();
+      return std::move(result);
     };
     auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
       auto& data = data_p.bind_data->CastNoConst<RegisterPackedData>();
       if (data.finished) { output.SetCardinality(0); return; }
       output.SetCardinality(1);
       output.SetValue(0, 0, Value("ok"));
-      output.SetValue(1, 0, Value::BIGINT(0));
+      output.SetValue(1, 0, Value::BIGINT(data.num_rows));
+      output.SetValue(2, 0, Value(data.create_table_sql));
       data.finished = true;
     };
     TableFunction reg_packed("sirius_register_packed_table",

@@ -530,14 +530,19 @@ void GPUBufferManager::registerExternalTable(
   auto num_cols = view.num_columns();
   auto num_rows = static_cast<size_t>(view.num_rows());
 
+  // GPUBufferManager uses UPPERCASE table and column names for lookups.
+  string up_table_name = table_name;
+  transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+
   auto rel = make_shared_ptr<GPUIntermediateRelation>(static_cast<size_t>(num_cols));
-  rel->names = table_name;
+  rel->names = up_table_name;
 
   for (cudf::size_type c = 0; c < num_cols; c++) {
     auto col = view.column(c);
     auto col_name = (static_cast<size_t>(c) < column_names.size())
                       ? column_names[c]
                       : "col_" + std::to_string(c);
+    transform(col_name.begin(), col_name.end(), col_name.begin(), ::toupper);
     rel->column_names[c] = col_name;
 
     // Map cudf type to GPUColumnType.
@@ -596,9 +601,9 @@ void GPUBufferManager::registerExternalTable(
     }
   }
 
-  tables[table_name] = rel;
+  tables[up_table_name] = rel;
   SIRIUS_LOG_INFO("[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy GPU)",
-                  table_name, num_cols, num_rows);
+                  up_table_name, num_cols, num_rows);
 }
 
 }  // namespace duckdb

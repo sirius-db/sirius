@@ -767,56 +767,32 @@ impl SiriusEngine {
         gpu_size: usize,
         cudf_metadata: &[u8],
     ) -> Result<(), EngineError> {
-        // Step 1: C++ cudf::unpack → stores per-column GPU pointers in LastGPUBuffers.
+        // Step 1: C++ cudf::unpack → registers in GPUBufferManager::tables (zero-copy).
+        // Returns the CREATE TABLE SQL for us to execute (can't run inside the bind).
         let sql = "SELECT * FROM sirius_register_packed_table(?, ?, ?, ?)";
         let mut stmt = self.conn
             .prepare(sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow(duckdb::params![
+        let mut rows = stmt.query(duckdb::params![
             table_name,
             gpu_addr as i64,
             gpu_size as i64,
             cudf_metadata,
         ])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let row = rows.next()
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
+            .ok_or_else(|| EngineError::ExecFailed("register_packed_table returned no rows".into()))?;
+        let create_table_sql: String = row.get(2)
+            .map_err(|e| EngineError::ExecFailed(format!("get create_table_sql: {e}")))?;
+        drop(rows);
+        drop(stmt);
 
-        // Step 2: Read the unpacked GPU pointers and register the table.
-        let gpu_info = self.get_last_gpu_result_buffers()
-            .map_err(|e| EngineError::ExecFailed(format!("get_last_gpu_result_buffers after unpack: {e}")))?
-            .ok_or_else(|| EngineError::ExecFailed("no GPU buffer info after cudf::unpack".to_string()))?;
+        // Step 2: Create schema-only DuckDB table on THIS connection.
+        self.conn.execute_batch(&create_table_sql)
+            .map_err(|e| EngineError::ExecFailed(format!("CREATE TABLE for GPU exchange: {e}")))?;
 
-        let column_names: Vec<String> = gpu_info.column_info.iter().map(|(n, _)| n.clone()).collect();
-        let column_types_sql: Vec<String> = gpu_info.column_info.iter().map(|(_, type_id)| {
-            // Map cudf type_id to DuckDB SQL type.
-            match *type_id {
-                3 => "TINYINT".to_string(),    // INT8
-                4 => "SMALLINT".to_string(),   // INT16
-                5 => "INTEGER".to_string(),    // INT32
-                6 => "BIGINT".to_string(),     // INT64
-                9 => "FLOAT".to_string(),      // FLOAT32
-                10 => "DOUBLE".to_string(),    // FLOAT64
-                14 => "BOOLEAN".to_string(),   // BOOL8
-                17 => "VARCHAR".to_string(),   // STRING
-                19 => "DATE".to_string(),      // TIMESTAMP_DAYS
-                20 | 21 | 22 | 23 => "TIMESTAMP".to_string(), // TIMESTAMP_*
-                25 => "DECIMAL(9,0)".to_string(),  // DECIMAL32
-                26 => "DECIMAL(18,0)".to_string(), // DECIMAL64
-                27 => "DECIMAL(38,0)".to_string(), // DECIMAL128
-                _ => "VARCHAR".to_string(),
-            }
-        }).collect();
-        let gpu_ptrs: Vec<(usize, usize)> = gpu_info.buffer_addrs.iter()
-            .map(|&(addr, len, _)| (addr, len))
-            .collect();
-
-        self.register_gpu_exchange_table(
-            table_name,
-            &column_names,
-            &column_types_sql,
-            gpu_info.num_rows,
-            &gpu_ptrs,
-        )
+        Ok(())
     }
 
     /// Allocate GPU memory via the C++ CUDA runtime (cudaMalloc).

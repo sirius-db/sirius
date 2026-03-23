@@ -847,6 +847,8 @@ enum ExecPlan {
         bytes: Vec<u8>,
         sort_limit_sql: Option<String>,
     },
+    /// SQL executed via GPU (gpu_execution), for exchange data in GPUBufferManager.
+    Sql(String),
     /// SQL that should only run on CPU (e.g. exchange fragments reading pre-computed data).
     /// Skips gpu_execution() which can cause INTERNAL errors on non-GPU tables.
     SqlCpuOnly(String),
@@ -859,6 +861,7 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
         let cpu_plan = match plan {
             ExecPlan::Substrait { bytes, sort_limit_sql } =>
                 ExecPlan::SubstraitCpuOnly { bytes, sort_limit_sql },
+            ExecPlan::Sql(sql) => ExecPlan::SqlCpuOnly(sql),
             other => other, // already CPU-only
         };
         return execute_plan(engine, cpu_plan, no_cpu_fallback, false);
@@ -894,6 +897,10 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
         ExecPlan::SubstraitCpuOnly { bytes, sort_limit_sql } => {
             tracing::info!("executing via CPU from_substrait (no data tables, GPU skipped)");
             from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
+        }
+        ExecPlan::Sql(sql) => {
+            tracing::info!(sql = %sql, "executing via GPU SQL");
+            engine.execute_gpu(&sql).map_err(|e| e.to_string())
         }
         ExecPlan::SqlCpuOnly(sql) => {
             tracing::info!(sql = %sql, "executing via CPU SQL (GPU skipped)");
@@ -1757,30 +1764,33 @@ impl PBackendService for PBackendServiceHandler {
                                 gpu_size = packed.gpu_size,
                                 "registering packed GPU exchange table (zero CPU copies)"
                             );
-                            // register_packed_table: cudf::unpack → GPUBufferManager::tables
-                            // + schema-only DuckDB table. Called from spawn_blocking context
-                            // (engine lock held, no nested DuckDB queries in progress).
-                            let engine_guard = engine.lock().unwrap();
-                            match engine_guard.register_packed_table(
-                                &table_name, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
-                            ) {
-                                Ok(()) => {
-                                    match engine_guard.get_table_columns(&table_name) {
-                                        Ok(cols) => {
-                                            info!(table = %table_name, cols = cols.len(),
-                                                  "packed GPU table registered (zero CPU copies)");
-                                            table_schemas.insert(table_name, cols);
-                                        }
-                                        Err(e) => warn!(error = %e, "get_table_columns after GPU registration"),
-                                    }
-                                    drop(engine_guard);
+                            // Must run on blocking thread: register_packed_table calls DuckDB
+                            // queries (ctx.Query inside C++ table function bind).
+                            let reg_engine = engine.clone();
+                            let reg_table = table_name.clone();
+                            let reg_result = tokio::task::spawn_blocking(move || {
+                                let eng = reg_engine.lock().unwrap();
+                                eng.register_packed_table(
+                                    &reg_table, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
+                                )?;
+                                eng.get_table_columns(&reg_table)
+                                    .map_err(|e| sirius_ffi::EngineError::ExecFailed(e.to_string()))
+                            }).await;
+
+                            match reg_result {
+                                Ok(Ok(cols)) => {
+                                    info!(table = %table_name, cols = cols.len(),
+                                          "packed GPU table registered (zero CPU copies)");
+                                    table_schemas.insert(table_name, cols);
                                     let _ = buffer.take(&key);
                                     continue;
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     warn!(error = %e, table = %table_name,
                                           "packed GPU registration failed, falling back to PBlock path");
-                                    drop(engine_guard);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "spawn_blocking panicked during GPU registration");
                                 }
                             }
                         }
@@ -2001,36 +2011,33 @@ impl PBackendService for PBackendServiceHandler {
                     // 2. Everything else (AGG finalize, SORT, JOIN): Substrait path
                     //    AGG finalize uses INTERMEDIATE_TO_RESULT phase so DuckDB rewrites
                     //    count → sum, etc. for merging partial results.
+                    // Track whether GPU-resident exchange tables were registered (from packed nixl).
+                    // Currently not used — exchange fragments stay on CPU (SubstraitCpuOnly)
+                    // because the GPU engine doesn't support AGG finalize or UNION operations.
+                    // GPU-resident tables will be D2H-copied by DuckDB's ScanDataDuckDB when
+                    // the Substrait plan runs via from_substrait (CPU path).
+                    let _has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
+                        table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
+                    });
+
                     let (exec_plan, output_names) =
                         if let Some(read_sql) = generate_exchange_union_sql(&params) {
+                            // UNION ALL always uses CPU SQL path (GPU doesn't support set operations).
                             info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
                             (ExecPlan::SqlCpuOnly(read_sql), None)
                         } else {
-                            // Track whether any exchange tables are GPU-resident (from packed nixl transfer).
-                            let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
-                                let k = ExchangeKey { query_id, node_id: nid };
-                                // If we registered a packed GPU table (above), it's in GPUBufferManager.
-                                // Check table_schemas — if a table was registered via packed path,
-                                // it was added to table_schemas above.
+                            let has_gpu_tables = has_gpu_tables || exchange_node_ids.iter().any(|&nid| {
                                 table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
                             });
 
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    // Use GPU execution if exchange tables are GPU-resident
-                                    // (registered via cudf::unpack into GPUBufferManager).
-                                    // Otherwise use CPU (tables are in DuckDB storage from PBlock path).
-                                    let exec = if has_gpu_tables {
-                                        info!("exchange fragment using GPU execution (GPU-resident tables)");
-                                        ExecPlan::Substrait {
-                                            bytes: plan.substrait_bytes,
-                                            sort_limit_sql: plan.sort_limit_sql,
-                                        }
-                                    } else {
-                                        ExecPlan::SubstraitCpuOnly {
-                                            bytes: plan.substrait_bytes,
-                                            sort_limit_sql: plan.sort_limit_sql,
-                                        }
+                                    // Exchange fragments use CPU Substrait. Even when tables are
+                                    // GPU-resident, the GPU engine doesn't support AGG finalize.
+                                    // DuckDB's from_substrait handles INTERMEDIATE_TO_RESULT phase.
+                                    let exec = ExecPlan::SubstraitCpuOnly {
+                                        bytes: plan.substrait_bytes,
+                                        sort_limit_sql: plan.sort_limit_sql,
                                     };
                                     (exec, Some(plan.output_names))
                                 }
