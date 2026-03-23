@@ -1476,6 +1476,34 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo cuda_alloc_info(cuda_alloc);
   catalog.CreateTableFunction(transaction, cuda_alloc_info);
 
+  // sirius_set_staging_buffer(addr BIGINT, size BIGINT) — tells the result
+  // collector where to pack GPU data via chunked_pack.
+  {
+    struct SetStagingData : public TableFunctionData { bool finished = false; };
+    auto bind = [](ClientContext&, TableFunctionBindInput& input,
+                    vector<LogicalType>& return_types, vector<string>& names)
+      -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::VARCHAR};
+      names = {"status"};
+      auto addr = static_cast<uintptr_t>(input.inputs[0].GetValue<int64_t>());
+      auto size = static_cast<size_t>(input.inputs[1].GetValue<int64_t>());
+      LastGPUBuffers::GetInstance().SetStagingBuffer(addr, size);
+      SIRIUS_LOG_INFO("[sirius_set_staging_buffer] addr=0x{:x} size={}", addr, size);
+      return make_uniq<SetStagingData>();
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<SetStagingData>();
+      if (data.finished) { output.SetCardinality(0); return; }
+      output.SetCardinality(1);
+      output.SetValue(0, 0, Value("ok"));
+      data.finished = true;
+    };
+    TableFunction set_staging("sirius_set_staging_buffer",
+                               {LogicalType::BIGINT, LogicalType::BIGINT}, func, bind);
+    CreateTableFunctionInfo info(set_staging);
+    catalog.CreateTableFunction(transaction, info);
+  }
+
   // sirius_get_packed_gpu() — returns the packed GPU buffer from cudf::pack().
   // Returns: addr (BIGINT), size (BIGINT), metadata (BLOB).
   struct GetPackedGPUData : public TableFunctionData { bool finished = false; };

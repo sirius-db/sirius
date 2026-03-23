@@ -34,6 +34,7 @@
 
 // cudf
 #include <cudf/contiguous_split.hpp>
+#include <cudf/utilities/span.hpp>
 #include <rmm/device_buffer.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -217,23 +218,48 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           });
         }
 
-        // Pack GPU data into a contiguous buffer for nixl exchange.
-        // cudf::pack() copies all column data (data + null masks + offsets)
-        // into a single contiguous rmm::device_buffer, which we keep alive
-        // in LastGPUBuffers. This solves the stale-pointer problem: individual
-        // column pointers become invalid after query cleanup, but the packed
-        // buffer is independently owned.
+        // Pack GPU data for nixl exchange using chunked_pack.
+        //
+        // If a staging buffer address is available (pre-registered with nixl),
+        // pack directly into it — zero per-query nixl registrations.
+        // Otherwise, fall back to cudf::pack() which allocates a new buffer.
         if (should_retain) {
-          auto packed = cudf::pack(view);
-          auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
-          auto gpu_size = packed.gpu_data->size();
-          SIRIUS_LOG_INFO("[result_collector] cudf::pack: {} bytes at 0x{:x} ({} columns, {} rows)",
-                          gpu_size, gpu_addr, view.num_columns(),
-                          view.num_rows());
-          // Wrap device_buffer in shared_ptr for type-erased storage.
-          auto gpu_data_ptr = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
-          duckdb::LastGPUBuffers::GetInstance().StorePackedData(
-            std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
+          auto& lgb = duckdb::LastGPUBuffers::GetInstance();
+          auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
+
+          if (staging_addr != 0 && staging_size > 0) {
+            // chunked_pack: write directly into the pre-registered staging buffer.
+            auto packer = cudf::chunked_pack::create(view, staging_size);
+            auto total_size = packer->get_total_contiguous_size();
+            if (total_size <= staging_size) {
+              cudf::device_span<uint8_t> dst_span(
+                reinterpret_cast<uint8_t*>(staging_addr), staging_size);
+              while (packer->has_next()) {
+                packer->next(dst_span);
+              }
+              auto metadata = packer->build_metadata();
+              SIRIUS_LOG_INFO("[result_collector] chunked_pack into staging: {} bytes at 0x{:x}",
+                              total_size, staging_addr);
+              lgb.StorePackedData(nullptr, staging_addr, total_size, std::move(metadata));
+            } else {
+              SIRIUS_LOG_WARN("[result_collector] packed size {} exceeds staging {} — falling back to cudf::pack",
+                              total_size, staging_size);
+              auto packed = cudf::pack(view);
+              auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
+              auto gpu_size = packed.gpu_data->size();
+              auto gpu_data_ptr = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
+              lgb.StorePackedData(std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
+            }
+          } else {
+            // No staging buffer — use cudf::pack() (allocates a new buffer).
+            auto packed = cudf::pack(view);
+            auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
+            auto gpu_size = packed.gpu_data->size();
+            SIRIUS_LOG_INFO("[result_collector] cudf::pack: {} bytes at 0x{:x}",
+                            gpu_size, gpu_addr);
+            auto gpu_data_ptr = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
+            lgb.StorePackedData(std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
+          }
         }
       }
 

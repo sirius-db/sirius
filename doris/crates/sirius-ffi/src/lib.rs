@@ -733,6 +733,21 @@ impl SiriusEngine {
         }
     }
 
+    /// Tell the C++ result collector where the nixl staging buffer is.
+    ///
+    /// After this, GPU results will be packed directly into the staging buffer
+    /// via cudf::chunked_pack — zero per-query nixl registrations.
+    pub fn set_staging_buffer(&self, addr: usize, size: usize) -> Result<(), EngineError> {
+        let sql = format!("SELECT * FROM sirius_set_staging_buffer({}, {})", addr as i64, size as i64);
+        let mut stmt = self.conn
+            .prepare(&sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .collect();
+        Ok(())
+    }
+
     /// Allocate GPU memory via the C++ CUDA runtime (cudaMalloc).
     ///
     /// Used for the nixl staging buffer, which must be allocated in the same

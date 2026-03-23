@@ -122,6 +122,11 @@ impl Drop for NixlRegisteredBuffer {
 
 /// Cached RMM pool registration info.
 /// Wraps a nixl Agent with cached peer metadata.
+///
+/// SAFETY: The UnsafeCell<Option<GpuStagingBuffer>> is only mutated at startup
+/// (register_staging_from_addr) before any concurrent access. After that, it's
+/// only read via staging().
+unsafe impl Sync for NixlExchange {}
 pub struct NixlExchange {
     agent: Agent,
     backend: Backend,
@@ -132,9 +137,9 @@ pub struct NixlExchange {
     /// UCX cannot handle GPU memory on this system).
     gpu_transfer_enabled: std::sync::atomic::AtomicBool,
     /// Pre-allocated GPU staging buffer for nixl transfers. When present,
-    /// source buffers are D2D-copied into this cuMemAlloc-backed region
-    /// instead of doing per-transfer cuMemAlloc+register cycles.
-    staging: Option<GpuStagingBuffer>,
+    /// source buffers are packed into this buffer via cudf::chunked_pack.
+    /// UnsafeCell allows mutation at startup via register_staging_from_addr.
+    staging: std::cell::UnsafeCell<Option<GpuStagingBuffer>>,
     /// Cached nixl metadata from startup (valid when using staging buffer,
     /// since the registered memory region doesn't change).
     cached_metadata: Mutex<Option<Vec<u8>>>,
@@ -215,12 +220,12 @@ impl NixlExchange {
             backend,
             remote_agents: Mutex::new(HashMap::new()),
             gpu_transfer_enabled: std::sync::atomic::AtomicBool::new(true),
-            staging,
+            staging: std::cell::UnsafeCell::new(staging),
             cached_metadata: Mutex::new(None),
         };
 
         // Cache startup metadata if staging buffer is present (memory layout is stable).
-        if exchange.staging.is_some() {
+        if unsafe { &*exchange.staging.get() }.is_some() {
             match exchange.agent.get_local_md() {
                 Ok(md) => {
                     info!(md_len = md.len(), "cached nixl metadata (staging buffer registered)");
@@ -231,6 +236,28 @@ impl NixlExchange {
         }
 
         Some(exchange)
+    }
+
+    /// Register a pre-allocated GPU address as the staging buffer with nixl.
+    ///
+    /// Used when the staging buffer was allocated via C++ cudaMalloc (to ensure
+    /// it's in the same CUDA runtime as RMM). The buffer is registered with nixl
+    /// once and reused for all transfers.
+    ///
+    /// Must be called at startup before any concurrent access (before gRPC server starts).
+    pub fn register_staging_from_addr(&self, addr: usize, size: usize) -> Result<(), String> {
+        let staging = GpuStagingBuffer::from_existing(addr, size, 0, &self.agent, &self.backend)?;
+        // Cache metadata after registration.
+        match self.agent.get_local_md() {
+            Ok(md) => {
+                info!(md_len = md.len(), "cached nixl metadata (C++ staging buffer registered)");
+                *self.cached_metadata.lock().unwrap() = Some(md);
+            }
+            Err(e) => warn!(error = %e, "failed to cache metadata after staging registration"),
+        }
+        // SAFETY: called at startup before any concurrent access.
+        unsafe { *self.staging.get() = Some(staging); }
+        Ok(())
     }
 
     /// Access the nixl Agent (for staging buffer creation etc.).
@@ -245,7 +272,8 @@ impl NixlExchange {
 
     /// Access the GPU staging buffer, if allocated.
     pub fn staging(&self) -> Option<&GpuStagingBuffer> {
-        self.staging.as_ref()
+        // SAFETY: staging is only mutated at startup before concurrent access.
+        unsafe { &*self.staging.get() }.as_ref()
     }
 
     /// Get cached metadata (from startup, when staging buffer is registered).

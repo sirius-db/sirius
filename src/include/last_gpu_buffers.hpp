@@ -110,6 +110,20 @@ class LastGPUBuffers {
     return packed_metadata_.get();
   }
 
+  /// Set the pre-registered nixl staging buffer address and size.
+  /// Called once at startup after C++ cudaMalloc + nixl registration.
+  void SetStagingBuffer(uintptr_t addr, size_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    staging_addr_ = addr;
+    staging_size_ = size;
+  }
+
+  /// Get the staging buffer for chunked_pack to write into.
+  std::pair<uintptr_t, size_t> GetStagingBuffer() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {staging_addr_, staging_size_};
+  }
+
   void SetRetainNext(bool v) {
     std::lock_guard<std::mutex> lock(mutex_);
     retain_next_ = v;
@@ -130,6 +144,9 @@ class LastGPUBuffers {
   uintptr_t packed_gpu_addr_ = 0;
   size_t packed_gpu_size_ = 0;
   std::unique_ptr<std::vector<uint8_t>> packed_metadata_;
+  /// Pre-registered nixl staging buffer (set once at startup).
+  uintptr_t staging_addr_ = 0;
+  size_t staging_size_ = 0;
   bool retain_next_ = false;
 };
 

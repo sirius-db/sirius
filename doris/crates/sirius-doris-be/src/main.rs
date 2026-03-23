@@ -153,12 +153,39 @@ fn main() {
             config.advertise_host.as_deref().unwrap_or("localhost"),
             config.brpc_port
         );
+        // Create nixl agent without staging first, then allocate staging via C++.
         doris_rpc::nixl_exchange::NixlExchange::try_new_with_staging(
             &agent_name,
-            staging_size,
+            None, // No Rust-side staging (RTLD_LOCAL makes cuMemAlloc inaccessible from C++)
         )
             .map(|a| std::sync::Arc::new(a))
     };
+    // If nixl is available, allocate staging buffer via C++ cudaMalloc and register with nixl.
+    // This ensures the staging buffer is in the same CUDA runtime as RMM so that
+    // cudf::chunked_pack can write directly into it.
+    if let (Some(ref agent), Some(ref eng), Some(size)) = (&nixl_agent, &engine, staging_size) {
+        let eng_guard = eng.lock().unwrap();
+        match eng_guard.cuda_alloc(size) {
+            Ok(staging_addr) => {
+                info!(addr = format_args!("0x{staging_addr:x}"), size, size_mb = size / (1024 * 1024),
+                      "allocated nixl staging buffer via C++ cudaMalloc");
+                // Register with nixl.
+                match agent.register_staging_from_addr(staging_addr, size) {
+                    Ok(()) => {
+                        // Tell C++ result collector where to pack GPU data.
+                        if let Err(e) = eng_guard.set_staging_buffer(staging_addr, size) {
+                            warn!(error = %e, "failed to set staging buffer in C++ result collector");
+                        } else {
+                            info!("staging buffer registered with nixl + C++ result collector");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to register staging buffer with nixl"),
+                }
+            }
+            Err(e) => warn!(error = %e, "C++ cuda_alloc for staging failed"),
+        }
+        drop(eng_guard);
+    }
     if let Some(ref agent) = nixl_agent {
         let has_staging = agent.staging().is_some();
         info!(
