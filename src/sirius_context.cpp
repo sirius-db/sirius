@@ -312,10 +312,11 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
   return *task_creator_;
 }
 
-void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap)
+void SiriusContext::create_query(
+  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines)
 {
   throw_if_not_initialized();
-  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipeline_hashmap));
+  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
   pipeline_executor_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
 }

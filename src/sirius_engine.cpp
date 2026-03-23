@@ -195,9 +195,8 @@ void sirius_engine::execute()
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
 
-  // Create the query with the pipeline hashmap
-  sirius_pipeline_hashmap pipeline_map(new_scheduled);
-  sirius_ctx->create_query(std::move(pipeline_map));
+  // Create the query with the pipelines
+  sirius_ctx->create_query(std::move(new_scheduled));
   auto future = sirius_ctx->get_pipeline_executor().start_query();
   try {
     future.get();
