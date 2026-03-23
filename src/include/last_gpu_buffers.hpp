@@ -80,6 +80,34 @@ class LastGPUBuffers {
   void ReleaseRetainedData() {
     std::lock_guard<std::mutex> lock(mutex_);
     retained_gpu_data_.clear();
+    packed_gpu_data_.reset();
+    packed_metadata_.reset();
+    packed_gpu_addr_ = 0;
+    packed_gpu_size_ = 0;
+  }
+
+  /// Store packed GPU data (from cudf::pack). The device_buffer is wrapped
+  /// in shared_ptr<void> to avoid exposing rmm headers.
+  void StorePackedData(std::shared_ptr<void> gpu_data,
+                       uintptr_t gpu_addr, size_t gpu_size,
+                       std::unique_ptr<std::vector<uint8_t>> metadata) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    packed_gpu_data_ = std::move(gpu_data);
+    packed_gpu_addr_ = gpu_addr;
+    packed_gpu_size_ = gpu_size;
+    packed_metadata_ = std::move(metadata);
+  }
+
+  /// Get the packed GPU buffer address and size (0 if not packed).
+  std::pair<uintptr_t, size_t> GetPackedGPU() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {packed_gpu_addr_, packed_gpu_size_};
+  }
+
+  /// Get the packed metadata bytes (nullptr if not packed).
+  const std::vector<uint8_t>* GetPackedMetadata() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return packed_metadata_.get();
   }
 
   void SetRetainNext(bool v) {
@@ -97,6 +125,11 @@ class LastGPUBuffers {
   mutable std::mutex mutex_;
   std::vector<GPUBufferInfo> buffers_;
   std::vector<std::shared_ptr<void>> retained_gpu_data_;
+  /// Packed GPU data (contiguous buffer from cudf::pack).
+  std::shared_ptr<void> packed_gpu_data_;
+  uintptr_t packed_gpu_addr_ = 0;
+  size_t packed_gpu_size_ = 0;
+  std::unique_ptr<std::vector<uint8_t>> packed_metadata_;
   bool retain_next_ = false;
 };
 

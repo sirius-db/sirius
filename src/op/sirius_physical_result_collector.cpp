@@ -33,6 +33,8 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // cudf
+#include <cudf/contiguous_split.hpp>
+#include <rmm/device_buffer.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
@@ -215,12 +217,23 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           });
         }
 
-        // Retain GPU data to prevent deallocation during query cleanup.
-        // Storing the data_batch shared_ptr keeps the cudf::table (and its GPU
-        // buffers) alive until ReleaseRetainedData() is called.
+        // Pack GPU data into a contiguous buffer for nixl exchange.
+        // cudf::pack() copies all column data (data + null masks + offsets)
+        // into a single contiguous rmm::device_buffer, which we keep alive
+        // in LastGPUBuffers. This solves the stale-pointer problem: individual
+        // column pointers become invalid after query cleanup, but the packed
+        // buffer is independently owned.
         if (should_retain) {
-          duckdb::LastGPUBuffers::GetInstance().RetainData(
-            std::static_pointer_cast<void>(input_batch));
+          auto packed = cudf::pack(view);
+          auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
+          auto gpu_size = packed.gpu_data->size();
+          SIRIUS_LOG_INFO("[result_collector] cudf::pack: {} bytes at 0x{:x} ({} columns, {} rows)",
+                          gpu_size, gpu_addr, view.num_columns(),
+                          view.num_rows());
+          // Wrap device_buffer in shared_ptr for type-erased storage.
+          auto gpu_data_ptr = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
+          duckdb::LastGPUBuffers::GetInstance().StorePackedData(
+            std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
         }
       }
 

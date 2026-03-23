@@ -2265,16 +2265,21 @@ impl PBackendService for PBackendServiceHandler {
                 // Try RMM pool registration first (zero-copy path). Falls back to
                 // cuMemAlloc copy if pool registration fails.
                 if should_retain {
-                    // Stage GPU buffers via C++ cudaMemcpy. Pass 0 to let C++ self-allocate
-                    // a staging buffer (both src and dst must be in the same CUDA runtime).
-                    match engine.stage_gpu_buffers(0) {
-                        Ok(staged) if !staged.is_empty() => {
-                            tracing::info!(num_staged = staged.len(), "C++ staged GPU buffers");
-                            // TODO: register C++ staging ptr with nixl and apply to location
+                    // Get the packed GPU buffer from cudf::pack() — a single contiguous
+                    // GPU allocation in the C++ CUDA runtime. This replaces the old
+                    // per-column staging approach which failed due to RTLD_LOCAL CUDA
+                    // context isolation (RMM sub-allocations are stale after query cleanup).
+                    match engine.get_packed_gpu() {
+                        Ok(Some((addr, size, metadata))) => {
+                            tracing::info!(addr = format_args!("0x{addr:x}"), size, metadata_len = metadata.len(),
+                                          "packed GPU buffer from cudf::pack");
+                            location.set_packed_gpu(addr, size, metadata);
                         }
-                        Ok(_) => {}
+                        Ok(None) => {
+                            tracing::info!("no packed GPU data available");
+                        }
                         Err(e) => {
-                            tracing::warn!(error = %e, "C++ stage_gpu_buffers failed");
+                            tracing::warn!(error = %e, "get_packed_gpu failed");
                         }
                     }
                 }

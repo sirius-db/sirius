@@ -1475,6 +1475,41 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                             CudaAllocBind);
   CreateTableFunctionInfo cuda_alloc_info(cuda_alloc);
   catalog.CreateTableFunction(transaction, cuda_alloc_info);
+
+  // sirius_get_packed_gpu() — returns the packed GPU buffer from cudf::pack().
+  // Returns: addr (BIGINT), size (BIGINT), metadata (BLOB).
+  struct GetPackedGPUData : public TableFunctionData { bool finished = false; };
+  auto get_packed_gpu_bind = [](ClientContext& ctx, TableFunctionBindInput& input,
+                                 vector<LogicalType>& return_types, vector<string>& names)
+    -> unique_ptr<FunctionData> {
+    return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BLOB};
+    names = {"gpu_addr", "gpu_size", "metadata"};
+    return make_uniq<GetPackedGPUData>();
+  };
+  auto get_packed_gpu_func = [](ClientContext& ctx, TableFunctionInput& data_p, DataChunk& output) {
+    auto& data = data_p.bind_data->CastNoConst<GetPackedGPUData>();
+    if (data.finished) { output.SetCardinality(0); return; }
+    auto [addr, size] = LastGPUBuffers::GetInstance().GetPackedGPU();
+    auto* md = LastGPUBuffers::GetInstance().GetPackedMetadata();
+    if (addr == 0 || size == 0) {
+      output.SetCardinality(0);
+      data.finished = true;
+      return;
+    }
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(addr)));
+    output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(size)));
+    if (md && !md->empty()) {
+      output.SetValue(2, 0, Value::BLOB(md->data(), md->size()));
+    } else {
+      output.SetValue(2, 0, Value(LogicalType::BLOB));
+    }
+    data.finished = true;
+  };
+  TableFunction get_packed_gpu("sirius_get_packed_gpu", {},
+                                get_packed_gpu_func, get_packed_gpu_bind);
+  CreateTableFunctionInfo get_packed_gpu_info(get_packed_gpu);
+  catalog.CreateTableFunction(transaction, get_packed_gpu_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

@@ -49,6 +49,30 @@ impl ExecutionLocation {
         }
     }
 
+    /// Store packed GPU buffer info from cudf::pack().
+    ///
+    /// The packed buffer is a single contiguous GPU allocation containing all
+    /// column data, null masks, and offsets. It's allocated by the C++ CUDA
+    /// runtime (same as RMM) so it stays valid after query cleanup.
+    pub fn set_packed_gpu(&mut self, addr: usize, size: usize, metadata: Vec<u8>) {
+        if let Self::Gpu { buffers, .. } = self {
+            // Replace per-column buffer descriptors with a single packed buffer.
+            buffers.clear();
+            buffers.push(GpuBufferDesc {
+                addr,
+                len: size,
+                device_id: 0,
+            });
+            tracing::info!(
+                addr = format_args!("0x{addr:x}"),
+                size,
+                metadata_len = metadata.len(),
+                "set packed GPU buffer for nixl transfer"
+            );
+            // TODO: store metadata for receiver-side unpack
+        }
+    }
+
     /// Apply staging results from C++ `sirius_stage_gpu_buffers()`.
     ///
     /// Updates GPU buffer addresses to point into the staging buffer at the

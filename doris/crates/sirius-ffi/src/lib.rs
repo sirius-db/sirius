@@ -712,6 +712,27 @@ impl SiriusEngine {
         }))
     }
 
+    /// Get the packed GPU buffer from cudf::pack() (single contiguous buffer).
+    ///
+    /// Returns `(addr, size, metadata_bytes)` if pack() was called during the last
+    /// GPU execution with retain_gpu_buffers enabled. Returns `None` otherwise.
+    pub fn get_packed_gpu(&self) -> Result<Option<(usize, usize, Vec<u8>)>, EngineError> {
+        let mut stmt = self.conn
+            .prepare("SELECT gpu_addr, gpu_size, metadata FROM sirius_get_packed_gpu()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt.query([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        match rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+            Some(row) => {
+                let addr: i64 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let size: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let metadata: Vec<u8> = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                Ok(Some((addr as usize, size as usize, metadata)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Allocate GPU memory via the C++ CUDA runtime (cudaMalloc).
     ///
     /// Used for the nixl staging buffer, which must be allocated in the same
