@@ -51,7 +51,7 @@ class query {
   /**
    * @brief Get the scan operators in pipeline execution order.
    *
-   * @return Reference to the vector of pointers to scan operators.
+   * @return Reference to the vector of pointers to scan operators in execution order.
    */
   [[nodiscard]] const duckdb::vector<op::sirius_physical_operator*>& get_scan_operators() const;
 
@@ -76,6 +76,8 @@ class query {
   //! Builds the internal data structures from the pipelines
   void build_indices();
 
+  //! Pipelines and the order in which they must be executed in order to successfully complete the
+  // query.
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> _pipelines;
   //! Cached scan operators in pipeline execution order
   duckdb::vector<op::sirius_physical_operator*> _scan_operators;

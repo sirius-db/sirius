@@ -26,7 +26,7 @@ query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipel
 
 void query::build_indices()
 {
-  for (auto& pipeline : _pipelines) {
+  for (const auto& pipeline : _pipelines) {
     for (auto& op : pipeline->get_operators()) {
       op.get().set_pipeline(pipeline);
     }
