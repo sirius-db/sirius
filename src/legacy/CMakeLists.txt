@@ -8,8 +8,8 @@
 option(ENABLE_LEGACY_SIRIUS
        "Enable legacy Sirius code path (gpu_processing table function)" OFF)
 
-# Sources that are always compiled (shared types used by expression executor
-# and CUDA kernels: GPUColumn, GPUPipeline, GPUExecutor, operators, etc.)
+# Sources that are always compiled (shared types used by expression executor and
+# CUDA kernels: GPUColumn, GPUPipeline, GPUExecutor, operators, etc.)
 # cmake-format: off
 set(SIRIUS_LEGACY_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/gpu_columns.cpp

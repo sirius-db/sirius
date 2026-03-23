@@ -348,9 +348,10 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
 
 static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog& catalog)
 {
-  TableFunction gpu_processing(
-    "gpu_processing", {LogicalType::VARCHAR}, SiriusExtension::GPUProcessingFunction,
-    SiriusExtension::GPUProcessingBind);
+  TableFunction gpu_processing("gpu_processing",
+                               {LogicalType::VARCHAR},
+                               SiriusExtension::GPUProcessingFunction,
+                               SiriusExtension::GPUProcessingBind);
   gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_processing_info(gpu_processing);
   catalog.CreateTableFunction(transaction, gpu_processing_info);
