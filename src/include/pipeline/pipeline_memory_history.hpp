@@ -33,9 +33,9 @@ namespace sirius::pipeline {
  * (e.g. approximate_batch_size or reserved_compressed_bytes).
  */
 struct task_memory_record {
-  std::size_t estimated_bytes;    ///< Pre-history estimation basis
-  std::size_t peak_memory_bytes;  ///< Actual peak allocated bytes during execution
-  std::size_t output_bytes;       ///< Total output data size
+  std::size_t estimated_bytes;              ///< Pre-history estimation basis
+  std::size_t peak_memory_bytes;            ///< Actual peak allocated bytes during execution
+  std::optional<std::size_t> output_bytes;  ///< Total output data size (nullopt if task OOM'd)
 };
 
 /**

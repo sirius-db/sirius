@@ -109,8 +109,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
       }
 
       lock_result = batch->try_to_lock_for_processing(requested_memory_space->get_id());
-    } catch (...) {
-      cancel_task_if_needed();
+    } catch (const rmm::out_of_memory& oom) {
+      SIRIUS_LOG_ERROR("gpu_pipeline_task: failed to lock batch for processing due to OOM.");
+      throw;
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "gpu_pipeline_task: failed to lock batch for processing due to unknown error: {}",
+        e.what());
       throw;
     }
   }
@@ -392,6 +397,14 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     try {
       handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory& oom) {
+      auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
+      auto input_basis = local_state.get_task_consumption_basis();
+      // If the number of bytes consumed is greater than the reservation size, record the peak
+      // consumption
+      if (peak_bytes > reservation_bytes) {
+        auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+        global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
+      }
       SIRIUS_LOG_ERROR("Pipeline {}: OOM at batch {} preparing for processing, state: {}",
                        pipeline->get_pipeline_id(),
                        batch->get_batch_id(),
@@ -440,7 +453,19 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 3. Execute cudf operators on the pipeline
   _allocator       = allocator;
   auto input_basis = local_state.get_task_consumption_basis();
-  auto output_data = compute_task(stream);
+  std::unique_ptr<op::operator_data> output_data;
+  try {
+    output_data = compute_task(stream);
+  } catch (oom_reschedule_exception&) {
+    auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+    // If the number of bytes consumed is greater than the reservation size, record the peak
+    // consumption
+    if (peak_bytes > reservation_bytes) {
+      auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+      global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
+    }
+    throw;
+  }
 
   // Record memory metrics for future reservation estimates
   if (output_data) {
@@ -488,10 +513,12 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
   auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
   auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
   SIRIUS_LOG_TRACE(
-    "Pipeline {}: estimated reservation size - input_size={}, estimate={}",
+    "Pipeline {}: estimated reservation size - input_size={}, estimate={}, "
+    "bytes_to_materialize_input={}",
     _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_pipeline_id(),
     input_size,
-    estimate ? *estimate : 0);
+    estimate ? *estimate : 0,
+    bytes_to_materialize_input);
   if (estimate) { return *estimate + bytes_to_materialize_input; }
   // Fallback: no history yet (first batch in pipeline)
   return input_size * 2 + bytes_to_materialize_input;
