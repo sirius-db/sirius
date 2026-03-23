@@ -200,11 +200,11 @@ class host_parquet_representation : public cucascade::idata_representation {
   [[nodiscard]] std::size_t get_size_in_bytes() const override { return _size_in_bytes; }
 
   /**
-   * @brief Gets the uncompressed size of the data represented by this representation.
+   * @brief Gets the uncompressed (logical) size of the data represented by this representation.
    *
    * @return The uncompressed size of the data.
    */
-  [[nodiscard]] std::size_t get_uncompressed_size_in_bytes() const
+  [[nodiscard]] std::size_t get_logical_data_size_in_bytes() const override
   {
     return _uncompressed_size_in_bytes;
   }

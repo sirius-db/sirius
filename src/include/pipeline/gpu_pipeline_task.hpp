@@ -94,11 +94,27 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     std::size_t input_size = 0;
     if (_input_data) {
       for (const auto& batch : _input_data->get_data_batches()) {
-        if (batch && batch->get_data()) { input_size += batch->get_data()->get_size_in_bytes(); }
+        if (batch && batch->get_data()) {
+          input_size += batch->get_data()->get_logical_data_size_in_bytes();
+        }
       }
     }
     _estimation_basis = input_size;
     return *_estimation_basis;
+  }
+
+  [[nodiscard]] std::size_t get_bytes_to_materialize_input() const
+  {
+    std::size_t input_size = 0;
+    if (_input_data) {
+      for (const auto& batch : _input_data->get_data_batches()) {
+        if (batch && batch->get_data() &&
+            batch->get_data()->get_current_tier() != cucascade::memory::Tier::GPU) {
+          input_size += batch->get_data()->get_logical_data_size_in_bytes();
+        }
+      }
+    }
+    return input_size;
   }
 };
 

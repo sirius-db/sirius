@@ -482,6 +482,9 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 {
   auto input_size =
     _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
+
+  auto bytes_to_materialize_input =
+    _local_state->cast<gpu_pipeline_task_local_state>().get_bytes_to_materialize_input();
   auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
   auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
   SIRIUS_LOG_TRACE(
@@ -489,9 +492,9 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
     _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_pipeline_id(),
     input_size,
     estimate ? *estimate : 0);
-  if (estimate) { return *estimate; }
+  if (estimate) { return *estimate + bytes_to_materialize_input; }
   // Fallback: no history yet (first batch in pipeline)
-  return input_size * 2;
+  return input_size * 2 + bytes_to_materialize_input;
 }
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
