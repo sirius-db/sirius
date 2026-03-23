@@ -20,6 +20,8 @@
 #include "config.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "last_gpu_buffers.hpp"
+#include <cudf/contiguous_split.hpp>
+#include <cudf/utilities/traits.hpp>
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -1475,6 +1477,90 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                             CudaAllocBind);
   CreateTableFunctionInfo cuda_alloc_info(cuda_alloc);
   catalog.CreateTableFunction(transaction, cuda_alloc_info);
+
+  // sirius_register_packed_table(table_name VARCHAR, gpu_addr BIGINT, gpu_size BIGINT, metadata BLOB)
+  // Unpacks a cudf::pack()'d GPU buffer and registers it as a DuckDB table.
+  // This skips the PBlock→CPU→Arrow IPC→DuckDB roundtrip entirely.
+  {
+    struct RegisterPackedData : public TableFunctionData {
+      bool finished = false;
+    };
+    auto bind = [](ClientContext& ctx, TableFunctionBindInput& input,
+                    vector<LogicalType>& return_types, vector<string>& names)
+      -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
+      names = {"status", "num_rows"};
+
+      string table_name = input.inputs[0].GetValue<string>();
+      auto gpu_addr = static_cast<uintptr_t>(input.inputs[1].GetValue<int64_t>());
+      auto gpu_size = static_cast<size_t>(input.inputs[2].GetValue<int64_t>());
+      auto md_blob = input.inputs[3].GetValueUnsafe<string>();
+      auto* md_ptr = reinterpret_cast<const uint8_t*>(md_blob.data());
+      auto* gpu_ptr = reinterpret_cast<uint8_t*>(gpu_addr);
+
+      SIRIUS_LOG_INFO("[register_packed_table] table={} gpu=0x{:x} size={} md_size={}",
+                      table_name, gpu_addr, gpu_size, md_blob.size());
+
+      // cudf::unpack: reconstruct table_view pointing into the contiguous GPU buffer.
+      cudf::table_view view = cudf::unpack(md_ptr, gpu_ptr);
+      auto num_cols = view.num_columns();
+      auto num_rows = view.num_rows();
+
+      SIRIUS_LOG_INFO("[register_packed_table] unpacked: {} cols, {} rows", num_cols, num_rows);
+
+      // Store per-column GPU pointers from the unpacked view in LastGPUBuffers.
+      // The exchange async task can then read these to build the DuckDB table
+      // without going through PBlock encode/decode.
+      std::vector<GPUBufferInfo> gpu_infos;
+      for (int c = 0; c < num_cols; c++) {
+        auto col = view.column(c);
+        GPUBufferInfo info;
+        info.addr = reinterpret_cast<uintptr_t>(col.data<uint8_t>());
+        if (cudf::is_fixed_width(col.type())) {
+          info.len = static_cast<size_t>(col.size()) * cudf::size_of(col.type());
+        } else {
+          info.len = 0; // Variable-width: handled by offsets
+        }
+        info.device_id = 0;
+        info.column_name = "col_" + std::to_string(c);
+        info.type_id = static_cast<int>(col.type().id());
+        info.num_rows = static_cast<size_t>(col.size());
+        info.null_count = static_cast<int>(col.null_count());
+        if (col.nullable() && col.null_mask()) {
+          info.null_mask_addr = reinterpret_cast<uintptr_t>(col.null_mask());
+          info.null_mask_len = cudf::bitmask_allocation_size_bytes(col.size());
+        }
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto offsets_col = col.child(0);
+          info.offsets_addr = reinterpret_cast<uintptr_t>(offsets_col.data<int32_t>());
+          info.offsets_len = static_cast<size_t>(offsets_col.size()) * sizeof(int32_t);
+          // Chars buffer = head_data (col.data()) with size derived from offsets.
+          info.len = gpu_size; // Upper bound — receiver will use offsets to trim.
+        }
+        info.scale = col.type().scale();
+        gpu_infos.push_back(std::move(info));
+      }
+      // Store so Rust can retrieve via sirius_get_last_gpu_buffers().
+      LastGPUBuffers::GetInstance().Store(std::move(gpu_infos));
+      SIRIUS_LOG_INFO("[register_packed_table] stored {} column GPU pointers from unpacked view",
+                      num_cols);
+
+      return make_uniq<RegisterPackedData>();
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<RegisterPackedData>();
+      if (data.finished) { output.SetCardinality(0); return; }
+      output.SetCardinality(1);
+      output.SetValue(0, 0, Value("ok"));
+      output.SetValue(1, 0, Value::BIGINT(0));
+      data.finished = true;
+    };
+    TableFunction reg_packed("sirius_register_packed_table",
+                              {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BLOB},
+                              func, bind);
+    CreateTableFunctionInfo reg_packed_info(reg_packed);
+    catalog.CreateTableFunction(transaction, reg_packed_info);
+  }
 
   // sirius_set_staging_buffer(addr BIGINT, size BIGINT) — tells the result
   // collector where to pack GPU data via chunked_pack.

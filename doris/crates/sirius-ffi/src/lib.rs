@@ -748,6 +748,34 @@ impl SiriusEngine {
         Ok(())
     }
 
+    /// Register a packed GPU buffer as a DuckDB table via cudf::unpack + gpu_register_table.
+    ///
+    /// Unpacks the cudf metadata to get a table_view pointing into the GPU buffer,
+    /// then registers the per-column GPU pointers with DuckDB's GPU execution engine.
+    /// Zero CPU copies — the entire path is GPU→GPU.
+    pub fn register_packed_table(
+        &self,
+        table_name: &str,
+        gpu_addr: usize,
+        gpu_size: usize,
+        cudf_metadata: &[u8],
+    ) -> Result<(), EngineError> {
+        // Use parameterized query to pass BLOB without hex encoding issues.
+        let sql = "SELECT * FROM sirius_register_packed_table(?, ?, ?, ?)";
+        let mut stmt = self.conn
+            .prepare(sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow(duckdb::params![
+            table_name,
+            gpu_addr as i64,
+            gpu_size as i64,
+            cudf_metadata,
+        ])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .collect();
+        Ok(())
+    }
+
     /// Allocate GPU memory via the C++ CUDA runtime (cudaMalloc).
     ///
     /// Used for the nixl staging buffer, which must be allocated in the same

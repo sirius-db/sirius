@@ -17,6 +17,8 @@ use crate::exchange_buffer::ExchangeBuffer;
 pub struct NixlMetadataServiceHandler {
     nixl_agent: Option<Arc<NixlExchange>>,
     exchange_buffer: ExchangeBuffer,
+    /// Engine for direct GPU table registration (packed cudf transfer path).
+    engine: Option<Arc<std::sync::Mutex<sirius_ffi::SiriusEngine>>>,
     /// Pending GPU buffers awaiting transfer_complete. RAII cleanup on removal:
     /// - Registered: deregisters from nixl + frees GPU memory
     /// - Staged: releases leases (staging buffer reclaims space when all drop)
@@ -39,8 +41,14 @@ impl NixlMetadataServiceHandler {
         Self {
             nixl_agent,
             exchange_buffer,
+            engine: None,
             pending_buffers: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_engine(mut self, engine: Option<Arc<std::sync::Mutex<sirius_ffi::SiriusEngine>>>) -> Self {
+        self.engine = engine;
+        self
     }
 }
 
@@ -367,9 +375,45 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 .unwrap_or([0u8; 8]),
         );
 
-        // Try GPU buffer reconstruction (D2H) before freeing GPU memory.
-        // This must happen BEFORE dropping pending_buffers (which frees GPU memory).
         let pending_key = (query_id_hi, query_id_lo, req.node_id);
+
+        // Fast path: packed cudf transfer — store packed info in ExchangeBuffer.
+        // The exchange async task (which holds the engine lock) will call
+        // cudf::unpack + gpu_register_table to register the table on GPU.
+        if !req.packed_cudf_metadata.is_empty() {
+            let dst_buf = req.dst_buffers.first().ok_or_else(|| {
+                Status::internal("packed transfer: no dst buffer")
+            })?;
+
+            info!(
+                gpu_addr = format_args!("0x{:x}", dst_buf.addr),
+                gpu_size = dst_buf.len,
+                metadata_len = req.packed_cudf_metadata.len(),
+                "transfer_complete: packed cudf buffer received, storing for GPU-direct registration"
+            );
+
+            let key = crate::exchange_buffer::ExchangeKey {
+                query_id: (query_id_hi, query_id_lo),
+                node_id: req.node_id,
+            };
+            self.exchange_buffer.store_packed_gpu(
+                key.clone(),
+                crate::exchange_buffer::PackedGpuExchange {
+                    gpu_addr: dst_buf.addr as usize,
+                    gpu_size: dst_buf.len as usize,
+                    cudf_metadata: req.packed_cudf_metadata.clone(),
+                },
+            );
+            // Signal EOS (no PBlock data — the exchange task will use packed GPU path).
+            self.exchange_buffer.add_block(&key, req.sender_id, None, true);
+
+            return Ok(Response::new(PNixlTransferCompleteResponse {
+                status_code: 0,
+                error_msgs: vec![],
+            }));
+        }
+
+        // Fallback: D2H GPU buffer reconstruction → PBlock path.
         let ipc_bytes = if !req.dst_null_masks.is_empty() {
             // Sub-buffer info available — try D2H reconstruction.
             // Run D2H on a blocking thread to avoid stalling the tokio runtime.

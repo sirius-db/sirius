@@ -1440,7 +1440,7 @@ fn generate_exchange_agg_merge_sql(
 ///
 /// Uses the low 32 bits of query_id.lo as a hex prefix to avoid collisions
 /// when concurrent queries use the same node_id.
-fn exchange_table_name(query_lo: i64, node_id: i32) -> String {
+pub(crate) fn exchange_table_name(query_lo: i64, node_id: i32) -> String {
     format!("__EXCH_{:08x}_{}", query_lo as u32, node_id)
 }
 
@@ -1743,12 +1743,44 @@ impl PBackendService for PBackendServiceHandler {
 
                     info!(%finst_id, "all exchange data received, proceeding with execution");
 
-                    // Decode PBlocks and register exchange tables.
+                    // Decode PBlocks (or register packed GPU tables) as exchange tables.
                     let mut table_schemas = std::collections::HashMap::<String, Vec<String>>::new();
                     for &node_id in &exchange_node_ids {
                         let key = ExchangeKey { query_id, node_id };
-                        let blocks = buffer.take(&key);
                         let table_name = exchange_table_name(query_id.1, node_id);
+
+                        // Check for packed GPU data first (from nixl cudf::pack transfer).
+                        if let Some(packed) = buffer.take_packed_gpu(&key) {
+                            info!(
+                                table = %table_name,
+                                gpu_addr = format_args!("0x{:x}", packed.gpu_addr),
+                                gpu_size = packed.gpu_size,
+                                "registering packed GPU exchange table (zero CPU copies)"
+                            );
+                            let engine_guard = engine.lock().unwrap();
+                            match engine_guard.register_packed_table(
+                                &table_name, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
+                            ) {
+                                Ok(()) => {
+                                    info!(table = %table_name, "packed GPU table registered on GPU");
+                                    match engine_guard.get_table_columns(&table_name) {
+                                        Ok(cols) => { table_schemas.insert(table_name, cols); }
+                                        Err(e) => warn!(error = %e, "failed to get packed table columns"),
+                                    }
+                                    drop(engine_guard);
+                                    // Take (and discard) any PBlocks that may have arrived.
+                                    let _ = buffer.take(&key);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, table = %table_name,
+                                          "packed GPU registration failed, falling back to PBlock path");
+                                    drop(engine_guard);
+                                }
+                            }
+                        }
+
+                        let blocks = buffer.take(&key);
 
                         if blocks.is_empty() {
                             info!(table = %table_name, "exchange has no blocks, creating empty table");
@@ -2932,6 +2964,7 @@ pub async fn start_grpc_server(
 
     // Clone before moving into handler (nixl service also needs these).
     let nixl_agent_for_service = nixl_agent.clone();
+    let engine_for_nixl = engine.clone();
 
     let mut handler = PBackendServiceHandler::new(
         state,
@@ -2967,7 +3000,7 @@ pub async fn start_grpc_server(
         let nixl_handler = super::nixl_service::NixlMetadataServiceHandler::new(
             nixl_agent_for_service,
             exchange_buffer.clone(),
-        );
+        ).with_engine(engine_for_nixl);
         // Increase message size limits for large Arrow IPC payloads in transfer_complete.
         let nixl_svc = NixlMetadataServiceServer::new(nixl_handler)
             .max_decoding_message_size(256 * 1024 * 1024)   // 256 MB
