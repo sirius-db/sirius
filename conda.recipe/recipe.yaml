@@ -6,8 +6,7 @@ package:
   version: ${{ version }}
 
 source:
-  - git: ..
-    branch: rattler
+  - path: ..
 
 build:
   number: 0
