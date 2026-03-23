@@ -98,6 +98,7 @@ impl NixlTransferEngine {
             schema_ipc: vec![],
             ipc_bytes: payload.ipc_bytes,
             _staging_leases: vec![],
+            packed_metadata: None,
         };
 
         // Try staging buffer (D2D copy into pre-registered cuMemAlloc region).
@@ -154,6 +155,7 @@ impl NixlTransferEngine {
             node_id,
             sender_id,
             staged.staged,
+            None, // packed_metadata — transfer engine uses per-column path
         )
         .await
     }

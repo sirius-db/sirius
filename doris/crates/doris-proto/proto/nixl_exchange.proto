@@ -36,6 +36,9 @@ message PExchangeNixlMetadataRequest {
   repeated PGpuBufferDesc src_null_masks = 8; // Null bitmap buffers (per column)
   repeated PGpuBufferDesc src_offsets = 9;    // String offset buffers (per column)
   repeated int32 null_counts = 10;            // Null count per column
+  // When set, src_buffers contains a single packed buffer from cudf::pack().
+  // Receiver should allocate one dst buffer and use cudf::unpack() with this metadata.
+  bytes packed_cudf_metadata = 11;
 }
 
 // Response: receiver provides destination GPU buffer addresses.
@@ -64,6 +67,8 @@ message PNixlTransferCompleteRequest {
   repeated PGpuBufferDesc dst_null_masks = 9; // Null bitmap buffers
   repeated PGpuBufferDesc dst_offsets = 10;   // String offset buffers
   repeated int32 null_counts = 11;            // Null count per column
+  // cudf::pack() metadata (when packed transfer was used).
+  bytes packed_cudf_metadata = 12;
 }
 
 message PNixlTransferCompleteResponse {

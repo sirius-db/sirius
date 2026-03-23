@@ -37,6 +37,10 @@ pub enum ExecutionLocation {
         /// Staging buffer leases. Kept alive until transfer completes.
         /// When present, buffer addresses point into the staging buffer.
         _staging_leases: Vec<StagingLease>,
+        /// cudf::pack() metadata for the packed GPU buffer (if packed).
+        /// When present, `buffers` contains a single descriptor pointing to
+        /// the contiguous packed buffer in the nixl staging region.
+        packed_metadata: Option<Vec<u8>>,
     },
 }
 
@@ -55,7 +59,7 @@ impl ExecutionLocation {
     /// column data, null masks, and offsets. It's allocated by the C++ CUDA
     /// runtime (same as RMM) so it stays valid after query cleanup.
     pub fn set_packed_gpu(&mut self, addr: usize, size: usize, metadata: Vec<u8>) {
-        if let Self::Gpu { buffers, .. } = self {
+        if let Self::Gpu { buffers, packed_metadata, column_buffers, .. } = self {
             // Replace per-column buffer descriptors with a single packed buffer.
             buffers.clear();
             buffers.push(GpuBufferDesc {
@@ -63,13 +67,14 @@ impl ExecutionLocation {
                 len: size,
                 device_id: 0,
             });
+            column_buffers.clear();
+            *packed_metadata = Some(metadata.clone());
             tracing::info!(
                 addr = format_args!("0x{addr:x}"),
                 size,
                 metadata_len = metadata.len(),
                 "set packed GPU buffer for nixl transfer"
             );
-            // TODO: store metadata for receiver-side unpack
         }
     }
 
@@ -230,6 +235,7 @@ pub fn detect_execution_location(
                     schema_ipc: gpu_info.schema_ipc,
                     ipc_bytes,
                     _staging_leases: vec![],
+                    packed_metadata: None,
                 };
             }
             Ok(None) => {
@@ -335,6 +341,7 @@ pub async fn send_exchange_with_nixl(
             schema_ipc: _,
             ipc_bytes: _,
             _staging_leases,
+            packed_metadata,
         } => {
             let Some(agent) = nixl_agent else {
                 if nixl_only {
@@ -358,16 +365,15 @@ pub async fn send_exchange_with_nixl(
                 ).await;
             }
 
-            // Buffers are staged if leases are held (addresses point into staging buffer).
-            let staged = !_staging_leases.is_empty();
+            // Packed buffers are always in the staging region.
+            let staged = packed_metadata.is_some() || !_staging_leases.is_empty();
 
             // Try nixl GPU-direct for each remote destination.
-            // Staging leases are kept alive by _staging_leases until this block exits.
             for dest in &remote_dests {
                 if let Err(e) = send_nixl_to_peer(
                     agent, &buffers, &column_info, &column_buffers, num_rows,
                     &ipc_bytes, dest, query_id, node_id, sender_id,
-                    staged,
+                    staged, packed_metadata.as_deref(),
                 ).await {
                     if nixl_only {
                         return Err(format!("nixl-only: nixl transfer to {} failed: {}", dest.brpc_addr, e));
@@ -540,6 +546,7 @@ pub async fn send_nixl_to_peer(
     node_id: i32,
     sender_id: i32,
     staged: bool,
+    packed_metadata: Option<&[u8]>,
 ) -> Result<(), String> {
     use doris_proto::nixl::{
         NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest,
@@ -640,6 +647,7 @@ pub async fn send_nixl_to_peer(
         src_null_masks,
         src_offsets,
         null_counts: null_counts.clone(),
+        packed_cudf_metadata: packed_metadata.map(|m| m.to_vec()).unwrap_or_default(),
     };
 
     let channel = tonic::transport::Endpoint::from_shared(grpc_addr.clone())
@@ -769,6 +777,7 @@ pub async fn send_nixl_to_peer(
         dst_null_masks: response.dst_null_masks,
         dst_offsets: response.dst_offsets,
         null_counts,
+        packed_cudf_metadata: packed_metadata.map(|m| m.to_vec()).unwrap_or_default(),
     };
 
     let channel2 = tonic::transport::Endpoint::from_shared(grpc_addr.clone())
@@ -901,6 +910,7 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: ipc.clone(),
             _staging_leases: vec![],
+                    packed_metadata: None,
         };
         assert_eq!(location.into_ipc_bytes(), ipc);
     }
@@ -924,6 +934,7 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: vec![],
             _staging_leases: vec![],
+                    packed_metadata: None,
         };
         match location {
             ExecutionLocation::Gpu { buffers, num_rows, _staging_leases, .. } => {
@@ -952,6 +963,7 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: ipc,
             _staging_leases: vec![],
+                    packed_metadata: None,
         };
         let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
         let dests = vec![ExchangeDest {
@@ -987,6 +999,7 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: vec![],
             _staging_leases: vec![],
+                    packed_metadata: None,
         };
         let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
         let dests = vec![ExchangeDest {
