@@ -948,7 +948,7 @@ mod tests {
                 );
                 assert_eq!(agg.measures.len(), 1, "should have 1 measure (count)");
                 let measure = &agg.measures[0].measure.as_ref().unwrap();
-                assert_eq!(measure.phase, 3, "should be INITIAL_TO_RESULT");
+                assert_eq!(measure.phase, 4, "should be INTERMEDIATE_TO_RESULT for exchange finalize");
             }
             other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
         }
@@ -2061,6 +2061,23 @@ mod tests {
                 other => panic!("expected NamedTable for CSV, got {:?}", other),
             },
             other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test -p plan-translator -- --ignored decode_substrait_debug
+    fn decode_substrait_debug() {
+        use std::fs;
+        for entry in fs::read_dir("/tmp/sirius-cluster/").unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().map(|e| e == "bin").unwrap_or(false)
+                && path.file_name().unwrap().to_str().unwrap().starts_with("substrait-exchange")
+            {
+                let data = fs::read(&path).unwrap();
+                let plan = Plan::decode(data.as_slice()).unwrap();
+                println!("\n=== {} ({} bytes) ===", path.display(), data.len());
+                println!("{:#?}", plan);
+            }
         }
     }
 }

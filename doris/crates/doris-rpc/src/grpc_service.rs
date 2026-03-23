@@ -1960,23 +1960,22 @@ impl PBackendService for PBackendServiceHandler {
 
                     // Translate and execute.
                     // Priority order:
-                    // 1. AGG(finalize) over exchange: generate merge SQL (SUM/MIN/MAX).
-                    //    Substrait can't handle finalize semantics (it re-runs COUNT instead of SUM).
-                    // 2. UNION_NODE / pure EXCHANGE root: trivial exchange table SQL (DuckDB SetRel broken for substrait)
-                    // 3. Other (SORT/JOIN over exchange): Substrait path
+                    // 1. UNION_NODE: trivial exchange table SQL (DuckDB SetRel broken for substrait)
+                    // 2. Everything else (AGG finalize, SORT, JOIN): Substrait path
+                    //    AGG finalize uses INTERMEDIATE_TO_RESULT phase so DuckDB rewrites
+                    //    count → sum, etc. for merging partial results.
                     let (exec_plan, output_names) =
-                        if let Some(merge_sql) = generate_exchange_agg_merge_sql(&params, &table_schemas) {
-                            (ExecPlan::SqlCpuOnly(merge_sql), None)
-                        } else if let Some(read_sql) = generate_exchange_union_sql(&params) {
+                        if let Some(read_sql) = generate_exchange_union_sql(&params) {
                             info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
                             (ExecPlan::SqlCpuOnly(read_sql), None)
                         } else {
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    let exec = if plan.force_cpu_substrait {
-                                        ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
-                                    } else {
-                                        ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
+                                    // Exchange fragments always use CPU: they read from exchange
+                                    // tables (not parquet), so GPU scan pipeline has no operators.
+                                    let exec = ExecPlan::SubstraitCpuOnly {
+                                        bytes: plan.substrait_bytes,
+                                        sort_limit_sql: plan.sort_limit_sql,
                                     };
                                     (exec, Some(plan.output_names))
                                 }

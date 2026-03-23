@@ -910,7 +910,17 @@ fn translate_aggregation_node(
 
         let func_anchor = registry.register_function(crate::URI_AGGREGATE, &func_name);
 
-        let phase = if agg_node.need_finalize {
+        // Phase depends on context:
+        // - need_finalize + child is Read (exchange table) → INTERMEDIATE_TO_RESULT (4)
+        //   The exchange table contains partial aggregation results from remote BEs.
+        // - need_finalize + child is Aggregate (two-phase collapse) → handled above
+        // - need_finalize (other) → INITIAL_TO_RESULT (3)
+        // - !need_finalize → INITIAL_TO_INTERMEDIATE (1)
+        let is_exchange_finalize = agg_node.need_finalize
+            && matches!(input.rel_type.as_ref(), Some(rel::RelType::Read(_)));
+        let phase = if is_exchange_finalize {
+            4 // INTERMEDIATE_TO_RESULT: merge partial results from exchange
+        } else if agg_node.need_finalize {
             3 // INITIAL_TO_RESULT
         } else {
             1 // INITIAL_TO_INTERMEDIATE
