@@ -170,8 +170,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   // After concatenation (or if only one batch), work with a single batch.
-  const auto& batch_ref = single_batch ? single_batch
-                          : (!raw_input_batches.empty() ? raw_input_batches[0] : nullptr);
+  const auto& batch_ref =
+    single_batch ? single_batch : (!raw_input_batches.empty() ? raw_input_batches[0] : nullptr);
   if (!batch_ref || !batch_ref->get_data()) { return std::make_unique<operator_data>(); }
 
   // Apply table filters as a GPU expression if present.
@@ -193,7 +193,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After filtering, project away filter-only columns if needed.
   // The 'types' member indicates the expected output columns.
   duckdb::idx_t expected_output_columns = types.size();
-  auto& gpu_rep  = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
   auto& out_table = gpu_rep.get_table();
 
   if (out_table.num_columns() > expected_output_columns) {
@@ -210,8 +210,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     auto* space          = output_batch->get_memory_space();
     auto projected_rep =
       std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
-    output_batch =
-      std::make_shared<cucascade::data_batch>(output_batch->get_batch_id(), std::move(projected_rep));
+    output_batch = std::make_shared<cucascade::data_batch>(output_batch->get_batch_id(),
+                                                           std::move(projected_rep));
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
