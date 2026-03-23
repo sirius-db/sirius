@@ -19,7 +19,6 @@
 #include "gpu_executor.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius_config.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 
@@ -268,41 +267,15 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
 std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_data()
 {
-  // Take data batches from ports and schedule a task.
-  // For single-port, non-sink operators (pure pipeline sources): coalesce multiple small
-  // batches into one task to reduce per-task overhead and improve GPU utilization.
-  // Sink operators (e.g., PARTITION) also serve as sources but their execute() may expect
-  // exactly one batch, so they must not coalesce here.
-  // For multi-port operators: take one batch per port (e.g., hash join needs one from each side).
+  // take one data batch from each port and schedule a task (a task takes one data batch from each
+  // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-
-  if (ports.size() == 1 && !is_sink()) {
-    auto& [port_name, port_ptr] = *ports.begin();
-    uint64_t accumulated_bytes  = 0;
-    size_t batch_count          = 0;
-    // Cap per-task batch count to avoid grabbing too many compressed batches
-    // whose representation bytes understate their actual GPU processing cost.
-    constexpr size_t max_batches_per_task = 32;
-    while (true) {
-      auto batch = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
-      if (!batch) { break; }
-      uint64_t batch_bytes = 0;
-      if (batch->get_data()) { batch_bytes = batch->get_data()->get_size_in_bytes(); }
-      accumulated_bytes += batch_bytes;
-      input_batch.push_back(std::move(batch));
-      ++batch_count;
-      if (accumulated_bytes >= config::DEFAULT_SCAN_TASK_BATCH_SIZE ||
-          batch_count >= max_batches_per_task) {
-        break;
-      }
-    }
-  } else {
-    for (auto& [port_name, port_ptr] : ports) {
-      auto batch = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
-      if (batch) { input_batch.push_back(std::move(batch)); }
-    }
+  for (auto& [port_name, port_ptr] : ports) {
+    // For Pipeline barrier: need at least one data batch in the port's repository
+    // TODO: later on we will adjust to the new data repository interface in cuCascade
+    auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
-
   if (input_batch.empty()) { return nullptr; }
   return std::make_unique<operator_data>(input_batch);
 }
