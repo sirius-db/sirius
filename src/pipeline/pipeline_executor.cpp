@@ -162,6 +162,7 @@ std::future<void> pipeline_executor::start_query()
   }
 
   constexpr int k_initial_scans = 2;
+  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
     auto* scan_op = _priority_scans.front();
     _task_creator->schedule(scan_op);
