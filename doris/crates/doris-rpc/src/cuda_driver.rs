@@ -98,37 +98,44 @@ pub fn cuda_memcpy_dtod_no_ctx(dst: usize, src: usize, len: usize) -> Result<(),
 
 /// Copy GPU memory device-to-device.
 ///
-/// RMM pool sub-allocations use CUDA VMM (cuMemCreate/cuMemMap) internally,
-/// which neither cuMemcpyDtoD nor cudaMemcpy(D2D) can handle directly.
-/// Workaround: bounce through host memory (D2H → H2D).
+/// DuckDB loads extensions with RTLD_LOCAL, giving the C++ Sirius extension
+/// a separate CUDA runtime. Memory allocated by RMM (via the C++ runtime's
+/// cudaMalloc) may not be accessible via the Rust-side driver API copy functions.
+///
+/// Strategy: try cuMemcpy (context-independent), fall back to cuMemcpyDtoD,
+/// then to cudaMemcpy with runtime context initialization.
 pub fn cuda_memcpy_dtod(dst: usize, src: usize, len: usize) -> Result<(), String> {
-    use cudarc::runtime::sys as rt;
-    // D2H: src GPU → host buffer
-    let mut host_buf = vec![0u8; len];
-    let err = unsafe {
-        rt::cudaMemcpy(
-            host_buf.as_mut_ptr() as *mut std::ffi::c_void,
-            src as *const std::ffi::c_void,
-            len,
-            rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-        )
-    };
-    if err != rt::cudaError_t::cudaSuccess {
-        return Err(format!("cudaMemcpy D2H(src=0x{src:x}, len={len}): {err:?}"));
+    ensure_cuda_context()?;
+    // cuMemcpy is the "unified" driver API copy that handles cross-context pointers.
+    let result = unsafe { sys::cuMemcpy(dst as u64, src as u64, len) }.result();
+    if result.is_ok() {
+        return Ok(());
     }
-    // H2D: host buffer → dst GPU
-    let err = unsafe {
-        rt::cudaMemcpy(
-            dst as *mut std::ffi::c_void,
-            host_buf.as_ptr() as *const std::ffi::c_void,
-            len,
-            rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-        )
-    };
-    if err != rt::cudaError_t::cudaSuccess {
-        return Err(format!("cudaMemcpy H2D(dst=0x{dst:x}, len={len}): {err:?}"));
+    // Fallback: try cuMemcpyDtoD_v2 (requires both pointers in current context).
+    let result2 = unsafe { sys::cuMemcpyDtoD_v2(dst as u64, src as u64, len) }.result();
+    if result2.is_ok() {
+        return Ok(());
     }
-    Ok(())
+    // Fallback: try cudaMemcpy via runtime API with cudaSetDevice.
+    {
+        use cudarc::runtime::sys as rt;
+        let _ = unsafe { rt::cudaSetDevice(0) };
+        let err = unsafe {
+            rt::cudaMemcpy(
+                dst as *mut std::ffi::c_void,
+                src as *const std::ffi::c_void,
+                len,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+            )
+        };
+        if err == rt::cudaError_t::cudaSuccess {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "all GPU memcpy variants failed (dst=0x{dst:x}, src=0x{src:x}, len={len}): \
+         cuMemcpy={result:?}, cuMemcpyDtoD={result2:?}"
+    ))
 }
 
 /// Query the base address and size of the containing allocation for a device pointer.

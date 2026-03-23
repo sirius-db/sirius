@@ -132,6 +132,50 @@ impl GpuStagingBuffer {
         })
     }
 
+    /// Wrap a pre-allocated GPU address as a staging buffer and register with nixl.
+    ///
+    /// Used when the GPU memory was allocated via C++ `cudaMalloc` (through
+    /// `SiriusEngine::cuda_alloc`) to ensure the staging buffer lives in the
+    /// same CUDA runtime as RMM pool allocations.
+    pub fn from_existing(
+        base_addr: usize,
+        size: usize,
+        device_id: u64,
+        agent: &nixl_sys::Agent,
+        backend: &Backend,
+    ) -> Result<Self, String> {
+        let mut opt =
+            nixl_sys::OptArgs::new().map_err(|e| format!("OptArgs::new: {e}"))?;
+        opt.add_backend(backend)
+            .map_err(|e| format!("add_backend: {e}"))?;
+
+        let wrapper = StagingMemoryRegion {
+            addr: base_addr,
+            len: size,
+            device_id,
+        };
+
+        let registration = agent
+            .register_memory(&wrapper, Some(&opt))
+            .map_err(|e| format!("register_memory: {e}"))?;
+
+        info!(
+            base = format_args!("0x{base_addr:x}"),
+            size,
+            size_mb = size / (1024 * 1024),
+            device_id,
+            "GPU staging buffer (C++ allocated) registered with nixl"
+        );
+
+        Ok(Self {
+            base_addr,
+            total_size: size,
+            device_id,
+            _registration: registration,
+            allocator: Mutex::new(BumpAllocator::new(size)),
+        })
+    }
+
     /// Base address of the staging buffer.
     pub fn base_addr(&self) -> usize {
         self.base_addr

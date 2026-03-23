@@ -604,6 +604,39 @@ impl SiriusEngine {
         Ok(())
     }
 
+    /// Stage retained GPU buffers into a staging buffer using the C++ CUDA context.
+    ///
+    /// Copies all data/null_mask/offsets buffers from the last GPU execution into
+    /// the staging buffer at `staging_ptr`. Returns a list of (buffer_idx, offset, len, type)
+    /// describing the layout.
+    ///
+    /// This must be called from C++ because DuckDB loads extensions with RTLD_LOCAL,
+    /// so the C++ CUDA runtime (which allocated the RMM pool) is the only context
+    /// that can access the GPU buffer addresses.
+    pub fn stage_gpu_buffers(&self, staging_ptr: usize) -> Result<Vec<StagedBuffer>, EngineError> {
+        let sql = format!("SELECT * FROM sirius_stage_gpu_buffers({})", staging_ptr as i64);
+        let mut stmt = self.conn
+            .prepare(&sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt.query([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+
+        let mut staged = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+            let buffer_idx: i32 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let offset: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let len: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let buf_type: String = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            staged.push(StagedBuffer {
+                buffer_idx: buffer_idx as usize,
+                staged_offset: offset as usize,
+                len: len as usize,
+                buf_type,
+            });
+        }
+        Ok(staged)
+    }
+
     /// Release previously retained GPU buffers (after nixl transfer or on error).
     pub fn release_gpu_buffers(&self) -> Result<(), EngineError> {
         let mut stmt = self.conn
@@ -678,6 +711,38 @@ impl SiriusEngine {
             schema_ipc,
         }))
     }
+
+    /// Allocate GPU memory via the C++ CUDA runtime (cudaMalloc).
+    ///
+    /// Used for the nixl staging buffer, which must be allocated in the same
+    /// CUDA runtime as RMM (DuckDB loads extensions with RTLD_LOCAL, creating
+    /// separate CUDA runtimes for C++ and Rust).
+    pub fn cuda_alloc(&self, size: usize) -> Result<usize, EngineError> {
+        let sql = format!("SELECT * FROM sirius_cuda_alloc({})", size as i64);
+        let mut stmt = self.conn
+            .prepare(&sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt.query([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let row = rows.next()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .ok_or_else(|| EngineError::ExecFailed("sirius_cuda_alloc: no result".into()))?;
+        let addr: i64 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        Ok(addr as usize)
+    }
+}
+
+/// A GPU buffer that has been staged (copied) into the nixl staging region.
+#[derive(Debug, Clone)]
+pub struct StagedBuffer {
+    /// Column index in the original GPU result.
+    pub buffer_idx: usize,
+    /// Byte offset within the staging buffer.
+    pub staged_offset: usize,
+    /// Buffer size in bytes.
+    pub len: usize,
+    /// Buffer type: "data", "null_mask", or "offsets".
+    pub buf_type: String,
 }
 
 /// Per-column extended GPU buffer info (null mask, string offsets).

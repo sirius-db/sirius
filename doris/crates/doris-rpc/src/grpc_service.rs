@@ -2031,12 +2031,17 @@ impl PBackendService for PBackendServiceHandler {
                         } else {
                             let mut loc = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
                             if should_retain_exch {
-                                // Try staging buffer (D2D copy into pre-registered cuMemAlloc region).
-                                let _staged = nixl_agent_for_exch_blocking
-                                    .as_ref()
-                                    .and_then(|agent| agent.staging())
-                                    .map(|staging| loc.try_stage_buffers(staging))
-                                    .unwrap_or(false);
+                                if let Some(staging) = nixl_agent_for_exch_blocking.as_ref().and_then(|a| a.staging()) {
+                                    match engine.stage_gpu_buffers(staging.base_addr()) {
+                                        Ok(staged) => {
+                                            tracing::info!(num_staged = staged.len(), "C++ staged GPU buffers for exchange");
+                                            loc.apply_staging(staging.base_addr(), &staged);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "C++ stage_gpu_buffers failed for exchange");
+                                        }
+                                    }
+                                }
                             }
                             Ok(loc)
                         }
@@ -2260,12 +2265,18 @@ impl PBackendService for PBackendServiceHandler {
                 // Try RMM pool registration first (zero-copy path). Falls back to
                 // cuMemAlloc copy if pool registration fails.
                 if should_retain {
-                    // Try staging buffer (D2D copy into pre-registered cuMemAlloc region).
-                    let _staged = nixl_agent_for_blocking
-                        .as_ref()
-                        .and_then(|agent| agent.staging())
-                        .map(|staging| location.try_stage_buffers(staging))
-                        .unwrap_or(false);
+                    // Stage GPU buffers via C++ cudaMemcpy. Pass 0 to let C++ self-allocate
+                    // a staging buffer (both src and dst must be in the same CUDA runtime).
+                    match engine.stage_gpu_buffers(0) {
+                        Ok(staged) if !staged.is_empty() => {
+                            tracing::info!(num_staged = staged.len(), "C++ staged GPU buffers");
+                            // TODO: register C++ staging ptr with nixl and apply to location
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "C++ stage_gpu_buffers failed");
+                        }
+                    }
                 }
                 tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
                 Ok(location)

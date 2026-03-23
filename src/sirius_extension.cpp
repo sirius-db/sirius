@@ -37,6 +37,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "from_substrait.hpp"
@@ -1061,6 +1062,175 @@ void SiriusExtension::ReleaseGPUBuffersFunction(
   data.finished = true;
 }
 
+// --- sirius_stage_gpu_buffers(staging_ptr BIGINT) table function ---
+// Copies retained GPU buffers (data + null_mask + offsets) into a staging buffer
+// using the C++ CUDA context (which allocated the RMM pool). Rust's CUDA context
+// cannot access RMM sub-allocations because DuckDB loads extensions with RTLD_LOCAL,
+// giving each .so a separate CUDA runtime instance.
+//
+// Returns one row per buffer: (buffer_idx, staged_offset, len, buf_type)
+// where buf_type is "data", "null_mask", or "offsets".
+
+struct StageGPUBuffersData : public TableFunctionData {
+  uintptr_t staging_ptr = 0;
+  struct StagedEntry {
+    int buffer_idx;
+    size_t staged_offset;
+    size_t len;
+    std::string buf_type;
+  };
+  std::vector<StagedEntry> entries;
+  idx_t row_idx = 0;
+};
+
+static unique_ptr<FunctionData> StageGPUBuffersBind(
+  ClientContext& context,
+  TableFunctionBindInput& input,
+  vector<LogicalType>& return_types,
+  vector<string>& names)
+{
+  return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR};
+  names = {"buffer_idx", "staged_offset", "len", "buf_type"};
+
+  auto result = make_uniq<StageGPUBuffersData>();
+  result->staging_ptr = static_cast<uintptr_t>(input.inputs[0].GetValue<int64_t>());
+
+  auto& gpu_bufs = LastGPUBuffers::GetInstance();
+  auto buffers = gpu_bufs.Get();
+
+  size_t offset = 0;
+  const size_t ALIGN = 256; // nixl transfer alignment
+
+  // If staging_ptr is 0, allocate our own staging buffer from C++ cudaMalloc.
+  // This ensures both source and destination are in the same CUDA runtime.
+  size_t total_size = 0;
+  for (auto& buf : buffers) {
+    if (buf.len > 0) total_size += (buf.len + ALIGN - 1) & ~(ALIGN - 1);
+    if (buf.null_mask_len > 0) total_size += (buf.null_mask_len + ALIGN - 1) & ~(ALIGN - 1);
+    if (buf.offsets_len > 0) total_size += (buf.offsets_len + ALIGN - 1) & ~(ALIGN - 1);
+  }
+
+  bool self_allocated = false;
+  if (result->staging_ptr == 0 && total_size > 0) {
+    void* ptr = nullptr;
+    auto err = cudaMalloc(&ptr, total_size);
+    if (err != cudaSuccess) {
+      throw IOException("sirius_stage_gpu_buffers: cudaMalloc(%zu) for staging failed: %s",
+                        total_size, cudaGetErrorString(err));
+    }
+    result->staging_ptr = reinterpret_cast<uintptr_t>(ptr);
+    self_allocated = true;
+    SIRIUS_LOG_INFO("[sirius_stage_gpu_buffers] self-allocated staging buffer: 0x{:x} size={}",
+                    result->staging_ptr, total_size);
+  }
+
+  SIRIUS_LOG_INFO("[sirius_stage_gpu_buffers] staging {} buffers, staging_ptr=0x{:x} total_size={}",
+                  buffers.size(), result->staging_ptr, total_size);
+
+  for (int i = 0; i < static_cast<int>(buffers.size()); i++) {
+    auto& buf = buffers[i];
+    // Data buffer.
+    if (buf.len > 0) {
+      auto err = cudaMemcpy(
+        reinterpret_cast<void*>(result->staging_ptr + offset),
+        reinterpret_cast<const void*>(buf.addr),
+        buf.len, cudaMemcpyDefault);
+      if (err != cudaSuccess) {
+        throw IOException("sirius_stage_gpu_buffers: cudaMemcpy data buf %d (addr=0x%lx len=%zu -> staging 0x%lx+%zu) failed: %s",
+                          i, buf.addr, buf.len, result->staging_ptr, offset, cudaGetErrorString(err));
+      }
+      result->entries.push_back({i, offset, buf.len, "data"});
+      offset += (buf.len + ALIGN - 1) & ~(ALIGN - 1);
+    }
+    // Null mask buffer.
+    if (buf.null_mask_addr != 0 && buf.null_mask_len > 0) {
+      auto err = cudaMemcpy(
+        reinterpret_cast<void*>(result->staging_ptr + offset),
+        reinterpret_cast<const void*>(buf.null_mask_addr),
+        buf.null_mask_len, cudaMemcpyDefault);
+      if (err != cudaSuccess) {
+        throw IOException("sirius_stage_gpu_buffers: cudaMemcpy null_mask buf %d failed: %s",
+                          i, cudaGetErrorString(err));
+      }
+      result->entries.push_back({i, offset, buf.null_mask_len, "null_mask"});
+      offset += (buf.null_mask_len + ALIGN - 1) & ~(ALIGN - 1);
+    }
+    // Offsets buffer (strings).
+    if (buf.offsets_addr != 0 && buf.offsets_len > 0) {
+      auto err = cudaMemcpy(
+        reinterpret_cast<void*>(result->staging_ptr + offset),
+        reinterpret_cast<const void*>(buf.offsets_addr),
+        buf.offsets_len, cudaMemcpyDefault);
+      if (err != cudaSuccess) {
+        throw IOException("sirius_stage_gpu_buffers: cudaMemcpy offsets buf %d failed: %s",
+                          i, cudaGetErrorString(err));
+      }
+      result->entries.push_back({i, offset, buf.offsets_len, "offsets"});
+      offset += (buf.offsets_len + ALIGN - 1) & ~(ALIGN - 1);
+    }
+  }
+
+  return std::move(result);
+}
+
+static void StageGPUBuffersFunction(
+  ClientContext& context,
+  TableFunctionInput& data_p,
+  DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<StageGPUBuffersData>();
+  idx_t count = 0;
+  while (data.row_idx < data.entries.size() && count < STANDARD_VECTOR_SIZE) {
+    auto& e = data.entries[data.row_idx];
+    output.SetValue(0, count, Value::INTEGER(e.buffer_idx));
+    output.SetValue(1, count, Value::BIGINT(static_cast<int64_t>(e.staged_offset)));
+    output.SetValue(2, count, Value::BIGINT(static_cast<int64_t>(e.len)));
+    output.SetValue(3, count, Value(e.buf_type));
+    count++;
+    data.row_idx++;
+  }
+  output.SetCardinality(count);
+}
+
+// --- sirius_cuda_alloc(size BIGINT) table function ---
+// Allocates GPU memory using the C++ CUDA runtime's cudaMalloc. Returns the pointer.
+// Used by the Rust nixl staging buffer to ensure the allocation is in the same
+// CUDA runtime as RMM (DuckDB loads extensions with RTLD_LOCAL, creating
+// separate CUDA runtimes for C++ and Rust).
+
+struct CudaAllocData : public TableFunctionData {
+  uintptr_t ptr = 0;
+  size_t size = 0;
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> CudaAllocBind(
+  ClientContext& context, TableFunctionBindInput& input,
+  vector<LogicalType>& return_types, vector<string>& names) {
+  return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+  names = {"addr", "size"};
+  auto result = make_uniq<CudaAllocData>();
+  result->size = static_cast<size_t>(input.inputs[0].GetValue<int64_t>());
+  void* ptr = nullptr;
+  auto err = cudaMalloc(&ptr, result->size);
+  if (err != cudaSuccess) {
+    throw IOException("sirius_cuda_alloc: cudaMalloc(%zu) failed: %s", result->size, cudaGetErrorString(err));
+  }
+  result->ptr = reinterpret_cast<uintptr_t>(ptr);
+  SIRIUS_LOG_INFO("[sirius_cuda_alloc] allocated {} bytes at 0x{:x}", result->size, result->ptr);
+  return std::move(result);
+}
+
+static void CudaAllocFunction(
+  ClientContext& context, TableFunctionInput& data_p, DataChunk& output) {
+  auto& data = data_p.bind_data->CastNoConst<CudaAllocData>();
+  if (data.finished) { output.SetCardinality(0); return; }
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(data.ptr)));
+  output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(data.size)));
+  data.finished = true;
+}
+
 // --- sirius_get_pool_info() table function ---
 // Returns the RMM processing pool base address and size for nixl GPU-direct registration.
 
@@ -1102,6 +1272,110 @@ void GetPoolInfoFunction(
   data.finished = true;
 }
 
+// ---------------------------------------------------------------------------
+// from_substrait_local: execute a Substrait plan on the caller's connection.
+//
+// Unlike DuckDB's built-in from_substrait (which creates a new connection and
+// can't see tables created on the caller's connection), this function uses the
+// caller's context directly. This ensures exchange tables registered via
+// CREATE TABLE + Appender are visible during plan execution.
+// ---------------------------------------------------------------------------
+struct FromSubstraitLocalData : public TableFunctionData {
+  shared_ptr<Relation> plan;
+  unique_ptr<QueryResult> res;
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> FromSubstraitLocalBind(
+    ClientContext &context, TableFunctionBindInput &input,
+    vector<LogicalType> &return_types, vector<string> &names) {
+  if (input.inputs[0].IsNull()) {
+    throw BinderException("from_substrait_local cannot be called with a NULL parameter");
+  }
+  auto result = make_uniq<FromSubstraitLocalData>();
+  string serialized = input.inputs[0].GetValueUnsafe<string>();
+
+  // Transform the Substrait plan using a temporary connection for plan
+  // building (to avoid binder deadlock), but the returned Relation's
+  // GetTableRef() will be resolved by DuckDB's binder on the caller's
+  // context — which sees all tables.
+  auto con = Connection(*context.db);
+  SubstraitToDuckDB transformer(con.context, serialized, /*json=*/false, /*acquire_lock=*/false);
+  result->plan = transformer.TransformPlan();
+
+  for (auto &column : result->plan->Columns()) {
+    return_types.emplace_back(column.Type());
+    names.emplace_back(column.Name());
+  }
+  return std::move(result);
+}
+
+static unique_ptr<TableRef> FromSubstraitLocalBindReplace(
+    ClientContext &context, TableFunctionBindInput &input) {
+  if (input.inputs[0].IsNull()) {
+    throw BinderException("from_substrait_local cannot be called with a NULL parameter");
+  }
+  string serialized = input.inputs[0].GetValueUnsafe<string>();
+
+  // Transform on a temporary connection (avoids binder deadlock).
+  auto con = Connection(*context.db);
+  SubstraitToDuckDB transformer(con.context, serialized, /*json=*/false, /*acquire_lock=*/false);
+  auto plan = transformer.TransformPlan();
+
+  if (!plan->IsReadOnly()) {
+    return nullptr;
+  }
+
+  // Convert the Relation to a SQL string and parse it as a fresh SubqueryRef.
+  // We cannot use plan->GetTableRef() because DuckDB's binder handles the
+  // substituted TableRef differently than a standalone query, producing wrong
+  // results for joins (the JoinRelation's positional references get misresolved).
+  auto query_node = plan->GetQueryNode();
+  auto select_stmt = make_uniq<SelectStatement>();
+  select_stmt->node = std::move(query_node);
+  auto sql = select_stmt->ToString();
+
+  // Parse the SQL string to get a fresh, self-contained TableRef.
+  Parser parser;
+  parser.ParseQuery(sql);
+  if (parser.statements.empty()) {
+    return nullptr;
+  }
+  auto &parsed = parser.statements[0];
+  if (parsed->type != StatementType::SELECT_STATEMENT) {
+    return nullptr;
+  }
+  auto &parsed_select = parsed->Cast<SelectStatement>();
+  auto copy = parsed->Copy();
+  auto &select_copy = copy->Cast<SelectStatement>();
+  auto fresh_select = make_uniq<SelectStatement>();
+  fresh_select->node = select_copy.node->Copy();
+  auto *ref = new SubqueryRef(std::move(fresh_select), "from_substrait_local");
+  fprintf(stderr, "[from_substrait_local] bind_replace returning SubqueryRef for SQL: %s\n", sql.substr(0, 200).c_str());
+  return unique_ptr<TableRef>(ref);
+}
+
+static void FromSubstraitLocalFunction(
+    ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+  auto &data = data_p.bind_data->CastNoConst<FromSubstraitLocalData>();
+  if (data.finished) return;
+
+  if (!data.res) {
+    // Execute on the caller's connection context (NOT a new connection).
+    // This is the key difference from from_substrait: we use the same
+    // context that created the exchange tables.
+    auto ctx = context.shared_from_this();
+    data.plan->context = make_shared_ptr<ClientContextWrapper>(ctx);
+    data.res = data.plan->Execute();
+  }
+  auto result_chunk = data.res->Fetch();
+  if (!result_chunk) {
+    data.finished = true;
+    return;
+  }
+  output.Move(*result_chunk);
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -1127,6 +1401,17 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  // from_substrait_local: Substrait execution on the caller's connection.
+  // Uses bind_replace to return a TableRef that DuckDB's binder resolves
+  // against the caller's context (which has the exchange tables).
+  TableFunction from_substrait_local("from_substrait_local",
+                                      {LogicalType::BLOB},
+                                      FromSubstraitLocalFunction,
+                                      FromSubstraitLocalBind);
+  from_substrait_local.bind_replace = FromSubstraitLocalBindReplace;
+  CreateTableFunctionInfo from_substrait_local_info(from_substrait_local);
+  catalog.CreateTableFunction(transaction, from_substrait_local_info);
 
   TableFunction gpu_processing_substrait("gpu_processing_substrait",
                                          {LogicalType::BLOB},
@@ -1176,6 +1461,20 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                      ReleaseGPUBuffersBind);
   CreateTableFunctionInfo release_gpu_buffers_info(release_gpu_buffers);
   catalog.CreateTableFunction(transaction, release_gpu_buffers_info);
+
+  TableFunction stage_gpu_buffers("sirius_stage_gpu_buffers",
+                                   {LogicalType::BIGINT},
+                                   StageGPUBuffersFunction,
+                                   StageGPUBuffersBind);
+  CreateTableFunctionInfo stage_gpu_buffers_info(stage_gpu_buffers);
+  catalog.CreateTableFunction(transaction, stage_gpu_buffers_info);
+
+  TableFunction cuda_alloc("sirius_cuda_alloc",
+                            {LogicalType::BIGINT},
+                            CudaAllocFunction,
+                            CudaAllocBind);
+  CreateTableFunctionInfo cuda_alloc_info(cuda_alloc);
+  catalog.CreateTableFunction(transaction, cuda_alloc_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

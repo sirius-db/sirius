@@ -49,6 +49,39 @@ impl ExecutionLocation {
         }
     }
 
+    /// Apply staging results from C++ `sirius_stage_gpu_buffers()`.
+    ///
+    /// Updates GPU buffer addresses to point into the staging buffer at the
+    /// offsets reported by the C++ side.
+    pub fn apply_staging(&mut self, staging_base: usize, staged: &[sirius_ffi::StagedBuffer]) {
+        if let Self::Gpu { buffers, column_buffers, .. } = self {
+            for entry in staged {
+                let addr = staging_base + entry.staged_offset;
+                match entry.buf_type.as_str() {
+                    "data" => {
+                        if let Some(b) = buffers.get_mut(entry.buffer_idx) {
+                            b.addr = addr;
+                            b.len = entry.len;
+                        }
+                    }
+                    "null_mask" => {
+                        if let Some(cb) = column_buffers.get_mut(entry.buffer_idx) {
+                            cb.null_mask_addr = addr;
+                            cb.null_mask_len = entry.len;
+                        }
+                    }
+                    "offsets" => {
+                        if let Some(cb) = column_buffers.get_mut(entry.buffer_idx) {
+                            cb.offsets_addr = addr;
+                            cb.offsets_len = entry.len;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Try to stage all GPU buffers (data + sub-buffers) into the staging buffer.
     ///
     /// On success, updates buffer addresses to point into the staging buffer
