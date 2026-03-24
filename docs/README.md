@@ -235,6 +235,10 @@ Sirius is under active development, and several features are still in progress. 
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
 
+## Developer Documentation
+
+For in-depth documentation on the Super Sirius execution engine (the `gpu_execution` code path), see the [Super Sirius Documentation](super-sirius/README.md).
+
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), more [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), accelerating more engines, and many more.
 
