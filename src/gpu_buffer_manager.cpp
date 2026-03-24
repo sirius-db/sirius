@@ -15,6 +15,7 @@
  */
 
 #include "gpu_buffer_manager.hpp"
+#include <cudf/concatenate.hpp>
 
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -605,11 +606,30 @@ void GPUBufferManager::registerExternalTable(
   // This avoids going through GPUColumn::convertToCudfColumn() which may
   // not handle all column types from cudf::unpack correctly.
   // Deep copy into a new cudf::table owned by this GPUIntermediateRelation.
-  // The raw pointer is stored because GPUIntermediateRelation must remain copyable.
-  // Ownership is managed by storing the table in rmm_stored_buffers (kept alive).
   auto* owned_table = new cudf::table(view, cudf::get_default_stream());
-  rel->packed_cudf_table = owned_table;
 
+  // If the table already exists (multiple senders), concatenate the new data.
+  auto existing = tables.find(up_table_name);
+  if (existing != tables.end() && existing->second->packed_cudf_table) {
+    // Concatenate: existing + new → merged table.
+    std::vector<cudf::table_view> views;
+    views.push_back(existing->second->packed_cudf_table->view());
+    views.push_back(owned_table->view());
+    auto merged = cudf::concatenate(views, cudf::get_default_stream());
+    delete existing->second->packed_cudf_table;
+    delete owned_table;
+    existing->second->packed_cudf_table = merged.release();
+    // Update column lengths.
+    auto new_rows = static_cast<size_t>(existing->second->packed_cudf_table->num_rows());
+    for (auto& col : existing->second->columns) {
+      if (col) col->column_length = new_rows;
+    }
+    SIRIUS_LOG_INFO("[registerExternalTable] appended to '{}', now {} rows",
+                    up_table_name, new_rows);
+    return;
+  }
+
+  rel->packed_cudf_table = owned_table;
   tables[up_table_name] = rel;
   SIRIUS_LOG_INFO("[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy GPU + cudf::table owned)",
                   up_table_name, num_cols, num_rows);

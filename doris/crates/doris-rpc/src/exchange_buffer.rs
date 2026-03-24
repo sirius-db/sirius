@@ -56,7 +56,7 @@ pub struct ExchangeBuffer {
     /// Packed GPU exchange data: when cudf packed transfer is used, the receiver
     /// stores the packed buffer info here. The exchange async task retrieves it
     /// and calls gpu_register_table to make the data available to DuckDB on GPU.
-    packed_gpu: Arc<DashMap<ExchangeKey, PackedGpuExchange>>,
+    packed_gpu: Arc<DashMap<ExchangeKey, Vec<PackedGpuExchange>>>,
 }
 
 impl ExchangeBuffer {
@@ -68,14 +68,14 @@ impl ExchangeBuffer {
         }
     }
 
-    /// Store packed GPU exchange data for an exchange key.
+    /// Store packed GPU exchange data for an exchange key (accumulates from multiple senders).
     pub fn store_packed_gpu(&self, key: ExchangeKey, data: PackedGpuExchange) {
-        self.packed_gpu.insert(key, data);
+        self.packed_gpu.entry(key).or_insert_with(Vec::new).push(data);
     }
 
-    /// Take packed GPU exchange data for an exchange key.
-    pub fn take_packed_gpu(&self, key: &ExchangeKey) -> Option<PackedGpuExchange> {
-        self.packed_gpu.remove(key).map(|(_, v)| v)
+    /// Take all packed GPU exchange data for an exchange key.
+    pub fn take_packed_gpu(&self, key: &ExchangeKey) -> Option<Vec<PackedGpuExchange>> {
+        self.packed_gpu.remove(key).map(|(_, v)| v).filter(|v| !v.is_empty())
     }
 
     /// Check if a query has been cancelled.

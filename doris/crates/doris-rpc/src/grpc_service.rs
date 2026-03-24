@@ -1757,22 +1757,30 @@ impl PBackendService for PBackendServiceHandler {
                         let table_name = exchange_table_name(query_id.1, node_id);
 
                         // Check for packed GPU data first (from nixl cudf::pack transfer).
-                        if let Some(packed) = buffer.take_packed_gpu(&key) {
+                        if let Some(packed_list) = buffer.take_packed_gpu(&key) {
+                            // Register the FIRST packed buffer. If there are multiple senders,
+                            // register each one — the C++ registerExternalTable will
+                            // concatenate them via cudf::concatenate.
+                            let first = &packed_list[0];
                             info!(
                                 table = %table_name,
-                                gpu_addr = format_args!("0x{:x}", packed.gpu_addr),
-                                gpu_size = packed.gpu_size,
+                                num_packed = packed_list.len(),
+                                gpu_addr = format_args!("0x{:x}", first.gpu_addr),
+                                gpu_size = first.gpu_size,
                                 "registering packed GPU exchange table (zero CPU copies)"
                             );
-                            // Must run on blocking thread: register_packed_table calls DuckDB
-                            // queries (ctx.Query inside C++ table function bind).
                             let reg_engine = engine.clone();
                             let reg_table = table_name.clone();
+                            let packed_owned = packed_list;
                             let reg_result = tokio::task::spawn_blocking(move || {
                                 let eng = reg_engine.lock().unwrap();
-                                eng.register_packed_table(
-                                    &reg_table, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
-                                )?;
+                                // Register each packed buffer into the same table.
+                                // C++ registerExternalTable concatenates if the table already exists.
+                                for packed in &packed_owned {
+                                    eng.register_packed_table(
+                                        &reg_table, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
+                                    )?;
+                                }
                                 eng.get_table_columns(&reg_table)
                                     .map_err(|e| sirius_ffi::EngineError::ExecFailed(e.to_string()))
                             }).await;

@@ -1054,6 +1054,22 @@ void SiriusExtension::ReleaseGPUBuffersFunction(
   size_t freed = 0;
   if (buffer_is_initialized) {
     freed = GPUBufferManager::GetInstance().ReleaseRetainedBuffers();
+    // Clean up exchange tables registered via registerExternalTable.
+    // These are GPU-cached exchange data from nixl transfers that should
+    // not persist across queries (stale data causes wrong results).
+    auto& tables = GPUBufferManager::GetInstance().tables;
+    for (auto it = tables.begin(); it != tables.end(); ) {
+      if (it->first.find("__EXCH_") != std::string::npos) {
+        // Free the owned cudf::table if present.
+        if (it->second && it->second->packed_cudf_table) {
+          delete it->second->packed_cudf_table;
+          it->second->packed_cudf_table = nullptr;
+        }
+        it = tables.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
   LastGPUBuffers::GetInstance().ReleaseRetainedData();
   LastGPUBuffers::GetInstance().Clear();
