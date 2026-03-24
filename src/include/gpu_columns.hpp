@@ -251,6 +251,13 @@ class GPUIntermediateRelation {
   vector<string> column_names;
   vector<shared_ptr<GPUColumn>> columns;
   size_t column_count;
+
+  /// When set, this relation was populated from a cudf::unpack'd packed buffer.
+  /// The packed_table owns the GPU memory (via rmm::device_buffer deep copy).
+  /// Pre-owned cudf::table from registerExternalTable (cudf::unpack'd data).
+  /// Raw pointer — ownership managed manually by the exchange lifecycle.
+  /// nullptr when not populated from packed nixl transfer.
+  cudf::table* packed_cudf_table = nullptr;
 };
 
 }  // namespace duckdb

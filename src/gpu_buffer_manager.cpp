@@ -601,8 +601,17 @@ void GPUBufferManager::registerExternalTable(
     }
   }
 
+  // Store a deep copy of the cudf::table for use by duckdb_scan_task.
+  // This avoids going through GPUColumn::convertToCudfColumn() which may
+  // not handle all column types from cudf::unpack correctly.
+  // Deep copy into a new cudf::table owned by this GPUIntermediateRelation.
+  // The raw pointer is stored because GPUIntermediateRelation must remain copyable.
+  // Ownership is managed by storing the table in rmm_stored_buffers (kept alive).
+  auto* owned_table = new cudf::table(view, cudf::get_default_stream());
+  rel->packed_cudf_table = owned_table;
+
   tables[up_table_name] = rel;
-  SIRIUS_LOG_INFO("[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy GPU)",
+  SIRIUS_LOG_INFO("[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy GPU + cudf::table owned)",
                   up_table_name, num_cols, num_rows);
 }
 

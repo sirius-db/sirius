@@ -31,7 +31,12 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 // cudf
+#include <cudf/table/table.hpp>
 #include <cudf/utilities/bit.hpp>
+
+// sirius GPU cache
+#include <gpu_buffer_manager.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -541,6 +546,69 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
+
+  // Check if the table is already GPU-resident in GPUBufferManager::tables.
+  // This happens when exchange data was received via nixl and registered via
+  // cudf::unpack + registerExternalTable (zero-copy from staging buffer).
+  // In this case, skip the DuckDB scan entirely — the data is already on GPU.
+  {
+    auto& bm = duckdb::GPUBufferManager::GetInstance();
+    duckdb::TableFunctionToStringInput tf_input(g_state._op.function, g_state._op.bind_data.get());
+    auto to_string = g_state._op.function.to_string(tf_input);
+    std::string table_name;
+    for (auto& [k, v] : to_string) {
+      if (k == "Table") { table_name = v; break; }
+    }
+    if (!table_name.empty()) {
+      std::string up = table_name;
+      std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+      auto it = bm.tables.find(up);
+      if (it != bm.tables.end() && !it->second->columns.empty() &&
+          it->second->columns[0]->column_length > 0) {
+        auto num_cached_rows = it->second->columns[0]->column_length;
+
+        // Only one thread should produce the cached batch.
+        // Use exhausted flag as a mutex — first thread wins.
+        bool expected = false;
+        if (!g_state._op.exhausted.compare_exchange_strong(expected, true)) {
+          // Another thread already claimed this — just drain and exit.
+          l_state._local_state_drained = true;
+          g_state.decrement_local_states();
+          return nullptr;
+        }
+
+        SIRIUS_LOG_INFO("[duckdb_scan_task] table '{}' already GPU-resident ({} rows) — producing GPU batch directly",
+                        table_name, num_cached_rows);
+
+        auto* cached_ptr = it->second->packed_cudf_table;
+        if (!cached_ptr) {
+          SIRIUS_LOG_WARN("[duckdb_scan_task] no packed_cudf_table — falling through to DuckDB scan");
+          g_state._op.exhausted.store(false);
+        } else {
+          // Take ownership: GPUBufferManager → unique_ptr → gpu_table_representation → data_batch.
+          it->second->packed_cudf_table = nullptr;  // Release from cache.
+          auto owned_table = std::unique_ptr<cudf::table>(cached_ptr);
+          SIRIUS_LOG_INFO("[duckdb_scan_task] took cudf::table from cache ({} cols, {} rows)",
+                          owned_table->num_columns(), owned_table->num_rows());
+
+          auto* gpu_space = g_state._sirius_ctx->get_memory_manager().get_memory_space(
+              cucascade::memory::Tier::GPU, 0);
+          auto gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
+              std::move(owned_table), *gpu_space);
+          static std::atomic<int64_t> cached_batch_id{1000000};
+          auto batch = std::make_shared<cucascade::data_batch>(
+              cached_batch_id.fetch_add(1), std::move(gpu_rep));
+
+          l_state._local_state_drained = true;
+          g_state.decrement_local_states();
+
+          std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+          batches.push_back(batch);
+          return std::make_unique<op::operator_data>(std::move(batches));
+        }
+      }
+    }
+  }
 
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.
