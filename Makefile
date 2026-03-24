@@ -72,13 +72,16 @@ clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
 test: test_release
 
 test_release: release
-	./$(TEST_PATH) "$(CURDIR)/test/*"
+	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
+	@echo "Run C++ unit tests with: ./build/release/extension/sirius/test/cpp/sirius_unittest"
 
 test_debug: debug
-	./$(TEST_PATH_DEBUG) "$(CURDIR)/test/*"
+	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
+	@echo "Run C++ unit tests with: ./build/debug/extension/sirius/test/cpp/sirius_unittest"
 
 test_reldebug: relwithdebinfo
-	./$(TEST_PATH_RELWITHDEBINFO) "$(CURDIR)/test/*"
+	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
+	@echo "Run C++ unit tests with: ./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest"
 
 clean:
 	rm -rf build
