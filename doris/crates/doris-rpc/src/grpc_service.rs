@@ -2029,41 +2029,15 @@ impl PBackendService for PBackendServiceHandler {
                     });
 
                     let (exec_plan, output_names) =
-                        if let Some(read_sql) = generate_exchange_union_sql(&params) {
-                            // UNION ALL: use GPU SQL path when GPU exchange tables are registered
-                            // (reads from GPUBufferManager), fall back to CPU SQL otherwise.
-                            let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
-                                table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
-                            });
-                            if has_gpu_tables {
-                                info!(sql = %read_sql, "exchange fragment using GPU SQL path (GPU tables registered)");
-                                (ExecPlan::Sql(read_sql), None)
-                            } else {
-                                info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
-                                (ExecPlan::SqlCpuOnly(read_sql), None)
-                            }
-                        } else {
-                            let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
-                                table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
-                            });
-
+                        {
+                            // All exchange fragments go through Substrait (GPU).
+                            // No SQL, no CPU fallback — data stays on GPU.
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    // Use GPU for exchange fragments — the GPU scan reads from
-                                    // GPUBufferManager (for packed GPU tables) or DuckDB (for PBlock
-                                    // tables, which get H2D copied by ScanDataDuckDB).
-                                    // The from_substrait transformer already handles AGG finalize
-                                    // (INTERMEDIATE_TO_RESULT phase rewrites count→sum).
-                                    let exec = if plan.force_cpu_substrait {
-                                        ExecPlan::SubstraitCpuOnly {
-                                            bytes: plan.substrait_bytes,
-                                            sort_limit_sql: plan.sort_limit_sql,
-                                        }
-                                    } else {
-                                        ExecPlan::Substrait {
-                                            bytes: plan.substrait_bytes,
-                                            sort_limit_sql: plan.sort_limit_sql,
-                                        }
+                                    info!("exchange fragment using GPU Substrait path");
+                                    let exec = ExecPlan::Substrait {
+                                        bytes: plan.substrait_bytes,
+                                        sort_limit_sql: plan.sort_limit_sql,
                                     };
                                     (exec, Some(plan.output_names))
                                 }
@@ -2116,20 +2090,20 @@ impl PBackendService for PBackendServiceHandler {
                         }
                         if is_cpu_only {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
-                        } else {
-                            let mut loc = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
-                            if should_retain_exch {
-                                // Get packed GPU buffer from cudf::chunked_pack (written to send staging).
-                                match engine.get_packed_gpu() {
-                                    Ok(Some((addr, size, metadata))) => {
-                                        tracing::info!(addr = format_args!("0x{addr:x}"), size, "packed GPU for exchange forward");
-                                        loc.set_packed_gpu(addr, size, metadata);
-                                    }
-                                    Ok(None) => tracing::info!("no packed GPU data for exchange forward"),
-                                    Err(e) => tracing::warn!(error = %e, "get_packed_gpu failed for exchange"),
+                        } else if should_retain_exch {
+                            // Build location from packed staging data only.
+                            match engine.get_packed_gpu() {
+                                Ok(Some((addr, size, metadata))) => {
+                                    tracing::info!(addr = format_args!("0x{addr:x}"), size, "packed GPU for exchange forward");
+                                    Ok(crate::nixl_integration::ExecutionLocation::from_packed(addr, size, metadata, ipc_bytes))
+                                }
+                                _ => {
+                                    tracing::info!("no packed GPU data for exchange forward, using CPU path");
+                                    Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                                 }
                             }
-                            Ok(loc)
+                        } else {
+                            Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         }
                     })
                     .await;
@@ -2365,17 +2339,23 @@ impl PBackendService for PBackendServiceHandler {
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                         }
-                        let mut location = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
-                        if should_retain {
-                            match engine.get_packed_partitions() {
-                                Ok(parts) if !parts.is_empty() => location.set_packed_partitions(parts),
-                                _ => {}
+                        // Build location from packed staging data only (no old GPUBufferManager path).
+                        let location = if should_retain {
+                            let partitions = engine.get_packed_partitions().unwrap_or_default();
+                            let packed = engine.get_packed_gpu().ok().flatten();
+                            if let Some((addr, size, metadata)) = packed {
+                                let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
+                                    addr, size, metadata, ipc_bytes);
+                                if !partitions.is_empty() {
+                                    loc.set_packed_partitions(partitions);
+                                }
+                                loc
+                            } else {
+                                crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                             }
-                            match engine.get_packed_gpu() {
-                                Ok(Some((addr, size, metadata))) => location.set_packed_gpu(addr, size, metadata),
-                                _ => {}
-                            }
-                        }
+                        } else {
+                            crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
+                        };
                         Ok(location)
                     }).await;
 
@@ -2454,39 +2434,37 @@ impl PBackendService for PBackendServiceHandler {
                 if let Some(names) = output_names {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                 }
-                let t_detect = std::time::Instant::now();
-                let mut location = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
-                tracing::info!(detect_ms = t_detect.elapsed().as_millis() as u64, gpu = matches!(location, crate::nixl_integration::ExecutionLocation::Gpu { .. }), "detect_execution_location done");
-                // Try RMM pool registration first (zero-copy path). Falls back to
-                // cuMemAlloc copy if pool registration fails.
-                if should_retain {
-                    // Get the packed GPU buffer from cudf::pack() — a single contiguous
-                    // GPU allocation in the C++ CUDA runtime. This replaces the old
-                    // per-column staging approach which failed due to RTLD_LOCAL CUDA
-                    // context isolation (RMM sub-allocations are stale after query cleanup).
-                    // Get per-partition packed data (from GPU hash_partition) or
-                    // single packed buffer (from broadcast cudf::pack).
-                    match engine.get_packed_partitions() {
-                        Ok(parts) if !parts.is_empty() => {
-                            tracing::info!(num_partitions = parts.len(), "got GPU packed partitions");
-                            location.set_packed_partitions(parts);
+                // Build ExecutionLocation from packed GPU data only.
+                // We skip the old detect_execution_location (GPUBufferManager individual
+                // buffers) entirely — those RMM sub-allocations can't be registered with
+                // nixl (UCX rejects them). The packed staging buffer is pre-registered.
+                let location = if should_retain {
+                    // Check per-partition packed data first (GPU hash_partition), then
+                    // single packed buffer (broadcast cudf::pack).
+                    let partitions = engine.get_packed_partitions().unwrap_or_default();
+                    let packed = engine.get_packed_gpu().ok().flatten();
+                    if let Some((addr, size, metadata)) = packed {
+                        tracing::info!(addr = format_args!("0x{addr:x}"), size, metadata_len = metadata.len(),
+                                      "packed GPU buffer from staging");
+                        let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
+                            addr, size, metadata, ipc_bytes);
+                        if !partitions.is_empty() {
+                            tracing::info!(num_partitions = partitions.len(), "got GPU packed partitions");
+                            loc.set_packed_partitions(partitions);
                         }
-                        _ => {}
+                        loc
+                    } else if !partitions.is_empty() {
+                        tracing::info!(num_partitions = partitions.len(), "got GPU packed partitions (no single pack)");
+                        let mut loc = crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes);
+                        // Partitions without a single packed buffer — fall through to CPU
+                        loc
+                    } else {
+                        tracing::info!("no packed GPU data, using CPU IPC path");
+                        crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                     }
-                    match engine.get_packed_gpu() {
-                        Ok(Some((addr, size, metadata))) => {
-                            tracing::info!(addr = format_args!("0x{addr:x}"), size, metadata_len = metadata.len(),
-                                          "packed GPU buffer from cudf::pack");
-                            location.set_packed_gpu(addr, size, metadata);
-                        }
-                        Ok(None) => {
-                            tracing::info!("no packed GPU data available");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "get_packed_gpu failed");
-                        }
-                    }
-                }
+                } else {
+                    crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
+                };
                 tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
                 Ok(location)
             })

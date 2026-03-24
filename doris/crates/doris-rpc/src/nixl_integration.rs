@@ -48,6 +48,25 @@ pub enum ExecutionLocation {
 }
 
 impl ExecutionLocation {
+    /// Create a GPU location from a packed staging buffer.
+    ///
+    /// This is the primary constructor for GPU results — the packed buffer
+    /// is a single contiguous allocation in the pre-registered nixl staging
+    /// region, created by cudf::chunked_pack in the result collector.
+    pub fn from_packed(addr: usize, size: usize, metadata: Vec<u8>, ipc_bytes: Vec<u8>) -> Self {
+        Self::Gpu {
+            buffers: vec![GpuBufferDesc { addr, len: size, device_id: 0 }],
+            column_info: vec![],
+            column_buffers: vec![],
+            num_rows: 0,
+            schema_ipc: vec![],
+            ipc_bytes,
+            _staging_leases: vec![],
+            packed_metadata: Some(metadata),
+            packed_partitions: vec![],
+        }
+    }
+
     /// Extract IPC bytes, consuming self.
     pub fn into_ipc_bytes(self) -> Vec<u8> {
         match self {
