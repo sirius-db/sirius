@@ -604,6 +604,9 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
           //
           // For now: just log and fall through — the exchange table registration
           // already put data in GPUBufferManager. We need to also populate DuckDB.
+          // Ensure CUDA context on this thread (needed to access RMM-allocated GPU data).
+          cudaSetDevice(0);
+
           // Create GPU data_batch and publish to the pipeline.
           auto* gpu_space = g_state._sirius_ctx->get_memory_manager().get_memory_space(
               cucascade::memory::Tier::GPU, 0);

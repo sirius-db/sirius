@@ -57,6 +57,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
     requested_memory_space != nullptr &&
     lock_result.status == cucascade::lock_for_processing_status::memory_space_mismatch;
 
+  if (needs_conversion) {
+    auto* batch_space = batch->get_memory_space();
+    int b_tier = batch_space ? static_cast<int>(batch_space->get_tier()) : -1;
+    int t_tier = static_cast<int>(target_space->get_tier());
+    spdlog::info("[gpu_pipeline_task] needs_conversion: batch_tier={} target_tier={}", b_tier, t_tier);
+  }
+
   if (!lock_result.success && needs_conversion) {
     try {
       auto& registry = sirius::converter_registry::get();
