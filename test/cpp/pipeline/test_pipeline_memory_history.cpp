@@ -46,7 +46,7 @@ TEST_CASE("pipeline_memory_history single record produces correct estimate",
   // Record: estimated 100 bytes, peaked at 300 bytes → ratio = 3.0
   history.record({100, 300, 200});
 
-  // For a new task with 100 bytes estimated, expect 100 * 3.0 * 1.2 = 360
+  // For a new task with 100 bytes estimated, expect 100 * 3.0 = 300
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate == 300);
@@ -58,12 +58,12 @@ TEST_CASE("pipeline_memory_history estimate clamps to minimum of estimated_bytes
   pipeline_memory_history history;
 
   // Record: estimated 100 bytes, peaked at only 50 bytes → ratio = 0.5
-  // 200 * 0.5 * 1.2 = 120, which is less than 200
+  // 200 * 0.5 = 100, which is less than 200
   history.record({100, 50, 30});
 
   auto estimate = history.estimate_peak_memory(200);
   REQUIRE(estimate.has_value());
-  REQUIRE(*estimate >= 200);
+  REQUIRE(*estimate == 200);
 }
 
 TEST_CASE("pipeline_memory_history multiple records are weighted by proximity",
@@ -79,7 +79,7 @@ TEST_CASE("pipeline_memory_history multiple records are weighted by proximity",
 
   // For estimated_bytes=1000, the close record (ratio=2.0) should dominate
   // over the far record (ratio=5.0), so the result should be closer to
-  // 1000 * 2.0 * 1.2 = 2400 than to 1000 * 5.0 * 1.2 = 6000
+  // 1000 * 2.0 = 2000 than to 1000 * 5.0 = 5000
   auto estimate = history.estimate_peak_memory(1000);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate >= 2000);
@@ -96,7 +96,7 @@ TEST_CASE("pipeline_memory_history skips records with zero estimated_bytes",
 
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
-  // Only the second record contributes: 100 * 3.0 * 1.2 = 360
+  // Only the second record contributes: 100 * 3.0 = 300
   REQUIRE(*estimate == 300);
 }
 
@@ -119,7 +119,7 @@ TEST_CASE("pipeline_memory_history ring buffer evicts oldest records",
 
   REQUIRE(history.size() == 64);
 
-  // Estimate should now reflect ratio=4.0: 100 * 4.0 * 1.2 = 480
+  // Estimate should now reflect ratio=4.0: 100 * 4.0 = 400
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate == 400);

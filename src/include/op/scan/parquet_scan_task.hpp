@@ -433,15 +433,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    *
    * @return The estimated reservation size in bytes.
    */
-  [[nodiscard]] size_t get_estimated_reservation_size() const override
-  {
-    auto current_estimate =
-      this->_local_state->cast<parquet_scan_task_local_state>().get_task_consumption_basis();
-    auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
-    auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
-    if (refined) { return *refined; }
-    return current_estimate;
-  }
+  [[nodiscard]] size_t get_estimated_reservation_size() const override;
 
   /**
    * @brief Get the output consumers operators for this task.

@@ -383,20 +383,19 @@ void parquet_scan_task::execute(rmm::cuda_stream_view stream)
 {
   auto& l_state        = this->_local_state->cast<parquet_scan_task_local_state>();
   auto estimated_bytes = l_state.get_reserved_compressed_bytes();
-  auto output_data     = compute_task(stream);
 
   // Record memory metrics for future reservation estimates.
   // Parquet scan tasks don't have peak memory tracking, so use output size as proxy.
-  if (output_data) {
+  if (auto output_data = compute_task(stream); output_data) {
     std::size_t output_bytes = 0;
     for (const auto& batch : output_data->get_data_batches()) {
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
     }
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
     g_state.get_memory_history().record({estimated_bytes, output_bytes, output_bytes});
-  }
 
-  if (output_data) { publish_output(*output_data, stream); }
+    publish_output(*output_data, stream);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -529,6 +528,16 @@ void parquet_scan_task::publish_output(op::operator_data& output_data,
   for (auto& batch : output_data.get_data_batches()) {
     _data_repo->add_data_batch(std::move(batch));
   }
+}
+
+size_t parquet_scan_task::get_estimated_reservation_size() const
+{
+  auto current_estimate =
+    this->_local_state->cast<parquet_scan_task_local_state>().get_task_consumption_basis();
+  auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
+  auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
+  if (refined) { return *refined; }
+  return current_estimate;
 }
 
 void parquet_scan_task::read_range_into_allocation(

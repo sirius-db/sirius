@@ -58,6 +58,7 @@ class pipeline_memory_history {
    */
   void record(task_memory_record rec)
   {
+    if (rec.estimated_bytes == 0) { return; }
     std::lock_guard<std::mutex> lock(_mutex);
     if (_records.size() < kMaxRecords) {
       _records.push_back(rec);
@@ -86,8 +87,6 @@ class pipeline_memory_history {
     double weight_sum         = 0.0;
 
     for (const auto& rec : _records) {
-      if (rec.estimated_bytes == 0) { continue; }
-
       double ratio =
         static_cast<double>(rec.peak_memory_bytes) / static_cast<double>(rec.estimated_bytes);
 
@@ -101,8 +100,6 @@ class pipeline_memory_history {
       weighted_ratio_sum += ratio * weight;
       weight_sum += weight;
     }
-
-    if (weight_sum == 0.0) { return std::nullopt; }
 
     double avg_ratio = weighted_ratio_sum / weight_sum;
 

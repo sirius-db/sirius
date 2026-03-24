@@ -493,15 +493,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    */
   void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
-  std::size_t get_estimated_reservation_size() const override
-  {
-    auto current_estimate =
-      this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
-    auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
-    auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
-    if (refined) { return *refined; }
-    return current_estimate;
-  }
+  [[nodiscard]] std::size_t get_estimated_reservation_size() const override;
 
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override
