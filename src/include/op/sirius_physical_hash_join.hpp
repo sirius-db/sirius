@@ -130,6 +130,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @param build_side_bytes
   void update_join_exec_mode(int num_partitions, uint64_t build_side_bytes);
 
+  /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
+  [[nodiscard]] bool is_build_probe_mode();
+
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

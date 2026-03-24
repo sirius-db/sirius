@@ -279,8 +279,21 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto [num_parts, total_bytes] = determine_num_partitions();
-      _hash_join_op->Cast<sirius_physical_hash_join>().update_join_exec_mode(num_parts,
-                                                                             total_bytes);
+      auto& hash_join               = _hash_join_op->Cast<sirius_physical_hash_join>();
+      hash_join.update_join_exec_mode(num_parts, total_bytes);
+      if (_hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
+          hash_join.is_build_probe_mode()) {
+        // Either sibling may run this block first; configure the build-side CONCAT only.
+        auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
+          for (auto& [next_op, port_id] : part_op.get_next_port_after_sink()) {
+            if (next_op->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
+            auto& concat = next_op->Cast<sirius_physical_concat>();
+            if (concat.is_build_concat()) { concat.set_concat_all(true); }
+          }
+        };
+        enable_build_concat_all(*this);
+        enable_build_concat_all(sibling);
+      }
       _num_partitions         = num_parts;
       sibling._num_partitions = num_parts;
       SIRIUS_LOG_DEBUG(
