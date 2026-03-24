@@ -283,8 +283,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       "Failed to load Sirius configuration from file: " + config_path.string() + " " + e.what());
   }
 
-  _operator_params.validate_and_fix();
-
   // std::cerr << "Loaded Sirius configuration from file: " << config_path << std::endl;
 
   std::copy(gpu_memory_space_configs.begin(),

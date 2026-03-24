@@ -390,6 +390,12 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
   }
 }
 
+bool sirius_physical_hash_join::is_build_probe_mode()
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
+}
+
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
@@ -772,7 +778,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
-      auto build_keys_result      = prepare_join_keys(input_batches[1],
+      if (input_batches.size() != 2) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join::execute: BUILD_PROBE SCHEDULED expects probe + build "
+          "batch, got " +
+          std::to_string(input_batches.size()) + " batches in operator " +
+          std::to_string(this->get_operator_id()));
+      }
+      auto build_batch            = input_batches[1];
+      auto build_keys_result      = prepare_join_keys(build_batch,
                                                  right_key_col_indices,
                                                  cast_necessary,
                                                  key_casts,
@@ -782,7 +796,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        _build_table              = input_batches[1];
+        _build_table              = std::move(build_batch);
         _hash_table =
           std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe

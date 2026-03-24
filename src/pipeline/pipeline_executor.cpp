@@ -161,7 +161,13 @@ std::future<void> pipeline_executor::start_query()
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  schedule_next_scan_tasks();
+  constexpr int k_initial_scans = 2;
+  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+  for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
+    auto* scan_op = _priority_scans.front();
+    _task_creator->schedule(scan_op);
+    _priority_scans.pop();
+  }
 
   return future;
 }
@@ -213,21 +219,7 @@ void pipeline_executor::management_eventloop()
         break;
       }
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
-    } else {
-      // TODO(amin): think about eager scheduling again when state of next tasks are stored in the
-      // operator
-      // schedule_next_scan_tasks();
     }
-  }
-}
-
-void pipeline_executor::schedule_next_scan_tasks()
-{
-  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-  if (!_priority_scans.empty()) {
-    auto* scan_op = _priority_scans.front();
-    _task_creator->schedule(scan_op);
-    _priority_scans.pop();
   }
 }
 
