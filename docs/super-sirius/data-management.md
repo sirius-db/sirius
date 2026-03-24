@@ -1,0 +1,135 @@
+# Data Management
+
+This document covers data batches, data repositories, ports, barrier semantics, and data format conversion.
+
+## Data Batch Lifecycle
+
+A data batch flows through the system in these stages:
+
+```
+1. Scan Phase:     scan_task creates data_batch with host/parquet representation
+2. Repository:     batch is stored in shared_data_repository
+3. Consumption:    task_creator pops batch, transitions to task_created state
+4. Execution:      GPU task locks batch, converts to GPU, executes operator chain
+5. Output:         operators produce new batches, pushed to downstream repositories
+6. Downgrade:      if GPU memory pressure, batch moved to host (optional)
+7. Cleanup:        batch destroyed when no longer referenced
+```
+
+### Batch State Machine
+
+Each `data_batch` (from cuCascade) maintains a state:
+
+```
+idle → task_created → processing → idle
+                   ↘ in_transit (downgrade) → idle
+```
+
+- **idle**: available for consumption or downgrade
+- **task_created**: claimed by task creator, not yet executing
+- **processing**: locked by a GPU task during execution
+- **in_transit**: locked by downgrade executor during tier migration
+
+## Data Repositories
+
+Data repositories are thread-safe containers managed by the `shared_data_repository_manager`:
+
+- Keyed by `(operator_id, port_id)` pairs
+- Support partitioned storage (multiple partitions per repository)
+- Provide `add_data_batch()` for producers and `pop_data_batch()` for consumers
+- Track total size and per-partition sizes
+- Registered centrally in `shared_data_repository_manager` for downgrade candidate selection
+
+### `shared_data_repository_manager`
+
+Central registry of all repositories in query execution:
+- Provides `for_each_repository()` iterator for downgrade candidate selection
+- Thread-safe access to all active repositories
+
+## Port System
+
+**File:** `src/include/op/sirius_physical_operator.hpp`
+
+Ports connect pipelines by routing data from one operator's output to another's input:
+
+```cpp
+struct port {
+    MemoryBarrierType type;                    // PIPELINE, PARTIAL, or FULL
+    cucascade::shared_data_repository* repo;   // holds queued data_batch objects
+    shared_ptr<sirius_pipeline> src_pipeline;  // pipeline producing data
+    shared_ptr<sirius_pipeline> dest_pipeline; // pipeline consuming data
+};
+```
+
+### Barrier Semantics
+
+| Barrier | Behavior | When Used |
+|---------|----------|-----------|
+| `FULL` | Downstream waits until upstream pipeline is **completely finished** before consuming any data | Hash join build side — entire hash table must be built before probing |
+| `PARTIAL` | Downstream can consume data **incrementally** as it arrives, but respects pipeline boundaries | CONCAT after PARTITION in streaming joins (INNER) |
+| `PIPELINE` | No synchronization — data flows **immediately** | Within a single pipeline |
+
+### `push_data_batch()`
+
+When a sink's `sink()` method produces output batches, the default implementation pushes each batch to downstream operators:
+
+```cpp
+for (auto& batch : output_batches) {
+    for (auto& [next_op, port_id] : next_port_after_sink) {
+        next_op->push_data_batch(port_id, batch);
+    }
+}
+```
+
+`next_port_after_sink` is configured during pipeline construction by `insert_repository()`.
+
+### Port Names
+
+Operators access their ports by string name:
+- `"default"` — primary input (most operators)
+- `"build"` — build-side input (hash join only)
+
+## Operator Data Containers
+
+### `operator_data`
+
+Wraps a `vector<shared_ptr<data_batch>>` for operator input/output:
+- Created by `get_next_task_input_data()` from port pops
+- Passed through the operator chain during `execute()`
+- Each batch may be from a different port
+
+### `partitioned_operator_data`
+
+Extends `operator_data` with a partition index. Used by partition-aware operators (CONCAT, MERGE_SORT, MERGE_GROUP_BY) to track which partition the data belongs to.
+
+## Data Format Conversion
+
+### `sirius_converter_registry`
+
+**File:** `src/include/data/sirius_converter_registry.hpp`
+
+Global singleton for converting between data representations:
+- Registers builtin cuCascade converters + Sirius-specific converters (parquet)
+- Thread-safe initialization via mutex
+- Used by:
+  - Downgrade tasks: GPU representation → HOST representation
+  - Scan tasks: Parquet representation → GPU table representation
+  - GPU pipeline tasks: HOST representation → GPU representation (`lock_or_prepare_batch`)
+
+### Conversion Examples
+
+| From | To | When |
+|------|----|------|
+| `host_data_representation` | GPU `cudf::table` | GPU task input preparation |
+| GPU `cudf::table` | `host_data_representation` | Downgrade executor |
+| `host_parquet_representation` | GPU `cudf::table` | Parquet materialization |
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/include/op/sirius_physical_operator.hpp` | Port struct, barrier types, push_data_batch |
+| `src/op/sirius_physical_operator.cpp` | Default sink/push implementation |
+| `src/include/data/cached_data_representation.hpp` | Cached data wrappers |
+| `src/include/data/sirius_converter_registry.hpp` | Format conversion registry |
+| `src/include/memory/multiple_blocks_allocation_accessor.hpp` | Multi-block allocation cursor |

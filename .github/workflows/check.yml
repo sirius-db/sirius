@@ -18,6 +18,7 @@ on:
     branches:
       - dev
   pull_request:
+  merge_group:
 
 jobs:
   lint:

@@ -21,7 +21,6 @@
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_interface.hpp"
-#include "sirius_pipeline_hashmap.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -41,7 +40,6 @@ using namespace sirius::op::scan;
 using namespace std::chrono_literals;
 using namespace sirius::op;
 using namespace sirius;
-using sirius::sirius_pipeline_hashmap;
 
 //===----------------------------------------------------------------------===//
 // Mock GPU Physical Operator
@@ -154,7 +152,6 @@ class mock_pipeline_builder {
 class testable_task_creator : public task_creator {
  public:
   testable_task_creator(int num_threads,
-                        sirius_pipeline_hashmap& gpu_pipeline_map,
                         duckdb::ClientContext& client_context,
                         pipeline_executor& pipeline_executor,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
@@ -245,8 +242,7 @@ class test_fixture {
       pipeline_exec(exec::thread_pool_config{.num_threads = 1},
                     exec::thread_pool_config{.num_threads = 2},
                     *memory_manager),
-      empty_pipelines(),
-      pipeline_map(empty_pipelines)
+      empty_pipelines()
   {
   }
 
@@ -265,7 +261,6 @@ class test_fixture {
   sirius_engine engine;
   pipeline_executor pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
-  sirius::sirius_pipeline_hashmap pipeline_map;
 };
 
 //===----------------------------------------------------------------------===//
@@ -277,7 +272,7 @@ TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
 
@@ -312,7 +307,7 @@ TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("Multiple start_thread_pool calls don't create extra threads")
   {
@@ -352,11 +347,8 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
   test_fixture fixture;
 
   {
-    testable_task_creator creator(2,
-                                  fixture.pipeline_map,
-                                  *fixture.con.context,
-                                  fixture.pipeline_exec,
-                                  *fixture.memory_manager);
+    testable_task_creator creator(
+      2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
     creator.start_thread_pool();
     // Destructor should stop threads
   }
@@ -375,7 +367,7 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create a mock operator with no ports (will return monostate)
   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
@@ -394,7 +386,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create the source operator that we will call process_next_task on
   auto source_op = std::make_unique<mock_sirius_physical_operator>();
