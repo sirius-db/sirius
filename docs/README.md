@@ -49,7 +49,7 @@ The environment activation handles setting up everything needed to build and tes
 
 To build Sirius:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 ```
 
 Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
@@ -195,7 +195,7 @@ make test
 
 To run a specific test run the command from the root directory:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 ```
 
@@ -203,13 +203,13 @@ build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 
 Sirius also implements C++ tests for all of the APIs it implements. These tests are meant to be individual unit tests for each of the classes/functions used to run Sirius. You can find examples on how to implement these unit tests in `test/cpp`. You can run all of the unit tests using:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 build/release/extension/sirius/test/cpp/sirius_unittest
 ```
 
 To run tests associated with specific tag or to run a specific test you can execute the the test script like this:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
 build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
 ```
