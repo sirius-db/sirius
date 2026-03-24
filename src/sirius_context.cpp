@@ -174,10 +174,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     auto spaces        = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& dg_cfg = config_.get_downgrade_executor_config();
     for (auto* space : spaces) {
-      sirius::parallel::task_executor_config executor_config{
-        dg_cfg.num_threads, false, dg_cfg.cpu_affinity_list};
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
-        std::move(executor_config),
+        dg_cfg,
         *data_repository_manager_,
         space->get_id(),
         const_cast<cucascade::memory::memory_space*>(space),
@@ -314,10 +312,11 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
   return *task_creator_;
 }
 
-void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap)
+void SiriusContext::create_query(
+  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines)
 {
   throw_if_not_initialized();
-  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipeline_hashmap));
+  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
   pipeline_executor_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
 }
