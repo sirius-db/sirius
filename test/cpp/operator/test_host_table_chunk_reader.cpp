@@ -20,7 +20,6 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
-#include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 
 // cudf

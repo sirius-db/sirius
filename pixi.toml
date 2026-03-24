@@ -8,6 +8,7 @@ requires-pixi = ">=0.59"
 scripts = ["scripts/pixi_activate.sh"]
 
 [dependencies]
+bc = "*"
 cmake = "4.1.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
@@ -18,26 +19,27 @@ sccache = "*"
 unzip = "*"
 clang = ">=21,<22"
 wget = "*"
-
 libcudf = "26.02.*"
 librmm = "*"
 libcurand-dev = "*"
 pre-commit = "*"
 libconfig = "*"
 libabseil = ">=20260107.0"
-duckdb = ">=1.4.4,<2"
-spdlog = "1.8.*"
+duckdb = "=1.4.4"
 clang-tools = ">=21.1.8,<22"
+spdlog = "1.8.*"
+pkg-config = "*"
+mold = "*"
+sqlite = ">=3.52.0,<4"
 
 [tasks]
-substrait-build = { cmd = "make -C substrait release GEN=ninja", description = "Build DuckDB substrait extension" }
 
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
 [feature.cuda13.system-requirements]
 cuda = "13"
 
 [feature.cuda13.dependencies]
-cuda-version = "13.*"
+cuda-version = "13.1.*"
 
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
@@ -53,7 +55,12 @@ cuda-version = "12.*"
 # GPU architectures: Turing through Hopper (75, 80, 86, 90a)
 CUDAARCHS = "75-real;80-real;86-real;90a-real"
 
-# Doris Rust BE feature: extra deps for building doris/ workspace
+[environments]
+default = ["cuda13"]
+cuda12 = ["cuda12"]
+doris = ["cuda13", "doris", "nixl"]
+doris-fe = ["doris-fe"]
+doris-be = ["doris-be"]
 [feature.doris.dependencies]
 rust = ">=1.85"
 libprotobuf = ">=5"
@@ -296,10 +303,3 @@ pkg-config = "*"
 clangdev = "*"
 
 [feature.nixl.tasks]
-
-[environments]
-default = ["cuda13"]
-cuda12 = ["cuda12"]
-doris = ["cuda13", "doris", "nixl"]
-doris-fe = ["doris-fe"]
-doris-be = ["doris-be"]

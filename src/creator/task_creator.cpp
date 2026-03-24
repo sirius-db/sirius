@@ -17,15 +17,12 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
-#include "op/sirius_physical_top_n.hpp"
-#include "op/sirius_physical_top_n_merge.hpp"
-#include "op/sirius_physical_ungrouped_aggregate.hpp"
-#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "planner/query.hpp"
@@ -34,9 +31,7 @@
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
-#include <iterator>
 #include <optional>
-#include <queue>
 
 namespace sirius::creator {
 
@@ -69,15 +64,11 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
 
-  // Clear the global state maps for the new query
   _scan_operator_global_state_map.clear();
-  _parquet_scan_operator_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
 
-  // Iterate through all pipelines in the query and create global states
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
-    // Get the sink operator of the pipeline
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) { continue; }
 
@@ -92,16 +83,21 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-      const auto& op_params =
-        _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-          ->get_config()
-          .get_operator_params();
-      _parquet_scan_operator_global_state_map.emplace(
-        operator_id,
-        std::make_shared<op::scan::parquet_scan_task_global_state>(
-          pipeline,
-          &source_operator->Cast<op::sirius_physical_parquet_scan>(),
-          op_params.scan_task_batch_size));
+      auto it = _parquet_scan_operator_global_state_map.find(operator_id);
+      if (it != _parquet_scan_operator_global_state_map.end()) {
+        it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
+      } else {
+        const auto& op_params =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+            ->get_config()
+            .get_operator_params();
+        _parquet_scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::parquet_scan_task_global_state>(
+            pipeline,
+            &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+            op_params.scan_task_batch_size));
+      }
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
@@ -117,12 +113,11 @@ void task_creator::drain_pending_tasks()
   _kiosk.wait_all();
 }
 
-void task_creator::reset()
+void task_creator::reset(bool keep_parquet_metadata)
 {
-  // Clear the scan operator global state map for the new query
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _scan_operator_global_state_map.clear();
-  _parquet_scan_operator_global_state_map.clear();
+  if (!keep_parquet_metadata) { _parquet_scan_operator_global_state_map.clear(); }
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();
@@ -158,7 +153,10 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // task creator should never schedule additional scans from downstream.
     // (Parquet scans are fine — they use partition indices that self-limit.)
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      return nullptr;
+      auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
+      if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
+        return nullptr;
+      }
     }
     return get_operator_for_next_task(producer);
   }
@@ -288,36 +286,38 @@ void task_creator::manager_loop()
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
           auto* parquet_scan             = &node->Cast<op::sirius_physical_parquet_scan>();
-          pipeline->mark_task_created();
-          auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
-          if (!partition_idx.has_value()) {
-            pipeline->mark_task_completed();
-            if (pipeline->is_pipeline_finished()) {
-              auto output_consumers = pipeline->get_output_consumers();
-              for (auto& output_consumer : output_consumers) {
-                schedule(output_consumer);
+          while (true) {
+            pipeline->mark_task_created();
+            auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
+            if (!partition_idx.has_value()) {
+              pipeline->mark_task_completed();
+              if (pipeline->is_pipeline_finished()) {
+                auto output_consumers = pipeline->get_output_consumers();
+                for (auto& output_consumer : output_consumers) {
+                  schedule(output_consumer);
+                }
               }
+              return;
             }
-            return;
-          }
-          if (!parquet_task_global_state->has_more_partitions()) {
-            parquet_scan->has_more_partitions = false;
-          }
+            if (!parquet_task_global_state->has_more_partitions()) {
+              parquet_scan->has_more_partitions = false;
+            }
 
-          auto parquet_task_local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
-            *parquet_task_global_state, *partition_idx);
+            auto parquet_task_local_state =
+              std::make_unique<op::scan::parquet_scan_task_local_state>(*parquet_task_global_state,
+                                                                        *partition_idx);
 
-          if (destination_data_repositories.empty()) {
-            throw std::runtime_error(
-              "No destination data repositories provided for parquet scan task creation.");
+            if (destination_data_repositories.empty()) {
+              throw std::runtime_error(
+                "No destination data repositories provided for parquet scan task creation.");
+            }
+            auto parquet_task =
+              std::make_unique<op::scan::parquet_scan_task>(get_next_task_id(),
+                                                            destination_data_repositories[0],
+                                                            std::move(parquet_task_local_state),
+                                                            parquet_task_global_state);
+            _pipeline_executor->schedule(std::move(parquet_task));
           }
-          auto parquet_task =
-            std::make_unique<op::scan::parquet_scan_task>(get_next_task_id(),
-                                                          destination_data_repositories[0],
-                                                          std::move(parquet_task_local_state),
-                                                          parquet_task_global_state);
-          _pipeline_executor->schedule(std::move(parquet_task));
-          // scheduling pipeline task
         } else {
           // need to exhaust input batches until all ports are empty
           while (!node->all_ports_empty()) {
@@ -358,6 +358,7 @@ void task_creator::manager_loop()
         }
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
+        _pipeline_executor->terminate_query(std::current_exception());
         stop();
       }
     });

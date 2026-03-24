@@ -31,7 +31,6 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -41,7 +40,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
-#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -342,8 +340,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     auto* space = batch->get_memory_space();
     if (!space) { continue; }
 
-    auto table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto view  = table.view();
+    auto& table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    auto view   = table.view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -524,7 +522,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
 
-  auto merged_table =
+  auto& merged_table =
     merged_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
   auto merged_view = merged_table.view();
 

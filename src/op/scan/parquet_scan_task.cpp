@@ -17,26 +17,28 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
+#include <data/host_parquet_representation_converters.hpp>
+#include <data/sirius_converter_registry.hpp>
+#include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // duckdb
 #include <duckdb/common/multi_file/multi_file_states.hpp>
-#include <duckdb/common/types.hpp>
-#include <duckdb/main/config.hpp>
 
 // cudf
+#include "cucascade/data/cpu_data_representation.hpp"
+#include "cucascade/data/gpu_data_representation.hpp"
 #include "cudf/cudf_utils.hpp"
+#include "data/cached_data_representation.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -47,6 +49,7 @@
 
 // standard library
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <unordered_set>
@@ -180,21 +183,41 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   std::for_each(
     files.begin(), files.end(), [this](auto const& file) { _file_paths.push_back(file.path); });
 
-  // Construct the io_sources and read the footers
+  // Construct the io_sources and read the footers.
+  // Also record each file's total size and footer offset so that scan tasks
+  // can cache the parquet header+footer alongside the column-chunk data,
+  // eliminating all file I/O during subsequent (preload) iterations.
+  constexpr size_t PARQUET_MAGIC_SIZE = 4;
+  constexpr size_t FOOTER_TAIL_SIZE   = 8;  // 4-byte footer_len + 4-byte magic
+
   std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
   std::vector<std::unique_ptr<cudf::io::datasource::buffer>> footer_buffers;
   datasources.reserve(files.size());
   footer_buffers.reserve(files.size());
-  std::for_each(
-    _file_paths.begin(), _file_paths.end(), [&datasources, &footer_buffers](auto const& file_path) {
-      auto datasource = cudf::io::datasource::create(file_path);
-      datasources.push_back(std::move(datasource));
+  _file_sizes.reserve(files.size());
+  _metadata_byte_sizes.reserve(files.size());
+  _footer_offsets.reserve(files.size());
+
+  for (auto const& file_path : _file_paths) {
+    auto datasource      = cudf::io::datasource::create(file_path);
+    auto const file_size = datasource->size();
+    datasources.push_back(std::move(datasource));
+
 #if CUDF_VERSION_NUM >= 2604
-      footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
+    footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
+    auto const footer_len = footer_buffers.back()->size();
 #else
-      footer_buffers.push_back(fetch_footer_to_host_fallback(*datasources.back()));
+    footer_buffers.push_back(fetch_footer_to_host_fallback(*datasources.back()));
+    auto const footer_len = footer_buffers.back()->size();
 #endif
-    });
+
+    auto const footer_offset  = file_size - FOOTER_TAIL_SIZE - footer_len;
+    auto const metadata_bytes = PARQUET_MAGIC_SIZE + footer_len + FOOTER_TAIL_SIZE;
+
+    _file_sizes.push_back(file_size);
+    _footer_offsets.push_back(footer_offset);
+    _metadata_byte_sizes.push_back(metadata_bytes);
+  }
 
   // Initialize reader options for applying projections (FUTURE: filters)
   _reader_options = cudf::io::parquet_reader_options::builder().build();
@@ -330,7 +353,8 @@ parquet_scan_task_local_state::parquet_scan_task_local_state(
   _rg_indices.resize(partition.row_group_count);
   std::iota(_rg_indices.begin(), _rg_indices.end(), partition.start_row_group);
   _reserved_uncompressed_bytes = partition.reserved_uncompressed_bytes;
-  _reserved_compressed_bytes   = partition.reserved_compressed_bytes;
+  _reserved_compressed_bytes =
+    partition.reserved_compressed_bytes + g_state.get_metadata_byte_size(_file_idx);
 }
 
 std::unique_ptr<parquet_scan_task_local_state::multiple_blocks_allocation>
@@ -359,36 +383,64 @@ parquet_scan_task::~parquet_scan_task()
 // Parquet Scan Task
 //===----------------------------------------------------------------------===//
 std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
-  rmm::cuda_stream_view /* stream */)
+  [[maybe_unused]] rmm::cuda_stream_view stream)
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
-  auto reader   = g_state.make_reader(l_state.get_file_idx());
+
+  if (!_datasource) {
+    _datasource = cudf::io::datasource::create(g_state.get_file_path(l_state.get_file_idx()));
+  }
+
+  auto reader = g_state.make_reader(l_state.get_file_idx());
+
+  auto& scan_op      = g_state.get_operator();
+  auto const num_rgs = l_state.get_rg_span().size();
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: operator {} (id={}) executing on {} batches with num row: {}",
+    scan_op.get_pipeline().get() != nullptr ? scan_op.get_pipeline()->get_pipeline_id() : 0,
+    scan_op.get_name(),
+    scan_op.get_operator_id(),
+    0,
+    "");
+  auto const task_start = std::chrono::high_resolution_clock::now();
 
   // Make the allocation and accessor
   auto allocation = l_state.make_allocation();
   memory::multiple_blocks_allocation_accessor<uint8_t> data_accessor;
   data_accessor.initialize(0, allocation);
 
-  // Get the byte ranges for the range of row groups assigned to this task
-  auto byte_ranges =
+  // Get the byte ranges for the range of row groups assigned to this task.
+  // Prepend the parquet header (4-byte magic at offset 0) and append the
+  // footer + trailer so that the cache covers ALL bytes cuDF needs to open
+  // the file, enabling zero file I/O during preload iterations.
+  auto const file_idx    = l_state.get_file_idx();
+  auto const file_size   = g_state.get_file_size(file_idx);
+  auto const footer_off  = g_state.get_footer_offset(file_idx);
+  auto const footer_size = file_size - footer_off;
+
+  using range_t = cudf::io::text::byte_range_info;
+
+  auto column_chunk_ranges =
     reader->all_column_chunks_byte_ranges(l_state.get_rg_span(), g_state.get_options());
 
+  std::vector<range_t> byte_ranges;
+  byte_ranges.reserve(column_chunk_ranges.size() + 2);
+  byte_ranges.emplace_back(0, 4);  // PAR1 header
+  byte_ranges.insert(byte_ranges.end(), column_chunk_ranges.begin(), column_chunk_ranges.end());
+  byte_ranges.emplace_back(footer_off, footer_size);  // footer + trailer
+
   // Read each byte range into the allocation asynchronously
-  std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
-  new_byte_ranges.reserve(byte_ranges.size());
-  int64_t new_offset = 0;
+  int64_t bytes_read = 0;
   std::vector<std::future<std::size_t>> read_futures;
   for (auto const& range : byte_ranges) {
     read_range_into_allocation(
       range.offset(), range.size(), data_accessor, allocation, read_futures);
-    new_byte_ranges.emplace_back(new_offset, range.size());
-    new_offset += range.size();
+    bytes_read += range.size();
   }
   std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
 
-  if (new_offset != l_state.get_reserved_compressed_bytes()) {
-    // Metadata / file data mismatch
+  if (bytes_read != l_state.get_reserved_compressed_bytes()) {
     throw std::runtime_error(
       "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
       "compressed bytes");
@@ -401,13 +453,54 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   std::move(reader),
                                                   g_state.get_options(),
                                                   std::move(l_state.get_rg_indices()),
-                                                  std::move(new_byte_ranges),
+                                                  std::move(byte_ranges),
                                                   l_state.get_reserved_compressed_bytes(),
-                                                  l_state.get_reserved_uncompressed_bytes());
-  auto data_batch =
-    std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
-  return std::make_unique<op::operator_data>(
-    std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
+                                                  l_state.get_reserved_uncompressed_bytes(),
+                                                  file_size,
+                                                  _datasource);
+
+  std::shared_ptr<cucascade::data_batch> batch;
+  if (_materialized_columns) {
+    auto& registry          = sirius::converter_registry::get();
+    auto materialized_table = registry.convert<cucascade::gpu_table_representation>(
+      *parquet_representation, _gpu_memory_space, stream);
+    stream.synchronize();
+    parquet_representation.reset();
+    auto host_table = registry.convert<cucascade::host_data_representation>(
+      *materialized_table, l_state.get_memory_space(), stream);
+    if (_wrap_in_cache) {
+      batch = std::make_shared<cucascade::data_batch>(
+        get_next_batch_id(),
+        std::make_unique<cached_host_data_representation>(std::move(host_table)));
+    } else {
+      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(host_table));
+    }
+  } else {
+    if (_wrap_in_cache) {
+      batch = std::make_shared<cucascade::data_batch>(
+        get_next_batch_id(),
+        std::make_unique<cached_host_parquet_representation>(std::move(parquet_representation)));
+    } else {
+      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(),
+                                                      std::move(parquet_representation));
+    }
+  }
+  auto result = std::make_unique<op::operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
+
+  auto const task_end = std::chrono::high_resolution_clock::now();
+  auto const task_duration =
+    std::chrono::duration_cast<std::chrono::microseconds>(task_end - task_start);
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
+    "{:.2f} ms",
+    scan_op.get_pipeline().get() != nullptr ? scan_op.get_pipeline()->get_pipeline_id() : 0,
+    scan_op.get_name(),
+    scan_op.get_operator_id(),
+    result->get_data_batches().size(),
+    num_rgs,
+    task_duration.count() / 1000.0);
+  return result;
 }
 
 void parquet_scan_task::publish_output(op::operator_data& output_data,

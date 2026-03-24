@@ -24,7 +24,6 @@
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
-#include <pipeline/sirius_pipeline_task_states.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -38,7 +37,6 @@
 #include <rapids_logger/logger.hpp>
 
 // duckdb
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>

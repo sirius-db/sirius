@@ -16,10 +16,10 @@
 
 #include "../operator/cuda_helper.cuh"
 #include "config.hpp"
-#include "cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_order.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_order.hpp"
 
 #include <cub/cub.cuh>
 
@@ -1067,8 +1067,10 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
     }
   }
 
-  auto keys_table        = cudf::table_view(columns_cudf);
-  auto sorted_order      = cudf::sorted_order(keys_table, orders, null_orders);
+  auto keys_table = cudf::table_view(columns_cudf);
+
+  auto sorted_order = cudf::sorted_order(keys_table, orders, null_orders);
+
   auto sorted_order_view = sorted_order->view();
 
   std::vector<cudf::column_view> projection_cudf;

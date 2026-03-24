@@ -16,17 +16,6 @@
 
 #include "op/sirius_physical_parquet_scan.hpp"
 
-#include "config.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/execution_context.hpp"
-#include "duckdb/parallel/task_executor.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
-#include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "log/logging.hpp"
-#include "utils.hpp"
-
 namespace sirius {
 namespace op {
 

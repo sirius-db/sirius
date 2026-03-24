@@ -26,7 +26,6 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius_pipeline_hashmap.hpp"
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/data/data_batch.hpp>
@@ -108,7 +107,9 @@ class task_creator {
   void prepare_for_query(const sirius::planner::query& query);
 
   /// \brief clean-up query bound resources and prepare the task creator for next query
-  void reset();
+  /// @param keep_parquet_metadata When true, parquet scan global states are kept
+  ///        so that cached file metadata (footers) can be reused on a warm re-run.
+  void reset(bool keep_parquet_metadata = false);
 
   /**
    * @brief Stop the task creator and its thread pool.

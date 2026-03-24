@@ -121,9 +121,18 @@ class interruptible_mpmc {
   }
 
   /**
+   * \brief Returns true if the queue is approximately empty.
+   *
+   * Uses size_approx() from the underlying concurrent queue, which may
+   * transiently over- or under-count in the presence of concurrent producers
+   * and consumers. Safe for assertions in quiescent states (e.g. after drain).
+   */
+  [[nodiscard]] bool is_empty() const noexcept { return queue.size_approx() == 0; }
+
+  /**
    * Resets the queue state to active (useful for restarting workers).
    */
-  void reset() { _is_active.store(true, std::memory_order_relaxed); }
+  void reactivate() { _is_active.store(true, std::memory_order_relaxed); }
 };
 
 }  // namespace sirius::exec

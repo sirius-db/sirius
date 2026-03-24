@@ -70,7 +70,7 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
     default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported join condition comparison type: {}",
-                       condition.comparison);
+                       static_cast<int>(condition.comparison));
       return std::nullopt;
   }
 }
@@ -194,7 +194,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
                                                      *child_expr);
     default: {
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported cast type_id: {}",
-                       cudf_return_type.id());
+                       static_cast<int>(cudf_return_type.id()));
       return std::nullopt;
     }
   }
@@ -327,7 +327,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
         _resource_ref);
     }
     default: {
-      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}", cudf_type.id());
+      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}",
+                       static_cast<int>(cudf_type.id()));
       return std::nullopt;
     }
   }

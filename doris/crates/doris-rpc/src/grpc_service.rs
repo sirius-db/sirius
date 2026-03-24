@@ -2030,9 +2030,18 @@ impl PBackendService for PBackendServiceHandler {
 
                     let (exec_plan, output_names) =
                         if let Some(read_sql) = generate_exchange_union_sql(&params) {
-                            // UNION ALL always uses CPU SQL path (GPU doesn't support set operations).
-                            info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
-                            (ExecPlan::SqlCpuOnly(read_sql), None)
+                            // UNION ALL: use GPU SQL path when GPU exchange tables are registered
+                            // (reads from GPUBufferManager), fall back to CPU SQL otherwise.
+                            let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
+                                table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
+                            });
+                            if has_gpu_tables {
+                                info!(sql = %read_sql, "exchange fragment using GPU SQL path (GPU tables registered)");
+                                (ExecPlan::Sql(read_sql), None)
+                            } else {
+                                info!(sql = %read_sql, "exchange fragment using CPU-only SQL path");
+                                (ExecPlan::SqlCpuOnly(read_sql), None)
+                            }
                         } else {
                             let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
                                 table_schemas.contains_key(&exchange_table_name(query_id.1, nid))

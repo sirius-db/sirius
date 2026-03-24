@@ -16,7 +16,6 @@
 
 #include "pipeline/pipeline_executor.hpp"
 
-#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
@@ -25,7 +24,6 @@
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
-#include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -126,9 +124,9 @@ pipeline_executor::get_scan_executor() noexcept
   return *_scan_executor;
 }
 
-void pipeline_executor::set_scan_caching_enabled(bool enabled)
+void pipeline_executor::set_scan_caching_config(sirius::op::scan::cache_level level)
 {
-  _scan_executor->set_scan_caching_enabled(enabled);
+  _scan_executor->set_scan_caching_enabled(level);
 }
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
@@ -172,6 +170,38 @@ std::future<void> pipeline_executor::start_query()
   return future;
 }
 
+void pipeline_executor::terminate_query(std::exception_ptr error)
+{
+  _completion_handler->report_error(error);
+  stop();
+}
+
+void pipeline_executor::drain_after_error()
+{
+  SIRIUS_LOG_INFO("pipeline_executor: draining after error");
+  // Drain the task creator first so no thread is inside get_next_task_input_data()/
+  // pop_data_batch() when QueryEnd() clears repositories (avoids use-after-free).
+  if (_task_creator) { _task_creator->stop_thread_pool(); }
+  // Drain the top-level task queue so management_eventloop doesn't dispatch
+  // stale tasks from the failed query.
+  _task_queue.drain();
+
+  // Stop the scan executor's manager loop, wait for in-flight scan tasks to
+  // finish, then restart the manager for the next query.  We must use
+  // drain_and_wait() (not just drain + wait_all) because the scan manager
+  // thread holds a kiosk ticket while blocked on pop(); without interrupting
+  // the queue and stopping the kiosk first, wait_all() deadlocks.
+  _scan_executor->drain_and_wait();
+
+  // Interrupt each GPU executor's manager loop, wait for in-flight thread-pool
+  // tasks to finish, then restart the manager for the next query.
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->drain_and_wait();
+  }
+  if (_task_creator) { _task_creator->start_thread_pool(); }
+  SIRIUS_LOG_INFO("pipeline_executor: DONE draining after error");
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
@@ -188,7 +218,9 @@ void pipeline_executor::management_eventloop()
       }
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
-      schedule_next_scan_tasks();
+      // TODO(amin): think about eager scheduling again when state of next tasks are stored in the
+      // operator
+      // schedule_next_scan_tasks();
     }
   }
 }

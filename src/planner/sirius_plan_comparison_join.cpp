@@ -14,27 +14,14 @@
  * limitations under the License.
  */
 
-#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/common/operator/subtract.hpp"
-#include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
-#include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
-#include "duckdb/execution/operator/join/physical_cross_product.hpp"
-#include "duckdb/execution/operator/join/physical_hash_join.hpp"
-#include "duckdb/execution/operator/join/physical_iejoin.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
-#include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/transaction/duck_transaction.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_context.hpp"
 
 namespace sirius::planner {
 
@@ -85,17 +72,21 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     //                                     std::move(op.filter_pushdown));
     // join.Cast<PhysicalHashJoin>().join_stats = std::move(op.join_stats);
     // return join;
-    auto join =
-      duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(op,
-                                                               std::move(left),
-                                                               std::move(right),
-                                                               std::move(op.conditions),
-                                                               op.join_type,
-                                                               op.left_projection_map,
-                                                               op.right_projection_map,
-                                                               std::move(op.mark_types),
-                                                               op.estimated_cardinality,
-                                                               std::move(op.filter_pushdown));
+    const auto& op_params = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                              ->get_config()
+                              .get_operator_params();
+    auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+      op,
+      std::move(left),
+      std::move(right),
+      std::move(op.conditions),
+      op.join_type,
+      op.left_projection_map,
+      op.right_projection_map,
+      std::move(op.mark_types),
+      op.estimated_cardinality,
+      std::move(op.filter_pushdown),
+      op_params.max_build_hash_table_bytes);
     join->Cast<sirius::op::sirius_physical_hash_join>().join_stats = std::move(op.join_stats);
     return join;
   }

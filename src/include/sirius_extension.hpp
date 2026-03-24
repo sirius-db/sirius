@@ -28,17 +28,13 @@ class SiriusExtension : public Extension {
   std::string Version() const override;
   static void InitialGPUConfigs(DBConfig& db);
   static void RegisterGPUFunctions(DatabaseInstance& catalog);
+#ifdef SIRIUS_ENABLE_LEGACY
   static void GPUProcessingSubstraitFunction(ClientContext& context,
                                              TableFunctionInput& data_p,
                                              DataChunk& output);
   static void GPUProcessingFunction(ClientContext& context,
                                     TableFunctionInput& data_p,
                                     DataChunk& output);
-  static void GPUExecutionFunction(ClientContext& context,
-                                   TableFunctionInput& data_p,
-                                   DataChunk& output);
-  // static void GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk
-  // &output);
   static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext& context,
                                                              TableFunctionBindInput& input,
                                                              vector<LogicalType>& return_types,
@@ -47,8 +43,10 @@ class SiriusExtension : public Extension {
                                                     TableFunctionBindInput& input,
                                                     vector<LogicalType>& return_types,
                                                     vector<string>& names);
-  // static unique_ptr<FunctionData> GPUCachingBind(ClientContext &context, TableFunctionBindInput
-  // &input, vector<LogicalType> &return_types, vector<string> &names);
+#endif
+  static void GPUExecutionFunction(ClientContext& context,
+                                   TableFunctionInput& data_p,
+                                   DataChunk& output);
   static void GPUBufferInitFunction(ClientContext& context,
                                     TableFunctionInput& data_p,
                                     DataChunk& output);

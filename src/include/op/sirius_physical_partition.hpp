@@ -83,15 +83,23 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
+  std::optional<task_creation_hint> get_next_task_hint() override;
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   void set_num_partitions(int num_partitions);
 
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
-  int determine_num_partitions();
+
+  /// Looks at the amount of data waiting on the input port and determines the number of partitions
+  /// to create. Returns a pair of (num_partitions, total_bytes).
+  std::pair<int, uint64_t> determine_num_partitions();
   sirius_physical_operator* _parent_op            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
+  sirius_physical_operator* _hash_join_op =
+    nullptr;  // hash join operator that this partition operator feeds into (optional: for
+              // hash_joins only)
   std::vector<int> _partition_keys;
   /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
   /// cast the key column to this type before hashing.  Used to align hash values when the

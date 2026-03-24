@@ -16,17 +16,23 @@
 
 #pragma once
 
-#include "downgrade/downgrade_queue.hpp"
 #include "downgrade/downgrade_task.hpp"
-#include "parallel/task_executor.hpp"
+#include "exec/config.hpp"
+#include "exec/interruptible_mpmc.hpp"
+#include "exec/kiosk.hpp"
+#include "exec/thread_pool.hpp"
+#include "parallel/task.hpp"
 #include "task_completion.hpp"
+
+#include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <algorithm>
+#include <atomic>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -47,15 +53,16 @@ struct downgrade_repository_info {
  * monitors it for memory pressure. When `should_downgrade_memory()` triggers, it automatically
  * iterates all repositories in the data_repository_manager and schedules downgrade tasks.
  *
- * The executor runs a monitor thread that polls the memory space and a worker thread that
- * executes the downgrade tasks (GPU→HOST copies, etc.).
+ * The executor runs a monitor thread that polls the memory space, a manager thread that
+ * dispatches tasks from the queue to the thread pool, and a thread pool that executes
+ * the downgrade tasks (GPU→HOST copies, etc.).
  */
-class downgrade_executor : public itask_executor {
+class downgrade_executor {
  public:
   /**
    * @brief Constructs a new downgrade_executor bound to a specific memory space.
    *
-   * @param config Configuration for the task executor (thread count, retry policy, etc.)
+   * @param config Configuration for the task executor (thread count, etc.)
    * @param data_repo_mgr Reference to the data repository manager
    * @param space_id The memory space this executor is responsible for downgrading FROM
    * @param memory_space Pointer to the memory space (for pressure queries; nullptr disables
@@ -63,25 +70,13 @@ class downgrade_executor : public itask_executor {
    * @param reservation_manager Reference to the memory reservation manager
    */
   explicit downgrade_executor(
-    task_executor_config config,
+    exec::thread_pool_config config,
     cucascade::shared_data_repository_manager& data_repo_mgr,
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
-    sirius::memory::sirius_memory_reservation_manager& reservation_manager)
-    : itask_executor(std::make_unique<downgrade_task_queue>(), config),
-      _data_repo_mgr(data_repo_mgr),
-      _space_id(space_id),
-      _memory_space(memory_space),
-      _reservation_manager(reservation_manager)
-  {
-  }
+    sirius::memory::sirius_memory_reservation_manager& reservation_manager);
 
-  /**
-   * @brief Get the memory space this executor is responsible for.
-   */
-  cucascade::memory::memory_space_id get_space_id() const { return _space_id; }
-
-  ~downgrade_executor() override = default;
+  ~downgrade_executor();
 
   // Non-copyable and non-movable
   downgrade_executor(const downgrade_executor&)            = delete;
@@ -89,15 +84,18 @@ class downgrade_executor : public itask_executor {
   downgrade_executor(downgrade_executor&&)                 = delete;
   downgrade_executor& operator=(downgrade_executor&&)      = delete;
 
-  void schedule_downgrade_task(std::unique_ptr<downgrade_task> downgrade_task)
-  {
-    this->schedule(std::move(downgrade_task));
-  }
+  /**
+   * @brief Get the memory space this executor is responsible for.
+   */
+  cucascade::memory::memory_space_id get_space_id() const { return _space_id; }
 
-  void schedule(std::unique_ptr<itask> task) override;
-  void worker_loop(int worker_id) override;
-  void start() override;
-  void stop() override;
+  /**
+   * @brief Schedule a task for execution.
+   */
+  void schedule(std::unique_ptr<sirius::parallel::itask> task);
+
+  void start();
+  void stop();
 
   /**
    * @brief Drain all pending and in-flight downgrade tasks.
@@ -129,7 +127,10 @@ class downgrade_executor : public itask_executor {
                             size_t amount_to_downgrade);
 
  private:
-  downgrade_task* cast_to_downgrade_task(itask* task);
+  /**
+   * @brief Manager loop that dispatches tasks from the queue to the thread pool.
+   */
+  void manager_loop();
 
   /**
    * @brief Monitor loop that polls the memory space for pressure and triggers downgrades.
@@ -151,13 +152,20 @@ class downgrade_executor : public itask_executor {
     size_t& collected_bytes);
 
  private:
+  std::atomic<bool> _running{false};
+  exec::thread_pool_config _config;
+  exec::kiosk _kiosk;
+  std::unique_ptr<exec::thread_pool> _thread_pool;
+  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
+  std::thread _manager_thread;
+  cudaStream_t _stream{nullptr};
+  std::thread _monitor_thread;
+
   cucascade::shared_data_repository_manager& _data_repo_mgr;
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
   task_completion_message_queue _message_queue;  ///< Owned; receives downgrade task completions
-
-  std::thread _monitor_thread;
 };
 
 }  // namespace parallel

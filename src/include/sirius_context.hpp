@@ -21,9 +21,11 @@
 #include "extension_lock.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
 #include "sirius_config.hpp"
-#include "sirius_pipeline_hashmap.hpp"
+
+#include <rmm/resource_ref.hpp>
 
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
@@ -32,7 +34,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
+
+namespace cucascade::memory {
+class small_pinned_host_memory_resource;
+}  // namespace cucascade::memory
 
 namespace duckdb {
 
@@ -99,10 +106,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
-  /// \brief Start a query with its pipeline hashmap.
-  /// \param pipeline_hashmap The pipeline hashmap for the query.
-  /// \param context The client context for the query execution.
-  void create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap, ClientContext& context);
+  /// \brief Start a query with its pipelines.
+  /// \param pipelines The ordered pipelines for the query.
+  void create_query(
+    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines);
 
   /// \brief Get the current query.
   [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
@@ -121,6 +128,12 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  // Destroyed before memory_manager_ (declared after it — reverse destruction order).
+  std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
+  // Previous cuDF pinned resource and threshold — restored in terminate() before
+  // small_pinned_allocator_ is destroyed to prevent dangling references.
+  std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
+  std::size_t prev_pinned_threshold_{0};
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
   std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;

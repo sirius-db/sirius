@@ -21,8 +21,6 @@
 #include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 
-#include <cudf/cudf_utils.hpp>
-
 #include <nvtx3/nvtx3.hpp>
 
 namespace sirius {

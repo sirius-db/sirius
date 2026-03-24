@@ -16,23 +16,17 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
-#include "duckdb/common/algorithm.hpp"
-#include "duckdb/common/printer.hpp"
-#include "duckdb/common/tree_renderer/text_tree_renderer.hpp"
-#include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
-#include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/parallel/pipeline_event.hpp"
-#include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
-#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius_engine.hpp"
+
+#include <nvtx3/nvtx3.hpp>
+
+#include <format>
 
 namespace sirius {
 namespace pipeline {
@@ -285,17 +279,25 @@ bool sirius_pipeline::is_pipeline_finished() const
 
 void sirius_pipeline::update_pipeline_status()
 {
+  auto end_nvtx_range_if_finished = [this]() {
+    if (pipeline_finished.load() && _nvtx_range_started.load()) {
+      nvtxRangeEnd(_nvtx_pipeline_range_id);
+    }
+  };
+
   if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
     if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
                                  // get_next_task_hint() to check if the source is ready?
       pipeline_finished.store(true);
+      end_nvtx_range_if_finished();
       return;
     }
   } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
     auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
     if (!parquet_scan.has_more_partitions) {
       if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
+      end_nvtx_range_if_finished();
       return;
     }
   } else {
@@ -318,12 +320,35 @@ void sirius_pipeline::update_pipeline_status()
     // done atomically.
     if (limit_exhausted ||
         (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
-      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
+      if (tasks_created.load() == tasks_completed.load()) {
+        pipeline_finished.store(true);
+        for (auto& op : get_operators()) {
+          op.get().finalize_operator();
+        }
+      }
     }
+    end_nvtx_range_if_finished();
   }
 }
 
-void sirius_pipeline::mark_task_created() { tasks_created++; }
+void sirius_pipeline::mark_task_created()
+{
+  tasks_created++;
+  // Start a process-wide NVTX range on the very first task created for this pipeline
+  bool expected = false;
+  if (_nvtx_range_started.compare_exchange_strong(expected, true)) {
+    nvtxEventAttributes_t attr{};
+    attr.version            = NVTX_VERSION;
+    attr.size               = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.messageType        = NVTX_MESSAGE_TYPE_ASCII;
+    auto label              = std::format("Pipeline {}: {} -> {}",
+                             pipeline_id,
+                             source ? source->get_name() : "?",
+                             sink ? sink->get_name() : "?");
+    attr.message.ascii      = label.c_str();
+    _nvtx_pipeline_range_id = nvtxRangeStartEx(&attr);
+  }
+}
 
 void sirius_pipeline::mark_task_completed()
 {

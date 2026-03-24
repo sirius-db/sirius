@@ -185,6 +185,46 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
   }
 
+  /**
+   * @brief Rebind this global state to a new pipeline and scan operator.
+   *
+   * Reuses all cached file metadata and row group partitions, avoiding
+   * footer reads and metadata parsing.  Only the pipeline/operator pointers
+   * and the partition counter are updated.
+   */
+  void rebind(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+              sirius_physical_parquet_scan* scan_op)
+  {
+    set_pipeline(std::move(pipeline));
+    _scan_op = scan_op;
+    _next_rg_partition.store(0, std::memory_order_relaxed);
+    scan_op->has_more_partitions.store(true, std::memory_order_relaxed);
+    scan_op->exhausted.store(false, std::memory_order_relaxed);
+  }
+
+  /**
+   * @brief Get the file size for the given file index.
+   */
+  [[nodiscard]] size_t get_file_size(size_t file_idx) const { return _file_sizes[file_idx]; }
+
+  /**
+   * @brief Get the total number of parquet metadata bytes (header + footer + trailer)
+   * that must be cached alongside the column-chunk data for file @p file_idx.
+   */
+  [[nodiscard]] size_t get_metadata_byte_size(size_t file_idx) const
+  {
+    return _metadata_byte_sizes[file_idx];
+  }
+
+  /**
+   * @brief Get the file offset where the parquet footer begins for file @p file_idx.
+   * The footer range covers [footer_offset, file_size).
+   */
+  [[nodiscard]] size_t get_footer_offset(size_t file_idx) const
+  {
+    return _footer_offsets[file_idx];
+  }
+
  private:
   /**
    * @brief Fill the vector of column indices for this scan after projection.
@@ -211,6 +251,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
   cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
+
+  std::vector<size_t> _file_sizes;           ///< Per-file total file size in bytes
+  std::vector<size_t> _metadata_byte_sizes;  ///< Per-file header+footer+trailer bytes
+  std::vector<size_t> _footer_offsets;       ///< Per-file offset where footer begins
 
   std::vector<std::vector<size_t>>
     _row_group_uncompressed_bytes;  ///< Per-(file,row-group) uncompressed bytes
@@ -348,8 +392,6 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
       _task_id(task_id),
       _data_repo(data_repo)
   {
-    auto& l_state_cast = this->_local_state->cast<parquet_scan_task_local_state>();
-    _datasource = cudf::io::datasource::create(g_state->get_file_path(l_state_cast.get_file_idx()));
   }
 
   ~parquet_scan_task() override;
@@ -409,6 +451,21 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    */
   [[nodiscard]] uint64_t get_task_id() const { return _task_id; }
 
+  /**
+   * @brief Set whether this task should operate on materialized (decoded) columns.
+   *
+   * @param materialized_columns True to use materialized columns, false otherwise.
+   * @param gpu_memory_space     Pointer to the GPU memory space used for materialization.
+   */
+  void set_materialized_columns(bool wrap_in_cache,
+                                bool materialized_columns,
+                                cucascade::memory::memory_space* gpu_memory_space)
+  {
+    _wrap_in_cache        = wrap_in_cache;
+    _materialized_columns = materialized_columns;
+    _gpu_memory_space     = gpu_memory_space;
+  }
+
  private:
   /**
    * @brief Read the given byte range from the parquet file into the memory allocation for this
@@ -423,7 +480,11 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   //===----------Fields----------===//
   uint64_t _task_id;                   ///< The unique ID of this task
   shared_data_repository* _data_repo;  ///< The shared data repository to which to push batches
-  std::unique_ptr<cudf::io::datasource> _datasource;  ///< The cudf datasource for the input file
+  std::shared_ptr<cudf::io::datasource> _datasource;  ///< The cudf datasource for the input file
+  bool _wrap_in_cache{false};
+  bool _materialized_columns{false};  ///< Whether this task operates on materialized columns
+  cucascade::memory::memory_space* _gpu_memory_space{
+    nullptr};  ///< GPU memory space for materialization
 };
 
 }  // namespace sirius::op::scan
