@@ -228,6 +228,12 @@ pub async fn send_exchange_result(
 mod tests {
     use super::*;
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn test_exchange_dest_debug() {
         let dest = ExchangeDest {

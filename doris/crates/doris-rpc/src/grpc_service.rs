@@ -2369,6 +2369,15 @@ impl PBackendService for PBackendServiceHandler {
                     // GPU allocation in the C++ CUDA runtime. This replaces the old
                     // per-column staging approach which failed due to RTLD_LOCAL CUDA
                     // context isolation (RMM sub-allocations are stale after query cleanup).
+                    // Get per-partition packed data (from GPU hash_partition) or
+                    // single packed buffer (from broadcast cudf::pack).
+                    match engine.get_packed_partitions() {
+                        Ok(parts) if !parts.is_empty() => {
+                            tracing::info!(num_partitions = parts.len(), "got GPU packed partitions");
+                            location.set_packed_partitions(parts);
+                        }
+                        _ => {}
+                    }
                     match engine.get_packed_gpu() {
                         Ok(Some((addr, size, metadata))) => {
                             tracing::info!(addr = format_args!("0x{addr:x}"), size, metadata_len = metadata.len(),
