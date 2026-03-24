@@ -20,11 +20,14 @@
 
 #include <cudf/cudf_utils.hpp>
 
+#include <data/cached_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
+#include <log/logging.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
+#include <pipeline/pipeline_executor.hpp>
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -356,6 +359,12 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
 
   // Initialize local table function state (will skip if local_tf_state already set)
   initialize_local_table_function_state(op, exec_ctx, g_state._global_tf_state.get());
+
+  SIRIUS_LOG_DEBUG(
+    "[duckdb_scan_task_local_state] Initialized: batch_size={}, estimated_rows={}, num_cols={}",
+    _approximate_batch_size,
+    _estimated_rows_per_batch,
+    _num_columns);
 }
 
 size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
@@ -441,7 +450,8 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
   }
 }
 
-std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch()
+std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch(
+  bool wrap_in_cache)
 {
   using data_batch               = cucascade::data_batch;
   using host_table_allocation    = cucascade::memory::host_table_allocation;
@@ -463,8 +473,87 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   // Make the host table representation
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
 
+  if (wrap_in_cache) {
+    // Wrap in cached_host_data_representation for shared ownership.
+    // This allows the cache to retain the host data while the pipeline
+    // converts a shallow clone to GPU (same pattern as parquet scan caching).
+    auto cached = std::make_unique<sirius::cached_host_data_representation>(std::move(table));
+    return std::make_shared<data_batch>(get_next_batch_id(), std::move(cached));
+  }
+
   // Create the data batch and return
   return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));
+}
+
+std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::seal_and_publish_batch(
+  cucascade::shared_data_repository* data_repo, bool cache)
+{
+  if (_row_offset == 0) { return nullptr; }
+
+  // Trim unused blocks back to the pool
+  auto const tail = get_tail_byte_offset();
+  _allocation->trim_to(tail);
+
+  // Create the data batch and publish directly to the data repository.
+  // Publishing immediately (rather than accumulating) allows downstream GPU
+  // processing to start and free memory while scanning continues.
+  auto batch = make_data_batch(cache);
+  SIRIUS_LOG_DEBUG("[duckdb_scan_task] Sealed batch #{} with {} rows, {} bytes",
+                   _emitted_batch_count,
+                   _row_offset,
+                   tail);
+
+  if (cache) {
+    // When caching: the batch contains a cached_host_data_representation.
+    // Publish a shallow clone to the data repo (pipeline converts clone to GPU).
+    // Return the original batch for the cache (retains shared ownership of host data).
+    auto* cached_rep =
+      dynamic_cast<sirius::cached_host_data_representation*>(batch->get_data());
+    auto repo_batch = std::make_shared<cucascade::data_batch>(
+      get_next_batch_id(), cached_rep->shallow_clone());
+    data_repo->add_data_batch(std::move(repo_batch));
+  } else {
+    data_repo->add_data_batch(batch);
+  }
+  _emitted_batch_count++;
+
+  // Reset row offset (allocation was moved into the batch)
+  _row_offset = 0;
+  return batch;
+}
+
+void duckdb_scan_task_local_state::start_new_batch(duckdb_scan_task_global_state& g_state)
+{
+  _row_offset = 0;
+
+  SIRIUS_LOG_DEBUG("[duckdb_scan_task] start_new_batch: requesting {} bytes reservation",
+                   _approximate_batch_size);
+
+  // Acquire new reservation and allocation
+  auto& mem_res_mgr = g_state._sirius_ctx->get_memory_manager();
+  _reservation      = mem_res_mgr.request_reservation(_res_request, _approximate_batch_size);
+
+  auto& mem_space = _reservation->get_memory_space();
+  _host_space     = const_cast<cucascade::memory::memory_space*>(&mem_space);
+  auto* allocator =
+    mem_space.get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+  if (allocator == nullptr) {
+    throw std::runtime_error(
+      "[duckdb_scan_task_local_state::start_new_batch] Failed to get "
+      "fixed_size_host_memory_resource allocator.");
+  }
+  _allocation = allocator->allocate_multiple_blocks(_approximate_batch_size, _reservation.get());
+
+  // Reinitialize column builders
+  _column_builders.clear();
+  _varchar_indices.clear();
+  estimate_rows_per_batch(g_state._op);
+  initialize_builders();
+}
+
+duckdb_scan_executor& duckdb_scan_task_global_state::get_scan_executor() noexcept
+{
+  return _pipeline_executor.get_scan_executor();
 }
 
 //===----------------------------------------------------------------------===//
@@ -500,15 +589,23 @@ bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
   return true;
 }
 
-bool duckdb_scan_task::chunk_fits(duckdb_scan_task_local_state& l_state)
+bool duckdb_scan_task::ensure_chunk_fits(duckdb_scan_task_local_state& l_state)
 {
-  // Loop over the VARCHAR columns and check if they fit in the allocated buffers
   for (auto varchar_idx : l_state._varchar_indices) {
     auto& vec = l_state._chunk.data[varchar_idx];
     vec.Flatten(l_state._chunk.size());
     auto const& validity = duckdb::FlatVector::Validity(l_state._chunk.data[varchar_idx]);
     if (!l_state._column_builders[varchar_idx].sufficient_space_for_column(
           vec, validity, l_state._chunk.size())) {
+      // Try to grow the allocation and recheck
+      if (l_state._allocation &&
+          l_state._allocation->grow_by(l_state._allocation->block_size())) {
+        if (l_state._column_builders[varchar_idx].sufficient_space_for_column(
+              vec, validity, l_state._chunk.size())) {
+          continue;
+        }
+      }
+      // Growth didn't help or wasn't possible — caller must seal and start fresh
       return false;
     }
   }
@@ -539,34 +636,68 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
+  SIRIUS_LOG_DEBUG("[duckdb_scan_task] Task {} starting, batch_size={} bytes",
+                   _task_id,
+                   l_state._approximate_batch_size);
+
+  auto& scan_executor   = g_state.get_scan_executor();
+  auto output_consumers = g_state.get_output_consumers();
+  auto const pipeline_id =
+    g_state.get_pipeline() ? g_state.get_pipeline()->get_pipeline_id() : 0;
+
+  // DuckDB scan caching follows the same pattern as parquet scan caching:
+  // batches are wrapped in cached_host_data_representation (shared ownership),
+  // and shallow clones are published to the data repository for pipeline processing.
+  // The cache retains the original host data; the pipeline converts clones to GPU.
+  bool caching_enabled = scan_executor.is_scan_caching_enabled();
+
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
-  // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
                             g_state._op.scanned_types);
 
-  // Enter the scan loop to accumulate a data batch
-  while (get_next_chunk(l_state, g_state)) {
-    // We know a priori that the fixed-width columns and masks will fit in the allocated buffers.
-    // For variable-length columns, we need to check that we have enough space.
-    // If there isn't enough space, we just throw an exception for now.
-    /// FUTURE WORK: push the current data batch into a new scan task.
-    if (!chunk_fits(l_state)) {
-      std::string err_msg =
-        "[duckdb_scan_task]: current chunk does not fit in the allocated buffers.";
-      throw std::runtime_error(err_msg);
+  // Lambda to seal a batch, publish it, cache it, and kick the downstream pipeline.
+  auto seal_publish_and_schedule = [&]() {
+    auto batch = l_state.seal_and_publish_batch(_data_repo, caching_enabled);
+
+    // Cache the batch for warm-run replay. The batch contains a
+    // cached_host_data_representation with shared ownership of the host data.
+    if (caching_enabled && batch) {
+      scan_executor.cache_duckdb_scan_batch(pipeline_id, batch);
     }
 
-    // Process the chunk into the column builders
+    // Notify the task_creator that new data is available for the downstream pipeline.
+    for (auto* consumer : output_consumers) {
+      g_state._sirius_ctx->get_task_creator().schedule(consumer);
+    }
+  };
+
+  // Enter the streaming scan loop
+  while (get_next_chunk(l_state, g_state)) {
+    if (!ensure_chunk_fits(l_state)) {
+      SIRIUS_LOG_DEBUG("[duckdb_scan_task] VARCHAR overflow at row_offset={}, sealing batch",
+                       l_state._row_offset);
+      seal_publish_and_schedule();
+      l_state.start_new_batch(g_state);
+    }
+
     process_chunk(l_state);
 
-    // Termination condition
-    if (STANDARD_VECTOR_SIZE + l_state._row_offset >= l_state._estimated_rows_per_batch) { break; }
+    if (STANDARD_VECTOR_SIZE + l_state._row_offset >= l_state._estimated_rows_per_batch) {
+      seal_publish_and_schedule();
+      l_state.start_new_batch(g_state);
+    }
   }
 
-  // Add tasks back to the queue if the local scan state is not finished
+  // Seal final partial batch
+  if (l_state._row_offset > 0) { seal_publish_and_schedule(); }
+
+  SIRIUS_LOG_DEBUG("[duckdb_scan_task] Task {} finished, published {} batches, drained={}",
+                   _task_id,
+                   l_state._emitted_batch_count,
+                   l_state._local_state_drained);
+
+  // Schedule a continuation task if the local scan state is not finished
   if (!l_state._local_state_drained) {
-    // Create a new local state, passing the existing local_tf_state to continue the scan
-    // This ensures DuckDB continues scanning from the current position rather than starting over
     auto new_local_state =
       std::make_unique<duckdb_scan_task_local_state>(g_state,
                                                      l_state._exec_ctx,
@@ -574,7 +705,6 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
                                                      l_state._default_varchar_size,
                                                      std::move(l_state._local_tf_state));
 
-    // Create a new reference to the global state
     auto const new_task_id = g_state._sirius_ctx->get_task_creator().get_next_task_id();
     auto shared_global_state =
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
@@ -583,12 +713,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
     g_state._pipeline_executor.schedule(std::move(next_task));
   }
 
-  // Make data batch and push to repository
-  if (l_state._row_offset > 0) {
-    return std::make_unique<op::operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()});
-  }
-
+  // All batches were published directly to the data repo during the scan loop.
   return std::make_unique<op::operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
 }
 

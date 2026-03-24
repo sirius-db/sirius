@@ -35,6 +35,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUTPUT_BASE="${OUTPUT_BASE:-$PROJECT_DIR/reports}"
 LABEL=""
 SF=""
+DB_PATH=""
 PROFILE_DIR=""
 COMPARE_DIR=""
 ITERATIONS="${ITERATIONS:-2}"
@@ -49,7 +50,8 @@ usage() {
     echo "Usage: $0 [OPTIONS] [query_numbers...]"
     echo ""
     echo "Options:"
-    echo "  --sf SF              Scale factor for profiling (e.g., 300_rg2m, 100)"
+    echo "  --sf SF              Scale factor for profiling parquet (e.g., 300_rg2m, 100)"
+    echo "  --db-path PATH       Profile DuckDB native table scan against a .duckdb file"
     echo "  --profile-dir DIR    Use existing profiles (skip profiling)"
     echo "  --output-dir DIR     Base directory for reports (default: ./reports)"
     echo "  --label LABEL        Custom label (default: sirius_sf<SF>)"
@@ -66,6 +68,7 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --sf)           SF="$2"; shift 2 ;;
+        --db-path)      DB_PATH="$2"; shift 2 ;;
         --profile-dir)  PROFILE_DIR="$2"; shift 2 ;;
         --output-dir)   OUTPUT_BASE="$2"; shift 2 ;;
         --label)        LABEL="$2"; shift 2 ;;
@@ -79,9 +82,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ -z "$SF" ] && [ -z "$PROFILE_DIR" ]; then
-    echo "ERROR: Either --sf or --profile-dir is required" >&2
+if [ -z "$SF" ] && [ -z "$DB_PATH" ] && [ -z "$PROFILE_DIR" ]; then
+    echo "ERROR: Either --sf, --db-path, or --profile-dir is required" >&2
     usage
+fi
+
+if [ -n "$DB_PATH" ] && [ ! -f "$DB_PATH" ]; then
+    echo "ERROR: Database file not found: $DB_PATH" >&2
+    exit 1
 fi
 
 if [ -n "$PROFILE_DIR" ] && [ ! -d "$PROFILE_DIR" ]; then
@@ -96,7 +104,9 @@ fi
 
 # Derive label
 if [ -z "$LABEL" ]; then
-    if [ -n "$SF" ]; then
+    if [ -n "$DB_PATH" ]; then
+        LABEL="sirius_native_$(basename "$DB_PATH" .duckdb)"
+    elif [ -n "$SF" ]; then
         LABEL="sirius_sf${SF}"
     else
         LABEL="sirius_$(basename "$PROFILE_DIR")"
@@ -117,6 +127,9 @@ echo "Label        : $LABEL"
 echo "Report dir   : $REPORT_DIR"
 if [ -n "$PROFILE_DIR" ]; then
     echo "Profile src  : $PROFILE_DIR (existing)"
+elif [ -n "$DB_PATH" ]; then
+    echo "Database     : $DB_PATH"
+    echo "Iterations   : $ITERATIONS"
 else
     echo "Scale factor : $SF"
     echo "Iterations   : $ITERATIONS"
@@ -143,17 +156,28 @@ if [ -n "$PROFILE_DIR" ]; then
     echo "  Copied $(ls "$REPORT_DIR/profiles/"*.sqlite 2>/dev/null | wc -l) SQLite files"
     echo ""
 else
-    echo "[Phase 2] Running nsys profiling (sf=$SF, iterations=$ITERATIONS)..."
     export OUTPUT_DIR="$REPORT_DIR/profiles"
     export ITERATIONS
     export QUERY_TIMEOUT
-    export SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
-    if bash "$PROJECT_DIR/test/tpch_performance/profile_tpch_nsys.sh" "$SF" "${QUERIES[@]+"${QUERIES[@]}"}"; then
-        echo ""
-        echo "  Profiling complete."
+    if [ -n "$DB_PATH" ]; then
+        echo "[Phase 2] Running nsys profiling (db=$DB_PATH, iterations=$ITERATIONS)..."
+        if bash "$PROJECT_DIR/test/tpch_performance/profile_tpch_nsys_duckdb_native.sh" "$DB_PATH" "${QUERIES[@]+"${QUERIES[@]}"}"; then
+            echo ""
+            echo "  Profiling complete."
+        else
+            echo ""
+            echo "  WARNING: Profiling finished with errors (some queries may have failed)"
+        fi
     else
-        echo ""
-        echo "  WARNING: Profiling finished with errors (some queries may have failed)"
+        echo "[Phase 2] Running nsys profiling (sf=$SF, iterations=$ITERATIONS)..."
+        export SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
+        if bash "$PROJECT_DIR/test/tpch_performance/profile_tpch_nsys.sh" "$SF" "${QUERIES[@]+"${QUERIES[@]}"}"; then
+            echo ""
+            echo "  Profiling complete."
+        else
+            echo ""
+            echo "  WARNING: Profiling finished with errors (some queries may have failed)"
+        fi
     fi
     echo ""
 fi

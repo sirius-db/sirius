@@ -182,6 +182,33 @@ class duckdb_scan_executor {
   void prepare_cache_for_scan_operators(
     const std::vector<sirius::op::sirius_physical_operator*>& scan_operators);
 
+  /**
+   * @brief Cache a DuckDB scan batch for a given pipeline.
+   *
+   * Called by duckdb_scan_task during streaming to store each published batch
+   * in the cache for replay on subsequent queries.
+   *
+   * @param pipeline_id The pipeline ID to cache under
+   * @param batch The batch to cache (shared_ptr is copied, not moved)
+   */
+  void cache_duckdb_scan_batch(size_t pipeline_id,
+                                const std::shared_ptr<cucascade::data_batch>& batch);
+
+  /**
+   * @brief Replay cached DuckDB scan batches for a pipeline.
+   *
+   * In preload mode, replays all cached batches to the data repository
+   * and schedules output consumers, bypassing the actual DuckDB scan.
+   *
+   * @param pipeline_id The pipeline ID whose cache to replay
+   * @param data_repo The data repository to publish batches to
+   * @param consumers The output consumers to schedule after publishing
+   * @return true if replay succeeded (was in preload mode with cached data)
+   */
+  bool replay_cached_duckdb_scan(size_t pipeline_id,
+                                  cucascade::shared_data_repository* data_repo,
+                                  const std::vector<op::sirius_physical_operator*>& consumers);
+
  private:
   /**
    * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
@@ -199,6 +226,8 @@ class duckdb_scan_executor {
   struct cache_entry {
     std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;
     std::size_t batch_index{0};
+    // For DuckDB scan: flat list of all published batches (since they bypass get_scan_output)
+    std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_batches;
   };
 
   mutable std::mutex _cache_mutex;

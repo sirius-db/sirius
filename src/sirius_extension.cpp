@@ -784,6 +784,14 @@ static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
+static void SetDuckdbScanFlushSize(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->duckdb_scan_flush_size = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config DUCKDB_SCAN_FLUSH_SIZE to {}", params->duckdb_scan_flush_size);
+}
+
 static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -940,6 +948,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
+  // Flush size for streaming scan batches
+  config.AddExtensionOption("duckdb_scan_flush_size",
+                            "Flush size (bytes) for streaming DuckDB scan batches",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.duckdb_scan_flush_size),
+                            SetDuckdbScanFlushSize);
   // Default varchar size for estimating rows per batch
   config.AddExtensionOption(
     "default_scan_task_varchar_size",

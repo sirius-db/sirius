@@ -33,6 +33,7 @@ struct configuration_setter;
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
+constexpr uint64_t DEFAULT_DUCKDB_SCAN_FLUSH_SIZE     = 64ULL * 1024 * 1024;  // 64 MB
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
@@ -45,6 +46,10 @@ constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  /
 struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+
+  /// Flush size (bytes) for streaming DuckDB scan batches. Controls how much data
+  /// accumulates before sealing a batch and emitting it to the repository.
+  uint64_t duckdb_scan_flush_size = config::DEFAULT_DUCKDB_SCAN_FLUSH_SIZE;
 
   /// Default size estimate (bytes) for VARCHAR columns when computing rows per batch.
   uint64_t default_scan_task_varchar_size = config::DEFAULT_SCAN_TASK_VARCHAR_SIZE;

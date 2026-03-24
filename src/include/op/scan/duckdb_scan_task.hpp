@@ -52,6 +52,9 @@
 #include <cstdint>
 
 namespace sirius::op::scan {
+
+// Forward declaration for caching support
+class duckdb_scan_executor;
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task Global State
 //===----------------------------------------------------------------------===//
@@ -143,6 +146,11 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   {
     return _total_task_count.load(std::memory_order_acquire) < _max_threads;
   }
+
+  /**
+   * @brief Get the scan executor (for caching support).
+   */
+  duckdb_scan_executor& get_scan_executor() noexcept;
 
  private:
   std::atomic<std::size_t> _total_task_count{0};
@@ -301,7 +309,7 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
   duckdb_scan_task_local_state(
     duckdb_scan_task_global_state& g_state,
     duckdb::ExecutionContext& exec_ctx,
-    size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    size_t approximate_batch_size = sirius::config::DEFAULT_DUCKDB_SCAN_FLUSH_SIZE,
     size_t default_varchar_size   = sirius::config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
@@ -314,9 +322,47 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
   /**
    * @brief Creates a data batch from the current state of the column builders.
    *
+   * @param wrap_in_cache When true, wraps the host_data_representation in a
+   *        cached_host_data_representation for shared ownership. This allows
+   *        the cache to retain the host data even after the pipeline converts
+   *        a shallow clone to GPU.
    * @return A shared pointer to the created data batch.
    */
-  std::shared_ptr<data_batch> make_data_batch();
+  std::shared_ptr<data_batch> make_data_batch(bool wrap_in_cache = false);
+
+  /**
+   * @brief Seal the current batch and publish it directly to the data repository.
+   *
+   * Trims the allocation to the actual data size, creates a host_data_representation,
+   * and pushes it to the data repository immediately. This enables downstream GPU
+   * processing to start while scanning continues, preventing memory deadlocks.
+   * Does nothing if no rows have been written.
+   *
+   * When caching is enabled, the batch is wrapped in a cached_host_data_representation
+   * and a shallow clone is published to the data repository. The original batch (with
+   * shared ownership of the host data) is returned for storage in the scan cache.
+   * This follows the same pattern as parquet scan caching.
+   *
+   * @param[in] data_repo The data repository to publish the batch to.
+   * @param[in] cache When true, wrap in cached representation and shallow-clone for the repo.
+   */
+  std::shared_ptr<data_batch> seal_and_publish_batch(cucascade::shared_data_repository* data_repo,
+                                                     bool cache = false);
+
+  /**
+   * @brief Start a new batch with a fresh memory allocation.
+   *
+   * Resets row offset, acquires a new reservation and allocation, and reinitializes
+   * column builders for the next batch of data.
+   *
+   * @param[in] g_state The global state (needed for memory manager and operator reference).
+   */
+  void start_new_batch(duckdb_scan_task_global_state& g_state);
+
+  /**
+   * @brief Get the count of batches emitted so far during this task.
+   */
+  [[nodiscard]] size_t get_emitted_batch_count() const noexcept { return _emitted_batch_count; }
 
  private:
   //===----------Fields----------===//
@@ -336,6 +382,8 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
   duckdb::DataChunk _chunk;           ///< DataChunk buffer
   size_t _row_offset        = 0;      ///< Current row offset in buffers
   bool _local_state_drained = false;  ///< Whether this local state has fully drained
+
+  size_t _emitted_batch_count = 0;  ///< Count of batches published during streaming
 
   std::unique_ptr<duckdb::LocalTableFunctionState>
     _local_tf_state;                    ///< Local state for the table function.
@@ -433,12 +481,16 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
                              duckdb_scan_task_global_state& g_state);
 
   /**
-   * @brief Checks if the current data chunk fits in the allocated buffers of the column builders.
+   * @brief Ensures the current data chunk fits in the allocated buffers.
+   *
+   * For VARCHAR columns that don't fit, attempts to grow the allocation via grow_by().
+   * If growth is insufficient or not possible, returns false to signal that the current
+   * batch should be sealed and a new one started.
    *
    * @param[in,out] l_state The local state of the scan task.
-   * @return true if the chunk fits, false otherwise.
+   * @return true if the chunk fits (possibly after growing), false if batch must be sealed.
    */
-  static bool chunk_fits(duckdb_scan_task_local_state& l_state);
+  static bool ensure_chunk_fits(duckdb_scan_task_local_state& l_state);
 
   /**
    * @brief Processes the current data chunk and copies its data into the column builders'

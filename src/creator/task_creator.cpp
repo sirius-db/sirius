@@ -255,33 +255,56 @@ void task_creator::manager_loop()
         }
         // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-          // Check to see if you need to create a new global s for this scan operator
-          size_t operator_id          = node->get_operator_id();
-          auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
-
-          const auto& op_params =
-            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-              ->get_config()
-              .get_operator_params();
-          auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-            *scan_task_global_state,
-            *_execution_context,
-            op_params.scan_task_batch_size,
-            op_params.default_scan_task_varchar_size);
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
               "No destination data repositories provided for scan task creation.");
           }
-          auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
-            get_next_task_id(),
-            destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably
-                                               // needs to be multiple possible destination data
-                                               // repositories
-            std::move(scan_task_local_state),
-            scan_task_global_state);
-          pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
-                                          // with the task creation
-          _pipeline_executor->schedule(std::move(scan_task));
+
+          // Try to replay cached DuckDB scan batches (warm run with caching enabled).
+          // If replay succeeds, we skip creating a scan task entirely — the cached
+          // host batches are shallow-cloned into the data repository and the pipeline
+          // converts them to GPU as normal.
+          auto pipeline_id = pipeline->get_pipeline_id();
+          auto& scan_executor = _pipeline_executor->get_scan_executor();
+          auto output_consumers = node->get_next_port_after_sink();
+          std::vector<op::sirius_physical_operator*> consumers;
+          for (auto& [child, port_id] : output_consumers) {
+            consumers.push_back(child);
+          }
+          if (scan_executor.replay_cached_duckdb_scan(
+                pipeline_id, destination_data_repositories[0], consumers)) {
+            // Cache replay succeeded — mark the scan source as drained and schedule
+            // downstream consumers. No scan task needed.
+            auto scan_task_global_state = _scan_operator_global_state_map.at(
+              node->get_operator_id());
+            scan_task_global_state->set_source_drained();
+            pipeline->mark_task_created();
+            pipeline->mark_task_completed();
+            for (auto* consumer : consumers) {
+              schedule(consumer);
+            }
+          } else {
+            // Normal scan path: create and schedule a DuckDB scan task.
+            size_t operator_id          = node->get_operator_id();
+            auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
+
+            const auto& op_params =
+              _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                ->get_config()
+                .get_operator_params();
+            auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+              *scan_task_global_state,
+              *_execution_context,
+              op_params.scan_task_batch_size,
+              op_params.default_scan_task_varchar_size);
+            auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
+              get_next_task_id(),
+              destination_data_repositories[0],
+              std::move(scan_task_local_state),
+              scan_task_global_state);
+            pipeline->mark_task_created();
+            _pipeline_executor->schedule(std::move(scan_task));
+          }
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);

@@ -17,19 +17,16 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 
 #include "creator/task_creator.hpp"
-#include "cucascade/data/cpu_data_representation.hpp"
 #include "cucascade/data/data_batch.hpp"
-#include "cucascade/data/gpu_data_representation.hpp"
 #include "data/cached_data_representation.hpp"
 #include "data/data_batch_utils.hpp"
-#include "data/host_parquet_representation.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -115,13 +112,23 @@ bool duckdb_scan_executor::cache_scan_results_for_query(const std::string& query
   }
   std::hash<std::string> hash_fn;
   auto new_query_hash = hash_fn(query);
+  SIRIUS_LOG_WARN("cache_scan_results_for_query: new_hash={}, stored_hash={}, match={}",
+                  new_query_hash,
+                  _query_hash,
+                  new_query_hash == _query_hash);
   if (new_query_hash == _query_hash) {
     SIRIUS_LOG_INFO("Scan results for query already cached, preloading: {}", query);
     return true;
   }
   SIRIUS_LOG_INFO("Caching scan results for query: {}", query);
   _query_hash = new_query_hash;
-  _cache.clear();
+  {
+    std::lock_guard<std::mutex> lock(_cache_mutex);
+    for (auto& [id, entry] : _cache) {
+      if (entry) { entry->duckdb_scan_batches.clear(); }
+    }
+    _cache.clear();
+  }
   return false;
 }
 
@@ -209,7 +216,10 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
     return cloned_batches;
   };
 
-  if (_cache_level == cache_level::NONE) {
+  if (_cache_level == cache_level::NONE || is_duckdb_scan) {
+    // DuckDB scans handle their own caching internally via seal_and_publish_batch +
+    // cache_duckdb_scan_batch, so bypass the get_scan_output caching path to avoid
+    // deadlock (_cache_mutex held here while compute_task tries to acquire it).
     return task->compute_task(stream);
   } else {
     auto pipe_id = task->get_pipeline_id();
@@ -228,6 +238,68 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
       return scan_output;
     }
   }
+}
+
+void duckdb_scan_executor::cache_duckdb_scan_batch(
+  size_t pipeline_id, const std::shared_ptr<cucascade::data_batch>& batch)
+{
+  if (_cache_level == cache_level::NONE) { return; }
+  std::lock_guard<std::mutex> lock(_cache_mutex);
+  auto it = _cache.find(pipeline_id);
+  if (it == _cache.end()) { return; }
+  if (!batch) {
+    // nullptr sentinel: clear stale cache entries so fresh scan batches can replace them
+    it->second->duckdb_scan_batches.clear();
+    return;
+  }
+  it->second->duckdb_scan_batches.push_back(batch);
+}
+
+bool duckdb_scan_executor::replay_cached_duckdb_scan(
+  size_t pipeline_id,
+  cucascade::shared_data_repository* data_repo,
+  const std::vector<op::sirius_physical_operator*>& consumers)
+{
+  if (_cache_level == cache_level::NONE || !_preload_mode) { return false; }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches_to_replay;
+  {
+    std::lock_guard<std::mutex> lock(_cache_mutex);
+    auto it = _cache.find(pipeline_id);
+    if (it == _cache.end() || it->second->duckdb_scan_batches.empty()) { return false; }
+    batches_to_replay = it->second->duckdb_scan_batches;
+  }
+
+  SIRIUS_LOG_WARN("Replaying {} cached DuckDB scan batches for pipeline {}",
+                  batches_to_replay.size(),
+                  pipeline_id);
+
+  // Shallow-clone cached host batches and publish to the data repository.
+  // Each cached batch contains a cached_host_data_representation with shared
+  // ownership of the underlying host allocation. The shallow clone creates a
+  // new data_batch sharing the same host data. The pipeline converts clones
+  // to GPU as normal (same pattern as parquet scan caching).
+  for (auto& batch : batches_to_replay) {
+    auto* cached_rep =
+      dynamic_cast<sirius::cached_host_data_representation*>(batch->get_data());
+    if (!cached_rep) {
+      SIRIUS_LOG_ERROR(
+        "Cached DuckDB scan batch has unexpected representation type for pipeline {}",
+        pipeline_id);
+      return false;
+    }
+    auto clone = std::make_shared<cucascade::data_batch>(
+      get_next_batch_id(), cached_rep->shallow_clone());
+    data_repo->add_data_batch(std::move(clone));
+  }
+
+  SIRIUS_LOG_WARN("  Shallow clone complete, published {} batches", batches_to_replay.size());
+
+  // Don't schedule consumers here — the scan executor's manager_loop will schedule
+  // them after the scan task completes (via the same path as non-cached execution).
+  // Double-scheduling causes duplicate GPU pipeline tasks that hang.
+
+  return true;
 }
 
 void duckdb_scan_executor::manager_loop()
