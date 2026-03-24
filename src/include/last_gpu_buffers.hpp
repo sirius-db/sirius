@@ -134,6 +134,46 @@ class LastGPUBuffers {
     return retain_next_;
   }
 
+  /// Set hash partition config for the next GPU execution.
+  /// The result collector will partition the GPU result before packing.
+  void SetPartitionConfig(int num_partitions, std::vector<int> column_indices) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    partition_num_ = num_partitions;
+    partition_cols_ = std::move(column_indices);
+    packed_partitions_.clear();
+  }
+
+  /// Get partition config (0 = no partitioning).
+  std::pair<int, std::vector<int>> GetPartitionConfig() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {partition_num_, partition_cols_};
+  }
+
+  void ClearPartitionConfig() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    partition_num_ = 0;
+    partition_cols_.clear();
+    packed_partitions_.clear();
+  }
+
+  /// Per-partition packed result from GPU hash_partition + chunked_pack.
+  struct PackedPartition {
+    size_t staging_offset;
+    size_t packed_size;
+    std::unique_ptr<std::vector<uint8_t>> metadata;
+    int32_t num_rows;
+  };
+
+  void StorePackedPartitions(std::vector<PackedPartition> partitions) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    packed_partitions_ = std::move(partitions);
+  }
+
+  std::vector<PackedPartition> TakePackedPartitions() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::move(packed_partitions_);
+  }
+
  private:
   LastGPUBuffers() = default;
   mutable std::mutex mutex_;
@@ -148,6 +188,10 @@ class LastGPUBuffers {
   uintptr_t staging_addr_ = 0;
   size_t staging_size_ = 0;
   bool retain_next_ = false;
+  /// Hash partition config for exchange.
+  int partition_num_ = 0;
+  std::vector<int> partition_cols_;
+  std::vector<PackedPartition> packed_partitions_;
 };
 
 }  // namespace duckdb

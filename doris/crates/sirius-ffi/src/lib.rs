@@ -733,6 +733,40 @@ impl SiriusEngine {
         }
     }
 
+    /// Set hash partition config for the next GPU execution.
+    /// The C++ result collector will GPU hash-partition the result before packing.
+    pub fn set_exchange_partition(&self, num_partitions: usize, col_indices: &[i32]) -> Result<(), EngineError> {
+        let list_str = col_indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT * FROM sirius_set_exchange_partition({}, [{}])", num_partitions, list_str);
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow([]).map_err(|e| EngineError::ExecFailed(e.to_string()))?.collect();
+        Ok(())
+    }
+
+    /// Get per-partition packed GPU buffers from the last GPU execution.
+    pub fn get_packed_partitions(&self) -> Result<Vec<PackedPartition>, EngineError> {
+        let mut stmt = self.conn
+            .prepare("SELECT partition_id, staging_offset, packed_size, metadata, num_rows FROM sirius_get_packed_partitions()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt.query([]).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+            let partition_id: i32 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let staging_offset: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let packed_size: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let metadata: Vec<u8> = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let num_rows: i32 = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            result.push(PackedPartition {
+                partition_id: partition_id as usize,
+                staging_offset: staging_offset as usize,
+                packed_size: packed_size as usize,
+                metadata,
+                num_rows: num_rows as u32,
+            });
+        }
+        Ok(result)
+    }
+
     /// Tell the C++ result collector where the nixl staging buffer is.
     ///
     /// After this, GPU results will be packed directly into the staging buffer
@@ -813,6 +847,16 @@ impl SiriusEngine {
         let addr: i64 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         Ok(addr as usize)
     }
+}
+
+/// A per-partition packed GPU buffer from GPU hash_partition + chunked_pack.
+#[derive(Debug, Clone)]
+pub struct PackedPartition {
+    pub partition_id: usize,
+    pub staging_offset: usize,
+    pub packed_size: usize,
+    pub metadata: Vec<u8>,
+    pub num_rows: u32,
 }
 
 /// A GPU buffer that has been staged (copied) into the nixl staging region.

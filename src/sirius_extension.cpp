@@ -1621,6 +1621,73 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     catalog.CreateTableFunction(transaction, info);
   }
 
+  // sirius_set_exchange_partition(num_partitions INT, col_indices LIST(INT))
+  {
+    struct SetPartData : public TableFunctionData { bool finished = false; };
+    auto bind = [](ClientContext&, TableFunctionBindInput& input,
+                    vector<LogicalType>& return_types, vector<string>& names) -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::VARCHAR};
+      names = {"status"};
+      int num_parts = input.inputs[0].GetValue<int32_t>();
+      auto& list_val = input.inputs[1];
+      auto& children = duckdb::ListValue::GetChildren(list_val);
+      std::vector<int> cols;
+      for (auto& c : children) { cols.push_back(c.GetValue<int32_t>()); }
+      LastGPUBuffers::GetInstance().SetPartitionConfig(num_parts, std::move(cols));
+      SIRIUS_LOG_INFO("[sirius_set_exchange_partition] num_partitions={} cols={}", num_parts, cols.size());
+      return make_uniq<SetPartData>();
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<SetPartData>();
+      if (data.finished) { output.SetCardinality(0); return; }
+      output.SetCardinality(1);
+      output.SetValue(0, 0, Value("ok"));
+      data.finished = true;
+    };
+    TableFunction f("sirius_set_exchange_partition",
+                     {LogicalType::INTEGER, LogicalType::LIST(LogicalType::INTEGER)}, func, bind);
+    CreateTableFunctionInfo info(f);
+    catalog.CreateTableFunction(transaction, info);
+  }
+
+  // sirius_get_packed_partitions() — returns per-partition packed buffers.
+  {
+    struct GetPartData : public TableFunctionData {
+      std::vector<LastGPUBuffers::PackedPartition> partitions;
+      idx_t row_idx = 0;
+    };
+    auto bind = [](ClientContext&, TableFunctionBindInput&,
+                    vector<LogicalType>& return_types, vector<string>& names) -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BLOB, LogicalType::INTEGER};
+      names = {"partition_id", "staging_offset", "packed_size", "metadata", "num_rows"};
+      auto result = make_uniq<GetPartData>();
+      result->partitions = LastGPUBuffers::GetInstance().TakePackedPartitions();
+      return std::move(result);
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<GetPartData>();
+      idx_t count = 0;
+      while (data.row_idx < data.partitions.size() && count < STANDARD_VECTOR_SIZE) {
+        auto& p = data.partitions[data.row_idx];
+        output.SetValue(0, count, Value::INTEGER(static_cast<int32_t>(data.row_idx)));
+        output.SetValue(1, count, Value::BIGINT(static_cast<int64_t>(p.staging_offset)));
+        output.SetValue(2, count, Value::BIGINT(static_cast<int64_t>(p.packed_size)));
+        if (p.metadata && !p.metadata->empty()) {
+          output.SetValue(3, count, Value::BLOB(p.metadata->data(), p.metadata->size()));
+        } else {
+          output.SetValue(3, count, Value(LogicalType::BLOB));
+        }
+        output.SetValue(4, count, Value::INTEGER(p.num_rows));
+        count++;
+        data.row_idx++;
+      }
+      output.SetCardinality(count);
+    };
+    TableFunction f("sirius_get_packed_partitions", {}, func, bind);
+    CreateTableFunctionInfo info(f);
+    catalog.CreateTableFunction(transaction, info);
+  }
+
   // sirius_get_packed_gpu() — returns the packed GPU buffer from cudf::pack().
   // Returns: addr (BIGINT), size (BIGINT), metadata (BLOB).
   struct GetPackedGPUData : public TableFunctionData { bool finished = false; };

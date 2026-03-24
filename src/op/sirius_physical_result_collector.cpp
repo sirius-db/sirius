@@ -34,6 +34,8 @@
 
 // cudf
 #include <cudf/contiguous_split.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/utilities/span.hpp>
 #include <rmm/device_buffer.hpp>
 #include <cudf/null_mask.hpp>
@@ -218,32 +220,65 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           });
         }
 
-        // Pack GPU data for nixl exchange using chunked_pack.
-        //
-        // If a staging buffer address is available (pre-registered with nixl),
-        // pack directly into it — zero per-query nixl registrations.
-        // Otherwise, fall back to cudf::pack() which allocates a new buffer.
         if (should_retain) {
           auto& lgb = duckdb::LastGPUBuffers::GetInstance();
           auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
+          auto [part_num, part_cols] = lgb.GetPartitionConfig();
 
-          if (staging_addr != 0 && staging_size > 0) {
-            // chunked_pack: write directly into the pre-registered staging buffer.
+          if (part_num > 0 && !part_cols.empty() && staging_addr != 0) {
+            // GPU hash partition + per-partition pack into staging.
+            std::vector<cudf::size_type> col_indices(part_cols.begin(), part_cols.end());
+            auto [partitioned_table, offsets] = cudf::hash_partition(
+                view, col_indices, part_num, cudf::hash_id::HASH_MURMUR3,
+                cudf::DEFAULT_HASH_SEED, cudf::get_default_stream());
+
+            SIRIUS_LOG_INFO("[result_collector] GPU hash_partition: {} partitions, {} rows → offsets: [{}]",
+                            part_num, view.num_rows(),
+                            [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
+
+            std::vector<duckdb::LastGPUBuffers::PackedPartition> packed_parts;
+            size_t staging_offset = 0;
+
+            for (int i = 0; i < part_num; i++) {
+              auto start = offsets[i];
+              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_table->num_rows();
+              auto num_rows = end - start;
+              if (num_rows == 0) {
+                { duckdb::LastGPUBuffers::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
+                continue;
+              }
+              auto slice = cudf::slice(partitioned_table->view(), {start, end});
+              auto packer = cudf::chunked_pack::create(slice[0], staging_size - staging_offset);
+              auto total = packer->get_total_contiguous_size();
+              if (staging_offset + total > staging_size) {
+                SIRIUS_LOG_WARN("[result_collector] partition {} ({} bytes) exceeds staging", i, total);
+                { duckdb::LastGPUBuffers::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
+                continue;
+              }
+              cudf::device_span<uint8_t> dst(
+                reinterpret_cast<uint8_t*>(staging_addr + staging_offset), staging_size - staging_offset);
+              while (packer->has_next()) { packer->next(dst); }
+              auto md = packer->build_metadata();
+              SIRIUS_LOG_INFO("[result_collector] partition {}: {} rows, {} bytes at staging+{}",
+                              i, num_rows, total, staging_offset);
+              { duckdb::LastGPUBuffers::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = total; pp.metadata = std::move(md); pp.num_rows = static_cast<int32_t>(num_rows); packed_parts.push_back(std::move(pp)); }
+              staging_offset += (total + 255) & ~255UL;  // 256-byte align
+            }
+            lgb.StorePackedPartitions(std::move(packed_parts));
+            lgb.ClearPartitionConfig();
+          } else if (staging_addr != 0 && staging_size > 0) {
+            // No partitioning — single pack into staging (broadcast path).
             auto packer = cudf::chunked_pack::create(view, staging_size);
             auto total_size = packer->get_total_contiguous_size();
             if (total_size <= staging_size) {
               cudf::device_span<uint8_t> dst_span(
                 reinterpret_cast<uint8_t*>(staging_addr), staging_size);
-              while (packer->has_next()) {
-                packer->next(dst_span);
-              }
+              while (packer->has_next()) { packer->next(dst_span); }
               auto metadata = packer->build_metadata();
               SIRIUS_LOG_INFO("[result_collector] chunked_pack into staging: {} bytes at 0x{:x}",
                               total_size, staging_addr);
               lgb.StorePackedData(nullptr, staging_addr, total_size, std::move(metadata));
             } else {
-              SIRIUS_LOG_WARN("[result_collector] packed size {} exceeds staging {} — falling back to cudf::pack",
-                              total_size, staging_size);
               auto packed = cudf::pack(view);
               auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
               auto gpu_size = packed.gpu_data->size();
@@ -251,12 +286,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
               lgb.StorePackedData(std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
             }
           } else {
-            // No staging buffer — use cudf::pack() (allocates a new buffer).
             auto packed = cudf::pack(view);
             auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
             auto gpu_size = packed.gpu_data->size();
-            SIRIUS_LOG_INFO("[result_collector] cudf::pack: {} bytes at 0x{:x}",
-                            gpu_size, gpu_addr);
+            SIRIUS_LOG_INFO("[result_collector] cudf::pack: {} bytes at 0x{:x}", gpu_size, gpu_addr);
             auto gpu_data_ptr = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
             lgb.StorePackedData(std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
           }

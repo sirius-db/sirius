@@ -446,7 +446,18 @@ async fn send_hash_partitioned(
 ) -> Result<(), String> {
     use crate::hash_partitioner::{compute_dest_assignments, resolve_partition_columns, split_by_destination};
 
-    // Decode IPC bytes into Arrow RecordBatch for hashing.
+    // Check if GPU hash partitioning was done (packed partitions in staging).
+    if let ExecutionLocation::Gpu { packed_metadata: Some(_), buffers, .. } = _location {
+        // GPU partitions are available — check if we have per-partition data.
+        // The packed_metadata on the location is for the FULL table (broadcast).
+        // Per-partition data is stored separately in the engine.
+        // TODO: retrieve per-partition packed data from engine.get_packed_partitions()
+        // and nixl-transfer each partition to its destination.
+        // For now, log that GPU partitioning was requested and fall through to CPU.
+        tracing::info!("GPU hash partitioning detected but per-partition nixl transfer not yet wired");
+    }
+
+    // CPU fallback: decode IPC bytes into Arrow RecordBatch for hashing.
     let batch = ipc_to_record_batch(ipc_bytes)?;
 
     let slots = desc_tbl_slots

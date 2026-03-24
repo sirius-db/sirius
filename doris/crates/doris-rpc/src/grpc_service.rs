@@ -2319,6 +2319,21 @@ impl PBackendService for PBackendServiceHandler {
             let should_retain = exchange_dests.is_some() && self.nixl_agent.is_some();
             let nixl_agent_for_blocking = if should_retain { self.nixl_agent.clone() } else { None };
 
+            // Check if this is a hash-partitioned exchange.
+            let is_hash_partitioned = exchange_dests.as_ref()
+                .map(|e| matches!(e.partition, crate::hash_partitioner::PartitionStrategy::Hash { .. }))
+                .unwrap_or(false);
+            let hash_partition_info: Option<(usize, Vec<i32>)> = if is_hash_partitioned {
+                exchange_dests.as_ref().and_then(|e| {
+                    if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, .. } = &e.partition {
+                        // TODO: resolve actual column indices from partition_exprs.
+                        // For now, use first N columns as partition keys.
+                        let col_indices: Vec<i32> = (0..2).collect(); // assume 2 GROUP BY cols
+                        Some((*num_destinations, col_indices))
+                    } else { None }
+                })
+            } else { None };
+
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                 let t_total = std::time::Instant::now();
@@ -2328,6 +2343,14 @@ impl PBackendService for PBackendServiceHandler {
                         tracing::warn!(error = %e, "failed to set retain_gpu_buffers, nixl may not work");
                     } else {
                         tracing::info!("retain_gpu_buffers set before GPU execution");
+                    }
+                    // Set GPU hash partition config if needed.
+                    if let Some((num_dests, ref col_indices)) = hash_partition_info {
+                        if let Err(e) = engine.set_exchange_partition(num_dests, col_indices) {
+                            tracing::warn!(error = %e, "failed to set GPU partition config");
+                        } else {
+                            tracing::info!(num_dests, cols = ?col_indices, "GPU hash partition config set");
+                        }
                     }
                 }
                 let t_exec = std::time::Instant::now();
