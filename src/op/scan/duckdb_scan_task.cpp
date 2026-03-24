@@ -571,10 +571,11 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
         // Use exhausted flag as a mutex — first thread wins.
         bool expected = false;
         if (!g_state._op.exhausted.compare_exchange_strong(expected, true)) {
-          // Another thread already claimed this — just drain and exit.
+          // Another thread already claimed this — return empty (not nullptr!
+          // because the scan executor dereferences the return value).
           l_state._local_state_drained = true;
           g_state.decrement_local_states();
-          return nullptr;
+          return std::make_unique<op::operator_data>();
         }
 
         SIRIUS_LOG_INFO("[duckdb_scan_task] table '{}' already GPU-resident ({} rows) — producing GPU batch directly",
