@@ -2313,6 +2313,92 @@ impl PBackendService for PBackendServiceHandler {
             // Check if this fragment's output should be sent to remote BEs.
             let exchange_dests = extract_exchange_destinations(params);
 
+            // When this leaf has exchange destinations, make execution async
+            // so the exec_plan_fragment gRPC response returns immediately.
+            // Without this, the FE's 30s timeout fires because the leaf scan +
+            // exchange send can take longer than 30s.
+            if exchange_dests.is_some() {
+                // Clone everything needed for the async task.
+                let params = params.clone();
+                let engine = match &self.engine {
+                    Some(e) => e.clone(),
+                    None => continue,
+                };
+                let store = self.result_store.clone();
+                let exchange_buffer = self.exchange_buffer.clone();
+                let nixl_agent = self.nixl_agent.clone();
+                let no_cpu_fallback = self.no_cpu_fallback;
+                let force_cpu = self.force_cpu;
+                let nixl_only = self.nixl_only;
+                let local_brpc_addr = self.local_brpc_addr.clone();
+                let exec_plan = exec_plan;
+                let output_names = output_names;
+                let output_indices = output_indices;
+                let exchange_dests = exchange_dests;
+                let hash_partition_info: Option<(usize, Vec<i32>)> = exchange_dests.as_ref().and_then(|e| {
+                    if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, .. } = &e.partition {
+                        Some((*num_destinations, (0..2i32).collect()))
+                    } else { None }
+                });
+
+                tokio::spawn(async move {
+                    let should_retain = nixl_agent.is_some();
+
+                    let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
+                        let engine = engine.lock().unwrap();
+                        if should_retain {
+                            let _ = engine.retain_gpu_buffers();
+                            if let Some((num_dests, ref col_indices)) = hash_partition_info {
+                                let _ = engine.set_exchange_partition(num_dests, col_indices);
+                            }
+                        }
+                        let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
+                        if let Some(names) = output_names {
+                            ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
+                        }
+                        let mut location = crate::nixl_integration::detect_execution_location(ipc_bytes, &engine);
+                        if should_retain {
+                            match engine.get_packed_partitions() {
+                                Ok(parts) if !parts.is_empty() => location.set_packed_partitions(parts),
+                                _ => {}
+                            }
+                            match engine.get_packed_gpu() {
+                                Ok(Some((addr, size, metadata))) => location.set_packed_gpu(addr, size, metadata),
+                                _ => {}
+                            }
+                        }
+                        Ok(location)
+                    }).await;
+
+                    match exec_result {
+                        Ok(Ok(location)) => {
+                            if let Some(exch_info) = exchange_dests {
+                                let query_id = (params.query_id.hi, params.query_id.lo);
+                                let sender_id = params.local_params.as_ref()
+                                    .and_then(|lp| lp.first())
+                                    .map(|p| p.sender_id.unwrap_or(0))
+                                    .unwrap_or(0);
+                                let desc_tbl_slots: Option<Vec<(i32, String)>> = params.desc_tbl.as_ref()
+                                    .and_then(|dt| dt.slot_descriptors.as_ref())
+                                    .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
+                                if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
+                                    nixl_agent.as_ref(), location, &exch_info, query_id,
+                                    sender_id, nixl_only, &local_brpc_addr, &exchange_buffer,
+                                    desc_tbl_slots.as_deref(),
+                                ).await {
+                                    tracing::warn!(error = %e, "async leaf exchange send failed");
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => tracing::warn!(error = %e, "async leaf execution failed"),
+                        Err(e) => tracing::warn!(error = %e, "async leaf spawn_blocking panicked"),
+                    }
+                });
+
+                // Return immediately — leaf execution happens asynchronously.
+                continue;
+            }
+
             // If this leaf has exchange destinations and nixl is available,
             // tell Sirius to retain GPU result buffers past query cleanup
             // so the nixl GPU-direct path can use them.
