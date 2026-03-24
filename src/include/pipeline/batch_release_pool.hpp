@@ -16,8 +16,9 @@
 
 #pragma once
 
-#include <cucascade/data/data_batch.hpp>
 #include <cuda_runtime_api.h>
+
+#include <cucascade/data/data_batch.hpp>
 
 #include <condition_variable>
 #include <memory>

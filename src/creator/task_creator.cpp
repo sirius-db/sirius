@@ -264,8 +264,8 @@ void task_creator::manager_loop()
           // If replay succeeds, we skip creating a scan task entirely — the cached
           // host batches are shallow-cloned into the data repository and the pipeline
           // converts them to GPU as normal.
-          auto pipeline_id = pipeline->get_pipeline_id();
-          auto& scan_executor = _pipeline_executor->get_scan_executor();
+          auto pipeline_id      = pipeline->get_pipeline_id();
+          auto& scan_executor   = _pipeline_executor->get_scan_executor();
           auto output_consumers = node->get_next_port_after_sink();
           std::vector<op::sirius_physical_operator*> consumers;
           for (auto& [child, port_id] : output_consumers) {
@@ -275,8 +275,8 @@ void task_creator::manager_loop()
                 pipeline_id, destination_data_repositories[0], consumers)) {
             // Cache replay succeeded — mark the scan source as drained and schedule
             // downstream consumers. No scan task needed.
-            auto scan_task_global_state = _scan_operator_global_state_map.at(
-              node->get_operator_id());
+            auto scan_task_global_state =
+              _scan_operator_global_state_map.at(node->get_operator_id());
             scan_task_global_state->set_source_drained();
             pipeline->mark_task_created();
             pipeline->mark_task_completed();
@@ -297,11 +297,11 @@ void task_creator::manager_loop()
               *_execution_context,
               op_params.scan_task_batch_size,
               op_params.default_scan_task_varchar_size);
-            auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
-              get_next_task_id(),
-              destination_data_repositories[0],
-              std::move(scan_task_local_state),
-              scan_task_global_state);
+            auto scan_task =
+              std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
+                                                           destination_data_repositories[0],
+                                                           std::move(scan_task_local_state),
+                                                           scan_task_global_state);
             pipeline->mark_task_created();
             _pipeline_executor->schedule(std::move(scan_task));
           }

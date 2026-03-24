@@ -192,7 +192,7 @@ class duckdb_scan_executor {
    * @param batch The batch to cache (shared_ptr is copied, not moved)
    */
   void cache_duckdb_scan_batch(size_t pipeline_id,
-                                const std::shared_ptr<cucascade::data_batch>& batch);
+                               const std::shared_ptr<cucascade::data_batch>& batch);
 
   /**
    * @brief Replay cached DuckDB scan batches for a pipeline.
@@ -206,8 +206,8 @@ class duckdb_scan_executor {
    * @return true if replay succeeded (was in preload mode with cached data)
    */
   bool replay_cached_duckdb_scan(size_t pipeline_id,
-                                  cucascade::shared_data_repository* data_repo,
-                                  const std::vector<op::sirius_physical_operator*>& consumers);
+                                 cucascade::shared_data_repository* data_repo,
+                                 const std::vector<op::sirius_physical_operator*>& consumers);
 
  private:
   /**

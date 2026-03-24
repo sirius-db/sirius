@@ -507,10 +507,9 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::seal_and_pu
     // When caching: the batch contains a cached_host_data_representation.
     // Publish a shallow clone to the data repo (pipeline converts clone to GPU).
     // Return the original batch for the cache (retains shared ownership of host data).
-    auto* cached_rep =
-      dynamic_cast<sirius::cached_host_data_representation*>(batch->get_data());
-    auto repo_batch = std::make_shared<cucascade::data_batch>(
-      get_next_batch_id(), cached_rep->shallow_clone());
+    auto* cached_rep = dynamic_cast<sirius::cached_host_data_representation*>(batch->get_data());
+    auto repo_batch =
+      std::make_shared<cucascade::data_batch>(get_next_batch_id(), cached_rep->shallow_clone());
     data_repo->add_data_batch(std::move(repo_batch));
   } else {
     data_repo->add_data_batch(batch);
@@ -598,8 +597,7 @@ bool duckdb_scan_task::ensure_chunk_fits(duckdb_scan_task_local_state& l_state)
     if (!l_state._column_builders[varchar_idx].sufficient_space_for_column(
           vec, validity, l_state._chunk.size())) {
       // Try to grow the allocation and recheck
-      if (l_state._allocation &&
-          l_state._allocation->grow_by(l_state._allocation->block_size())) {
+      if (l_state._allocation && l_state._allocation->grow_by(l_state._allocation->block_size())) {
         if (l_state._column_builders[varchar_idx].sufficient_space_for_column(
               vec, validity, l_state._chunk.size())) {
           continue;
@@ -640,10 +638,9 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
                    _task_id,
                    l_state._approximate_batch_size);
 
-  auto& scan_executor   = g_state.get_scan_executor();
-  auto output_consumers = g_state.get_output_consumers();
-  auto const pipeline_id =
-    g_state.get_pipeline() ? g_state.get_pipeline()->get_pipeline_id() : 0;
+  auto& scan_executor    = g_state.get_scan_executor();
+  auto output_consumers  = g_state.get_output_consumers();
+  auto const pipeline_id = g_state.get_pipeline() ? g_state.get_pipeline()->get_pipeline_id() : 0;
 
   // DuckDB scan caching follows the same pattern as parquet scan caching:
   // batches are wrapped in cached_host_data_representation (shared ownership),
@@ -661,9 +658,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
 
     // Cache the batch for warm-run replay. The batch contains a
     // cached_host_data_representation with shared ownership of the host data.
-    if (caching_enabled && batch) {
-      scan_executor.cache_duckdb_scan_batch(pipeline_id, batch);
-    }
+    if (caching_enabled && batch) { scan_executor.cache_duckdb_scan_batch(pipeline_id, batch); }
 
     // Notify the task_creator that new data is available for the downstream pipeline.
     for (auto* consumer : output_consumers) {

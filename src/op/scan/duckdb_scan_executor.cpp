@@ -26,11 +26,10 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 
-#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
-
 #include <rmm/cuda_device.hpp>
 
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <mutex>
 
@@ -280,16 +279,14 @@ bool duckdb_scan_executor::replay_cached_duckdb_scan(
   // new data_batch sharing the same host data. The pipeline converts clones
   // to GPU as normal (same pattern as parquet scan caching).
   for (auto& batch : batches_to_replay) {
-    auto* cached_rep =
-      dynamic_cast<sirius::cached_host_data_representation*>(batch->get_data());
+    auto* cached_rep = dynamic_cast<sirius::cached_host_data_representation*>(batch->get_data());
     if (!cached_rep) {
       SIRIUS_LOG_ERROR(
-        "Cached DuckDB scan batch has unexpected representation type for pipeline {}",
-        pipeline_id);
+        "Cached DuckDB scan batch has unexpected representation type for pipeline {}", pipeline_id);
       return false;
     }
-    auto clone = std::make_shared<cucascade::data_batch>(
-      get_next_batch_id(), cached_rep->shallow_clone());
+    auto clone =
+      std::make_shared<cucascade::data_batch>(get_next_batch_id(), cached_rep->shallow_clone());
     data_repo->add_data_batch(std::move(clone));
   }
 
