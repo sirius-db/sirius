@@ -18,6 +18,10 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
+
+// Forward-declare CUDA profiler API functions (linked via libcudart).
+extern "C" int cudaProfilerStart();
+extern "C" int cudaProfilerStop();
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
@@ -36,8 +40,10 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
 #include "gpu_buffer_manager.hpp"
+#ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#endif
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -51,13 +57,12 @@ namespace duckdb {
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
-struct GPUTableFunctionData : public TableFunctionData {
-  GPUTableFunctionData() = default;
-  shared_ptr<Relation> plan;
-  shared_ptr<GPUPreparedStatementData> gpu_prepared;
+struct SiriusTableFunctionData : public TableFunctionData {
+  SiriusTableFunctionData() = default;
+  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<GPUContext> gpu_context;
+  unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -137,12 +142,14 @@ struct GPUTableFunctionData : public TableFunctionData {
   }
 };
 
-struct SiriusTableFunctionData : public TableFunctionData {
-  SiriusTableFunctionData() = default;
-  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
+#ifdef SIRIUS_ENABLE_LEGACY
+struct GPUTableFunctionData : public TableFunctionData {
+  GPUTableFunctionData() = default;
+  shared_ptr<Relation> plan;
+  shared_ptr<GPUPreparedStatementData> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<::sirius::sirius_interface> sirius_iface;
+  unique_ptr<GPUContext> gpu_context;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -338,6 +345,18 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
   output.Reference(*result_chunk);
   return;
 }
+
+static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog& catalog)
+{
+  TableFunction gpu_processing("gpu_processing",
+                               {LogicalType::VARCHAR},
+                               SiriusExtension::GPUProcessingFunction,
+                               SiriusExtension::GPUProcessingBind);
+  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
+  catalog.CreateTableFunction(transaction, gpu_processing_info);
+}
+#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
   ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
@@ -585,6 +604,50 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   data.finished = true;
 }
 
+static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
+                                             TableFunctionBindInput& input,
+                                             vector<LogicalType>& return_types,
+                                             vector<string>& names)
+{
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return nullptr;
+}
+
+struct ProfilerFunctionData : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> ProfilerInit(ClientContext& context,
+                                                         TableFunctionInitInput& input)
+{
+  return make_uniq<ProfilerFunctionData>();
+}
+
+static void ProfilerStartFunction(ClientContext& context,
+                                  TableFunctionInput& data_p,
+                                  DataChunk& output)
+{
+  auto& data = data_p.global_state->Cast<ProfilerFunctionData>();
+  if (data.finished) return;
+  cudaProfilerStart();
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
+static void ProfilerStopFunction(ClientContext& context,
+                                 TableFunctionInput& data_p,
+                                 DataChunk& output)
+{
+  auto& data = data_p.global_state->Cast<ProfilerFunctionData>();
+  if (data.finished) return;
+  cudaProfilerStop();
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -597,11 +660,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
   catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-  TableFunction gpu_processing(
-    "gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
-  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
-  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(transaction, gpu_processing_info);
+#ifdef SIRIUS_ENABLE_LEGACY
+  RegisterLegacyGPUFunctions(transaction, catalog);
+#endif
 
   TableFunction gpu_execution("gpu_execution",
                               {LogicalType::VARCHAR},
@@ -610,6 +671,17 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  // Profiler control functions for nsys --capture-range=cudaProfilerApi
+  TableFunction profiler_start(
+    "profiler_start", {}, ProfilerStartFunction, ProfilerBind, ProfilerInit);
+  CreateTableFunctionInfo profiler_start_info(profiler_start);
+  catalog.CreateTableFunction(transaction, profiler_start_info);
+
+  TableFunction profiler_stop(
+    "profiler_stop", {}, ProfilerStopFunction, ProfilerBind, ProfilerInit);
+  CreateTableFunctionInfo profiler_stop_info(profiler_stop);
+  catalog.CreateTableFunction(transaction, profiler_stop_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
@@ -617,6 +689,12 @@ static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& param
   Config::USE_PIN_MEM_FOR_CPU_PROCESSING = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CPU_PROCESSING to {}",
                    Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
+}
+
+static void SetUsePinMemoryForCaching(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::USE_PIN_MEM_FOR_CACHING = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}", Config::USE_PIN_MEM_FOR_CACHING);
 }
 
 static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parameter)
@@ -682,19 +760,23 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
-static void SetCacheInGpu(ClientContext& context, SetScope scope, Value& parameter)
+static void SetCacheScanLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
-    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_in_gpu SET ignored");
+    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_scan_level SET ignored");
     return;
   }
-  bool enabled = BooleanValue::Get(parameter);
-  auto& cfg    = sirius_ctx->get_config();
-  cfg.set_cache_in_gpu(enabled);
-  sirius_ctx->get_pipeline_executor().set_scan_caching_enabled(
-    cfg.is_scan_caching_enabled(), cfg.is_cache_decoded_table_enabled(), enabled);
-  SIRIUS_LOG_DEBUG("Updated config cache_in_gpu to {}", enabled);
+  auto level_str = StringValue::Get(parameter);
+  sirius::op::scan::cache_level level;
+  if (!sirius::op::scan::string_to_enum(level_str, level)) {
+    throw InvalidInputException(
+      "Invalid cache_scan_level '{}'. Valid values: none, table_gpu, table_host, parquet",
+      level_str);
+  }
+  auto& cfg = sirius_ctx->get_config();
+  cfg.set_cache_level(level);
+  SIRIUS_LOG_DEBUG("Updated config cache_scan_level to {}", level_str);
 }
 
 static sirius::operator_params* get_operator_params(ClientContext& context)
@@ -749,6 +831,36 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
+static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_LEVEL = StringValue::Get(parameter);
+  SetGlobalLogLevel(Config::LOG_LEVEL);
+  SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
+}
+
+static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_DIR = StringValue::Get(parameter);
+  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
+}
+
+static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
+}
+
+static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
+                   params->max_build_hash_table_bytes);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -757,6 +869,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CPU_PROCESSING),
                             SetUsePinMemory);
+
+  config.AddExtensionOption(
+    "use_pin_memory_for_caching",
+    "Whether or not the cache buffer is allocated with pinned host memory instead of GPU memory",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CACHING),
+    SetUsePinMemoryForCaching);
 
   // Add in config option for expression executor
   config.AddExtensionOption("use_cudf_expr",
@@ -847,6 +966,23 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
 
+  // Logging configuration
+  config.AddExtensionOption("sirius_log_level",
+                            "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_LEVEL),
+                            SetLogLevel);
+  config.AddExtensionOption("sirius_log_dir",
+                            "Directory for Sirius log files",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_DIR),
+                            SetLogDir);
+  config.AddExtensionOption("sirius_log_flush_seconds",
+                            "Interval in seconds between automatic log flushes",
+                            LogicalType::INTEGER,
+                            Value::INTEGER(Config::LOG_FLUSH_SECONDS),
+                            SetLogFlushSeconds);
+
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
@@ -859,11 +995,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
                             SetConcatBatchBytes);
 
-  config.AddExtensionOption("cache_in_gpu",
-                            "Whether to cache scan results in GPU memory instead of host memory",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(false),
-                            SetCacheInGpu);
+  config.AddExtensionOption("scan_cache_level",
+                            "Scan result caching level: none, table_gpu, table_host, parquet",
+                            LogicalType::VARCHAR,
+                            Value("none"),
+                            SetCacheScanLevel);
+
+  config.AddExtensionOption("max_build_hash_table_bytes",
+                            "Maximum size a build-side table can be where it will create a "
+                            "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
+                            SetMaxBuildHashTableBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

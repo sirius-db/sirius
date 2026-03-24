@@ -66,9 +66,9 @@ class cache_ranges {
 
   // Returns a list of spans that together cover [query_offset, query_offset+query_size).
   // Each span points directly into one of the underlying chunk buffers.
-  // Throws std::out_of_range if the query does not fall within a cached range.
-  [[nodiscard]] std::vector<std::span<const std::byte>> get_ranges(std::size_t query_offset,
-                                                                   std::size_t query_size) const;
+  // Returns std::nullopt if the query does not fall within a cached range.
+  [[nodiscard]] std::optional<std::vector<std::span<const std::byte>>> get_ranges(
+    std::size_t query_offset, std::size_t query_size) const;
 
   [[nodiscard]] std::size_t max_offset() const noexcept;
 

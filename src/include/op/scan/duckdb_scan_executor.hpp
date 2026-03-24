@@ -21,6 +21,7 @@
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/kiosk.hpp"
 #include "exec/thread_pool.hpp"
+#include "op/scan/config.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/task_request.hpp"
@@ -131,6 +132,15 @@ class duckdb_scan_executor {
   void drain_leftover_tasks();
 
   /**
+   * @brief Drain tasks and wait for all in-flight work to complete.
+   *
+   * Interrupts the manager loop so it releases its kiosk ticket, waits for
+   * all in-flight thread-pool tasks, then restarts the manager so the
+   * executor is ready for the next query.  Used during error cleanup.
+   */
+  void drain_and_wait();
+
+  /**
    * @brief Set the completion handler for query completion signaling
    *
    * @param handler Pointer to the completion handler
@@ -141,24 +151,34 @@ class duckdb_scan_executor {
    * @brief Cache scan results for the given query
    *
    * @param query The query string to cache results for
+   * @return True if this is a re-execution of the same query (cache hit),
+   *         false if the query changed (cache miss / cleared).
    */
-  void cache_scan_results_for_query(const std::string& query);
+  [[nodiscard]] bool cache_scan_results_for_query(const std::string& query);
 
   /**
-   * @brief Enable or disable scan result caching
+   * @brief Configure scan result caching level
    *
-   * @param enabled True to enable caching, false to disable
+   * @param level The cache level to use
    */
-  void set_scan_caching_enabled(bool enabled,
-                                bool cache_decoded_table = false,
-                                bool cache_in_gpu        = false);
+  void set_scan_caching_enabled(cache_level level);
 
   /**
    * @brief Check if scan result caching is enabled
    *
    * @return True if caching is enabled, false otherwise
    */
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _caching_enabled; }
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept
+  {
+    return _cache_level != cache_level::NONE;
+  }
+
+  /**
+   * @brief Check if the scan executor is in preload mode (cache is hot).
+   *
+   * @return True if preload mode is active, false otherwise.
+   */
+  [[nodiscard]] bool is_preload_mode() const noexcept { return _preload_mode; }
 
   /**
    * @brief Prepare cache for scan operators
@@ -193,10 +213,7 @@ class duckdb_scan_executor {
   mutable std::mutex _cache_mutex;
   std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
   std::size_t _query_hash{0};
-  bool _caching_enabled{false};
-  bool _cache_decoded_table{false};
-  bool _wrap_batch_data{false};
-  bool _cache_in_gpu{false};
+  cache_level _cache_level{cache_level::NONE};
   bool _preload_mode{false};
 
   std::atomic<bool> _running{false};

@@ -17,6 +17,7 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -63,15 +64,11 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
 
-  // Clear the global state maps for the new query
   _scan_operator_global_state_map.clear();
-  _parquet_scan_operator_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
 
-  // Iterate through all pipelines in the query and create global states
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
-    // Get the sink operator of the pipeline
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) { continue; }
 
@@ -86,21 +83,28 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-      const auto& op_params =
-        _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-          ->get_config()
-          .get_operator_params();
-      _parquet_scan_operator_global_state_map.emplace(
-        operator_id,
-        std::make_shared<op::scan::parquet_scan_task_global_state>(
-          pipeline,
-          &source_operator->Cast<op::sirius_physical_parquet_scan>(),
-          op_params.scan_task_batch_size));
+      auto it = _parquet_scan_operator_global_state_map.find(operator_id);
+      if (it != _parquet_scan_operator_global_state_map.end()) {
+        it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
+      } else {
+        const auto& op_params =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+            ->get_config()
+            .get_operator_params();
+        _parquet_scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::parquet_scan_task_global_state>(
+            pipeline,
+            &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+            op_params.scan_task_batch_size));
+      }
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
     }
   }
+  _num_scans_in_plan =
+    _scan_operator_global_state_map.size() + _parquet_scan_operator_global_state_map.size();
 }
 
 void task_creator::drain_pending_tasks()
@@ -111,12 +115,11 @@ void task_creator::drain_pending_tasks()
   _kiosk.wait_all();
 }
 
-void task_creator::reset()
+void task_creator::reset(bool keep_parquet_metadata)
 {
-  // Clear the scan operator global state map for the new query
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _scan_operator_global_state_map.clear();
-  _parquet_scan_operator_global_state_map.clear();
+  if (!keep_parquet_metadata) { _parquet_scan_operator_global_state_map.clear(); }
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();
@@ -316,6 +319,10 @@ void task_creator::manager_loop()
                                                             std::move(parquet_task_local_state),
                                                             parquet_task_global_state);
             _pipeline_executor->schedule(std::move(parquet_task));
+
+            // If there is only a single scan in the plan, continue creating scan tasks to create
+            // I/O parallelism. Otherwise, let the plan drive the creation of more tasks.
+            if (_num_scans_in_plan >= 2) { break; }
           }
         } else {
           // need to exhaust input batches until all ports are empty

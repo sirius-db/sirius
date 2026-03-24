@@ -232,5 +232,11 @@ bool sirius_physical_concat::is_sink() const { return true; }
 
 bool sirius_physical_concat::is_build_concat() { return _is_build; }
 
+void sirius_physical_concat::set_concat_all(bool concat_all)
+{
+  std::lock_guard<std::mutex> lg(lock);
+  _concat_all = concat_all;
+}
+
 }  // namespace op
 }  // namespace sirius

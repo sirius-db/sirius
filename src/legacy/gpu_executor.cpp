@@ -26,6 +26,8 @@
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <stdio.h>
 
 namespace duckdb {
@@ -59,6 +61,8 @@ void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan)
 
 void GPUExecutor::Execute()
 {
+  nvtx3::scoped_range nvtx_range{"sirius::legacy_query"};
+
   // Check if we should fall back to duckdb execution.
   if (Config::ENABLE_FALLBACK_CHECK) {
     FallbackChecker fallback_checker(scheduled);
