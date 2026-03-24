@@ -437,19 +437,8 @@ std::size_t gpu_pipeline_task::get_input_size() const
 
 std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 {
-  std::size_t base = get_input_size();
-  auto* pipeline   = _global_state != nullptr
-                       ? _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()
-                       : nullptr;
-  if (pipeline != nullptr) {
-    for (auto& op_ref : pipeline->get_operators()) {
-      if (op_ref.get().type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
-        // Hash join keeps build side in memory; reserve 1.5x input size.
-        return (base * 3) / 2;
-      }
-    }
-  }
-  return base;
+  // WSM TODO: this is a placeholder for the actual reservation size
+  return get_input_size() * 1;
 }
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
