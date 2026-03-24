@@ -38,6 +38,7 @@ set(SIRIUS_LEGACY_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_substring.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_table_scan.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_top_n.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_union.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_ungrouped_aggregate.cpp
     PARENT_SCOPE)
 
@@ -61,6 +62,7 @@ if(ENABLE_LEGACY_SIRIUS)
       ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_order.cpp
       ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_projection.cpp
       ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_recursive_cte.cpp
+      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_set_operation.cpp
       ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_top_n.cpp
       PARENT_SCOPE)
   set(SIRIUS_LEGACY_COMPILE_DEFINITIONS SIRIUS_ENABLE_LEGACY PARENT_SCOPE)

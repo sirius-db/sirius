@@ -25,7 +25,7 @@ namespace duckdb {
 
 class GPUResultCollection {
  public:
-  GPUResultCollection() : read_idx(0), write_idx(0), num_rows(0), data_chunks(nullptr) {}
+  GPUResultCollection() : read_idx(0), num_rows(0) {}
 
   void SetCapacity(size_t capacity);
   void AddChunk(DataChunk& chunk);
@@ -33,14 +33,10 @@ class GPUResultCollection {
 
   size_t size() { return num_rows; }
 
-  ~GPUResultCollection()
-  {
-    if (data_chunks != nullptr) { delete[] data_chunks; }
-  }
+  ~GPUResultCollection() = default;
 
-  DataChunk* data_chunks;
+  vector<unique_ptr<DataChunk>> data_chunks;
   size_t num_rows;
-  size_t write_idx;
   size_t read_idx;
 };
 

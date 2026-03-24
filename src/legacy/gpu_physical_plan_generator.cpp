@@ -179,10 +179,11 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
       // plan = CreatePlan(op.Cast<LogicalPositionalJoin>());
       break;
     case LogicalOperatorType::LOGICAL_UNION:
+      plan = CreatePlan(op.Cast<LogicalSetOperation>());
+      break;
     case LogicalOperatorType::LOGICAL_EXCEPT:
     case LogicalOperatorType::LOGICAL_INTERSECT:
-      throw NotImplementedException("Set operation not supported");
-      // plan = CreatePlan(op.Cast<LogicalSetOperation>());
+      throw NotImplementedException("EXCEPT/INTERSECT not supported on GPU");
       break;
     case LogicalOperatorType::LOGICAL_INSERT:
       throw NotImplementedException("Insert not supported");

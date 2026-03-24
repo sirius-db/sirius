@@ -21,22 +21,26 @@
 
 namespace duckdb {
 
-void GPUResultCollection::SetCapacity(size_t capacity) { data_chunks = new DataChunk[capacity]; }
+void GPUResultCollection::SetCapacity(size_t capacity)
+{
+  data_chunks.reserve(data_chunks.size() + capacity);
+}
 
 void GPUResultCollection::AddChunk(DataChunk& chunk)
 {
   num_rows += chunk.size();
-  data_chunks[write_idx].Move(chunk);
-  write_idx += 1;
+  auto new_chunk = make_uniq<DataChunk>();
+  new_chunk->Move(chunk);
+  data_chunks.push_back(std::move(new_chunk));
 }
 
 unique_ptr<DataChunk> GPUResultCollection::GetNext()
 {
   // We have returned all of the values then return the empty result
-  if (read_idx >= write_idx) { return nullptr; }
+  if (read_idx >= data_chunks.size()) { return nullptr; }
 
   // Create a result that references the value in the buffer
-  DataChunk& return_chunk            = data_chunks[read_idx];
+  DataChunk& return_chunk            = *data_chunks[read_idx];
   unique_ptr<DataChunk> result_value = make_uniq<DataChunk>();
 
   result_value->InitializeEmpty(return_chunk.GetTypes());
