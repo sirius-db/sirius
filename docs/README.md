@@ -54,56 +54,112 @@ CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 
 Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
 
-Optionally, to use the Python API in Sirius, we also need to build the duckdb-python package with the following commands:
+By default, only the `gpu_execution` code path is compiled. To also build the `gpu_processing` (in-memory) code path, enable the `ENABLE_LEGACY_SIRIUS` CMake option:
 ```
-pushd duckdb-python
-pip install .
-popd
-```
-Common issues: If `pip install .` only works inside an environment, then do the following from the Sirius home directory before the installation:
-```
-python3 -m venv --prompt duckdb .venv
-source .venv/bin/activate
+cd duckdb && cmake --preset release -DENABLE_LEGACY_SIRIUS=ON && cmake --build --preset release && cd ..
 ```
 
-## Generating and Loading test datasets
+## Running Sirius
 
-### TPC-H Dataset
+Sirius provides two execution paths:
 
-To generate the TPC-H dataset
-```
-cd test_datasets
-unzip tpch-dbgen.zip
-cd tpch-dbgen
-./dbgen -s 1 && mkdir -p s1 && mv *.tbl s1  # this generates dataset of SF1
-cd ../../
+- **`gpu_execution` (Recommended)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
+- **`gpu_processing`** — In-memory execution where the dataset must fit in GPU memory. Works with DuckDB's native storage format.
+
+### `gpu_execution` (Recommended)
+
+#### Configuration
+
+`gpu_execution` requires a config file in [libconfig++](https://hyperreckoning.com/libconfig/) format. Point to it via the `SIRIUS_CONFIG_FILE` environment variable, or place it at the default path `~/.sirius/sirius.cfg`.
+
+Here is a minimal config file to get started:
+
+```cfg
+sirius = {
+    topology = {
+        num_gpus = 1;
+    };
+    memory = {
+        gpu = {
+            usage_limit_fraction = 0.5;
+            reservation_limit_fraction = 1.0;
+        }
+        host = {
+            capacity_bytes = 32000000000;
+            initial_number_pools = 10;
+            pool_size = 512;
+            block_size = 1048576;
+        };
+    };
+    executor = {
+        pipeline = {
+            num_threads = 4;
+        };
+        duckdb_scan = {
+            num_threads = 2;
+        };
+        task_creator = {
+            num_threads = 2;
+        };
+        downgrade = {
+            num_threads = 1;
+        };
+    };
+    operator_params = {
+        scan_task_batch_size = 100000000;
+        default_scan_task_varchar_size = 256;
+        max_sort_partition_bytes = 0;
+        hash_partition_bytes = 100000000;
+        concat_batch_bytes = 100000000;
+        max_build_hash_table_bytes = 90000000;
+    };
+};
 ```
 
-To load the TPC-H dataset to duckdb:
-```
-./build/release/duckdb {DATABASE_NAME}.duckdb
-.read scripts/tpch_load.sql
+Key configuration sections:
+- **memory.gpu**: `usage_limit_fraction` controls what fraction of GPU memory Sirius may use.
+- **memory.host**: Configures the host-memory spilling tier (capacity, pool layout).
+- **executor**: Thread counts for pipeline execution, data scanning, task creation, and memory downgrade.
+- **operator_params**: Batch sizes and memory limits for individual operators.
+
+See the [Configuration documentation](super-sirius/configuration.md) for a full reference.
+
+#### CLI Usage
+
+```bash
+export SIRIUS_CONFIG_FILE=/path/to/sirius.cfg
+./build/release/duckdb
 ```
 
-### ClickBench Dataset
+From the DuckDB shell, create views pointing to your Parquet files and run queries with `gpu_execution`:
 
-To download the dataset run:
-```
-cd test_datasets
-wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
-gzip -d test_hits.tsv.gz
-cd ..
+```sql
+-- Create views for parquet data
+CREATE VIEW lineitem AS SELECT * FROM read_parquet('/data/lineitem/*.parquet');
+CREATE VIEW orders AS SELECT * FROM read_parquet('/data/orders/*.parquet');
+CREATE VIEW customer AS SELECT * FROM read_parquet('/data/customer/*.parquet');
+
+-- Run a query on GPU
+CALL gpu_execution('SELECT
+    l_returnflag,
+    l_linestatus,
+    sum(l_quantity) as sum_qty,
+    sum(l_extendedprice) as sum_base_price,
+    sum(l_extendedprice * (1 - l_discount)) as sum_disc_price
+FROM lineitem
+WHERE l_shipdate <= date ''1998-09-02''
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus');
 ```
 
-To load the dataset to duckdb:
-```
-./build/release/duckdb {DATABASE_NAME}.duckdb
-.read scripts/clickbench_load_duckdb.sql
-```
+### `gpu_processing`
 
-## Running Sirius: CLI
-To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
-From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
+`gpu_processing` is the in-memory execution path. It works with DuckDB's native storage format and requires the dataset to fit in GPU memory.
+
+#### CLI Usage
+
+Start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
+From the DuckDB shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
 call gpu_buffer_init("1 GB", "2 GB");
@@ -147,41 +203,61 @@ All 22 TPC-H queries are saved in tpch-queries.sql. To run all queries:
 .read tpch-queries.sql
 ```
 
-## Running Sirius: Python API
-Make sure to build the duckdb-python package before using the Python API with the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To use the Sirius Python API, add the following code to the beginning of your Python program:
+## Generating and Loading Test Datasets
+
+### Parquet (for `gpu_execution`)
+
+For TPC-H benchmarking, use the provided data generation script:
+
+```bash
+cd test/tpch_performance
+pixi run bash generate_tpch_data.sh 100   # generates SF100 parquet data
 ```
-import duckdb
-con = duckdb.connect('{DATABASE_NAME}.duckdb', config={"allow_unsigned_extensions": "true"})
-con.execute("load '{SIRIUS_HOME_PATH}/build/release/extension/sirius/sirius.duckdb_extension'")
-con.execute("call gpu_buffer_init('{GPU_CACHE_SIZE}', '{GPU_PROCESSING_SIZE}')")
+
+This produces partitioned Parquet files under `test_datasets/tpch_parquet_sf100/`. Then create views from the DuckDB shell:
+
+```sql
+CREATE VIEW lineitem AS SELECT * FROM read_parquet('test_datasets/tpch_parquet_sf100/lineitem/*.parquet');
+-- repeat for other tables...
 ```
-To execute query in Python:
+
+For your own data, point `read_parquet()` at any Parquet file or glob:
+
+```sql
+CREATE VIEW my_table AS SELECT * FROM read_parquet('/path/to/my_data/*.parquet');
 ```
-con.execute('''
-  call gpu_processing("select
-    l.l_orderkey,
-    sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
-    o.o_orderdate,
-    o.o_shippriority
-  from
-    customer c,
-    orders o,
-    lineitem l
-  where
-    c.c_mktsegment = 'HOUSEHOLD'
-    and c.c_custkey = o.o_custkey
-    and l.l_orderkey = o.o_orderkey
-    and o.o_orderdate < date '1995-03-25'
-    and l.l_shipdate > date '1995-03-25'
-  group by
-    l.l_orderkey,
-    o.o_orderdate,
-    o.o_shippriority
-  order by
-    revenue desc,
-    o.o_orderdate
-  limit 10;");
-            ''').fetchall()
+
+### DuckDB Native Format (for `gpu_processing`)
+
+To generate the TPC-H dataset
+```
+cd test_datasets
+unzip tpch-dbgen.zip
+cd tpch-dbgen
+./dbgen -s 1 && mkdir -p s1 && mv *.tbl s1  # this generates dataset of SF1
+cd ../../
+```
+
+To load the TPC-H dataset to duckdb:
+```
+./build/release/duckdb {DATABASE_NAME}.duckdb
+.read scripts/tpch_load.sql
+```
+
+### ClickBench Dataset
+
+To download the dataset run:
+```
+cd test_datasets
+wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
+gzip -d test_hits.tsv.gz
+cd ..
+```
+
+To load the dataset to duckdb:
+```
+./build/release/duckdb {DATABASE_NAME}.duckdb
+.read scripts/clickbench_load_duckdb.sql
 ```
 
 ## Correctness Testing
@@ -238,17 +314,29 @@ SET sirius_log_flush_seconds = 1;
 ```
 
 ## Limitations
-Sirius is under active development, and several features are still in progress. Notable current limitations include:
-- **Data Size Limitations:** Sirius currently only works when the dataset fits in the GPU memory capacity. To be more specific, it would return an error if the input data size is larger than the GPU caching region or if the intermediate results is larger than the GPU processing region. We are actively addressing this issue by adding support for partitioning and batch execution (issues [#12](https://github.com/sirius-db/sirius/issues/12) and [#19](https://github.com/sirius-db/sirius/issues/19)), multi-GPUs execution (issue [#18](https://github.com/sirius-db/sirius/issues/18)), spilling to disk/host memory (issue [#19](https://github.com/sirius-db/sirius/issues/19)), and distributed query execution (issue [#18](https://github.com/sirius-db/sirius/issues/18)).
-- **Row Count Limitations:** Sirius uses libcudf to implement `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`. However, since libcudf uses `int32_t` for row IDs, this imposes limits on the maximum row count that Sirius can currently handle (~2B rows). See libcudf issue [#13159](https://github.com/rapidsai/cudf/issues/13159) for more details. We are actively addressing this by adding support for partitioning and batch execution. See Sirius issue [#12](https://github.com/sirius-db/sirius/issues/12) for more details.
+
+Sirius is under active development. Notable current limitations include:
+
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types. See issue [#20](https://github.com/sirius-db/sirius/issues/20) for more details.
-- **Operator Coverage:** At present, Sirius only supports a range of operators including `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc. See issue [#21](https://github.com/sirius-db/sirius/issues/21) for more details.
+- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc. See issue [#21](https://github.com/sirius-db/sirius/issues/21) for more details.
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
 
 ## Developer Documentation
 
-For in-depth documentation on the Super Sirius execution engine (the `gpu_execution` code path), see the [Super Sirius Documentation](super-sirius/README.md).
+For in-depth documentation on the `gpu_execution` engine, see the [Super Sirius Documentation](super-sirius/README.md).
+
+## Contributors and Partners
+
+<p align="center">
+  <a href="https://www.nvidia.com/"><img src="https://upload.wikimedia.org/wikipedia/sco/2/21/Nvidia_logo.svg" alt="NVIDIA" height="40" style="margin: 0 20px;"/></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.wisc.edu/"><img src="https://upload.wikimedia.org/wikipedia/commons/e/e5/Wisconsin_Badgers_logo.svg" alt="UW-Madison" height="40" style="margin: 0 20px;"/></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" height="40" style="margin: 0 20px;"/></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.vastdata.com/"><img src="https://www.vastdata.com/hubfs/VAST-Data-Logo-01.svg" alt="VAST Data" height="40" style="margin: 0 20px;"/></a>
+</p>
 
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), more [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), accelerating more engines, and many more.
