@@ -938,8 +938,33 @@ pub fn decoded_columns_to_arrow_ipc(
                     let arr = Int32Array::new(buf.into(), null_buf);
                     (Field::new(&name, DataType::Int32, col.is_nullable), Arc::new(arr))
                 }
-                x if x == TypeId::Uint32 as i32 || x == TypeId::Datev2 as i32 || x == TypeId::Ipv4 as i32 => {
-                    // DATEV2 and IPV4 stored as UInt32; DuckDB will handle casting.
+                x if x == TypeId::Datev2 as i32 => {
+                    // DATEV2: packed uint32 (year<<9 | month<<5 | day) → Arrow Date32 (days since epoch).
+                    let days: Vec<i32> = (0..num_rows).map(|r| {
+                        let off = r * 4;
+                        let v = u32::from_le_bytes(col.data[off..off+4].try_into().unwrap_or([0;4]));
+                        let year = (v >> 9) as i32;
+                        let month = ((v >> 5) & 0xF) as u32;
+                        let day = (v & 0x1F) as u32;
+                        // Days since 1970-01-01 (civil calendar algorithm).
+                        let y = if month <= 2 { year - 1 } else { year };
+                        let m = if month <= 2 { month + 9 } else { month - 3 };
+                        let era = if y >= 0 { y } else { y - 399 } / 400;
+                        let yoe = (y - era * 400) as u32;
+                        let doy = (153 * m + 2) / 5 + day - 1;
+                        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                        (era * 146097 + doe as i32 - 719468) as i32
+                    }).collect();
+                    let arr = Date32Array::from(days).with_data_type(DataType::Date32);
+                    let arr = if let Some(nb) = null_buf {
+                        // Reconstruct with null buffer
+                        Date32Array::new(arr.values().clone(), Some(nb))
+                    } else {
+                        arr
+                    };
+                    (Field::new(&name, DataType::Date32, col.is_nullable), Arc::new(arr))
+                }
+                x if x == TypeId::Uint32 as i32 || x == TypeId::Ipv4 as i32 => {
                     let arr = UInt32Array::new(buf.into(), null_buf);
                     (Field::new(&name, DataType::UInt32, col.is_nullable), Arc::new(arr))
                 }
