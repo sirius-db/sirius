@@ -258,12 +258,21 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
             break;
           }
         }
-        // check if all dependencies are scheduled
-        for (int dep = 0; dep < base_pipeline->dependencies.size(); dep++) {
-          if (find(scheduled.begin(), scheduled.end(), base_pipeline->dependencies[dep]) ==
-              scheduled.end()) {
-            should_schedule = false;
-            break;
+        // check if all dependencies are scheduled (check ALL pipelines in this meta-pipeline,
+        // not just the base pipeline, because dependencies may be on non-base pipelines e.g.
+        // when a hash join build side dependency is on the probe pipeline, not the first pipeline)
+        {
+          vector<shared_ptr<GPUPipeline>> all_pipelines_in_meta;
+          to_schedule[to_schedule.size() - 1 - meta]->GetPipelines(all_pipelines_in_meta, false);
+          for (auto& mp_pipeline : all_pipelines_in_meta) {
+            for (int dep = 0; dep < mp_pipeline->dependencies.size(); dep++) {
+              if (find(scheduled.begin(), scheduled.end(), mp_pipeline->dependencies[dep]) ==
+                  scheduled.end()) {
+                should_schedule = false;
+                break;
+              }
+            }
+            if (!should_schedule) break;
           }
         }
       }
