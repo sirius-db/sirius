@@ -952,7 +952,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
     // build source to pipelines map
     for (size_t i = 0; i < new_scheduled.size(); i++) {
-      source_to_pipelines[new_scheduled[i]->source.get()].push_back(new_scheduled[i]);
+      auto* src = new_scheduled[i]->source.get();
+      auto* snk = new_scheduled[i]->sink.get();
+      source_to_pipelines[src].push_back(new_scheduled[i]);
+      SIRIUS_LOG_INFO("[source_to_pipelines] pipeline {} src={} ({}) sink={} ({})",
+                      i, (void*)src, src ? static_cast<int>(src->type) : -1,
+                      (void*)snk, snk ? static_cast<int>(snk->type) : -1);
     }
 
     // Assign pipeline IDs before adding ports so that add_port can sort _ports_list
@@ -1089,7 +1094,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-        for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
+        auto* sink_op = new_scheduled[i]->get_sink().get();
+        auto& deps = source_to_pipelines[sink_op];
+        SIRIUS_LOG_INFO("[repo_setup] pipeline {} SCAN sink={} ({}) has {} dependent pipelines",
+                        i, (void*)sink_op, static_cast<int>(sink_op->type), deps.size());
+        for (auto dependent_pipeline : deps) {
           auto next_op             = dependent_pipeline->get_operators().size() == 0
                                        ? dependent_pipeline->get_sink().get()
                                        : &dependent_pipeline->get_operators()[0].get();

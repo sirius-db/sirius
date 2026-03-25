@@ -315,6 +315,12 @@ void duckdb_scan_executor::manager_loop()
                             scan_task = std::move(scan_task)]() mutable {
       try {
         auto consumers = scan_task->get_output_consumers();
+        SIRIUS_LOG_INFO("[scan_executor] scan task has {} consumers", consumers.size());
+        for (size_t ci = 0; ci < consumers.size(); ci++) {
+          auto* c = consumers[ci];
+          SIRIUS_LOG_INFO("[scan_executor] consumer[{}]: {} type={}",
+                          ci, (void*)c, c ? static_cast<int>(c->type) : -1);
+        }
         {
           auto output_data = get_scan_output(scan_task, stream);
           stream->synchronize();
