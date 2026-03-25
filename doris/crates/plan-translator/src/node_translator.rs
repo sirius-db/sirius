@@ -118,7 +118,7 @@ fn translate_node(
                 }
             };
 
-            return Ok(Rel {
+            let mut rel = Rel {
                 rel_type: Some(rel::RelType::Read(Box::new(substrait::proto::ReadRel {
                     base_schema: Some(base_schema),
                     read_type: Some(substrait::proto::read_rel::ReadType::NamedTable(
@@ -129,7 +129,66 @@ fn translate_node(
                     )),
                     ..Default::default()
                 }))),
-            });
+            };
+
+            // If the EXCHANGE_NODE has sort_info (merge-sort exchange), wrap in
+            // SortRel + FetchRel. This re-applies ORDER BY/LIMIT on the merged
+            // exchange data from multiple senders.
+            if let Some(exchange_node) = &node.exchange_node {
+                if let Some(sort_info) = &exchange_node.sort_info {
+                    let tuples = if !node.row_tuples.is_empty() {
+                        Some(&node.row_tuples[..])
+                    } else {
+                        None
+                    };
+                    let mut sorts = Vec::new();
+                    for (i, expr) in sort_info.ordering_exprs.iter().enumerate() {
+                        let is_asc = sort_info.is_asc_order.get(i).copied().unwrap_or(true);
+                        let nulls_first = sort_info.nulls_first.get(i).copied().unwrap_or(true);
+                        let direction = match (is_asc, nulls_first) {
+                            (true, true) => sort_field::SortDirection::AscNullsFirst,
+                            (true, false) => sort_field::SortDirection::AscNullsLast,
+                            (false, true) => sort_field::SortDirection::DescNullsFirst,
+                            (false, false) => sort_field::SortDirection::DescNullsLast,
+                        };
+                        let sort_expr = if let Some(tuples) = tuples {
+                            expr_translator::translate_expr_in_context(expr, desc, registry, tuples)?
+                        } else {
+                            expr_translator::translate_expr(expr, desc, registry)?
+                        };
+                        sorts.push(SortField {
+                            expr: Some(sort_expr),
+                            sort_kind: Some(sort_field::SortKind::Direction(direction as i32)),
+                        });
+                    }
+                    if !sorts.is_empty() {
+                        rel = Rel {
+                            rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                                input: Some(Box::new(rel)),
+                                sorts,
+                                ..Default::default()
+                            }))),
+                        };
+                    }
+                }
+            }
+            // Apply LIMIT if present on the exchange node.
+            let offset = node.exchange_node.as_ref().and_then(|e| e.offset).unwrap_or(0);
+            if node.limit >= 0 || offset > 0 {
+                rel = Rel {
+                    rel_type: Some(rel::RelType::Fetch(Box::new(FetchRel {
+                        input: Some(Box::new(rel)),
+                        offset_mode: Some(fetch_rel::OffsetMode::Offset(offset)),
+                        count_mode: if node.limit >= 0 {
+                            Some(fetch_rel::CountMode::Count(node.limit))
+                        } else {
+                            None
+                        },
+                        ..Default::default()
+                    }))),
+                };
+            }
+            return Ok(rel);
         }
         bail!("EXCHANGE_NODE with {} children not yet supported", children.len())
     } else if node.node_type == TPlanNodeType::EMPTY_SET_NODE {
