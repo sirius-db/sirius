@@ -101,22 +101,7 @@ fn translate_node(
             // into a DuckDB table by grpc_service.rs. The table name is
             // query-scoped (e.g. "__EXCH_{query_lo_hex}_{node_id}") and
             // passed via table_schemas. Look up by node_id suffix.
-            // Match query-scoped exchange table name: __EXCH_{hex8}_{node_id}
-            // or legacy __EXCHANGE_TABLE_{node_id}. Use exact node_id match
-            // to avoid ambiguity (e.g. node_id=3 must not match __EXCH_xxx_13).
-            let node_id_str = node.node_id.to_string();
-            let exchange_table_name = table_schemas.keys()
-                .find(|k| {
-                    if !k.starts_with("__EXCH_") { return false; }
-                    // Extract the trailing number after the last '_'
-                    match k.rfind('_') {
-                        Some(pos) => &k[pos + 1..] == node_id_str,
-                        None => false,
-                    }
-                })
-                .or_else(|| table_schemas.keys().find(|k| *k == &format!("__EXCHANGE_TABLE_{}", node.node_id)))
-                .cloned()
-                .unwrap_or_else(|| format!("__EXCHANGE_TABLE_{}", node.node_id));
+            let exchange_table_name = resolve_exchange_table_name(node.node_id, table_schemas);
 
             // Build schema from the exchange node's output tuple.
             let tuple_id = *node
@@ -1282,4 +1267,38 @@ fn translate_nested_loop_join_node(
 
         apply_conjuncts(join_rel, node, desc, registry)
     }
+}
+
+/// Resolve the DuckDB table name for an exchange node.
+///
+/// Exchange tables are named `__EXCH_{hex8}_{node_id}` by the exchange receiver.
+/// This function searches `table_schemas` for a matching key. Falls back to the
+/// legacy `__EXCHANGE_TABLE_{node_id}` format if not found.
+///
+/// The lookup uses exact node_id suffix matching to avoid ambiguity
+/// (e.g., node_id=3 must not match `__EXCH_abc_13`).
+pub fn resolve_exchange_table_name(
+    node_id: i32,
+    table_schemas: &HashMap<String, Vec<String>>,
+) -> String {
+    let node_id_str = node_id.to_string();
+    table_schemas
+        .keys()
+        .find(|k| {
+            if !k.starts_with("__EXCH_") {
+                return false;
+            }
+            // Extract the trailing number after the last '_'
+            match k.rfind('_') {
+                Some(pos) => &k[pos + 1..] == node_id_str,
+                None => false,
+            }
+        })
+        .or_else(|| {
+            table_schemas
+                .keys()
+                .find(|k| *k == &format!("__EXCHANGE_TABLE_{}", node_id))
+        })
+        .cloned()
+        .unwrap_or_else(|| format!("__EXCHANGE_TABLE_{}", node_id))
 }
