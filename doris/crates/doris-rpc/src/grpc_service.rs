@@ -1794,9 +1794,45 @@ impl PBackendService for PBackendServiceHandler {
                                 gpu_size = first.gpu_size,
                                 "registering packed GPU exchange table (zero CPU copies)"
                             );
+                            // Extract DATE column indices from the exchange node's descriptor.
+                            // The C++ register_packed_table maps cudf INT32 to DuckDB INTEGER,
+                            // but DATE columns need to be overridden to DuckDB DATE.
+                            let date_col_overrides: Vec<(usize, &str)> = (|| -> Option<Vec<(usize, &str)>> {
+                                use doris_thrift::types::TPrimitiveType;
+                                let plan = params.fragment.as_ref()?.plan.as_ref()?;
+                                let exch_node = plan.nodes.iter().find(|n| {
+                                    n.node_type == doris_thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE
+                                        && n.num_children == 0
+                                        && n.node_id == node_id
+                                })?;
+                                let tuple_id = *exch_node.row_tuples.first()?;
+                                let dt = params.desc_tbl.as_ref()?;
+                                let slots = dt.slot_descriptors.as_ref()?.as_slice();
+                                let mat_slots: Vec<_> = slots.iter()
+                                    .filter(|s| s.parent == tuple_id && s.is_materialized)
+                                    .collect();
+                                let mut overrides = Vec::new();
+                                for (i, slot) in mat_slots.iter().enumerate() {
+                                    let ptype = slot.slot_type.types.as_ref()
+                                        .and_then(|ts| ts.first())
+                                        .and_then(|tn| tn.scalar_type.as_ref())
+                                        .map(|s| s.type_);
+                                    match ptype {
+                                        Some(TPrimitiveType::DATE) | Some(TPrimitiveType::DATEV2) =>
+                                            overrides.push((i, "DATE")),
+                                        Some(TPrimitiveType::DATETIME) | Some(TPrimitiveType::DATETIMEV2) =>
+                                            overrides.push((i, "TIMESTAMP")),
+                                        _ => {}
+                                    }
+                                }
+                                Some(overrides)
+                            })().unwrap_or_default();
+
                             let reg_engine = engine.clone();
                             let reg_table = table_name.clone();
                             let packed_owned = packed_list;
+                            let date_overrides = date_col_overrides.iter()
+                                .map(|(i, t)| (*i, t.to_string())).collect::<Vec<_>>();
                             let reg_result = tokio::task::spawn_blocking(move || {
                                 let eng = reg_engine.lock().unwrap();
                                 // Register each packed buffer into the same table.
@@ -1805,6 +1841,16 @@ impl PBackendService for PBackendServiceHandler {
                                     eng.register_packed_table(
                                         &reg_table, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
                                     )?;
+                                }
+                                // Override DATE/TIMESTAMP column types (C++ maps cudf INT32 to INTEGER).
+                                for (col_idx, dtype) in &date_overrides {
+                                    let alter_sql = format!(
+                                        "ALTER TABLE \"{}\" ALTER COLUMN \"col_{}\" TYPE {}",
+                                        reg_table, col_idx, dtype
+                                    );
+                                    if let Err(e) = eng.execute_sql(&alter_sql) {
+                                        tracing::warn!(error = %e, col_idx, dtype, "failed to override column type");
+                                    }
                                 }
                                 eng.get_table_columns(&reg_table)
                                     .map_err(|e| sirius_ffi::EngineError::ExecFailed(e.to_string()))
