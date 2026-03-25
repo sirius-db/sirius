@@ -429,9 +429,17 @@ impl SiriusEngine {
         let schema = reader.schema();
 
         // Create the table with the right schema.
-        let cols: Vec<String> = schema.fields().iter().map(|f| {
+        // Sanitize column names: expression text (e.g. `sum("if"((...))`) from
+        // Doris PBlock metadata breaks SQL parsing. Use positional aliases.
+        let cols: Vec<String> = schema.fields().iter().enumerate().map(|(i, f)| {
             let dt = arrow_type_to_duckdb_sql(f.data_type());
-            format!("\"{}\" {}", f.name(), dt)
+            let name = f.name();
+            let safe_name = if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
+                name.to_string()
+            } else {
+                format!("col_{}", i)
+            };
+            format!("\"{}\" {}", safe_name, dt)
         }).collect();
         let create_sql = format!(
             "CREATE OR REPLACE TABLE \"{}\" ({})",

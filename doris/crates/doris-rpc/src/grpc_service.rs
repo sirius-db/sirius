@@ -1908,10 +1908,13 @@ impl PBackendService for PBackendServiceHandler {
                             .collect();
 
                         let column_names: Vec<String> =
-                            keep_indices.iter().map(|&i| {
+                            keep_indices.iter().enumerate().map(|(out_idx, &i)| {
                                 let name = &col_info[i].0;
-                                if name.is_empty() {
-                                    format!("col{}", i)
+                                // Sanitize: column names with special chars (parens, quotes,
+                                // hash signs) break SQL CREATE TABLE and Substrait NamedTable.
+                                // Use positional alias for any non-identifier name.
+                                if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                                    format!("col_{}", out_idx)
                                 } else {
                                     name.clone()
                                 }
