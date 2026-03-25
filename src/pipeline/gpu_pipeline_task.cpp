@@ -284,10 +284,13 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         requested_bytes = cc_oom->requested_bytes;
         global_usage    = cc_oom->global_usage;
       }
+      size_t reservation_bytes =
+        _local_state->cast<gpu_pipeline_task_local_state>().get_reservation_bytes();
       SIRIUS_LOG_WARN(
         "Pipeline {}: OOM at operator {} (id={}, index {}/{}), "
         "requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
         "peak allocated {} bytes ({:.2f} MB), "
+        "reservation {} bytes ({:.2f} MB), "
         "rescheduling task {}",
         pipeline->get_pipeline_id(),
         op.get_name(),
@@ -300,7 +303,20 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         static_cast<double>(global_usage) / (1024.0 * 1024.0),
         peak_bytes,
         static_cast<double>(peak_bytes) / (1024.0 * 1024.0),
+        reservation_bytes,
+        static_cast<double>(reservation_bytes) / (1024.0 * 1024.0),
         _task_id);
+
+      peak_bytes += requested_bytes;  // update peak bytes to include the requested bytes since that
+                                      // is what could have been the peak consumption
+      // If the number of bytes consumed is greater than the reservation size, record the peak
+      // consumption
+      if (peak_bytes > reservation_bytes) {
+        auto input_basis =
+          _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
+        auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+        global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
+      }
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
         i,
@@ -391,12 +407,18 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     try {
       handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory& oom) {
-      auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
-      auto input_basis = local_state.get_task_consumption_basis();
+      auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+      if (auto const* cc_oom =
+            dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+        peak_bytes +=
+          cc_oom->requested_bytes;  // update peak bytes to include the requested bytes since that
+                                    // is what could have been the peak consumption
+      }
       // If the number of bytes consumed is greater than the reservation size, record the peak
       // consumption
       if (peak_bytes > reservation_bytes) {
-        auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+        auto input_basis = local_state.get_task_consumption_basis();
+        auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
         global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
       }
       SIRIUS_LOG_ERROR("Pipeline {}: OOM at batch {} preparing for processing, state: {}",
@@ -441,21 +463,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
-  _allocator       = allocator;
-  auto input_basis = local_state.get_task_consumption_basis();
-  std::unique_ptr<op::operator_data> output_data;
-  try {
-    output_data = compute_task(stream);
-  } catch (oom_reschedule_exception&) {
-    auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
-    // If the number of bytes consumed is greater than the reservation size, record the peak
-    // consumption
-    if (peak_bytes > reservation_bytes) {
-      auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-      global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
-    }
-    throw;
-  }
+  _allocator                                     = allocator;
+  auto input_basis                               = local_state.get_task_consumption_basis();
+  std::unique_ptr<op::operator_data> output_data = compute_task(stream);
 
   // Record memory metrics for future reservation estimates
   if (output_data) {

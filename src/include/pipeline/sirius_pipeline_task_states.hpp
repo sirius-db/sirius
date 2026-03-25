@@ -111,8 +111,11 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
    */
   void set_reservation(std::unique_ptr<cucascade::memory::reservation> res)
   {
-    _reservation = std::move(res);
+    _reservation       = std::move(res);
+    _reservation_bytes = _reservation->size();
   }
+
+  [[nodiscard]] std::size_t get_reservation_bytes() const { return _reservation_bytes; }
 
   /**
    * @brief Get the basis for estimating task memory consumption.
@@ -136,6 +139,7 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
 
   std::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources
+  std::size_t _reservation_bytes;
 };
 
 }  // namespace pipeline

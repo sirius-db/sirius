@@ -22,5 +22,6 @@ set(TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_executor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_oom_reschedule.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_memory_history.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_pipeline_task_history.cpp
     # ${CMAKE_CURRENT_SOURCE_DIR}/test_modified_pipeline.cpp
     PARENT_SCOPE)
