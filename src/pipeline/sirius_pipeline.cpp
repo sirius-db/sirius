@@ -290,6 +290,7 @@ void sirius_pipeline::update_pipeline_status()
     if (table_scan.exhausted.load(std::memory_order_acquire)) {
       pipeline_finished.store(true);
       end_nvtx_range_if_finished();
+      if (on_finished) { on_finished(); }
       return;
     }
   } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {

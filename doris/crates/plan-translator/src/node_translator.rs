@@ -108,10 +108,14 @@ fn translate_node(
                 .row_tuples
                 .first()
                 .context("EXCHANGE_NODE has no row_tuples")?;
-            let base_schema = if let Some(columns) = table_schemas.get(&exchange_table_name) {
-                scan_translator::build_exchange_schema(columns, desc)?
-            } else {
-                desc.table_named_struct(tuple_id)?
+            let base_schema = match table_schemas.get(&exchange_table_name) {
+                Some(columns) if !columns.is_empty() => {
+                    scan_translator::build_exchange_schema(columns, desc)?
+                }
+                _ => {
+                    // No column info (empty exchange or not registered) — use descriptor.
+                    desc.table_named_struct(tuple_id)?
+                }
             };
 
             return Ok(Rel {

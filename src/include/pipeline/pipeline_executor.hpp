@@ -194,6 +194,7 @@ class pipeline_executor {
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
   std::unique_ptr<completion_handler> _completion_handler;
+  duckdb::shared_ptr<planner::query> _current_query;
 };
 
 }  // namespace pipeline

@@ -327,6 +327,17 @@ void duckdb_scan_executor::manager_loop()
             _task_creator->schedule(consumer);
           }
         }
+
+        // Check if scan produced 0 rows and pipeline is already finished.
+        // When all scan threads complete with 0 rows, exhausted=true and
+        // pipeline_finished=true are set, but no GPU tasks are created
+        // (no data → no pipeline tasks). Signal completion directly.
+        if (_completion_handler && !_completion_handler->is_completed()) {
+          // The scan task knows its pipeline. If the pipeline is finished
+          // and its sink is a RESULT_COLLECTOR, signal completion.
+          // Nothing to do here — completion is signaled from
+          // update_pipeline_status via the completion_handler callback.
+        }
       } catch (...) {
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
       }

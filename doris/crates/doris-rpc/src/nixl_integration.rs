@@ -562,15 +562,17 @@ async fn send_hash_partitioned(
                         }
                     }
                     _ => {
-                        // Empty partition — still need to signal EOS.
+                        // Empty partition — still need to signal EOS so the receiver
+                        // doesn't wait forever for data that will never arrive.
                         if is_local {
                             exchange_buffer.add_block(&key, sender_id, None, true);
+                        } else {
+                            // Send empty EOS via bRPC for remote empty partitions.
+                            crate::exchange_sender::send_eos(
+                                dest, query_id, node_id, sender_id,
+                            ).await.map_err(|e| format!("empty partition EOS: {e}"))?;
                         }
-                        // For remote empty partitions, the bRPC fallback path below
-                        // will handle it if this GPU path doesn't return early.
-                        // For now, empty remote partitions cause the exchange to hang.
-                        // TODO: send empty EOS via bRPC for remote empty partitions.
-                        tracing::info!(dest_idx, dest = %dest.brpc_addr, "empty partition (EOS only)");
+                        tracing::info!(dest_idx, dest = %dest.brpc_addr, is_local, "empty partition EOS sent");
                     }
                 }
             }

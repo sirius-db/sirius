@@ -27,6 +27,7 @@
 #include "duckdb/parallel/pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
+#include <functional>
 
 namespace sirius {
 
@@ -149,6 +150,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   void mark_task_created();
   void mark_task_completed();
+
+  //! Optional callback invoked when the pipeline finishes.
+  //! Used to signal the completion_handler when a 0-row scan completes
+  //! and no GPU tasks are created.
+  std::function<void()> on_finished;
 
  private:
   //! Whether or not the pipeline has been readied

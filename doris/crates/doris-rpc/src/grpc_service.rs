@@ -1831,7 +1831,81 @@ impl PBackendService for PBackendServiceHandler {
                         let blocks = buffer.take(&key);
 
                         if blocks.is_empty() {
-                            info!(table = %table_name, "exchange has no blocks, creating empty table");
+                            // No PBlocks received — the exchange produced 0 rows
+                            // (e.g. hash partition sent all data to the other BE).
+                            // Create an empty DuckDB table with the correct schema from
+                            // the exchange node's slot descriptors.
+                            info!(table = %table_name, node_id, "exchange has no PBlock data, creating empty table from descriptor");
+
+                            // Find the EXCHANGE_NODE in the plan to get its row_tuples,
+                            // then resolve column types from the descriptor table.
+                            let col_defs: Vec<String> = (|| -> Option<Vec<String>> {
+                                let plan = params.fragment.as_ref()?.plan.as_ref()?;
+                                let exch_node = plan.nodes.iter().find(|n| {
+                                    n.node_type == doris_thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE
+                                        && n.num_children == 0
+                                        && n.node_id == node_id
+                                })?;
+                                let tuple_id = *exch_node.row_tuples.first()?;
+                                let dt = params.desc_tbl.as_ref()?;
+                                // TSlotDescriptor.parent links to TTupleDescriptor.id.
+                                let slots = dt.slot_descriptors.as_ref()?.as_slice();
+                                let mut defs = Vec::new();
+                                for slot in slots.iter().filter(|s| s.parent == tuple_id && s.is_materialized) {
+                                        use doris_thrift::types::TPrimitiveType;
+                                        let ptype: Option<doris_thrift::types::TPrimitiveType> = slot.slot_type.types.as_ref()
+                                            .and_then(|ts| ts.first())
+                                            .and_then(|tn| tn.scalar_type.as_ref())
+                                            .map(|s| s.type_);
+                                        let sql_type = match ptype {
+                                            Some(TPrimitiveType::BIGINT) => "BIGINT",
+                                            Some(TPrimitiveType::INT) => "INTEGER",
+                                            Some(TPrimitiveType::SMALLINT) => "SMALLINT",
+                                            Some(TPrimitiveType::TINYINT) => "TINYINT",
+                                            Some(TPrimitiveType::DOUBLE) => "DOUBLE",
+                                            Some(TPrimitiveType::FLOAT) => "FLOAT",
+                                            Some(TPrimitiveType::BOOLEAN) => "BOOLEAN",
+                                            Some(TPrimitiveType::DATE) | Some(TPrimitiveType::DATEV2) => "DATE",
+                                            Some(TPrimitiveType::DATETIME) | Some(TPrimitiveType::DATETIMEV2) => "TIMESTAMP",
+                                            Some(TPrimitiveType::DECIMALV2) => "DECIMAL(27,9)",
+                                            Some(TPrimitiveType::DECIMAL32) => "DECIMAL(9,0)",
+                                            Some(TPrimitiveType::DECIMAL64) => "DECIMAL(18,0)",
+                                            Some(TPrimitiveType::DECIMAL128I) => "DECIMAL(38,0)",
+                                            Some(TPrimitiveType::LARGEINT) => "HUGEINT",
+                                            Some(TPrimitiveType::CHAR) | Some(TPrimitiveType::STRING) => "VARCHAR",
+                                            // Default to BIGINT for aggregate measures (COUNT, SUM of int).
+                                            // VARCHAR default caused sum(VARCHAR) errors.
+                                            _ => "BIGINT",
+                                        };
+                                        let safe_name = if slot.col_name.is_empty()
+                                            || !slot.col_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                                        {
+                                            format!("col_{}", slot.id)
+                                        } else {
+                                            slot.col_name.clone()
+                                        };
+                                        defs.push(format!("\"{}\" {}", safe_name, sql_type));
+                                }
+                                Some(defs)
+                            })().unwrap_or_default();
+
+                            let engine_guard = engine.lock().unwrap();
+                            if !col_defs.is_empty() {
+                                let create_sql = format!(
+                                    "CREATE OR REPLACE TABLE \"{}\" ({})",
+                                    table_name, col_defs.join(", ")
+                                );
+                                info!(table = %table_name, sql = %create_sql, "creating empty exchange table");
+                                let _ = engine_guard.execute_sql(&create_sql);
+                                match engine_guard.get_table_columns(&table_name) {
+                                    Ok(cols) => { table_schemas.insert(table_name.clone(), cols); }
+                                    Err(_) => { table_schemas.insert(table_name.clone(), vec![]); }
+                                }
+                            } else {
+                                warn!(table = %table_name, "no column info for empty exchange table");
+                                table_schemas.insert(table_name.clone(), vec![]);
+                            }
+                            drop(engine_guard);
                             continue;
                         }
 

@@ -131,6 +131,8 @@ void pipeline_executor::set_scan_caching_config(sirius::op::scan::cache_level le
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
+  _current_query = query;
+
   // Drain leftover tasks from previous query
   _scan_executor->drain_leftover_tasks();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
@@ -163,6 +165,23 @@ std::future<void> pipeline_executor::start_query()
   _scan_executor->set_completion_handler(_completion_handler.get());
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->set_completion_handler(_completion_handler.get());
+  }
+
+  // Set on_finished callbacks on result-collector pipelines so that 0-row scans
+  // (which produce no GPU tasks) can signal the completion handler directly.
+  auto* ch = _completion_handler.get();
+  if (_current_query) {
+  for (auto& pipeline : _current_query->get_pipelines()) {
+    auto sink = pipeline->get_sink();
+    if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+      pipeline->on_finished = [ch]() {
+        if (ch && !ch->is_completed()) {
+          SIRIUS_LOG_INFO("pipeline on_finished: signaling completion (0-row scan)");
+          ch->mark_completed();
+        }
+      };
+    }
+  }
   }
 
   schedule_next_scan_tasks();

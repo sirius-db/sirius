@@ -224,6 +224,19 @@ pub async fn send_exchange_result(
     Ok(())
 }
 
+/// Send an empty EOS signal to a remote BE for a given exchange node.
+///
+/// Used when a hash partition produces 0 rows for a destination —
+/// the receiver still needs the EOS to stop waiting.
+pub async fn send_eos(
+    dest: &ExchangeDest,
+    query_id: (i64, i64),
+    node_id: i32,
+    sender_id: i32,
+) -> Result<(), String> {
+    send_transmit_block(dest, query_id, node_id, sender_id, None, true, 0).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
