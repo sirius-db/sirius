@@ -287,8 +287,7 @@ void sirius_pipeline::update_pipeline_status()
 
   if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
-    if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
-                                 // get_next_task_hint() to check if the source is ready?
+    if (table_scan.exhausted.load(std::memory_order_acquire)) {
       pipeline_finished.store(true);
       end_nvtx_range_if_finished();
       return;

@@ -102,10 +102,13 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   {
     _source_drained.store(true, std::memory_order_release);
     if (get_pipeline()) {
-      auto* scan_op =
-        dynamic_cast<sirius_physical_duckdb_scan*>(&get_pipeline()->get_operators().at(0).get());
+      auto source = get_pipeline()->get_source();
+      auto* scan_op = source ? dynamic_cast<sirius_physical_duckdb_scan*>(source.get()) : nullptr;
 
-      if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
+      if (scan_op) {
+        scan_op->exhausted.store(true, std::memory_order_release);
+        get_pipeline()->update_pipeline_status();
+      }
     }
   }
 

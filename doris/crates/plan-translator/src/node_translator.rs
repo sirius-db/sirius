@@ -102,12 +102,18 @@ fn translate_node(
             // query-scoped (e.g. "__EXCH_{query_lo_hex}_{node_id}") and
             // passed via table_schemas. Look up by node_id suffix.
             // Match query-scoped exchange table name: __EXCH_{hex8}_{node_id}
-            // or legacy __EXCHANGE_TABLE_{node_id}. Use precise suffix to
-            // avoid ambiguity (e.g. node 4 vs 14).
-            let suffix_a = format!("__EXCH_") ;  // query-scoped prefix
-            let suffix_b = format!("_{}", node.node_id);
+            // or legacy __EXCHANGE_TABLE_{node_id}. Use exact node_id match
+            // to avoid ambiguity (e.g. node_id=3 must not match __EXCH_xxx_13).
+            let node_id_str = node.node_id.to_string();
             let exchange_table_name = table_schemas.keys()
-                .find(|k| k.starts_with(&suffix_a) && k.ends_with(&suffix_b))
+                .find(|k| {
+                    if !k.starts_with("__EXCH_") { return false; }
+                    // Extract the trailing number after the last '_'
+                    match k.rfind('_') {
+                        Some(pos) => &k[pos + 1..] == node_id_str,
+                        None => false,
+                    }
+                })
                 .or_else(|| table_schemas.keys().find(|k| *k == &format!("__EXCHANGE_TABLE_{}", node.node_id)))
                 .cloned()
                 .unwrap_or_else(|| format!("__EXCHANGE_TABLE_{}", node.node_id));

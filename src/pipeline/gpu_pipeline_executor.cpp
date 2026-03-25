@@ -261,9 +261,19 @@ void gpu_pipeline_executor::manager_loop()
       }
 
       if (!query_complete && _task_creator) {
-        bool pipeline_done = pipeline && pipeline->is_pipeline_finished();
         for (auto* consumer : consumers) {
           if (consumer) { _task_creator->schedule(consumer); }
+        }
+        // Re-check pipeline completion after scheduling downstream tasks.
+        // A concurrent scan task may have set exhausted=true (and thus
+        // pipeline_finished=true) between the first check above and now.
+        // Without this re-check, the completion signal would be missed when
+        // this is the last GPU task for the pipeline.
+        if (_completion_handler && pipeline && !_completion_handler->is_completed()) {
+          auto sink = pipeline->get_sink();
+          if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+            query_complete = pipeline->is_pipeline_finished();
+          }
         }
       }
 

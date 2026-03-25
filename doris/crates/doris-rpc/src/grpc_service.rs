@@ -1194,9 +1194,16 @@ fn reorder_and_pad_ipc(
     let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None)
         .map_err(|e| format!("parse IPC for reorder+pad: {e}"))?;
     let schema = reader.schema();
+    let ipc_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
-    if schema.fields().len() >= fe_output_names.len() {
-        return Ok(ipc_bytes.to_vec());
+    // Check if columns are already in the right order — skip reorder if so.
+    if schema.fields().len() == fe_output_names.len() {
+        let already_ordered = ipc_names.iter().zip(fe_output_names.iter()).all(|(a, b)| {
+            *a == b || b.starts_with("expr_")
+        });
+        if already_ordered {
+            return Ok(ipc_bytes.to_vec());
+        }
     }
 
     // Build name → IPC column index map.
@@ -1207,11 +1214,28 @@ fn reorder_and_pad_ipc(
         .map(|(i, f)| (f.name().as_str(), i))
         .collect();
 
-    // For each FE output position, find the source IPC column index (or None for NULL).
-    let mapping: Vec<Option<usize>> = fe_output_names
-        .iter()
-        .map(|name| ipc_name_to_idx.get(name.as_str()).copied())
+    // For each FE output position, find the source IPC column index.
+    // Names like "expr_N" are aggregate expressions — match by elimination
+    // (assign unmatched IPC columns to unmatched FE positions).
+    let mut used_ipc: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut mapping: Vec<Option<usize>> = Vec::with_capacity(fe_output_names.len());
+    for name in fe_output_names {
+        if let Some(&idx) = ipc_name_to_idx.get(name.as_str()) {
+            mapping.push(Some(idx));
+            used_ipc.insert(idx);
+        } else {
+            mapping.push(None); // Will be resolved below
+        }
+    }
+    // Assign unmatched IPC columns (aggregates) to unmatched FE positions (expr_N).
+    let mut unmatched_ipc: Vec<usize> = (0..schema.fields().len())
+        .filter(|i| !used_ipc.contains(i))
         .collect();
+    for slot in &mut mapping {
+        if slot.is_none() && !unmatched_ipc.is_empty() {
+            *slot = Some(unmatched_ipc.remove(0));
+        }
+    }
 
     let matched = mapping.iter().filter(|m| m.is_some()).count();
     let null_count = mapping.iter().filter(|m| m.is_none()).count();
@@ -1221,8 +1245,9 @@ fn reorder_and_pad_ipc(
         matched,
         null_count,
         fe_names = ?fe_output_names,
-        ipc_names = ?schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
-        "reordering and padding IPC for late materialization"
+        ipc_names = ?ipc_names,
+        mapping = ?mapping,
+        "reordering IPC columns to match FE output order"
     );
 
     // Build padded schema in FE output order.
@@ -2141,6 +2166,7 @@ impl PBackendService for PBackendServiceHandler {
                                 // columns to FE output positions by name, inserting NULLs
                                 // for late-materialized columns.
                                 let fe_names = extract_fe_output_names(&params);
+                                info!(fe_names = ?fe_names, "extract_fe_output_names for result delivery");
                                 if !fe_names.is_empty() {
                                     match reorder_and_pad_ipc(&ipc_bytes, &fe_names) {
                                         Ok(padded) => ipc_bytes = padded,
