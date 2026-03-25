@@ -153,8 +153,20 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // task creator should never schedule additional scans from downstream.
     // (Parquet scans are fine — they use partition indices that self-limit.)
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
-      if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
+      auto it = _scan_operator_global_state_map.find(producer->get_operator_id());
+      if (it != _scan_operator_global_state_map.end()) {
+        if (it->second->is_source_drained()) {
+          // Scan is done — data should be in the repository already.
+          // Return the CONSUMER node (not the producer) so the task creator
+          // creates a GPU task for the consumer pipeline.
+          return node;
+        }
+        if (!it->second->can_create_more_tasks()) {
+          return nullptr;
+        }
+      } else {
+        SIRIUS_LOG_WARN("Task Creator: DUCKDB_SCAN operator {} has no global state",
+                        producer->get_operator_id());
         return nullptr;
       }
     }

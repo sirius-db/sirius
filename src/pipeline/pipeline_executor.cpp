@@ -248,17 +248,23 @@ void pipeline_executor::schedule_next_scan_tasks()
 {
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   SIRIUS_LOG_INFO("[schedule_next_scan_tasks] priority_scans queue size={}", _priority_scans.size());
-  if (!_priority_scans.empty()) {
+  if (_priority_scans.empty()) {
+    SIRIUS_LOG_WARN("[schedule_next_scan_tasks] NO scan operators in queue — pipeline will hang!");
+    return;
+  }
+  // Schedule ALL priority scans, not just the first one.
+  // Multi-pipeline plans (e.g., Q7 with 6 exchange tables) have multiple
+  // scan operators that need to run concurrently for the pipeline dependency
+  // chain to progress.
+  auto num_threads = _scan_executor->get_num_threads();
+  while (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    auto num_threads = _scan_executor->get_num_threads();
     SIRIUS_LOG_INFO("[schedule_next_scan_tasks] scheduling scan type={} on {} threads",
                     static_cast<int>(scan_op->type), num_threads);
     for (auto i = 0; i != num_threads; ++i) {
       _task_creator->schedule(scan_op);
     }
     _priority_scans.pop();
-  } else {
-    SIRIUS_LOG_WARN("[schedule_next_scan_tasks] NO scan operators in queue — pipeline will hang!");
   }
 }
 
