@@ -213,7 +213,29 @@ void sirius_engine::execute()
   auto future = sirius_ctx->get_pipeline_executor().start_query();
   SIRIUS_LOG_INFO("[sirius_engine::execute] waiting on future.get()");
   try {
-    future.get();
+    // Wait with timeout to detect pipeline hangs and log diagnostic info.
+    auto status = future.wait_for(std::chrono::seconds(30));
+    if (status == std::future_status::timeout) {
+      SIRIUS_LOG_WARN("[sirius_engine::execute] pipeline hang detected after 30s");
+      // Log per-pipeline status to identify the stuck pipeline.
+      auto query = sirius_ctx->get_query();
+      if (query) {
+        for (size_t i = 0; i < query->get_pipelines().size(); ++i) {
+          auto& p = query->get_pipelines()[i];
+          auto src = p->get_source();
+          auto snk = p->get_sink();
+          SIRIUS_LOG_WARN("[pipeline {}] finished={} tasks_created={} tasks_completed={} src={} sink={}",
+                          i, p->is_pipeline_finished(),
+                          p->tasks_created.load(), p->tasks_completed.load(),
+                          src ? static_cast<int>(src->type) : -1,
+                          snk ? static_cast<int>(snk->type) : -1);
+        }
+      }
+      // Continue waiting (don't timeout — let the FE handle it).
+      future.get();
+    } else {
+      future.get();
+    }
     SIRIUS_LOG_INFO("[sirius_engine::execute] future.get() returned OK");
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
