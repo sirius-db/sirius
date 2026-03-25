@@ -1077,7 +1077,8 @@ fn project_ipc_columns(
                     tracing::warn!(
                         column = %name,
                         duckdb_schema = ?schema_names,
-                        "projection column not found in result, skipping projection"
+                        output_names = ?output_names,
+                        "projection column not found in result, skipping projection (caller: check project_ipc_columns call sites)"
                     );
                     return Ok(ipc_bytes.to_vec());
                 }
@@ -2159,14 +2160,12 @@ impl PBackendService for PBackendServiceHandler {
                             }
                         }
                         let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
-                        // Only project columns for result-delivery fragments (no exchange destinations).
-                        // Intermediate exchange fragments forward all columns — the next fragment
-                        // needs the full schema (including grouping keys that output_names may omit).
-                        if !should_retain_exch {
-                            if let Some(names) = output_names {
-                                ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
-                            }
-                        }
+                        // Skip project_ipc_columns entirely for exchange fragments.
+                        // - Intermediate fragments (should_retain_exch=true): need all columns
+                        //   for the next fragment, including GROUP BY keys that output_names omit.
+                        // - Result-delivery fragments: IPC may have generic col_N names from packed
+                        //   GPU tables — name matching fails. Column reordering is handled later
+                        //   by reorder_and_pad_ipc (with descriptor-based aliases).
                         if is_cpu_only {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         } else if should_retain_exch {
