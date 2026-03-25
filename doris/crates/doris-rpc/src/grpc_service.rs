@@ -1176,126 +1176,6 @@ fn extract_fe_output_names(params: &TPipelineFragmentParams) -> Vec<String> {
         .collect()
 }
 
-/// Reorder IPC columns to match FE output order and pad with NULLs for missing columns.
-///
-/// When Doris uses late materialization (VMaterializeNode), the exchange data has
-/// fewer columns than the FE expects, and may be in a different order (e.g., sort key
-/// order vs. SELECT list order). This function:
-/// 1. Matches IPC columns to FE output positions by name
-/// 2. Reorders columns to match FE's expected order
-/// 3. Inserts NullArray columns for late-materialized columns not in the exchange
-fn reorder_and_pad_ipc(
-    ipc_bytes: &[u8],
-    fe_output_names: &[String],
-) -> Result<Vec<u8>, String> {
-    use arrow::ipc::reader::StreamReader;
-    use arrow::ipc::writer::StreamWriter;
-
-    let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None)
-        .map_err(|e| format!("parse IPC for reorder+pad: {e}"))?;
-    let schema = reader.schema();
-    let ipc_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-
-    // Check if columns are already in the right order — skip reorder if so.
-    if schema.fields().len() == fe_output_names.len() {
-        let already_ordered = ipc_names.iter().zip(fe_output_names.iter()).all(|(a, b)| {
-            *a == b || b.starts_with("expr_")
-        });
-        if already_ordered {
-            return Ok(ipc_bytes.to_vec());
-        }
-    }
-
-    // Build name → IPC column index map.
-    let ipc_name_to_idx: std::collections::HashMap<&str, usize> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (f.name().as_str(), i))
-        .collect();
-
-    // For each FE output position, find the source IPC column index.
-    // Names like "expr_N" are aggregate expressions — match by elimination
-    // (assign unmatched IPC columns to unmatched FE positions).
-    let mut used_ipc: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut mapping: Vec<Option<usize>> = Vec::with_capacity(fe_output_names.len());
-    for name in fe_output_names {
-        if let Some(&idx) = ipc_name_to_idx.get(name.as_str()) {
-            mapping.push(Some(idx));
-            used_ipc.insert(idx);
-        } else {
-            mapping.push(None); // Will be resolved below
-        }
-    }
-    // Assign unmatched IPC columns (aggregates) to unmatched FE positions (expr_N).
-    let mut unmatched_ipc: Vec<usize> = (0..schema.fields().len())
-        .filter(|i| !used_ipc.contains(i))
-        .collect();
-    for slot in &mut mapping {
-        if slot.is_none() && !unmatched_ipc.is_empty() {
-            *slot = Some(unmatched_ipc.remove(0));
-        }
-    }
-
-    let matched = mapping.iter().filter(|m| m.is_some()).count();
-    let null_count = mapping.iter().filter(|m| m.is_none()).count();
-    info!(
-        ipc_cols = schema.fields().len(),
-        fe_cols = fe_output_names.len(),
-        matched,
-        null_count,
-        fe_names = ?fe_output_names,
-        ipc_names = ?ipc_names,
-        mapping = ?mapping,
-        "reordering IPC columns to match FE output order"
-    );
-
-    // Build padded schema in FE output order.
-    let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(fe_output_names.len());
-    for (i, maybe_idx) in mapping.iter().enumerate() {
-        match maybe_idx {
-            Some(idx) => fields.push(schema.field(*idx).clone().into()),
-            None => fields.push(Arc::new(arrow::datatypes::Field::new(
-                &fe_output_names[i],
-                arrow::datatypes::DataType::Utf8,
-                true,
-            ))),
-        }
-    }
-    let padded_schema = Arc::new(arrow::datatypes::Schema::new(fields));
-
-    let mut buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, &padded_schema)
-            .map_err(|e| format!("IPC writer: {e}"))?;
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| format!("read IPC batch: {e}"))?;
-            let num_rows = batch.num_rows();
-            let mut columns: Vec<Arc<dyn arrow::array::Array>> =
-                Vec::with_capacity(fe_output_names.len());
-            for maybe_idx in &mapping {
-                match maybe_idx {
-                    Some(idx) => columns.push(batch.column(*idx).clone()),
-                    None => columns.push(arrow::array::new_null_array(
-                        &arrow::datatypes::DataType::Utf8,
-                        num_rows,
-                    )),
-                }
-            }
-            let padded_batch = arrow::record_batch::RecordBatch::try_new(
-                padded_schema.clone(),
-                columns,
-            )
-            .map_err(|e| format!("create padded batch: {e}"))?;
-            writer
-                .write(&padded_batch)
-                .map_err(|e| format!("write padded batch: {e}"))?;
-        }
-        writer.finish().map_err(|e| format!("finish IPC: {e}"))?;
-    }
-    Ok(buf)
-}
-
 /// Check if a fragment has unresolved EXCHANGE_NODE(0 children) that need
 /// exchange data from other BEs (i.e., not merged with a leaf fragment).
 fn has_unresolved_exchanges(params: &TPipelineFragmentParams) -> Vec<i32> {
@@ -2296,9 +2176,9 @@ impl PBackendService for PBackendServiceHandler {
                                 let fe_names = extract_fe_output_names(&params);
                                 info!(fe_names = ?fe_names, "extract_fe_output_names for result delivery");
                                 if !fe_names.is_empty() {
-                                    match reorder_and_pad_ipc(&ipc_bytes, &fe_names) {
-                                        Ok(padded) => ipc_bytes = padded,
-                                        Err(e) => warn!(error = %e, "IPC reorder+pad failed, storing as-is"),
+                                    match crate::ipc_reorder::reorder_and_pad_ipc(&ipc_bytes, &fe_names) {
+                                        Ok(reordered) => ipc_bytes = reordered,
+                                        Err(e) => warn!(error = %e, "IPC reorder failed, storing as-is"),
                                     }
                                 }
 
