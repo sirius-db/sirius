@@ -868,18 +868,11 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
     }
     match plan {
         ExecPlan::Substrait { bytes, sort_limit_sql } => {
-            // Strip SortRel/FetchRel from Substrait before GPU execution — the Sirius
-            // GPU planner doesn't handle ORDER BY/LIMIT operators. The sort/limit SQL
-            // wrapper is applied outside via `execute_substrait`.
-            let gpu_bytes = if sort_limit_sql.is_some() {
-                strip_sort_limit_from_substrait(&bytes)
-            } else {
-                None
-            };
-            let plan_bytes = gpu_bytes.as_deref().unwrap_or(&bytes);
+            // Pass the full Substrait plan (including SortRel/FetchRel) to the GPU engine.
+            // The Sirius GPU planner handles ORDER_BY and LIMIT operators natively.
             let t0 = std::time::Instant::now();
-            tracing::info!(substrait_bytes = plan_bytes.len(), "gpu_execution_substrait starting");
-            match engine.execute_substrait(plan_bytes, sort_limit_sql.as_deref()) {
+            tracing::info!(substrait_bytes = bytes.len(), "gpu_execution_substrait starting");
+            match engine.execute_substrait(&bytes, None) {
                 Ok(ipc) => {
                     tracing::info!(elapsed_ms = t0.elapsed().as_millis() as u64, ipc_len = ipc.len(), "executed via gpu_execution_substrait");
                     Ok(ipc)
@@ -890,7 +883,8 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "gpu_execution_substrait failed, falling back to CPU from_substrait");
-                    from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
+                    // from_substrait handles SortRel/FetchRel natively.
+                    from_substrait_with_sort(engine, &bytes, None)
                 }
             }
         }
