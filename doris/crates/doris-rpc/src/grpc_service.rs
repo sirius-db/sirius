@@ -1132,6 +1132,46 @@ fn project_ipc_columns(
 /// Extract FE output column names from fragment output_exprs + desc_tbl.
 ///
 /// Returns the column names in the order the FE's SELECT list expects them.
+/// Extract column names from the fragment's root plan node descriptor.
+///
+/// Returns names in the order the GPU execution produces columns (GROUP BY keys
+/// first, then measures). Used as aliases for `reorder_and_pad_ipc` when IPC
+/// has generic col_N names from packed GPU exchange tables.
+fn extract_descriptor_column_names(params: &TPipelineFragmentParams) -> Vec<String> {
+    let plan = match params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let root = match plan.nodes.first() {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let dt = match params.desc_tbl.as_ref() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let slots = match dt.slot_descriptors.as_ref() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    // Collect materialized slots from all row_tuples of the root node.
+    let mut names = Vec::new();
+    for &tuple_id in &root.row_tuples {
+        for slot in slots.iter().filter(|s| s.parent == tuple_id && s.is_materialized) {
+            let safe = if slot.col_name.is_empty()
+                || !slot.col_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                format!("expr_{}", names.len())
+            } else {
+                slot.col_name.clone()
+            };
+            names.push(safe);
+        }
+    }
+    names
+}
+
 fn extract_fe_output_names(params: &TPipelineFragmentParams) -> Vec<String> {
     use doris_thrift::exprs::TExprNodeType;
 
@@ -1730,25 +1770,17 @@ impl PBackendService for PBackendServiceHandler {
                                         &reg_table, packed.gpu_addr, packed.gpu_size, &packed.cudf_metadata,
                                     )?;
                                 }
-                                // Override column names and types from descriptor.
-                                // C++ uses generic col_N names and cudf types (INT32 for DATE).
-                                for (col_idx, name, type_override) in &overrides {
-                                    // Rename column
-                                    let rename_sql = format!(
-                                        "ALTER TABLE \"{}\" RENAME COLUMN \"col_{}\" TO \"{}\"",
-                                        reg_table, col_idx, name
-                                    );
-                                    if let Err(e) = eng.execute_sql(&rename_sql) {
-                                        tracing::warn!(error = %e, col_idx, name, "column rename failed");
-                                    }
-                                    // Override type if needed
+                                // Override DATE/TIMESTAMP column types from descriptor.
+                                // C++ uses cudf types (INT32 for DATE) — need DuckDB DATE.
+                                // Don't rename columns — GPUBufferManager uses col_N names.
+                                for (col_idx, _name, type_override) in &overrides {
                                     if let Some(dtype) = type_override {
                                         let type_sql = format!(
-                                            "ALTER TABLE \"{}\" ALTER COLUMN \"{}\" TYPE {}",
-                                            reg_table, name, dtype
+                                            "ALTER TABLE \"{}\" ALTER COLUMN \"col_{}\" TYPE {}",
+                                            reg_table, col_idx, dtype
                                         );
                                         if let Err(e) = eng.execute_sql(&type_sql) {
-                                            tracing::warn!(error = %e, name, dtype, "column type override failed");
+                                            tracing::warn!(error = %e, col_idx, dtype, "column type override failed");
                                         }
                                     }
                                 }
@@ -2196,7 +2228,16 @@ impl PBackendService for PBackendServiceHandler {
                                 let fe_names = extract_fe_output_names(&params);
                                 info!(fe_names = ?fe_names, "extract_fe_output_names for result delivery");
                                 if !fe_names.is_empty() {
-                                    match crate::ipc_reorder::reorder_and_pad_ipc(&ipc_bytes, &fe_names) {
+                                    // Extract column aliases from descriptor: maps col_N → real name.
+                                    // This handles packed GPU tables where C++ uses generic col_N names.
+                                    let aliases = extract_descriptor_column_names(&params);
+                                    let alias_ref = if !aliases.is_empty() && aliases.iter().any(|a| !a.starts_with("col_")) {
+                                        Some(aliases.as_slice())
+                                    } else {
+                                        None
+                                    };
+                                    info!(aliases = ?alias_ref, "IPC column aliases for reorder");
+                                    match crate::ipc_reorder::reorder_and_pad_ipc(&ipc_bytes, &fe_names, alias_ref) {
                                         Ok(reordered) => ipc_bytes = reordered,
                                         Err(e) => warn!(error = %e, "IPC reorder failed, storing as-is"),
                                     }

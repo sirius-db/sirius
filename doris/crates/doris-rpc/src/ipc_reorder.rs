@@ -22,14 +22,25 @@ use tracing::info;
 ///
 /// Returns the original IPC unchanged only if the column order already matches
 /// AND all names match exactly (no `expr_N` wildcards).
+///
+/// `ipc_name_aliases` maps IPC column names (e.g. "col_0") to their real names
+/// from the descriptor table. This handles packed GPU exchange tables where the
+/// C++ registration uses generic names.
 pub fn reorder_and_pad_ipc(
     ipc_bytes: &[u8],
     fe_output_names: &[String],
+    ipc_name_aliases: Option<&[String]>,
 ) -> Result<Vec<u8>, String> {
     let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None)
         .map_err(|e| format!("parse IPC for reorder+pad: {e}"))?;
     let schema = reader.schema();
-    let ipc_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    // Use aliases if provided (maps col_0→real_name), otherwise use IPC field names.
+    let ipc_names: Vec<&str> = if let Some(aliases) = ipc_name_aliases {
+        // Aliases are positional — alias[i] is the real name for IPC column i.
+        aliases.iter().map(|s| s.as_str()).collect()
+    } else {
+        schema.fields().iter().map(|f| f.name().as_str()).collect()
+    };
 
     // Check if columns are already in the right order with EXACT name matching.
     // expr_N names are NOT considered exact matches — they always trigger reorder.
@@ -43,21 +54,22 @@ pub fn reorder_and_pad_ipc(
         }
     }
 
-    // Build name → IPC column index map.
-    let ipc_name_to_idx: std::collections::HashMap<&str, usize> = schema
-        .fields()
+    // Build name → IPC column index map (uses aliases if provided).
+    let ipc_name_to_idx: std::collections::HashMap<&str, usize> = ipc_names
         .iter()
         .enumerate()
-        .map(|(i, f)| (f.name().as_str(), i))
+        .map(|(i, name)| (*name, i))
         .collect();
 
     // For each FE output position, find the source IPC column index.
-    // Names like "expr_N" are aggregate expressions — match by elimination
-    // (assign unmatched IPC columns to unmatched FE positions).
+    // When aliases are provided, all names are treated as exact matches
+    // (aliases already contain "expr_N" placeholders for aggregates).
+    // Without aliases, "expr_N" names are matched by elimination.
+    let use_exact = ipc_name_aliases.is_some();
     let mut used_ipc: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut mapping: Vec<Option<usize>> = Vec::with_capacity(fe_output_names.len());
     for name in fe_output_names {
-        if !name.starts_with("expr_") {
+        if use_exact || !name.starts_with("expr_") {
             if let Some(&idx) = ipc_name_to_idx.get(name.as_str()) {
                 mapping.push(Some(idx));
                 used_ipc.insert(idx);
@@ -196,6 +208,7 @@ mod ipc_reorder_tests {
         let result = reorder_and_pad_ipc(
             &ipc,
             &["a".into(), "b".into(), "c".into()],
+            None,
         )
         .unwrap();
         assert_eq!(read_ipc_column_names(&result), vec!["a", "b", "c"]);
@@ -214,6 +227,7 @@ mod ipc_reorder_tests {
         let result = reorder_and_pad_ipc(
             &ipc,
             &["c".into(), "a".into(), "b".into()],
+            None,
         )
         .unwrap();
         assert_eq!(read_ipc_column_names(&result), vec!["c", "a", "b"]);
@@ -242,6 +256,7 @@ mod ipc_reorder_tests {
                 "o_orderdate".into(),
                 "o_shippriority".into(),
             ],
+            None,
         )
         .unwrap();
         let names = read_ipc_column_names(&result);
@@ -266,6 +281,7 @@ mod ipc_reorder_tests {
         let result = reorder_and_pad_ipc(
             &ipc,
             &["a".into(), "expr_0".into(), "b".into()],
+            None,
         )
         .unwrap();
         let names = read_ipc_column_names(&result);
@@ -286,6 +302,7 @@ mod ipc_reorder_tests {
         let result = reorder_and_pad_ipc(
             &ipc,
             &["a".into(), "b".into(), "missing".into()],
+            None,
         )
         .unwrap();
         let names = read_ipc_column_names(&result);
@@ -308,6 +325,7 @@ mod ipc_reorder_tests {
         let result = reorder_and_pad_ipc(
             &ipc,
             &["c".into(), "a".into()],
+            None,
         )
         .unwrap();
         let names = read_ipc_column_names(&result);
@@ -330,6 +348,7 @@ mod ipc_reorder_tests {
         let result = reorder_and_pad_ipc(
             &ipc,
             &["expr_0".into(), "group_key".into(), "expr_2".into()],
+            None,
         )
         .unwrap();
         let names = read_ipc_column_names(&result);
@@ -340,8 +359,44 @@ mod ipc_reorder_tests {
     }
 
     #[test]
+    fn test_alias_based_reorder() {
+        // IPC has col_0, col_1, col_2, col_3 (generic from packed GPU).
+        // Aliases: col_0→l_orderkey, col_1→o_orderdate, col_2→o_shippriority, col_3→revenue
+        // FE expects: l_orderkey, expr_1(=revenue), o_orderdate, o_shippriority
+        let ipc = make_ipc(
+            &["col_0", "col_1", "col_2", "col_3"],
+            vec![
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![19050])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Float64Array::from(vec![406181.01])),
+            ],
+        );
+        let aliases = vec![
+            "l_orderkey".to_string(),
+            "o_orderdate".to_string(),
+            "o_shippriority".to_string(),
+            "expr_1".to_string(), // revenue aggregate
+        ];
+        let result = reorder_and_pad_ipc(
+            &ipc,
+            &[
+                "l_orderkey".into(),
+                "expr_1".into(),
+                "o_orderdate".into(),
+                "o_shippriority".into(),
+            ],
+            Some(&aliases),
+        )
+        .unwrap();
+        let values = read_ipc_first_row(&result);
+        // Revenue (406181.01) should be at position 1, dates at 2
+        assert_eq!(values, vec!["100", "406181.01", "19050", "0"]);
+    }
+
+    #[test]
     fn test_empty_ipc_returns_error() {
-        let result = reorder_and_pad_ipc(&[], &["a".into()]);
+        let result = reorder_and_pad_ipc(&[], &["a".into()], None);
         assert!(result.is_err());
     }
 }
