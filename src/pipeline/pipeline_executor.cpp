@@ -184,7 +184,19 @@ std::future<void> pipeline_executor::start_query()
   }
   }
 
-  schedule_next_scan_tasks();
+  // Schedule initial scan operators from the priority queue.
+  // Each scan operator gets ONE task_creator::schedule() call — the scan
+  // continuation mechanism (via next_task_hint) creates additional tasks.
+  {
+    std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+    while (!_priority_scans.empty()) {
+      auto* scan_op = _priority_scans.front();
+      SIRIUS_LOG_INFO("[start_query] scheduling scan type={} (remaining={})",
+                      static_cast<int>(scan_op->type), _priority_scans.size());
+      _task_creator->schedule(scan_op);
+      _priority_scans.pop();
+    }
+  }
 
   return future;
 }
@@ -237,9 +249,8 @@ void pipeline_executor::management_eventloop()
       }
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
-      // TODO(amin): think about eager scheduling again when state of next tasks are stored in the
-      // operator
-      // schedule_next_scan_tasks();
+      // Scan re-scheduling disabled — continuation handled by task creator's
+      // next_task_hint mechanism. Re-enabling causes scan interleaving regression.
     }
   }
 }
@@ -249,18 +260,13 @@ void pipeline_executor::schedule_next_scan_tasks()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   SIRIUS_LOG_INFO("[schedule_next_scan_tasks] priority_scans queue size={}", _priority_scans.size());
   if (_priority_scans.empty()) {
-    SIRIUS_LOG_WARN("[schedule_next_scan_tasks] NO scan operators in queue — pipeline will hang!");
     return;
   }
-  // Schedule ALL priority scans, not just the first one.
-  // Multi-pipeline plans (e.g., Q7 with 6 exchange tables) have multiple
-  // scan operators that need to run concurrently for the pipeline dependency
-  // chain to progress.
   auto num_threads = _scan_executor->get_num_threads();
   while (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    SIRIUS_LOG_INFO("[schedule_next_scan_tasks] scheduling scan type={} on {} threads",
-                    static_cast<int>(scan_op->type), num_threads);
+    SIRIUS_LOG_INFO("[schedule_next_scan_tasks] scheduling scan type={} on {} threads (remaining={})",
+                    static_cast<int>(scan_op->type), num_threads, _priority_scans.size());
     for (auto i = 0; i != num_threads; ++i) {
       _task_creator->schedule(scan_op);
     }

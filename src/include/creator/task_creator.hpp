@@ -73,6 +73,10 @@ namespace sirius::creator {
 
 struct task_creation_request {
   op::sirius_physical_operator* node;
+  /// Explicit pipeline for this task. When set, overrides node->get_pipeline().
+  /// This is needed for shared operators (TABLE_SCAN) that appear in multiple
+  /// pipelines — node->get_pipeline() returns the wrong one.
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline;
 };
 
 class task_creator {
@@ -146,6 +150,9 @@ class task_creator {
    * @param info The task creation info to schedule.
    */
   virtual void schedule(op::sirius_physical_operator* request);
+  /// Schedule with explicit pipeline (for shared operators like TABLE_SCAN).
+  virtual void schedule(op::sirius_physical_operator* node,
+                        duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
   /**
    * @brief Get the next task id.

@@ -110,6 +110,30 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
         get_pipeline()->update_pipeline_status();
       }
     }
+    // Mark the scan pipeline as finished. The scan pipeline (source=nullptr,
+    // sink=DUCKDB_SCAN) can't run update_pipeline_status because source is null.
+    // Find it via next_port_after_sink: the downstream operator's port has
+    // src_pipeline pointing to the scan pipeline.
+    {
+      auto next_ports = _op.get_next_port_after_sink();
+      for (auto& [next_op, port_id] : next_ports) {
+        auto* port = next_op->get_port(port_id);
+        if (port) {
+          // Mark the scan pipeline as finished.
+          if (port->src_pipeline && !port->src_pipeline->is_pipeline_finished()) {
+            port->src_pipeline->mark_as_finished();
+          }
+          // Trigger update_pipeline_status on the downstream (dest) pipeline.
+          // TABLE_SCAN pass-through pipelines don't get update_pipeline_status
+          // called via mark_task_completed (tasks may be tracked on a different
+          // pipeline due to shared operators). This ensures the pipeline
+          // detects completion when source is finished and ports are empty.
+          if (port->dest_pipeline) {
+            port->dest_pipeline->update_pipeline_status();
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -140,6 +164,23 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
       output_consumers.push_back(child);
     }
     return output_consumers;
+  }
+
+  /// Return consumers with their explicit pipeline (from port->dest_pipeline).
+  /// This is needed for shared operators where get_pipeline() returns the wrong pipeline.
+  struct consumer_with_pipeline {
+    sirius_physical_operator* op;
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline;
+  };
+  std::vector<consumer_with_pipeline> get_output_consumers_with_pipelines() const noexcept
+  {
+    std::vector<consumer_with_pipeline> result;
+    auto ports = _op.get_next_port_after_sink();
+    for (auto& [child, port_id] : ports) {
+      auto* port = child->get_port(port_id);
+      result.push_back({child, port ? port->dest_pipeline : nullptr});
+    }
+    return result;
   }
 
   std::size_t can_create_more_tasks() const noexcept
@@ -501,6 +542,14 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   std::vector<op::sirius_physical_operator*> get_output_consumers() override
   {
     return this->_global_state->cast<duckdb_scan_task_global_state>().get_output_consumers();
+  }
+
+  /// @brief Get output consumers with explicit pipeline info (for shared operators).
+  std::vector<duckdb_scan_task_global_state::consumer_with_pipeline>
+  get_output_consumers_with_pipelines()
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>()
+      .get_output_consumers_with_pipelines();
   }
 
   [[nodiscard]] size_t get_pipeline_id() const

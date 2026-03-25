@@ -144,32 +144,27 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
       throw std::runtime_error(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
-    // WSM TODO: how do we handle other ports that are not default?
     return hint.value().producer;
   } else if (hint.has_value() &&
              hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
     auto* producer = hint.value().producer;
-    // DuckDB scan tasks create their own continuations internally, so the
-    // task creator should never schedule additional scans from downstream.
-    // (Parquet scans are fine — they use partition indices that self-limit.)
-    if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+
+    // Guard against infinite recursion: if the producer IS the same node
+    // (or nullptr), don't recurse.
+    if (producer == nullptr || producer == node) {
+      return nullptr;
+    }
+
+    // DuckDB scan tasks create their own continuations internally.
+    if (producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
       auto it = _scan_operator_global_state_map.find(producer->get_operator_id());
       if (it != _scan_operator_global_state_map.end()) {
-        if (it->second->is_source_drained()) {
-          // Scan is done — data should be in the repository already.
-          // Return the CONSUMER node (not the producer) so the task creator
-          // creates a GPU task for the consumer pipeline.
-          return node;
-        }
-        if (!it->second->can_create_more_tasks()) {
+        if (it->second->is_source_drained() || !it->second->can_create_more_tasks()) {
           return nullptr;
         }
-      } else {
-        SIRIUS_LOG_WARN("Task Creator: DUCKDB_SCAN operator {} has no global state",
-                        producer->get_operator_id());
-        return nullptr;
       }
     }
+
     return get_operator_for_next_task(producer);
   }
   return nullptr;
@@ -208,6 +203,15 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   _task_creation_queue.push(std::move(request));
 }
 
+void task_creator::schedule(op::sirius_physical_operator* node,
+                            duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
+{
+  auto request      = std::make_unique<task_creation_request>();
+  request->node     = node;
+  request->pipeline = std::move(pipeline);
+  _task_creation_queue.push(std::move(request));
+}
+
 void task_creator::manager_loop()
 {
   while (_running.load()) {
@@ -226,15 +230,30 @@ void task_creator::manager_loop()
     auto node = request->node;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    auto original_type = static_cast<int>(node->type);
+    try {
+      node = get_operator_for_next_task(node);
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("Task Creator: get_operator_for_next_task threw: {} (node type={})",
+                       e.what(), original_type);
+      continue;
+    }
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      SIRIUS_LOG_INFO("Task Creator: get_operator_for_next_task returned nullptr for type={}",
+                      original_type);
+      continue;
+    }
+    SIRIUS_LOG_INFO("Task Creator: scheduling task for node type={} op_id={}",
+                    static_cast<int>(node->type), node->get_operator_id());
 
-    // Schedule the task creation work on the thread pool
-    _thread_pool->schedule([this, node, ticket = std::move(ticket)]() mutable {
+    // Schedule the task creation work on the thread pool.
+    // Use explicit pipeline from the request if provided (for shared operators).
+    auto explicit_pipeline = request->pipeline;
+    _thread_pool->schedule([this, node, ticket = std::move(ticket),
+                            explicit_pipeline = std::move(explicit_pipeline)]() mutable {
       try {
-        // Get what we need to create the task
-        auto pipeline = node->get_pipeline();
+        auto pipeline = explicit_pipeline ? explicit_pipeline : node->get_pipeline();
         std::vector<cucascade::shared_data_repository*> destination_data_repositories;
         // special handling for delim joins
         if (pipeline->get_sink()->type ==

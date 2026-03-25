@@ -84,6 +84,17 @@ void sirius_engine::insert_repository(
                       dependent_pipeline));
   input_pipeline->get_sink()->add_next_port_after_sink({next_op, port_id});
 
+  // Add pipeline dependency for GPU pipelines whose sink is NOT a scan operator.
+  // Scan sinks use next_port_after_sink for consumer scheduling (via scan executor).
+  // Non-scan sinks (HASH_JOIN, PARTITION, etc.) need add_dependency so that
+  // get_output_consumers() returns downstream operators for GPU task completion.
+  auto sink_type = input_pipeline->get_sink()->type;
+  if (sink_type != op::SiriusPhysicalOperatorType::DUCKDB_SCAN &&
+      sink_type != op::SiriusPhysicalOperatorType::PARQUET_SCAN &&
+      sink_type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    dependent_pipeline->add_dependency(input_pipeline);
+  }
+
   if (next_op->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto partition_op = next_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
     partition_op->add_port(port_id,
@@ -119,6 +130,15 @@ void sirius_engine::insert_repository(
                       input_pipeline,
                       dependent_pipeline));
   cur_op->add_next_port_after_sink({next_op, port_id});
+
+  // Add dependency for non-scan, non-result-collector sinks (same as first overload).
+  auto* sink_check = input_pipeline->get_sink().get();
+  if (sink_check &&
+      sink_check->type != op::SiriusPhysicalOperatorType::DUCKDB_SCAN &&
+      sink_check->type != op::SiriusPhysicalOperatorType::PARQUET_SCAN &&
+      sink_check->type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    dependent_pipeline->add_dependency(input_pipeline);
+  }
 
   if (next_op->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto partition_op = next_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
@@ -1056,8 +1076,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                    op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
-                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
-        for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::CROSS_PRODUCT) {
+        auto& deps = source_to_pipelines[new_scheduled[i]->get_sink().get()];
+        SIRIUS_LOG_INFO("[repo_setup] pipeline {} FULL-barrier sink={} ({}) has {} dependent pipelines",
+                        i, (void*)new_scheduled[i]->get_sink().get(),
+                        static_cast<int>(new_scheduled[i]->sink->type), deps.size());
+        for (auto dependent_pipeline : deps) {
           // if the source is CONCAT, then use partial barrier type
           if ((dependent_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
                dependent_pipeline->get_operators().size() == 0) ||
@@ -1206,9 +1234,17 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
         auto probe_concat_pipeline    = new_scheduled[i]->dependencies[1];
         auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
-        // change probe partition barrier to partial
-        probe_partition_pipeline->get_source()->get_port("default")->type =
-          op::MemoryBarrierType::PARTIAL;
+        // Change probe partition barrier to partial.
+        // The port might be "default" (regular scans) or "scan" (exchange table scans).
+        {
+          auto* probe_src = probe_partition_pipeline->get_source().get();
+          if (probe_src) {
+            auto port_ids = probe_src->get_port_ids();
+            for (auto pid : port_ids) {
+              probe_src->get_port(pid)->type = op::MemoryBarrierType::PARTIAL;
+            }
+          }
+        }
         if (build_partition_pipeline->get_sink()->type ==
             op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           // partition pipeline only has one operator
@@ -1258,13 +1294,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         if (first_op.type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
             first_op.type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
           // Joins have "default" and "build" ports
-          auto* default_port = first_op.get_port("default");
+          auto port_ids_j = first_op.get_port_ids();
+          auto* default_port = (std::find(port_ids_j.begin(), port_ids_j.end(), "default") != port_ids_j.end())
+                                 ? first_op.get_port("default") : nullptr;
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
                             static_cast<int>(default_port->type),
                             static_cast<void*>(default_port->repo));
           }
-          auto* build_port = first_op.get_port("build");
+          auto* build_port = (std::find(port_ids_j.begin(), port_ids_j.end(), "build") != port_ids_j.end())
+                               ? first_op.get_port("build") : nullptr;
           if (build_port) {
             SIRIUS_LOG_INFO("    Port 'build': barrier_type={}, repo={}",
                             static_cast<int>(build_port->type),
@@ -1288,8 +1327,10 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                    first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
           // ignore DUCKDB_SCAN, PARQUET_SCAN, and RESULT_COLLECTOR since they don't have ports
         } else {
-          // Most operators have "default" port
-          auto* default_port = first_op.get_port("default");
+          // Most operators have "default" port — but check first
+          auto port_ids_d = first_op.get_port_ids();
+          auto* default_port = (std::find(port_ids_d.begin(), port_ids_d.end(), "default") != port_ids_d.end())
+                                 ? first_op.get_port("default") : nullptr;
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
                             static_cast<int>(default_port->type),
@@ -1302,13 +1343,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
         if (sink->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
             sink->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-          auto* default_port = sink->get_port("default");
+          auto pids_s1 = sink->get_port_ids();
+          auto* default_port = (std::find(pids_s1.begin(), pids_s1.end(), "default") != pids_s1.end())
+                                 ? sink->get_port("default") : nullptr;
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
                             static_cast<int>(default_port->type),
                             static_cast<void*>(default_port->repo));
           }
-          auto* build_port = sink->get_port("build");
+          auto* build_port = (std::find(pids_s1.begin(), pids_s1.end(), "build") != pids_s1.end())
+                               ? sink->get_port("build") : nullptr;
           if (build_port) {
             SIRIUS_LOG_INFO("    Port 'build': barrier_type={}, repo={}",
                             static_cast<int>(build_port->type),
@@ -1326,7 +1370,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                    sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
           // ignore DUCKDB_SCAN, PARQUET_SCAN, and RESULT_COLLECTOR since they don't have ports
         } else {
-          auto* default_port = sink->get_port("default");
+          auto pids_s2 = sink->get_port_ids();
+          auto* default_port = (std::find(pids_s2.begin(), pids_s2.end(), "default") != pids_s2.end())
+                                 ? sink->get_port("default") : nullptr;
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
                             static_cast<int>(default_port->type),
