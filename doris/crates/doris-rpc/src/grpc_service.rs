@@ -2113,8 +2113,13 @@ impl PBackendService for PBackendServiceHandler {
                             }
                         }
                         let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
-                        if let Some(names) = output_names {
-                            ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
+                        // Only project columns for result-delivery fragments (no exchange destinations).
+                        // Intermediate exchange fragments forward all columns — the next fragment
+                        // needs the full schema (including grouping keys that output_names may omit).
+                        if !should_retain_exch {
+                            if let Some(names) = output_names {
+                                ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
+                            }
                         }
                         if is_cpu_only {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
