@@ -17,11 +17,14 @@
 #include "op/sirius_physical_table_scan.hpp"
 
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "sirius_config.hpp"
 
+#include <cudf/concatenate.hpp>
 #include <cudf/table/table.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
 namespace sirius {
@@ -107,84 +110,112 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   return conjunction;
 }
 
+std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_data()
+{
+  // Coalesce multiple small scan batches into a single task to reduce per-task
+  // overhead and improve GPU utilization. The batches are concatenated into one
+  // table in execute().
+  D_ASSERT(ports.size() == 1);
+  auto& [port_name, port_ptr] = *ports.begin();
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+  uint64_t accumulated_bytes = 0;
+  size_t batch_count         = 0;
+  // Cap per-task batch count to avoid grabbing too many compressed batches
+  // whose representation bytes understate their actual GPU processing cost.
+  constexpr size_t max_batches_per_task = 32;
+  while (true) {
+    auto batch = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    if (!batch) { break; }
+    uint64_t batch_bytes = 0;
+    if (batch->get_data()) { batch_bytes = batch->get_data()->get_size_in_bytes(); }
+    accumulated_bytes += batch_bytes;
+    input_batch.push_back(std::move(batch));
+    ++batch_count;
+    if (accumulated_bytes >= config::DEFAULT_SCAN_TASK_BATCH_SIZE ||
+        batch_count >= max_batches_per_task) {
+      break;
+    }
+  }
+  if (input_batch.empty()) { return nullptr; }
+  return std::make_unique<operator_data>(input_batch);
+}
+
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  const auto& raw_input_batches = input_data.get_data_batches();
 
+  // When multiple small batches were coalesced by get_next_task_input_data(),
+  // concatenate their GPU tables into one to issue fewer, larger kernel launches.
+  std::shared_ptr<cucascade::data_batch> single_batch;
+  if (raw_input_batches.size() > 1) {
+    std::vector<cudf::table_view> table_views;
+    table_views.reserve(raw_input_batches.size());
+    cucascade::memory::memory_space* space = nullptr;
+    for (const auto& batch : raw_input_batches) {
+      if (batch && batch->get_data()) {
+        auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
+        table_views.push_back(gpu_rep.get_table().view());
+        if (!space) { space = batch->get_memory_space(); }
+      }
+    }
+    if (table_views.size() > 1 && space) {
+      auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
+      auto concat_rep =
+        std::make_unique<cucascade::gpu_table_representation>(std::move(concatenated), *space);
+      single_batch = std::make_shared<cucascade::data_batch>(0, std::move(concat_rep));
+    }
+  }
+
+  // After concatenation (or if only one batch), work with a single batch.
+  const auto& batch_ref =
+    single_batch ? single_batch : (!raw_input_batches.empty() ? raw_input_batches[0] : nullptr);
+  if (!batch_ref || !batch_ref->get_data()) { return std::make_unique<operator_data>(); }
+
+  // Apply table filters as a GPU expression if present.
+  std::shared_ptr<cucascade::data_batch> output_batch;
   duckdb::unique_ptr<duckdb::Expression> filter_expr;
   if (table_filters) {
     filter_expr = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, projection_ids);
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
-  output_batches.reserve(input_batches.size());
-
   if (filter_expr != nullptr) {
-    // The executor uses the data_batch API to filter rows according to `expression`.
     duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
-    for (size_t batch_idx = 0; batch_idx < input_batches.size(); batch_idx++) {
-      auto const& batch = input_batches[batch_idx];
-      if (!batch) { continue; }
-      auto filtered_batch = gpu_expression_executor.select(batch, stream);
-      if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
-    }
+    output_batch = gpu_expression_executor.select(batch_ref, stream);
+    if (!output_batch) { return std::make_unique<operator_data>(); }
   } else {
-    for (auto const& batch : input_batches) {
-      if (batch) { output_batches.push_back(batch); }
-    }
+    output_batch = batch_ref;
   }
 
-  // After filtering, we may need to project away filter-only columns.
-  // The 'types' member indicates the expected output columns (not including filter-only columns).
-  // If we have more columns than expected output types, we need to project.
+  // After filtering, project away filter-only columns if needed.
+  // The 'types' member indicates the expected output columns.
   duckdb::idx_t expected_output_columns = types.size();
-  bool needs_projection                 = false;
+  auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto& out_table = gpu_rep.get_table();
 
-  if (!output_batches.empty() && output_batches[0]) {
-    auto& first_batch_rep =
-      output_batches[0]->get_data()->cast<cucascade::gpu_table_representation>();
-    auto& first_table = first_batch_rep.get_table();
-    if (first_table.num_columns() > expected_output_columns) { needs_projection = true; }
-  }
+  if (out_table.num_columns() > expected_output_columns) {
+    auto table   = gpu_rep.release_table();
+    auto columns = table->release();
 
-  if (needs_projection) {
-    // The batch columns are in column_ids order (as produced by DUCKDB_SCAN).
-    // projection_ids are indices into column_ids that specify which columns to keep.
-    // We select the first expected_output_columns entries from projection_ids.
-    std::vector<std::shared_ptr<cucascade::data_batch>> projected_batches;
-    projected_batches.reserve(output_batches.size());
-
-    for (auto& batch : output_batches) {
-      if (!batch) { continue; }
-
-      // Release the table from the batch (zero-copy: we're the sole consumer)
-      auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
-      auto table    = gpu_rep.release_table();
-      auto columns  = table->release();
-
-      // Select only the output columns by using projection_ids as indices
-      std::vector<std::unique_ptr<cudf::column>> selected;
-      selected.reserve(expected_output_columns);
-      for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
-        selected.push_back(std::move(columns[projection_ids[i]]));
-      }
-
-      auto projected_table = std::make_unique<cudf::table>(std::move(selected));
-      auto* space          = batch->get_memory_space();
-      auto projected_rep =
-        std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
-      auto projected_batch =
-        std::make_shared<cucascade::data_batch>(batch->get_batch_id(), std::move(projected_rep));
-
-      projected_batches.push_back(std::move(projected_batch));
+    std::vector<std::unique_ptr<cudf::column>> selected;
+    selected.reserve(expected_output_columns);
+    for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
+      selected.push_back(std::move(columns[projection_ids[i]]));
     }
 
-    output_batches = std::move(projected_batches);
+    auto projected_table = std::make_unique<cudf::table>(std::move(selected));
+    auto* space          = output_batch->get_memory_space();
+    auto projected_rep =
+      std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
+    output_batch = std::make_shared<cucascade::data_batch>(output_batch->get_batch_id(),
+                                                           std::move(projected_rep));
   }
 
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.push_back(std::move(output_batch));
   return std::make_unique<operator_data>(output_batches);
 }
 
