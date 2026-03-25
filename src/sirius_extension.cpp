@@ -44,13 +44,12 @@ extern "C" int cudaProfilerStop();
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
+#include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
-
-#include "duckdb/main/connection_manager.hpp"
 
 #include <cstdlib>
 
@@ -1015,9 +1014,9 @@ static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
 
-  auto& db     = loader.GetDatabaseInstance();
-  auto& config = DBConfig::GetConfig(db);
-  auto callback     = make_uniq<duckdb::SiriusContextExtensionCallback>();
+  auto& db           = loader.GetDatabaseInstance();
+  auto& config       = DBConfig::GetConfig(db);
+  auto callback      = make_uniq<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr = callback.get();
   config.extension_callbacks.push_back(std::move(callback));
   sirius::converter_registry::initialize();
