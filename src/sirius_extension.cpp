@@ -50,6 +50,8 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
 
+#include "duckdb/main/connection_manager.hpp"
+
 #include <cstdlib>
 
 namespace duckdb {
@@ -1015,10 +1017,18 @@ static void LoadInternal(ExtensionLoader& loader)
 
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
-  config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
+  auto callback     = make_uniq<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr = callback.get();
+  config.extension_callbacks.push_back(std::move(callback));
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register SiriusContext on connections that were opened before the extension
+  // was loaded (e.g. when loaded via LOAD in Python or the CLI).
+  for (auto& ctx : ConnectionManager::Get(db).GetConnectionList()) {
+    callback_ptr->OnConnectionOpened(*ctx);
+  }
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
