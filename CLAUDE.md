@@ -63,7 +63,6 @@ import duckdb
 
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
-con.execute("CALL gpu_buffer_init('10 GB', '10 GB')")
 result = con.execute("CALL gpu_execution('SELECT ...')").fetchall()
 ```
 
@@ -339,11 +338,11 @@ This is a DuckDB extension project using the extension template. The build syste
 CLI:
 ```sql
 LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
-CALL gpu_buffer_init('1 GB', '2 GB');
--- Legacy mode:
-CALL gpu_processing('SELECT ...');
 -- New mode (preferred):
 CALL gpu_execution('SELECT ...');
+-- Legacy mode (requires gpu_buffer_init first):
+CALL gpu_buffer_init('1 GB', '2 GB');
+CALL gpu_processing('SELECT ...');
 ```
 
 Python (requires `pixi run -e duckdb-python build-duckdb-python` first):
@@ -352,7 +351,6 @@ import duckdb
 
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
-con.execute("CALL gpu_buffer_init('10 GB', '10 GB')")
 con.execute("CALL gpu_execution('SELECT ...')").fetchall()
 ```
 
