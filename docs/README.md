@@ -64,16 +64,16 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 
 ## Contributors and Partners
 
-<p align="center">
-  <a href="https://www.nvidia.com/"><img src="https://www.nvidia.com/content/nvidiaGDC/us/en_US/about-nvidia/legal-info/logo-brand-usage/_jcr_content/root/responsivegrid/nv_container_392921705/nv_container_412055486/nv_image.coreimg.100.1290.png/1703060329095/nvidia-logo-horz.png" alt="NVIDIA" height="120"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" height="120"/></a>
-</p>
-<p align="center">
-  <a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" height="120"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.vastdata.com/"><img src="https://upload.wikimedia.org/wikipedia/commons/3/36/VAST_Data_logo.svg" alt="VAST Data" height="120"/></a>
-</p>
+<table align="center" border="0" cellspacing="40" cellpadding="0">
+  <tr>
+    <td align="center" valign="middle"><a href="https://www.nvidia.com/"><img src="https://www.nvidia.com/content/nvidiaGDC/us/en_US/about-nvidia/legal-info/logo-brand-usage/_jcr_content/root/responsivegrid/nv_container_392921705/nv_container_412055486/nv_image.coreimg.100.1290.png/1703060329095/nvidia-logo-horz.png" alt="NVIDIA" width="250"/></a></td>
+    <td align="center" valign="middle"><a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" width="250"/></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle"><a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" width="200"/></a></td>
+    <td align="center" valign="middle"><a href="https://www.vastdata.com/"><img src="https://upload.wikimedia.org/wikipedia/commons/3/36/VAST_Data_logo.svg" alt="VAST Data" width="200"/></a></td>
+  </tr>
+</table>
 
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as disk spilling, multi-GPUs, multi-node, more operators, data types, accelerating more engines, and many more.
