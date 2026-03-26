@@ -65,13 +65,13 @@ Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages duri
 Log directory and level can be initialized via environment variables before loading the extension:
 ```bash
 export SIRIUS_LOG_DIR=/path/to/logs
-export SIRIUS_LOG_LEVEL=debug
+export SIRIUS_LOG_LEVEL=trace
 ```
 
 Both can also be configured at runtime via DuckDB's `SET` command:
 ```sql
 SET sirius_log_dir = '/path/to/logs';
-SET sirius_log_level = 'debug';
+SET sirius_log_level = 'trace';
 SET sirius_log_flush_seconds = 1;
 ```
 
@@ -87,7 +87,7 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 ## Contributors and Partners
 
 <p align="center">
-  <a href="https://www.nvidia.com/"><img src="https://nvidianews.nvidia.com/file?fid=692f56b83d6332f881bbc58b" alt="NVIDIA" height="80"/></a>
+  <a href="https://www.nvidia.com/"><img src="https://nvidianews.nvidia.com/_gallery/get_file/?file_id=692f56b83d6332f881bbc58b" alt="NVIDIA" height="80"/></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" height="80"/></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
