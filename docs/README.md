@@ -30,28 +30,6 @@ Experiment Setup:
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
-## Building Sirius
-
-To clone the Sirius repository:
-```
-git clone --recurse-submodules https://github.com/sirius-db/sirius.git
-cd sirius
-```
-The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
-
-There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed. Start a shell in the environment with:
-```
-pixi shell
-```
-The environment activation handles setting up everything needed to build and test.
-
-To build Sirius:
-```
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-```
-
-Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
-
 ## Running Sirius
 
 Sirius provides two execution paths. See each page for how to build, run, and test:

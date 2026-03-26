@@ -2,6 +2,22 @@
 
 `gpu_execution` is the recommended execution path — out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. It currently works with **Parquet** data format.
 
+## Building
+
+Clone the Sirius repository:
+```
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+cd sirius
+```
+
+Set up the environment with [Pixi](https://pixi.sh/) and build:
+```
+pixi shell
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
+```
+
+Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value.
+
 ## Configuration
 
 `gpu_execution` requires a config file in [libconfig++](https://hyperreckoning.com/libconfig/) format. Point to it via the `SIRIUS_CONFIG_FILE` environment variable, or place it at the default path `~/.sirius/sirius.cfg`.

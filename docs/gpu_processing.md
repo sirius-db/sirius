@@ -4,6 +4,17 @@
 
 ## Building
 
+Clone the Sirius repository:
+```
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+cd sirius
+```
+
+Set up the environment with [Pixi](https://pixi.sh/):
+```
+pixi shell
+```
+
 By default, only the `gpu_execution` code path is compiled. To build `gpu_processing`, enable the `ENABLE_LEGACY_SIRIUS` CMake option:
 ```
 cd duckdb && cmake --preset release -DENABLE_LEGACY_SIRIUS=ON && cmake --build --preset release && cd ..
