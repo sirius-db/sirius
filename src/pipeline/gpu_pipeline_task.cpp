@@ -309,14 +309,11 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
 
       peak_bytes += requested_bytes;  // update peak bytes to include the requested bytes since that
                                       // is what could have been the peak consumption
-      // If the number of bytes consumed is greater than the reservation size, record the peak
-      // consumption
-      if (peak_bytes > reservation_bytes) {
-        auto input_basis =
-          _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
-        auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-        global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
-      }
+      auto input_basis =
+        _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
+      auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+      global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
+
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
         i,
@@ -408,19 +405,19 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+      printf("peak_bytes: %zu\n", peak_bytes);
       if (auto const* cc_oom =
             dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+        printf("cc_oom->requested_bytes: %zu\n", cc_oom->requested_bytes);
         peak_bytes +=
           cc_oom->requested_bytes;  // update peak bytes to include the requested bytes since that
                                     // is what could have been the peak consumption
       }
-      // If the number of bytes consumed is greater than the reservation size, record the peak
-      // consumption
-      if (peak_bytes > reservation_bytes) {
-        auto input_basis = local_state.get_task_consumption_basis();
-        auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
-        global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
-      }
+
+      auto input_basis = local_state.get_task_consumption_basis();
+      auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
+      global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
+
       SIRIUS_LOG_ERROR("Pipeline {}: OOM at batch {} preparing for processing, state: {}",
                        pipeline->get_pipeline_id(),
                        batch->get_batch_id(),

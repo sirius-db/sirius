@@ -327,6 +327,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
+    test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_parquet_scan_task.cpp

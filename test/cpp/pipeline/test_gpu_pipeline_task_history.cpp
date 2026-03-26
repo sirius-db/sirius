@@ -41,15 +41,7 @@
 namespace {
 
 // Memory layout constants:
-//   GPU capacity       = 500 MB (software limit)
-//   Task reservation   = 300 MB
-//   Pre-allocation     = 400 MB (consumes most GPU capacity)
-//   Input data         = ~200 MB on host (cannot fit in remaining ~100 MB GPU)
-constexpr std::size_t kGpuCapacity       = 500ULL * 1024 * 1024;              // 500 MB
-constexpr std::size_t kReservationSize   = 300ULL * 1024 * 1024;              // 300 MB
-constexpr std::size_t kPreAllocationSize = 400ULL * 1024 * 1024;              // 400 MB
-constexpr std::size_t kInputDataSize     = 200ULL * 1024 * 1024;              // ~200 MB
-constexpr std::size_t kInputNumRows      = kInputDataSize / sizeof(int64_t);  // ~25M rows
+constexpr std::size_t kGpuCapacity = 500ULL * 1024 * 1024;  // 500 MB
 
 //------------------------------------------------------------------------------
 // Stub operator — minimal sirius_physical_operator with injectable behaviour.
@@ -129,16 +121,27 @@ struct pipeline_task_history_fixture {
 //
 // Memory layout:
 //   GPU capacity  = 500 MB
-//   Reservation   = 300 MB
-//   Pre-alloc     = 400 MB (leaves ~100 MB free GPU)
-//   Input data    = ~200 MB host_data_representation
+//   Reservation   = 200 MB
+//   Pre-alloc     = 250 MB (leaves ~50 MB free GPU)
+//   Input data    = ~300 MB host_data_representation (will go over its reservation and over the 50
+//   MB free GPU)
 //
 // When execute() tries to convert the host data to GPU via lock_or_prepare_batch,
-// the 200 MB allocation exceeds the remaining ~100 MB → rmm::out_of_memory.
+// the 300 MB allocation exceeds the remaining ~50 MB → rmm::out_of_memory.
 //
-// In the OOM catch handler, peak_bytes ≈ 200 MB (requested) which is LESS than
-// reservation_bytes = 300 MB, so no record is written to memory_history.
+// In the OOM catch handler, peak_bytes ≈ 300 MB (requested) should be recorded to memory history.
 // ---------------------------------------------------------------------------
+
+// Memory layout constants:
+//   GPU capacity       = 500 MB (software limit)
+//   Task reservation   = 300 MB
+//   Pre-allocation     = 400 MB (consumes most GPU capacity)
+//   Input data         = ~200 MB on host (cannot fit in remaining ~100 MB GPU)
+constexpr std::size_t kReservationSize   = 200ULL * 1024 * 1024;  // 200 MB
+constexpr std::size_t kPreAllocationSize = 250ULL * 1024 * 1024;  // 250 MB
+constexpr std::size_t kInputDataSize     = 300ULL * 1024 * 1024;  // 300 MB
+constexpr std::size_t kInputNumRows      = kInputDataSize / sizeof(int64_t);
+
 TEST_CASE("gpu_pipeline_task execute OOM does not record to memory history",
           "[gpu_pipeline_task][history]")
 {
@@ -200,6 +203,9 @@ TEST_CASE("gpu_pipeline_task execute OOM does not record to memory history",
     stream, std::move(pressure_reservation), nullptr, nullptr);
   void* pressure_alloc = pressure_allocator->allocate(stream, kPreAllocationSize);
 
+  stream.synchronize();
+  pressure_allocator->reset_stream_reservation(stream);
+
   // -------------------------------------------------------------------------
   // 4. Build a minimal pipeline with one stub operator
   // -------------------------------------------------------------------------
@@ -214,6 +220,7 @@ TEST_CASE("gpu_pipeline_task execute OOM does not record to memory history",
   auto stub_op = std::make_unique<stub_operator>();
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.add_pipeline_operator(*pipeline, *stub_op);
+  build_state.set_pipeline_sink(*pipeline, *stub_op, 1);
 
   // -------------------------------------------------------------------------
   // 5. Build task local state and global state
@@ -250,11 +257,12 @@ TEST_CASE("gpu_pipeline_task execute OOM does not record to memory history",
   task->mark_as_rescheduled();
 
   // -------------------------------------------------------------------------
-  // 7. Verify: memory history should be empty
-  //    The OOM peak_bytes (~200 MB requested) < reservation_bytes (300 MB),
-  //    so the recording condition (peak_bytes > reservation_bytes) is false.
+  // 7. Verify: memory history should have one record with the OOM peak_bytes
   // -------------------------------------------------------------------------
-  REQUIRE(global_state->get_memory_history().size() == 0);
+  REQUIRE(global_state->get_memory_history().size() == 1);
+  auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
+  REQUIRE(estimate.has_value());
+  REQUIRE(*estimate == kInputDataSize);
 
   // -------------------------------------------------------------------------
   // Cleanup: release the pressure allocation

@@ -58,6 +58,12 @@ class pipeline_memory_history {
    */
   void record(task_memory_record rec)
   {
+    printf(
+      "pipeline_memory_history::record: estimated_bytes=%zu, peak_memory_bytes=%zu, "
+      "output_bytes=%zu\n",
+      rec.estimated_bytes,
+      rec.peak_memory_bytes,
+      rec.output_bytes.has_value() ? rec.output_bytes.value() : 0);
     if (rec.estimated_bytes == 0) { return; }
     std::lock_guard<std::mutex> lock(_mutex);
     if (_records.size() < kMaxRecords) {
