@@ -797,7 +797,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     uint64_t** offset_dev_result;
     cudaMalloc((void**) &offset_dev_result, num_keys * sizeof(uint64_t*));
     for (uint64_t i = 0; i < num_keys; i++) {
-        offset[i] = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+        offset[i] = gpuBufferManager->customCudaMalloc<uint64_t>(count[0] + 1, 0, 0);
     }
     cudaMemcpy(offset_dev_result, offset, num_keys * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     CHECK_ERROR();
