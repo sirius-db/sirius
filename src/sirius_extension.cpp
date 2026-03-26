@@ -441,15 +441,19 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
 
-	// Use this if developing
-	size_t cache_size_per_gpu = 1UL * 1024 * 1024 * 1024; // 1GB
-	size_t processing_size_per_gpu = 1UL * 1024 * 1024 * 1024; // 1GB
+	// Read GPU memory size from environment variable SIRIUS_GPU_MEMORY_GB (default: 11)
+	const char* gpu_memory_env = std::getenv("SIRIUS_GPU_MEMORY_GB");
+	int gpu_memory_gb = gpu_memory_env ? std::atoi(gpu_memory_env) : 11;
+	if (gpu_memory_gb <= 0) gpu_memory_gb = 11;
+
+	// Allocate ~55% for cache, ~36% for processing, ~9% reserved for CUDA runtime
+	size_t gpu_memory_bytes = static_cast<size_t>(gpu_memory_gb) * 1024UL * 1024 * 1024;
+	size_t cache_size_per_gpu = gpu_memory_bytes * 55 / 100;
+	size_t processing_size_per_gpu = gpu_memory_bytes * 36 / 100;
 	size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; // 64GB
-	// Use this if testing on A100-40GB
-	// size_t cache_size_per_gpu = 24UL * 1024 * 1024 * 1024; // 24GB
-	// size_t processing_size_per_gpu = 14UL * 1024 * 1024 * 1024; // 14GB
-	// size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; // 64GB
-	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
+	printf("GPU config: %d GB/card, cache %zu MB, processing %zu MB, CPU 64 GB\n",
+	       gpu_memory_gb, cache_size_per_gpu / (1024 * 1024), processing_size_per_gpu / (1024 * 1024));
+	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
 }
 
 void SiriusExtension::Load(DuckDB &db) {
