@@ -21,12 +21,12 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 - CUDA >= 13.0 (requires NVIDIA driver >= 570)
 - We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
-### Requirements
+### Installing Dependencies
 
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
-## Running Sirius
+## Building and Running Sirius
 
 Sirius provides two execution paths. See each page for how to build, run, and test:
 
