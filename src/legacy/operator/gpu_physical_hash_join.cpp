@@ -465,8 +465,14 @@ SourceResultType GPUPhysicalHashJoin::GetData(GPUIntermediateRelation& output_re
     throw InvalidInputException("Get data not supported for this join type");
   }
 
-  if (join_type == JoinType::OUTER) {
-    throw InvalidInputException("Get data not supported for this join type");
+  if (join_type == JoinType::OUTER && outer_join_handled_in_execute) {
+    // cudf::full_join already emitted all rows (matched + unmatched on both sides)
+    // in Execute(), so GetData has nothing more to produce.
+    auto end      = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_DEBUG("Full outer join GetData (no-op, handled in Execute): {} us",
+                     duration.count());
+    return SourceResultType::FINISHED;
   }
 
   uint64_t* row_ids                  = nullptr;
@@ -583,7 +589,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
 
   // probing hash table
   SIRIUS_LOG_DEBUG("Probing hash table");
-  if (join_type == JoinType::INNER || join_type == JoinType::LEFT) {
+  if (join_type == JoinType::INNER || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
     // check if there is a non-equality condition
     vector<shared_ptr<GPUColumn>> build_key(conditions.size());
     for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
@@ -601,7 +607,11 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
         }
       }
       if (!has_non_equality_condition) {
-        if (join_type == JoinType::LEFT) {
+        if (join_type == JoinType::OUTER) {
+          cudf_hash_full_join(
+            probe_key, build_key, conditions.size(), row_ids_left, row_ids_right, count);
+          outer_join_handled_in_execute = true;
+        } else if (join_type == JoinType::LEFT) {
           cudf_hash_left_join(probe_key,
                               build_key,
                               conditions.size(),
@@ -619,16 +629,16 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
                                unique_build_keys);
         }
       } else {
-        if (join_type == JoinType::LEFT) {
+        if (join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
           throw NotImplementedException(
-            "Left join with non-equality condition is not supported yet");
+            "Left/full outer join with non-equality condition is not supported yet");
         }
         cudf_mixed_or_conditional_inner_join(
           probe_key, build_key, conditions, join_type, row_ids_left, row_ids_right, count);
       }
     }
-  } else if (join_type == JoinType::SEMI || join_type == JoinType::OUTER ||
-             join_type == JoinType::RIGHT || join_type == JoinType::ANTI) {
+  } else if (join_type == JoinType::SEMI || join_type == JoinType::RIGHT ||
+             join_type == JoinType::ANTI) {
     HandleProbeExpression(probe_key,
                           count,
                           row_ids_left,
@@ -855,7 +865,7 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
         ht_len * (conditions.size() + 2), 0, 0);
   }
 
-  if (join_type == JoinType::INNER || join_type == JoinType::LEFT) {
+  if (join_type == JoinType::INNER || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
     // check if there is a non-equality condition
     // bool has_non_equality_condition = false;
     // for (idx_t i = 0; i < conditions.size(); i++) {
