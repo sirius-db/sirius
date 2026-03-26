@@ -7,7 +7,7 @@ Sirius is a GPU-native SQL engine. It plugs into existing databases such as Duck
 
 <!-- ![Architecture](sirius-architecture.png) -->
 <p align="center">
-  <img src="super-sirius-arch.png" alt="Diagram" width="900"/>
+  <img src="super-sirius-arch.png" alt="Diagram" width="700"/>
 </p>
 
 ## Performance
