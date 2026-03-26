@@ -7,7 +7,7 @@ Sirius is a GPU-native SQL engine. It plugs into existing databases such as Duck
 
 <!-- ![Architecture](sirius-architecture.png) -->
 <p align="center">
-  <img src="sirius-arch.png" alt="Diagram" width="900"/>
+  <img src="super-sirius-arch.png" alt="Diagram" width="900"/>
 </p>
 
 ## Performance
@@ -17,7 +17,7 @@ Experiment Setup:
 - GPU instance: GH200@LambdaLabs ($1.5/hour)
 - CPU instance: c8i.8xlarge@AWS ($1.5/hour)
 
-![Performance](sirius-perf.png)
+![Performance](super-sirius-perf.png)
 
 ## Supported OS/GPU/CUDA
 - Ubuntu >= 22.04
