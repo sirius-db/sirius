@@ -21,6 +21,21 @@
 // duckdb
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
+namespace sirius::experimental {
+using ast_result     = gpu_expression_executor::ast_result;
+using execute_result = gpu_expression_executor::execute_result;
+
+execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression const& expr,
+                                                execution_mode mode)
+{
+  if (mode == execution_mode::AST) {
+    expr_ref ast_expr = _ast_tree.emplace<cudf::ast::column_reference>(expr.index);
+    return execute_result(ast_result(ast_expr));
+  }
+  return execute_result(_input_table.column(expr.index));
+}
+}  // namespace sirius::experimental
+
 namespace duckdb {
 namespace sirius {
 

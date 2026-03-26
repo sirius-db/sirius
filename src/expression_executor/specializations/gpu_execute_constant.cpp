@@ -14,14 +14,82 @@
  * limitations under the License.
  */
 
-#include "duckdb/common/exception.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
+// sirius
+#include <cudf/ast/expressions.hpp>
+#include <cudf/cudf_utils.hpp>
+#include <cudf/fixed_point/fixed_point.hpp>
 
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_executor/gpu_expression_executor_state.hpp>
+
+// duckdb
 #include <rmm/cuda_stream_view.hpp>
 
+#include <duckdb/common/exception.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+
 #include <type_traits>
+
+namespace {
+using execute_result = sirius::experimental::gpu_expression_executor::execute_result;
+using ast_node       = sirius::experimental::gpu_expression_executor::ast_result;
+using execution_mode = sirius::experimental::gpu_expression_executor::execution_mode;
+
+template <typename T>
+execute_result make_execute_result_from_scalar(
+  cudf::ast::tree& ast_tree,
+  std::vector<std::unique_ptr<cudf::scalar>>& temp_scalars,
+  T device_scalar,
+  execution_mode mode)
+{
+  if (mode == execution_mode::AST) {
+    auto expr_ref              = ast_tree.emplace<cudf::ast::literal>(*device_scalar);
+    auto const temp_scalar_idx = temp_scalars.size();
+    temp_scalars.push_back(std::move(device_scalar));
+    return execute_result(ast_node(expr_ref, {temp_scalar_idx}, {}));
+  }
+  return execute_result(std::move(device_scalar));
+}
+
+}  // namespace
+
+namespace sirius::experimental {
+using execute_result = gpu_expression_executor::execute_result;
+
+execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression const& expr,
+                                                execution_mode mode)
+{
+  assert(expr.value.type() == expr.return_type);
+
+  auto const cudf_type = duckdb::GetCudfType(expr.value.type());
+  switch (cudf_type.id()) {
+    case cudf::type_id::INT32: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+        expr.value.GetValue<int32_t>(), true, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::FLOAT32: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<float_t>>(
+        expr.value.GetValue<float_t>(), true, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::DECIMAL32: {
+      auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+        expr.value.GetValueUnsafe<numeric::decimal32::rep>(), true, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::STRING: {
+      auto scalar = std::make_unique<cudf::string_scalar>(
+        expr.value.GetValue<std::string>(), true, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    default:
+      throw duckdb::NotImplementedException("[gpu_expression_executor] Unsupported scalar type: {}",
+                                            expr.GetExpressionType());
+  }
+}
+
+}  // namespace sirius::experimental
 
 namespace duckdb {
 namespace sirius {

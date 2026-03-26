@@ -28,6 +28,7 @@
 
 // duckdb
 #include <duckdb/common/exception.hpp>
+#include <duckdb/common/types.hpp>
 
 // cudf
 #include <cudf/stream_compaction.hpp>
@@ -37,6 +38,109 @@
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+namespace sirius::experimental {
+
+std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& expr) const
+{
+  switch (expr.GetExpressionClass()) {
+    case duckdb::ExpressionClass::BOUND_BETWEEN: {
+      auto const& between_expr = expr.Cast<duckdb::BoundBetweenExpression>();
+      // 2 comparison ops + 1 AND op + the ops in the children
+      return 3 + count_ast_ops(*between_expr.input) + count_ast_ops(*between_expr.lower) +
+             count_ast_ops(*between_expr.upper);
+    }
+    case duckdb::ExpressionClass::BOUND_CASE: {
+      // No AST support
+      return 0;
+    }
+    case duckdb::ExpressionClass::BOUND_CAST: {
+      auto const& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
+      if (std::find(supported_ast_cast_types.begin(),
+                    supported_ast_cast_types.end(),
+                    expr.return_type.id()) != supported_ast_cast_types.end()) {
+        return 1 + count_ast_ops(*cast_expr.child);
+      }
+      return 0;
+    }
+    case duckdb::ExpressionClass::BOUND_COMPARISON: {
+      auto const& comp_expr = expr.Cast<duckdb::BoundComparisonExpression>();
+      return 1 + count_ast_ops(*comp_expr.left) + count_ast_ops(*comp_expr.right);
+    }
+    case duckdb::ExpressionClass::BOUND_CONJUNCTION: {
+      auto const& conj_expr = expr.Cast<duckdb::BoundConjunctionExpression>();
+      std::size_t count     = 1;
+      for (const auto& child : conj_expr.children) {
+        count += count_ast_ops(*child);
+      }
+      return count;
+    }
+    case duckdb::ExpressionClass::BOUND_CONSTANT: {
+      // Base case
+      return 0;
+    }
+    case duckdb::ExpressionClass::BOUND_FUNCTION: {
+      auto const& func_expr = expr.Cast<duckdb::BoundFunctionExpression>();
+      if (std::find(supported_ast_functions.begin(),
+                    supported_ast_functions.end(),
+                    func_expr.function.name) != supported_ast_functions.end()) {
+        std::size_t count = 1;
+        for (const auto& child : func_expr.children) {
+          count += count_ast_ops(*child);
+        }
+        return count;
+      }
+      return 0;
+    }
+    case duckdb::ExpressionClass::BOUND_OPERATOR: {
+      auto const& op_expr = expr.Cast<duckdb::BoundOperatorExpression>();
+      switch (op_expr.type) {
+        case duckdb::ExpressionType::COMPARE_IN:  // Fallthrough
+        case duckdb::ExpressionType::COMPARE_NOT_IN: {
+          auto const num_ors = op_expr.children.size() - 2;
+          auto const num_eqs = op_expr.children.size() - 1;
+          auto count =
+            num_ors + num_eqs + (op_expr.type == duckdb::ExpressionType::COMPARE_NOT_IN ? 1 : 0);
+          for (const auto& child : op_expr.children) {
+            count += count_ast_ops(*child);
+          }
+          return count;
+        }
+        case duckdb::ExpressionType::OPERATOR_COALESCE:
+          /// KEVIN: This should be doable.
+          throw duckdb::NotImplementedException(
+            "[gpu_expression_executor] count_ast_ops called on an unsupported COALESCE operator "
+            "expression.");
+        case duckdb::ExpressionType::OPERATOR_TRY:
+          throw duckdb::NotImplementedException(
+            "[gpu_expression_executor] count_ast_ops called on an unsupported TRY operator "
+            "expression.");
+        case duckdb::ExpressionType::OPERATOR_NOT: return 1 + count_ast_ops(*op_expr.children[0]);
+        case duckdb::ExpressionType::OPERATOR_IS_NULL:
+          return 1 + count_ast_ops(*op_expr.children[0]);
+        case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL:
+          return 2 + count_ast_ops(*op_expr.children[0]);
+        default:
+          throw duckdb::InternalException(
+            "[gpu_expression_executor] count_ast_ops called on an operator expression [{}] with "
+            "unsupported operator type: {}",
+            op_expr.ToString(),
+            static_cast<int>(op_expr.type));
+      }
+    }
+    case duckdb::ExpressionClass::BOUND_REF: {
+      // Base case
+      return 0;
+    }
+    default:
+      throw duckdb::InternalException(
+        "[gpu_expression_executor] count_ast_ops called on an expression [{}] with unsupported "
+        "expression class: {}",
+        expr.ToString(),
+        static_cast<int>(expr.GetExpressionClass()));
+  }
+}
+}  // namespace sirius::experimental
 
 namespace duckdb {
 namespace sirius {

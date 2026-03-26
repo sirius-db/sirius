@@ -14,20 +14,99 @@
  * limitations under the License.
  */
 
-#include "duckdb/common/exception.hpp"
-#include "duckdb/planner/expression/bound_case_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
+// sirius
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_executor/gpu_expression_executor_state.hpp>
 
+// duckdb
+#include <duckdb/common/exception.hpp>
+#include <duckdb/planner/expression/bound_case_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+
+// cudf
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 
-namespace duckdb {
-namespace sirius {
-
 // We need to handle implicit error checks inserted as CASE statements by DuckDB
 #define ERROR_FUNC_STR "error"
+
+namespace sirius::experimental {
+using execute_result = gpu_expression_executor::execute_result;
+execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression const& expr,
+                                                execution_mode mode)
+{
+  //===----------MATERIALIZE mode only (AST breaker)----------===//
+  std::unique_ptr<cudf::column> output;
+
+  // First, execute the ELSE
+  auto current_result = execute(*expr.else_expr, execution_mode::MATERIALIZE);
+
+  // Loop backwards, so that the THEN of the first true WHEN is copied to the output column
+  auto num_checks = static_cast<int32_t>(
+    expr.case_checks.size());  // This is sane, and needed for the descending loop index
+  for (int32_t i = num_checks - 1; i >= 0; --i) {
+    auto& case_check = expr.case_checks[i];
+
+    // Fist, execute the WHEN expression to get boolean array intermediate
+    auto current_mask = execute(*case_check.when_expr, execution_mode::MATERIALIZE);
+
+    // Check for error functions
+    if (case_check.then_expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+        case_check.then_expr->Cast<duckdb::BoundFunctionExpression>().function.name ==
+          ERROR_FUNC_STR) {
+      // If the THEN is true anywhere, throw error()
+      auto any_result = cudf::reduce(current_mask.get_column_view(),
+                                     *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
+                                     cudf::data_type(cudf::type_id::BOOL8),
+                                     _stream,
+                                     _mr);
+      if (static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value()) {
+        // Assume that this arises for the stated error
+        throw duckdb::InternalException(
+          "[gpu_expression_executor:case]: More than one row returned by a subquery used as an "
+          "expression.");
+      }
+      continue;
+    }
+
+    // Otherwise, execute the THEN and selectively copy to the output
+    auto current_then = execute(*case_check.then_expr, execution_mode::MATERIALIZE);
+    if (current_result.is_scalar()) {
+      // This can only possibly happen when i = num_checks - 1
+      if (current_then.is_scalar()) {
+        output = cudf::copy_if_else(current_then.get_scalar(),
+                                    current_result.get_scalar(),
+                                    current_mask.get_column_view(),
+                                    _stream,
+                                    _mr);
+      } else {
+        output = cudf::copy_if_else(current_then.get_column_view(),
+                                    current_result.get_scalar(),
+                                    current_mask.get_column_view(),
+                                    _stream,
+                                    _mr);
+      }
+    } else if (current_then.is_scalar()) {
+      output = cudf::copy_if_else(current_then.get_scalar(),
+                                  current_result.get_column_view(),
+                                  current_mask.get_column_view(),
+                                  _stream,
+                                  _mr);
+    } else {
+      output = cudf::copy_if_else(current_then.get_column_view(),
+                                  current_result.get_column_view(),
+                                  current_mask.get_column_view(),
+                                  _stream,
+                                  _mr);
+    }
+    current_result = execute_result(std::move(output));
+  }
+  return std::move(current_result);
+}
+}  // namespace sirius::experimental
+
+namespace duckdb {
+namespace sirius {
 
 std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
   const BoundCaseExpression& expr, GpuExpressionExecutorState& root)

@@ -14,19 +14,131 @@
  * limitations under the License.
  */
 
-#include "duckdb/common/exception.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
-#include "operator/empty_str_check.cuh"
+// sirius
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_executor/gpu_expression_executor_state.hpp>
+#include <operator/empty_str_check.cuh>
 
+// duckdb
+#include <duckdb/common/exception.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+
+// cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/transform.hpp>
 
+// standard library
 #include <memory>
 #include <type_traits>
+
+namespace sirius::experimental {
+using execute_result = gpu_expression_executor::execute_result;
+
+execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpression const& expr,
+                                                execution_mode mode)
+{
+  if (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size) {
+    auto comparison_type_switch_ast =
+      [](duckdb::BoundComparisonExpression const& expr) -> cudf::ast::ast_operator {
+      using enum duckdb::ExpressionType;
+      switch (expr.GetExpressionType()) {
+        case COMPARE_EQUAL: return cudf::ast::ast_operator::EQUAL;
+        case COMPARE_GREATERTHAN: return cudf::ast::ast_operator::GREATER;
+        case COMPARE_GREATERTHANOREQUALTO: return cudf::ast::ast_operator::GREATER_EQUAL;
+        case COMPARE_LESSTHAN: return cudf::ast::ast_operator::LESS;
+        case COMPARE_LESSTHANOREQUALTO: return cudf::ast::ast_operator::LESS_EQUAL;
+        case COMPARE_NOTEQUAL: return cudf::ast::ast_operator::NOT_EQUAL;
+        case COMPARE_DISTINCT_FROM:
+        case COMPARE_NOT_DISTINCT_FROM:
+          throw duckdb::NotImplementedException(
+            "[expression_executor:comparison] DISTINCT comparisons not supported in expression "
+            "executor.");
+        default:
+          throw duckdb::InternalException(
+            "[expression_executor:comparison] Unrecognized comparison type : {}",
+            static_cast<int>(expr.GetExpressionType()));
+      }
+    };
+
+    auto left      = execute(*expr.left, mode);
+    auto right     = execute(*expr.right, mode);
+    auto comp_expr = _ast_tree.emplace<cudf::ast::operation>(
+      comparison_type_switch_ast(expr), left.get_expr(), right.get_expr());
+
+    //===----------1: AST Mode----------===//
+    if (mode == execution_mode::AST) {
+      return execute_result(
+        ast_result(comp_expr,
+                   {left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
+                   {left.get_temp_column_indices(), right.get_temp_column_indices()}));
+    }
+
+    //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
+    // JIT compile the AST Subtree
+    auto result_column = execute_ast(comp_expr);
+
+    // Release consumed temporaries
+    release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
+                        {left.get_temp_column_indices(), right.get_temp_column_indices()});
+    return execute_result(std::move(result_column));
+  }
+
+  //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
+  auto comparison_type_switch =
+    [](duckdb::BoundComparisonExpression const& expr) -> cudf::binary_operator {
+    using enum duckdb::ExpressionType;
+    switch (expr.GetExpressionType()) {
+      case COMPARE_EQUAL: return cudf::binary_operator::EQUAL;
+      case COMPARE_GREATERTHAN: return cudf::binary_operator::GREATER;
+      case COMPARE_GREATERTHANOREQUALTO: return cudf::binary_operator::GREATER_EQUAL;
+      case COMPARE_LESSTHAN: return cudf::binary_operator::LESS;
+      case COMPARE_LESSTHANOREQUALTO: return cudf::binary_operator::LESS_EQUAL;
+      case COMPARE_NOTEQUAL: return cudf::binary_operator::NOT_EQUAL;
+      case COMPARE_DISTINCT_FROM:
+      case COMPARE_NOT_DISTINCT_FROM:
+        throw duckdb::NotImplementedException(
+          "[expression_executor:comparison] DISTINCT comparisons not supported in expression "
+          "executor.");
+      default:
+        throw duckdb::InternalException(
+          "[expression_executor:comparison] Unrecognized comparison type : {}",
+          static_cast<int>(expr.GetExpressionType()));
+    }
+  };
+
+  auto left              = execute(*expr.left, execution_mode::MATERIALIZE);
+  auto right             = execute(*expr.right, execution_mode::MATERIALIZE);
+  auto const output_type = GetCudfType(expr.return_type);
+
+  std::unique_ptr<cudf::column> result_column;
+  if (left.is_scalar()) {
+    result_column = cudf::binary_operation(left.get_scalar(),
+                                           right.get_column_view(),
+                                           comparison_type_switch(expr),
+                                           output_type,
+                                           _stream,
+                                           _mr);
+  } else if (right.is_scalar()) {
+    result_column = cudf::binary_operation(left.get_column_view(),
+                                           right.get_scalar(),
+                                           comparison_type_switch(expr),
+                                           output_type,
+                                           _stream,
+                                           _mr);
+  } else {
+    result_column = cudf::binary_operation(left.get_column_view(),
+                                           right.get_column_view(),
+                                           comparison_type_switch(expr),
+                                           output_type,
+                                           _stream,
+                                           _mr);
+  }
+  return execute_result(std::move(result_column));
+}
+}  // namespace sirius::experimental
 
 namespace duckdb {
 namespace sirius {
