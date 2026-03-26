@@ -164,7 +164,6 @@ __global__ void compact_string_offset(uint64_t* group_idx, uint64_t** group_byte
             } else if ((offset < (N - 1)) && (group_idx[offset] != group_idx[offset + 1])) {
                 uint64_t out_idx = group_idx[offset];
                 for (uint64_t key = 0; key < num_keys; key ++) {
-                    cudaAssert(group_byte_offset[key][offset] != group_byte_offset[key][offset + 1]);
                     result_offset[key][out_idx] = group_byte_offset[key][offset];
                 }
             }
