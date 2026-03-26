@@ -195,7 +195,6 @@ __global__ void rows_to_columns_string(uint64_t* group_idx, sort_keys_type_strin
                 uint64_t out_idx = group_idx[offset];
                 uint64_t key_length_bytes = 0;
                 for (uint64_t key = 0; key < num_keys; key ++) {
-                    cudaAssert(group_byte_offset[key][offset] != group_byte_offset[key][offset + 1]);
                     uint64_t out_offset = group_byte_offset[key][offset];
                     uint64_t actual_key_length = group_byte_offset[key][offset + 1] - group_byte_offset[key][offset];
                     uint8_t* ptr = reinterpret_cast<uint8_t*>(row_keys[out_idx].keys);
