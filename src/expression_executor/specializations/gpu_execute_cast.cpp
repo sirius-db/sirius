@@ -69,7 +69,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
   auto const return_type = GetCudfType(expr.return_type);
   auto child             = execute(*expr.child, execution_mode::MATERIALIZE);
-  auto result_column     = cudf::cast(child.get_column_view(), return_type, _stream, _mr);
+  D_ASSERT(!child.is_scalar());  // CAST should never be called on a scalar
+  auto result_column = cudf::cast(child.get_column_view(), return_type, _stream, _mr);
   return execute_result(std::move(result_column));
 }
 

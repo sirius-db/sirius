@@ -14,21 +14,25 @@
  * limitations under the License.
  */
 
-#include "cudf/cudf_utils.hpp"
-#include "duckdb/common/assert.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_dispatcher.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
-#include "expression_executor/regex/regex_playground.hpp"
-#include "operator/gpu_physical_strings_matching.hpp"
-#include "operator/strlen_from_offsets.cuh"
+// sirius
+#include <expression_executor/gpu_dispatcher.hpp>
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_executor/gpu_expression_executor_state.hpp>
+#include <expression_executor/regex/regex_playground.hpp>
+#include <operator/gpu_physical_strings_matching.hpp>
+#include <operator/strlen_from_offsets.cuh>
 
+// duckdb
+#include <duckdb/common/assert.hpp>
+#include <duckdb/common/exception.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+
+// cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
@@ -40,6 +44,7 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 
+// standard library
 #include <regex>
 #include <string>
 
@@ -136,11 +141,19 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
 
   //----------Numeric Binary Functions----------//
   auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> execute_result {
-    auto left          = execute(*expr.children[0], execution_mode::MATERIALIZE);
-    auto right         = execute(*expr.children[1], execution_mode::MATERIALIZE);
-    auto result_column = cudf::binary_operation(
-      left.get_column_view(), right.get_column_view(), op, output_type, _stream, _mr);
-    return execute_result(std::move(result_column));
+    auto left  = execute(*expr.children[0], execution_mode::MATERIALIZE);
+    auto right = execute(*expr.children[1], execution_mode::MATERIALIZE);
+    D_ASSERT(!left.is_scalar() || !right.is_scalar());  // Both sides cannot be scalars
+    if (left.is_scalar()) {
+      return execute_result(cudf::binary_operation(
+        left.get_scalar(), right.get_column_view(), op, output_type, _stream, _mr));
+    }
+    if (right.is_scalar()) {
+      return execute_result(cudf::binary_operation(
+        left.get_column_view(), right.get_scalar(), op, output_type, _stream, _mr));
+    }
+    return execute_result(cudf::binary_operation(
+      left.get_column_view(), right.get_column_view(), op, output_type, _stream, _mr));
   };
   if (func_string == ADD_FUNC_STR) {
     return execute_numeric_binary_func(cudf::binary_operator::ADD);

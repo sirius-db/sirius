@@ -64,6 +64,12 @@ static std::array<duckdb::LogicalTypeId, 3> constexpr supported_ast_cast_types{
 static std::array<std::string_view, 6> constexpr supported_ast_functions{
   "+", "-", "*", "/", "//", "%"};
 
+enum class expression_executor_strategy {
+  MATERIALIZE,
+  AST_INTERPRET,
+  AST_JIT,
+};
+
 class gpu_expression_executor {
   using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
 
@@ -188,7 +194,8 @@ class gpu_expression_executor {
     MATERIALIZE,
   };
 
-  gpu_expression_executor(rmm::device_async_resource_ref = cudf::get_current_device_resource_ref(),
+  gpu_expression_executor(expression_executor_strategy strategy,
+                          rmm::device_async_resource_ref = cudf::get_current_device_resource_ref(),
                           rmm::cuda_stream_view stream   = cudf::get_default_stream(),
                           std::size_t min_ast_size       = 2);
 
@@ -196,6 +203,7 @@ class gpu_expression_executor {
                                       duckdb::Expression const& expr);
 
  private:
+  expression_executor_strategy _strategy;
   rmm::device_async_resource_ref _mr;
   rmm::cuda_stream_view _stream;
   std::size_t _min_ast_size;
@@ -207,12 +215,33 @@ class gpu_expression_executor {
 
   std::unique_ptr<cudf::column> execute_ast(expr_ref root_expr)
   {
-    cudf::table temp_table(std::move(_temp_columns));
-    cudf::table_view combined_table_view({_input_table, temp_table.view()});
-    auto result_column =
-      cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
-    _temp_columns = temp_table.release();
-    return std::move(result_column);
+    std::vector<cudf::column_view> combined_column_views;
+    combined_column_views.reserve(_input_table.num_columns() + _temp_columns.size());
+    for (int column_idx = 0; column_idx < _input_table.num_columns(); ++column_idx) {
+      combined_column_views.push_back(_input_table.column(column_idx));
+    }
+
+    // We must be careful not to add invalidated temporary columns, as cuDF will throw when
+    // constructing the table_view. Since the input table has a nonzero number of columns, we can
+    // use the 0th column to produce a dummy column_view to maintain the integrity of the column
+    // indices (note that this dummy column will never be referenced).
+    for (auto const& temp_column : _temp_columns) {
+      if (temp_column) {
+        combined_column_views.push_back(temp_column->view());
+      } else {
+        combined_column_views.push_back(_input_table.column(0));
+      }
+    }
+
+    cudf::table_view combined_table_view(combined_column_views);
+    if (_strategy == expression_executor_strategy::AST_INTERPRET) {
+      auto result_column = cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
+      return std::move(result_column);
+    } else {
+      auto result_column =
+        cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
+      return std::move(result_column);
+    }
   };
 
   void release_temporaries(std::vector<std::size_t> const& scalar_indices,

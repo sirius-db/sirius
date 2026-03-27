@@ -55,12 +55,20 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
         case_check.then_expr->Cast<duckdb::BoundFunctionExpression>().function.name ==
           ERROR_FUNC_STR) {
       // If the THEN is true anywhere, throw error()
-      auto any_result = cudf::reduce(current_mask.get_column_view(),
-                                     *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
-                                     cudf::data_type(cudf::type_id::BOOL8),
-                                     _stream,
-                                     _mr);
-      if (static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value()) {
+      bool throw_error = false;
+      if (current_mask.is_scalar()) {
+        auto const& bool_scalar =
+          static_cast<cudf::scalar_type_t<bool> const&>(current_mask.get_scalar());
+        if (bool_scalar.is_valid(_stream)) { throw_error = bool_scalar.value(_stream); }
+      } else {
+        auto any_result = cudf::reduce(current_mask.get_column_view(),
+                                       *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
+                                       cudf::data_type(cudf::type_id::BOOL8),
+                                       _stream,
+                                       _mr);
+        throw_error     = static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value(_stream);
+      }
+      if (throw_error) {
         // Assume that this arises for the stated error
         throw duckdb::InternalException(
           "[gpu_expression_executor:case]: More than one row returned by a subquery used as an "

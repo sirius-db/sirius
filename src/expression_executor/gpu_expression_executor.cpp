@@ -41,6 +41,14 @@
 
 namespace sirius::experimental {
 
+gpu_expression_executor::gpu_expression_executor(expression_executor_strategy strategy,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 std::size_t min_ast_size)
+  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+{
+}
+
 std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& expr) const
 {
   switch (expr.GetExpressionClass()) {
@@ -69,7 +77,8 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
     }
     case duckdb::ExpressionClass::BOUND_CONJUNCTION: {
       auto const& conj_expr = expr.Cast<duckdb::BoundConjunctionExpression>();
-      std::size_t count     = 1;
+      auto count =
+        conj_expr.children.size() - 1;  // Number of AND/OR ops is one less than number of children
       for (const auto& child : conj_expr.children) {
         count += count_ast_ops(*child);
       }
@@ -107,7 +116,7 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
           return count;
         }
         case duckdb::ExpressionType::OPERATOR_COALESCE:
-          /// KEVIN: This should be doable.
+          /// KEVIN: TODO
           throw duckdb::NotImplementedException(
             "[gpu_expression_executor] count_ast_ops called on an unsupported COALESCE operator "
             "expression.");

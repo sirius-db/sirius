@@ -49,6 +49,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression c
     };
 
     auto input                = execute(*expr.input, execution_mode::AST);
+    D_ASSERT(!input.is_scalar());
     auto lower                = execute(*expr.lower, execution_mode::AST);
     auto upper                = execute(*expr.upper, execution_mode::AST);
     auto [lower_op, upper_op] = comparison_type_switch_ast(expr);

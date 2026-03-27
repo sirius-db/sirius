@@ -93,7 +93,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpressi
   // DuckDB should prune all scalar conjuncts away
   D_ASSERT(!output.is_scalar());
   for (idx_t i = 1; i < expr.children.size(); i++) {
-    auto child = execute(*expr.children[i], execution_mode::AST);
+    auto child = execute(*expr.children[i], execution_mode::MATERIALIZE);
     D_ASSERT(!child.is_scalar());
     auto output_column = cudf::binary_operation(output.get_column_view(),
                                                 child.get_column_view(),
