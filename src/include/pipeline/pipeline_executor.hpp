@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/config.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
@@ -127,13 +128,11 @@ class pipeline_executor {
   [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
 
   /**
-   * @brief Enable or disable scan result caching
+   * @brief Configure scan result caching level
    *
-   * @param enabled True to enable caching, false to disable
+   * @param level The cache level to use
    */
-  void set_scan_caching_enabled(bool enabled,
-                                bool cache_decoded_table = false,
-                                bool cache_in_gpu        = false);
+  void set_scan_caching_config(sirius::op::scan::cache_level level);
 
   /**
    * @brief Set the priority scan operators
@@ -164,10 +163,19 @@ class pipeline_executor {
    */
   void terminate_query(std::exception_ptr error);
 
+  /**
+   * @brief Drain all in-flight tasks after a query error.
+   *
+   * Drains the top-level task queue and waits for each GPU executor to finish
+   * all in-flight thread-pool tasks.  After this call it is safe for QueryEnd
+   * to destroy data repositories without causing a use-after-free in executing
+   * tasks.  Each GPU executor's manager thread is restarted so the executor is
+   * ready for the next query.
+   */
+  void drain_after_error();
+
  private:
   void management_eventloop();
-
-  void schedule_next_scan_tasks();
 
   std::mutex _priority_scans_mutex;
   std::queue<op::sirius_physical_operator*> _priority_scans;

@@ -56,6 +56,7 @@ usage() {
     echo "  --compare DIR        Compare against a previous report directory"
     echo "  --iterations N       Iterations per query (default: 2)"
     echo "  --query-timeout N    Per-query timeout in seconds (default: 90)"
+    echo "  --cache-level LEVEL  Scan cache level: none, table_gpu, table_host, parquet (default: none)"
     echo "  -h, --help           Show this help"
     echo ""
     echo "Either --sf or --profile-dir is required."
@@ -71,6 +72,7 @@ while [ $# -gt 0 ]; do
         --compare)      COMPARE_DIR="$2"; shift 2 ;;
         --iterations)   ITERATIONS="$2"; shift 2 ;;
         --query-timeout) QUERY_TIMEOUT="$2"; shift 2 ;;
+        --cache-level)  SCAN_CACHE_LEVEL="$2"; shift 2 ;;
         -h|--help)      usage ;;
         -*)             echo "ERROR: Unknown option: $1" >&2; usage ;;
         *)              QUERIES+=("$1"); shift ;;
@@ -145,6 +147,7 @@ else
     export OUTPUT_DIR="$REPORT_DIR/profiles"
     export ITERATIONS
     export QUERY_TIMEOUT
+    export SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
     if bash "$PROJECT_DIR/test/tpch_performance/profile_tpch_nsys.sh" "$SF" "${QUERIES[@]+"${QUERIES[@]}"}"; then
         echo ""
         echo "  Profiling complete."

@@ -22,9 +22,9 @@ Experiment Setup:
 ## Supported OS/GPU/CUDA/CMake
 - Ubuntu >= 22.04
 - NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 13.0
+- CUDA >= 13.0 (requires NVIDIA driver >= 570)
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
-- libcudf >= 26.04
+- libcudf (stable)
 - We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
 ### Requirements
@@ -49,7 +49,7 @@ The environment activation handles setting up everything needed to build and tes
 
 To build Sirius:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 ```
 
 Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
@@ -75,7 +75,7 @@ To generate the TPC-H dataset
 cd test_datasets
 unzip tpch-dbgen.zip
 cd tpch-dbgen
-./dbgen -s 1 && mkdir s1 && mv *.tbl s1  # this generates dataset of SF1
+./dbgen -s 1 && mkdir -p s1 && mv *.tbl s1  # this generates dataset of SF1
 cd ../../
 ```
 
@@ -195,7 +195,7 @@ make test
 
 To run a specific test run the command from the root directory:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 ```
 
@@ -203,13 +203,13 @@ build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 
 Sirius also implements C++ tests for all of the APIs it implements. These tests are meant to be individual unit tests for each of the classes/functions used to run Sirius. You can find examples on how to implement these unit tests in `test/cpp`. You can run all of the unit tests using:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 build/release/extension/sirius/test/cpp/sirius_unittest
 ```
 
 To run tests associated with specific tag or to run a specific test you can execute the the test script like this:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
 build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
 ```
@@ -222,10 +222,19 @@ build/release/extension/sirius/test/cpp/log
 Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.
 
 ## Logging
-Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:
-```
-export SIRIUS_LOG_DIR={PATH for logging}
+Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
+
+Log directory and level can be initialized via environment variables before loading the extension:
+```bash
+export SIRIUS_LOG_DIR=/path/to/logs
 export SIRIUS_LOG_LEVEL=debug
+```
+
+Both can also be configured at runtime via DuckDB's `SET` command:
+```sql
+SET sirius_log_dir = '/path/to/logs';
+SET sirius_log_level = 'debug';
+SET sirius_log_flush_seconds = 1;
 ```
 
 ## Limitations
@@ -236,6 +245,10 @@ Sirius is under active development, and several features are still in progress. 
 - **Operator Coverage:** At present, Sirius only supports a range of operators including `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc. See issue [#21](https://github.com/sirius-db/sirius/issues/21) for more details.
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
+
+## Developer Documentation
+
+For in-depth documentation on the Super Sirius execution engine (the `gpu_execution` code path), see the [Super Sirius Documentation](super-sirius/README.md).
 
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), more [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), accelerating more engines, and many more.

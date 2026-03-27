@@ -8,6 +8,7 @@ requires-pixi = ">=0.59"
 scripts = ["scripts/pixi_activate.sh"]
 
 [dependencies]
+bc = "*"
 cmake = "4.1.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
@@ -24,11 +25,12 @@ libcurand-dev = "*"
 pre-commit = "*"
 libconfig = "*"
 libabseil = ">=20260107.0"
-duckdb = ">=1.4.4,<2"
+duckdb = "=1.4.4"
 clang-tools = ">=21.1.8,<22"
 spdlog = "1.8.*"
 pkg-config = "*"
 mold = "*"
+sqlite = ">=3.52.0,<4"
 
 [tasks]
 

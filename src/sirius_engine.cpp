@@ -41,6 +41,8 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius_context.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/data_repository_manager.hpp>
 
 #include <stdexcept>
@@ -63,7 +65,8 @@ void sirius_engine::reset()
 void sirius_engine::insert_repository(
   std::string_view port_id,
   duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline)
+  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
+  op::MemoryBarrierType barrier_type)
 {
   auto next_op            = dependent_pipeline->get_operators().size() == 0
                               ? dependent_pipeline->get_sink().get()
@@ -75,7 +78,7 @@ void sirius_engine::insert_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
   next_op->add_port(port_id,
                     std::make_unique<op::sirius_physical_operator::port>(
-                      op::MemoryBarrierType::FULL,
+                      barrier_type,
                       data_repo_manager.get_repository(op_id, port_id).get(),
                       input_pipeline,
                       dependent_pipeline));
@@ -98,7 +101,8 @@ void sirius_engine::insert_repository(
   std::string_view port_id,
   op::sirius_physical_operator* cur_op,
   duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline)
+  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
+  op::MemoryBarrierType barrier_type)
 {
   auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_data_repository_manager();
@@ -110,7 +114,7 @@ void sirius_engine::insert_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
   next_op->add_port(port_id,
                     std::make_unique<op::sirius_physical_operator::port>(
-                      op::MemoryBarrierType::FULL,
+                      barrier_type,
                       data_repo_manager.get_repository(op_id, port_id).get(),
                       input_pipeline,
                       dependent_pipeline));
@@ -184,24 +188,29 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
+  nvtx3::scoped_range nvtx_range{"sirius::query"};
+
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
 
-  // Create the query with the pipeline hashmap
-  sirius_pipeline_hashmap pipeline_map(new_scheduled);
-  sirius_ctx->create_query(std::move(pipeline_map));
+  // Create the query with the pipelines
+  sirius_ctx->create_query(std::move(new_scheduled));
   auto future = sirius_ctx->get_pipeline_executor().start_query();
   try {
     future.get();
   } catch (const std::exception& e) {
-    /// todo(bobbi) we should handle the error properly, clean the query context and then return the
-    /// error to duckdb
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
+    // clear_all_repositories() immediately after execute() throws; without
+    // this drain, tasks still running in the thread pool hold raw pointers to
+    // those repositories and cause a use-after-free / heap corruption.
+    sirius_ctx->get_pipeline_executor().drain_after_error();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
+    sirius_ctx->get_pipeline_executor().drain_after_error();
     throw;
   }
 }
@@ -898,6 +907,13 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       source_to_pipelines[new_scheduled[i]->source.get()].push_back(new_scheduled[i]);
     }
 
+    // Assign pipeline IDs before adding ports so that add_port can sort _ports_list
+    // correctly by pipeline ID. (set_pipeline_id was previously called only after
+    // insert_repository, meaning all pipelines had id=0 at port-insertion time.)
+    for (size_t i = 0; i < new_scheduled.size(); i++) {
+      new_scheduled[i]->set_pipeline_id(i);
+    }
+
     // add data repositories and ports
     for (size_t i = 0; i < new_scheduled.size(); i++) {
       if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
@@ -988,9 +1004,20 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
-        // Full barrier operators — wait for upstream to finish before processing
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
-          insert_repository("default", new_scheduled[i], dependent_pipeline);
+          // if the source is CONCAT, then use partial barrier type
+          if ((dependent_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
+               dependent_pipeline->get_operators().size() == 0) ||
+              (dependent_pipeline->get_operators().size() > 0 &&
+               dependent_pipeline->get_operators()[0].get().type ==
+                 op::SiriusPhysicalOperatorType::CONCAT)) {
+            insert_repository(
+              "default", new_scheduled[i], dependent_pipeline, op::MemoryBarrierType::PARTIAL);
+            // Full barrier operators — wait for upstream to finish before processing
+          } else {
+            insert_repository(
+              "default", new_scheduled[i], dependent_pipeline, op::MemoryBarrierType::FULL);
+          }
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
@@ -1044,7 +1071,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
     // Set pipeline IDs, parents, and operator children (before finalization)
     for (size_t i = 0; i < new_scheduled.size(); i++) {
-      new_scheduled[i]->set_pipeline_id(i);
       new_scheduled[i]->parents.clear();
       new_scheduled[i]->dependencies.clear();
 
@@ -1123,8 +1149,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
         auto probe_concat_pipeline    = new_scheduled[i]->dependencies[1];
         auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
+        // change probe partition barrier to partial
+        probe_partition_pipeline->get_source()->get_port("default")->type =
+          op::MemoryBarrierType::PARTIAL;
         if (build_partition_pipeline->get_sink()->type ==
             op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+          // partition pipeline only has one operator
           auto& right_delim_join_op =
             build_partition_pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
           auto build_partition_op = right_delim_join_op.partition_join;
@@ -1133,6 +1163,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           build_partition_op->set_sibling_partition_op(&probe_partition_op);
           probe_partition_op.set_sibling_partition_op(build_partition_op);
         } else {
+          // partition pipeline only has one operator, so sink and source are the same
           auto& build_partition_op =
             build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
           auto& probe_partition_op =
