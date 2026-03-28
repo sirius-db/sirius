@@ -19,9 +19,11 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/iceberg_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
@@ -98,11 +100,29 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
             &source_operator->Cast<op::sirius_physical_parquet_scan>(),
             op_params.scan_task_batch_size));
       }
+    } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+      auto it = _parquet_scan_operator_global_state_map.find(operator_id);
+      if (it != _parquet_scan_operator_global_state_map.end()) {
+        it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_iceberg_scan>());
+      } else {
+        const auto& op_params =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+            ->get_config()
+            .get_operator_params();
+        _parquet_scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::iceberg_scan_task_global_state>(
+            pipeline,
+            &source_operator->Cast<op::sirius_physical_iceberg_scan>(),
+            op_params.scan_task_batch_size));
+      }
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
     }
   }
+  _num_scans_in_plan = _scan_operator_global_state_map.size() +
+                       _parquet_scan_operator_global_state_map.size();
 }
 
 void task_creator::drain_pending_tasks()
@@ -128,7 +148,8 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 {
   if (node == nullptr) { return nullptr; }
 
-  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+      node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
     size_t operator_id             = node->get_operator_id();
     auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
     if (parquet_task_global_state->has_more_partitions()) {
@@ -282,10 +303,16 @@ void task_creator::manager_loop()
           pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
                                           // with the task creation
           _pipeline_executor->schedule(std::move(scan_task));
-        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                   node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
-          auto* parquet_scan             = &node->Cast<op::sirius_physical_parquet_scan>();
+          // ICEBERG_SCAN inherits from PARQUET_SCAN; Cast<> is type-checked by enum so use
+          // static_cast for iceberg nodes.
+          auto* parquet_scan =
+            (node->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN)
+              ? static_cast<op::sirius_physical_parquet_scan*>(node)
+              : &node->Cast<op::sirius_physical_parquet_scan>();
           while (true) {
             pipeline->mark_task_created();
             auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();

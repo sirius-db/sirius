@@ -24,13 +24,39 @@
 // cudf
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+// rmm
+#include <rmm/cuda_stream_view.hpp>
+
 // standard library
+#include <functional>
 #include <memory>
 #include <vector>
 
 namespace sirius {
+
+/**
+ * @brief Function called after a parquet batch is decompressed to a GPU cuDF table.
+ *
+ * Used by the iceberg scan path to apply V2 positional and equality deletes on the
+ * GPU without adding any pipeline operator. The hook receives the freshly produced
+ * cudf::table, the data-file path that produced this batch, the 0-based absolute
+ * row offset of the first row in the batch within the data file, and the CUDA stream.
+ * It must return a (possibly filtered) replacement table.
+ *
+ * - data_file_path  : identifies which Iceberg data file this batch came from
+ *                     (used to look up matching positional-delete records).
+ * - first_row_offset: absolute row index of the first row in this batch within
+ *                     the data file.  Needed to translate Iceberg V2 positional
+ *                     delete `pos` values into batch-relative indices.
+ */
+using post_convert_fn_t =
+  std::function<std::unique_ptr<cudf::table>(std::unique_ptr<cudf::table>,
+                                             std::string const& data_file_path,
+                                             int64_t first_row_offset,
+                                             rmm::cuda_stream_view)>;
 
 /**
  * @brief A host representation of Parquet data for use in a hybrid scan.
@@ -234,6 +260,65 @@ class host_parquet_representation : public cucascade::idata_representation {
     _fallback_datasource = std::move(ds);
   }
 
+  // -------------------------------------------------------------------------
+  // Post-convert hook (used by the iceberg scan path for delete application)
+  // -------------------------------------------------------------------------
+
+  /**
+   * @brief Install a post-convert hook.
+   *
+   * Copied from parquet_scan_task_global_state::get_post_convert_fn() in
+   * parquet_scan_task::compute_task() so that the host->GPU converter can
+   * invoke it immediately after cudf::io::read_parquet returns.
+   */
+  void set_post_convert_fn(post_convert_fn_t fn) { _post_convert_fn = std::move(fn); }
+
+  [[nodiscard]] bool has_post_convert_fn() const { return _post_convert_fn != nullptr; }
+
+  /**
+   * @brief Apply the post-convert hook to @p tbl and return the filtered table.
+   *
+   * Computes the absolute first-row offset from the parquet reader metadata and
+   * forwards it together with the data-file path to the hook.  Only call after
+   * checking has_post_convert_fn().
+   */
+  [[nodiscard]] std::unique_ptr<cudf::table> apply_post_convert(std::unique_ptr<cudf::table> tbl,
+                                                                 rmm::cuda_stream_view stream)
+  {
+    return _post_convert_fn(std::move(tbl), _data_file_path, compute_first_row_offset(), stream);
+  }
+
+  [[nodiscard]] post_convert_fn_t const& get_post_convert_fn() const { return _post_convert_fn; }
+
+  /**
+   * @brief Set the path of the Iceberg data file this batch was produced from.
+   *
+   * Called by parquet_scan_task::compute_task() so the converter can forward
+   * the path to the post-convert hook.
+   */
+  void set_data_file_path(std::string path) { _data_file_path = std::move(path); }
+
+  [[nodiscard]] std::string const& get_data_file_path() const { return _data_file_path; }
+
+  /**
+   * @brief Compute the 0-based absolute row offset of the first row in this batch.
+   *
+   * Sums num_rows for all row groups preceding the first row group in
+   * _row_group_indices using the parquet reader's metadata.
+   * Returns 0 if there are no row groups.
+   */
+  [[nodiscard]] int64_t compute_first_row_offset() const
+  {
+    if (_row_group_indices.empty()) return 0;
+    auto const first_rg = static_cast<size_t>(_row_group_indices[0]);
+    auto const& meta    = _parquet_reader->parquet_metadata();
+    int64_t offset      = 0;
+    for (size_t rg = 0; rg < first_rg && rg < meta.row_groups.size(); ++rg) {
+      offset += meta.row_groups[rg].num_rows;
+    }
+    return offset;
+  }
+
  private:
   host_parquet_representation(cucascade::memory::memory_space* memory_space,
                               std::shared_ptr<hybrid_scan_reader> parquet_reader,
@@ -266,5 +351,9 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_size_in_bytes;
   std::size_t _file_size{0};
   std::shared_ptr<cudf::io::datasource> _fallback_datasource;
+  /// Optional post-convert hook (null for plain parquet, set for iceberg V2 deletes).
+  post_convert_fn_t _post_convert_fn;
+  /// Path of the Iceberg data file this batch was read from (empty for plain parquet).
+  std::string _data_file_path;
 };
 }  // namespace sirius

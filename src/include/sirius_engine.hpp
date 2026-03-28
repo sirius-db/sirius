@@ -31,6 +31,10 @@ namespace duckdb {
 class ClientContext;
 }  // namespace duckdb
 
+namespace sirius::op {
+class sirius_physical_table_scan;
+}  // namespace sirius::op
+
 namespace sirius {
 
 class sirius_interface;
@@ -90,6 +94,9 @@ class sirius_engine {
   //! Construct the sirius specific operator
   duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
     op::sirius_physical_operator* op);
+  //! Construct a sirius iceberg scan operator, populating delete file lists.
+  duckdb::unique_ptr<op::sirius_physical_operator> construct_iceberg_scan_operator(
+    op::sirius_physical_table_scan& scan_op);
   //! Create a child pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
