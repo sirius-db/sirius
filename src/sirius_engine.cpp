@@ -185,6 +185,11 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
   reset();
   sirius_owned_plan = std::move(plan);
+  // Pre-fetch iceberg delete-file metadata before initialize_internal() assigns
+  // operator IDs to pipeline-breaker operators (PARTITION, CONCAT, etc.).
+  // The DuckDB metadata connection is opened under InternalQueryGuard so that
+  // QueryBegin/QueryEnd side-effects on the shared SiriusContext are suppressed.
+  prefetch_iceberg_metadata(*sirius_owned_plan);
   initialize_internal(*sirius_owned_plan);
 }
 
@@ -258,75 +263,94 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_iceber
 {
   auto iceberg_scan = duckdb::make_uniq<op::sirius_physical_iceberg_scan>(&scan_op);
 
-  // Retrieve the iceberg table path from the scan parameters.
-  // iceberg_scan('/path/to/table') stores the path as parameters[0].
-  if (scan_op.parameters.empty()) {
-    // No path available — treat as V1 (no delete files).
-    return iceberg_scan;
-  }
-
-  std::string const table_path = scan_op.parameters[0].ToString();
-
-  // Use a fresh connection to the same database instance so that we can run iceberg_metadata()
-  // without interfering with the active query's state.
-  //
-  // Because OnConnectionOpened registers the SAME SiriusContext on every new connection,
-  // the new connection's QueryBegin callback would otherwise reset next_operator_id to 0
-  // (corrupting operator IDs for operators created later in initialize_internal) and
-  // QueryEnd would clear the data repositories.  Bracketing with enter/exit_internal_query()
-  // makes those callbacks no-ops for the duration of the metadata lookup.
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    // SiriusContext not registered on this connection — can't run iceberg_metadata().
-    // Treat as V1 (no delete files).
-    SIRIUS_LOG_WARN(
-      "[sirius_engine] SiriusContext not available for iceberg metadata lookup on '{}'. Treating "
-      "as V1.",
-      table_path);
-    return iceberg_scan;
-  }
-  sirius_ctx->enter_internal_query();
-  try {
-    duckdb::Connection meta_conn(*context.db);
-
-    auto result = meta_conn.Query("SELECT file_path, content FROM iceberg_metadata('" +
-                                  table_path + "') WHERE content != 'EXISTING'");
-    if (result->HasError()) {
-      sirius_ctx->exit_internal_query();
-      SIRIUS_LOG_WARN(
-        "[sirius_engine] iceberg_metadata() query failed for '{}': {}. Treating as V1.",
-        table_path,
-        result->GetError());
-      return iceberg_scan;
+  if (!scan_op.parameters.empty()) {
+    std::string const table_path = scan_op.parameters[0].ToString();
+    auto it                      = iceberg_metadata_cache_.find(table_path);
+    if (it != iceberg_metadata_cache_.end()) {
+      iceberg_scan->positional_delete_files = it->second.positional_delete_files;
+      iceberg_scan->equality_delete_files   = it->second.equality_delete_files;
     }
-
-    while (auto chunk = result->Fetch()) {
-      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
-        auto const file_path = chunk->GetValue(0, row).ToString();
-        auto const content   = chunk->GetValue(1, row).ToString();
-        if (content == "POSITION_DELETES") {
-          iceberg_scan->positional_delete_files.push_back(file_path);
-        } else if (content == "EQUALITY_DELETES") {
-          iceberg_scan->equality_delete_files.push_back(file_path);
-        }
-      }
-    }
-
-    sirius_ctx->exit_internal_query();
-    SIRIUS_LOG_INFO(
-      "[sirius_engine] iceberg '{}': {} positional-delete file(s), {} equality-delete file(s).",
-      table_path,
-      iceberg_scan->positional_delete_files.size(),
-      iceberg_scan->equality_delete_files.size());
-  } catch (std::exception const& e) {
-    sirius_ctx->exit_internal_query();
-    SIRIUS_LOG_WARN(
-      "[sirius_engine] Failed to read iceberg metadata for '{}': {}. Treating as V1.",
-      table_path,
-      e.what());
   }
 
   return iceberg_scan;
+}
+
+void sirius_engine::prefetch_iceberg_metadata(op::sirius_physical_operator& plan)
+{
+  // Walk the plan tree and fetch delete-file metadata for every iceberg scan.
+  // This runs in initialize() BEFORE initialize_internal() so that operator IDs
+  // for pipeline-breaker nodes (PARTITION, CONCAT, …) haven't been assigned yet.
+  //
+  // Opening a secondary DuckDB connection triggers QueryBegin/QueryEnd on the
+  // shared SiriusContext (because OnConnectionOpened registers it everywhere).
+  // InternalQueryGuard suppresses those side-effects so they don't corrupt the
+  // outer query's task_creator state or next_operator_id counter.
+
+  if (plan.type != op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    // sirius_physical_result_collector stores its plan in `plan` (not in `children`).
+    // For all other operators, recurse via `children`.
+    if (plan.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+      auto& collector = plan.Cast<op::sirius_physical_result_collector>();
+      prefetch_iceberg_metadata(collector.plan);
+    } else {
+      for (auto& child : plan.children) {
+        prefetch_iceberg_metadata(*child);
+      }
+    }
+    return;
+  }
+
+  auto& scan_op = plan.Cast<op::sirius_physical_table_scan>();
+  if (scan_op.function.name != "iceberg_scan" || scan_op.parameters.empty()) { return; }
+
+  std::string const table_path = scan_op.parameters[0].ToString();
+  if (iceberg_metadata_cache_.count(table_path)) { return; }  // already fetched
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    SIRIUS_LOG_WARN(
+      "[sirius_engine] SiriusContext not available; treating iceberg '{}' as V1.", table_path);
+    iceberg_metadata_cache_.emplace(table_path, IcebergDeleteFiles{});
+    return;
+  }
+
+  IcebergDeleteFiles files;
+  {
+    duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+    try {
+      duckdb::Connection meta_conn(*context.db);
+      auto result = meta_conn.Query("SELECT file_path, content FROM iceberg_metadata('" +
+                                    table_path + "') WHERE content != 'EXISTING'");
+      if (result->HasError()) {
+        SIRIUS_LOG_WARN(
+          "[sirius_engine] iceberg_metadata() failed for '{}': {}. Treating as V1.",
+          table_path,
+          result->GetError());
+      } else {
+        while (auto chunk = result->Fetch()) {
+          for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+            auto const file_path = chunk->GetValue(0, row).ToString();
+            auto const content   = chunk->GetValue(1, row).ToString();
+            if (content == "POSITION_DELETES") {
+              files.positional_delete_files.push_back(file_path);
+            } else if (content == "EQUALITY_DELETES") {
+              files.equality_delete_files.push_back(file_path);
+            }
+          }
+        }
+        SIRIUS_LOG_INFO(
+          "[sirius_engine] iceberg '{}': {} positional-delete, {} equality-delete file(s).",
+          table_path,
+          files.positional_delete_files.size(),
+          files.equality_delete_files.size());
+      }
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_engine] iceberg metadata error for '{}': {}. Treating as V1.", table_path, e.what());
+    }
+  }  // InternalQueryGuard exits here — suppression ends
+
+  iceberg_metadata_cache_.emplace(table_path, std::move(files));
 }
 
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)

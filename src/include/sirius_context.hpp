@@ -80,15 +80,34 @@ class SiriusContext : public ClientContextState {
    * Some code paths (e.g. iceberg metadata lookup) must open a second DuckDB
    * Connection to the same database.  Because OnConnectionOpened registers the
    * SAME SiriusContext on every connection, the new connection's query lifecycle
-   * callbacks would fire QueryBegin (resetting next_operator_id) and QueryEnd
-   * (clearing all data repositories), corrupting the outer query's state.
+   * callbacks would fire QueryBegin (resetting next_operator_id and resetting
+   * task_creator state) and QueryEnd (clearing all data repositories), corrupting
+   * the outer query's state.
    *
-   * Call enter_internal_query() before creating the internal connection and
-   * exit_internal_query() (or let the RAII guard do it) afterwards.  The depth
-   * counter allows nesting.
+   * Use the RAII InternalQueryGuard to bracket any code that opens an internal
+   * connection.  The depth counter allows nesting.
    */
-  void enter_internal_query() noexcept { _internal_query_depth.fetch_add(1, std::memory_order_relaxed); }
-  void exit_internal_query() noexcept { _internal_query_depth.fetch_sub(1, std::memory_order_relaxed); }
+  struct InternalQueryGuard {
+    explicit InternalQueryGuard(SiriusContext& ctx) noexcept : ctx_(ctx)
+    {
+      ctx_.enter_internal_query();
+    }
+    ~InternalQueryGuard() noexcept { ctx_.exit_internal_query(); }
+    InternalQueryGuard(const InternalQueryGuard&)            = delete;
+    InternalQueryGuard& operator=(const InternalQueryGuard&) = delete;
+
+   private:
+    SiriusContext& ctx_;
+  };
+
+  void enter_internal_query() noexcept
+  {
+    _internal_query_depth.fetch_add(1, std::memory_order_relaxed);
+  }
+  void exit_internal_query() noexcept
+  {
+    _internal_query_depth.fetch_sub(1, std::memory_order_relaxed);
+  }
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();

@@ -27,6 +27,10 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 namespace duckdb {
 class ClientContext;
 }  // namespace duckdb
@@ -94,9 +98,13 @@ class sirius_engine {
   //! Construct the sirius specific operator
   duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
     op::sirius_physical_operator* op);
-  //! Construct a sirius iceberg scan operator, populating delete file lists.
+  //! Construct a sirius iceberg scan operator, populating delete file lists from cache.
   duckdb::unique_ptr<op::sirius_physical_operator> construct_iceberg_scan_operator(
     op::sirius_physical_table_scan& scan_op);
+  //! Pre-fetch iceberg table metadata (delete files) for all iceberg scans in the plan.
+  //! Must be called from initialize() BEFORE initialize_internal() assigns operator IDs
+  //! to pipeline-breaker operators (PARTITION, CONCAT, etc.).
+  void prefetch_iceberg_metadata(op::sirius_physical_operator& plan);
   //! Create a child pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
@@ -109,6 +117,18 @@ class sirius_engine {
   std::condition_variable query_finish_cv;
   //! Whether the query has finished
   bool query_finished;
+
+  // ---------------------------------------------------------------------------
+  // Iceberg metadata cache
+  //
+  // Populated by prefetch_iceberg_metadata() in initialize(), BEFORE
+  // initialize_internal() runs.  Keyed by iceberg table path string.
+  // ---------------------------------------------------------------------------
+  struct IcebergDeleteFiles {
+    std::vector<std::string> positional_delete_files;
+    std::vector<std::string> equality_delete_files;
+  };
+  std::unordered_map<std::string, IcebergDeleteFiles> iceberg_metadata_cache_;
 };
 
 }  // namespace sirius
