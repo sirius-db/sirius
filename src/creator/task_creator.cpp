@@ -101,10 +101,13 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
             op_params.scan_task_batch_size));
       }
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+      SIRIUS_LOG_INFO("[task_creator::prepare_for_query] ICEBERG_SCAN operator_id={}", operator_id);
       auto it = _parquet_scan_operator_global_state_map.find(operator_id);
       if (it != _parquet_scan_operator_global_state_map.end()) {
+        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] rebind existing state for id={}", operator_id);
         it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_iceberg_scan>());
       } else {
+        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] creating NEW state for id={}", operator_id);
         const auto& op_params =
           _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
             ->get_config()

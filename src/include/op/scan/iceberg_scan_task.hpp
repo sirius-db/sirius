@@ -19,6 +19,9 @@
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_iceberg_scan.hpp>
 
+#include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/table/table.hpp>
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -44,6 +47,32 @@ struct iceberg_delete_state {
   std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
 };
 
+/**
+ * @brief State for Iceberg V2 equality deletes.
+ *
+ * Holds the deduplicated equality-delete key table on the GPU and a pre-built
+ * `cudf::distinct_hash_join` for fast probe operations.  Shared across all
+ * scan tasks for the same table (captured by shared_ptr in the hook lambda).
+ *
+ * For each data-chunk the post-convert hook probes the hash join with the
+ * chunk's key columns, then downloads the per-row match result (build_indices)
+ * to the host, builds a boolean keep-mask, and applies
+ * `cudf::apply_boolean_mask`.  The sync cost is small because build_indices is
+ * at most one INT32 per data row (~400 KB for a 100 K-row batch).
+ */
+struct iceberg_equality_delete_state {
+  /// De-duplicated equality-delete rows projected to key columns only.
+  /// Kept alive while `hash_join` is in use (hash_join holds a table_view ref).
+  std::unique_ptr<cudf::table> delete_key_table;
+
+  /// Pre-built distinct hash join (build side = delete_key_table).
+  std::unique_ptr<cudf::distinct_hash_join> hash_join;
+
+  /// Indices into the data-chunk that correspond to the equality key columns.
+  /// Parallel to the columns of delete_key_table.
+  std::vector<cudf::size_type> data_key_indices;
+};
+
 //===----------------------------------------------------------------------===//
 // Iceberg Scan Task Global State
 //===----------------------------------------------------------------------===//
@@ -62,8 +91,8 @@ struct iceberg_delete_state {
  *    a host-side map and installs a post-convert hook that filters the deleted
  *    rows from each row-group batch on the GPU before it is pushed down the
  *    pipeline.
- *  - Equality deletes are not yet implemented; a runtime error is thrown if
- *    equality_delete_files is non-empty.
+ *  - V2 equality deletes: reads delete files, builds a distinct_hash_join,
+ *    and installs a hook that applies an anti-join per row-group batch.
  */
 class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
  public:
@@ -118,7 +147,8 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
   // -------------------------------------------------------------------------
   // Fields
   // -------------------------------------------------------------------------
-  std::shared_ptr<iceberg_delete_state> _delete_state;
+  std::shared_ptr<iceberg_delete_state>          _delete_state;
+  std::shared_ptr<iceberg_equality_delete_state> _equality_delete_state;
 };
 
 }  // namespace sirius::op::scan

@@ -95,6 +95,7 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/duckdb_scan_task.cpp
+    src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp

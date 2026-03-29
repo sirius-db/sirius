@@ -32,6 +32,7 @@
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
+#include "op/scan/iceberg_avro_reader.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -315,6 +316,7 @@ void sirius_engine::prefetch_iceberg_metadata(op::sirius_physical_operator& plan
   }
 
   IcebergDeleteFiles files;
+  bool               metadata_ok = false;
   {
     duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
     try {
@@ -322,8 +324,11 @@ void sirius_engine::prefetch_iceberg_metadata(op::sirius_physical_operator& plan
       auto result = meta_conn.Query("SELECT file_path, content FROM iceberg_metadata('" +
                                     table_path + "') WHERE content != 'EXISTING'");
       if (result->HasError()) {
-        SIRIUS_LOG_WARN(
-          "[sirius_engine] iceberg_metadata() failed for '{}': {}. Treating as V1.",
+        // iceberg_metadata() fails on tables that have equality-delete manifests
+        // (DuckDB 1.4.4 limitation: "Invalid Manifest Content Type").
+        // Fall through to the avro-based fallback below.
+        SIRIUS_LOG_DEBUG(
+          "[sirius_engine] iceberg_metadata() unavailable for '{}': {}. Trying avro fallback.",
           table_path,
           result->GetError());
       } else {
@@ -338,17 +343,71 @@ void sirius_engine::prefetch_iceberg_metadata(op::sirius_physical_operator& plan
             }
           }
         }
-        SIRIUS_LOG_INFO(
-          "[sirius_engine] iceberg '{}': {} positional-delete, {} equality-delete file(s).",
-          table_path,
-          files.positional_delete_files.size(),
-          files.equality_delete_files.size());
+        metadata_ok = true;
+      }
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_engine] iceberg_metadata() exception for '{}': {}. Trying avro fallback.",
+        table_path,
+        e.what());
+    }
+  }  // InternalQueryGuard exits here — suppression ends
+
+  // Fallback: read the iceberg manifest-list avro directly.
+  // This handles tables with equality deletes where iceberg_metadata() fails.
+  if (!metadata_ok) {
+    try {
+      // Get the manifest-list path from iceberg_snapshots (works even when
+      // iceberg_metadata fails because it never touches delete manifests).
+      duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+      duckdb::Connection                        snap_conn(*context.db);
+      auto snap_result =
+        snap_conn.Query("SELECT manifest_list FROM iceberg_snapshots('" + table_path +
+                        "') ORDER BY sequence_number DESC LIMIT 1");
+      if (!snap_result->HasError()) {
+        auto chunk = snap_result->Fetch();
+        if (chunk && chunk->size() > 0) {
+          std::string manifest_list_path = chunk->GetValue(0, 0).ToString();
+          // Parse the manifest list avro to find all manifest paths + content types
+          auto manifests = sirius::op::scan::read_iceberg_manifest_list(manifest_list_path);
+          for (auto const& [mpath, mcontent] : manifests) {
+            constexpr int kPositionDeletes = 1;
+            constexpr int kEqualityDeletes = 2;
+            if (mcontent == kPositionDeletes) {
+              // Read positional-delete file paths from the manifest
+              auto del_files =
+                sirius::op::scan::read_iceberg_manifest_delete_files(mpath, kPositionDeletes);
+              for (auto& f : del_files) {
+                files.positional_delete_files.push_back(std::move(f));
+              }
+            } else if (mcontent == kEqualityDeletes) {
+              auto del_files =
+                sirius::op::scan::read_iceberg_manifest_delete_files(mpath, kEqualityDeletes);
+              for (auto& f : del_files) {
+                files.equality_delete_files.push_back(std::move(f));
+              }
+            }
+          }
+          metadata_ok = true;
+        }
       }
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
-        "[sirius_engine] iceberg metadata error for '{}': {}. Treating as V1.", table_path, e.what());
+        "[sirius_engine] avro manifest fallback failed for '{}': {}. Treating as V1.",
+        table_path,
+        e.what());
     }
-  }  // InternalQueryGuard exits here — suppression ends
+  }
+
+  if (metadata_ok) {
+    SIRIUS_LOG_INFO(
+      "[sirius_engine] iceberg '{}': {} positional-delete, {} equality-delete file(s).",
+      table_path,
+      files.positional_delete_files.size(),
+      files.equality_delete_files.size());
+  } else {
+    SIRIUS_LOG_WARN("[sirius_engine] iceberg '{}': treating as V1 (no delete files).", table_path);
+  }
 
   iceberg_metadata_cache_.emplace(table_path, std::move(files));
 }

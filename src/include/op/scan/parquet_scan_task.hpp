@@ -275,6 +275,17 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   [[nodiscard]] post_convert_fn_t get_post_convert_fn() const { return _post_convert_fn; }
 
+  /**
+   * @brief Return the selected column indices (indices into scan_op->names, in cudf table order).
+   *
+   * Used by iceberg_scan_task_global_state to compute data_key_indices that correctly map
+   * equality-delete key names to cudf table column positions.
+   */
+  [[nodiscard]] std::vector<size_t> const& get_selected_column_indices() const
+  {
+    return _selected_column_indices;
+  }
+
  protected:
   /**
    * @brief Protected constructor for subclasses that pre-process the file list.
