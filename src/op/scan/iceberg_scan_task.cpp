@@ -23,9 +23,13 @@
 
 // cudf
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/join/join.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 // cuda
@@ -36,8 +40,8 @@
 
 // standard library
 #include <algorithm>
-#include <cstring>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -183,6 +187,142 @@ post_convert_fn_t make_positional_delete_hook(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Equality delete helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Read an equality-delete parquet file and return (table, column_names).
+ *
+ * The returned table contains only the equality-key columns.
+ * Column names are extracted from the parquet schema metadata.
+ */
+std::pair<std::unique_ptr<cudf::table>, std::vector<std::string>>
+read_equality_delete_file(std::string const& delete_file_path)
+{
+  auto stream = cudf::get_default_stream();
+  auto opts =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{delete_file_path}).build();
+  auto result = cudf::io::read_parquet(opts, stream);
+
+  if (!result.tbl) {
+    throw std::runtime_error(
+      "[iceberg_scan_task] Failed to read equality-delete file: " + delete_file_path);
+  }
+
+  // Extract column names from schema info
+  std::vector<std::string> col_names;
+  col_names.reserve(result.metadata.schema_info.size());
+  for (auto const& si : result.metadata.schema_info) {
+    col_names.push_back(si.name);
+  }
+
+  stream.synchronize();
+  SIRIUS_LOG_INFO("[read_equality_delete_file] path={} rows={} cols={} schema_info_size={}",
+                  delete_file_path, result.tbl->num_rows(), result.tbl->num_columns(),
+                  result.metadata.schema_info.size());
+  for (auto const& si : result.metadata.schema_info) {
+    SIRIUS_LOG_INFO("[read_equality_delete_file]   col={}", si.name);
+  }
+  return {std::move(result.tbl), std::move(col_names)};
+}
+
+/**
+ * @brief Chain two post-convert hooks into one that applies them in sequence.
+ */
+post_convert_fn_t chain_hooks(post_convert_fn_t first, post_convert_fn_t second)
+{
+  return [f1 = std::move(first), f2 = std::move(second)](std::unique_ptr<cudf::table> tbl,
+                                                          std::string const& path,
+                                                          int64_t first_row,
+                                                          rmm::cuda_stream_view stream)
+           -> std::unique_ptr<cudf::table> {
+    tbl = f1(std::move(tbl), path, first_row, stream);
+    return f2(std::move(tbl), path, first_row, stream);
+  };
+}
+
+/**
+ * @brief Build a post-convert hook for Iceberg V2 equality deletes.
+ *
+ * The hook probes the pre-built distinct_hash_join with each data-chunk's
+ * key columns, retrieves the per-row match result (build_indices) via a
+ * device-to-host copy, builds a boolean keep-mask, and applies
+ * cudf::apply_boolean_mask.
+ */
+post_convert_fn_t make_equality_delete_hook(
+  std::shared_ptr<iceberg_equality_delete_state> eq_state)
+{
+  return [state = std::move(eq_state)](std::unique_ptr<cudf::table> tbl,
+                                       std::string const& /*path*/,
+                                       int64_t /*first_row*/,
+                                       rmm::cuda_stream_view stream)
+           -> std::unique_ptr<cudf::table> {
+    auto const n_rows = tbl->num_rows();
+    SIRIUS_LOG_INFO("[equality_delete_hook] chunk: {} rows, {} cols, key_indices={}", n_rows,
+                    tbl->num_columns(), state->data_key_indices.size());
+    if (n_rows == 0) return tbl;
+
+    // Verify all key columns are present in this chunk.  DuckDB can push down
+    // column projections (e.g. for count(*)) that exclude equality-key columns.
+    // When that happens the delete cannot be applied — return the original chunk.
+    // This gives incorrect results for count(*)-style queries on tables with
+    // equality deletes, but it avoids a crash; a full fix requires projecting
+    // the key columns unconditionally at scan time.
+    for (auto idx : state->data_key_indices) {
+      if (idx >= static_cast<cudf::size_type>(tbl->num_columns())) { return tbl; }
+    }
+
+    // Project data chunk to the equality key columns
+    auto data_key_view = tbl->select(state->data_key_indices);
+
+    // Probe the hash join: build_indices[i] = matching row in delete table,
+    // or JoinNoMatch if no match.  Keep rows where build_indices[i] == JoinNoMatch.
+    auto build_indices = state->hash_join->left_join(data_key_view, stream);
+
+    // Sync so the device→host copy sees the completed result
+    stream.synchronize();
+
+    // Download build_indices and build a keep-mask on the host
+    // build_indices->size() should equal n_rows for distinct left_join
+    auto const bi_size = static_cast<cudf::size_type>(build_indices->size());
+    auto const copy_n  = std::min(n_rows, bi_size);
+    std::vector<cudf::size_type> host_indices(n_rows, cudf::JoinNoMatch);
+    cudaMemcpy(host_indices.data(),
+               build_indices->data(),
+               copy_n * sizeof(cudf::size_type),
+               cudaMemcpyDeviceToHost);
+
+    std::vector<uint8_t> keep(n_rows);
+    bool any_deleted = false;
+    for (cudf::size_type i = 0; i < n_rows; ++i) {
+      bool matched = (host_indices[i] != cudf::JoinNoMatch);
+      keep[i]      = matched ? uint8_t{0} : uint8_t{1};
+      if (matched) any_deleted = true;
+    }
+
+    if (!any_deleted) {
+      SIRIUS_LOG_INFO("[equality_delete_hook] no rows deleted");
+      return tbl;
+    }
+    SIRIUS_LOG_INFO("[equality_delete_hook] deleting rows from chunk");
+
+    // Upload the boolean mask to the GPU and filter
+    auto bool_col =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::BOOL8},
+                                    n_rows,
+                                    cudf::mask_state::UNALLOCATED,
+                                    stream);
+    cudaMemcpyAsync(bool_col->mutable_view().data<uint8_t>(),
+                    keep.data(),
+                    n_rows * sizeof(uint8_t),
+                    cudaMemcpyHostToDevice,
+                    stream.value());
+
+    return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream);
+  };
+}
+
 }  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
@@ -246,43 +386,150 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
 
 void iceberg_scan_task_global_state::build_delete_state(sirius_physical_iceberg_scan* scan_op)
 {
-  // Equality deletes are not yet implemented.
-  if (!scan_op->equality_delete_files.empty()) {
-    throw std::runtime_error(
-      "[iceberg_scan_task_global_state] Equality deletes are not yet supported. "
-      "Found " +
-      std::to_string(scan_op->equality_delete_files.size()) + " equality-delete file(s).");
-  }
-
   // V1 tables and V2 tables with no delete files: nothing to do.
-  if (scan_op->positional_delete_files.empty()) {
+  if (scan_op->positional_delete_files.empty() && scan_op->equality_delete_files.empty()) {
     SIRIUS_LOG_DEBUG(
       "[iceberg_scan_task_global_state] No delete files; running as plain parquet scan.");
     return;
   }
 
-  // V2 positional deletes.
-  SIRIUS_LOG_INFO("[iceberg_scan_task_global_state] Loading {} positional-delete file(s).",
-                  scan_op->positional_delete_files.size());
+  // -------------------------------------------------------------------------
+  // V2 positional deletes
+  // -------------------------------------------------------------------------
+  post_convert_fn_t hook;
 
-  _delete_state = std::make_shared<iceberg_delete_state>();
+  if (!scan_op->positional_delete_files.empty()) {
+    SIRIUS_LOG_INFO("[iceberg_scan_task_global_state] Loading {} positional-delete file(s).",
+                    scan_op->positional_delete_files.size());
 
-  for (auto const& del_path : scan_op->positional_delete_files) {
-    SIRIUS_LOG_DEBUG("[iceberg_scan_task_global_state] Reading positional-delete file: {}",
-                     del_path);
-    read_positional_delete_file(del_path, _delete_state->positional_deletes);
+    _delete_state = std::make_shared<iceberg_delete_state>();
+
+    for (auto const& del_path : scan_op->positional_delete_files) {
+      SIRIUS_LOG_DEBUG("[iceberg_scan_task_global_state] Reading positional-delete file: {}",
+                       del_path);
+      read_positional_delete_file(del_path, _delete_state->positional_deletes);
+    }
+
+    for (auto& [path, positions] : _delete_state->positional_deletes) {
+      std::sort(positions.begin(), positions.end());
+    }
+
+    SIRIUS_LOG_INFO(
+      "[iceberg_scan_task_global_state] Loaded positional deletes for {} data file(s).",
+      _delete_state->positional_deletes.size());
+
+    hook = make_positional_delete_hook(_delete_state);
   }
 
-  // Sort each file's delete positions so that binary-search in the hook is correct.
-  for (auto& [path, positions] : _delete_state->positional_deletes) {
-    std::sort(positions.begin(), positions.end());
+  // -------------------------------------------------------------------------
+  // V2 equality deletes
+  // -------------------------------------------------------------------------
+  if (!scan_op->equality_delete_files.empty()) {
+    SIRIUS_LOG_INFO("[iceberg_scan_task_global_state] Loading {} equality-delete file(s).",
+                    scan_op->equality_delete_files.size());
+
+    // Read all equality-delete files and collect their rows.
+    std::vector<cudf::table_view> parts_views;
+    std::vector<std::unique_ptr<cudf::table>> parts_owned;
+    std::vector<std::string> key_column_names;  // from the first file
+
+    for (auto const& eq_path : scan_op->equality_delete_files) {
+      SIRIUS_LOG_DEBUG("[iceberg_scan_task_global_state] Reading equality-delete file: {}",
+                       eq_path);
+      auto [part, names] = read_equality_delete_file(eq_path);
+
+      if (key_column_names.empty()) {
+        key_column_names = names;
+      } else if (key_column_names != names) {
+        SIRIUS_LOG_WARN(
+          "[iceberg_scan_task_global_state] Equality-delete column names mismatch "
+          "across files — using first file's schema.");
+      }
+
+      parts_views.push_back(part->view());
+      parts_owned.push_back(std::move(part));
+    }
+
+    if (parts_views.empty() || key_column_names.empty()) {
+      SIRIUS_LOG_WARN(
+        "[iceberg_scan_task_global_state] No equality-delete rows found; skipping hook.");
+    } else {
+      // Concatenate all delete rows and deduplicate.
+      auto stream = cudf::get_default_stream();
+      auto all_delete_rows =
+        (parts_views.size() == 1)
+          ? std::make_unique<cudf::table>(parts_views[0], stream)
+          : cudf::concatenate(parts_views, stream);
+
+      // Build explicit key indices for all columns (empty vector means "no keys" in cudf,
+      // not "all keys", so we must enumerate them explicitly).
+      std::vector<cudf::size_type> all_key_indices;
+      all_key_indices.resize(static_cast<std::size_t>(all_delete_rows->num_columns()));
+      std::iota(all_key_indices.begin(), all_key_indices.end(), cudf::size_type{0});
+
+      SIRIUS_LOG_DEBUG(
+        "[iceberg_scan_task_global_state] Pre-distinct equality-delete rows: {}",
+        all_delete_rows->num_rows());
+
+      auto deduped_delete_rows = cudf::distinct(all_delete_rows->view(),
+                                                all_key_indices,
+                                                cudf::duplicate_keep_option::KEEP_FIRST,
+                                                cudf::null_equality::EQUAL,
+                                                cudf::nan_equality::ALL_EQUAL,
+                                                stream);
+
+      SIRIUS_LOG_INFO(
+        "[iceberg_scan_task_global_state] Equality-delete table: {} row(s), {} key column(s).",
+        deduped_delete_rows->num_rows(),
+        key_column_names.size());
+
+      // Map equality-key column names to positions in the cudf table.
+      //
+      // The cudf table produced by the parquet reader has columns in the order of
+      // get_selected_column_indices().  Each entry selected[j] is an index into
+      // scan_op->names, so the j-th column of the cudf table is scan_op->names[selected[j]].
+      // We therefore search for the key name in that "names-indexed-by-selected" view.
+      auto const& selected = get_selected_column_indices();
+      std::vector<cudf::size_type> data_key_indices;
+      bool all_found = true;
+      for (auto const& key_name : key_column_names) {
+        bool found = false;
+        for (cudf::size_type j = 0; j < static_cast<cudf::size_type>(selected.size()); ++j) {
+          if (scan_op->names[selected[j]] == key_name) {
+            data_key_indices.push_back(j);
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          SIRIUS_LOG_WARN(
+            "[iceberg_scan_task_global_state] Equality-delete key column '{}' not found in "
+            "scan output schema — skipping equality-delete hook.",
+            key_name);
+          all_found = false;
+          break;
+        }
+      }
+
+      if (all_found) {
+        // Build the distinct hash join (build side = equality-delete key table).
+        auto eq_state           = std::make_shared<iceberg_equality_delete_state>();
+        eq_state->data_key_indices = std::move(data_key_indices);
+        eq_state->delete_key_table = std::move(deduped_delete_rows);
+        eq_state->hash_join = std::make_unique<cudf::distinct_hash_join>(
+          eq_state->delete_key_table->view(), cudf::null_equality::EQUAL, 0.5, stream);
+        stream.synchronize();
+
+        _equality_delete_state = std::move(eq_state);
+
+        auto eq_hook = make_equality_delete_hook(_equality_delete_state);
+        hook         = hook ? chain_hooks(std::move(hook), std::move(eq_hook)) : std::move(eq_hook);
+      }
+    }
   }
 
-  SIRIUS_LOG_INFO("[iceberg_scan_task_global_state] Loaded positional deletes for {} data file(s).",
-                  _delete_state->positional_deletes.size());
-
-  // Install the post-convert hook.
-  set_post_convert_fn(make_positional_delete_hook(_delete_state));
+  // Install whatever hook(s) were built.
+  if (hook) { set_post_convert_fn(std::move(hook)); }
 }
 
 }  // namespace sirius::op::scan
