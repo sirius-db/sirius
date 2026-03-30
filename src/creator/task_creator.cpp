@@ -232,27 +232,31 @@ void task_creator::manager_loop()
           auto& delim_join    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
           auto partition_join = delim_join.partition_join;
           auto distinct_op    = delim_join.distinct.get();
-          for (auto& [next_op, port_id] : partition_join->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : partition_join->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
-          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : distinct_op->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
         } else if (pipeline->get_sink()->type ==
                    ::sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
           auto& delim_join      = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
           auto distinct_op      = delim_join.distinct.get();
           auto column_data_scan = delim_join.column_data_scan;
-          for (auto& [next_op, port_id] : column_data_scan->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
-          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : distinct_op->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
         } else {
-          auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
-          for (auto& [next_op, port_id] : next_port_after_sink) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : pipeline->get_sink()->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
         }
         // scheduling scan task

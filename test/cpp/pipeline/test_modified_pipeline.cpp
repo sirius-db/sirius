@@ -596,8 +596,10 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
 
         // Verify port is "build"
         auto& next_ports = sink->get_next_port_after_sink();
-        for (auto& [next_op, port_id] : next_ports) {
-          if (std::string(port_id) != "build") { info.build_partition_has_right_port = false; }
+        for (auto& next_port : next_ports) {
+          if (std::string(next_port.next_operator_port_name) != "build") {
+            info.build_partition_has_right_port = false;
+          }
         }
       } else {
         // Probe side partition
@@ -605,8 +607,10 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
 
         // Verify port is "default"
         auto& next_ports = sink->get_next_port_after_sink();
-        for (auto& [next_op, port_id] : next_ports) {
-          if (std::string(port_id) != "default") { info.probe_partition_has_default_port = false; }
+        for (auto& next_port : next_ports) {
+          if (std::string(next_port.next_operator_port_name) != "default") {
+            info.probe_partition_has_default_port = false;
+          }
         }
       }
 
@@ -788,9 +792,9 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
 
       // Validate next_port_after_sink connections
       auto& next_ports = sink->get_next_port_after_sink();
-      for (auto& [next_op, next_port_id] : next_ports) {
-        REQUIRE(next_op != nullptr);
-        REQUIRE(std::string(next_port_id) == port_id);
+      for (auto& next_port : next_ports) {
+        REQUIRE(next_port.next_operator != nullptr);
+        REQUIRE(std::string(next_port.next_operator_port_name) == port_id);
       }
 
     } else if (sink->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
@@ -1256,9 +1260,9 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
       if (!partition.is_build_partition()) {
         // This is a probe partition - check it uses "default" port
         auto& next_ports = sink->get_next_port_after_sink();
-        for (auto& [next_op, port_id] : next_ports) {
-          INFO("Probe partition port: " << port_id);
-          REQUIRE(std::string(port_id) == "default");
+        for (auto& next_port : next_ports) {
+          INFO("Probe partition port: " << next_port.next_operator_port_name);
+          REQUIRE(std::string(next_port.next_operator_port_name) == "default");
         }
 
         // Check if dependent pipeline has HASH_JOIN
