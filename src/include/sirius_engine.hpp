@@ -21,6 +21,7 @@
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/execution/task_error_manager.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -124,11 +125,7 @@ class sirius_engine {
   // Populated by prefetch_iceberg_metadata() in initialize(), BEFORE
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
-  struct IcebergDeleteFiles {
-    std::vector<std::string> positional_delete_files;
-    std::vector<std::string> equality_delete_files;
-  };
-  std::unordered_map<std::string, IcebergDeleteFiles> iceberg_metadata_cache_;
+  std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
 };
 
 }  // namespace sirius

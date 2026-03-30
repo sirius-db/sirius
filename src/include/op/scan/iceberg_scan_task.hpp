@@ -16,62 +16,15 @@
 
 #pragma once
 
+#include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_iceberg_scan.hpp>
 
-#include <cudf/join/distinct_hash_join.hpp>
-#include <cudf/table/table.hpp>
-
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace sirius::op::scan {
-
-//===----------------------------------------------------------------------===//
-// Iceberg Delete State
-//===----------------------------------------------------------------------===//
-
-/**
- * @brief Delete state for an Iceberg V2 scan.
- *
- * Constructed once at query-start time in iceberg_scan_task_global_state.
- * Shared (via shared_ptr captured in the post-convert lambda) across all
- * parquet_scan_tasks that process data files from the same Iceberg table.
- */
-struct iceberg_delete_state {
-  /// Per-data-file sorted positional deletes.
-  /// Key   = canonical data-file path.
-  /// Value = sorted list of 0-based absolute row positions to delete.
-  std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
-};
-
-/**
- * @brief State for Iceberg V2 equality deletes.
- *
- * Holds the deduplicated equality-delete key table on the GPU and a pre-built
- * `cudf::distinct_hash_join` for fast probe operations.  Shared across all
- * scan tasks for the same table (captured by shared_ptr in the hook lambda).
- *
- * For each data-chunk the post-convert hook probes the hash join with the
- * chunk's key columns, then downloads the per-row match result (build_indices)
- * to the host, builds a boolean keep-mask, and applies
- * `cudf::apply_boolean_mask`.  The sync cost is small because build_indices is
- * at most one INT32 per data row (~400 KB for a 100 K-row batch).
- */
-struct iceberg_equality_delete_state {
-  /// De-duplicated equality-delete rows projected to key columns only.
-  /// Kept alive while `hash_join` is in use (hash_join holds a table_view ref).
-  std::unique_ptr<cudf::table> delete_key_table;
-
-  /// Pre-built distinct hash join (build side = delete_key_table).
-  std::unique_ptr<cudf::distinct_hash_join> hash_join;
-
-  /// Indices into the data-chunk that correspond to the equality key columns.
-  /// Parallel to the columns of delete_key_table.
-  std::vector<cudf::size_type> data_key_indices;
-};
 
 //===----------------------------------------------------------------------===//
 // Iceberg Scan Task Global State
@@ -84,15 +37,12 @@ struct iceberg_equality_delete_state {
  * row-group partitioning, reader options) via the protected constructor that
  * accepts pre-resolved file paths and column indices.
  *
- * Additionally:
- *  - For V1 tables (no delete files on sirius_physical_iceberg_scan) the
- *    behaviour is identical to plain parquet_scan_task_global_state.
- *  - For V2 tables with positional deletes, loads the delete file data into
- *    a host-side map and installs a post-convert hook that filters the deleted
- *    rows from each row-group batch on the GPU before it is pushed down the
- *    pipeline.
- *  - V2 equality deletes: reads delete files, builds a distinct_hash_join,
- *    and installs a hook that applies an anti-join per row-group batch.
+ * Delete handling is delegated to an iceberg_delete_pipeline which composes
+ * one or more iceberg_delete_filter stages:
+ *  - V1 tables (no delete files): no filters, behaves as plain parquet scan.
+ *  - V2 positional deletes: positional_delete_filter.
+ *  - V2 equality deletes: equality_delete_filter.
+ *  - Combined: both filters chained in the pipeline.
  */
 class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
  public:
@@ -101,7 +51,7 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
    *
    * Extracts data file paths from bind_data, computes column projection, calls
    * the protected parquet_scan_task_global_state constructor, then builds the
-   * delete state (if any) from the delete-file lists on @p scan_op.
+   * delete pipeline (if any) from the delete-file lists on @p scan_op.
    *
    * @param pipeline             The pipeline for this scan.
    * @param scan_op              The physical iceberg scan operator.
@@ -135,20 +85,21 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
     size_t approximate_batch_size);
 
   // -------------------------------------------------------------------------
-  // Delete-state construction
+  // Delete pipeline construction
   // -------------------------------------------------------------------------
 
   /**
-   * @brief Read the delete files listed on @p scan_op and install the
-   * post-convert hook if there are any deletes to apply.
+   * @brief Read the delete files listed on @p scan_op, build filters, and
+   * install the pipeline's post-convert hook if there are any deletes to apply.
    */
-  void build_delete_state(sirius_physical_iceberg_scan* scan_op);
+  void build_delete_pipeline(sirius_physical_iceberg_scan* scan_op);
 
   // -------------------------------------------------------------------------
   // Fields
   // -------------------------------------------------------------------------
-  std::shared_ptr<iceberg_delete_state>          _delete_state;
-  std::shared_ptr<iceberg_equality_delete_state> _equality_delete_state;
+
+  /// The composable delete pipeline (empty for V1 tables).
+  iceberg_delete_pipeline _delete_pipeline;
 };
 
 }  // namespace sirius::op::scan

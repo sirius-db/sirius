@@ -95,8 +95,12 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/duckdb_scan_task.cpp
+    src/op/scan/equality_delete_filter.cpp
     src/op/scan/iceberg_avro_reader.cpp
+    src/op/scan/iceberg_delete_pipeline.cpp
+    src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/iceberg_scan_task.cpp
+    src/op/scan/positional_delete_filter.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp
     src/op/sirius_physical_column_data_scan.cpp
@@ -202,6 +206,7 @@ set(EXTENSION_SOURCES
 set(CUDA_SOURCES
     src/cuda/allocator.cu
     src/cuda/communication.cu
+    src/cuda/iceberg/equality_delete_mask.cu
     src/cuda/cudf/cudf_aggregate.cu
     src/cuda/cudf/cudf_duplicate_elimination.cu
     src/cuda/cudf/cudf_groupby.cu
