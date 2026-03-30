@@ -1083,17 +1083,21 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto partition_join = delim_join.partition_join;
           auto* distinct_op   = delim_join.distinct.get();
           for (auto& next_port : partition_join->get_next_port_after_sink()) {
-            if (next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline) {
+            if (next_port.next_operator->get_port(next_port.next_operator_port_name)
+                  ->dest_pipeline) {
               new_scheduled[i]->parents.push_back(
                 duckdb::weak_ptr<sirius::pipeline::sirius_pipeline>(
-                  next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline));
+                  next_port.next_operator->get_port(next_port.next_operator_port_name)
+                    ->dest_pipeline));
             }
           }
           for (auto& next_port : distinct_op->get_next_port_after_sink()) {
-            if (next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline) {
+            if (next_port.next_operator->get_port(next_port.next_operator_port_name)
+                  ->dest_pipeline) {
               new_scheduled[i]->parents.push_back(
                 duckdb::weak_ptr<sirius::pipeline::sirius_pipeline>(
-                  next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline));
+                  next_port.next_operator->get_port(next_port.next_operator_port_name)
+                    ->dest_pipeline));
             }
           }
         } else if (new_scheduled[i]->sink.get()->type ==
@@ -1103,26 +1107,31 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto* distinct_op     = delim_join.distinct.get();
           auto column_data_scan = delim_join.column_data_scan;
           for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
-            if (next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline) {
+            if (next_port.next_operator->get_port(next_port.next_operator_port_name)
+                  ->dest_pipeline) {
               new_scheduled[i]->parents.push_back(
                 duckdb::weak_ptr<sirius::pipeline::sirius_pipeline>(
-                  next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline));
+                  next_port.next_operator->get_port(next_port.next_operator_port_name)
+                    ->dest_pipeline));
             }
           }
           for (auto& next_port : distinct_op->get_next_port_after_sink()) {
-            if (next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline) {
+            if (next_port.next_operator->get_port(next_port.next_operator_port_name)
+                  ->dest_pipeline) {
               new_scheduled[i]->parents.push_back(
                 duckdb::weak_ptr<sirius::pipeline::sirius_pipeline>(
-                  next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline));
+                  next_port.next_operator->get_port(next_port.next_operator_port_name)
+                    ->dest_pipeline));
             }
           }
         } else {
-          for (auto& next_port :
-               new_scheduled[i]->sink.get()->get_next_port_after_sink()) {
-            if (next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline) {
+          for (auto& next_port : new_scheduled[i]->sink.get()->get_next_port_after_sink()) {
+            if (next_port.next_operator->get_port(next_port.next_operator_port_name)
+                  ->dest_pipeline) {
               new_scheduled[i]->parents.push_back(
                 duckdb::weak_ptr<sirius::pipeline::sirius_pipeline>(
-                  next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline));
+                  next_port.next_operator->get_port(next_port.next_operator_port_name)
+                    ->dest_pipeline));
             }
           }
         }

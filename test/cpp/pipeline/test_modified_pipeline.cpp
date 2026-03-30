@@ -597,7 +597,9 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
         // Verify port is "build"
         auto& next_ports = sink->get_next_port_after_sink();
         for (auto& next_port : next_ports) {
-          if (std::string(next_port.next_operator_port_name) != "build") { info.build_partition_has_right_port = false; }
+          if (std::string(next_port.next_operator_port_name) != "build") {
+            info.build_partition_has_right_port = false;
+          }
         }
       } else {
         // Probe side partition
@@ -606,7 +608,9 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
         // Verify port is "default"
         auto& next_ports = sink->get_next_port_after_sink();
         for (auto& next_port : next_ports) {
-          if (std::string(next_port.next_operator_port_name) != "default") { info.probe_partition_has_default_port = false; }
+          if (std::string(next_port.next_operator_port_name) != "default") {
+            info.probe_partition_has_default_port = false;
+          }
         }
       }
 
