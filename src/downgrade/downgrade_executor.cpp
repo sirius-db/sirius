@@ -84,9 +84,9 @@ void downgrade_executor::on_stopped()
 void downgrade_executor::manager_loop()
 {
   while (_running.load()) {
-    auto ticket = _kiosk.acquire();  // block until a thread is available
-    if (!ticket.is_valid()) {
-      SIRIUS_LOG_INFO("[downgrade] kiosk interrupted, stopping manager loop");
+    auto slot = _bounded_pool->reserve();  // block until a thread is available
+    if (!slot) {
+      SIRIUS_LOG_INFO("[downgrade] pool interrupted, stopping manager loop");
       break;
     }
     auto task = _task_queue.pop();  // block until a task is available
@@ -94,9 +94,7 @@ void downgrade_executor::manager_loop()
       SIRIUS_LOG_INFO("[downgrade] task queue interrupted, stopping manager loop");
       break;
     }
-    _thread_pool->schedule([task   = std::move(task),
-                            ticket = std::move(ticket),
-                            stream = rmm::cuda_stream_view{_stream}]() mutable {
+    slot.dispatch([task = std::move(task), stream = rmm::cuda_stream_view{_stream}]() mutable {
       try {
         task->execute(stream);
       } catch (const std::exception& e) {

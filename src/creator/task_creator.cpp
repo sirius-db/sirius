@@ -41,7 +41,7 @@ namespace sirius::creator {
 
 task_creator::task_creator(exec::thread_pool_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _kiosk(config.num_threads)
+  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr)
 {
 }
 
@@ -112,7 +112,7 @@ void task_creator::drain_pending_tasks()
   // Drain any queued task creation requests that haven't been picked up yet
   _task_creation_queue.drain();
   // Wait for any in-flight task creation lambdas to finish
-  _kiosk.wait_all();
+  _bounded_pool->wait_all();
 }
 
 void task_creator::reset(bool keep_parquet_metadata)
@@ -175,7 +175,7 @@ void task_creator::start_thread_pool()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
+  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(
     _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
   _manager_thread = std::thread(&task_creator::manager_loop, this);
 }
@@ -184,11 +184,12 @@ void task_creator::stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _kiosk.stop();
+  _bounded_pool->interrupt();
   _task_creation_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _kiosk.wait_all();
-  if (_thread_pool) { _thread_pool->stop(); }
+  _bounded_pool->wait_all();
+  _bounded_pool->stop();
+  _bounded_pool.reset();
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node)
@@ -201,9 +202,9 @@ void task_creator::schedule(op::sirius_physical_operator* node)
 void task_creator::manager_loop()
 {
   while (_running.load()) {
-    auto ticket = _kiosk.acquire();  // block till a thread is available
-    if (!ticket.is_valid()) {
-      SIRIUS_LOG_INFO("Task Creator: Kiosk interrupted, stopping manager loop");
+    auto slot = _bounded_pool->reserve();  // block till a thread is available
+    if (!slot) {
+      SIRIUS_LOG_INFO("Task Creator: pool interrupted, stopping manager loop");
       break;
     }
 
@@ -220,8 +221,8 @@ void task_creator::manager_loop()
 
     if (node == nullptr) { continue; }
 
-    // Schedule the task creation work on the thread pool
-    _thread_pool->schedule([this, node, ticket = std::move(ticket)]() mutable {
+    // Dispatch the task creation work to the pool
+    slot.dispatch([this, node]() mutable {
       try {
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();

@@ -203,9 +203,9 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 void duckdb_scan_executor::manager_loop()
 {
   while (_running.load()) {
-    auto ticket = _kiosk.acquire();  // block till a thread is available
-    if (!ticket.is_valid()) {
-      SIRIUS_LOG_INFO("DuckDB Scan Executor: Kiosk interrupted, stopping manager loop");
+    auto slot = _bounded_pool->reserve();  // block till a thread is available
+    if (!slot) {
+      SIRIUS_LOG_INFO("DuckDB Scan Executor: pool interrupted, stopping manager loop");
       break;
     }
     auto task = _task_queue.try_pop();
@@ -254,11 +254,10 @@ void duckdb_scan_executor::manager_loop()
 
     auto exc_stream = _stream_pool->acquire_stream(
       cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-    _thread_pool->schedule([this,
-                            ticket    = std::move(ticket),
-                            stream    = std::move(exc_stream),
-                            t         = std::move(task),
-                            scan_task = std::move(scan_task)]() mutable {
+    slot.dispatch([this,
+                   stream    = std::move(exc_stream),
+                   t         = std::move(task),
+                   scan_task = std::move(scan_task)]() mutable {
       try {
         auto consumers = scan_task->get_output_consumers();
         {

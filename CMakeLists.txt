@@ -267,8 +267,8 @@ set(TEST_SOURCES
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
+    test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
-    test/cpp/exec/test_kiosk.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp

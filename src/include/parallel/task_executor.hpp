@@ -16,10 +16,9 @@
 
 #pragma once
 
+#include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
-#include "exec/kiosk.hpp"
-#include "exec/thread_pool.hpp"
 #include "parallel/task.hpp"
 
 #include <absl/functional/any_invocable.h>
@@ -36,9 +35,8 @@ namespace parallel {
  *
  * Holds the common infrastructure shared by gpu_pipeline_executor,
  * duckdb_scan_executor, and downgrade_executor:
- *   - a bounded kiosk for concurrency control
+ *   - a bounded_thread_pool for concurrency control and task execution
  *   - an interruptible MPMC task queue
- *   - a thread pool for task execution
  *   - a manager thread that drives the dispatch loop
  *
  * Subclasses must implement manager_loop() and may override the virtual
@@ -47,10 +45,7 @@ namespace parallel {
  */
 class itask_executor {
  public:
-  explicit itask_executor(exec::thread_pool_config config)
-    : _config(std::move(config)), _kiosk(_config.num_threads)
-  {
-  }
+  explicit itask_executor(exec::thread_pool_config config) : _config(std::move(config)) {}
 
   virtual ~itask_executor() { stop(); }
 
@@ -83,6 +78,11 @@ class itask_executor {
    * thread pool, then calls on_stopped() for any final cleanup.
    */
   void stop();
+
+  /**
+   * @brief Block until all in-flight tasks complete. Convenience wrapper over the pool.
+   */
+  void wait_all();
 
   /**
    * @brief Drain any leftover tasks remaining in the queue.
@@ -145,8 +145,7 @@ class itask_executor {
  protected:
   std::atomic<bool> _running{false};
   exec::thread_pool_config _config;
-  exec::kiosk _kiosk;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
+  std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   exec::interruptible_mpmc<std::unique_ptr<itask>> _task_queue;
   std::thread _manager_thread;
 };

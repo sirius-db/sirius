@@ -54,7 +54,7 @@ namespace sirius::op::scan {
  * @brief A task executor for duckdb scan tasks.
  *
  * This class manages a pool of threads dedicated to executing DuckDB scan
- * tasks with kiosk-based concurrency control.
+ * tasks with bounded concurrency control.
  */
 class duckdb_scan_executor : public sirius::parallel::itask_executor {
  public:
@@ -91,7 +91,7 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
   /**
    * @brief Wait for all scheduled tasks to complete.
    */
-  void wait_all() { _kiosk.wait_all(); }
+  void wait_all() { itask_executor::wait_all(); }
 
   /**
    * @brief Set the task creator for scheduling output consumers

@@ -59,8 +59,7 @@ class dummy_task : public itask {
 /**
  * Minimal concrete executor for tests.
  *
- * Implements manager_loop() with the same kiosk+thread_pool dispatch pattern
- * used by the production executors, executing tasks via cudf default stream.
+ * Implements manager_loop() using the bounded_thread_pool reserve()+dispatch() pattern.
  */
 class dummy_task_executor : public itask_executor {
  public:
@@ -73,13 +72,11 @@ class dummy_task_executor : public itask_executor {
   void manager_loop() override
   {
     while (_running.load()) {
-      auto ticket = _kiosk.acquire();
-      if (!ticket.is_valid()) { break; }
+      auto slot = _bounded_pool->reserve();
+      if (!slot) { break; }
       auto task = _task_queue.pop();
       if (!task) { break; }
-      _thread_pool->schedule([t = std::move(task), ticket = std::move(ticket)]() mutable {
-        t->execute(cudf::get_default_stream());
-      });
+      slot.dispatch([t = std::move(task)]() mutable { t->execute(cudf::get_default_stream()); });
     }
   }
 };

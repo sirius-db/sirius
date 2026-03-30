@@ -25,12 +25,11 @@ void itask_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _kiosk.resume();
+  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
+                                                              _config.thread_name_prefix,
+                                                              _config.cpu_affinity_list,
+                                                              get_per_thread_init());
   _task_queue.reactivate();
-  _thread_pool    = std::make_unique<exec::thread_pool>(_config.num_threads,
-                                                     _config.thread_name_prefix,
-                                                     _config.cpu_affinity_list,
-                                                     get_per_thread_init());
   _manager_thread = std::thread([this] { manager_loop(); });
   on_start();
 }
@@ -39,21 +38,27 @@ void itask_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _kiosk.stop();
+  _bounded_pool->interrupt();
   _task_queue.interrupt();
   on_stop();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _kiosk.wait_all();
-  if (_thread_pool) { _thread_pool->stop(); }
+  _bounded_pool->wait_all();
+  _bounded_pool->stop();
+  _bounded_pool.reset();
   on_stopped();
+}
+
+void itask_executor::wait_all()
+{
+  if (_bounded_pool) { _bounded_pool->wait_all(); }
 }
 
 void itask_executor::drain_leftover_tasks() { _task_queue.drain(); }
 
 void itask_executor::drain_and_wait()
 {
-  // Stop the kiosk so the manager's acquire() unblocks with an invalid ticket.
-  _kiosk.stop();
+  // Interrupt the pool so the manager's reserve() unblocks with an invalid slot.
+  _bounded_pool->interrupt();
 
   // Interrupt pop() so the manager loop sees a nullptr and breaks out.
   _task_queue.interrupt();
@@ -62,13 +67,13 @@ void itask_executor::drain_and_wait()
   if (_manager_thread.joinable()) { _manager_thread.join(); }
 
   // Wait for all in-flight thread-pool tasks to finish.
-  _kiosk.wait_all();
+  _bounded_pool->wait_all();
 
   // Clear any remaining tasks from the queue.
   _task_queue.drain();
 
-  // Re-enable the kiosk and queue so the executor is ready for the next query.
-  _kiosk.resume();
+  // Re-enable the pool and queue so the executor is ready for the next query.
+  _bounded_pool->resume();
   _task_queue.reactivate();
   _manager_thread = std::thread([this] { manager_loop(); });
 }

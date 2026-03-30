@@ -60,9 +60,9 @@ void gpu_pipeline_executor::manager_loop()
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
   while (_running.load()) {
-    auto ticket = _kiosk.acquire();  // block till a thread is available
-    if (!ticket.is_valid()) {
-      SIRIUS_LOG_INFO("GPU Pipeline Executor: Kiosk interrupted, stopping manager loop");
+    auto slot = _bounded_pool->reserve();  // block till a thread is available
+    if (!slot) {
+      SIRIUS_LOG_INFO("GPU Pipeline Executor: pool interrupted, stopping manager loop");
       break;
     }
     if (!_task_request_publisher.send(
@@ -121,12 +121,11 @@ void gpu_pipeline_executor::manager_loop()
     auto* pipeline        = gpu_task->get_pipeline();
     auto exc_stream       = _stream_pool.acquire_stream(
       cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-    _thread_pool->schedule([this,
-                            task       = std::move(pipeline_task),
-                            ticket     = std::move(ticket),
-                            exc_stream = std::move(exc_stream),
-                            consumers  = std::move(output_consumers),
-                            pipeline]() mutable {
+    slot.dispatch([this,
+                   task       = std::move(pipeline_task),
+                   exc_stream = std::move(exc_stream),
+                   consumers  = std::move(output_consumers),
+                   pipeline]() mutable {
       try {
         task->execute(exc_stream);
       } catch (oom_reschedule_exception& oom) {
