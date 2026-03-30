@@ -263,8 +263,7 @@ class sirius_physical_operator {
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
   };
 
-  /// Describes a downstream operator and the port through which data is pushed after this
-  /// operator acts as a sink.
+  /// Describes a downstream operator's port to which data is pushed
   struct next_port_info {
     //! The downstream operator that receives data batches from this sink
     sirius_physical_operator* next_operator;
