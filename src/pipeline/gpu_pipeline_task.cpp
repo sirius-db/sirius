@@ -307,8 +307,6 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         static_cast<double>(reservation_bytes) / (1024.0 * 1024.0),
         _task_id);
 
-      peak_bytes += requested_bytes;  // update peak bytes to include the requested bytes since that
-                                      // is what could have been the peak consumption
       auto input_basis =
         _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
       auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
@@ -405,15 +403,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
-      printf("peak_bytes: %zu\n", peak_bytes);
-      if (auto const* cc_oom =
-            dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
-        printf("cc_oom->requested_bytes: %zu\n", cc_oom->requested_bytes);
-        peak_bytes +=
-          cc_oom->requested_bytes;  // update peak bytes to include the requested bytes since that
-                                    // is what could have been the peak consumption
-      }
-
       auto input_basis = local_state.get_task_consumption_basis();
       auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
       global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
@@ -445,7 +434,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     processing_handles.emplace_back(std::move(*handle));
   }
-
+  
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
     std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
