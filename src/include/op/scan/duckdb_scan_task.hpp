@@ -133,8 +133,8 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   {
     std::vector<sirius_physical_operator*> output_consumers;
     auto ports = _op.get_next_port_after_sink();
-    for (auto& [child, port_id] : ports) {
-      output_consumers.push_back(child);
+    for (auto& next_port : ports) {
+      output_consumers.push_back(next_port.next_operator);
     }
     return output_consumers;
   }
