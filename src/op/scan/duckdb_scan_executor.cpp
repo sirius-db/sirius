@@ -314,20 +314,7 @@ void duckdb_scan_executor::manager_loop()
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
       try {
-        // Get consumers with explicit pipeline info (for shared operators).
-        // The scan executor knows which pipeline each consumer belongs to via
-        // the port's dest_pipeline, avoiding the shared-operator get_pipeline() bug.
-        auto* dbt = dynamic_cast<duckdb_scan_task*>(scan_task);
-        auto consumers_with_pipelines = dbt
-          ? dbt->get_output_consumers_with_pipelines()
-          : std::vector<duckdb_scan_task_global_state::consumer_with_pipeline>{};
-        // Fallback for parquet scan (doesn't have the pipeline-aware method).
-        if (!dbt) {
-          auto consumers = scan_task->get_output_consumers();
-          for (auto* c : consumers) {
-            consumers_with_pipelines.push_back({c, nullptr});
-          }
-        }
+        auto consumers = scan_task->get_output_consumers();
         {
           auto output_data = get_scan_output(scan_task, stream);
           stream->synchronize();
@@ -336,10 +323,8 @@ void duckdb_scan_executor::manager_loop()
 
         t.reset();
         if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
-          for (auto& [consumer, pipeline] : consumers_with_pipelines) {
-            if (consumer) {
-              _task_creator->schedule(consumer, pipeline);
-            }
+          for (auto* consumer : consumers) {
+            _task_creator->schedule(consumer);
           }
         }
 

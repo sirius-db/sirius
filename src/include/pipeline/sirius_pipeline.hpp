@@ -130,12 +130,6 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   std::vector<op::sirius_physical_operator*> get_output_consumers() const;
 
-  struct consumer_with_pipeline {
-    op::sirius_physical_operator* op;
-    duckdb::shared_ptr<sirius_pipeline> pipeline;
-  };
-  std::vector<consumer_with_pipeline> get_output_consumers_with_pipelines() const;
-
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;
 
@@ -156,19 +150,6 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   void mark_task_created();
   void mark_task_completed();
-
-  //! Directly mark the pipeline as finished (for scan pipelines with source=nullptr
-  //! that can't use update_pipeline_status). Also cascades to parent pipelines.
-  void mark_as_finished() {
-    pipeline_finished.store(true);
-    for (auto& weak_parent : parents) {
-      if (auto parent = weak_parent.lock()) {
-        if (!parent->is_pipeline_finished()) {
-          parent->update_pipeline_status();
-        }
-      }
-    }
-  }
 
   //! Optional callback invoked when the pipeline finishes.
   //! Used to signal the completion_handler when a 0-row scan completes

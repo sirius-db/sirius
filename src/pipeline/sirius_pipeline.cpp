@@ -291,30 +291,12 @@ void sirius_pipeline::update_pipeline_status()
       pipeline_finished.store(true);
       end_nvtx_range_if_finished();
       if (on_finished) { on_finished(); }
-      // Cascade completion to parent pipelines.
-      for (auto& weak_parent : parents) {
-        if (auto parent = weak_parent.lock()) {
-          if (!parent->is_pipeline_finished()) {
-            parent->update_pipeline_status();
-          }
-        }
-      }
       return;
     }
   } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
     auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
     if (!parquet_scan.has_more_partitions) {
-      if (tasks_created.load() == tasks_completed.load()) {
-        pipeline_finished = true;
-        // Cascade completion to parent pipelines.
-        for (auto& weak_parent : parents) {
-          if (auto parent = weak_parent.lock()) {
-            if (!parent->is_pipeline_finished()) {
-              parent->update_pipeline_status();
-            }
-          }
-        }
-      }
+      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
       end_nvtx_range_if_finished();
       return;
     }
@@ -324,6 +306,8 @@ void sirius_pipeline::update_pipeline_status()
     if (first_node == nullptr) {
       throw duckdb::InternalException("First node of pipeline is nullptr");
     }
+    // Check if any operator has exhausted its limit — this allows the pipeline to finish
+    // early without waiting for the source pipeline to drain all remaining batches.
     bool limit_exhausted = false;
     for (auto& op_ref : operators) {
       if (op_ref.get().is_limit_exhausted()) {
@@ -331,27 +315,15 @@ void sirius_pipeline::update_pipeline_status()
         break;
       }
     }
-    bool src_finished = first_node->is_source_pipeline_finished();
-    bool ports_empty = first_node->all_ports_empty();
-    if (first_node->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-      SIRIUS_LOG_INFO("[update_pipeline_status] TABLE_SCAN pipeline: src_finished={} ports_empty={} tasks={}/{}",
-                      src_finished, ports_empty, tasks_created.load(), tasks_completed.load());
-    }
-    if (limit_exhausted || (src_finished && ports_empty)) {
+    // WSM TODO need to increment task created before pulling data?
+    // Lets fix this by putting task creation as a method in the pipeline class so that it can be
+    // done atomically.
+    if (limit_exhausted ||
+        (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
       if (tasks_created.load() == tasks_completed.load()) {
         pipeline_finished.store(true);
         for (auto& op : get_operators()) {
           op.get().finalize_operator();
-        }
-        // Cascade: trigger update_pipeline_status on parent pipelines
-        // (pipelines that depend on this one). This propagates completion
-        // through multi-level pipeline chains where tasks_created stays 0.
-        for (auto& weak_parent : parents) {
-          if (auto parent = weak_parent.lock()) {
-            if (!parent->is_pipeline_finished()) {
-              parent->update_pipeline_status();
-            }
-          }
         }
       }
     }
@@ -386,49 +358,10 @@ void sirius_pipeline::mark_task_completed()
 
 std::vector<op::sirius_physical_operator*> sirius_pipeline::get_output_consumers() const
 {
-  auto pairs = get_output_consumers_with_pipelines();
+  auto parents = get_parents();
   std::vector<op::sirius_physical_operator*> result;
-  for (auto& [op, _] : pairs) { result.push_back(op); }
-  return result;
-}
-
-std::vector<sirius_pipeline::consumer_with_pipeline>
-sirius_pipeline::get_output_consumers_with_pipelines() const
-{
-  std::vector<consumer_with_pipeline> result;
-
-  auto add_unique = [&](op::sirius_physical_operator* op,
-                        duckdb::shared_ptr<sirius_pipeline> pl) {
-    if (pl.get() == this) return;  // Skip self-reference only.
-    for (auto& [existing_op, _] : result) {
-      if (existing_op == op) return;
-    }
-    result.push_back({op, std::move(pl)});
-  };
-
-  // Parents (set via add_dependency).
-  for (auto& weak_parent : parents) {
-    if (auto parent = weak_parent.lock()) {
-      if (auto src = parent->get_source(); src) {
-        add_unique(src.get(), parent);
-      }
-    }
-  }
-  // next_port_after_sink (set via insert_repository).
-  if (sink) {
-    auto* mutable_sink = const_cast<op::sirius_physical_operator*>(sink.get());
-    auto& next_ports = mutable_sink->get_next_port_after_sink();
-    for (auto& [next_op, port_id] : next_ports) {
-      // Get dest_pipeline from the port.
-      auto* port = next_op->get_port(port_id);
-      add_unique(next_op, port ? port->dest_pipeline : nullptr);
-    }
-  }
-  // Dependencies: direct child pipelines that depend on this one.
-  for (auto& dep : dependencies) {
-    if (auto src = dep->get_source(); src) {
-      add_unique(src.get(), dep);
-    }
+  for (auto& parent : parents) {
+    if (auto src = parent->get_source(); src) { result.push_back(src.get()); }
   }
   return result;
 }

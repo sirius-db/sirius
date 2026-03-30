@@ -140,19 +140,7 @@ void gpu_pipeline_executor::manager_loop()
       }
       break;
     }
-    auto output_consumers_raw = gpu_task->get_output_consumers();
-    // Get pipeline-aware consumers for scheduling.
-    std::vector<std::pair<op::sirius_physical_operator*, duckdb::shared_ptr<sirius_pipeline>>>
-      output_consumers_with_pipelines;
-    {
-      auto* task_pipeline = gpu_task->get_pipeline();
-      if (task_pipeline) {
-        auto pairs = task_pipeline->get_output_consumers_with_pipelines();
-        for (auto& [op, pl] : pairs) {
-          output_consumers_with_pipelines.push_back({op, pl});
-        }
-      }
-    }
+    auto output_consumers = gpu_task->get_output_consumers();
     auto* pipeline        = gpu_task->get_pipeline();
     auto exc_stream       = _stream_pool.acquire_stream(
       cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
@@ -160,8 +148,7 @@ void gpu_pipeline_executor::manager_loop()
                             task       = std::move(pipeline_task),
                             ticket     = std::move(ticket),
                             exc_stream = std::move(exc_stream),
-                            consumers  = std::move(output_consumers_raw),
-                            consumers_with_pipelines = std::move(output_consumers_with_pipelines),
+                            consumers  = std::move(output_consumers),
                             pipeline]() mutable {
       try {
         task->execute(exc_stream);
@@ -274,18 +261,14 @@ void gpu_pipeline_executor::manager_loop()
       }
 
       if (!query_complete && _task_creator) {
-        for (auto& [consumer, consumer_pipeline] : consumers_with_pipelines) {
-          if (consumer) { _task_creator->schedule(consumer, consumer_pipeline); }
+        for (auto* consumer : consumers) {
+          if (consumer) { _task_creator->schedule(consumer); }
         }
-
-        // After task completion, trigger update_pipeline_status on the current
-        // pipeline AND all unfinished pipelines in the query. This handles cases
-        // where tasks_created was tracked on the wrong pipeline (shared operators).
-        if (pipeline) {
-          const_cast<sirius_pipeline*>(pipeline)->update_pipeline_status();
-        }
-
-        // Re-check pipeline completion.
+        // Re-check pipeline completion after scheduling downstream tasks.
+        // A concurrent scan task may have set exhausted=true (and thus
+        // pipeline_finished=true) between the first check above and now.
+        // Without this re-check, the completion signal would be missed when
+        // this is the last GPU task for the pipeline.
         if (_completion_handler && pipeline && !_completion_handler->is_completed()) {
           auto sink = pipeline->get_sink();
           if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {

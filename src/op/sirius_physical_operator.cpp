@@ -230,16 +230,6 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
-  // Debug: log port states for TABLE_SCAN and PARTITION operators
-  if (type == SiriusPhysicalOperatorType::TABLE_SCAN ||
-      type == SiriusPhysicalOperatorType::PARTITION) {
-    for (auto& p : _ports_list) {
-      SIRIUS_LOG_INFO("[get_next_task_hint] {} op_id={} port barrier={} repo_size={} src_finished={}",
-                      get_name(), operator_id, static_cast<int>(p->type), p->repo->total_size(),
-                      p->src_pipeline ? p->src_pipeline->is_pipeline_finished() : true);
-    }
-  }
-
   // look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
     return p->type == MemoryBarrierType::FULL && p->src_pipeline &&
@@ -247,10 +237,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   });
 
   if (unfinished_barrier != _ports_list.end()) {
-    auto& src = (*unfinished_barrier)->src_pipeline;
-    auto* producer = !src->get_operators().empty()
-                       ? &src->get_operators()[0].get()
-                       : src->get_source().get();
+    auto* producer = &((*unfinished_barrier)->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
@@ -271,10 +258,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
     });
 
   if (unfinished_pipeline != _ports_list.end()) {
-    auto& src = (*unfinished_pipeline)->src_pipeline;
-    auto* producer = !src->get_operators().empty()
-                       ? &src->get_operators()[0].get()
-                       : src->get_source().get();
+    auto* producer = &((*unfinished_pipeline)->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
