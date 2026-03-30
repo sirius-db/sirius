@@ -73,6 +73,9 @@ class SiriusContext : public ClientContextState {
   /// \param error Optional error data.
   void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
 
+  /// \brief Must return true for OnFinalizePrepare to be called by DuckDB.
+  bool CanRequestRebind() final { return true; }
+
   /// \brief Called after physical plan generation, before execution.
   /// Replaces the DuckDB physical plan with a Sirius GPU plan when possible.
   RebindQueryInfo OnFinalizePrepare(ClientContext& context,

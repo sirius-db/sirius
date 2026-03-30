@@ -81,7 +81,10 @@ class GPUExecutionFixtureBase {
   ~GPUExecutionFixtureBase() = default;
 
   /**
-   * @brief Run a query through gpu_execution and through DuckDB CPU, then compare results.
+   * @brief Run a query via transparent GPU execution and via DuckDB CPU, then compare results.
+   *
+   * Transparent execution is enabled by default when SiriusContext is initialized.
+   * The CPU baseline is obtained by temporarily disabling transparent execution.
    *
    * Values are compared as strings via Value::ToString() which normalizes type differences
    * (e.g., HUGEINT vs BIGINT both render "50"). Row order is ignored by collecting rows
@@ -95,20 +98,21 @@ class GPUExecutionFixtureBase {
   void compare_gpu_vs_cpu(const std::string& query,
                           std::optional<float> float_tolerance = std::nullopt)
   {
-    // Disable fallback so GPU errors are not silently hidden
-    con->Query("SET enable_duckdb_fallback = false;");
+    // Enable transparent GPU execution
+    con->Query("SET sirius_transparent_execution = true;");
 
-    // Run on GPU
-    auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
-    auto gpu_result = con->Query(gpu_sql);
+    // Run on GPU (transparent — plain SQL goes through Sirius optimizer hook)
+    auto gpu_result = con->Query(query);
     REQUIRE(gpu_result);
     if (gpu_result->HasError()) {
-      UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError());
+      UNSCOPED_INFO("transparent GPU execution error: " << gpu_result->GetError());
     }
     REQUIRE_FALSE(gpu_result->HasError());
 
-    // Run on CPU (plain DuckDB)
+    // Run on CPU (disable transparent execution)
+    con->Query("SET sirius_transparent_execution = false;");
     auto cpu_result = con->Query(query);
+    con->Query("SET sirius_transparent_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
@@ -122,8 +126,12 @@ class GPUExecutionFixtureBase {
                 << std::endl;
     }
 
+    // Strip trailing semicolons from query for subquery wrapping
+    auto clean_query = query;
+    while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
+      clean_query.pop_back();
+
     // Use DuckDB to sort both result sets by all columns for deterministic comparison.
-    // This avoids lexicographic vs numeric sort issues.
     auto ncols               = gpu_result->ColumnCount();
     std::string order_clause = " ORDER BY ";
     for (duckdb::idx_t c = 0; c < ncols; c++) {
@@ -131,14 +139,13 @@ class GPUExecutionFixtureBase {
       order_clause += std::to_string(c + 1);
     }
 
-    // Strip trailing semicolons from query for subquery wrapping
-    auto clean_query = query;
-    while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
-      clean_query.pop_back();
-
-    auto gpu_sorted =
-      con->Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
+    // GPU sorted (transparent execution)
+    auto gpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
+    // CPU sorted (transparent execution disabled)
+    con->Query("SET sirius_transparent_execution = false;");
     auto cpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
+    con->Query("SET sirius_transparent_execution = true;");
+
     REQUIRE(gpu_sorted);
     if (gpu_sorted->HasError()) { UNSCOPED_INFO("gpu sorted error: " << gpu_sorted->GetError()); }
     REQUIRE_FALSE(gpu_sorted->HasError());

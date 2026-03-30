@@ -67,7 +67,7 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobal
 duckdb::unique_ptr<duckdb::LocalSourceState> PhysicalSiriusExecution::GetLocalSourceState(
   duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const
 {
-  return nullptr;
+  return duckdb::make_uniq<duckdb::LocalSourceState>();
 }
 
 duckdb::SourceResultType PhysicalSiriusExecution::GetData(duckdb::ExecutionContext& context,

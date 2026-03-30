@@ -25,20 +25,13 @@ def _log(msg, warmup=False):
         print(msg)
 
 
-def _wrap_gpu_processing(sql):
-    """Wrap SQL in gpu_execution call."""
-    # Escape quotes in the SQL
-    escaped_sql = sql.replace('"', '\\"')
-    return f'call gpu_processing("{escaped_sql}");'
-
-
 def _verify_results(duckdb_rows, sirius_rows, query_name):
     """Verify that DuckDB and Sirius results match."""
     try:
         # Check row counts
         if len(duckdb_rows) != len(sirius_rows):
             print(
-                f"❌ {query_name}: Row count mismatch - DuckDB: {len(duckdb_rows)}, Sirius: {len(sirius_rows)}"
+                f"  {query_name}: Row count mismatch - DuckDB: {len(duckdb_rows)}, Sirius: {len(sirius_rows)}"
             )
             return False
 
@@ -51,18 +44,18 @@ def _verify_results(duckdb_rows, sirius_rows, query_name):
             zip(duckdb_rows_sorted, sirius_rows_sorted)
         ):
             if duck_row != sirius_row:
-                print(f"❌ {query_name}: Row {i} mismatch")
+                print(f"  {query_name}: Row {i} mismatch")
                 print(f"   DuckDB:  {duck_row}")
                 print(f"   Sirius:  {sirius_row}")
                 return False
             if duck_row == 0:
-                print(f"❌ {query_name}: Results are empty")
+                print(f"  {query_name}: Results are empty")
                 return False
 
-        print(f"✓ {query_name}: Results match ({len(duckdb_rows)} rows)")
+        print(f"  {query_name}: Results match ({len(duckdb_rows)} rows)")
         return True
     except Exception as e:
-        print(f"❌ {query_name}: Error during verification - {e}")
+        print(f"  {query_name}: Error during verification - {e}")
         return False
 
 
@@ -70,10 +63,14 @@ def execute_query(con, query_num, use_gpu=False, warmup=False, verify_mode=False
     """
     Execute a single TPC-H query.
 
+    When use_gpu=True, transparent execution is enabled — plain SQL is
+    automatically routed through the Sirius GPU engine.
+    When use_gpu=False, transparent execution is disabled (CPU-only).
+
     Args:
         con: Database connection
         query_num: Query number (1-22)
-        use_gpu: If True, wrap query with gpu_processing()
+        use_gpu: If True, enable transparent GPU execution
         warmup: If True, suppress output
         verify_mode: If True, return result for verification (don't consume it)
 
@@ -85,8 +82,12 @@ def execute_query(con, query_num, use_gpu=False, warmup=False, verify_mode=False
         raise ValueError(f"Query {query_name} not found")
 
     sql = QUERIES[query_name]
+
+    # Toggle transparent GPU execution
     if use_gpu:
-        sql = _wrap_gpu_processing(sql)
+        con.execute("SET sirius_transparent_execution = true;")
+    else:
+        con.execute("SET sirius_transparent_execution = false;")
 
     result = con.execute(sql)
 
@@ -105,7 +106,7 @@ def run_all(con, use_gpu=False, warmup=False):
 
     Args:
         con: Database connection
-        use_gpu: If True, use gpu_processing() for all queries
+        use_gpu: If True, enable transparent GPU execution
         warmup: If True, suppress output
     """
     for i in range(1, 23):
@@ -115,10 +116,6 @@ def run_all(con, use_gpu=False, warmup=False):
 def verify_all(con):
     """
     Verify that Sirius (GPU) and DuckDB produce the same results for all queries.
-
-    Args:
-        con: Database connection
-        warmup: If True, suppress output
 
     Returns:
         Dictionary mapping query numbers to verification status (True/False)
@@ -130,12 +127,12 @@ def verify_all(con):
         print(f"Verifying {query_name}...")
 
         try:
-            # Run with DuckDB
+            # Run with DuckDB (transparent execution disabled)
             duckdb_result = execute_query(
                 con, i, use_gpu=False, verify_mode=True
             ).fetchall()
 
-            # Run with Sirius
+            # Run with Sirius (transparent execution enabled)
             sirius_result = execute_query(
                 con, i, use_gpu=True, verify_mode=True
             ).fetchall()
@@ -145,7 +142,7 @@ def verify_all(con):
             results[i] = match
 
         except Exception as e:
-            print(f"❌ {query_name}: Exception - {e}")
+            print(f"  {query_name}: Exception - {e}")
             results[i] = False
 
     # Print summary
@@ -162,7 +159,6 @@ if __name__ == "__main__":
     con = duckdb.connect(
         "performance_test.duckdb", config={"allow_unsigned_extensions": "true"}
     )
-    # con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     extension_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "build/release/extension/sirius/sirius.duckdb_extension",
@@ -171,11 +167,7 @@ if __name__ == "__main__":
 
     SF = sys.argv[1]
 
-    print("Initializing GPU buffer...")
-    command = f"call gpu_buffer_init('{SF} GB', '{SF} GB')"
-    con.execute(command)
-
-    print("Initializing Sirius...")
+    print("Warming up Sirius (GPU)...")
     run_all(con, use_gpu=True, warmup=True)
 
     run_all(con, use_gpu=False, warmup=True)

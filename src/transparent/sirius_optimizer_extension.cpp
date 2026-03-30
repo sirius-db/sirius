@@ -17,10 +17,12 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include "config.hpp"
-#include "log/logging.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/logical_operator_type.hpp>
+#include <duckdb/common/enums/optimizer_type.hpp>
+#include <duckdb/main/config.hpp>
+#include <spdlog/spdlog.h>
 
 namespace sirius::transparent {
 
@@ -58,6 +60,24 @@ bool is_acceleratable_query(const duckdb::LogicalOperator& root)
   return true;
 }
 
+void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
+                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+{
+  if (!duckdb::Config::ENABLE_TRANSPARENT_EXECUTION) { return; }
+
+  auto& context = input.context;
+  auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!ctx || !ctx->is_initialized()) { return; }
+
+  if (!is_acceleratable_query(*plan)) { return; }
+
+  // Disable optimizers that produce DuckDB-internal functions Sirius can't handle.
+  // This runs before the built-in optimizers so they won't transform the plan.
+  auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
+  disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
+  disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+}
+
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
@@ -68,19 +88,25 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx || !ctx->is_initialized()) { return; }
 
+  // Re-enable the disabled optimizers so they don't leak to non-GPU queries.
+  auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
+  disabled.erase(duckdb::OptimizerType::IN_CLAUSE);
+  disabled.erase(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+
   if (!is_acceleratable_query(*plan)) {
-    SIRIUS_LOG_DEBUG("Transparent execution: query not acceleratable, skipping GPU");
+    spdlog::debug("Transparent execution: query not acceleratable (root type: {})",
+                  static_cast<int>(plan->type));
     return;
   }
 
   try {
     auto plan_copy = plan->Copy(context);
     ctx->set_captured_logical_plan(std::move(plan_copy));
-    SIRIUS_LOG_DEBUG("Transparent execution: logical plan captured for GPU execution");
+    spdlog::info("Transparent execution: logical plan captured for GPU execution");
   } catch (duckdb::NotImplementedException&) {
-    SIRIUS_LOG_DEBUG("Transparent execution: logical plan not serializable, skipping GPU");
+    spdlog::info("Transparent execution: logical plan not serializable, skipping GPU");
   } catch (std::exception& e) {
-    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}", e.what());
+    spdlog::info("Transparent execution: failed to copy logical plan: {}", e.what());
   }
 }
 

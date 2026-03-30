@@ -21,16 +21,17 @@
 
 namespace sirius::transparent {
 
+/// \brief Pre-optimization hook that disables DuckDB optimizers incompatible with Sirius.
+///
+/// Disables IN_CLAUSE and COMPRESSED_MATERIALIZATION optimizers before they run,
+/// so the logical plan remains in a form Sirius can process.
+void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
+                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
+
 /// \brief Post-optimization hook that captures the optimized logical plan for GPU execution.
 ///
-/// When transparent execution is enabled and SiriusContext is initialized, this hook:
-/// 1. Checks whether the query contains only GPU-acceleratable operators
-/// 2. Creates a copy of the optimized logical plan via serialize/deserialize
-/// 3. Stores the copy in SiriusContext for later use by OnFinalizePrepare
-///
-/// The original logical plan is NOT modified — DuckDB continues with its normal
-/// physical plan generation. The stored copy is consumed in OnFinalizePrepare to
-/// generate a Sirius physical plan.
+/// Re-enables the disabled optimizers (so they don't leak to non-GPU queries), then
+/// copies the optimized logical plan and stores it in SiriusContext for OnFinalizePrepare.
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
 
