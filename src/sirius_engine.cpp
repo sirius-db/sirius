@@ -1279,8 +1279,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       // Print ports and next operators after sink
       SIRIUS_LOG_INFO("  Sink next operators and ports:");
       for (auto& next_port : pipeline->sink->get_next_port_after_sink()) {
-        auto next_op = next_port.first;
-        auto port_id = next_port.second;
+        auto next_op = next_port.next_operator;
+        auto port_id = next_port.next_operator_port_name;
         SIRIUS_LOG_INFO("    Next Op: {} (id={}), Port: '{}'",
                         next_op->get_name(),
                         next_op->get_operator_id(),
@@ -1305,22 +1305,26 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join;
           SIRIUS_LOG_INFO("  Partition Join next operators:");
           for (auto& next_port : partition_join->get_next_port_after_sink()) {
-            SIRIUS_LOG_INFO("    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
-                            next_port.first->get_name(),
-                            next_port.first->get_operator_id(),
-                            next_port.second.data(),
-                            static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+            SIRIUS_LOG_INFO(
+              "    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
+              next_port.next_operator->get_name(),
+              next_port.next_operator->get_operator_id(),
+              next_port.next_operator_port_name.data(),
+              static_cast<void*>(
+                next_port.next_operator->get_port(next_port.next_operator_port_name)->repo));
           }
 
           auto distinct_op =
             delim_join->Cast<op::sirius_physical_right_delim_join>().distinct.get();
           SIRIUS_LOG_INFO("  Distinct next operators:");
           for (auto& next_port : distinct_op->get_next_port_after_sink()) {
-            SIRIUS_LOG_INFO("    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
-                            next_port.first->get_name(),
-                            next_port.first->get_operator_id(),
-                            next_port.second.data(),
-                            static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+            SIRIUS_LOG_INFO(
+              "    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
+              next_port.next_operator->get_name(),
+              next_port.next_operator->get_operator_id(),
+              next_port.next_operator_port_name.data(),
+              static_cast<void*>(
+                next_port.next_operator->get_port(next_port.next_operator_port_name)->repo));
           }
         }
 
@@ -1329,20 +1333,24 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             delim_join->Cast<op::sirius_physical_left_delim_join>().column_data_scan;
           SIRIUS_LOG_INFO("  Column Data Scan next operators:");
           for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
-            SIRIUS_LOG_INFO("    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
-                            next_port.first->get_name(),
-                            next_port.first->get_operator_id(),
-                            next_port.second.data(),
-                            static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+            SIRIUS_LOG_INFO(
+              "    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
+              next_port.next_operator->get_name(),
+              next_port.next_operator->get_operator_id(),
+              next_port.next_operator_port_name.data(),
+              static_cast<void*>(
+                next_port.next_operator->get_port(next_port.next_operator_port_name)->repo));
           }
           auto distinct_op = delim_join->Cast<op::sirius_physical_left_delim_join>().distinct.get();
           SIRIUS_LOG_INFO("  Partition Distinct next operators:");
           for (auto& next_port : distinct_op->get_next_port_after_sink()) {
-            SIRIUS_LOG_INFO("    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
-                            next_port.first->get_name(),
-                            next_port.first->get_operator_id(),
-                            next_port.second.data(),
-                            static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+            SIRIUS_LOG_INFO(
+              "    Next Op: {} (id={}), Port: '{}' Repo:'{}'",
+              next_port.next_operator->get_name(),
+              next_port.next_operator->get_operator_id(),
+              next_port.next_operator_port_name.data(),
+              static_cast<void*>(
+                next_port.next_operator->get_port(next_port.next_operator_port_name)->repo));
           }
         }
       }

@@ -200,13 +200,14 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;
   for (auto& batch : input_batches) {
-    for (auto& [next_op, port_id] : next_port_after_sink) {
+    for (auto& next_port_info : next_port_after_sink) {
       // the next operator is a partition consumer operator, so we need to push the batch into the
       // specific partition
       auto partition_consumer_op =
-        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
+        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
       if (partition_consumer_op) {
-        partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_id);
+        partition_consumer_op->push_data_batch_partitioned(
+          next_port_info.next_operator_port_name, batch, partition_id);
       } else {
         throw std::runtime_error("Next operator is not a partition consumer operator");
       }

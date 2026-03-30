@@ -263,6 +263,11 @@ class sirius_physical_operator {
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
   };
 
+  struct next_port_info {
+    sirius_physical_operator* next_operator;
+    std::string_view next_operator_port_name;
+  };
+
   // source pipeline pushed to repo of the ports
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
@@ -279,7 +284,7 @@ class sirius_physical_operator {
   void add_next_port_after_sink(
     std::pair<sirius_physical_operator*, std::string_view> port_locator);
   //! Get the next ports after sink
-  std::vector<std::pair<sirius_physical_operator*, std::string_view>>& get_next_port_after_sink();
+  std::vector<sirius_physical_operator::next_port_info>& get_next_port_after_sink();
 
   //! Get the next task hint
   virtual std::optional<task_creation_hint> get_next_task_hint();
@@ -326,7 +331,7 @@ class sirius_physical_operator {
   //! in `ports` are never invalidated by insertions.
   std::list<std::unique_ptr<port>> _ports_list;
   //! The next operators to be executed after this operator when it is used as a sink
-  std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
+  std::vector<sirius_physical_operator::next_port_info> next_port_after_sink;
 };
 
 }  // namespace op
