@@ -71,6 +71,9 @@ struct Config {
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
   static int LOG_FLUSH_SECONDS;
+
+  // Whether to transparently intercept SQL and execute on GPU
+  static bool ENABLE_TRANSPARENT_EXECUTION;
 };
 
 }  // namespace duckdb

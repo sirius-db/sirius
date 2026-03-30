@@ -23,6 +23,8 @@
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/physical_sirius_execution.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -30,6 +32,8 @@
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
+#include <duckdb/common/allocator.hpp>
+#include <duckdb/execution/physical_plan_generator.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -82,6 +86,9 @@ SiriusContext::~SiriusContext() noexcept
 
 void SiriusContext::QueryBegin(ClientContext& context)
 {
+  // Clear any stale captured plan from a previous query.
+  captured_logical_plan_.reset();
+
   // Reset operator ID counter so each query starts from 0
   sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
@@ -100,6 +107,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 void SiriusContext::QueryEnd()
 {
   spdlog::info("QueryEnd");
+  captured_logical_plan_.reset();
   query_.reset();
 
   // Drain all downgrade executors before clearing repositories — ensures no downgrade
@@ -331,6 +339,60 @@ duckdb::shared_ptr<const sirius::planner::query> SiriusContext::get_query() cons
 {
   throw_if_not_initialized();
   return query_;
+}
+
+void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
+{
+  captured_logical_plan_ = std::move(plan);
+}
+
+unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
+{
+  return std::move(captured_logical_plan_);
+}
+
+RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
+                                                 PreparedStatementData& prepared,
+                                                 PreparedStatementMode mode)
+{
+  if (!captured_logical_plan_) { return RebindQueryInfo::DO_NOT_REBIND; }
+  if (!is_initialized_) {
+    captured_logical_plan_.reset();
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+
+  // Only intercept SELECT statements.
+  if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
+    captured_logical_plan_.reset();
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+
+  auto logical_plan = take_captured_logical_plan();
+
+  try {
+    // Generate the Sirius physical plan from the captured logical plan.
+    sirius::planner::sirius_physical_plan_generator planner(context);
+    auto sirius_plan = planner.create_plan(std::move(logical_plan));
+
+    spdlog::info("Transparent execution: Sirius physical plan generated successfully");
+
+    // Create a new DuckDB PhysicalPlan containing our custom operator.
+    auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
+    auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
+      std::move(sirius_plan), prepared.types, prepared.names, 0);
+    new_physical_plan->SetRoot(sirius_op);
+
+    // Replace the DuckDB CPU physical plan.
+    prepared.physical_plan = std::move(new_physical_plan);
+
+    spdlog::info("Transparent execution: physical plan replaced with GPU operator");
+  } catch (NotImplementedException& e) {
+    spdlog::info("Transparent execution fallback (unsupported): {}", e.what());
+  } catch (std::exception& e) {
+    spdlog::info("Transparent execution fallback: {}", e.what());
+  }
+
+  return RebindQueryInfo::DO_NOT_REBIND;
 }
 
 void SiriusContext::throw_if_not_initialized() const

@@ -29,7 +29,9 @@
 
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/planner/extension_callback.hpp>
+#include <duckdb/planner/logical_operator.hpp>
 
 #include <map>
 #include <memory>
@@ -70,6 +72,12 @@ class SiriusContext : public ClientContextState {
   /// \param context The client context.
   /// \param error Optional error data.
   void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
+
+  /// \brief Called after physical plan generation, before execution.
+  /// Replaces the DuckDB physical plan with a Sirius GPU plan when possible.
+  RebindQueryInfo OnFinalizePrepare(ClientContext& context,
+                                    PreparedStatementData& prepared_statement,
+                                    PreparedStatementMode mode) final;
 
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::sirius_config& config);
@@ -121,6 +129,17 @@ class SiriusContext : public ClientContextState {
   /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
   [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
 
+  /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
+  [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
+
+  /// \brief Store a captured logical plan for transparent GPU execution.
+  /// Called by the optimizer extension hook after copying the optimized logical plan.
+  void set_captured_logical_plan(duckdb::unique_ptr<duckdb::LogicalOperator> plan);
+
+  /// \brief Take ownership of the captured logical plan (moves it out).
+  /// Called by OnFinalizePrepare to generate the Sirius physical plan.
+  duckdb::unique_ptr<duckdb::LogicalOperator> take_captured_logical_plan();
+
  private:
   void throw_if_not_initialized() const;
 
@@ -139,6 +158,10 @@ class SiriusContext : public ClientContextState {
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   duckdb::shared_ptr<sirius::planner::query> query_;
+
+  /// Captured optimized logical plan for transparent GPU execution.
+  /// Set by the optimizer extension hook, consumed by OnFinalizePrepare.
+  duckdb::unique_ptr<duckdb::LogicalOperator> captured_logical_plan_;
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius

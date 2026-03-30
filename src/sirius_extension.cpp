@@ -38,6 +38,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
 #include "gpu_buffer_manager.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -861,6 +862,13 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
                    params->max_build_hash_table_bytes);
 }
 
+static void SetEnableTransparentExecution(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_TRANSPARENT_EXECUTION = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_TRANSPARENT_EXECUTION to {}",
+                   Config::ENABLE_TRANSPARENT_EXECUTION);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1007,6 +1015,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption(
+    "sirius_transparent_execution",
+    "Whether to transparently intercept SQL queries and execute them on GPU",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_TRANSPARENT_EXECUTION),
+    SetEnableTransparentExecution);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1019,6 +1034,11 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register optimizer extension for transparent GPU execution.
+  OptimizerExtension opt_ext;
+  opt_ext.optimize_function = sirius::transparent::sirius_optimizer_hook;
+  config.optimizer_extensions.push_back(std::move(opt_ext));
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
