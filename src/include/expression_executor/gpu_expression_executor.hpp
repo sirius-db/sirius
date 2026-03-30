@@ -187,6 +187,14 @@ class gpu_expression_executor {
       auto const& column_payload = std::get<std::unique_ptr<cudf::column>>(payload);
       return column_payload->view();
     }
+    [[nodiscard]] std::unique_ptr<cudf::column> get_column()
+    {
+      if (std::holds_alternative<std::unique_ptr<cudf::column>>(payload)) {
+        return std::move(std::get<std::unique_ptr<cudf::column>>(payload));
+      }
+      throw std::runtime_error(
+        "[execute_result] Attempted to get column from execute_result that does not hold a column");
+    }
   };
 
   enum class execution_mode {
@@ -194,20 +202,23 @@ class gpu_expression_executor {
     MATERIALIZE,
   };
 
-  gpu_expression_executor(expression_executor_strategy strategy,
+  gpu_expression_executor(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
+                          expression_executor_strategy strategy,
                           rmm::device_async_resource_ref = cudf::get_current_device_resource_ref(),
                           rmm::cuda_stream_view stream   = cudf::get_default_stream(),
                           std::size_t min_ast_size       = 2);
 
-  std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
-                                      duckdb::Expression const& expr);
+  std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch);
+  std::shared_ptr<data_batch> select(std::shared_ptr<data_batch> input_batch);
 
  private:
+  std::vector<duckdb::Expression const*> _expressions;  ///< The expressions to execute
   expression_executor_strategy _strategy;
   rmm::device_async_resource_ref _mr;
   rmm::cuda_stream_view _stream;
   std::size_t _min_ast_size;
   cudf::table_view _input_table;
+  std::vector<std::unique_ptr<cudf::column>> _output_columns;
 
   cudf::ast::tree _ast_tree;
   std::vector<std::unique_ptr<cudf::scalar>> _temp_scalars;

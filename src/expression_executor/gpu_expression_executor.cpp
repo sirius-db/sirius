@@ -39,14 +39,103 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
-namespace sirius::experimental {
+namespace {
+/// Returns true if cudf::cast supports this type (fixed-width only; no STRING/LIST/STRUCT/etc.).
+bool IsFixedWidth(cudf::data_type const& type)
+{
+  auto const id = type.id();
+  return id != cudf::type_id::STRING && id != cudf::type_id::LIST && id != cudf::type_id::STRUCT &&
+         id != cudf::type_id::DICTIONARY32 && id != cudf::type_id::EMPTY;
+}
+}  // namespace
 
-gpu_expression_executor::gpu_expression_executor(expression_executor_strategy strategy,
-                                                 rmm::device_async_resource_ref resource_ref,
-                                                 rmm::cuda_stream_view stream,
-                                                 std::size_t min_ast_size)
+namespace sirius::experimental {
+using data_batch = cucascade::data_batch;
+
+gpu_expression_executor::gpu_expression_executor(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
+  expression_executor_strategy strategy,
+  rmm::device_async_resource_ref resource_ref,
+  rmm::cuda_stream_view stream,
+  std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
+  for (auto const& expr : expressions) {
+    _expressions.push_back(expr.get());
+  }
+}
+
+std::shared_ptr<data_batch> gpu_expression_executor::execute(
+  std::shared_ptr<data_batch> input_batch)
+{
+  if (!input_batch) { return input_batch; }
+  D_ASSERT(!_expressions.empty());
+  _output_columns.clear();
+  _output_columns.reserve(_expressions.size());
+
+  // Get the table_view from the input_batch
+  auto const& input_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  _input_table          = input_rep.get_table().view();
+
+  // Execute the expressions and emit results into _output_columns
+  for (auto const _expr : _expressions) {
+    auto const& expr = *_expr;
+    auto result      = execute(expr, execution_mode::MATERIALIZE);
+    // BOUND_REF: pass column through without type check (same as Execute(GPUIntermediateRelation)).
+    // The column is the actual input column; no cast is valid for string/non-fixed-width.
+    if (expr.expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      // Cast the `result` from libcudf to `return_type` if `result` has a different type.
+      // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
+      // Only use cudf::cast when both types are fixed-width (cast does not support
+      // STRING/LIST/STRUCT).
+      auto const cudf_return_type = GetCudfType(expr.return_type);
+      auto result_column          = result.get_column();
+      if (result_column->type().id() != cudf_return_type.id()) {
+        if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
+          result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);
+        } else {
+          throw duckdb::InternalException(
+            "[gpu_expression_executor] Unsupported type conversion: " +
+            cudf::type_to_name(result_column->type()) + " to " +
+            cudf::type_to_name(cudf_return_type));
+        }
+      }
+    } else {
+      // For BOUND_REF, we must deep copy the column to the upstream batch
+      _output_columns.push_back(
+        std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+    }
+  }
+
+  // Create the data representation
+  std::unique_ptr<cucascade::idata_representation> output_data_rep =
+    std::make_unique<cucascade::gpu_table_representation>(
+      std::move(std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr)),
+      *input_batch->get_memory_space());
+
+  // Create the data batch and return
+  auto const batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
+}
+
+std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data_batch> input_batch)
+{
+  D_ASSERT(_expressions.size() == 1);
+  auto const& expr = *_expressions[0];
+  D_ASSERT(expr.return_type == duckdb::LogicalType::BOOLEAN);
+
+  // Execute the expression to get the boolean mask (_input_table extracted by execute())
+  auto mask = execute(expr, execution_mode::MATERIALIZE);
+
+  // Apply the boolean mask to filter the input batch
+  auto output_table = cudf::apply_boolean_mask(_input_table, mask.get_column_view(), _stream, _mr);
+  std::unique_ptr<cucascade::idata_representation> output_data_rep =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
+                                                          *input_batch->get_memory_space());
+
+  // Create the data batch and return
+  auto const batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
 }
 
 std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& expr) const
@@ -153,16 +242,6 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
 
 namespace duckdb {
 namespace sirius {
-
-namespace {
-/// Returns true if cudf::cast supports this type (fixed-width only; no STRING/LIST/STRUCT/etc.).
-bool IsFixedWidth(cudf::data_type const& type)
-{
-  auto const id = type.id();
-  return id != cudf::type_id::STRING && id != cudf::type_id::LIST && id != cudf::type_id::STRUCT &&
-         id != cudf::type_id::DICTIONARY32 && id != cudf::type_id::EMPTY;
-}
-}  // namespace
 
 GpuExpressionExecutor::GpuExpressionExecutor(const Expression& expr,
                                              rmm::device_async_resource_ref resource_ref)
