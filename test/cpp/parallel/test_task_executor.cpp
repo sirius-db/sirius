@@ -15,12 +15,12 @@
  */
 
 #include "catch.hpp"
+#include "exec/config.hpp"
 #include "parallel/task_executor.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
 #include <chrono>
-#include <condition_variable>
-#include <mutex>
-#include <queue>
 #include <thread>
 
 using namespace sirius::parallel;
@@ -57,70 +57,37 @@ class dummy_task : public itask {
 };
 
 /**
- * Dummy task queue for tests.
- */
-class dummy_task_queue : public itask_queue {
- public:
-  ~dummy_task_queue() override = default;
-
-  void open() override
-  {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _open = true;
-    }
-    _cv.notify_all();
-  }
-
-  void close() override
-  {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _open = false;
-    }
-    _cv.notify_all();
-  }
-
-  void push(std::unique_ptr<itask> task) override
-  {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (!_open) { return; }
-      _tasks.push(std::move(task));
-    }
-    _cv.notify_one();
-  }
-
-  std::unique_ptr<itask> pull() override
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _cv.wait(lock, [&]() { return !_tasks.empty() || !_open; });
-    if (_tasks.empty()) { return nullptr; }
-    auto task = std::move(_tasks.front());
-    _tasks.pop();
-    return task;
-  }
-
- private:
-  std::queue<std::unique_ptr<itask>> _tasks;
-  std::mutex _mutex;
-  std::condition_variable _cv;
-  bool _open = false;
-};
-
-/**
- * Dummy task executor for tests.
+ * Minimal concrete executor for tests.
+ *
+ * Implements manager_loop() with the same kiosk+thread_pool dispatch pattern
+ * used by the production executors, executing tasks via cudf default stream.
  */
 class dummy_task_executor : public itask_executor {
  public:
-  using itask_executor::itask_executor;
+  explicit dummy_task_executor(sirius::exec::thread_pool_config config)
+    : itask_executor(std::move(config))
+  {
+  }
+
+ protected:
+  void manager_loop() override
+  {
+    while (_running.load()) {
+      auto ticket = _kiosk.acquire();
+      if (!ticket.is_valid()) { break; }
+      auto task = _task_queue.pop();
+      if (!task) { break; }
+      _thread_pool->schedule([t = std::move(task), ticket = std::move(ticket)]() mutable {
+        t->execute(cudf::get_default_stream());
+      });
+    }
+  }
 };
 
 TEST_CASE("Executor can start and stop gracefully", "[task_executor]")
 {
-  auto queue = std::make_unique<dummy_task_queue>();
-  task_executor_config config{4, false};
-  dummy_task_executor executor(std::move(queue), config);
+  sirius::exec::thread_pool_config config{4, "test_exec"};
+  dummy_task_executor executor(config);
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -128,10 +95,10 @@ TEST_CASE("Executor can start and stop gracefully", "[task_executor]")
 
 TEST_CASE("Executor executes scheduled tasks", "[task_executor]")
 {
-  auto queue = std::make_unique<dummy_task_queue>();
-  auto g     = std::make_shared<dummy_task_global_state>();
-  task_executor_config config{4, false};
-  dummy_task_executor executor(std::move(queue), config);
+  sirius::exec::thread_pool_config config{4, "test_exec"};
+  dummy_task_executor executor(config);
+  auto g = std::make_shared<dummy_task_global_state>();
+
   REQUIRE_NOTHROW(executor.start());
 
   // Schedule some tasks

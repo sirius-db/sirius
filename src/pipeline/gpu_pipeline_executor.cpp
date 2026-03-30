@@ -37,45 +37,22 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
-  : _config(config),
-    _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, _config.num_threads),
+  : sirius::parallel::itask_executor(config),
+    _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
-    _memory_space(mem_space),
-    _kiosk(_config.num_threads)
+    _memory_space(mem_space)
 {
 }
 
 gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
-void gpu_pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
+absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
-  _task_queue.push(std::move(task));
-}
-
-void gpu_pipeline_executor::start()
-{
-  bool expected = false;
-  if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool =
-    std::make_unique<exec::thread_pool>(_config.num_threads,
-                                        _config.thread_name_prefix,
-                                        _config.cpu_affinity_list,
-                                        [device_id = _memory_space->get_device_id()]() noexcept {
-                                          cudaSetDevice(device_id);
-                                          sirius::util::enable_log_on_default_stream();
-                                        });
-  _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
-}
-
-void gpu_pipeline_executor::stop()
-{
-  bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _kiosk.stop();
-  _task_queue.interrupt();
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _kiosk.wait_all();
-  if (_thread_pool) { _thread_pool->stop(); }
+  auto device_id = _memory_space->get_device_id();
+  return [device_id]() noexcept {
+    cudaSetDevice(device_id);
+    sirius::util::enable_log_on_default_stream();
+  };
 }
 
 void gpu_pipeline_executor::manager_loop()
@@ -283,36 +260,6 @@ gpu_pipeline_task* gpu_pipeline_executor::cast_to_gpu_pipeline_task(sirius::para
 void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task_creator)
 {
   _task_creator = task_creator;
-}
-
-void gpu_pipeline_executor::drain_leftover_tasks() { _task_queue.drain(); }
-
-void gpu_pipeline_executor::drain_and_wait()
-{
-  // Stop the kiosk so acquire() unblocks immediately with an invalid ticket.
-  // This is necessary when the manager loop is blocked at acquire() (i.e. all
-  // thread-pool slots are full) — interrupting the task queue alone won't help.
-  _kiosk.stop();
-
-  // Interrupt pop() so the manager_loop sees a nullptr return and breaks out
-  // of its while loop (within at most the 10 ms poll interval in pop()).
-  _task_queue.interrupt();
-
-  // Join the manager thread so we know it has exited (it will have seen either
-  // an invalid ticket from the stopped kiosk or a nullptr from the interrupted queue).
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-
-  // Wait for all in-flight thread-pool tasks to finish (each holds a kiosk
-  // ticket that is released when the lambda completes).
-  _kiosk.wait_all();
-
-  // Clear any remaining tasks from the queue.
-  _task_queue.drain();
-
-  // Re-enable the kiosk and queue so the executor is ready for the next query.
-  _kiosk.resume();
-  _task_queue.reactivate();
-  _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 
 bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }

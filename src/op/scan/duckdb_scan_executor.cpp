@@ -43,15 +43,14 @@ duckdb_scan_executor::duckdb_scan_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_reservation_manager* mem_mgr,
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher)
-  : _config(config),
-    _kiosk(_config.num_threads),
+  : sirius::parallel::itask_executor(config),
     _task_request_publisher(std::move(task_request_publisher)),
     _mem_mgr(mem_mgr)
 {
   auto gpu_spaces   = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   _gpu_memory_space = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
   _stream_pool      = std::make_unique<cucascade::memory::exclusive_stream_pool>(
-    rmm::cuda_device_id(_gpu_memory_space->get_device_id()), _config.num_threads);
+    rmm::cuda_device_id(_gpu_memory_space->get_device_id()), config.num_threads);
 }
 
 duckdb_scan_executor::~duckdb_scan_executor()
@@ -63,62 +62,9 @@ duckdb_scan_executor::~duckdb_scan_executor()
   stop();
 }
 
-void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
-{
-  _task_queue.push(std::move(task));
-}
-
-void duckdb_scan_executor::start()
-{
-  bool expected = false;
-  if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
-  _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
-}
-
-void duckdb_scan_executor::stop()
-{
-  bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _kiosk.stop();
-  _task_queue.interrupt();
-  if (_thread_pool) { _thread_pool->stop(); }
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _kiosk.wait_all();
-}
-
-void duckdb_scan_executor::wait_all() { _kiosk.wait_all(); }
-
 void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_creator)
 {
   _task_creator = task_creator;
-}
-
-void duckdb_scan_executor::drain_leftover_tasks() { _task_queue.drain(); }
-
-void duckdb_scan_executor::drain_and_wait()
-{
-  // Stop the kiosk so the manager_loop's acquire() returns an invalid ticket
-  // (the manager may be blocked there when all thread-pool slots are full).
-  _kiosk.stop();
-
-  // Interrupt pop() so the manager_loop sees a nullptr and breaks out.
-  _task_queue.interrupt();
-
-  // Join the manager thread so we know it has exited.
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-
-  // Wait for all in-flight thread-pool tasks to finish.
-  _kiosk.wait_all();
-
-  // Clear any remaining tasks from the queue.
-  _task_queue.drain();
-
-  // Re-enable the kiosk and queue so the executor is ready for the next query.
-  _kiosk.resume();
-  _task_queue.reactivate();
-  _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
 }
 
 void duckdb_scan_executor::set_completion_handler(

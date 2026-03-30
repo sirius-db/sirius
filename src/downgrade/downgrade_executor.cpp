@@ -35,8 +35,7 @@ downgrade_executor::downgrade_executor(
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager)
-  : _config(std::move(config)),
-    _kiosk(_config.num_threads),
+  : sirius::parallel::itask_executor(std::move(config)),
     _data_repo_mgr(data_repo_mgr),
     _space_id(space_id),
     _memory_space(memory_space),
@@ -47,31 +46,6 @@ downgrade_executor::downgrade_executor(
 
 downgrade_executor::~downgrade_executor() { stop(); }
 
-void downgrade_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
-{
-  _task_queue.push(std::move(task));
-}
-
-void downgrade_executor::start()
-{
-  bool expected = false;
-  if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _kiosk.resume();
-  _task_queue.reactivate();
-  absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
-  if (_memory_space) {
-    auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
-    if (!_stream) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
-  }
-  _thread_pool    = std::make_unique<exec::thread_pool>(_config.num_threads,
-                                                     _config.thread_name_prefix,
-                                                     _config.cpu_affinity_list,
-                                                     std::move(per_thread_init));
-  _manager_thread = std::thread(&downgrade_executor::manager_loop, this);
-  _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
-}
-
 void downgrade_executor::drain()
 {
   // Stop then restart — ensures all in-flight tasks complete and the queue is empty
@@ -79,16 +53,28 @@ void downgrade_executor::drain()
   start();
 }
 
-void downgrade_executor::stop()
+absl::AnyInvocable<void() noexcept> downgrade_executor::get_per_thread_init()
 {
-  bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _kiosk.stop();
-  _task_queue.interrupt();
+  if (_memory_space) {
+    auto device_id = _memory_space->get_device_id();
+    return [device_id]() noexcept { cudaSetDevice(device_id); };
+  }
+  return nullptr;
+}
+
+void downgrade_executor::on_start()
+{
+  if (_memory_space && !_stream) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
+  _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
+}
+
+void downgrade_executor::on_stop()
+{
   if (_monitor_thread.joinable()) { _monitor_thread.join(); }
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _kiosk.wait_all();
-  if (_thread_pool) { _thread_pool->stop(); }
+}
+
+void downgrade_executor::on_stopped()
+{
   if (_stream) {
     cudaStreamDestroy(_stream);
     _stream = nullptr;
