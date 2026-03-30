@@ -3,7 +3,7 @@
 Since SiriusDB is an extension to DuckDB, the CMake project source is actually the `duckdb` directory (a submodule of
 this project), which then pulls in SiriusDB as an extension. We use
 
-- symlinked sirius-specific `CMakePresets.json` (at `cmake/CMakePresets.json`) to version control the build config.
+- sirius-specific `CMakePresets.json` (at the repository root) to version control the build config.
 - [pixi](https://pixi.prefix.dev/) to manage build dependencies.
 
 ## Using CLion for development

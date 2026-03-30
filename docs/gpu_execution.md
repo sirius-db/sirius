@@ -10,13 +10,22 @@ git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 ```
 
-Set up the environment with [Pixi](https://pixi.sh/) and build:
+Build with [Pixi](https://pixi.sh/) (release by default):
 ```
-pixi shell
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
+pixi run build
 ```
 
-Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value.
+Other build presets are available:
+```
+pixi run build debug              # Debug build
+pixi run build relwithdebinfo     # Release with debug symbols (for profiling)
+pixi run build clang-release      # Clang release build
+```
+
+If building consumes too much memory, reduce ninja parallelism:
+```
+CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run build
+```
 
 ## Configuration
 
@@ -28,7 +37,7 @@ An example config file is provided at [`test/cpp/integration/integration.cfg`](.
 
 ```bash
 export SIRIUS_CONFIG_FILE=/path/to/sirius.cfg
-./build/release/duckdb
+pixi run duckdb
 ```
 
 From the DuckDB shell, create views pointing to your Parquet files and run queries with `gpu_execution`:
@@ -54,8 +63,7 @@ ORDER BY l_returnflag, l_linestatus');
 
 ## Generating Test Datasets
 
-For TPC-H benchmarking, use the provided data generation script:
-
+Generate TPC-H Parquet data using the provided script (requires the pixi environment):
 ```bash
 cd test/tpch_performance
 pixi run bash generate_tpch_data.sh 100   # generates SF100 parquet data
@@ -80,14 +88,13 @@ CREATE VIEW my_table AS SELECT * FROM read_parquet('/path/to/my_data/*.parquet')
 
 Run all unit tests:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-build/release/extension/sirius/test/cpp/sirius_unittest
+pixi run unittest
 ```
 
 Run tests associated with a specific tag or a specific test:
 ```
-build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+pixi run unittest "[cpu_cache]"
+pixi run unittest "test_cpu_cache_basic_string_single_col"
 ```
 
 Test logs are saved in:

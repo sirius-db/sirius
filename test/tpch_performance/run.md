@@ -6,7 +6,7 @@ Benchmarking tools for comparing DuckDB (CPU) vs Sirius (GPU) on TPC-H queries a
 
 1. Build the project:
    ```bash
-   pixi run make -j12
+   pixi run build
    ```
 
 2. Ensure a Sirius config file exists. The binary looks for config in this order:

@@ -50,7 +50,7 @@ Arguments:
 ## Before Running
 
 - **Ask the user** if they want to rebuild the code using there are upstream changes.
-- Use the pixi environment: `pixi run make` to build the code
+- Use the pixi environment: `pixi run build` to build the code
 - Use pixi for package management
 
 ## Output

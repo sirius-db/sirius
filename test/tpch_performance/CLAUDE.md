@@ -4,7 +4,7 @@ This directory contains benchmarking, profiling, and performance testing tools f
 
 ## Prerequisites
 
-- Sirius must be built: `pixi run make -j12` (from project root)
+- Sirius must be built: `pixi run build` (from project root)
 - Binary: `build/release/duckdb` with Sirius extension at `build/release/extension/sirius/sirius.duckdb_extension`
 - Sirius config: `test/cpp/integration/integration.cfg` (set `SIRIUS_CONFIG_FILE` env var)
 - Parquet data must exist in `test_datasets/tpch_parquet_sf<N>/` (auto-generated if missing)

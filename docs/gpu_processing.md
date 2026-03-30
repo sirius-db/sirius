@@ -10,19 +10,16 @@ git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 ```
 
-Set up the environment with [Pixi](https://pixi.sh/):
-```
-pixi shell
-```
-
 By default, only the `gpu_execution` code path is compiled. To build `gpu_processing`, enable the `ENABLE_LEGACY_SIRIUS` CMake option:
 ```
-cd duckdb && cmake --preset release -DENABLE_LEGACY_SIRIUS=ON && cmake --build --preset release && cd ..
+pixi shell
+cmake -S duckdb --preset release -DENABLE_LEGACY_SIRIUS=ON
+pixi run build
 ```
 
 ## Running
 
-Start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
+Start the DuckDB shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
 From the DuckDB shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
@@ -69,34 +66,20 @@ All 22 TPC-H queries are saved in tpch-queries.sql. To run all queries:
 
 ## Generating and Loading Test Datasets
 
-### TPC-H Dataset
-
-To generate the TPC-H dataset
-```
-cd test_datasets
-unzip tpch-dbgen.zip
-cd tpch-dbgen
-./dbgen -s 1 && mkdir -p s1 && mv *.tbl s1  # this generates dataset of SF1
-cd ../../
+A setup script generates both TPC-H (SF1) and ClickBench datasets in one step:
+```bash
+./setup_test_datasets.sh
 ```
 
-To load the TPC-H dataset to duckdb:
+This creates the necessary data files under `test_datasets/`. The script is idempotent — it skips datasets that already exist.
+
+To load the TPC-H dataset into DuckDB:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
 .read scripts/tpch_load.sql
 ```
 
-### ClickBench Dataset
-
-To download the dataset run:
-```
-cd test_datasets
-wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
-gzip -d test_hits.tsv.gz
-cd ..
-```
-
-To load the dataset to duckdb:
+To load the ClickBench dataset:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
 .read scripts/clickbench_load_duckdb.sql
@@ -108,11 +91,10 @@ To load the dataset to duckdb:
 
 Generate the datasets using the method described [above](#generating-and-loading-test-datasets), then run:
 ```
-make test
+pixi run sql-test
 ```
 
-To run a specific test from the root directory:
+To run a specific test:
 ```
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
+pixi run sql-test test/sql/tpch-sirius.test
 ```
