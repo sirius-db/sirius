@@ -612,3 +612,134 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   CHECK(result->GetValue(1, 1).GetValue<int64_t>() == 5);
 }
 
+//===----------------------------------------------------------------------===//
+// Iceberg V2 equality delete stress tests
+//
+// Each uses an inline-VALUES oracle rather than compare_gpu_vs_cpu because
+// DuckDB 1.4.4 iceberg_scan() has a broken equality-delete data path.
+// Each test targets a specific edge case in the hook implementation.
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Helper: run gpu_execution query and compare sorted rows against a
+ * VALUES table built from expected_rows = {fruit, count} pairs.
+ */
+static void check_eq(duckdb::Connection& con,
+                     const std::string& query,
+                     std::vector<std::pair<std::string, int64_t>> expected_rows)
+{
+  // Run GPU
+  con.Query("SET enable_duckdb_fallback = false;");
+  auto gpu = con.Query("CALL gpu_execution(\"" + query + "\")");
+  REQUIRE(gpu);
+  if (gpu->HasError()) { UNSCOPED_INFO("gpu_execution error: " << gpu->GetError()); }
+  REQUIRE_FALSE(gpu->HasError());
+
+  REQUIRE(static_cast<size_t>(gpu->RowCount()) == expected_rows.size());
+
+  // Sort GPU result by count for deterministic comparison
+  std::string sort_q = "SELECT * FROM gpu_execution(\"" + query + "\") ORDER BY count";
+  auto sorted = con.Query(sort_q);
+  REQUIRE(sorted);
+  REQUIRE_FALSE(sorted->HasError());
+
+  for (size_t i = 0; i < expected_rows.size(); ++i) {
+    CHECK(sorted->GetValue(0, i).ToString() == expected_rows[i].first);
+    CHECK(sorted->GetValue(1, i).GetValue<int64_t>() == expected_rows[i].second);
+  }
+}
+
+class GPUExecutionIcebergEqStressFixture : public GPUExecutionIcebergFixture {
+ public:
+  GPUExecutionIcebergEqStressFixture()
+  {
+    auto root       = get_project_root();
+    single_col_path = (root / "substrait/data/iceberg_v2_eq_single_col").string();
+    multi_del_path  = (root / "substrait/data/iceberg_v2_eq_multi_delete_file").string();
+    all_del_path    = (root / "substrait/data/iceberg_v2_eq_all_deleted").string();
+    combined_path   = (root / "substrait/data/iceberg_v2_eq_pos_combined").string();
+    multi_data_path = (root / "substrait/data/iceberg_v2_eq_multi_data_file").string();
+
+    auto check = [](const std::string& p) {
+      return fs::exists(p + "/metadata/version-hint.text");
+    };
+    datasets_available = iceberg_available &&
+                         check(single_col_path) && check(multi_del_path) &&
+                         check(all_del_path)    && check(combined_path)  &&
+                         check(multi_data_path);
+  }
+
+  bool        datasets_available = false;
+  std::string single_col_path;
+  std::string multi_del_path;
+  std::string all_del_path;
+  std::string combined_path;
+  std::string multi_data_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
+                 "gpu_execution iceberg - V2 equality deletes single-column key",
+                 "[integration][gpu_execution][iceberg]")
+{
+  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  // Key is only the fruit column (field_id=1); count is not part of the key.
+  // Delete entries: "banana", "date" → surviving: apple/1, cherry/3, elderberry/5
+  check_eq(*con,
+           "SELECT fruit, count FROM iceberg_scan('" + single_col_path + "') ORDER BY count",
+           {{"apple", 1}, {"cherry", 3}, {"elderberry", 5}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
+                 "gpu_execution iceberg - V2 equality deletes multiple delete files",
+                 "[integration][gpu_execution][iceberg]")
+{
+  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  // Two separate equality-delete parquet files (one row each): tests concatenate+deduplicate path.
+  // Delete file 1: banana/2; delete file 2: date/4 → surviving: apple/1, cherry/3, elderberry/5
+  check_eq(*con,
+           "SELECT fruit, count FROM iceberg_scan('" + multi_del_path + "') ORDER BY count",
+           {{"apple", 1}, {"cherry", 3}, {"elderberry", 5}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
+                 "gpu_execution iceberg - V2 equality deletes all rows deleted",
+                 "[integration][gpu_execution][iceberg]")
+{
+  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  // Delete file covers all 3 data rows → result must be empty.
+  // Tests apply_boolean_mask on an all-false mask.
+  auto result = con->Query(
+    "CALL gpu_execution(\"SELECT fruit, count FROM iceberg_scan('" + all_del_path + "')\")");
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO("gpu error: " << result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == 0);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
+                 "gpu_execution iceberg - V2 equality and positional deletes combined",
+                 "[integration][gpu_execution][iceberg]")
+{
+  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  // Positional delete removes row 0 (apple/1); equality delete removes banana/2.
+  // Tests chain_hooks firing both hooks in sequence.
+  // Surviving: cherry/3, date/4, elderberry/5
+  check_eq(*con,
+           "SELECT fruit, count FROM iceberg_scan('" + combined_path + "') ORDER BY count",
+           {{"cherry", 3}, {"date", 4}, {"elderberry", 5}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
+                 "gpu_execution iceberg - V2 equality deletes multiple data files",
+                 "[integration][gpu_execution][iceberg]")
+{
+  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  // Two data parquet files; one equality-delete file removes one row from each.
+  // File 1: apple/1, banana/2, cherry/3 — delete banana/2
+  // File 2: date/4, elderberry/5, fig/6  — delete elderberry/5
+  // Tests that the hook is applied correctly to each file's chunks independently.
+  check_eq(*con,
+           "SELECT fruit, count FROM iceberg_scan('" + multi_data_path + "') ORDER BY count",
+           {{"apple", 1}, {"cherry", 3}, {"date", 4}, {"fig", 6}});
+}
+

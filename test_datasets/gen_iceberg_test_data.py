@@ -574,6 +574,26 @@ def make_equality_delete_arrow_schema():
     })
 
 
+ICEBERG_SCHEMA_FRUIT_ONLY = json.dumps({
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+        {"id": 1, "name": "fruit", "required": False, "type": "string"},
+    ],
+})
+
+
+def make_equality_delete_single_col_schema():
+    """Equality-delete schema keyed on fruit only (field_id=1)."""
+    return pa.schema([
+        pa.field("fruit", pa.string(), nullable=True,
+                 metadata={"PARQUET:field_id": "1"}),
+    ], metadata={
+        "iceberg.schema": ICEBERG_SCHEMA_FRUIT_ONLY,
+        "iceberg.delete.content": "EQUALITY",
+    })
+
+
 def gen_v2_equality_delete(base: Path, rel_base: str):
     print(f"Generating {rel_base} ...")
     snap_id = 3000000000000000001
@@ -690,6 +710,409 @@ def gen_v2_equality_delete(base: Path, rel_base: str):
 
 
 # ---------------------------------------------------------------------------
+# Generate iceberg_v2_eq_single_col  (single-column equality key on fruit)
+# ---------------------------------------------------------------------------
+
+def gen_v2_eq_single_col(base: Path, rel_base: str):
+    print(f"Generating {rel_base} ...")
+    snap_id          = 4000000000000000001
+    data_uuid        = "d4e5f6a7-0004-0004-0004-000000000001"
+    delete_uuid      = "d4e5f6a7-0004-0004-0004-000000000002"
+    data_mf_uuid     = "d4e5f6a7-0004-0004-0004-000000000003"
+    delete_mf_uuid   = "d4e5f6a7-0004-0004-0004-000000000004"
+    snap_uuid        = "d4e5f6a7-0004-0004-0004-000000000005"
+    seq_num = 1
+
+    # Data: 5 rows
+    data_file_name = f"00000-0-{data_uuid}-00001.parquet"
+    data_table = pa.table(
+        {"fruit": ["apple", "banana", "cherry", "date", "elderberry"],
+         "count": [1, 2, 3, 4, 5]},
+        schema=make_data_arrow_schema(),
+    )
+    data_path = base / "data" / data_file_name
+    data_size = write_parquet(data_path, data_table)
+    data_rel  = f"{rel_base}/data/{data_file_name}"
+
+    # Equality delete: key on fruit only — delete "banana" and "date"
+    del_file_name = f"delete-eq-{delete_uuid}-00001.parquet"
+    del_table = pa.table({"fruit": ["banana", "date"]},
+                         schema=make_equality_delete_single_col_schema())
+    del_path = base / "data" / del_file_name
+    del_size = write_parquet(del_path, del_table)
+    del_rel  = f"{rel_base}/data/{del_file_name}"
+
+    def eq_entry(fp, rc, fs):
+        e = make_data_file_entry(2, fp, rc, fs)
+        e["equality_ids"] = [1]   # fruit field id only
+        return e
+
+    data_mf_path = base / "metadata" / f"{data_mf_uuid}-m0.avro"
+    data_mf_rel  = f"{rel_base}/metadata/{data_mf_uuid}-m0.avro"
+    data_mf_size = write_avro(data_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, make_data_file_entry(0, data_rel, 5, data_size))])
+
+    del_mf_path = base / "metadata" / f"{delete_mf_uuid}-m1.avro"
+    del_mf_rel  = f"{rel_base}/metadata/{delete_mf_uuid}-m1.avro"
+    del_mf_size = write_avro(del_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, eq_entry(del_rel, 2, del_size))])
+
+    snap_name = f"snap-{snap_id}-1-{snap_uuid}.avro"
+    write_avro(base / "metadata" / snap_name, MANIFEST_LIST_SCHEMA, [
+        {"manifest_path": data_mf_rel, "manifest_length": data_mf_size,
+         "partition_spec_id": 0, "content": 0, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 5, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+        {"manifest_path": del_mf_rel, "manifest_length": del_mf_size,
+         "partition_spec_id": 0, "content": 2, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 2, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+    ])
+    write_metadata_json(base / "metadata" / "v1.metadata.json", rel_base, snap_id,
+                        f"{rel_base}/metadata/{snap_name}")
+    with open(base / "metadata" / "version-hint.text", "w") as f:
+        f.write("1")
+    print(f"  {rel_base}: 5 rows, single-col eq-delete fruit IN (banana,date) -> apple/1, cherry/3, elderberry/5")
+
+
+# ---------------------------------------------------------------------------
+# Generate iceberg_v2_eq_multi_delete_file  (two separate equality-delete files)
+# ---------------------------------------------------------------------------
+
+def gen_v2_eq_multi_delete_file(base: Path, rel_base: str):
+    print(f"Generating {rel_base} ...")
+    snap_id         = 5000000000000000001
+    data_uuid       = "e5f6a7b8-0005-0005-0005-000000000001"
+    del1_uuid       = "e5f6a7b8-0005-0005-0005-000000000002"
+    del2_uuid       = "e5f6a7b8-0005-0005-0005-000000000003"
+    data_mf_uuid    = "e5f6a7b8-0005-0005-0005-000000000004"
+    del_mf_uuid     = "e5f6a7b8-0005-0005-0005-000000000005"
+    snap_uuid       = "e5f6a7b8-0005-0005-0005-000000000006"
+    seq_num = 1
+
+    # Data: 5 rows
+    data_file_name = f"00000-0-{data_uuid}-00001.parquet"
+    data_table = pa.table(
+        {"fruit": ["apple", "banana", "cherry", "date", "elderberry"],
+         "count": [1, 2, 3, 4, 5]},
+        schema=make_data_arrow_schema(),
+    )
+    data_path = base / "data" / data_file_name
+    data_size = write_parquet(data_path, data_table)
+    data_rel  = f"{rel_base}/data/{data_file_name}"
+
+    # Delete file 1: banana/2
+    del1_name = f"delete-eq-1-{del1_uuid}-00001.parquet"
+    del1_table = pa.table({"fruit": ["banana"], "count": [2]},
+                          schema=make_equality_delete_arrow_schema())
+    del1_path = base / "data" / del1_name
+    del1_size = write_parquet(del1_path, del1_table)
+    del1_rel  = f"{rel_base}/data/{del1_name}"
+
+    # Delete file 2: date/4
+    del2_name = f"delete-eq-2-{del2_uuid}-00001.parquet"
+    del2_table = pa.table({"fruit": ["date"], "count": [4]},
+                          schema=make_equality_delete_arrow_schema())
+    del2_path = base / "data" / del2_name
+    del2_size = write_parquet(del2_path, del2_table)
+    del2_rel  = f"{rel_base}/data/{del2_name}"
+
+    def eq_entry(fp, rc, fs):
+        e = make_data_file_entry(2, fp, rc, fs)
+        e["equality_ids"] = [1, 2]
+        return e
+
+    data_mf_path = base / "metadata" / f"{data_mf_uuid}-m0.avro"
+    data_mf_rel  = f"{rel_base}/metadata/{data_mf_uuid}-m0.avro"
+    data_mf_size = write_avro(data_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, make_data_file_entry(0, data_rel, 5, data_size))])
+
+    # Both delete files in one delete manifest
+    del_mf_path = base / "metadata" / f"{del_mf_uuid}-m1.avro"
+    del_mf_rel  = f"{rel_base}/metadata/{del_mf_uuid}-m1.avro"
+    del_mf_size = write_avro(del_mf_path, make_manifest_schema(seq_num, snap_id), [
+        make_manifest_entry(snap_id, seq_num, eq_entry(del1_rel, 1, del1_size)),
+        make_manifest_entry(snap_id, seq_num, eq_entry(del2_rel, 1, del2_size)),
+    ])
+
+    snap_name = f"snap-{snap_id}-1-{snap_uuid}.avro"
+    write_avro(base / "metadata" / snap_name, MANIFEST_LIST_SCHEMA, [
+        {"manifest_path": data_mf_rel, "manifest_length": data_mf_size,
+         "partition_spec_id": 0, "content": 0, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 5, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+        {"manifest_path": del_mf_rel, "manifest_length": del_mf_size,
+         "partition_spec_id": 0, "content": 2, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 2, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 2, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+    ])
+    write_metadata_json(base / "metadata" / "v1.metadata.json", rel_base, snap_id,
+                        f"{rel_base}/metadata/{snap_name}")
+    with open(base / "metadata" / "version-hint.text", "w") as f:
+        f.write("1")
+    print(f"  {rel_base}: 5 rows, 2 delete files (banana/2, date/4) -> apple/1, cherry/3, elderberry/5")
+
+
+# ---------------------------------------------------------------------------
+# Generate iceberg_v2_eq_all_deleted  (equality deletes remove every row)
+# ---------------------------------------------------------------------------
+
+def gen_v2_eq_all_deleted(base: Path, rel_base: str):
+    print(f"Generating {rel_base} ...")
+    snap_id       = 6000000000000000001
+    data_uuid     = "f6a7b8c9-0006-0006-0006-000000000001"
+    del_uuid      = "f6a7b8c9-0006-0006-0006-000000000002"
+    data_mf_uuid  = "f6a7b8c9-0006-0006-0006-000000000003"
+    del_mf_uuid   = "f6a7b8c9-0006-0006-0006-000000000004"
+    snap_uuid     = "f6a7b8c9-0006-0006-0006-000000000005"
+    seq_num = 1
+
+    # Data: 3 rows
+    data_file_name = f"00000-0-{data_uuid}-00001.parquet"
+    data_table = pa.table(
+        {"fruit": ["apple", "banana", "cherry"], "count": [1, 2, 3]},
+        schema=make_data_arrow_schema(),
+    )
+    data_path = base / "data" / data_file_name
+    data_size = write_parquet(data_path, data_table)
+    data_rel  = f"{rel_base}/data/{data_file_name}"
+
+    # Delete all 3 rows
+    del_file_name = f"delete-eq-{del_uuid}-00001.parquet"
+    del_table = pa.table(
+        {"fruit": ["apple", "banana", "cherry"], "count": [1, 2, 3]},
+        schema=make_equality_delete_arrow_schema(),
+    )
+    del_path = base / "data" / del_file_name
+    del_size = write_parquet(del_path, del_table)
+    del_rel  = f"{rel_base}/data/{del_file_name}"
+
+    def eq_entry(fp, rc, fs):
+        e = make_data_file_entry(2, fp, rc, fs)
+        e["equality_ids"] = [1, 2]
+        return e
+
+    data_mf_path = base / "metadata" / f"{data_mf_uuid}-m0.avro"
+    data_mf_rel  = f"{rel_base}/metadata/{data_mf_uuid}-m0.avro"
+    data_mf_size = write_avro(data_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, make_data_file_entry(0, data_rel, 3, data_size))])
+
+    del_mf_path = base / "metadata" / f"{del_mf_uuid}-m1.avro"
+    del_mf_rel  = f"{rel_base}/metadata/{del_mf_uuid}-m1.avro"
+    del_mf_size = write_avro(del_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, eq_entry(del_rel, 3, del_size))])
+
+    snap_name = f"snap-{snap_id}-1-{snap_uuid}.avro"
+    write_avro(base / "metadata" / snap_name, MANIFEST_LIST_SCHEMA, [
+        {"manifest_path": data_mf_rel, "manifest_length": data_mf_size,
+         "partition_spec_id": 0, "content": 0, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 3, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+        {"manifest_path": del_mf_rel, "manifest_length": del_mf_size,
+         "partition_spec_id": 0, "content": 2, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 3, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+    ])
+    write_metadata_json(base / "metadata" / "v1.metadata.json", rel_base, snap_id,
+                        f"{rel_base}/metadata/{snap_name}")
+    with open(base / "metadata" / "version-hint.text", "w") as f:
+        f.write("1")
+    print(f"  {rel_base}: 3 rows, all deleted -> 0 rows")
+
+
+# ---------------------------------------------------------------------------
+# Generate iceberg_v2_eq_pos_combined  (equality + positional deletes together)
+# ---------------------------------------------------------------------------
+
+def gen_v2_eq_pos_combined(base: Path, rel_base: str):
+    print(f"Generating {rel_base} ...")
+    snap_id        = 7000000000000000001
+    data_uuid      = "a7b8c9d0-0007-0007-0007-000000000001"
+    pos_del_uuid   = "a7b8c9d0-0007-0007-0007-000000000002"
+    eq_del_uuid    = "a7b8c9d0-0007-0007-0007-000000000003"
+    data_mf_uuid   = "a7b8c9d0-0007-0007-0007-000000000004"
+    pos_mf_uuid    = "a7b8c9d0-0007-0007-0007-000000000005"
+    eq_mf_uuid     = "a7b8c9d0-0007-0007-0007-000000000006"
+    snap_uuid      = "a7b8c9d0-0007-0007-0007-000000000007"
+    seq_num = 1
+
+    # Data: 5 rows
+    data_file_name = f"00000-0-{data_uuid}-00001.parquet"
+    data_table = pa.table(
+        {"fruit": ["apple", "banana", "cherry", "date", "elderberry"],
+         "count": [1, 2, 3, 4, 5]},
+        schema=make_data_arrow_schema(),
+    )
+    data_path = base / "data" / data_file_name
+    data_size = write_parquet(data_path, data_table)
+    data_rel  = f"{rel_base}/data/{data_file_name}"
+
+    # Positional delete: row 0 (apple/1)
+    pos_del_name = f"delete-pos-{pos_del_uuid}-00001.parquet"
+    pos_del_table = pa.table(
+        {"file_path": [data_rel], "pos": [0]},
+        schema=make_delete_arrow_schema(),
+    )
+    pos_del_path = base / "data" / pos_del_name
+    pos_del_size = write_parquet(pos_del_path, pos_del_table)
+    pos_del_rel  = f"{rel_base}/data/{pos_del_name}"
+
+    # Equality delete: banana/2
+    eq_del_name = f"delete-eq-{eq_del_uuid}-00001.parquet"
+    eq_del_table = pa.table(
+        {"fruit": ["banana"], "count": [2]},
+        schema=make_equality_delete_arrow_schema(),
+    )
+    eq_del_path = base / "data" / eq_del_name
+    eq_del_size = write_parquet(eq_del_path, eq_del_table)
+    eq_del_rel  = f"{rel_base}/data/{eq_del_name}"
+
+    def eq_entry(fp, rc, fs):
+        e = make_data_file_entry(2, fp, rc, fs)
+        e["equality_ids"] = [1, 2]
+        return e
+
+    data_mf_path = base / "metadata" / f"{data_mf_uuid}-m0.avro"
+    data_mf_rel  = f"{rel_base}/metadata/{data_mf_uuid}-m0.avro"
+    data_mf_size = write_avro(data_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, make_data_file_entry(0, data_rel, 5, data_size))])
+
+    pos_mf_path = base / "metadata" / f"{pos_mf_uuid}-m1.avro"
+    pos_mf_rel  = f"{rel_base}/metadata/{pos_mf_uuid}-m1.avro"
+    pos_mf_size = write_avro(pos_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, make_data_file_entry(1, pos_del_rel, 1, pos_del_size))])
+
+    eq_mf_path = base / "metadata" / f"{eq_mf_uuid}-m2.avro"
+    eq_mf_rel  = f"{rel_base}/metadata/{eq_mf_uuid}-m2.avro"
+    eq_mf_size = write_avro(eq_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, eq_entry(eq_del_rel, 1, eq_del_size))])
+
+    snap_name = f"snap-{snap_id}-1-{snap_uuid}.avro"
+    write_avro(base / "metadata" / snap_name, MANIFEST_LIST_SCHEMA, [
+        {"manifest_path": data_mf_rel, "manifest_length": data_mf_size,
+         "partition_spec_id": 0, "content": 0, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 5, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+        {"manifest_path": pos_mf_rel, "manifest_length": pos_mf_size,
+         "partition_spec_id": 0, "content": 1, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 1, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+        {"manifest_path": eq_mf_rel, "manifest_length": eq_mf_size,
+         "partition_spec_id": 0, "content": 2, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 1, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+    ])
+    write_metadata_json(base / "metadata" / "v1.metadata.json", rel_base, snap_id,
+                        f"{rel_base}/metadata/{snap_name}")
+    with open(base / "metadata" / "version-hint.text", "w") as f:
+        f.write("1")
+    print(f"  {rel_base}: 5 rows, pos-del row0 + eq-del banana/2 -> cherry/3, date/4, elderberry/5")
+
+
+# ---------------------------------------------------------------------------
+# Generate iceberg_v2_eq_multi_data_file  (two data files, one delete file)
+# ---------------------------------------------------------------------------
+
+def gen_v2_eq_multi_data_file(base: Path, rel_base: str):
+    print(f"Generating {rel_base} ...")
+    snap_id       = 8000000000000000001
+    data1_uuid    = "b8c9d0e1-0008-0008-0008-000000000001"
+    data2_uuid    = "b8c9d0e1-0008-0008-0008-000000000002"
+    del_uuid      = "b8c9d0e1-0008-0008-0008-000000000003"
+    data_mf_uuid  = "b8c9d0e1-0008-0008-0008-000000000004"
+    del_mf_uuid   = "b8c9d0e1-0008-0008-0008-000000000005"
+    snap_uuid     = "b8c9d0e1-0008-0008-0008-000000000006"
+    seq_num = 1
+
+    # Data file 1: apple/1, banana/2, cherry/3
+    data1_name = f"00000-0-{data1_uuid}-00001.parquet"
+    data1_table = pa.table(
+        {"fruit": ["apple", "banana", "cherry"], "count": [1, 2, 3]},
+        schema=make_data_arrow_schema(),
+    )
+    data1_path = base / "data" / data1_name
+    data1_size = write_parquet(data1_path, data1_table)
+    data1_rel  = f"{rel_base}/data/{data1_name}"
+
+    # Data file 2: date/4, elderberry/5, fig/6
+    data2_name = f"00001-0-{data2_uuid}-00001.parquet"
+    data2_table = pa.table(
+        {"fruit": ["date", "elderberry", "fig"], "count": [4, 5, 6]},
+        schema=make_data_arrow_schema(),
+    )
+    data2_path = base / "data" / data2_name
+    data2_size = write_parquet(data2_path, data2_table)
+    data2_rel  = f"{rel_base}/data/{data2_name}"
+
+    # Equality delete: banana/2 (from file1) and elderberry/5 (from file2)
+    del_file_name = f"delete-eq-{del_uuid}-00001.parquet"
+    del_table = pa.table(
+        {"fruit": ["banana", "elderberry"], "count": [2, 5]},
+        schema=make_equality_delete_arrow_schema(),
+    )
+    del_path = base / "data" / del_file_name
+    del_size = write_parquet(del_path, del_table)
+    del_rel  = f"{rel_base}/data/{del_file_name}"
+
+    def eq_entry(fp, rc, fs):
+        e = make_data_file_entry(2, fp, rc, fs)
+        e["equality_ids"] = [1, 2]
+        return e
+
+    # Data manifest: both data files
+    data_mf_path = base / "metadata" / f"{data_mf_uuid}-m0.avro"
+    data_mf_rel  = f"{rel_base}/metadata/{data_mf_uuid}-m0.avro"
+    data_mf_size = write_avro(data_mf_path, make_manifest_schema(seq_num, snap_id), [
+        make_manifest_entry(snap_id, seq_num, make_data_file_entry(0, data1_rel, 3, data1_size)),
+        make_manifest_entry(snap_id, seq_num, make_data_file_entry(0, data2_rel, 3, data2_size)),
+    ])
+
+    del_mf_path = base / "metadata" / f"{del_mf_uuid}-m1.avro"
+    del_mf_rel  = f"{rel_base}/metadata/{del_mf_uuid}-m1.avro"
+    del_mf_size = write_avro(del_mf_path, make_manifest_schema(seq_num, snap_id),
+        [make_manifest_entry(snap_id, seq_num, eq_entry(del_rel, 2, del_size))])
+
+    snap_name = f"snap-{snap_id}-1-{snap_uuid}.avro"
+    write_avro(base / "metadata" / snap_name, MANIFEST_LIST_SCHEMA, [
+        {"manifest_path": data_mf_rel, "manifest_length": data_mf_size,
+         "partition_spec_id": 0, "content": 0, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 2, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 6, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+        {"manifest_path": del_mf_rel, "manifest_length": del_mf_size,
+         "partition_spec_id": 0, "content": 2, "sequence_number": seq_num,
+         "min_sequence_number": seq_num, "added_snapshot_id": snap_id,
+         "added_files_count": 1, "existing_files_count": 0, "deleted_files_count": 0,
+         "added_rows_count": 2, "existing_rows_count": 0, "deleted_rows_count": 0,
+         "partitions": [], "key_metadata": None},
+    ])
+    write_metadata_json(base / "metadata" / "v1.metadata.json", rel_base, snap_id,
+                        f"{rel_base}/metadata/{snap_name}")
+    with open(base / "metadata" / "version-hint.text", "w") as f:
+        f.write("1")
+    print(f"  {rel_base}: 6 rows across 2 files, eq-delete banana/2+elderberry/5 -> apple/1, cherry/3, date/4, fig/6")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -708,6 +1131,26 @@ if __name__ == "__main__":
     gen_v2_equality_delete(
         base=project_root / "substrait/data/iceberg_v2_equality_delete",
         rel_base="substrait/data/iceberg_v2_equality_delete",
+    )
+    gen_v2_eq_single_col(
+        base=project_root / "substrait/data/iceberg_v2_eq_single_col",
+        rel_base="substrait/data/iceberg_v2_eq_single_col",
+    )
+    gen_v2_eq_multi_delete_file(
+        base=project_root / "substrait/data/iceberg_v2_eq_multi_delete_file",
+        rel_base="substrait/data/iceberg_v2_eq_multi_delete_file",
+    )
+    gen_v2_eq_all_deleted(
+        base=project_root / "substrait/data/iceberg_v2_eq_all_deleted",
+        rel_base="substrait/data/iceberg_v2_eq_all_deleted",
+    )
+    gen_v2_eq_pos_combined(
+        base=project_root / "substrait/data/iceberg_v2_eq_pos_combined",
+        rel_base="substrait/data/iceberg_v2_eq_pos_combined",
+    )
+    gen_v2_eq_multi_data_file(
+        base=project_root / "substrait/data/iceberg_v2_eq_multi_data_file",
+        rel_base="substrait/data/iceberg_v2_eq_multi_data_file",
     )
 
     print("\nDone. Verify with:")
