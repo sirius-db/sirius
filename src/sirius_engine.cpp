@@ -1037,7 +1037,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                               data_repo_manager.get_repository(op_id, port_id).get(),
                               new_scheduled[i],
                               dependent_pipeline));
-          new_scheduled[i]->get_sink()->add_next_port_after_sink(std::make_pair(next_op, port_id));
+          new_scheduled[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
@@ -1055,7 +1055,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                               data_repo_manager.get_repository(op_id, port_id).get(),
                               new_scheduled[i],
                               dependent_pipeline));
-          new_scheduled[i]->get_sink()->add_next_port_after_sink(std::make_pair(next_op, port_id));
+          new_scheduled[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
         // No action needed for RESULT_COLLECTOR sinks

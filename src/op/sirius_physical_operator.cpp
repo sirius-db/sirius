@@ -213,11 +213,9 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
   if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }
 }
 
-void sirius_physical_operator::add_next_port_after_sink(
-  std::pair<sirius_physical_operator*, std::string_view> port_locator)
+void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
-  next_port_after_sink.push_back(
-    next_port_info{port_locator.first, port_locator.second});
+  next_port_after_sink.push_back(port_info);
 }
 
 std::vector<sirius_physical_operator::next_port_info>&

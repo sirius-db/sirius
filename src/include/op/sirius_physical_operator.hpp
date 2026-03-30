@@ -263,8 +263,12 @@ class sirius_physical_operator {
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
   };
 
+  /// Describes a downstream operator and the port through which data is pushed after this
+  /// operator acts as a sink.
   struct next_port_info {
+    //! The downstream operator that receives data batches from this sink
     sirius_physical_operator* next_operator;
+    //! The port name on the downstream operator to push data into
     std::string_view next_operator_port_name;
   };
 
@@ -281,8 +285,7 @@ class sirius_physical_operator {
   //! Returns true if any FULL-barrier port has src_pipeline == src
   bool has_full_barrier_from(const pipeline::sirius_pipeline* src) const;
   //! Add a next port after sink
-  void add_next_port_after_sink(
-    std::pair<sirius_physical_operator*, std::string_view> port_locator);
+  void add_next_port_after_sink(next_port_info port_info);
   //! Get the next ports after sink
   std::vector<sirius_physical_operator::next_port_info>& get_next_port_after_sink();
 
