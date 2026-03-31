@@ -66,6 +66,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
                                          size_t start_operator_index = 0)
     : _input_data(std::move(input_data)), _start_operator_index(start_operator_index)
   {
+    _bytes_to_materialize_input = get_estimated_bytes_to_materialize_input();
   }
 
   std::unique_ptr<op::operator_data> _input_data;  ///< Input data batches for the pipeline
@@ -83,7 +84,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
 
   // The peak bytes observed to materialize the input data. We need to track this so we can subtract
   // it from the peak bytes observed to compute the operators' peak bytes.
-  size_t _peak_bytes_to_materialize_input = 0;
+  size_t _bytes_to_materialize_input = 0;
 
   /**
    * @brief Get a const pointer to the reservation (non-owning).
