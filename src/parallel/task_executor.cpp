@@ -16,68 +16,66 @@
 
 #include "parallel/task_executor.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
-
 namespace sirius {
 namespace parallel {
+
+void itask_executor::schedule(std::unique_ptr<itask> task) { _task_queue.push(std::move(task)); }
 
 void itask_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
+                                                              _config.thread_name_prefix,
+                                                              _config.cpu_affinity_list,
+                                                              get_per_thread_init());
+  _task_queue.reactivate();
+  _manager_thread = std::thread([this] { manager_loop(); });
   on_start();
-  _threads.reserve(_config.num_threads);
-  for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.emplace_back(&itask_executor::worker_loop, this, i);
-  }
 }
 
 void itask_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  _bounded_pool->interrupt();
+  _task_queue.interrupt();
   on_stop();
-  for (auto& thread : _threads) {
-    if (thread.joinable()) { thread.join(); }
-  }
-  _threads.clear();
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+  _bounded_pool->wait_all();
+  _bounded_pool->stop();
+  _bounded_pool.reset();
+  on_stopped();
 }
 
-void itask_executor::schedule(std::unique_ptr<itask> task) { _task_queue->push(std::move(task)); }
-
-void itask_executor::on_start() { _task_queue->open(); }
-
-void itask_executor::on_stop() { _task_queue->close(); }
-
-void itask_executor::on_task_error(int worker_id,
-                                   std::unique_ptr<itask> task,
-                                   const std::exception& e)
+void itask_executor::wait_all()
 {
-  if (_config.retry_on_error) {
-    schedule(std::move(task));
-  } else {
-    stop();
-  }
+  if (_bounded_pool) { _bounded_pool->wait_all(); }
 }
 
-void itask_executor::worker_loop(int worker_id)
+void itask_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
+void itask_executor::drain_and_wait()
 {
-  while (true) {
-    if (!_running.load()) {
-      // Executor is stopped.
-      break;
-    }
-    auto task = _task_queue->pull();
-    if (task == nullptr) {
-      // Task queue is closed.
-      break;
-    }
-    try {
-      task->execute(cudf::get_default_stream());
-    } catch (const std::exception& e) {
-      on_task_error(worker_id, std::move(task), e);
-    }
-  }
+  // Interrupt the pool so the manager's reserve() unblocks with an invalid slot.
+  _bounded_pool->interrupt();
+
+  // Interrupt pop() so the manager loop sees a nullptr and breaks out.
+  _task_queue.interrupt();
+
+  // Join the manager thread so we know it has exited.
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+
+  // Wait for all in-flight thread-pool tasks to finish.
+  _bounded_pool->wait_all();
+
+  // Clear any remaining tasks from the queue.
+  _task_queue.drain();
+
+  // Re-enable the pool and queue so the executor is ready for the next query.
+  _bounded_pool->resume();
+  _task_queue.reactivate();
+  _manager_thread = std::thread([this] { manager_loop(); });
 }
 
 }  // namespace parallel

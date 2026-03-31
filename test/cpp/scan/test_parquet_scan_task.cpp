@@ -20,7 +20,7 @@
 #include <utils/utils.hpp>
 
 // sirius
-#include <op/scan/duckdb_scan_task_queue.hpp>
+#include <exec/config.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
@@ -33,6 +33,7 @@
 
 // cudf
 #include <cudf/logger.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 #include <rapids_logger/logger.hpp>
 
@@ -52,6 +53,33 @@
 using namespace sirius;
 using namespace sirius::scan_test_utils;
 using namespace cucascade::memory;
+
+/**
+ * Minimal concrete executor for parquet scan tests.
+ *
+ * Implements manager_loop() using the bounded_thread_pool reserve()+dispatch() pattern.
+ */
+class simple_scan_executor : public sirius::parallel::itask_executor {
+ public:
+  explicit simple_scan_executor(sirius::exec::thread_pool_config config)
+    : itask_executor(std::move(config))
+  {
+  }
+
+ protected:
+  void manager_loop() override
+  {
+    while (_running.load()) {
+      auto slot = _bounded_pool->reserve();
+      if (!slot) { break; }
+      auto task = _task_queue.pop();
+      if (!task) { break; }
+      _bounded_pool->dispatch(std::move(slot), [t = std::move(task)]() mutable {
+        t->execute(cudf::get_default_stream());
+      });
+    }
+  }
+};
 
 using table_creator_t = void (*)(duckdb::Connection&,
                                  std::string const& table_name,
@@ -286,10 +314,8 @@ static void run_parquet_scan_test(std::string const& table_name,
 
   cucascade::shared_data_repository data_repo;
 
-  sirius::parallel::task_executor_config executor_config{num_threads, false};
-  auto task_queue =
-    std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
-  sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));
+  sirius::exec::thread_pool_config executor_config{num_threads, "parquet_scan_test"};
+  simple_scan_executor executor(executor_config);
 
   auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
     executor.start();
@@ -385,10 +411,8 @@ static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
 
   cucascade::shared_data_repository data_repo;
 
-  sirius::parallel::task_executor_config executor_config{num_threads, false};
-  auto task_queue =
-    std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
-  sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));
+  sirius::exec::thread_pool_config executor_config{num_threads, "parquet_scan_test"};
+  simple_scan_executor executor(executor_config);
 
   auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
     executor.start();
