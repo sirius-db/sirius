@@ -94,14 +94,15 @@ void downgrade_executor::manager_loop()
       SIRIUS_LOG_INFO("[downgrade] task queue interrupted, stopping manager loop");
       break;
     }
-    slot.dispatch([task = std::move(task), stream = rmm::cuda_stream_view{_stream}]() mutable {
-      try {
-        task->execute(stream);
-      } catch (const std::exception& e) {
-        // Downgrade failures are non-fatal — log and continue.
-        SIRIUS_LOG_ERROR("[downgrade] task execution failed: {}", e.what());
-      }
-    });
+    _bounded_pool->dispatch(
+      std::move(slot), [task = std::move(task), stream = rmm::cuda_stream_view{_stream}]() mutable {
+        try {
+          task->execute(stream);
+        } catch (const std::exception& e) {
+          // Downgrade failures are non-fatal — log and continue.
+          SIRIUS_LOG_ERROR("[downgrade] task execution failed: {}", e.what());
+        }
+      });
   }
 }
 

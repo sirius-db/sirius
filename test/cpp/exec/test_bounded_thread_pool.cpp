@@ -43,7 +43,7 @@ TEST_CASE("bounded_thread_pool respects capacity — never exceeds N concurrent 
   // Schedule more tasks than capacity; each holds briefly so overlap is observable.
   for (int i = 0; i < 12; ++i) {
     auto s = pool.reserve();
-    s.dispatch([&active, &peak, &mu] {
+    pool.dispatch(std::move(s), [&active, &peak, &mu] {
       int cur = active.fetch_add(1) + 1;
       {
         std::lock_guard lock(mu);
@@ -59,7 +59,7 @@ TEST_CASE("bounded_thread_pool respects capacity — never exceeds N concurrent 
 }
 
 // =============================================================================
-// Two-phase reserve() + slot.dispatch()
+// reserve() + dispatch()
 // =============================================================================
 
 TEST_CASE("bounded_thread_pool reserve and dispatch executes task", "[bounded_thread_pool]")
@@ -70,8 +70,8 @@ TEST_CASE("bounded_thread_pool reserve and dispatch executes task", "[bounded_th
   auto slot = pool.reserve();
   REQUIRE(slot.is_valid());
 
-  slot.dispatch([&ran] { ran = true; });
-  REQUIRE_FALSE(slot.is_valid());  // consumed
+  pool.dispatch(std::move(slot), [&ran] { ran = true; });
+  REQUIRE_FALSE(slot.is_valid());  // consumed by move
 
   pool.wait_all();
   REQUIRE(ran.load());
@@ -85,7 +85,7 @@ TEST_CASE("bounded_thread_pool reserve blocks when at capacity", "[bounded_threa
   std::atomic<bool> gate{false};
   auto slot = pool.reserve();
   REQUIRE(slot.is_valid());
-  slot.dispatch([&gate] {
+  pool.dispatch(std::move(slot), [&gate] {
     while (!gate.load()) {
       std::this_thread::yield();
     }
@@ -146,7 +146,7 @@ TEST_CASE("bounded_thread_pool interrupt causes reserve to return invalid slot",
 
   std::atomic<bool> gate{false};
   auto slot = pool.reserve();
-  slot.dispatch([&gate] {
+  pool.dispatch(std::move(slot), [&gate] {
     while (!gate.load()) {
       std::this_thread::yield();
     }
@@ -181,7 +181,7 @@ TEST_CASE("bounded_thread_pool interrupt wakes multiple blocked callers", "[boun
   std::atomic<bool> gate{false};
   {
     auto s = pool.reserve();
-    s.dispatch([&gate] {
+    pool.dispatch(std::move(s), [&gate] {
       while (!gate.load()) {
         std::this_thread::yield();
       }
@@ -229,7 +229,7 @@ TEST_CASE("bounded_thread_pool resume re-enables reserve after interrupt", "[bou
   std::atomic<bool> ran{false};
   auto s = pool.reserve();
   REQUIRE(s.is_valid());
-  s.dispatch([&ran] { ran = true; });
+  pool.dispatch(std::move(s), [&ran] { ran = true; });
   pool.wait_all();
   REQUIRE(ran.load());
 }
@@ -248,7 +248,7 @@ TEST_CASE("bounded_thread_pool wait_all returns only after all tasks complete",
 
   for (int i = 0; i < num_tasks; ++i) {
     auto s = pool.reserve();
-    s.dispatch([&completed] {
+    pool.dispatch(std::move(s), [&completed] {
       std::this_thread::sleep_for(10ms);
       completed.fetch_add(1);
     });
@@ -276,7 +276,7 @@ TEST_CASE("bounded_thread_pool exception in task does not crash the pool", "[bou
   // Task that throws — pool should catch it and remain functional.
   {
     auto s = pool.reserve();
-    s.dispatch([] { throw std::runtime_error("intentional"); });
+    pool.dispatch(std::move(s), [] { throw std::runtime_error("intentional"); });
   }
   pool.wait_all();
 
@@ -284,7 +284,7 @@ TEST_CASE("bounded_thread_pool exception in task does not crash the pool", "[bou
   std::atomic<bool> ran{false};
   auto s = pool.reserve();
   REQUIRE(s.is_valid());
-  s.dispatch([&ran] { ran = true; });
+  pool.dispatch(std::move(s), [&ran] { ran = true; });
   pool.wait_all();
   REQUIRE(ran.load());
 }
@@ -307,7 +307,7 @@ TEST_CASE("bounded_thread_pool destructor stops cleanly with in-flight tasks",
   {
     bounded_thread_pool pool(2, "test");
     auto s = pool.reserve();
-    s.dispatch([&completed] {
+    pool.dispatch(std::move(s), [&completed] {
       std::this_thread::sleep_for(5ms);
       completed.fetch_add(1);
     });
@@ -334,7 +334,7 @@ TEST_CASE("bounded_thread_pool concurrent producers all tasks execute", "[bounde
     producers.emplace_back([&pool, &counter] {
       for (int j = 0; j < tasks_each; ++j) {
         auto s = pool.reserve();
-        s.dispatch([&counter] { counter.fetch_add(1); });
+        pool.dispatch(std::move(s), [&counter] { counter.fetch_add(1); });
       }
     });
   }

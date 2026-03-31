@@ -222,7 +222,7 @@ void task_creator::manager_loop()
     if (node == nullptr) { continue; }
 
     // Dispatch the task creation work to the pool
-    slot.dispatch([this, node]() mutable {
+    _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
       try {
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();

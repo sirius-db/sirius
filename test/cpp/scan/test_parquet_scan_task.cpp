@@ -74,7 +74,9 @@ class simple_scan_executor : public sirius::parallel::itask_executor {
       if (!slot) { break; }
       auto task = _task_queue.pop();
       if (!task) { break; }
-      slot.dispatch([t = std::move(task)]() mutable { t->execute(cudf::get_default_stream()); });
+      _bounded_pool->dispatch(std::move(slot), [t = std::move(task)]() mutable {
+        t->execute(cudf::get_default_stream());
+      });
     }
   }
 };

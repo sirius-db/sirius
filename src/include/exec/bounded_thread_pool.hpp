@@ -35,20 +35,15 @@ namespace sirius::exec {
  * @brief A thread pool with bounded concurrency.
  *
  * Merges a fixed-size thread pool with a counting semaphore, eliminating the need for
- * a separate kiosk object. Provides two scheduling modes:
+ * a separate kiosk object. Usage:
  *
- *  - One-shot:  schedule(fn) — atomically reserves a slot and dispatches. Blocks when
- *               at capacity. Returns false if interrupted.
- *
- *  - Two-phase: reserve() returns a slot (blocks when at capacity, returns an invalid
- *               slot if interrupted). The caller then calls slot.dispatch(fn) after any
- *               inter-step coordination (e.g. signalling a task_request before waiting
- *               for the task to appear on a queue). Dropping the slot without calling
- *               dispatch() releases it back to the pool immediately.
+ *  1. reserve() — blocks when at capacity, returns a slot (invalid if interrupted).
+ *  2. dispatch(slot&&, fn) — consumes the slot and enqueues fn on a worker thread.
+ *     Dropping the slot without calling dispatch() releases it back immediately.
  *
  * Lifecycle:
- *  - interrupt(): wake all blocked reserve()/schedule() calls without disturbing
- *                 in-flight work. Paired with resume() for drain-and-restart patterns.
+ *  - interrupt(): wake all blocked reserve() calls without disturbing in-flight work.
+ *                 Paired with resume() for drain-and-restart patterns.
  *  - resume():    re-enable after interrupt().
  *  - wait_all():  block until all in-flight tasks complete.
  *  - stop():      interrupt + join all worker threads (called automatically by destructor).
@@ -58,9 +53,9 @@ class bounded_thread_pool {
   /**
    * @brief RAII handle representing a reserved execution slot.
    *
-   * Obtained via bounded_thread_pool::reserve(). Either dispatch() is called to submit
-   * work using this slot, or the slot goes out of scope without a dispatch (which
-   * releases the slot back to the pool immediately without running any work).
+   * Obtained via bounded_thread_pool::reserve(). Either bounded_thread_pool::dispatch()
+   * is called with this slot to submit work, or the slot goes out of scope without a
+   * dispatch (which releases the slot back to the pool immediately without running work).
    */
   class slot {
    public:
@@ -85,18 +80,6 @@ class bounded_thread_pool {
 
     [[nodiscard]] bool is_valid() const noexcept { return pool_ != nullptr; }
     explicit operator bool() const noexcept { return is_valid(); }
-
-    /**
-     * @brief Dispatch a function using this slot.
-     *
-     * The slot is consumed (becomes invalid). The function runs on a worker thread
-     * and the slot is released automatically when it completes.
-     */
-    void dispatch(absl::AnyInvocable<void()> fn)
-    {
-      auto* p = std::exchange(pool_, nullptr);
-      if (p) { p->dispatch_slot(std::move(fn)); }
-    }
 
    private:
     void release()
@@ -166,7 +149,7 @@ class bounded_thread_pool {
   }
 
   /**
-   * @brief Interrupt all blocked reserve()/schedule() calls.
+   * @brief Interrupt all blocked reserve() calls.
    *
    * In-flight tasks continue to completion. Call resume() to re-enable.
    */
@@ -213,12 +196,18 @@ class bounded_thread_pool {
     }
   }
 
-  // Called by slot::dispatch() — pushes fn to the worker queue with automatic slot release.
-  void dispatch_slot(absl::AnyInvocable<void()> fn)
+  /**
+   * @brief Dispatch a function using the given slot.
+   *
+   * Consumes the slot (it becomes invalid). The function runs on a worker thread;
+   * the slot is released automatically when the task completes.
+   */
+  void dispatch(slot&& s, absl::AnyInvocable<void()> fn)
   {
+    if (not s) { return; }
     {
       std::lock_guard lock(mu_);
-      work_queue_.push([this, fn = std::move(fn)]() mutable noexcept {
+      work_queue_.push([s = std::move(s), fn = std::move(fn)]() mutable noexcept {
         try {
           fn();
         } catch (const std::exception& e) {
@@ -226,13 +215,18 @@ class bounded_thread_pool {
         } catch (...) {
           SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
         }
-        release_slot();
+        // Destroy before slot is released upon lambda exit.
+        fn = nullptr;
+        // When slot, s, goes out of scope, release_slot is automatically
+        // invoked, clearing the path for another task to pick up that slot.
       });
     }
     cv_work_.notify_one();
   }
 
-  // Called by slot destructor (dropped without dispatch) or after task completion.
+ private:
+  // Called exclusively by the slot destructor — covers both the drop-without-dispatch
+  // and post-task-completion cases.
   void release_slot()
   {
     {
@@ -243,7 +237,6 @@ class bounded_thread_pool {
     cv_idle_.notify_all();
   }
 
- private:
   void work_loop()
   {
     while (true) {
@@ -255,12 +248,13 @@ class bounded_thread_pool {
         fn = std::move(work_queue_.front());
         work_queue_.pop();
       }
+      if (fn == nullptr) { break; }
       fn();
     }
   }
 
   std::mutex mu_;
-  std::condition_variable cv_capacity_;  // reserve()/schedule() wait here when at capacity
+  std::condition_variable cv_capacity_;  // reserve() waits here when at capacity
   std::condition_variable cv_idle_;      // wait_all() waits here
   std::condition_variable cv_work_;      // worker threads wait here for work
 

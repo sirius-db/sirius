@@ -254,28 +254,30 @@ void duckdb_scan_executor::manager_loop()
 
     auto exc_stream = _stream_pool->acquire_stream(
       cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-    slot.dispatch([this,
-                   stream    = std::move(exc_stream),
-                   t         = std::move(task),
-                   scan_task = std::move(scan_task)]() mutable {
-      try {
-        auto consumers = scan_task->get_output_consumers();
-        {
-          auto output_data = get_scan_output(scan_task, stream);
-          stream->synchronize();
-          scan_task->publish_output(*output_data, stream);
-        }
-
-        t.reset();
-        if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
-          for (auto* consumer : consumers) {
-            _task_creator->schedule(consumer);
+    _bounded_pool->dispatch(
+      std::move(slot),
+      [this,
+       stream    = std::move(exc_stream),
+       t         = std::move(task),
+       scan_task = std::move(scan_task)]() mutable {
+        try {
+          auto consumers = scan_task->get_output_consumers();
+          {
+            auto output_data = get_scan_output(scan_task, stream);
+            stream->synchronize();
+            scan_task->publish_output(*output_data, stream);
           }
+
+          t.reset();
+          if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
+            for (auto* consumer : consumers) {
+              _task_creator->schedule(consumer);
+            }
+          }
+        } catch (...) {
+          if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         }
-      } catch (...) {
-        if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
-      }
-    });
+      });
   }
 }
 
