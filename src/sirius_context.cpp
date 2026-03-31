@@ -89,6 +89,9 @@ void SiriusContext::QueryBegin(ClientContext& context)
   // Clear any stale captured plan from a previous query.
   captured_logical_plan_.reset();
 
+  // Suppress all state mutations for internal connections (e.g. iceberg metadata lookups).
+  if (_internal_query_depth.load(std::memory_order_relaxed) > 0) { return; }
+
   // Reset operator ID counter so each query starts from 0
   sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
@@ -106,6 +109,9 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd()
 {
+  // Suppress state mutations triggered by internal connections (e.g. iceberg metadata lookups).
+  if (_internal_query_depth.load(std::memory_order_relaxed) > 0) { return; }
+
   spdlog::info("QueryEnd");
   captured_logical_plan_.reset();
   query_.reset();

@@ -85,6 +85,41 @@ class SiriusContext : public ClientContextState {
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::sirius_config& config);
 
+  /**
+   * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
+   *
+   * Some code paths (e.g. iceberg metadata lookup) must open a second DuckDB
+   * Connection to the same database.  Because OnConnectionOpened registers the
+   * SAME SiriusContext on every connection, the new connection's query lifecycle
+   * callbacks would fire QueryBegin (resetting next_operator_id and resetting
+   * task_creator state) and QueryEnd (clearing all data repositories), corrupting
+   * the outer query's state.
+   *
+   * Use the RAII InternalQueryGuard to bracket any code that opens an internal
+   * connection.  The depth counter allows nesting.
+   */
+  struct InternalQueryGuard {
+    explicit InternalQueryGuard(SiriusContext& ctx) noexcept : ctx_(ctx)
+    {
+      ctx_.enter_internal_query();
+    }
+    ~InternalQueryGuard() noexcept { ctx_.exit_internal_query(); }
+    InternalQueryGuard(const InternalQueryGuard&)            = delete;
+    InternalQueryGuard& operator=(const InternalQueryGuard&) = delete;
+
+   private:
+    SiriusContext& ctx_;
+  };
+
+  void enter_internal_query() noexcept
+  {
+    _internal_query_depth.fetch_add(1, std::memory_order_relaxed);
+  }
+  void exit_internal_query() noexcept
+  {
+    _internal_query_depth.fetch_sub(1, std::memory_order_relaxed);
+  }
+
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
@@ -147,6 +182,7 @@ class SiriusContext : public ClientContextState {
   void throw_if_not_initialized() const;
 
   mutable std::mutex mutex_;
+  std::atomic<int> _internal_query_depth{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
