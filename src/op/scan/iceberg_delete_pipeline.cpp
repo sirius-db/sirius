@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-#include <op/scan/iceberg_delete_filter.hpp>
-
 #include <cudf/table/table.hpp>
 
-#include <numeric>
+#include <op/scan/iceberg_delete_filter.hpp>
 
 namespace sirius::op::scan {
 
@@ -32,27 +30,25 @@ post_convert_fn_t iceberg_delete_pipeline::build_hook() const
   auto filters = _filters;  // shared_ptr copies — safe to capture
   auto extra   = _extra_column_count;
 
-  return [filters = std::move(filters), extra](std::unique_ptr<cudf::table> tbl,
-                                               std::string const& path,
-                                               int64_t first_row,
-                                               rmm::cuda_stream_view stream)
-           -> std::unique_ptr<cudf::table> {
+  return [filters = std::move(filters), extra](
+           std::unique_ptr<cudf::table> tbl,
+           std::string const& path,
+           int64_t first_row,
+           rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
     // Apply each filter in order.
     for (auto const& f : filters) {
       tbl = f->apply(std::move(tbl), path, first_row, stream);
     }
 
-    // Strip force-projected extra columns (appended at the end for equality keys).
+    // Strip force-projected extra columns (equality keys appended at the end).
     if (extra > 0) {
       auto const total = tbl->num_columns();
       auto const keep  = static_cast<cudf::size_type>(total) - static_cast<cudf::size_type>(extra);
       if (keep > 0 && keep < total) {
-        std::vector<cudf::size_type> indices(static_cast<size_t>(keep));
-        std::iota(indices.begin(), indices.end(), cudf::size_type{0});
-        // Release columns from the original table, take the subset, build a new table.
-        // This avoids a deep copy — select() on a table_view just creates views,
-        // and the new cudf::table deep-copies only the selected columns.
-        tbl = std::make_unique<cudf::table>(tbl->select(indices), stream);
+        // Move columns out and truncate — no GPU memory copy.
+        auto cols = tbl->release();
+        cols.resize(static_cast<size_t>(keep));
+        tbl = std::make_unique<cudf::table>(std::move(cols));
       }
     }
 

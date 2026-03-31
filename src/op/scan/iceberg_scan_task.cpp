@@ -14,15 +14,6 @@
  * limitations under the License.
  */
 
-// sirius
-#include <op/scan/iceberg_scan_task.hpp>
-#include <op/scan/iceberg_delete_filter.hpp>
-#include <log/logging.hpp>
-
-// duckdb
-#include <duckdb/common/multi_file/multi_file_states.hpp>
-
-// cudf
 #include <cudf/concatenate.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/join/distinct_hash_join.hpp>
@@ -31,10 +22,15 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-// cuda
+#include <rmm/detail/error.hpp>
+
 #include <cuda_runtime_api.h>
 
-// standard library
+#include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <log/logging.hpp>
+#include <op/scan/iceberg_delete_filter.hpp>
+#include <op/scan/iceberg_scan_task.hpp>
+
 #include <algorithm>
 #include <memory>
 #include <numeric>
@@ -45,10 +41,6 @@
 
 namespace sirius::op::scan {
 
-//===----------------------------------------------------------------------===//
-// Helper: read positional-delete parquet file
-//===----------------------------------------------------------------------===//
-
 namespace {
 
 /**
@@ -56,9 +48,8 @@ namespace {
  *
  * The file must have schema: { file_path STRING, pos BIGINT }.
  */
-void read_positional_delete_file(
-  std::string const& delete_file_path,
-  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
+void read_positional_delete_file(std::string const& delete_file_path,
+                                 std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
   auto stream = cudf::get_default_stream();
 
@@ -78,20 +69,20 @@ void read_positional_delete_file(
 
   auto const& pos_col = result.tbl->get_column(1);
   if (pos_col.type().id() != cudf::type_id::INT64) {
-    throw std::runtime_error(
-      "[iceberg] positional-delete file 'pos' column is not INT64: " + delete_file_path);
+    throw std::runtime_error("[iceberg] positional-delete file 'pos' column is not INT64: " +
+                             delete_file_path);
   }
 
   std::vector<int64_t> host_pos(static_cast<size_t>(num_rows));
-  cudaMemcpy(host_pos.data(),
-             pos_col.view().data<int64_t>(),
-             static_cast<size_t>(num_rows) * sizeof(int64_t),
-             cudaMemcpyDeviceToHost);
+  RMM_CUDA_TRY(cudaMemcpy(host_pos.data(),
+                          pos_col.view().data<int64_t>(),
+                          static_cast<size_t>(num_rows) * sizeof(int64_t),
+                          cudaMemcpyDeviceToHost));
 
   auto const& fp_col_view = result.tbl->get_column(0).view();
   if (fp_col_view.type().id() != cudf::type_id::STRING) {
-    throw std::runtime_error(
-      "[iceberg] positional-delete file 'file_path' column is not STRING: " + delete_file_path);
+    throw std::runtime_error("[iceberg] positional-delete file 'file_path' column is not STRING: " +
+                             delete_file_path);
   }
 
   cudf::strings_column_view sv(fp_col_view);
@@ -99,15 +90,16 @@ void read_positional_delete_file(
   auto const chars_bytes = sv.chars_size(stream);
   std::vector<char> host_chars(chars_bytes);
   if (chars_bytes > 0) {
-    cudaMemcpy(host_chars.data(), sv.chars_begin(stream), chars_bytes, cudaMemcpyDeviceToHost);
+    RMM_CUDA_TRY(
+      cudaMemcpy(host_chars.data(), sv.chars_begin(stream), chars_bytes, cudaMemcpyDeviceToHost));
   }
 
   auto const& offsets_col = sv.offsets();
   std::vector<int32_t> host_offsets(static_cast<size_t>(num_rows) + 1);
-  cudaMemcpy(host_offsets.data(),
-             offsets_col.data<int32_t>(),
-             (static_cast<size_t>(num_rows) + 1) * sizeof(int32_t),
-             cudaMemcpyDeviceToHost);
+  RMM_CUDA_TRY(cudaMemcpy(host_offsets.data(),
+                          offsets_col.data<int32_t>(),
+                          (static_cast<size_t>(num_rows) + 1) * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost));
 
   for (cudf::size_type i = 0; i < num_rows; ++i) {
     auto const start = host_offsets[i];
@@ -120,8 +112,8 @@ void read_positional_delete_file(
 /**
  * @brief Read an equality-delete parquet file and return (table, column_names).
  */
-std::pair<std::unique_ptr<cudf::table>, std::vector<std::string>>
-read_equality_delete_file(std::string const& delete_file_path)
+std::pair<std::unique_ptr<cudf::table>, std::vector<std::string>> read_equality_delete_file(
+  std::string const& delete_file_path)
 {
   auto stream = cudf::get_default_stream();
   auto opts =
@@ -129,8 +121,7 @@ read_equality_delete_file(std::string const& delete_file_path)
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl) {
-    throw std::runtime_error(
-      "[iceberg] Failed to read equality-delete file: " + delete_file_path);
+    throw std::runtime_error("[iceberg] Failed to read equality-delete file: " + delete_file_path);
   }
 
   std::vector<std::string> col_names;
@@ -141,7 +132,9 @@ read_equality_delete_file(std::string const& delete_file_path)
 
   stream.synchronize();
   SIRIUS_LOG_INFO("[iceberg] read equality-delete: path={} rows={} cols={}",
-                  delete_file_path, result.tbl->num_rows(), result.tbl->num_columns());
+                  delete_file_path,
+                  result.tbl->num_rows(),
+                  result.tbl->num_columns());
   return {std::move(result.tbl), std::move(col_names)};
 }
 
@@ -151,8 +144,8 @@ read_equality_delete_file(std::string const& delete_file_path)
 // iceberg_scan_task_global_state — prepare
 //===----------------------------------------------------------------------===//
 
-iceberg_scan_task_global_state::init_data
-iceberg_scan_task_global_state::prepare(sirius_physical_iceberg_scan* scan_op)
+iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepare(
+  sirius_physical_iceberg_scan* scan_op)
 {
   auto& bind_data = scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
@@ -179,10 +172,8 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
   size_t approximate_batch_size)
-  : iceberg_scan_task_global_state(std::move(pipeline),
-                                   scan_op,
-                                   prepare(scan_op),
-                                   approximate_batch_size)
+  : iceberg_scan_task_global_state(
+      std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size)
 {
 }
 
@@ -229,11 +220,9 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
       std::sort(positions.begin(), positions.end());
     }
 
-    SIRIUS_LOG_INFO("[iceberg] Loaded positional deletes for {} data file(s).",
-                    pos_deletes.size());
+    SIRIUS_LOG_INFO("[iceberg] Loaded positional deletes for {} data file(s).", pos_deletes.size());
 
-    _delete_pipeline.add_filter(
-      std::make_shared<positional_delete_filter>(std::move(pos_deletes)));
+    _delete_pipeline.add_filter(std::make_shared<positional_delete_filter>(std::move(pos_deletes)));
   }
 
   // -----------------------------------------------------------------------
@@ -268,11 +257,9 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
     } else {
       auto stream = cudf::get_default_stream();
 
-      // Concatenate and deduplicate.
-      auto all_delete_rows =
-        (parts_views.size() == 1)
-          ? std::make_unique<cudf::table>(parts_views[0], stream)
-          : cudf::concatenate(parts_views, stream);
+      auto all_delete_rows = (parts_views.size() == 1)
+                               ? std::make_unique<cudf::table>(parts_views[0], stream)
+                               : cudf::concatenate(parts_views, stream);
 
       std::vector<cudf::size_type> all_key_indices(
         static_cast<size_t>(all_delete_rows->num_columns()));
@@ -286,7 +273,8 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
                                     stream);
 
       SIRIUS_LOG_INFO("[iceberg] Equality-delete table: {} row(s), {} key column(s).",
-                      deduped->num_rows(), key_column_names.size());
+                      deduped->num_rows(),
+                      key_column_names.size());
 
       // Map equality-key column names to positions in the cudf table.
       auto const& selected = get_selected_column_indices();
@@ -325,9 +313,7 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
   // -----------------------------------------------------------------------
   // Install the composed hook.
   // -----------------------------------------------------------------------
-  if (!_delete_pipeline.empty()) {
-    set_post_convert_fn(_delete_pipeline.build_hook());
-  }
+  if (!_delete_pipeline.empty()) { set_post_convert_fn(_delete_pipeline.build_hook()); }
 }
 
 }  // namespace sirius::op::scan

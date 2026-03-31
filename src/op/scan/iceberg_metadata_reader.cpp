@@ -14,17 +14,15 @@
  * limitations under the License.
  */
 
-#include <op/scan/iceberg_metadata_reader.hpp>
-#include <op/scan/iceberg_avro_reader.hpp>
-#include <log/logging.hpp>
-
 #include <duckdb/main/connection.hpp>
+#include <log/logging.hpp>
+#include <op/scan/iceberg_avro_reader.hpp>
+#include <op/scan/iceberg_metadata_reader.hpp>
 
 namespace sirius::op::scan {
 
-IcebergDeleteFiles read_iceberg_delete_metadata(
-  duckdb::ClientContext& context,
-  std::string const& table_path)
+IcebergDeleteFiles read_iceberg_delete_metadata(duckdb::ClientContext& context,
+                                                std::string const& table_path)
 {
   IcebergDeleteFiles files;
 
@@ -32,13 +30,19 @@ IcebergDeleteFiles read_iceberg_delete_metadata(
     // Get the manifest-list path from iceberg_snapshots().
     // This is lightweight (one row) and works even when iceberg_metadata() fails.
     duckdb::Connection snap_conn(*context.db);
-    auto snap_result =
-      snap_conn.Query("SELECT manifest_list FROM iceberg_snapshots('" + table_path +
-                      "') ORDER BY sequence_number DESC LIMIT 1");
+    // Escape single quotes to prevent SQL injection from table paths containing quotes.
+    std::string escaped_path = table_path;
+    for (std::string::size_type pos = 0; (pos = escaped_path.find('\'', pos)) != std::string::npos;
+         pos += 2) {
+      escaped_path.replace(pos, 1, "''");
+    }
+    auto snap_result = snap_conn.Query("SELECT manifest_list FROM iceberg_snapshots('" +
+                                       escaped_path + "') ORDER BY sequence_number DESC LIMIT 1");
 
     if (snap_result->HasError()) {
       SIRIUS_LOG_WARN("[iceberg_metadata_reader] iceberg_snapshots() failed for '{}': {}",
-                      table_path, snap_result->GetError());
+                      table_path,
+                      snap_result->GetError());
       return files;
     }
 
@@ -78,8 +82,7 @@ IcebergDeleteFiles read_iceberg_delete_metadata(
 
   } catch (std::exception const& e) {
     SIRIUS_LOG_WARN(
-      "[iceberg_metadata_reader] Failed for '{}': {}. Treating as V1.",
-      table_path, e.what());
+      "[iceberg_metadata_reader] Failed for '{}': {}. Treating as V1.", table_path, e.what());
   }
 
   return files;

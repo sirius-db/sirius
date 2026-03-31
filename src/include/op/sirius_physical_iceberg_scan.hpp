@@ -70,10 +70,6 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
 
   /// Paths of V2 equality-delete Parquet files.
   std::vector<std::string> equality_delete_files;
-
-  /// Column names used as the equality key in each equality-delete file.
-  /// Parallel to equality_delete_files.
-  std::vector<std::string> equality_field_names;
 };
 
 }  // namespace op

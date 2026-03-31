@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
-#include <op/scan/iceberg_delete_filter.hpp>
-#include <log/logging.hpp>
-
 #include <cudf/column/column_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/detail/error.hpp>
+
 #include <cuda_runtime_api.h>
+
+#include <log/logging.hpp>
+#include <op/scan/iceberg_delete_filter.hpp>
 
 #include <algorithm>
 
@@ -33,11 +35,10 @@ positional_delete_filter::positional_delete_filter(
 {
 }
 
-std::unique_ptr<cudf::table> positional_delete_filter::apply(
-  std::unique_ptr<cudf::table> tbl,
-  std::string const& data_file_path,
-  int64_t first_row,
-  rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> positional_delete_filter::apply(std::unique_ptr<cudf::table> tbl,
+                                                             std::string const& data_file_path,
+                                                             int64_t first_row,
+                                                             rmm::cuda_stream_view stream)
 {
   auto it = _positional_deletes.find(data_file_path);
   if (it == _positional_deletes.end() || it->second.empty()) {
@@ -61,16 +62,15 @@ std::unique_ptr<cudf::table> positional_delete_filter::apply(
   }
 
   // Copy to GPU as a BOOL8 column.
-  auto bool_col =
-    cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::BOOL8},
-                                  static_cast<cudf::size_type>(num_rows),
-                                  cudf::mask_state::UNALLOCATED,
-                                  stream);
-  cudaMemcpyAsync(bool_col->mutable_view().data<uint8_t>(),
-                  keep.data(),
-                  static_cast<size_t>(num_rows) * sizeof(uint8_t),
-                  cudaMemcpyHostToDevice,
-                  stream.value());
+  auto bool_col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::BOOL8},
+                                                static_cast<cudf::size_type>(num_rows),
+                                                cudf::mask_state::UNALLOCATED,
+                                                stream);
+  RMM_CUDA_TRY(cudaMemcpyAsync(bool_col->mutable_view().data<uint8_t>(),
+                               keep.data(),
+                               static_cast<size_t>(num_rows) * sizeof(uint8_t),
+                               cudaMemcpyHostToDevice,
+                               stream.value()));
 
   return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream);
 }
