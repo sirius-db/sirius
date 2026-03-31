@@ -14,12 +14,6 @@
  * limitations under the License.
  */
 
-// Delete before commit
-// Independent compilation:  nvcc -c src/cuda/operator/as_of_join.cu -Isrc/include
-// -Isrc/include/cudf -I.pixi/envs/default/include/ -I.pixi/envs/default/include/rapids/
-// -Ibuild/release/extension/sirius/_deps/spdlog_ep/src/spdlog_ep/include -I./duckdb/src/include
-// -Isrc/include/operator
-
 #pragma once
 
 #include "duckdb/common/value_operations/value_operations.hpp"
@@ -47,6 +41,24 @@ void asOfJoinNestedLoop(int64_t* left_data_timestamp,
                         uint64_t right_size,
                         int* condition_mode,
                         int num_keys);
+
+template <typename T>
+void asOfJoinBuildHashTable(uint8_t** keys,
+                    unsigned long long* ht,
+                    uint64_t ht_len,
+                    uint64_t N,
+                    int* condition_mode,
+                    int num_keys,
+                    bool is_right);
+
+template <typename T>
+void asOfJoinProbeHashTable(uint8_t** keys,
+                    unsigned long long* ht,
+                    uint64_t ht_len,
+                    uint64_t N,
+                    int* condition_mode,
+                    int num_keys,
+                    bool is_right);
 
 //! PhysicalAsOfJoin represents an as of join between two tables
 class GPUPhysicalAsOfJoin : public GPUPhysicalOperator {
