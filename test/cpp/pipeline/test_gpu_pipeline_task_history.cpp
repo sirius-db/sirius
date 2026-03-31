@@ -84,7 +84,7 @@ class stub_operator : public sirius::op::sirius_physical_operator {
 };
 
 //------------------------------------------------------------------------------
-// Test fixture: memory manager setup reused across tests.
+// Test fixture: memory manager setup and data creation helpers.
 //------------------------------------------------------------------------------
 struct pipeline_task_history_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
@@ -113,9 +113,143 @@ struct pipeline_task_history_fixture {
     if (!gpu_space) { return false; }
     host_space = manager->get_memory_space(cucascade::memory::Tier::HOST, 0);
     if (!host_space) { return false; }
+
+    sirius::converter_registry::initialize();
     return true;
   }
+
+  /// Create a data batch on GPU then convert to host representation.
+  std::shared_ptr<cucascade::data_batch> create_host_data_batch(std::size_t num_rows,
+                                                                rmm::cuda_stream_view stream)
+  {
+    auto gpu_mr = gpu_space->get_default_allocator();
+    auto gpu_table =
+      sirius::create_cudf_table_with_random_data(num_rows,
+                                                 {cudf::data_type{cudf::type_id::INT64}},
+                                                 {std::make_pair(0, 1000000)},
+                                                 stream,
+                                                 gpu_mr);
+    stream.synchronize();
+
+    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space);
+
+    REQUIRE(batch->try_to_lock_for_in_transit());
+    auto& registry = sirius::converter_registry::get();
+    batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    batch->try_to_release_in_transit();
+    stream.synchronize();
+
+    REQUIRE(batch->get_data() != nullptr);
+    REQUIRE(batch->get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
+    REQUIRE(batch->try_to_create_task());
+    return batch;
+  }
+
+  /// Create a data batch that stays on GPU.
+  std::shared_ptr<cucascade::data_batch> create_gpu_data_batch(std::size_t num_rows,
+                                                               rmm::cuda_stream_view stream)
+  {
+    auto gpu_mr = gpu_space->get_default_allocator();
+    auto gpu_table =
+      sirius::create_cudf_table_with_random_data(num_rows,
+                                                 {cudf::data_type{cudf::type_id::INT64}},
+                                                 {std::make_pair(0, 1000000)},
+                                                 stream,
+                                                 gpu_mr);
+    stream.synchronize();
+
+    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space);
+    REQUIRE(batch->try_to_create_task());
+    return batch;
+  }
 };
+
+//------------------------------------------------------------------------------
+// Pipeline context: DuckDB, engine, pipeline, and stub operator.
+//------------------------------------------------------------------------------
+struct pipeline_context {
+  std::unique_ptr<duckdb::DuckDB> db;
+  std::unique_ptr<duckdb::Connection> con;
+  std::unique_ptr<sirius::sirius_interface> iface;
+  std::unique_ptr<sirius::sirius_engine> engine;
+  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::unique_ptr<stub_operator> stub_op;
+};
+
+pipeline_context create_pipeline_context()
+{
+  pipeline_context ctx;
+  ctx.db       = std::make_unique<duckdb::DuckDB>(nullptr);
+  ctx.con      = std::make_unique<duckdb::Connection>(*ctx.db);
+  ctx.iface    = std::make_unique<sirius::sirius_interface>(*ctx.con->context);
+  ctx.engine   = std::make_unique<sirius::sirius_engine>(*ctx.con->context, *ctx.iface);
+  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(*ctx.engine);
+  ctx.pipeline->set_pipeline_id(42);
+  ctx.stub_op = std::make_unique<stub_operator>();
+
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_op);
+  build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
+  return ctx;
+}
+
+//------------------------------------------------------------------------------
+// Helper: create an on_execute lambda that allocates exec_size bytes via the
+// reservation-aware MR, passes through input batches, then deallocates.
+//------------------------------------------------------------------------------
+stub_operator::execute_fn make_allocating_execute_fn(cucascade::memory::memory_space* gpu_space,
+                                                     std::size_t exec_size)
+{
+  return [gpu_space, exec_size](const sirius::op::operator_data& input, rmm::cuda_stream_view s) {
+    auto* mr =
+      gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(mr != nullptr);
+    void* scratch = mr->allocate(s, exec_size);
+
+    std::vector<std::shared_ptr<cucascade::data_batch>> pass_through;
+    pass_through.reserve(input.get_data_batches().size());
+    for (auto const& batch : input.get_data_batches()) {
+      if (batch) { pass_through.push_back(batch); }
+    }
+    auto out = std::make_unique<sirius::op::operator_data>(std::move(pass_through));
+    s.synchronize();
+    mr->deallocate(s, scratch, exec_size);
+    s.synchronize();
+    return out;
+  };
+}
+
+//------------------------------------------------------------------------------
+// Helper: build a gpu_pipeline_task from a data batch and reservation size.
+// Pass reservation_size = 0 to skip reservation (for estimation flow).
+//------------------------------------------------------------------------------
+std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
+  pipeline_task_history_fixture& f,
+  std::shared_ptr<sirius::pipeline::sirius_pipeline_task_global_state> global_state,
+  std::shared_ptr<cucascade::data_batch> batch,
+  std::size_t reservation_size,
+  int task_id)
+{
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  batches.push_back(std::move(batch));
+  auto op_data = std::make_unique<sirius::op::operator_data>(std::move(batches));
+
+  auto local_state =
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
+
+  if (reservation_size > 0) {
+    auto reservation = f.manager->request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, reservation_size);
+    REQUIRE(reservation != nullptr);
+    local_state->set_reservation(std::move(reservation));
+  }
+
+  return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    task_id,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::move(local_state),
+    std::move(global_state));
+}
 
 }  // namespace
 
@@ -139,11 +273,6 @@ TEST_CASE(
   "gpu_pipeline_task execute OOM in lock_or_prepare_batch records to pipeline memory history",
   "[gpu_pipeline_task][history]")
 {
-  // Memory layout constants:
-  //   GPU capacity       = 500 MB (software limit)
-  //   Task reservation   = 200 MB
-  //   Pre-allocation     = 250 MB (consumes most GPU capacity)
-  //   Input data         = ~300 MB on host (cannot fit in remaining ~50 MB GPU)
   constexpr std::size_t kReservationSize   = 200ULL * 1024 * 1024;  // 200 MB
   constexpr std::size_t kPreAllocationSize = 250ULL * 1024 * 1024;  // 250 MB
   constexpr std::size_t kInputDataSize     = 300ULL * 1024 * 1024;  // 300 MB
@@ -157,44 +286,9 @@ TEST_CASE(
 
   rmm::cuda_stream stream, stream_data_init;
 
-  // -------------------------------------------------------------------------
-  // 1. Initialize converter registry (needed by lock_or_prepare_batch)
-  // -------------------------------------------------------------------------
-  sirius::converter_registry::initialize();
+  auto input_batch = f.create_host_data_batch(kInputNumRows, stream_data_init);
 
-  // -------------------------------------------------------------------------
-  // 2. Create ~200 MB input data as a GPU table, then convert to host.
-  // -------------------------------------------------------------------------
-  auto gpu_mr = f.gpu_space->get_default_allocator();
-  auto gpu_table =
-    sirius::create_cudf_table_with_random_data(kInputNumRows,
-                                               {cudf::data_type{cudf::type_id::INT64}},
-                                               {std::make_pair(0, 1000000)},
-                                               stream_data_init,
-                                               gpu_mr);
-
-  // Wrap GPU table in a data_batch
-  auto input_batch = sirius::make_data_batch(std::move(gpu_table), *f.gpu_space);
-
-  // Convert from GPU to host representation.
-  // Lock for in-transit → convert → release in-transit.
-  REQUIRE(input_batch->try_to_lock_for_in_transit());
-  auto& registry = sirius::converter_registry::get();
-  input_batch->convert_to<cucascade::host_data_representation>(
-    registry, f.host_space, stream_data_init);
-  input_batch->try_to_release_in_transit();
-  stream_data_init.synchronize();
-
-  // Verify the data is now on host
-  REQUIRE(input_batch->get_data() != nullptr);
-  REQUIRE(input_batch->get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
-
-  // Put batch in task_created state so execute()'s wait_to_lock_for_processing works
-  REQUIRE(input_batch->try_to_create_task());
-
-  // -------------------------------------------------------------------------
-  // 3. Pre-allocate GPU memory to create memory pressure
-  // -------------------------------------------------------------------------
+  // Pre-allocate GPU memory to create memory pressure
   auto pressure_reservation = f.manager->request_reservation(
     cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kPreAllocationSize);
   REQUIRE(pressure_reservation != nullptr);
@@ -211,67 +305,24 @@ TEST_CASE(
   stream.synchronize();
   pressure_allocator->reset_stream_reservation(stream);
 
-  // -------------------------------------------------------------------------
-  // 4. Build a minimal pipeline with one stub operator
-  // -------------------------------------------------------------------------
-  auto db  = std::make_unique<duckdb::DuckDB>(nullptr);
-  auto con = duckdb::Connection(*db);
-  sirius::sirius_interface iface(*con.context);
-  sirius::sirius_engine engine(*con.context, iface);
-
-  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(engine);
-  pipeline->set_pipeline_id(42);
-
-  auto stub_op = std::make_unique<stub_operator>();
-  sirius::pipeline::sirius_pipeline_build_state build_state;
-  build_state.add_pipeline_operator(*pipeline, *stub_op);
-  build_state.set_pipeline_sink(*pipeline, *stub_op, 1);
-
-  // -------------------------------------------------------------------------
-  // 5. Build task local state and global state
-  // -------------------------------------------------------------------------
+  // Build pipeline (no custom on_execute — OOM happens during lock_or_prepare_batch)
+  auto ctx = create_pipeline_context();
   auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(pipeline);
+    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  batches.push_back(input_batch);
-  auto op_data = std::make_unique<sirius::op::operator_data>(std::move(batches));
-
-  auto local_state =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
-
-  // Set the task's memory reservation (300 MB)
-  auto task_reservation = f.manager->request_reservation(
-    cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kReservationSize);
-  REQUIRE(task_reservation != nullptr);
-  local_state->set_reservation(std::move(task_reservation));
-
-  // -------------------------------------------------------------------------
-  // 6. Construct the task (real gpu_pipeline_task) and call execute()
-  // -------------------------------------------------------------------------
-  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
-    /*task_id=*/1,
-    std::vector<cucascade::shared_data_repository*>{},
-    std::move(local_state),
-    global_state);
+  auto task =
+    create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
   task->mark_as_rescheduled();
 
-  // -------------------------------------------------------------------------
-  // 7. Verify: memory history should have one record with the OOM peak_bytes
-  // -------------------------------------------------------------------------
+  // Verify: memory history should have one record with the OOM peak_bytes
   REQUIRE(global_state->get_memory_history().size() == 1);
   auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate == kInputDataSize);
 
-  // -------------------------------------------------------------------------
   // Cleanup: release the pressure allocation
-  // -------------------------------------------------------------------------
   pressure_allocator->deallocate(stream, pressure_alloc, kPreAllocationSize);
   pressure_allocator->reset_stream_reservation(stream);
 }
@@ -295,13 +346,10 @@ TEST_CASE(
 TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline memory history",
           "[gpu_pipeline_task][history]")
 {
-  // Memory layout constants:
-  //   GPU capacity       = 500 MB (software limit)
-  //   Task reservation   = 200 MB
-  //   Input data         = ~300 MB on host
-  constexpr std::size_t kReservationSize = 200ULL * 1024 * 1024;  // 200 MB
-  constexpr std::size_t kInputDataSize   = 300ULL * 1024 * 1024;  // 300 MB
-  constexpr std::size_t kInputNumRows    = kInputDataSize / sizeof(int64_t);
+  constexpr std::size_t kReservationSize        = 200ULL * 1024 * 1024;  // 200 MB
+  constexpr std::size_t kInputDataSize          = 300ULL * 1024 * 1024;  // 300 MB
+  constexpr std::size_t kInputNumRows           = kInputDataSize / sizeof(int64_t);
+  constexpr std::size_t kExecuteConsumptionSize = kInputDataSize;
 
   pipeline_task_history_fixture f;
   if (!f.setup()) {
@@ -311,102 +359,21 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
 
   rmm::cuda_stream stream, stream_data_init;
 
-  // -------------------------------------------------------------------------
-  // 1. Initialize converter registry (needed by lock_or_prepare_batch)
-  // -------------------------------------------------------------------------
-  sirius::converter_registry::initialize();
+  auto input_batch = f.create_host_data_batch(kInputNumRows, stream_data_init);
 
-  // -------------------------------------------------------------------------
-  // 2. Create input data as a GPU table, then convert to host.
-  // -------------------------------------------------------------------------
-  auto gpu_mr = f.gpu_space->get_default_allocator();
-  auto gpu_table =
-    sirius::create_cudf_table_with_random_data(kInputNumRows,
-                                               {cudf::data_type{cudf::type_id::INT64}},
-                                               {std::make_pair(0, 1000000)},
-                                               stream_data_init,
-                                               gpu_mr);
+  auto ctx                = create_pipeline_context();
+  ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize);
 
-  // Wrap GPU table in a data_batch
-  auto input_batch = sirius::make_data_batch(std::move(gpu_table), *f.gpu_space);
-
-  // Convert from GPU to host representation.
-  // Lock for in-transit → convert → release in-transit.
-  REQUIRE(input_batch->try_to_lock_for_in_transit());
-  auto& registry = sirius::converter_registry::get();
-  input_batch->convert_to<cucascade::host_data_representation>(
-    registry, f.host_space, stream_data_init);
-  input_batch->try_to_release_in_transit();
-  stream_data_init.synchronize();
-
-  // Verify the data is now on host
-  REQUIRE(input_batch->get_data() != nullptr);
-  REQUIRE(input_batch->get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
-
-  // Put batch in task_created state so execute()'s wait_to_lock_for_processing works
-  REQUIRE(input_batch->try_to_create_task());
-
-  // -------------------------------------------------------------------------
-  // 3. Build a minimal pipeline with one stub operator
-  // -------------------------------------------------------------------------
-  auto db  = std::make_unique<duckdb::DuckDB>(nullptr);
-  auto con = duckdb::Connection(*db);
-  sirius::sirius_interface iface(*con.context);
-  sirius::sirius_engine engine(*con.context, iface);
-
-  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(engine);
-  pipeline->set_pipeline_id(42);
-
-  auto stub_op = std::make_unique<stub_operator>();
-  // Deep-copy input on GPU so peak usage is ~2× the materialized input (OOM in execute).
-  stub_op->on_execute = [](const sirius::op::operator_data& input, rmm::cuda_stream_view s) {
-    std::vector<std::shared_ptr<cucascade::data_batch>> out;
-    const auto& batches = input.get_data_batches();
-    out.push_back(batches[0]->clone(sirius::get_next_batch_id(), s));
-    s.synchronize();
-    return std::make_unique<sirius::op::operator_data>(std::move(out));
-  };
-
-  sirius::pipeline::sirius_pipeline_build_state build_state;
-  build_state.add_pipeline_operator(*pipeline, *stub_op);
-  build_state.set_pipeline_sink(*pipeline, *stub_op, 1);
-
-  // -------------------------------------------------------------------------
-  // 4. Build task local state and global state
-  // -------------------------------------------------------------------------
   auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(pipeline);
+    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  batches.push_back(input_batch);
-  auto op_data = std::make_unique<sirius::op::operator_data>(std::move(batches));
-
-  auto local_state =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
-
-  // Set the task's memory reservation (300 MB)
-  auto task_reservation = f.manager->request_reservation(
-    cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kReservationSize);
-  REQUIRE(task_reservation != nullptr);
-  local_state->set_reservation(std::move(task_reservation));
-
-  // -------------------------------------------------------------------------
-  // 5. Construct the task (real gpu_pipeline_task) and call execute()
-  // -------------------------------------------------------------------------
-  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
-    /*task_id=*/1,
-    std::vector<cucascade::shared_data_repository*>{},
-    std::move(local_state),
-    global_state);
+  auto task =
+    create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
   task->mark_as_rescheduled();
-  // -------------------------------------------------------------------------
-  // 6. Verify: memory history should have one record with the OOM peak_bytes
-  // -------------------------------------------------------------------------
+
+  // Verify: memory history should have one record with the OOM peak_bytes
   REQUIRE(global_state->get_memory_history().size() == 1);
   auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
   REQUIRE(estimate.has_value());
@@ -442,151 +409,33 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
 
   rmm::cuda_stream stream, stream_data_init;
 
-  // -------------------------------------------------------------------------
-  // 1. Initialize converter registry (needed by lock_or_prepare_batch)
-  // -------------------------------------------------------------------------
-  sirius::converter_registry::initialize();
+  auto input_batch = f.create_host_data_batch(kInputNumRows1, stream_data_init);
 
-  // -------------------------------------------------------------------------
-  // 2. Create input data as a GPU table, then convert to host.
-  // -------------------------------------------------------------------------
-  auto gpu_mr = f.gpu_space->get_default_allocator();
-  auto gpu_table =
-    sirius::create_cudf_table_with_random_data(kInputNumRows1,
-                                               {cudf::data_type{cudf::type_id::INT64}},
-                                               {std::make_pair(0, 1000000)},
-                                               stream_data_init,
-                                               gpu_mr);
-  stream_data_init.synchronize();
+  auto ctx                = create_pipeline_context();
+  ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize1);
 
-  // Wrap GPU table in a data_batch
-  auto input_batch = sirius::make_data_batch(std::move(gpu_table), *f.gpu_space);
-
-  // Convert from GPU to host representation.
-  // Lock for in-transit → convert → release in-transit.
-  REQUIRE(input_batch->try_to_lock_for_in_transit());
-  auto& registry = sirius::converter_registry::get();
-  input_batch->convert_to<cucascade::host_data_representation>(
-    registry, f.host_space, stream_data_init);
-  input_batch->try_to_release_in_transit();
-  stream_data_init.synchronize();
-
-  // Verify the data is now on host
-  REQUIRE(input_batch->get_data() != nullptr);
-  REQUIRE(input_batch->get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
-
-  // Put batch in task_created state so execute()'s wait_to_lock_for_processing works
-  REQUIRE(input_batch->try_to_create_task());
-
-  // -------------------------------------------------------------------------
-  // 3. Build a minimal pipeline with one stub operator
-  // -------------------------------------------------------------------------
-  auto db  = std::make_unique<duckdb::DuckDB>(nullptr);
-  auto con = duckdb::Connection(*db);
-  sirius::sirius_interface iface(*con.context);
-  sirius::sirius_engine engine(*con.context, iface);
-
-  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(engine);
-  pipeline->set_pipeline_id(42);
-
-  auto stub_op = std::make_unique<stub_operator>();
-  // Allocate kExecuteConsumptionSize1 on the task stream via the GPU space's reservation-aware MR
-  // (execute() has already attached this task's reservation to that stream).
-  stub_op->on_execute = [gpu_space = f.gpu_space, exec_extra = kExecuteConsumptionSize1](
-                          const sirius::op::operator_data& input, rmm::cuda_stream_view s) {
-    auto* mr =
-      gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
-    REQUIRE(mr != nullptr);
-    void* scratch = mr->allocate(s, exec_extra);
-
-    std::vector<std::shared_ptr<cucascade::data_batch>> pass_through;
-    pass_through.reserve(input.get_data_batches().size());
-    for (auto const& batch : input.get_data_batches()) {
-      if (batch) { pass_through.push_back(batch); }
-    }
-    auto out = std::make_unique<sirius::op::operator_data>(std::move(pass_through));
-    s.synchronize();
-    mr->deallocate(s, scratch, exec_extra);
-    s.synchronize();
-    return out;
-  };
-  sirius::pipeline::sirius_pipeline_build_state build_state;
-  build_state.add_pipeline_operator(*pipeline, *stub_op);
-  build_state.set_pipeline_sink(*pipeline, *stub_op, 1);
-
-  // -------------------------------------------------------------------------
-  // 4. Build task local state and global state
-  // -------------------------------------------------------------------------
   auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(pipeline);
+    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  batches.push_back(input_batch);
-  auto op_data = std::make_unique<sirius::op::operator_data>(std::move(batches));
+  // Task 1: execute successfully with 20 MB input and 20 MB execute allocation
+  auto task1 =
+    create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize1, /*task_id=*/1);
 
-  auto local_state =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
+  task1->execute(stream);
+  task1->mark_as_rescheduled();
 
-  // Set the task's memory reservation
-  auto task_reservation = f.manager->request_reservation(
-    cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kReservationSize1);
-  REQUIRE(task_reservation != nullptr);
-  local_state->set_reservation(std::move(task_reservation));
-
-  // -------------------------------------------------------------------------
-  // 5. Construct the task (real gpu_pipeline_task) and call execute()
-  // -------------------------------------------------------------------------
-  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
-    /*task_id=*/1,
-    std::vector<cucascade::shared_data_repository*>{},
-    std::move(local_state),
-    global_state);
-
-  task->execute(stream);
-
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
-  task->mark_as_rescheduled();
-
-  // -------------------------------------------------------------------------
-  // 6. Verify: memory history should have one record with the peak_bytes
-  // -------------------------------------------------------------------------
+  // Verify: memory history should have one record with the peak_bytes
   REQUIRE(global_state->get_memory_history().size() == 1);
   auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize1);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate == kExecuteConsumptionSize1);
 
-  // -------------------------------------------------------------------------
-  // 7. Create second input data and build second task
-  // -------------------------------------------------------------------------
+  // Task 2: 5 MB input staying on GPU, 2.5 MB execute allocation
+  auto input_batch2 = f.create_gpu_data_batch(kInputNumRows2, stream_data_init);
 
-  // Clear the input batch to release the memory
-  input_batch.reset();
+  ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize2);
 
-  auto gpu_table2 =
-    sirius::create_cudf_table_with_random_data(kInputNumRows2,
-                                               {cudf::data_type{cudf::type_id::INT64}},
-                                               {std::make_pair(0, 1000000)},
-                                               stream_data_init,
-                                               gpu_mr);
-  stream_data_init.synchronize();
-
-  // Wrap GPU table in a data_batch
-  auto input_batch2 = sirius::make_data_batch(std::move(gpu_table2), *f.gpu_space);
-  // Put batch in task_created state so execute()'s wait_to_lock_for_processing works
-  REQUIRE(input_batch2->try_to_create_task());
-
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches2;
-  batches2.push_back(input_batch2);
-  auto op_data2 = std::make_unique<sirius::op::operator_data>(std::move(batches2));
-  auto local_state2 =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data2));
-
-  auto task2 = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
-    /*task_id=*/2,
-    std::vector<cucascade::shared_data_repository*>{},
-    std::move(local_state2),
-    global_state);
+  auto task2 = create_pipeline_task(f, global_state, input_batch2, 0, /*task_id=*/2);
 
   auto estimation2 = task2->get_estimated_reservation_size();
   REQUIRE(estimation2 ==
@@ -599,33 +448,11 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
   REQUIRE(local_state2_ptr != nullptr);
   local_state2_ptr->set_reservation(std::move(task_reservation2));
 
-  stub_op->on_execute = [gpu_space = f.gpu_space, exec_extra = kExecuteConsumptionSize2](
-                          const sirius::op::operator_data& input, rmm::cuda_stream_view s) {
-    auto* mr =
-      gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
-    REQUIRE(mr != nullptr);
-    void* scratch = mr->allocate(s, exec_extra);
-
-    std::vector<std::shared_ptr<cucascade::data_batch>> pass_through;
-    pass_through.reserve(input.get_data_batches().size());
-    for (auto const& batch : input.get_data_batches()) {
-      if (batch) { pass_through.push_back(batch); }
-    }
-    auto out = std::make_unique<sirius::op::operator_data>(std::move(pass_through));
-    s.synchronize();
-    mr->deallocate(s, scratch, exec_extra);
-    s.synchronize();
-    return out;
-  };
   task2->execute(stream);
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
   task2->mark_as_rescheduled();
 
-  // -------------------------------------------------------------------------
-  // 8. Verify: memory history should have two records with the peak_bytes, and verify that
+  // Verify: memory history should have two records with the peak_bytes, and verify that
   // estimates now consider the second tasks history
-  // -------------------------------------------------------------------------
   // The second tasks memory consumption was lower, so the estimate of a similar task with the same
   // input size should now be lower. And the converse is true as well.
   REQUIRE(global_state->get_memory_history().size() == 2);
