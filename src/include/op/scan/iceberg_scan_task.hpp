@@ -78,11 +78,10 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
 
   /// Private delegating constructor — receives pre-computed @p init so that
   /// the base constructor can be called in the member initialiser list.
-  iceberg_scan_task_global_state(
-    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-    sirius_physical_iceberg_scan* scan_op,
-    init_data init,
-    size_t approximate_batch_size);
+  iceberg_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+                                 sirius_physical_iceberg_scan* scan_op,
+                                 init_data init,
+                                 size_t approximate_batch_size);
 
   // -------------------------------------------------------------------------
   // Delete pipeline construction

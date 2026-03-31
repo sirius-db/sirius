@@ -49,26 +49,52 @@ MANIFEST_LIST_SCHEMA = {
         {"field-id": 513, "name": "existing_rows_count", "type": "long"},
         {"field-id": 514, "name": "deleted_rows_count", "type": "long"},
         {
-            "field-id": 507, "name": "partitions",
-            "type": ["null", {
-                "element-id": 508, "type": "array",
-                "items": {
-                    "type": "record", "name": "r508",
-                    "fields": [
-                        {"field-id": 509, "name": "contains_null", "type": "boolean"},
-                        {"field-id": 518, "name": "contains_nan",
-                         "type": ["null", "boolean"], "default": None},
-                        {"field-id": 510, "name": "lower_bound",
-                         "type": ["null", "bytes"], "default": None},
-                        {"field-id": 511, "name": "upper_bound",
-                         "type": ["null", "bytes"], "default": None},
-                    ],
+            "field-id": 507,
+            "name": "partitions",
+            "type": [
+                "null",
+                {
+                    "element-id": 508,
+                    "type": "array",
+                    "items": {
+                        "type": "record",
+                        "name": "r508",
+                        "fields": [
+                            {
+                                "field-id": 509,
+                                "name": "contains_null",
+                                "type": "boolean",
+                            },
+                            {
+                                "field-id": 518,
+                                "name": "contains_nan",
+                                "type": ["null", "boolean"],
+                                "default": None,
+                            },
+                            {
+                                "field-id": 510,
+                                "name": "lower_bound",
+                                "type": ["null", "bytes"],
+                                "default": None,
+                            },
+                            {
+                                "field-id": 511,
+                                "name": "upper_bound",
+                                "type": ["null", "bytes"],
+                                "default": None,
+                            },
+                        ],
+                    },
                 },
-            }],
+            ],
             "default": None,
         },
-        {"field-id": 519, "name": "key_metadata",
-         "type": ["null", "bytes"], "default": None},
+        {
+            "field-id": 519,
+            "name": "key_metadata",
+            "type": ["null", "bytes"],
+            "default": None,
+        },
     ],
 }
 
@@ -79,12 +105,24 @@ def make_manifest_schema(sequence_number: int, snapshot_id: int):
         "name": "manifest_entry",
         "fields": [
             {"field-id": 0, "name": "status", "type": "int"},
-            {"field-id": 1, "name": "snapshot_id",
-             "type": ["null", "long"], "default": None},
-            {"field-id": 3, "name": "sequence_number",
-             "type": ["null", "long"], "default": None},
-            {"field-id": 4, "name": "file_sequence_number",
-             "type": ["null", "long"], "default": None},
+            {
+                "field-id": 1,
+                "name": "snapshot_id",
+                "type": ["null", "long"],
+                "default": None,
+            },
+            {
+                "field-id": 3,
+                "name": "sequence_number",
+                "type": ["null", "long"],
+                "default": None,
+            },
+            {
+                "field-id": 4,
+                "name": "file_sequence_number",
+                "type": ["null", "long"],
+                "default": None,
+            },
             {
                 "field-id": 2,
                 "name": "data_file",
@@ -95,62 +133,211 @@ def make_manifest_schema(sequence_number: int, snapshot_id: int):
                         {"field-id": 134, "name": "content", "type": "int"},
                         {"field-id": 100, "name": "file_path", "type": "string"},
                         {"field-id": 101, "name": "file_format", "type": "string"},
-                        {"field-id": 102, "name": "partition",
-                         "type": {"type": "record", "name": "r102", "fields": []}},
+                        {
+                            "field-id": 102,
+                            "name": "partition",
+                            "type": {"type": "record", "name": "r102", "fields": []},
+                        },
                         {"field-id": 103, "name": "record_count", "type": "long"},
                         {"field-id": 104, "name": "file_size_in_bytes", "type": "long"},
-                        {"field-id": 108, "name": "column_sizes",
-                         "type": ["null", {"logicalType": "map", "type": "array",
-                                           "items": {"type": "record", "name": "k108_v",
-                                                     "fields": [
-                                                         {"field-id": 117, "name": "key", "type": "int"},
-                                                         {"field-id": 118, "name": "value", "type": "long"}]}}],
-                         "default": None},
-                        {"field-id": 109, "name": "value_counts",
-                         "type": ["null", {"logicalType": "map", "type": "array",
-                                           "items": {"type": "record", "name": "k109_v",
-                                                     "fields": [
-                                                         {"field-id": 119, "name": "key", "type": "int"},
-                                                         {"field-id": 120, "name": "value", "type": "long"}]}}],
-                         "default": None},
-                        {"field-id": 110, "name": "null_value_counts",
-                         "type": ["null", {"logicalType": "map", "type": "array",
-                                           "items": {"type": "record", "name": "k110_v",
-                                                     "fields": [
-                                                         {"field-id": 121, "name": "key", "type": "int"},
-                                                         {"field-id": 122, "name": "value", "type": "long"}]}}],
-                         "default": None},
-                        {"field-id": 137, "name": "nan_value_counts",
-                         "type": ["null", {"logicalType": "map", "type": "array",
-                                           "items": {"type": "record", "name": "k137_v",
-                                                     "fields": [
-                                                         {"field-id": 138, "name": "key", "type": "int"},
-                                                         {"field-id": 139, "name": "value", "type": "long"}]}}],
-                         "default": None},
-                        {"field-id": 125, "name": "lower_bounds",
-                         "type": ["null", {"logicalType": "map", "type": "array",
-                                           "items": {"type": "record", "name": "k125_v",
-                                                     "fields": [
-                                                         {"field-id": 126, "name": "key", "type": "int"},
-                                                         {"field-id": 127, "name": "value", "type": "bytes"}]}}],
-                         "default": None},
-                        {"field-id": 128, "name": "upper_bounds",
-                         "type": ["null", {"logicalType": "map", "type": "array",
-                                           "items": {"type": "record", "name": "k128_v",
-                                                     "fields": [
-                                                         {"field-id": 129, "name": "key", "type": "int"},
-                                                         {"field-id": 130, "name": "value", "type": "bytes"}]}}],
-                         "default": None},
-                        {"field-id": 131, "name": "key_metadata",
-                         "type": ["null", "bytes"], "default": None},
-                        {"field-id": 132, "name": "split_offsets",
-                         "type": ["null", {"element-id": 133, "type": "array", "items": "long"}],
-                         "default": None},
-                        {"field-id": 135, "name": "equality_ids",
-                         "type": ["null", {"element-id": 136, "type": "array", "items": "int"}],
-                         "default": None},
-                        {"field-id": 140, "name": "sort_order_id",
-                         "type": ["null", "int"], "default": None},
+                        {
+                            "field-id": 108,
+                            "name": "column_sizes",
+                            "type": [
+                                "null",
+                                {
+                                    "logicalType": "map",
+                                    "type": "array",
+                                    "items": {
+                                        "type": "record",
+                                        "name": "k108_v",
+                                        "fields": [
+                                            {
+                                                "field-id": 117,
+                                                "name": "key",
+                                                "type": "int",
+                                            },
+                                            {
+                                                "field-id": 118,
+                                                "name": "value",
+                                                "type": "long",
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 109,
+                            "name": "value_counts",
+                            "type": [
+                                "null",
+                                {
+                                    "logicalType": "map",
+                                    "type": "array",
+                                    "items": {
+                                        "type": "record",
+                                        "name": "k109_v",
+                                        "fields": [
+                                            {
+                                                "field-id": 119,
+                                                "name": "key",
+                                                "type": "int",
+                                            },
+                                            {
+                                                "field-id": 120,
+                                                "name": "value",
+                                                "type": "long",
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 110,
+                            "name": "null_value_counts",
+                            "type": [
+                                "null",
+                                {
+                                    "logicalType": "map",
+                                    "type": "array",
+                                    "items": {
+                                        "type": "record",
+                                        "name": "k110_v",
+                                        "fields": [
+                                            {
+                                                "field-id": 121,
+                                                "name": "key",
+                                                "type": "int",
+                                            },
+                                            {
+                                                "field-id": 122,
+                                                "name": "value",
+                                                "type": "long",
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 137,
+                            "name": "nan_value_counts",
+                            "type": [
+                                "null",
+                                {
+                                    "logicalType": "map",
+                                    "type": "array",
+                                    "items": {
+                                        "type": "record",
+                                        "name": "k137_v",
+                                        "fields": [
+                                            {
+                                                "field-id": 138,
+                                                "name": "key",
+                                                "type": "int",
+                                            },
+                                            {
+                                                "field-id": 139,
+                                                "name": "value",
+                                                "type": "long",
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 125,
+                            "name": "lower_bounds",
+                            "type": [
+                                "null",
+                                {
+                                    "logicalType": "map",
+                                    "type": "array",
+                                    "items": {
+                                        "type": "record",
+                                        "name": "k125_v",
+                                        "fields": [
+                                            {
+                                                "field-id": 126,
+                                                "name": "key",
+                                                "type": "int",
+                                            },
+                                            {
+                                                "field-id": 127,
+                                                "name": "value",
+                                                "type": "bytes",
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 128,
+                            "name": "upper_bounds",
+                            "type": [
+                                "null",
+                                {
+                                    "logicalType": "map",
+                                    "type": "array",
+                                    "items": {
+                                        "type": "record",
+                                        "name": "k128_v",
+                                        "fields": [
+                                            {
+                                                "field-id": 129,
+                                                "name": "key",
+                                                "type": "int",
+                                            },
+                                            {
+                                                "field-id": 130,
+                                                "name": "value",
+                                                "type": "bytes",
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 131,
+                            "name": "key_metadata",
+                            "type": ["null", "bytes"],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 132,
+                            "name": "split_offsets",
+                            "type": [
+                                "null",
+                                {"element-id": 133, "type": "array", "items": "long"},
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 135,
+                            "name": "equality_ids",
+                            "type": [
+                                "null",
+                                {"element-id": 136, "type": "array", "items": "int"},
+                            ],
+                            "default": None,
+                        },
+                        {
+                            "field-id": 140,
+                            "name": "sort_order_id",
+                            "type": ["null", "int"],
+                            "default": None,
+                        },
                     ],
                 },
             },
@@ -161,6 +348,7 @@ def make_manifest_schema(sequence_number: int, snapshot_id: int):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 # Map pyarrow types to Iceberg type strings
 def arrow_to_iceberg_type(arrow_type):
@@ -188,12 +376,14 @@ def parquet_schema_to_iceberg(pq_schema):
     """Convert a pyarrow schema (from parquet) to an Iceberg schema dict."""
     fields = []
     for i, field in enumerate(pq_schema):
-        fields.append({
-            "id": i + 1,
-            "name": field.name,
-            "required": not field.nullable,
-            "type": arrow_to_iceberg_type(field.type),
-        })
+        fields.append(
+            {
+                "id": i + 1,
+                "name": field.name,
+                "required": not field.nullable,
+                "type": arrow_to_iceberg_type(field.type),
+            }
+        )
     return {
         "type": "struct",
         "schema-id": 0,
@@ -244,12 +434,27 @@ def make_manifest_entry(snapshot_id, sequence_number, data_file):
 # Main logic
 # ---------------------------------------------------------------------------
 
-TPCH_TABLES = ["nation", "region", "part", "supplier", "partsupp",
-               "customer", "orders", "lineitem"]
+TPCH_TABLES = [
+    "nation",
+    "region",
+    "part",
+    "supplier",
+    "partsupp",
+    "customer",
+    "orders",
+    "lineitem",
+]
 
 
-def wrap_table(table_name, parquet_files, out_dir, rel_out, snap_id,
-               delete_pct=0, delete_key_cols=None):
+def wrap_table(
+    table_name,
+    parquet_files,
+    out_dir,
+    rel_out,
+    snap_id,
+    delete_pct=0,
+    delete_key_cols=None,
+):
     """Wrap parquet file(s) as a single Iceberg table."""
 
     print(f"  Wrapping {table_name}: {len(parquet_files)} data file(s) ...", end="")
@@ -271,33 +476,38 @@ def wrap_table(table_name, parquet_files, out_dir, rel_out, snap_id,
         # Use relative path from project root
         rel_path = str(pf.resolve().relative_to(Path.cwd()))
         data_entries.append(
-            make_manifest_entry(snap_id, seq_num,
-                                make_data_file_entry(0, rel_path, nrows, fsize)))
+            make_manifest_entry(
+                snap_id, seq_num, make_data_file_entry(0, rel_path, nrows, fsize)
+            )
+        )
         total_rows += nrows
 
     # Write data manifest
     data_mf_path = out_dir / "metadata" / "m0-data.avro"
     data_mf_rel = f"{rel_out}/metadata/m0-data.avro"
-    data_mf_size = write_avro(data_mf_path, make_manifest_schema(seq_num, snap_id),
-                              data_entries)
+    data_mf_size = write_avro(
+        data_mf_path, make_manifest_schema(seq_num, snap_id), data_entries
+    )
 
-    manifest_list_entries = [{
-        "manifest_path": data_mf_rel,
-        "manifest_length": data_mf_size,
-        "partition_spec_id": 0,
-        "content": 0,
-        "sequence_number": seq_num,
-        "min_sequence_number": seq_num,
-        "added_snapshot_id": snap_id,
-        "added_files_count": len(parquet_files),
-        "existing_files_count": 0,
-        "deleted_files_count": 0,
-        "added_rows_count": total_rows,
-        "existing_rows_count": 0,
-        "deleted_rows_count": 0,
-        "partitions": [],
-        "key_metadata": None,
-    }]
+    manifest_list_entries = [
+        {
+            "manifest_path": data_mf_rel,
+            "manifest_length": data_mf_size,
+            "partition_spec_id": 0,
+            "content": 0,
+            "sequence_number": seq_num,
+            "min_sequence_number": seq_num,
+            "added_snapshot_id": snap_id,
+            "added_files_count": len(parquet_files),
+            "existing_files_count": 0,
+            "deleted_files_count": 0,
+            "added_rows_count": total_rows,
+            "existing_rows_count": 0,
+            "deleted_rows_count": 0,
+            "partitions": [],
+            "key_metadata": None,
+        }
+    ]
 
     # Equality deletes (if requested)
     delete_rows = 0
@@ -313,6 +523,7 @@ def wrap_table(table_name, parquet_files, out_dir, rel_out, snap_id,
 
         # Read all key columns from all files and sample delete_pct%
         import pyarrow.parquet as pq_mod
+
         key_tables = []
         for pf in parquet_files:
             t = pq_mod.read_table(str(pf), columns=delete_key_cols)
@@ -327,29 +538,38 @@ def wrap_table(table_name, parquet_files, out_dir, rel_out, snap_id,
         delete_rows = delete_table.num_rows
 
         # Add iceberg metadata to schema
-        iceberg_del_schema = json.dumps({
-            "type": "struct",
-            "schema-id": 0,
-            "fields": [
-                {"id": i + 1, "name": f.name, "required": False,
-                 "type": arrow_to_iceberg_type(f.type)}
-                for i, f in enumerate(arrow_schema)
-                if f.name in delete_key_cols
-            ],
-        })
+        iceberg_del_schema = json.dumps(
+            {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": i + 1,
+                        "name": f.name,
+                        "required": False,
+                        "type": arrow_to_iceberg_type(f.type),
+                    }
+                    for i, f in enumerate(arrow_schema)
+                    if f.name in delete_key_cols
+                ],
+            }
+        )
         new_fields = []
         for f in delete_table.schema:
             # Find field id in original schema
             for orig_i, orig_f in enumerate(arrow_schema):
                 if orig_f.name == f.name:
-                    new_fields.append(f.with_metadata({
-                        "PARQUET:field_id": str(orig_i + 1)
-                    }))
+                    new_fields.append(
+                        f.with_metadata({"PARQUET:field_id": str(orig_i + 1)})
+                    )
                     break
-        delete_arrow_schema = pa.schema(new_fields, metadata={
-            "iceberg.schema": iceberg_del_schema,
-            "iceberg.delete.content": "EQUALITY",
-        })
+        delete_arrow_schema = pa.schema(
+            new_fields,
+            metadata={
+                "iceberg.schema": iceberg_del_schema,
+                "iceberg.delete.content": "EQUALITY",
+            },
+        )
         delete_table = delete_table.cast(delete_arrow_schema)
 
         # Write delete parquet
@@ -360,33 +580,40 @@ def wrap_table(table_name, parquet_files, out_dir, rel_out, snap_id,
         del_pq_rel = f"{rel_out}/data/equality-deletes.parquet"
 
         # Equality IDs = field IDs of key columns
-        eq_ids = [i + 1 for i, f in enumerate(arrow_schema) if f.name in delete_key_cols]
+        eq_ids = [
+            i + 1 for i, f in enumerate(arrow_schema) if f.name in delete_key_cols
+        ]
 
         del_entry = make_data_file_entry(2, del_pq_rel, delete_rows, del_pq_size)
         del_entry["equality_ids"] = eq_ids
 
         del_mf_path = out_dir / "metadata" / "m1-deletes.avro"
         del_mf_rel = f"{rel_out}/metadata/m1-deletes.avro"
-        del_mf_size = write_avro(del_mf_path, make_manifest_schema(seq_num, snap_id),
-                                 [make_manifest_entry(snap_id, seq_num, del_entry)])
+        del_mf_size = write_avro(
+            del_mf_path,
+            make_manifest_schema(seq_num, snap_id),
+            [make_manifest_entry(snap_id, seq_num, del_entry)],
+        )
 
-        manifest_list_entries.append({
-            "manifest_path": del_mf_rel,
-            "manifest_length": del_mf_size,
-            "partition_spec_id": 0,
-            "content": 2,
-            "sequence_number": seq_num,
-            "min_sequence_number": seq_num,
-            "added_snapshot_id": snap_id,
-            "added_files_count": 1,
-            "existing_files_count": 0,
-            "deleted_files_count": 0,
-            "added_rows_count": delete_rows,
-            "existing_rows_count": 0,
-            "deleted_rows_count": 0,
-            "partitions": [],
-            "key_metadata": None,
-        })
+        manifest_list_entries.append(
+            {
+                "manifest_path": del_mf_rel,
+                "manifest_length": del_mf_size,
+                "partition_spec_id": 0,
+                "content": 2,
+                "sequence_number": seq_num,
+                "min_sequence_number": seq_num,
+                "added_snapshot_id": snap_id,
+                "added_files_count": 1,
+                "existing_files_count": 0,
+                "deleted_files_count": 0,
+                "added_rows_count": delete_rows,
+                "existing_rows_count": 0,
+                "deleted_rows_count": 0,
+                "partitions": [],
+                "key_metadata": None,
+            }
+        )
 
     # Manifest list
     snap_avro_path = out_dir / "metadata" / "snap.avro"
@@ -410,14 +637,16 @@ def wrap_table(table_name, parquet_files, out_dir, rel_out, snap_id,
         "sort-orders": [{"order-id": 0, "fields": []}],
         "current-snapshot-id": snap_id,
         "refs": {"main": {"snapshot-id": snap_id, "type": "branch"}},
-        "snapshots": [{
-            "sequence-number": seq_num,
-            "snapshot-id": snap_id,
-            "timestamp-ms": 1700000000000,
-            "summary": {"operation": "append"},
-            "manifest-list": snap_avro_rel,
-            "schema-id": 0,
-        }],
+        "snapshots": [
+            {
+                "sequence-number": seq_num,
+                "snapshot-id": snap_id,
+                "timestamp-ms": 1700000000000,
+                "summary": {"operation": "append"},
+                "manifest-list": snap_avro_rel,
+                "schema-id": 0,
+            }
+        ],
         "snapshot-log": [{"timestamp-ms": 1700000000000, "snapshot-id": snap_id}],
         "metadata-log": [],
     }
@@ -435,12 +664,24 @@ def main():
     parser = argparse.ArgumentParser(description="Wrap TPC-H parquet as Iceberg")
     parser.add_argument("parquet_dir", help="Input parquet directory")
     parser.add_argument("output_dir", help="Output iceberg directory")
-    parser.add_argument("--delete-pct", type=int, default=0,
-                        help="Percentage of rows to equality-delete (0=none)")
-    parser.add_argument("--delete-tables", nargs="+", default=[],
-                        help="Tables to add equality deletes to (default: none)")
-    parser.add_argument("--delete-key-cols", nargs="+", default=None,
-                        help="Key columns for equality deletes (default: first 2 columns)")
+    parser.add_argument(
+        "--delete-pct",
+        type=int,
+        default=0,
+        help="Percentage of rows to equality-delete (0=none)",
+    )
+    parser.add_argument(
+        "--delete-tables",
+        nargs="+",
+        default=[],
+        help="Tables to add equality deletes to (default: none)",
+    )
+    parser.add_argument(
+        "--delete-key-cols",
+        nargs="+",
+        default=None,
+        help="Key columns for equality deletes (default: first 2 columns)",
+    )
     args = parser.parse_args()
 
     parquet_dir = Path(args.parquet_dir).resolve()
@@ -455,9 +696,11 @@ def main():
 
     for i, table_name in enumerate(TPCH_TABLES):
         # Find parquet files for this table
-        candidates = list(parquet_dir.glob(f"{table_name}.parquet")) + \
-                     list(parquet_dir.glob(f"{table_name}/*.parquet")) + \
-                     list(parquet_dir.glob(f"{table_name}_*.parquet"))
+        candidates = (
+            list(parquet_dir.glob(f"{table_name}.parquet"))
+            + list(parquet_dir.glob(f"{table_name}/*.parquet"))
+            + list(parquet_dir.glob(f"{table_name}_*.parquet"))
+        )
         if not candidates:
             print(f"  Skipping {table_name} (no parquet files found)")
             continue
@@ -479,8 +722,15 @@ def main():
         else:
             key_cols = None
 
-        wrap_table(table_name, sorted(candidates), table_out, rel_out,
-                   snap_id, del_pct, key_cols)
+        wrap_table(
+            table_name,
+            sorted(candidates),
+            table_out,
+            rel_out,
+            snap_id,
+            del_pct,
+            key_cols,
+        )
 
     print("\nDone.")
 

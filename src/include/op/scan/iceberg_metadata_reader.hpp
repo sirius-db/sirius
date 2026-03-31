@@ -48,8 +48,7 @@ struct IcebergDeleteFiles {
  * @param table_path The Iceberg table path passed to iceberg_scan().
  * @return Delete file metadata (both vectors empty for V1 tables).
  */
-IcebergDeleteFiles read_iceberg_delete_metadata(
-  duckdb::ClientContext& context,
-  std::string const& table_path);
+IcebergDeleteFiles read_iceberg_delete_metadata(duckdb::ClientContext& context,
+                                                std::string const& table_path);
 
 }  // namespace sirius::op::scan

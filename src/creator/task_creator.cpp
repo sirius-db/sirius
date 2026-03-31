@@ -104,10 +104,12 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       SIRIUS_LOG_INFO("[task_creator::prepare_for_query] ICEBERG_SCAN operator_id={}", operator_id);
       auto it = _parquet_scan_operator_global_state_map.find(operator_id);
       if (it != _parquet_scan_operator_global_state_map.end()) {
-        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] rebind existing state for id={}", operator_id);
+        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] rebind existing state for id={}",
+                        operator_id);
         it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_iceberg_scan>());
       } else {
-        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] creating NEW state for id={}", operator_id);
+        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] creating NEW state for id={}",
+                        operator_id);
         const auto& op_params =
           _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
             ->get_config()
@@ -310,10 +312,9 @@ void task_creator::manager_loop()
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
           // ICEBERG_SCAN inherits from PARQUET_SCAN; Cast<> is type-checked by enum so use
           // static_cast for iceberg nodes.
-          auto* parquet_scan =
-            (node->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN)
-              ? static_cast<op::sirius_physical_parquet_scan*>(node)
-              : &node->Cast<op::sirius_physical_parquet_scan>();
+          auto* parquet_scan = (node->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN)
+                                 ? static_cast<op::sirius_physical_parquet_scan*>(node)
+                                 : &node->Cast<op::sirius_physical_parquet_scan>();
           while (true) {
             pipeline->mark_task_created();
             auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();

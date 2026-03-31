@@ -54,6 +54,6 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
  * @throws                std::runtime_error on I/O or parse errors.
  */
 std::vector<std::string> read_iceberg_manifest_delete_files(const std::string& path,
-                                                            int                target_content);
+                                                            int target_content);
 
 }  // namespace sirius::op::scan

@@ -19,8 +19,7 @@
 namespace sirius {
 namespace op {
 
-sirius_physical_iceberg_scan::sirius_physical_iceberg_scan(
-  sirius_physical_table_scan* table_scan)
+sirius_physical_iceberg_scan::sirius_physical_iceberg_scan(sirius_physical_table_scan* table_scan)
   : sirius_physical_iceberg_scan(
       table_scan->types,
       table_scan->function,
@@ -51,17 +50,17 @@ sirius_physical_iceberg_scan::sirius_physical_iceberg_scan(
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p)
   : sirius_physical_parquet_scan(std::move(types),
-                                  std::move(function_p),
-                                  std::move(bind_data_p),
-                                  std::move(returned_types_p),
-                                  std::move(column_ids_p),
-                                  std::move(projection_ids_p),
-                                  std::move(names_p),
-                                  std::move(table_filters_p),
-                                  estimated_cardinality,
-                                  std::move(extra_info),
-                                  std::move(parameters_p),
-                                  std::move(virtual_columns_p))
+                                 std::move(function_p),
+                                 std::move(bind_data_p),
+                                 std::move(returned_types_p),
+                                 std::move(column_ids_p),
+                                 std::move(projection_ids_p),
+                                 std::move(names_p),
+                                 std::move(table_filters_p),
+                                 estimated_cardinality,
+                                 std::move(extra_info),
+                                 std::move(parameters_p),
+                                 std::move(virtual_columns_p))
 {
   // Override the type set by the parquet scan base constructor
   type = SiriusPhysicalOperatorType::ICEBERG_SCAN;

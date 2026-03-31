@@ -283,7 +283,7 @@ class host_parquet_representation : public cucascade::idata_representation {
    * checking has_post_convert_fn().
    */
   [[nodiscard]] std::unique_ptr<cudf::table> apply_post_convert(std::unique_ptr<cudf::table> tbl,
-                                                                 rmm::cuda_stream_view stream)
+                                                                rmm::cuda_stream_view stream)
   {
     return _post_convert_fn(std::move(tbl), _data_file_path, compute_first_row_offset(), stream);
   }

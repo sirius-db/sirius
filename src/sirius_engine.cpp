@@ -20,6 +20,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "log/logging.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -27,12 +28,11 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -304,8 +304,8 @@ void sirius_engine::prefetch_iceberg_metadata(op::sirius_physical_operator& plan
   // SiriusContext.  InternalQueryGuard suppresses those side-effects.
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
-    SIRIUS_LOG_WARN(
-      "[sirius_engine] SiriusContext not available; treating iceberg '{}' as V1.", table_path);
+    SIRIUS_LOG_WARN("[sirius_engine] SiriusContext not available; treating iceberg '{}' as V1.",
+                    table_path);
     iceberg_metadata_cache_.emplace(table_path, op::scan::IcebergDeleteFiles{});
     return;
   }
@@ -324,8 +324,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "Sirius context is not initialized. Ensure load_sirius() is called or ~/.sirius/sirius.cfg "
       "exists.");
   }
-  const sirius::operator_params& op_params =
-    sirius_ctx_ptr->get_config().get_operator_params();
+  const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
   {
     // lock_guard<mutex> elock(executor_lock);
     sirius_physical_plan = &plan;

@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <op/scan/iceberg_equality_delete_mask.hpp>
-
 #include <cudf/column/column_factories.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/types.hpp>
@@ -23,6 +21,8 @@
 #include <rmm/exec_policy.hpp>
 
 #include <thrust/transform.h>
+
+#include <op/scan/iceberg_equality_delete_mask.hpp>
 
 namespace sirius::op::scan {
 

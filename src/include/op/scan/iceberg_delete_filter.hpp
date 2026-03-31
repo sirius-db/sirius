@@ -88,8 +88,7 @@ class positional_delete_filter : public iceberg_delete_filter {
    * @param deletes Map of data_file_path -> sorted positions to delete.
    *                Ownership is moved in.
    */
-  explicit positional_delete_filter(
-    std::unordered_map<std::string, std::vector<int64_t>> deletes);
+  explicit positional_delete_filter(std::unordered_map<std::string, std::vector<int64_t>> deletes);
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      std::string const& data_file_path,

@@ -51,8 +51,8 @@ namespace {
 
 static int64_t read_vlong(const uint8_t*& p, const uint8_t* end)
 {
-  uint64_t n     = 0;
-  int      shift = 0;
+  uint64_t n = 0;
+  int shift  = 0;
   while (p < end && (*p & 0x80u)) {
     n |= uint64_t(*p & 0x7Fu) << shift;
     shift += 7;
@@ -116,9 +116,9 @@ enum class AvroKind {
 struct AvroField;  // forward declaration
 
 struct AvroType {
-  AvroKind             kind   = AvroKind::Null;
-  std::vector<AvroType> union_branches;    // AvroKind::Union
-  std::vector<AvroField> record_fields;   // AvroKind::Record
+  AvroKind kind = AvroKind::Null;
+  std::vector<AvroType> union_branches;  // AvroKind::Union
+  std::vector<AvroField> record_fields;  // AvroKind::Record
   // Array and map item types are stored as the first element of union_branches
   // (reused as a single-element container to avoid extra allocation).
   const AvroType& item_type() const { return union_branches[0]; }
@@ -126,7 +126,7 @@ struct AvroType {
 
 struct AvroField {
   std::string name;
-  AvroType    type;
+  AvroType type;
 };
 
 // ---------------------------------------------------------------------------
@@ -145,7 +145,8 @@ struct JsonParser {
 
   void skip_ws()
   {
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+      ++p;
   }
 
   char peek()
@@ -198,11 +199,14 @@ struct JsonParser {
   void skip_object()
   {
     expect('{');
-    if (peek() == '}') { ++p; return; }
+    if (peek() == '}') {
+      ++p;
+      return;
+    }
     do {
       skip_ws();
       if (peek() == '}') break;
-      read_string_val();   // key
+      read_string_val();  // key
       expect(':');
       skip_value();
     } while (peek() == ',' && ++p);
@@ -212,7 +216,10 @@ struct JsonParser {
   void skip_array_literal()
   {
     expect('[');
-    if (peek() == ']') { ++p; return; }
+    if (peek() == ']') {
+      ++p;
+      return;
+    }
     do {
       skip_ws();
       if (peek() == ']') break;
@@ -224,9 +231,8 @@ struct JsonParser {
   void skip_number()
   {
     // Read sign, digits, decimal, exponent
-    while (p < end &&
-           ((*p >= '0' && *p <= '9') || *p == '-' || *p == '+' || *p == '.' || *p == 'e' ||
-            *p == 'E')) {
+    while (p < end && ((*p >= '0' && *p <= '9') || *p == '-' || *p == '+' || *p == '.' ||
+                       *p == 'e' || *p == 'E')) {
       ++p;
     }
   }
@@ -315,12 +321,12 @@ struct JsonParser {
           ++p;  // consume ']'
         } else if (key == "items") {
           // Array item type
-          t.kind    = AvroKind::Array;
+          t.kind        = AvroKind::Array;
           AvroType item = parse_type();
           t.union_branches.push_back(std::move(item));
         } else if (key == "values") {
           // Map value type
-          t.kind    = AvroKind::Map;
+          t.kind        = AvroKind::Map;
           AvroType item = parse_type();
           t.union_branches.push_back(std::move(item));
         } else {
@@ -365,10 +371,7 @@ struct JsonParser {
     return f;
   }
 
-  AvroType parse_schema()
-  {
-    return parse_type();
-  }
+  AvroType parse_schema() { return parse_type(); }
 };
 
 // ---------------------------------------------------------------------------
@@ -376,8 +379,8 @@ struct JsonParser {
 // ---------------------------------------------------------------------------
 
 // Forward declarations
-static void     skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t* end);
-static int64_t  skip_avro_block_items(const uint8_t*& p, const uint8_t* end);
+static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t* end);
+static int64_t skip_avro_block_items(const uint8_t*& p, const uint8_t* end);
 
 static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t* end)
 {
@@ -456,8 +459,8 @@ static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t*
 // ---------------------------------------------------------------------------
 
 struct AvroHeader {
-  AvroType             schema;
-  std::string          codec;              // "null", "deflate", "snappy", …
+  AvroType schema;
+  std::string codec;  // "null", "deflate", "snappy", …
   std::array<uint8_t, 16> sync_marker{};
 };
 
@@ -527,10 +530,10 @@ static int find_field(const AvroType& rec, const std::string& name)
 // Read a single field value from a record, skipping everything before field_idx.
 // p must be positioned at the start of the record.
 // After this call, p is at the beginning of the requested field's encoded value.
-static void advance_to_field(int                   field_idx,
-                             const AvroType&       rec_type,
-                             const uint8_t*&       p,
-                             const uint8_t*        end)
+static void advance_to_field(int field_idx,
+                             const AvroType& rec_type,
+                             const uint8_t*& p,
+                             const uint8_t* end)
 {
   for (int i = 0; i < field_idx; ++i) {
     skip_avro_value(rec_type.record_fields[i].type, p, end);
@@ -561,9 +564,9 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
   if (mp_idx < 0) { throw std::runtime_error("avro: manifest_path field not found"); }
   if (ct_idx < 0) { throw std::runtime_error("avro: content field not found"); }
 
-  int first_idx = std::min(mp_idx, ct_idx);
+  int first_idx  = std::min(mp_idx, ct_idx);
   int second_idx = std::max(mp_idx, ct_idx);
-  bool mp_first = (mp_idx < ct_idx);
+  bool mp_first  = (mp_idx < ct_idx);
 
   std::vector<std::pair<std::string, int>> result;
   std::array<uint8_t, 16> block_sync{};
@@ -585,7 +588,7 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
       advance_to_field(first_idx, hdr.schema, p, end);
 
       std::string mp_val;
-      int         ct_val = 0;
+      int ct_val = 0;
 
       if (mp_first) {
         mp_val = read_bytes_val(p, end);  // manifest_path (string)
@@ -623,7 +626,7 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
 }
 
 std::vector<std::string> read_iceberg_manifest_delete_files(const std::string& path,
-                                                            int                target_content)
+                                                            int target_content)
 {
   std::ifstream f(path, std::ios::binary);
   if (!f) { throw std::runtime_error("avro: cannot open manifest: " + path); }
@@ -646,9 +649,9 @@ std::vector<std::string> read_iceberg_manifest_delete_files(const std::string& p
   if (content_idx < 0) { throw std::runtime_error("avro: data_file.content not found"); }
   if (filepath_idx < 0) { throw std::runtime_error("avro: data_file.file_path not found"); }
 
-  int   first_df_idx  = std::min(content_idx, filepath_idx);
-  int   second_df_idx = std::max(content_idx, filepath_idx);
-  bool  content_first = (content_idx < filepath_idx);
+  int first_df_idx   = std::min(content_idx, filepath_idx);
+  int second_df_idx  = std::max(content_idx, filepath_idx);
+  bool content_first = (content_idx < filepath_idx);
 
   std::vector<std::string> result;
 
@@ -666,7 +669,7 @@ std::vector<std::string> read_iceberg_manifest_delete_files(const std::string& p
       advance_to_field(first_df_idx, df_type, p, end);
 
       std::string file_path;
-      int         file_content = 0;
+      int file_content = 0;
 
       if (content_first) {
         file_content = read_vint(p, end);

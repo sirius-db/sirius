@@ -28,6 +28,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
+
 #include <string>
 #include <unordered_map>
 #include <vector>

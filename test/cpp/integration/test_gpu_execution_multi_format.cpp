@@ -185,7 +185,7 @@ class GPUExecutionCSVFixture : public MultiFormatFixtureBase {
       if (!fs::exists(pq_path)) continue;
 
       auto result = con->Query("COPY (SELECT * FROM read_parquet('" + pq_path.string() +
-                                "')) TO '" + csv_path.string() + "' (HEADER, DELIMITER ',');");
+                               "')) TO '" + csv_path.string() + "' (HEADER, DELIMITER ',');");
       REQUIRE(result);
       REQUIRE_FALSE(result->HasError());
     }
@@ -196,7 +196,7 @@ class GPUExecutionCSVFixture : public MultiFormatFixtureBase {
       if (!fs::exists(csv_path)) continue;
 
       auto result = con->Query("CREATE VIEW " + tbl + " AS SELECT * FROM read_csv('" +
-                                csv_path.string() + "');");
+                               csv_path.string() + "');");
       REQUIRE(result);
       REQUIRE_FALSE(result->HasError());
     }
@@ -286,8 +286,7 @@ TEST_CASE_METHOD(GPUExecutionCSVFixture,
                  "gpu_execution csv - group by with sum",
                  "[integration][gpu_execution][csv][aggregate]")
 {
-  compare_gpu_vs_cpu(
-    "select n_regionkey, count(*) as cnt from nation group by n_regionkey;");
+  compare_gpu_vs_cpu("select n_regionkey, count(*) as cnt from nation group by n_regionkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionCSVFixture,
@@ -462,12 +461,11 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     v1_path   = (root / "substrait/data/iceberg_v1").string();
     v2_path   = (root / "substrait/data/iceberg_v2_delete").string();
 
-    auto load_result = con->Query("LOAD '" + ICEBERG_EXT_PATH + "';");
-    iceberg_available =
-      fs::exists(ICEBERG_EXT_PATH) && load_result && !load_result->HasError();
+    auto load_result  = con->Query("LOAD '" + ICEBERG_EXT_PATH + "';");
+    iceberg_available = fs::exists(ICEBERG_EXT_PATH) && load_result && !load_result->HasError();
   }
 
-  bool    iceberg_available = false;
+  bool iceberg_available = false;
   std::string v1_path;
   std::string v2_path;
 };
@@ -476,7 +474,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V1 basic scan",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!iceberg_available) { WARN("iceberg extension not available — skipping"); return; }
+  if (!iceberg_available) {
+    WARN("iceberg extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT fruit, count FROM iceberg_scan('" + v1_path + "') ORDER BY count;");
 }
 
@@ -484,7 +485,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V1 count(*)",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!iceberg_available) { WARN("iceberg extension not available — skipping"); return; }
+  if (!iceberg_available) {
+    WARN("iceberg extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT count(*) FROM iceberg_scan('" + v1_path + "');");
 }
 
@@ -492,16 +496,22 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V1 filter and order by",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!iceberg_available) { WARN("iceberg extension not available — skipping"); return; }
-  compare_gpu_vs_cpu(
-    "SELECT fruit, count FROM iceberg_scan('" + v1_path + "') WHERE count > 1 ORDER BY count;");
+  if (!iceberg_available) {
+    WARN("iceberg extension not available — skipping");
+    return;
+  }
+  compare_gpu_vs_cpu("SELECT fruit, count FROM iceberg_scan('" + v1_path +
+                     "') WHERE count > 1 ORDER BY count;");
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes basic scan",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!iceberg_available) { WARN("iceberg extension not available — skipping"); return; }
+  if (!iceberg_available) {
+    WARN("iceberg extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT fruit, count FROM iceberg_scan('" + v2_path + "') ORDER BY count;");
 }
 
@@ -509,7 +519,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes count(*)",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!iceberg_available) { WARN("iceberg extension not available — skipping"); return; }
+  if (!iceberg_available) {
+    WARN("iceberg extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT count(*) FROM iceberg_scan('" + v2_path + "');");
 }
 
@@ -517,9 +530,12 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes order by desc",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!iceberg_available) { WARN("iceberg extension not available — skipping"); return; }
-  compare_gpu_vs_cpu(
-    "SELECT fruit, count FROM iceberg_scan('" + v2_path + "') ORDER BY count DESC;");
+  if (!iceberg_available) {
+    WARN("iceberg extension not available — skipping");
+    return;
+  }
+  compare_gpu_vs_cpu("SELECT fruit, count FROM iceberg_scan('" + v2_path +
+                     "') ORDER BY count DESC;");
 }
 
 //===----------------------------------------------------------------------===//
@@ -547,8 +563,7 @@ class GPUExecutionIcebergEqualityDeleteFixture : public GPUExecutionIcebergFixtu
   GPUExecutionIcebergEqualityDeleteFixture()
   {
     eq_path = (get_project_root() / "substrait/data/iceberg_v2_equality_delete").string();
-    eq_dataset_available =
-      iceberg_available && fs::exists(eq_path + "/metadata/version-hint.text");
+    eq_dataset_available = iceberg_available && fs::exists(eq_path + "/metadata/version-hint.text");
   }
 
   std::unique_ptr<duckdb::MaterializedQueryResult> run_gpu(const std::string& query)
@@ -562,7 +577,7 @@ class GPUExecutionIcebergEqualityDeleteFixture : public GPUExecutionIcebergFixtu
     return result;
   }
 
-  bool        eq_dataset_available = false;
+  bool eq_dataset_available = false;
   std::string eq_path;
 };
 
@@ -570,7 +585,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes basic scan",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!eq_dataset_available) { WARN("equality-delete dataset not available — skipping"); return; }
+  if (!eq_dataset_available) {
+    WARN("equality-delete dataset not available — skipping");
+    return;
+  }
 
   // Expected: apple/1, cherry/3, elderberry/5 (ordered by count ASC)
   auto result = run_gpu("SELECT fruit, count FROM iceberg_scan('" + eq_path + "') ORDER BY count");
@@ -587,7 +605,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes count(*)",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!eq_dataset_available) { WARN("equality-delete dataset not available — skipping"); return; }
+  if (!eq_dataset_available) {
+    WARN("equality-delete dataset not available — skipping");
+    return;
+  }
   // DuckDB optimizes count(*) to read row counts from parquet footer metadata,
   // bypassing the actual data scan — so the equality delete hook never fires.
   // This is a pre-existing metadata-only scan optimization bug, not specific to
@@ -600,7 +621,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes filter on surviving rows",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!eq_dataset_available) { WARN("equality-delete dataset not available — skipping"); return; }
+  if (!eq_dataset_available) {
+    WARN("equality-delete dataset not available — skipping");
+    return;
+  }
 
   // count > 2 among surviving rows → cherry/3, elderberry/5
   auto result = run_gpu("SELECT fruit, count FROM iceberg_scan('" + eq_path +
@@ -639,7 +663,7 @@ static void check_eq(duckdb::Connection& con,
 
   // Sort GPU result by count for deterministic comparison
   std::string sort_q = "SELECT * FROM gpu_execution(\"" + query + "\") ORDER BY count";
-  auto sorted = con.Query(sort_q);
+  auto sorted        = con.Query(sort_q);
   REQUIRE(sorted);
   REQUIRE_FALSE(sorted->HasError());
 
@@ -660,16 +684,12 @@ class GPUExecutionIcebergEqStressFixture : public GPUExecutionIcebergFixture {
     combined_path   = (root / "substrait/data/iceberg_v2_eq_pos_combined").string();
     multi_data_path = (root / "substrait/data/iceberg_v2_eq_multi_data_file").string();
 
-    auto check = [](const std::string& p) {
-      return fs::exists(p + "/metadata/version-hint.text");
-    };
-    datasets_available = iceberg_available &&
-                         check(single_col_path) && check(multi_del_path) &&
-                         check(all_del_path)    && check(combined_path)  &&
-                         check(multi_data_path);
+    auto check = [](const std::string& p) { return fs::exists(p + "/metadata/version-hint.text"); };
+    datasets_available = iceberg_available && check(single_col_path) && check(multi_del_path) &&
+                         check(all_del_path) && check(combined_path) && check(multi_data_path);
   }
 
-  bool        datasets_available = false;
+  bool datasets_available = false;
   std::string single_col_path;
   std::string multi_del_path;
   std::string all_del_path;
@@ -681,7 +701,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
                  "gpu_execution iceberg - V2 equality deletes single-column key",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  if (!datasets_available) {
+    WARN("stress datasets not available — skipping");
+    return;
+  }
   // Key is only the fruit column (field_id=1); count is not part of the key.
   // Delete entries: "banana", "date" → surviving: apple/1, cherry/3, elderberry/5
   check_eq(*con,
@@ -693,7 +716,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
                  "gpu_execution iceberg - V2 equality deletes multiple delete files",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  if (!datasets_available) {
+    WARN("stress datasets not available — skipping");
+    return;
+  }
   // Two separate equality-delete parquet files (one row each): tests concatenate+deduplicate path.
   // Delete file 1: banana/2; delete file 2: date/4 → surviving: apple/1, cherry/3, elderberry/5
   check_eq(*con,
@@ -705,11 +731,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
                  "gpu_execution iceberg - V2 equality deletes all rows deleted",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  if (!datasets_available) {
+    WARN("stress datasets not available — skipping");
+    return;
+  }
   // Delete file covers all 3 data rows → result must be empty.
   // Tests apply_boolean_mask on an all-false mask.
-  auto result = con->Query(
-    "CALL gpu_execution(\"SELECT fruit, count FROM iceberg_scan('" + all_del_path + "')\")");
+  auto result = con->Query("CALL gpu_execution(\"SELECT fruit, count FROM iceberg_scan('" +
+                           all_del_path + "')\")");
   REQUIRE(result);
   if (result->HasError()) { UNSCOPED_INFO("gpu error: " << result->GetError()); }
   REQUIRE_FALSE(result->HasError());
@@ -720,7 +749,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
                  "gpu_execution iceberg - V2 equality and positional deletes combined",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  if (!datasets_available) {
+    WARN("stress datasets not available — skipping");
+    return;
+  }
   // Positional delete removes row 0 (apple/1); equality delete removes banana/2.
   // Tests chain_hooks firing both hooks in sequence.
   // Surviving: cherry/3, date/4, elderberry/5
@@ -733,7 +765,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
                  "gpu_execution iceberg - V2 equality deletes multiple data files",
                  "[integration][gpu_execution][iceberg]")
 {
-  if (!datasets_available) { WARN("stress datasets not available — skipping"); return; }
+  if (!datasets_available) {
+    WARN("stress datasets not available — skipping");
+    return;
+  }
   // Two data parquet files; one equality-delete file removes one row from each.
   // File 1: apple/1, banana/2, cherry/3 — delete banana/2
   // File 2: date/4, elderberry/5, fig/6  — delete elderberry/5
@@ -742,4 +777,3 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
            "SELECT fruit, count FROM iceberg_scan('" + multi_data_path + "') ORDER BY count",
            {{"apple", 1}, {"cherry", 3}, {"date", 4}, {"fig", 6}});
 }
-

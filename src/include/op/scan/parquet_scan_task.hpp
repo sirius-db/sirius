@@ -306,12 +306,11 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    *                                equality-delete key columns).
    * @param approximate_batch_size  Target uncompressed batch size for partitioning.
    */
-  parquet_scan_task_global_state(
-    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-    sirius_physical_parquet_scan* scan_op,
-    std::vector<std::string> file_paths,
-    std::vector<size_t> selected_column_indices,
-    size_t approximate_batch_size);
+  parquet_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+                                 sirius_physical_parquet_scan* scan_op,
+                                 std::vector<std::string> file_paths,
+                                 std::vector<size_t> selected_column_indices,
+                                 size_t approximate_batch_size);
 
  private:
   /**
