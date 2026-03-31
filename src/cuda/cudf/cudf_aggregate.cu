@@ -127,6 +127,10 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
         } else if (num_rows > 1) {
           to_cudf_type = cudf::data_type(cudf::type_id::INT32);
         }
+      } else if (to_cudf_type.id() == cudf::type_id::INT64) {
+        // INT64 SUM can overflow - GPU doesn't support INT128 accumulator
+        // Throw exception to trigger CPU fallback which handles overflow correctly
+        throw NotImplementedException("GPU SUM of BIGINT may overflow - falling back to CPU");
       }
 
       // CuDF reduce will return an invalid scalar if all values are NULL
