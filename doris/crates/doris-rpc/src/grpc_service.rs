@@ -19,6 +19,20 @@ use super::hash_partitioner::{partition_strategy_from_thrift, ExchangeInfo};
 use result_formatter::result_store::{FinstId, ResultStore};
 use sirius_ffi::SiriusEngine;
 
+/// Deduplicate column names by appending `_N` suffixes for duplicates.
+/// Substrait plans use column indices (not names), so names just need to
+/// be unique for DuckDB's table creation. Self-joins (e.g., Q7's
+/// `nation n1, nation n2`) produce duplicate column names like
+/// `n_nationkey, n_name, n_nationkey, n_name`.
+fn dedup_column_names(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    names.into_iter().map(|name| {
+        let count = seen.entry(name.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 { name } else { format!("{}_{}", name, *count - 1) }
+    }).collect()
+}
+
 use super::exchange_buffer::{ExchangeBuffer, ExchangeKey};
 use super::exchange_sender::ExchangeDest;
 use super::heartbeat_service::BeState;
@@ -1862,6 +1876,19 @@ impl PBackendService for PBackendServiceHandler {
                                 Some(defs)
                             })().unwrap_or_default();
 
+                            // Deduplicate column defs (self-joins produce duplicate names
+                            // like n_nationkey, n_name, n_nationkey, n_name).
+                            let col_defs = {
+                                let names: Vec<String> = col_defs.iter().map(|d| {
+                                    d.split('"').nth(1).unwrap_or("").to_string()
+                                }).collect();
+                                let types: Vec<String> = col_defs.iter().map(|d| {
+                                    d.rsplit_once('"').map(|(_, t)| t.trim().to_string()).unwrap_or_default()
+                                }).collect();
+                                let deduped = dedup_column_names(names);
+                                deduped.into_iter().zip(types).map(|(n, t)| format!("\"{}\" {}", n, t)).collect::<Vec<_>>()
+                            };
+
                             let engine_guard = engine.lock().unwrap();
                             if !col_defs.is_empty() {
                                 let create_sql = format!(
@@ -1954,8 +1981,8 @@ impl PBackendService for PBackendServiceHandler {
                             })
                             .collect();
 
-                        let column_names: Vec<String> =
-                            keep_indices.iter().enumerate().map(|(out_idx, &i)| {
+                        let column_names: Vec<String> = {
+                            let raw: Vec<String> = keep_indices.iter().enumerate().map(|(out_idx, &i)| {
                                 let name = &col_info[i].0;
                                 // Sanitize: column names with special chars (parens, quotes,
                                 // hash signs) break SQL CREATE TABLE and Substrait NamedTable.
@@ -1966,6 +1993,9 @@ impl PBackendService for PBackendServiceHandler {
                                     name.clone()
                                 }
                             }).collect();
+                            // Deduplicate (self-joins produce duplicate column names).
+                            dedup_column_names(raw)
+                        };
                         let column_types_sql: Vec<String> =
                             keep_indices.iter().map(|&i| col_info[i].1.clone()).collect();
 
