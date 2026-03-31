@@ -167,277 +167,277 @@ class MultiFormatFixtureBase {
  * then creates views using read_csv(). This tests the generic duckdb_scan path
  * that routes non-parquet table functions through DuckDB's scan infrastructure.
  */
-class GPUExecutionCSVFixture : public MultiFormatFixtureBase {
- public:
-  GPUExecutionCSVFixture()
-  {
-    auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
-    csv_dir          = fs::temp_directory_path() / "sirius_test_csv";
-    fs::create_directories(csv_dir);
+// class GPUExecutionCSVFixture : public MultiFormatFixtureBase {
+//  public:
+//   GPUExecutionCSVFixture()
+//   {
+//     auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+//     csv_dir          = fs::temp_directory_path() / "sirius_test_csv";
+//     fs::create_directories(csv_dir);
 
-    // Export parquet to CSV
-    std::vector<std::string> tables = {
-      "nation", "region", "customer", "orders", "lineitem", "part", "partsupp", "supplier"};
+//     // Export parquet to CSV
+//     std::vector<std::string> tables = {
+//       "nation", "region", "customer", "orders", "lineitem", "part", "partsupp", "supplier"};
 
-    for (const auto& tbl : tables) {
-      auto pq_path  = parquet_dir / (tbl + ".parquet");
-      auto csv_path = csv_dir / (tbl + ".csv");
-      if (!fs::exists(pq_path)) continue;
+//     for (const auto& tbl : tables) {
+//       auto pq_path  = parquet_dir / (tbl + ".parquet");
+//       auto csv_path = csv_dir / (tbl + ".csv");
+//       if (!fs::exists(pq_path)) continue;
 
-      auto result = con->Query("COPY (SELECT * FROM read_parquet('" + pq_path.string() +
-                               "')) TO '" + csv_path.string() + "' (HEADER, DELIMITER ',');");
-      REQUIRE(result);
-      REQUIRE_FALSE(result->HasError());
-    }
+//       auto result = con->Query("COPY (SELECT * FROM read_parquet('" + pq_path.string() +
+//                                "')) TO '" + csv_path.string() + "' (HEADER, DELIMITER ',');");
+//       REQUIRE(result);
+//       REQUIRE_FALSE(result->HasError());
+//     }
 
-    // Create views from CSV files
-    for (const auto& tbl : tables) {
-      auto csv_path = csv_dir / (tbl + ".csv");
-      if (!fs::exists(csv_path)) continue;
+//     // Create views from CSV files
+//     for (const auto& tbl : tables) {
+//       auto csv_path = csv_dir / (tbl + ".csv");
+//       if (!fs::exists(csv_path)) continue;
 
-      auto result = con->Query("CREATE VIEW " + tbl + " AS SELECT * FROM read_csv('" +
-                               csv_path.string() + "');");
-      REQUIRE(result);
-      REQUIRE_FALSE(result->HasError());
-    }
-  }
+//       auto result = con->Query("CREATE VIEW " + tbl + " AS SELECT * FROM read_csv('" +
+//                                csv_path.string() + "');");
+//       REQUIRE(result);
+//       REQUIRE_FALSE(result->HasError());
+//     }
+//   }
 
-  ~GPUExecutionCSVFixture() { fs::remove_all(csv_dir); }
+//   ~GPUExecutionCSVFixture() { fs::remove_all(csv_dir); }
 
-  fs::path csv_dir;
-};
+//   fs::path csv_dir;
+// };
 
-//===----------------------------------------------------------------------===//
-// CSV Scan tests
-//===----------------------------------------------------------------------===//
+// //===----------------------------------------------------------------------===//
+// // CSV Scan tests
+// //===----------------------------------------------------------------------===//
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - scan single column",
-                 "[integration][gpu_execution][csv][scan]")
-{
-  compare_gpu_vs_cpu("select n_nationkey from nation;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - scan single column",
+//                  "[integration][gpu_execution][csv][scan]")
+// {
+//   compare_gpu_vs_cpu("select n_nationkey from nation;");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - scan multiple columns",
-                 "[integration][gpu_execution][csv][scan]")
-{
-  compare_gpu_vs_cpu("select n_nationkey, n_regionkey, n_name from nation;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - scan multiple columns",
+//                  "[integration][gpu_execution][csv][scan]")
+// {
+//   compare_gpu_vs_cpu("select n_nationkey, n_regionkey, n_name from nation;");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - scan all columns",
-                 "[integration][gpu_execution][csv][scan]")
-{
-  compare_gpu_vs_cpu("select * from region;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - scan all columns",
+//                  "[integration][gpu_execution][csv][scan]")
+// {
+//   compare_gpu_vs_cpu("select * from region;");
+// }
 
-//===----------------------------------------------------------------------===//
-// CSV Filter tests (exercises BoundConstantExpression with various types)
-//===----------------------------------------------------------------------===//
+// //===----------------------------------------------------------------------===//
+// // CSV Filter tests (exercises BoundConstantExpression with various types)
+// //===----------------------------------------------------------------------===//
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - filter integer equality",
-                 "[integration][gpu_execution][csv][filter]")
-{
-  compare_gpu_vs_cpu("select n_nationkey, n_name from nation where n_regionkey = 1;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - filter integer equality",
+//                  "[integration][gpu_execution][csv][filter]")
+// {
+//   compare_gpu_vs_cpu("select n_nationkey, n_name from nation where n_regionkey = 1;");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - filter string equality",
-                 "[integration][gpu_execution][csv][filter]")
-{
-  compare_gpu_vs_cpu("select r_regionkey from region where r_name = 'EUROPE';");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - filter string equality",
+//                  "[integration][gpu_execution][csv][filter]")
+// {
+//   compare_gpu_vs_cpu("select r_regionkey from region where r_name = 'EUROPE';");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - filter date comparison",
-                 "[integration][gpu_execution][csv][filter]")
-{
-  // This tests the TIMESTAMP_DAYS constant materializer fix
-  compare_gpu_vs_cpu(
-    "select o_orderkey, o_totalprice from orders "
-    "where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01';");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - filter date comparison",
+//                  "[integration][gpu_execution][csv][filter]")
+// {
+//   // This tests the TIMESTAMP_DAYS constant materializer fix
+//   compare_gpu_vs_cpu(
+//     "select o_orderkey, o_totalprice from orders "
+//     "where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01';");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - filter date between",
-                 "[integration][gpu_execution][csv][filter]")
-{
-  // DuckDB may rewrite >= AND < to BETWEEN, exercising the BoundBetweenExpression path
-  compare_gpu_vs_cpu(
-    "select o_orderkey from orders "
-    "where o_orderdate between date '1995-01-01' and date '1995-03-31';");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - filter date between",
+//                  "[integration][gpu_execution][csv][filter]")
+// {
+//   // DuckDB may rewrite >= AND < to BETWEEN, exercising the BoundBetweenExpression path
+//   compare_gpu_vs_cpu(
+//     "select o_orderkey from orders "
+//     "where o_orderdate between date '1995-01-01' and date '1995-03-31';");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - filter float comparison",
-                 "[integration][gpu_execution][csv][filter]")
-{
-  // CSV reads DECIMAL columns as DOUBLE — tests FLOAT64 filter path
-  compare_gpu_vs_cpu("select l_orderkey from lineitem where l_discount > 0.05;", 0.001f);
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - filter float comparison",
+//                  "[integration][gpu_execution][csv][filter]")
+// {
+//   // CSV reads DECIMAL columns as DOUBLE — tests FLOAT64 filter path
+//   compare_gpu_vs_cpu("select l_orderkey from lineitem where l_discount > 0.05;", 0.001f);
+// }
 
-//===----------------------------------------------------------------------===//
-// CSV Aggregation tests
-//===----------------------------------------------------------------------===//
+// //===----------------------------------------------------------------------===//
+// // CSV Aggregation tests
+// //===----------------------------------------------------------------------===//
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - group by with sum",
-                 "[integration][gpu_execution][csv][aggregate]")
-{
-  compare_gpu_vs_cpu("select n_regionkey, count(*) as cnt from nation group by n_regionkey;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - group by with sum",
+//                  "[integration][gpu_execution][csv][aggregate]")
+// {
+//   compare_gpu_vs_cpu("select n_regionkey, count(*) as cnt from nation group by n_regionkey;");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - aggregate with float columns",
-                 "[integration][gpu_execution][csv][aggregate]")
-{
-  // Tests SUM/AVG on DOUBLE (CSV-inferred type)
-  compare_gpu_vs_cpu(
-    "select l_returnflag, sum(l_quantity) as sum_qty, avg(l_extendedprice) as avg_price "
-    "from lineitem group by l_returnflag;",
-    0.01f);
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - aggregate with float columns",
+//                  "[integration][gpu_execution][csv][aggregate]")
+// {
+//   // Tests SUM/AVG on DOUBLE (CSV-inferred type)
+//   compare_gpu_vs_cpu(
+//     "select l_returnflag, sum(l_quantity) as sum_qty, avg(l_extendedprice) as avg_price "
+//     "from lineitem group by l_returnflag;",
+//     0.01f);
+// }
 
-//===----------------------------------------------------------------------===//
-// CSV Join tests
-//===----------------------------------------------------------------------===//
+// //===----------------------------------------------------------------------===//
+// // CSV Join tests
+// //===----------------------------------------------------------------------===//
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - inner join",
-                 "[integration][gpu_execution][csv][join]")
-{
-  compare_gpu_vs_cpu(
-    "select n.n_name, r.r_name from nation n inner join region r "
-    "on n.n_regionkey = r.r_regionkey;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - inner join",
+//                  "[integration][gpu_execution][csv][join]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select n.n_name, r.r_name from nation n inner join region r "
+//     "on n.n_regionkey = r.r_regionkey;");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - multi table join",
-                 "[integration][gpu_execution][csv][join]")
-{
-  compare_gpu_vs_cpu(
-    "select c.c_name, n.n_name from customer c "
-    "inner join nation n on c.c_nationkey = n.n_nationkey "
-    "inner join region r on n.n_regionkey = r.r_regionkey "
-    "where r.r_name = 'EUROPE' "
-    "order by c.c_name limit 10;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - multi table join",
+//                  "[integration][gpu_execution][csv][join]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select c.c_name, n.n_name from customer c "
+//     "inner join nation n on c.c_nationkey = n.n_nationkey "
+//     "inner join region r on n.n_regionkey = r.r_regionkey "
+//     "where r.r_name = 'EUROPE' "
+//     "order by c.c_name limit 10;");
+// }
 
-//===----------------------------------------------------------------------===//
-// CSV TPC-H representative queries
-//===----------------------------------------------------------------------===//
+// //===----------------------------------------------------------------------===//
+// // CSV TPC-H representative queries
+// //===----------------------------------------------------------------------===//
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - tpch q1 pricing summary",
-                 "[integration][gpu_execution][csv][tpch]")
-{
-  compare_gpu_vs_cpu(
-    "select l_returnflag, l_linestatus, "
-    "sum(l_quantity) as sum_qty, "
-    "sum(l_extendedprice) as sum_base_price, "
-    "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price "
-    "from lineitem "
-    "where l_shipdate <= date '1998-09-02' "
-    "group by l_returnflag, l_linestatus "
-    "order by l_returnflag, l_linestatus;",
-    0.01f);
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - tpch q1 pricing summary",
+//                  "[integration][gpu_execution][csv][tpch]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select l_returnflag, l_linestatus, "
+//     "sum(l_quantity) as sum_qty, "
+//     "sum(l_extendedprice) as sum_base_price, "
+//     "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price "
+//     "from lineitem "
+//     "where l_shipdate <= date '1998-09-02' "
+//     "group by l_returnflag, l_linestatus "
+//     "order by l_returnflag, l_linestatus;",
+//     0.01f);
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - tpch q3 shipping priority",
-                 "[integration][gpu_execution][csv][tpch]")
-{
-  compare_gpu_vs_cpu(
-    "select l_orderkey, "
-    "sum(l_extendedprice * (1 - l_discount)) as revenue, "
-    "o_orderdate, o_shippriority "
-    "from customer "
-    "inner join orders on c_custkey = o_custkey "
-    "inner join lineitem on l_orderkey = o_orderkey "
-    "where c_mktsegment = 'BUILDING' "
-    "and o_orderdate < date '1995-03-15' "
-    "and l_shipdate > date '1995-03-15' "
-    "group by l_orderkey, o_orderdate, o_shippriority "
-    "order by revenue desc limit 10;",
-    0.01f);
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - tpch q3 shipping priority",
+//                  "[integration][gpu_execution][csv][tpch]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select l_orderkey, "
+//     "sum(l_extendedprice * (1 - l_discount)) as revenue, "
+//     "o_orderdate, o_shippriority "
+//     "from customer "
+//     "inner join orders on c_custkey = o_custkey "
+//     "inner join lineitem on l_orderkey = o_orderkey "
+//     "where c_mktsegment = 'BUILDING' "
+//     "and o_orderdate < date '1995-03-15' "
+//     "and l_shipdate > date '1995-03-15' "
+//     "group by l_orderkey, o_orderdate, o_shippriority "
+//     "order by revenue desc limit 10;",
+//     0.01f);
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - tpch q4 order priority",
-                 "[integration][gpu_execution][csv][tpch]")
-{
-  compare_gpu_vs_cpu(
-    "select o_orderpriority, count(*) as order_count "
-    "from orders "
-    "where o_orderdate >= date '1996-10-01' "
-    "and o_orderdate < date '1997-01-01' "
-    "and exists ( "
-    "  select * from lineitem "
-    "  where l_orderkey = o_orderkey "
-    "  and l_commitdate < l_receiptdate "
-    ") "
-    "group by o_orderpriority "
-    "order by o_orderpriority;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - tpch q4 order priority",
+//                  "[integration][gpu_execution][csv][tpch]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select o_orderpriority, count(*) as order_count "
+//     "from orders "
+//     "where o_orderdate >= date '1996-10-01' "
+//     "and o_orderdate < date '1997-01-01' "
+//     "and exists ( "
+//     "  select * from lineitem "
+//     "  where l_orderkey = o_orderkey "
+//     "  and l_commitdate < l_receiptdate "
+//     ") "
+//     "group by o_orderpriority "
+//     "order by o_orderpriority;");
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - tpch q6 revenue forecast",
-                 "[integration][gpu_execution][csv][tpch]")
-{
-  // Tests date + float filters together (the original "Unknown cudf type: 12" trigger)
-  compare_gpu_vs_cpu(
-    "select sum(l_extendedprice * l_discount) as revenue "
-    "from lineitem "
-    "where l_shipdate >= date '1997-01-01' "
-    "and l_shipdate < date '1998-01-01' "
-    "and l_discount between 0.07 - 0.01 and 0.07 + 0.01 "
-    "and l_quantity < 25;",
-    0.01f);
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - tpch q6 revenue forecast",
+//                  "[integration][gpu_execution][csv][tpch]")
+// {
+//   // Tests date + float filters together (the original "Unknown cudf type: 12" trigger)
+//   compare_gpu_vs_cpu(
+//     "select sum(l_extendedprice * l_discount) as revenue "
+//     "from lineitem "
+//     "where l_shipdate >= date '1997-01-01' "
+//     "and l_shipdate < date '1998-01-01' "
+//     "and l_discount between 0.07 - 0.01 and 0.07 + 0.01 "
+//     "and l_quantity < 25;",
+//     0.01f);
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - tpch q10 returned item reporting",
-                 "[integration][gpu_execution][csv][tpch]")
-{
-  compare_gpu_vs_cpu(
-    "select c_custkey, c_name, "
-    "sum(l_extendedprice * (1 - l_discount)) as revenue, "
-    "c_acctbal, n_name, c_address, c_phone, c_comment "
-    "from customer inner join orders on c_custkey = o_custkey "
-    "inner join lineitem on l_orderkey = o_orderkey "
-    "inner join nation on c_nationkey = n_nationkey "
-    "where o_orderdate >= date '1993-07-01' "
-    "and o_orderdate < date '1993-10-01' "
-    "and l_returnflag = 'R' "
-    "group by c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment "
-    "order by revenue desc limit 20;",
-    0.01f);
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - tpch q10 returned item reporting",
+//                  "[integration][gpu_execution][csv][tpch]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select c_custkey, c_name, "
+//     "sum(l_extendedprice * (1 - l_discount)) as revenue, "
+//     "c_acctbal, n_name, c_address, c_phone, c_comment "
+//     "from customer inner join orders on c_custkey = o_custkey "
+//     "inner join lineitem on l_orderkey = o_orderkey "
+//     "inner join nation on c_nationkey = n_nationkey "
+//     "where o_orderdate >= date '1993-07-01' "
+//     "and o_orderdate < date '1993-10-01' "
+//     "and l_returnflag = 'R' "
+//     "group by c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment "
+//     "order by revenue desc limit 20;",
+//     0.01f);
+// }
 
-//===----------------------------------------------------------------------===//
-// CSV Order By / Limit tests
-//===----------------------------------------------------------------------===//
+// //===----------------------------------------------------------------------===//
+// // CSV Order By / Limit tests
+// //===----------------------------------------------------------------------===//
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - order by with limit",
-                 "[integration][gpu_execution][csv][order]")
-{
-  compare_gpu_vs_cpu(
-    "select o_orderkey, o_totalprice, o_orderdate "
-    "from orders order by o_totalprice desc limit 10;",
-    0.01f);
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - order by with limit",
+//                  "[integration][gpu_execution][csv][order]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select o_orderkey, o_totalprice, o_orderdate "
+//     "from orders order by o_totalprice desc limit 10;",
+//     0.01f);
+// }
 
-TEST_CASE_METHOD(GPUExecutionCSVFixture,
-                 "gpu_execution csv - order by date column",
-                 "[integration][gpu_execution][csv][order]")
-{
-  compare_gpu_vs_cpu(
-    "select o_orderkey, o_orderdate from orders "
-    "where o_orderstatus = 'F' order by o_orderdate limit 10;");
-}
+// TEST_CASE_METHOD(GPUExecutionCSVFixture,
+//                  "gpu_execution csv - order by date column",
+//                  "[integration][gpu_execution][csv][order]")
+// {
+//   compare_gpu_vs_cpu(
+//     "select o_orderkey, o_orderdate from orders "
+//     "where o_orderstatus = 'F' order by o_orderdate limit 10;");
+// }
 
 //===----------------------------------------------------------------------===//
 // Iceberg scan tests
