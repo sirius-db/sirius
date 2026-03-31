@@ -18,6 +18,7 @@
 
 // sirius
 #include <config.hpp>
+#include <data/host_parquet_representation.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
@@ -40,6 +41,9 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 
+// rmm
+#include <rmm/cuda_stream_view.hpp>
+
 // standard library
 #include <atomic>
 #include <memory>
@@ -47,6 +51,28 @@
 #include <vector>
 
 namespace sirius::op::scan {
+
+//===----------------------------------------------------------------------===//
+// Utility (shared with iceberg_scan_task)
+//===----------------------------------------------------------------------===//
+namespace detail {
+/**
+ * @brief Compute the parquet column indices to read for the given scan operator.
+ *
+ * Applies projection_ids / column_ids to select only the needed columns.
+ * Virtual columns and duplicates are excluded/deduplicated.
+ * Defined in parquet_scan_task.cpp.
+ */
+std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op);
+}  // namespace detail
+
+//===----------------------------------------------------------------------===//
+// Post-Convert Hook Type
+//===----------------------------------------------------------------------===//
+// Defined in host_parquet_representation.hpp (sirius::post_convert_fn_t).
+// Re-exported here so that callers in namespace sirius::op::scan can use it
+// without a qualification.
+using sirius::post_convert_fn_t;
 
 //===----------------------------------------------------------------------===//
 // Parquet Scan Task Global State
@@ -225,6 +251,67 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return _footer_offsets[file_idx];
   }
 
+  // -------------------------------------------------------------------------
+  // Post-convert hook (used by iceberg scan for delete application)
+  // -------------------------------------------------------------------------
+
+  /**
+   * @brief Install a post-convert hook that fires after each row-group batch
+   * is decompressed to a GPU table by the host->GPU converter.
+   *
+   * The hook receives the freshly produced cudf::table and must return a
+   * (possibly filtered) replacement table. The iceberg scan path uses this to
+   * apply V2 positional and equality deletes without any pipeline operator.
+   */
+  void set_post_convert_fn(post_convert_fn_t fn) { _post_convert_fn = std::move(fn); }
+
+  [[nodiscard]] bool has_post_convert_fn() const { return _post_convert_fn != nullptr; }
+
+  /**
+   * @brief Return a copy of the installed post-convert hook.
+   *
+   * Called by compute_task to attach the hook to each host_parquet_representation
+   * so the converter can invoke it when decompressing that specific batch.
+   */
+  [[nodiscard]] post_convert_fn_t get_post_convert_fn() const { return _post_convert_fn; }
+
+  /**
+   * @brief Return the selected column indices (indices into scan_op->names, in cudf table order).
+   *
+   * Used by iceberg_scan_task_global_state to compute data_key_indices that correctly map
+   * equality-delete key names to cudf table column positions.
+   */
+  [[nodiscard]] std::vector<size_t> const& get_selected_column_indices() const
+  {
+    return _selected_column_indices;
+  }
+
+ protected:
+  /**
+   * @brief Protected constructor for subclasses that pre-process the file list.
+   *
+   * Skips the MultiFileBindData extraction step; the caller supplies already-
+   * resolved @p file_paths and @p selected_column_indices directly. Everything
+   * else (footer reads, metadata parsing, row-group partitioning) is identical
+   * to the public constructor.
+   *
+   * Used by iceberg_scan_task_global_state, which separates data files from
+   * delete files before constructing the base state.
+   *
+   * @param pipeline                The pipeline for this scan.
+   * @param scan_op                 The physical scan operator (provides column
+   *                                names for projection, exhausted flag, etc.).
+   * @param file_paths              Pre-filtered list of DATA-file paths only.
+   * @param selected_column_indices Column indices to read (may be widened for
+   *                                equality-delete key columns).
+   * @param approximate_batch_size  Target uncompressed batch size for partitioning.
+   */
+  parquet_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+                                 sirius_physical_parquet_scan* scan_op,
+                                 std::vector<std::string> file_paths,
+                                 std::vector<size_t> selected_column_indices,
+                                 size_t approximate_batch_size);
+
  private:
   /**
    * @brief Fill the vector of column indices for this scan after projection.
@@ -264,6 +351,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<size_t> _selected_column_indices;        ///< Column indices to read (projection)
 
   std::atomic<size_t> _next_rg_partition{0};  ///< Number of local states created
+
+  /// Optional hook called after each batch is decompressed to a GPU table.
+  /// Null for plain parquet scans; set by iceberg_scan_task_global_state.
+  post_convert_fn_t _post_convert_fn;
 };
 
 //===----------------------------------------------------------------------===//
