@@ -30,15 +30,11 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 
 /// \brief Post-optimization hook that captures the optimized logical plan for GPU execution.
 ///
-/// Re-enables the disabled optimizers (so they don't leak to non-GPU queries), then
-/// copies the optimized logical plan and stores it in SiriusContext for OnFinalizePrepare.
+/// Re-enables the disabled optimizers, then copies the optimized logical plan and stores
+/// it in SiriusContext. OnFinalizePrepare calls create_plan() on this copy — that is the
+/// single source of truth for whether Sirius supports the query. If create_plan() throws,
+/// we silently fall back to CPU.
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
-
-/// \brief Quick check whether a logical plan tree contains only operators that Sirius supports.
-///
-/// Walks the tree recursively. Returns false if any node is an operator type that
-/// sirius_physical_plan_generator::create_plan() would throw NotImplementedException for.
-bool is_acceleratable_query(const duckdb::LogicalOperator& root);
 
 }  // namespace sirius::transparent

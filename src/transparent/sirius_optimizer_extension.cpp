@@ -19,46 +19,11 @@
 #include "config.hpp"
 #include "sirius_context.hpp"
 
-#include <duckdb/common/enums/logical_operator_type.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/config.hpp>
 #include <spdlog/spdlog.h>
 
 namespace sirius::transparent {
-
-bool is_acceleratable_query(const duckdb::LogicalOperator& root)
-{
-  // Check if this node's operator type is supported by sirius_physical_plan_generator.
-  // This mirrors the switch statement in sirius_physical_plan_generator::create_plan().
-  switch (root.type) {
-    // Supported operators:
-    case duckdb::LogicalOperatorType::LOGICAL_GET:
-    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
-    case duckdb::LogicalOperatorType::LOGICAL_FILTER:
-    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-    case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY:
-    case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
-    case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
-    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-    case duckdb::LogicalOperatorType::LOGICAL_EMPTY_RESULT:
-    case duckdb::LogicalOperatorType::LOGICAL_CHUNK_GET:
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
-    case duckdb::LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-    case duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF: break;
-
-    // Everything else is unsupported — skip GPU execution.
-    default: return false;
-  }
-
-  // Recursively check all children.
-  for (auto& child : root.children) {
-    if (!is_acceleratable_query(*child)) { return false; }
-  }
-  return true;
-}
 
 void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
@@ -69,10 +34,8 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx || !ctx->is_initialized()) { return; }
 
-  // Unconditionally disable optimizers that produce DuckDB-internal functions
-  // Sirius can't handle. We can't gate this on is_acceleratable_query() because
-  // the pre-optimization plan shape may differ from the post-optimization shape
-  // (e.g. subqueries get flattened). The post-hook re-enables them.
+  // Disable optimizers that produce DuckDB-internal functions Sirius can't handle.
+  // The post-hook re-enables them so non-GPU queries aren't affected.
   auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
   disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
   disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
@@ -93,20 +56,16 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   disabled.erase(duckdb::OptimizerType::IN_CLAUSE);
   disabled.erase(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
 
-  if (!is_acceleratable_query(*plan)) {
-    spdlog::debug("Transparent execution: query not acceleratable (root type: {})",
-                  static_cast<int>(plan->type));
-    return;
-  }
-
+  // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this
+  // copy — that's the single source of truth for GPU support. If the plan contains
+  // unsupported operators, create_plan() throws and we fall back to CPU.
   try {
     auto plan_copy = plan->Copy(context);
     ctx->set_captured_logical_plan(std::move(plan_copy));
-    spdlog::info("Transparent execution: logical plan captured for GPU execution");
   } catch (duckdb::NotImplementedException&) {
-    spdlog::info("Transparent execution: logical plan not serializable, skipping GPU");
+    // Plan not serializable — skip GPU.
   } catch (std::exception& e) {
-    spdlog::info("Transparent execution: failed to copy logical plan: {}", e.what());
+    spdlog::debug("Transparent execution: failed to copy logical plan: {}", e.what());
   }
 }
 
