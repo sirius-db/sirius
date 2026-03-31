@@ -118,6 +118,8 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Only used in optimized table scan
   bool exhausted = false;
 
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 

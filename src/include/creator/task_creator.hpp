@@ -26,7 +26,6 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius_pipeline_hashmap.hpp"
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/data/data_batch.hpp>
@@ -184,6 +183,7 @@ class task_creator {
   sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
+  size_t _num_scans_in_plan{0};
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task

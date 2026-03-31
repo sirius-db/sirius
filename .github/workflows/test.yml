@@ -18,10 +18,11 @@ on:
     branches:
       - dev
   pull_request:
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }} # cancel existing runs on PRs but run on all `dev` commits
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `dev` and merge queue commits
 
 jobs:
   build:
@@ -82,11 +83,19 @@ jobs:
         run: |
           ./setup_test_datasets.sh
           chmod -R a+r test_datasets/
+          mkdir -p test_datasets/tpch_parquet_sf1
+          ./build/release/duckdb -f scripts/tpch_to_parquet.sql
 
-      - name: Run sqllogic tests
+      - name: TPC-H performance snapshot
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.cfg
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
         run: |
-          ./build/release/test/unittest "$PWD/test/*" | tee test.log; EXIT=${PIPESTATUS[0]}
-          if grep -qE "FAILURES SUMMARY|Error in GPUExecuteQuery" test.log || [ "$EXIT" -ne 0 ]; then
-            echo "Test failures detected!"
-            exit 1
-          fi
+          ./test/tpch_performance/benchmark_and_validate.sh 1
+          RUN_DIR=$(ls -td runs/*/ | head -1)
+          {
+            echo "## TPC-H Performance (SF1)"
+            echo '```'
+            cat "$RUN_DIR/comparison.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

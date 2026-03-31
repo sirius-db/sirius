@@ -166,12 +166,14 @@ struct ComparisonDispatcher {
   template <typename T>
   std::unique_ptr<cudf::column> DoScalarComparison(const cudf::column_view& left,
                                                    const T& right_value,
+                                                   bool right_is_null,
                                                    const cudf::data_type& return_type)
   {
     if constexpr (std::is_same_v<T, std::string>) {
       // Create a string scalar from the constant value
-      auto string_scalar =
-        cudf::string_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+      auto string_scalar = cudf::string_scalar(
+        right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
+
       return cudf::binary_operation(left,
                                     string_scalar,
                                     ComparisonOp,
@@ -181,9 +183,11 @@ struct ComparisonDispatcher {
     } else if constexpr (std::is_same_v<T, int32_t>) {
       // For int32_t, check at runtime if this is a TIMESTAMP_DAYS comparison
       if (left.type().id() == cudf::type_id::TIMESTAMP_DAYS) {
-        auto date_scalar = cudf::timestamp_scalar<cudf::timestamp_D>(
-          cudf::duration_D{right_value}, true, executor.execution_stream, executor.resource_ref);
-        auto result = cudf::binary_operation(left,
+        auto date_scalar = cudf::timestamp_scalar<cudf::timestamp_D>(cudf::duration_D{right_value},
+                                                                     !right_is_null,
+                                                                     executor.execution_stream,
+                                                                     executor.resource_ref);
+        auto result      = cudf::binary_operation(left,
                                              date_scalar,
                                              ComparisonOp,
                                              return_type,
@@ -192,8 +196,8 @@ struct ComparisonDispatcher {
         return result;
       } else {
         // Regular int32_t comparison
-        auto numeric_scalar =
-          cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+        auto numeric_scalar = cudf::numeric_scalar(
+          right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
         return cudf::binary_operation(left,
                                       numeric_scalar,
                                       ComparisonOp,
@@ -205,8 +209,10 @@ struct ComparisonDispatcher {
       // For int64_t, check at runtime if this is a timestamp comparison
       switch (left.type().id()) {
         case cudf::type_id::TIMESTAMP_SECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_s>(
-            cudf::duration_s{right_value}, true, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_s>(cudf::duration_s{right_value},
+                                                                     !right_is_null,
+                                                                     executor.execution_stream,
+                                                                     executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
@@ -215,8 +221,11 @@ struct ComparisonDispatcher {
                                         executor.resource_ref);
         }
         case cudf::type_id::TIMESTAMP_MILLISECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_ms>(
-            cudf::duration_ms{right_value}, true, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar =
+            cudf::timestamp_scalar<cudf::timestamp_ms>(cudf::duration_ms{right_value},
+                                                       !right_is_null,
+                                                       executor.execution_stream,
+                                                       executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
@@ -225,8 +234,11 @@ struct ComparisonDispatcher {
                                         executor.resource_ref);
         }
         case cudf::type_id::TIMESTAMP_MICROSECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_us>(
-            cudf::duration_us{right_value}, true, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar =
+            cudf::timestamp_scalar<cudf::timestamp_us>(cudf::duration_us{right_value},
+                                                       !right_is_null,
+                                                       executor.execution_stream,
+                                                       executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
@@ -235,8 +247,11 @@ struct ComparisonDispatcher {
                                         executor.resource_ref);
         }
         case cudf::type_id::TIMESTAMP_NANOSECONDS: {
-          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_ns>(
-            cudf::duration_ns{right_value}, true, executor.execution_stream, executor.resource_ref);
+          auto ts_scalar =
+            cudf::timestamp_scalar<cudf::timestamp_ns>(cudf::duration_ns{right_value},
+                                                       !right_is_null,
+                                                       executor.execution_stream,
+                                                       executor.resource_ref);
           return cudf::binary_operation(left,
                                         ts_scalar,
                                         ComparisonOp,
@@ -247,7 +262,7 @@ struct ComparisonDispatcher {
         default: {
           // Regular int64_t comparison
           auto numeric_scalar = cudf::numeric_scalar(
-            right_value, true, executor.execution_stream, executor.resource_ref);
+            right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
           return cudf::binary_operation(left,
                                         numeric_scalar,
                                         ComparisonOp,
@@ -258,8 +273,8 @@ struct ComparisonDispatcher {
       }
     } else {
       // Create a numeric scalar from the constant value
-      auto numeric_scalar =
-        cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+      auto numeric_scalar = cudf::numeric_scalar(
+        right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
       return cudf::binary_operation(left,
                                     numeric_scalar,
                                     ComparisonOp,
@@ -273,13 +288,14 @@ struct ComparisonDispatcher {
   template <typename T>
   std::unique_ptr<cudf::column> DoScalarComparison(const cudf::column_view& left,
                                                    typename T::rep right_value,
+                                                   bool right_is_null,
                                                    numeric::scale_type scale,
                                                    const cudf::data_type& return_type)
   {
     std::unique_ptr<cudf::scalar> right_decimal_scalar;
     if (left.type().id() == cudf::type_to_id<T>()) {
       right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<T>>(
-        right_value, scale, true, executor.execution_stream, executor.resource_ref);
+        right_value, scale, !right_is_null, executor.execution_stream, executor.resource_ref);
     } else {
       // If types are different, need to construct `right_decimal_scalar` using `left.type()`
       switch (left.type().id()) {
@@ -291,7 +307,7 @@ struct ComparisonDispatcher {
           right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
             static_cast<int32_t>(right_value),
             scale,
-            true,
+            !right_is_null,
             executor.execution_stream,
             executor.resource_ref);
           break;
@@ -304,7 +320,7 @@ struct ComparisonDispatcher {
           right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
             static_cast<int64_t>(right_value),
             scale,
-            true,
+            !right_is_null,
             executor.execution_stream,
             executor.resource_ref);
           break;
@@ -313,7 +329,7 @@ struct ComparisonDispatcher {
           right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
             static_cast<__int128_t>(right_value),
             scale,
-            true,
+            !right_is_null,
             executor.execution_stream,
             executor.resource_ref);
           break;
@@ -338,63 +354,109 @@ struct ComparisonDispatcher {
   {
     auto return_type = GetCudfType(expr.return_type);
 
-    // Resolve the children (DuckDB moves constants to the right comparator)
-    auto left = executor.Execute(*expr.left, state->child_states[0].get());
+    // Resolve the children
+    // DuckDB sometimes moves constants to the right comparator.
+    // Even though this does not always happen, this file is based on the principle that DuckDB
+    // always puts the constant on the right side. Therefore, if the left side is a constant, we
+    // swap the children.
+
+    const Expression* left_expr  = expr.left.get();
+    const Expression* right_expr = expr.right.get();
+    if (expr.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+      left_expr  = expr.right.get();
+      right_expr = expr.left.get();
+    }
+
+    auto left = executor.Execute(*left_expr, state->child_states[0].get());
 
     // If the right side is a constant, do not materialize in a column
-    if (expr.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-      auto right_value = expr.right->Cast<BoundConstantExpression>().value;
+    if (right_expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+      auto right_value = right_expr->Cast<BoundConstantExpression>().value;
 
-      switch (GetCudfType(expr.right->return_type).id()) {
+      switch (GetCudfType(right_expr->return_type).id()) {
         case cudf::type_id::INT16:
           return DoScalarComparison<int16_t>(
-            left->view(), right_value.GetValue<int16_t>(), return_type);
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<int16_t>() : 0,
+            right_value.IsNull(),
+            return_type);
         case cudf::type_id::INT32:
           return DoScalarComparison<int32_t>(
-            left->view(), right_value.GetValue<int32_t>(), return_type);
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<int32_t>() : 0,
+            right_value.IsNull(),
+            return_type);
         case cudf::type_id::INT64:
           return DoScalarComparison<int64_t>(
-            left->view(), right_value.GetValue<int64_t>(), return_type);
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<int64_t>() : 0,
+            right_value.IsNull(),
+            return_type);
         case cudf::type_id::FLOAT32:
           return DoScalarComparison<float_t>(
-            left->view(), right_value.GetValue<float_t>(), return_type);
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<float_t>() : 0,
+            right_value.IsNull(),
+            return_type);
         case cudf::type_id::FLOAT64:
           return DoScalarComparison<double_t>(
-            left->view(), right_value.GetValue<double_t>(), return_type);
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<double_t>() : 0,
+            right_value.IsNull(),
+            return_type);
         case cudf::type_id::BOOL8:
-          return DoScalarComparison<bool>(left->view(), right_value.GetValue<bool>(), return_type);
+          return DoScalarComparison<bool>(left->view(),
+                                          !right_value.IsNull() ? right_value.GetValue<bool>() : 0,
+                                          right_value.IsNull(),
+                                          return_type);
         case cudf::type_id::STRING:
           return DoScalarComparison<std::string>(
-            left->view(), right_value.GetValue<std::string>(), return_type);
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<std::string>() : "",
+            right_value.IsNull(),
+            return_type);
         case cudf::type_id::TIMESTAMP_DAYS:
           // DuckDB DATE is int32_t (days since epoch), same as cuDF TIMESTAMP_DAYS
           return DoScalarComparison<int32_t>(
-            left->view(), right_value.GetValue<int32_t>(), return_type);
+
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<int32_t>() : 0,
+            right_value.IsNull(),
+            return_type);
+
         case cudf::type_id::TIMESTAMP_SECONDS:
         case cudf::type_id::TIMESTAMP_MILLISECONDS:
         case cudf::type_id::TIMESTAMP_MICROSECONDS:
         case cudf::type_id::TIMESTAMP_NANOSECONDS:
           // DuckDB timestamps are int64_t internally
           return DoScalarComparison<int64_t>(
-            left->view(), right_value.GetValue<int64_t>(), return_type);
+            left->view(),
+            !right_value.IsNull() ? right_value.GetValue<int64_t>() : 0,
+            right_value.IsNull(),
+            return_type);
+
         case cudf::type_id::DECIMAL32:
           // cudf decimal type uses negative scale, same for below
           return DoScalarComparison<numeric::decimal32>(
             left->view(),
-            right_value.GetValueUnsafe<int32_t>(),
+            !right_value.IsNull() ? right_value.GetValueUnsafe<int32_t>() : 0,
+            right_value.IsNull(),
             numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
             return_type);
         case cudf::type_id::DECIMAL64:
           return DoScalarComparison<numeric::decimal64>(
             left->view(),
-            right_value.GetValueUnsafe<int64_t>(),
+            !right_value.IsNull() ? right_value.GetValueUnsafe<int64_t>() : 0,
+            right_value.IsNull(),
             numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
             return_type);
         case cudf::type_id::DECIMAL128: {
-          duckdb::hugeint_t hugeint_value = right_value.GetValueUnsafe<duckdb::hugeint_t>();
+          duckdb::hugeint_t hugeint_value =
+            !right_value.IsNull() ? right_value.GetValueUnsafe<duckdb::hugeint_t>() : 0;
           return DoScalarComparison<numeric::decimal128>(
             left->view(),
             (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower,
+            right_value.IsNull(),
             numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
             return_type);
         }
@@ -471,10 +533,13 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparis
       return dispatcher(expr, state);
     }
     case ExpressionType::COMPARE_DISTINCT_FROM:
-    case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
       throw NotImplementedException(
-        "Execute[Comparison]: DISTINCT comparisons not yet "
-        "implemented!");
+        "Execute[Comparison]: DISTINCT comparison not yet implemented!");
+    case ExpressionType::COMPARE_NOT_DISTINCT_FROM: {
+      ComparisonDispatcher<cudf::binary_operator::NULL_EQUALS> dispatcher(*this);
+      return dispatcher(expr, state);
+    }
+
     default: throw InternalException("Execute[Comparison]: Unknown comparison type!");
   }
 }

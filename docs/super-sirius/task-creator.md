@@ -1,0 +1,270 @@
+# Task Creator
+
+This document covers the task creation subsystem: how the system decides when and what tasks to create based on operator readiness and data availability.
+
+## Overview
+
+**File:** `src/include/creator/task_creator.hpp`, `src/creator/task_creator.cpp`
+
+The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
+
+## Core Flow
+
+```
+schedule(operator*)
+    ↓
+_task_creation_queue.push(request)
+    ↓
+manager_loop() picks up request
+    ↓
+get_operator_for_next_task(operator) — follows hint chain
+    ↓
+operator->get_next_task_hint() → READY or WAITING_FOR_INPUT_DATA
+    ↓
+Create task (duckdb_scan_task, parquet_scan_task, or gpu_pipeline_task)
+    ↓
+Dispatch to executor (scan_executor or pipeline_executor)
+```
+
+## Global State Maps
+
+Initialized during `prepare_for_query()`, cleared during `reset()`:
+
+| Map | Key | Value | Purpose |
+|-----|-----|-------|---------|
+| `_scan_operator_global_state_map` | operator ID | `duckdb_scan_task_global_state` | DuckDB scan batching state |
+| `_parquet_scan_operator_global_state_map` | operator ID | `parquet_scan_task_global_state` | Parquet metadata, row group partitions (preserved across warm runs) |
+| `_gpu_operator_global_state_map` | operator ID | `gpu_pipeline_task_global_state` | Shared pipeline state |
+
+All map access is protected by `_global_state_mutex`.
+
+## `TaskCreationHint` Enum
+
+**File:** `src/include/op/sirius_physical_operator.hpp`
+
+```cpp
+enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
+struct task_creation_hint {
+    TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
+    sirius_physical_operator* producer{nullptr};
+};
+```
+
+- `READY` — operator has sufficient input data, create a task now
+- `WAITING_FOR_INPUT_DATA` — follow `producer` pointer to find upstream operator
+
+## `get_operator_for_next_task()` — Recursive Hint Chain
+
+**File:** `src/creator/task_creator.cpp`
+
+```
+function get_operator_for_next_task(node):
+    // Special case: PARQUET_SCAN checks partition availability
+    if node is PARQUET_SCAN:
+        if parquet_global_state->has_more_partitions(): return node
+        else: return nullptr
+
+    hint = node->get_next_task_hint()
+    if hint is READY:
+        return hint.producer  // create task from this operator
+    if hint is WAITING_FOR_INPUT_DATA:
+        producer = hint.producer
+        // Special case: DUCKDB_SCAN already drained
+        if producer is DUCKDB_SCAN and (drained or !can_create_more_tasks):
+            return nullptr
+        return get_operator_for_next_task(producer)  // recurse upstream
+    if no hint:
+        return nullptr  // nothing to do
+```
+
+This recursion ensures data flows from the deepest producers first, respecting pipeline dependencies.
+
+## Base Class `get_next_task_hint()`
+
+**File:** `src/op/sirius_physical_operator.cpp`
+
+Default implementation checks all input ports in order:
+
+1. If any `FULL` barrier port's source pipeline is not finished → return `WAITING_FOR_INPUT_DATA` pointing to that pipeline's source
+2. If all ports have data available (and FULL barriers have finished source pipelines) → return `READY`
+3. If any `PARTIAL` barrier port's source pipeline is not finished → return `WAITING_FOR_INPUT_DATA`
+4. Otherwise → return `nullopt` (nothing to do)
+
+## Base Class `get_next_task_input_data()`
+
+**File:** `src/op/sirius_physical_operator.cpp`
+
+Default implementation pops one batch from each input port:
+
+```
+for each port (in order):
+    batch = port.repo->pop_data_batch(state=task_created)
+    batches.push_back(batch)
+return operator_data(batches)
+```
+
+Returns `nullptr` if no batches are available.
+
+## Per-Operator Overrides
+
+The core of the task creator's behavior comes from operator-specific overrides:
+
+### DUCKDB_SCAN / PARQUET_SCAN
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | Returns `READY` if scan is not exhausted (atomic flag) |
+| `get_next_task_input_data()` | N/A — task creator creates scan tasks directly |
+| Why custom | Sources don't have ports; the task creator handles them specially |
+
+For PARQUET_SCAN, the task creator loops through `parquet_global_state->acquire_next_rg_partition_index()` to create one task per row group partition.
+
+For DUCKDB_SCAN, one task is created per invocation. The scan task self-schedules its continuation internally.
+
+### HASH_JOIN (BUILD_PROBE mode)
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | Tracks build state machine: `NOT_BUILT` → `SCHEDULING` → `SCHEDULED` → `BUILT`. Returns READY when both build and probe data available (NOT_BUILT) or probe data available (BUILT). |
+| `get_next_task_input_data()` | `get_next_task_input_data_for_build_probe()`: On SCHEDULING → pop one build + one probe batch. On BUILT → pop one probe batch. |
+| Why custom | Build/probe asymmetry: first task needs both sides, subsequent tasks only need probe |
+
+State machine transitions:
+```
+NOT_BUILT: build_size>0 AND probe_size>0 → SCHEDULING (return READY)
+SCHEDULING/SCHEDULED: → WAITING_FOR_INPUT_DATA (probe source)
+BUILT: probe_size>0 → READY
+```
+
+### HASH_JOIN (STANDARD mode)
+
+Uses base class for both `get_next_task_hint()` and `get_next_task_input_data()`. Input data walks the partition × left × right grid using snapshot batch IDs for Cartesian product iteration.
+
+### PARTITION
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | If probe-side with no `_num_partitions` and has sibling: delegates to build sibling's hint. Otherwise: base class. |
+| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count on first call via `determine_num_partitions()`. Notifies hash join of partition count. Then delegates to base class. |
+| Why custom | Sibling pair coordination: probe must wait for build to determine partition count |
+
+Deadlock prevention: both this and sibling partition locks are acquired in a fixed order using `std::scoped_lock`.
+
+### CONCAT
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | If source finished: READY if data exists. If `_concat_all`: WAITING. Otherwise: checks if any partition's accumulated bytes ≥ `_concat_batch_bytes`. |
+| `get_next_task_input_data()` | For each partition: accumulates batches until byte threshold. Returns `partitioned_operator_data` with partition index. |
+| Why custom | Byte-threshold batching; `_concat_all` mode for LEFT/ANTI/OUTER joins requires all data before output |
+
+### SORT_SAMPLE
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | If boundaries computed: base class. Otherwise: waits for N sample batches OR source finished. |
+| `get_next_task_input_data()` | Base class (after boundary computation) |
+| Why custom | Two-phase: cannot compute boundaries until N samples are collected |
+
+### MERGE_SORT
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | Base class (no override) |
+| `get_next_task_input_data()` | Mutex-locked: drains ALL batches from one partition, advances `_current_partition_index`. |
+| Why custom | One task per partition — must drain entire partition for multi-way merge |
+
+### GROUPED_AGGREGATE_MERGE
+
+Same pattern as MERGE_SORT: drains all batches from one partition per call, advancing partition index.
+
+### TOP_N_MERGE
+
+Same pattern as MERGE_SORT: drains all batches from one partition per call.
+
+### DELIM_JOIN
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_input_data()` | Delegates to internal `partition_join` operator |
+| Why custom | Wrapper pattern — the actual task creation is handled by the embedded join |
+
+## Override Summary Table
+
+| Operator | `get_next_task_hint()` | `get_next_task_input_data()` | Why Custom |
+|----------|------------------------|------------------------------|------------|
+| DUCKDB_SCAN | READY if not exhausted | N/A (task creator handles) | Source, no ports |
+| PARQUET_SCAN | READY if partitions remain | N/A (task creator handles) | Source, no ports |
+| HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
+| HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
+| PARTITION | Delegates to build sibling | Mutex-locked count determination | Sibling coordination |
+| CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
+| SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
+| MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |
+| GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |
+| TOP_N_MERGE | Base class | Drain all from one partition | Per-partition merge |
+| DELIM_JOIN | N/A | Delegates to partition_join | Wrapper pattern |
+
+## Task Creator Manager Loop
+
+**File:** `src/creator/task_creator.cpp`
+
+```
+while running:
+    1. kiosk.acquire()                    -- wait for thread availability
+    2. _task_creation_queue.pop()         -- get next scheduling request
+    3. node = get_operator_for_next_task(request.node)  -- follow hint chain
+    4. if node is nullptr: continue
+
+    5. Schedule work on thread pool:
+       For DUCKDB_SCAN:
+           - Create one duckdb_scan_task
+           - pipeline.mark_task_created()
+           - Dispatch to scan executor
+
+       For PARQUET_SCAN:
+           - Loop: acquire next row group partition
+           - Create one parquet_scan_task per partition
+           - pipeline.mark_task_created() for each
+           - Dispatch to scan executor
+
+       For GPU operators:
+           - Loop while (!node.all_ports_empty()):
+             - pipeline.mark_task_created()  // BEFORE popping data
+             - data = node.get_next_task_input_data()
+             - If data: create gpu_pipeline_task, dispatch to pipeline_executor
+             - If no data: pipeline.mark_task_completed()
+```
+
+The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
+
+## `can_create_more_tasks()` and `has_processed_all_tasks()`
+
+These methods signal task exhaustion:
+- `can_create_more_tasks()` — returns false when no more tasks can be created (e.g., scan exhausted, all partitions processed)
+- `has_processed_all_tasks()` — returns false when tasks are still in flight
+
+Both throw `not implemented` in the base class and must be overridden by operators that need them.
+
+## `drain_pending_tasks()`
+
+**File:** `src/creator/task_creator.cpp`
+
+Called during `drain_after_error()` to cleanly shut down:
+1. `_task_creation_queue.drain()` — clears pending requests
+2. `_kiosk.wait_all()` — waits for in-flight task creation lambdas to complete
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/include/creator/task_creator.hpp` | Task creator interface |
+| `src/creator/task_creator.cpp` | Manager loop, hint chain, task dispatch |
+| `src/include/op/sirius_physical_operator.hpp` | Base `get_next_task_hint()`, `get_next_task_input_data()` |
+| `src/op/sirius_physical_operator.cpp` | Base implementations |
+| `src/op/sirius_physical_hash_join.cpp` | BUILD_PROBE hint/data overrides |
+| `src/op/sirius_physical_partition.cpp` | Sibling sync, adaptive count |
+| `src/op/sirius_physical_concat.cpp` | Byte-threshold batching |
+| `src/op/sirius_physical_sort_sample.cpp` | N-batch sampling |
+| `src/op/sirius_physical_merge_sort.cpp` | Per-partition drain |

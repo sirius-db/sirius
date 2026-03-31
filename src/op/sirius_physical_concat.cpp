@@ -210,15 +210,16 @@ void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_st
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
   auto partition_idx           = partitioned_output_data->get_partition_idx();
   for (auto& batch : partitioned_output_data->get_data_batches()) {
-    for (auto& [next_op, port_id] : next_port_after_sink) {
+    for (auto& next_port_info : next_port_after_sink) {
       auto partition_consumer_op =
-        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
+        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
       if (partition_consumer_op) {
-        partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_idx);
+        partition_consumer_op->push_data_batch_partitioned(
+          next_port_info.next_operator_port_name, batch, partition_idx);
       } else {
         throw std::runtime_error(
           "sirius_physical_concat::sink(): Next operator is not a partition consumer operator: " +
-          SiriusPhysicalOperatorToString(next_op->type));
+          SiriusPhysicalOperatorToString(next_port_info.next_operator->type));
       }
     }
   }
@@ -231,6 +232,12 @@ bool sirius_physical_concat::is_source() const { return true; }
 bool sirius_physical_concat::is_sink() const { return true; }
 
 bool sirius_physical_concat::is_build_concat() { return _is_build; }
+
+void sirius_physical_concat::set_concat_all(bool concat_all)
+{
+  std::lock_guard<std::mutex> lg(lock);
+  _concat_all = concat_all;
+}
 
 }  // namespace op
 }  // namespace sirius

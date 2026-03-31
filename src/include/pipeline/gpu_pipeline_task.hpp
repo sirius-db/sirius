@@ -74,7 +74,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Number of times this task has been retried due to OOM (0 = first attempt).
   uint32_t retry_count = 0;
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
-  uint64_t original_task_id = 0;
+  std::optional<uint64_t> original_task_id = std::nullopt;
 
   /**
    * @brief Get a const pointer to the reservation (non-owning).
