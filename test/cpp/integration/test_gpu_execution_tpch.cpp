@@ -2676,50 +2676,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   // Force small partition size (1 KB) so lineitem data is split into multiple partitions
   con->Query("SET max_sort_partition_bytes = 1024;");
 
-  std::string query = "select l_orderkey, l_partkey from lineitem order by l_orderkey";
-
-  // Run on GPU
-  auto gpu_result = con->Query("CALL gpu_execution('" + query + "')");
-  REQUIRE(gpu_result);
-  if (gpu_result->HasError()) { UNSCOPED_INFO("gpu error: " << gpu_result->GetError()); }
-  REQUIRE_FALSE(gpu_result->HasError());
-
-  // Run on CPU
-  auto cpu_result = con->Query(query + ";");
-  REQUIRE(cpu_result);
-  REQUIRE_FALSE(cpu_result->HasError());
-
-  // Verify dimensions match
-  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-
-  // With 600K rows and 1KB max partition, we must have many partitions.
-  // Verify the data is non-trivially large (ensures partitioning actually happened).
-  REQUIRE(gpu_result->RowCount() > 1000);
-  // Sort both result sets for deterministic comparison
-  auto gpu_sorted = con->Query("SELECT * FROM gpu_execution('" + query + "') ORDER BY 1, 2");
-  auto cpu_sorted = con->Query("SELECT * FROM (" + query + ") t ORDER BY 1, 2");
-  REQUIRE(gpu_sorted);
-  REQUIRE_FALSE(gpu_sorted->HasError());
-  REQUIRE(cpu_sorted);
-  REQUIRE_FALSE(cpu_sorted->HasError());
-
-  // Compare every cell
-  duckdb::idx_t mismatches = 0;
-  for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-    for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-      auto gpu_val = gpu_sorted->GetValue(c, r).ToString();
-      auto cpu_val = cpu_sorted->GetValue(c, r).ToString();
-      if (gpu_val != cpu_val) {
-        if (mismatches < 5) {
-          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val << "] CPU=["
-                               << cpu_val << "]");
-        }
-        mismatches++;
-      }
-      REQUIRE(gpu_val == cpu_val);
-    }
-  }
+  compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem order by l_orderkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -2729,50 +2686,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   // Force small partition size (1 KB) so lineitem data is split into multiple partitions
   con->Query("SET max_sort_partition_bytes = 1024;");
 
-  std::string query = "select l_orderkey, l_partkey from lineitem order by l_orderkey";
-
-  // Run on GPU
-  auto gpu_result = con->Query("CALL gpu_execution('" + query + "')");
-  REQUIRE(gpu_result);
-  if (gpu_result->HasError()) { UNSCOPED_INFO("gpu error: " << gpu_result->GetError()); }
-  REQUIRE_FALSE(gpu_result->HasError());
-
-  // Run on CPU
-  auto cpu_result = con->Query(query + ";");
-  REQUIRE(cpu_result);
-  REQUIRE_FALSE(cpu_result->HasError());
-
-  // Verify dimensions match
-  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-
-  // With 600K rows and 1KB max partition, we must have many partitions.
-  // Verify the data is non-trivially large (ensures partitioning actually happened).
-  REQUIRE(gpu_result->RowCount() > 1000);
-  // Sort both result sets for deterministic comparison
-  auto gpu_sorted = con->Query("SELECT * FROM gpu_execution('" + query + "') ORDER BY 1, 2");
-  auto cpu_sorted = con->Query("SELECT * FROM (" + query + ") t ORDER BY 1, 2");
-  REQUIRE(gpu_sorted);
-  REQUIRE_FALSE(gpu_sorted->HasError());
-  REQUIRE(cpu_sorted);
-  REQUIRE_FALSE(cpu_sorted->HasError());
-
-  // Compare every cell
-  duckdb::idx_t mismatches = 0;
-  for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-    for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-      auto gpu_val = gpu_sorted->GetValue(c, r).ToString();
-      auto cpu_val = cpu_sorted->GetValue(c, r).ToString();
-      if (gpu_val != cpu_val) {
-        if (mismatches < 5) {
-          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val << "] CPU=["
-                               << cpu_val << "]");
-        }
-        mismatches++;
-      }
-      REQUIRE(gpu_val == cpu_val);
-    }
-  }
+  compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem order by l_orderkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -2835,28 +2749,14 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - order by with decimal column",
                  "[integration][gpu_execution][order_by][order_by_types]")
 {
-  auto gpu_result = con->Query(
-    "CALL gpu_execution('select o_orderkey, o_totalprice from orders order by o_orderkey')");
-  REQUIRE(gpu_result);
-  if (gpu_result->HasError()) {
-    std::cerr << "DECIMAL error: " << gpu_result->GetError() << std::endl;
-  }
-  REQUIRE_FALSE(gpu_result->HasError());
-  REQUIRE(gpu_result->RowCount() > 0);
+  compare_gpu_vs_cpu("select o_orderkey, o_totalprice from orders order by o_orderkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - order by with decimal column parquet",
                  "[integration][gpu_execution][parquet][order_by][order_by_types]")
 {
-  auto gpu_result = con->Query(
-    "CALL gpu_execution('select o_orderkey, o_totalprice from orders order by o_orderkey')");
-  REQUIRE(gpu_result);
-  if (gpu_result->HasError()) {
-    std::cerr << "DECIMAL error: " << gpu_result->GetError() << std::endl;
-  }
-  REQUIRE_FALSE(gpu_result->HasError());
-  REQUIRE(gpu_result->RowCount() > 0);
+  compare_gpu_vs_cpu("select o_orderkey, o_totalprice from orders order by o_orderkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -2923,30 +2823,14 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - order by with varchar column",
                  "[integration][gpu_execution][order_by][order_by_types]")
 {
-  auto gpu_result =
-    con->Query("CALL gpu_execution('select n_nationkey, n_name from nation order by n_nationkey')");
-  REQUIRE(gpu_result);
-  if (gpu_result->HasError()) {
-    std::cerr << "VARCHAR order by error: " << gpu_result->GetError() << std::endl;
-  }
-  REQUIRE_FALSE(gpu_result->HasError());
-  REQUIRE(gpu_result->RowCount() > 0);
-  std::cerr << "VARCHAR order by: " << gpu_result->RowCount() << " rows OK" << std::endl;
+  compare_gpu_vs_cpu("select n_nationkey, n_name from nation order by n_nationkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - order by with varchar column parquet",
                  "[integration][gpu_execution][parquet][order_by][order_by_types]")
 {
-  auto gpu_result =
-    con->Query("CALL gpu_execution('select n_nationkey, n_name from nation order by n_nationkey')");
-  REQUIRE(gpu_result);
-  if (gpu_result->HasError()) {
-    std::cerr << "VARCHAR order by error: " << gpu_result->GetError() << std::endl;
-  }
-  REQUIRE_FALSE(gpu_result->HasError());
-  REQUIRE(gpu_result->RowCount() > 0);
-  std::cerr << "VARCHAR order by: " << gpu_result->RowCount() << " rows OK" << std::endl;
+  compare_gpu_vs_cpu("select n_nationkey, n_name from nation order by n_nationkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
