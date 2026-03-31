@@ -277,6 +277,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         op, *operator_input_output_data, stream, pipeline, i, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes        = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the operators.
+      peak_bytes -= local_state._peak_bytes_to_materialize_input;
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
       if (auto const* cc_oom =
@@ -290,6 +292,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         "Pipeline {}: OOM at operator {} (id={}, index {}/{}), "
         "requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
         "peak allocated {} bytes ({:.2f} MB), "
+        "peak bytes to materialize input {} bytes ({:.2f} MB), "
         "reservation {} bytes ({:.2f} MB), "
         "rescheduling task {}",
         pipeline->get_pipeline_id(),
@@ -303,6 +306,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         static_cast<double>(global_usage) / (1024.0 * 1024.0),
         peak_bytes,
         static_cast<double>(peak_bytes) / (1024.0 * 1024.0),
+        local_state._peak_bytes_to_materialize_input,
+        static_cast<double>(local_state._peak_bytes_to_materialize_input) / (1024.0 * 1024.0),
         reservation_bytes,
         static_cast<double>(reservation_bytes) / (1024.0 * 1024.0),
         _task_id);
@@ -379,6 +384,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   absl::Cleanup source_closer = [allocator, stream]() {
     allocator->reset_stream_reservation(stream);
   };
+
   std::vector<cucascade::data_batch_processing_handle> processing_handles;
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
@@ -435,6 +441,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     processing_handles.emplace_back(std::move(*handle));
   }
   
+  local_state._peak_bytes_to_materialize_input = allocator->get_peak_allocated_bytes(stream);
+
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
     std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
@@ -456,6 +464,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // Record memory metrics for future reservation estimates
   if (output_data) {
     auto peak_bytes          = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+    // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the operators.
+    peak_bytes -= local_state._peak_bytes_to_materialize_input;
     std::size_t output_bytes = 0;
     for (const auto& batch : output_data->get_data_batches()) {
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
@@ -464,12 +474,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
     SIRIUS_LOG_TRACE(
       "Pipeline {}: memory history record - input_basis={}, output_bytes={}, reservation_bytes={}, "
-      "peak_bytes={}",
+      "peak_bytes={}, peak_bytes_to_materialize_input={}",
       pipeline->get_pipeline_id(),
       input_basis,
       output_bytes,
       reservation_bytes,
-      peak_bytes);
+      peak_bytes,
+      local_state._peak_bytes_to_materialize_input);
   }
 
   if (output_data) { publish_output(*output_data, stream); }
@@ -495,7 +506,7 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
     _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
 
   auto bytes_to_materialize_input =
-    _local_state->cast<gpu_pipeline_task_local_state>().get_bytes_to_materialize_input();
+    _local_state->cast<gpu_pipeline_task_local_state>().get_estimated_bytes_to_materialize_input();
   auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
   auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
   if (estimate) { return *estimate + bytes_to_materialize_input; }

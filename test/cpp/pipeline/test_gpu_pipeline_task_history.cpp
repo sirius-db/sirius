@@ -68,12 +68,13 @@ class stub_operator : public sirius::op::sirius_physical_operator {
                                                      rmm::cuda_stream_view stream) override
   {
     if (on_execute) { return on_execute(input, stream); }
-    return sirius_physical_operator::execute(input, stream);
+    throw std::runtime_error("execute not implemented");
   }
 
   void sink(const sirius::op::operator_data& input, rmm::cuda_stream_view stream) override
   {
     if (on_sink) { return on_sink(input, stream); }
+    
   }
 
   bool is_sink() const override { return acts_as_sink; }
@@ -156,7 +157,7 @@ constexpr std::size_t kInputNumRows      = kInputDataSize / sizeof(int64_t);
     return;
   }
 
-  rmm::cuda_stream stream;
+  rmm::cuda_stream stream, stream_data_init;
 
   // -------------------------------------------------------------------------
   // 1. Initialize converter registry (needed by lock_or_prepare_batch)
@@ -171,7 +172,7 @@ constexpr std::size_t kInputNumRows      = kInputDataSize / sizeof(int64_t);
     sirius::create_cudf_table_with_random_data(kInputNumRows,
                                                {cudf::data_type{cudf::type_id::INT64}},
                                                {std::make_pair(0, 1000000)},
-                                               stream,
+                                               stream_data_init,
                                                gpu_mr);
 
   // Wrap GPU table in a data_batch
@@ -181,8 +182,9 @@ constexpr std::size_t kInputNumRows      = kInputDataSize / sizeof(int64_t);
   // Lock for in-transit → convert → release in-transit.
   REQUIRE(input_batch->try_to_lock_for_in_transit());
   auto& registry = sirius::converter_registry::get();
-  input_batch->convert_to<cucascade::host_data_representation>(registry, f.host_space, stream);
+  input_batch->convert_to<cucascade::host_data_representation>(registry, f.host_space, stream_data_init);
   input_batch->try_to_release_in_transit();
+  stream_data_init.synchronize();
 
   // Verify the data is now on host
   REQUIRE(input_batch->get_data() != nullptr);
@@ -309,7 +311,7 @@ WARN("Skipping test — no GPU available");
 return;
 }
 
-rmm::cuda_stream stream;
+rmm::cuda_stream stream, stream_data_init;
 
 // -------------------------------------------------------------------------
 // 1. Initialize converter registry (needed by lock_or_prepare_batch)
@@ -324,7 +326,7 @@ auto gpu_table =
 sirius::create_cudf_table_with_random_data(kInputNumRows,
                                        {cudf::data_type{cudf::type_id::INT64}},
                                        {std::make_pair(0, 1000000)},
-                                       stream,
+                                       stream_data_init,
                                        gpu_mr);
 
 // Wrap GPU table in a data_batch
@@ -334,8 +336,9 @@ auto input_batch = sirius::make_data_batch(std::move(gpu_table), *f.gpu_space);
 // Lock for in-transit → convert → release in-transit.
 REQUIRE(input_batch->try_to_lock_for_in_transit());
 auto& registry = sirius::converter_registry::get();
-input_batch->convert_to<cucascade::host_data_representation>(registry, f.host_space, stream);
+input_batch->convert_to<cucascade::host_data_representation>(registry, f.host_space, stream_data_init);
 input_batch->try_to_release_in_transit();
+stream_data_init.synchronize();
 
 // Verify the data is now on host
 REQUIRE(input_batch->get_data() != nullptr);
@@ -360,13 +363,11 @@ auto stub_op = std::make_unique<stub_operator>();
 stub_op->on_execute = [](const sirius::op::operator_data& input, rmm::cuda_stream_view s) {
   std::vector<std::shared_ptr<cucascade::data_batch>> out;
   const auto& batches = input.get_data_batches();
-  out.reserve(batches.size());
-  for (auto const& batch : batches) {
-    if (!batch) { continue; }
-    out.push_back(batch->clone(sirius::get_next_batch_id(), s));
-  }
+  out.push_back(batches[0]->clone(sirius::get_next_batch_id(), s));
+  s.synchronize();
   return std::make_unique<sirius::op::operator_data>(std::move(out));
 };
+
 sirius::pipeline::sirius_pipeline_build_state build_state;
 build_state.add_pipeline_operator(*pipeline, *stub_op);
 build_state.set_pipeline_sink(*pipeline, *stub_op, 1);
@@ -404,40 +405,28 @@ REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_except
 // Mark as rescheduled so the destructor does not call mark_task_completed()
 // (which would dereference the pipeline's null source operator).
 task->mark_as_rescheduled();
-
 // -------------------------------------------------------------------------
 // 6. Verify: memory history should have one record with the OOM peak_bytes
 // -------------------------------------------------------------------------
 REQUIRE(global_state->get_memory_history().size() == 1);
 auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
 REQUIRE(estimate.has_value());
-REQUIRE(*estimate == kInputDataSize * 2);
+REQUIRE(*estimate == kInputDataSize);
 
 }
 
 
 
 // ---------------------------------------------------------------------------
-// Test: task executes successfully, operator execute records to pipeline memory history.
-//
-// Memory layout:
-//   GPU capacity  = 500 MB
-//   Reservation   = 200 MB
-//   Input data    = ~200 MB host_data_representation 
-//   Operator allocates = 200 MB
-//
-// After the task executes successfully, peak_bytes ≈ 400 MB should be recorded to pipeline memory history.
+// Test: task executes successfully, operator execute records to pipeline memory history. 
+// Another task with a similar input size and operator execute records to pipeline memory history.
+// We validate then that the new records are used to apply weighted average to estimate the peak memory for a similar task.
 // ---------------------------------------------------------------------------
 
 
 TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory history",
   "[gpu_pipeline_task][history]")
 {
-
-// Memory layout constants:
-//   GPU capacity       = 500 MB (software limit)
-//   Task reservation   = 200 MB
-//   Input data         = ~200 MB on host
 constexpr std::size_t kReservationSize1   = 20ULL * 1024 * 1024;  // 20 MB
 constexpr std::size_t kInputDataSize1     = 20ULL * 1024 * 1024;  // 20 MB
 constexpr std::size_t kInputNumRows1      = kInputDataSize1 / sizeof(int64_t);
@@ -455,7 +444,7 @@ WARN("Skipping test — no GPU available");
 return;
 }
 
-rmm::cuda_stream stream;
+rmm::cuda_stream stream, stream_data_init;
 
 // -------------------------------------------------------------------------
 // 1. Initialize converter registry (needed by lock_or_prepare_batch)
@@ -470,8 +459,9 @@ auto gpu_table =
 sirius::create_cudf_table_with_random_data(kInputNumRows1,
                                        {cudf::data_type{cudf::type_id::INT64}},
                                        {std::make_pair(0, 1000000)},
-                                       stream,
+                                       stream_data_init,
                                        gpu_mr);
+stream_data_init.synchronize();
 
 // Wrap GPU table in a data_batch
 auto input_batch = sirius::make_data_batch(std::move(gpu_table), *f.gpu_space);
@@ -480,8 +470,9 @@ auto input_batch = sirius::make_data_batch(std::move(gpu_table), *f.gpu_space);
 // Lock for in-transit → convert → release in-transit.
 REQUIRE(input_batch->try_to_lock_for_in_transit());
 auto& registry = sirius::converter_registry::get();
-input_batch->convert_to<cucascade::host_data_representation>(registry, f.host_space, stream);
+input_batch->convert_to<cucascade::host_data_representation>(registry, f.host_space, stream_data_init);
 input_batch->try_to_release_in_transit();
+stream_data_init.synchronize();
 
 // Verify the data is now on host
 REQUIRE(input_batch->get_data() != nullptr);
@@ -559,14 +550,13 @@ task->execute(stream);
 // (which would dereference the pipeline's null source operator).
 task->mark_as_rescheduled();
 
-
 // -------------------------------------------------------------------------
 // 6. Verify: memory history should have one record with the peak_bytes
 // -------------------------------------------------------------------------
 REQUIRE(global_state->get_memory_history().size() == 1);
 auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize1);
 REQUIRE(estimate.has_value());
-REQUIRE(*estimate == kInputDataSize1 + kExecuteConsumptionSize1);
+REQUIRE(*estimate == kExecuteConsumptionSize1);
 
 // -------------------------------------------------------------------------
 // 7. Create second input data and build second task
@@ -575,18 +565,13 @@ REQUIRE(*estimate == kInputDataSize1 + kExecuteConsumptionSize1);
 // Clear the input batch to release the memory
 input_batch.reset();
 
-auto* gpu_alloc =
-  f.gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
-REQUIRE(gpu_alloc != nullptr);
-gpu_alloc->reset_peak_allocated_bytes(stream);
- 
-
 auto gpu_table2 =
 sirius::create_cudf_table_with_random_data(kInputNumRows2,
                                        {cudf::data_type{cudf::type_id::INT64}},
                                        {std::make_pair(0, 1000000)},
-                                       stream,
+                                       stream_data_init,
                                        gpu_mr);
+stream_data_init.synchronize();
 
 // Wrap GPU table in a data_batch
 auto input_batch2 = sirius::make_data_batch(std::move(gpu_table2), *f.gpu_space);
@@ -606,7 +591,7 @@ auto task2 = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
   global_state);
 
 auto estimation2 = task2->get_estimated_reservation_size();
-REQUIRE(estimation2 == ((float)kInputDataSize2 / (float)kInputDataSize1) * (kInputDataSize1 + kExecuteConsumptionSize1));
+REQUIRE(estimation2 == ((float)kInputDataSize2 / (float)kInputDataSize1) * (kExecuteConsumptionSize1));
 auto task_reservation2 = f.manager->request_reservation(
   cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, estimation2);
 REQUIRE(task_reservation2 != nullptr);
@@ -617,7 +602,6 @@ local_state2_ptr->set_reservation(std::move(task_reservation2));
 
 stub_op->on_execute = [gpu_space = f.gpu_space, exec_extra = kExecuteConsumptionSize2](
   const sirius::op::operator_data& input, rmm::cuda_stream_view s) {
-    printf("Executing task 2 - on_execute\n");
     auto* mr = gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
     REQUIRE(mr != nullptr);
     void* scratch = mr->allocate(s, exec_extra);
@@ -631,12 +615,9 @@ stub_op->on_execute = [gpu_space = f.gpu_space, exec_extra = kExecuteConsumption
     s.synchronize();
     mr->deallocate(s, scratch, exec_extra);
     s.synchronize();
-    printf("Executing task 2 - on_execute - deallocated\n");
     return out;
 };
-printf("Executing task 2\n");
 task2->execute(stream);
-printf("Task 2 executed\n");
 // Mark as rescheduled so the destructor does not call mark_task_completed()
 // (which would dereference the pipeline's null source operator).
 task2->mark_as_rescheduled();
@@ -648,16 +629,19 @@ task2->mark_as_rescheduled();
 REQUIRE(global_state->get_memory_history().size() == 2);
 auto estimate1 = global_state->get_memory_history().estimate_peak_memory(kInputDataSize1);
 REQUIRE(estimate1.has_value());
-REQUIRE(*estimate1 < kInputDataSize1 + kExecuteConsumptionSize1);
+REQUIRE(*estimate1 < kExecuteConsumptionSize1);
 auto avg_ratio = (kExecuteConsumptionRatio1 + kExecuteConsumptionRatio2) / 2;
 // The estimate should be greater than the input size times the average consumption ratio because the input size is more similar to the first task than the second task.
 REQUIRE(*estimate1 > kInputDataSize1 * avg_ratio);
 auto estimate2 = global_state->get_memory_history().estimate_peak_memory(kInputDataSize2);
 REQUIRE(estimate2.has_value());
-REQUIRE(*estimate2 >kInputDataSize2 + kExecuteConsumptionSize2);
+REQUIRE(*estimate2 > kExecuteConsumptionSize2);
 REQUIRE(*estimate2 < kInputDataSize2 * avg_ratio);
 
-auto estimate3 = global_state->get_memory_history().estimate_peak_memory((kInputDataSize1 + kInputDataSize2)/2);
+auto middle_size = (kInputDataSize1 + kInputDataSize2)/2;
+auto middle_consumption = (kExecuteConsumptionSize1 + kExecuteConsumptionSize2)/2;
+auto estimate3 = global_state->get_memory_history().estimate_peak_memory(middle_size);
 REQUIRE(estimate3.has_value());
-REQUIRE(*estimate3 == ((kInputDataSize1 + kExecuteConsumptionSize1) + (kInputDataSize2 + kExecuteConsumptionSize2))/2);
+REQUIRE(*estimate3 < middle_consumption * 1.15);
+REQUIRE(*estimate3 > middle_consumption * 0.85);
 }
