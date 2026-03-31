@@ -71,9 +71,9 @@ class pipeline_memory_history {
   /**
    * @brief Record a failed task's memory metrics.
    *
-   * If an existing record with the same estimated_bytes and nullopt output_bytes
-   * is found, updates it with the maximum of the two peak_memory_bytes values.
-   * Otherwise, inserts a new record with output_bytes = nullopt.
+   * This checks if a previous failed task was recorded with the same input size, if so, we want to
+   * keep the one with the largest peak consumption, so that the next attempt has a higher memory
+   * estimation.
    *
    * Thread-safe. May be called concurrently from multiple executor threads.
    *
