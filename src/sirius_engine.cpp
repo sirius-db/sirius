@@ -1307,8 +1307,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                    first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-                   first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
-          // ignore DUCKDB_SCAN, PARQUET_SCAN, and ICEBERG_SCAN since they don't have port
+                   first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
+                   first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+          // ignore operators that don't have ports
         } else {
           // Most operators have "default" port
           auto* default_port = first_op.get_port("default");
@@ -1346,7 +1347,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                    sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                    sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
-          // ignore DUCKDB_SCAN, PARQUET_SCAN, and ICEBERG_SCAN since they don't have port
+          // ignore DUCKDB_SCAN, PARQUET_SCAN, and ICEBERG_SCAN since they don't have ports
+        } else if (sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+          // ignore RESULT_COLLECTOR since it doesn't have ports
         } else {
           auto* default_port = sink->get_port("default");
           if (default_port) {
