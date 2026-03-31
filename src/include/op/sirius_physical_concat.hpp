@@ -60,6 +60,10 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! Get the parent operator (e.g., HASH_JOIN for build concat)
   sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
+  //! Used when PARTITION + `update_join_exec_mode` selects BUILD_PROBE: merge all build batches
+  //! before the join so the hash join sees a single build batch.
+  void set_concat_all(bool concat_all);
+
  private:
   sirius_physical_operator* _parent_op;
   bool _is_build;

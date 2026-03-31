@@ -200,13 +200,14 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;
   for (auto& batch : input_batches) {
-    for (auto& [next_op, port_id] : next_port_after_sink) {
+    for (auto& next_port_info : next_port_after_sink) {
       // the next operator is a partition consumer operator, so we need to push the batch into the
       // specific partition
       auto partition_consumer_op =
-        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
+        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
       if (partition_consumer_op) {
-        partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_id);
+        partition_consumer_op->push_data_batch_partitioned(
+          next_port_info.next_operator_port_name, batch, partition_id);
       } else {
         throw std::runtime_error("Next operator is not a partition consumer operator");
       }
@@ -279,8 +280,21 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto [num_parts, total_bytes] = determine_num_partitions();
-      _hash_join_op->Cast<sirius_physical_hash_join>().update_join_exec_mode(num_parts,
-                                                                             total_bytes);
+      auto& hash_join               = _hash_join_op->Cast<sirius_physical_hash_join>();
+      hash_join.update_join_exec_mode(num_parts, total_bytes);
+      if (_hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
+          hash_join.is_build_probe_mode()) {
+        // Either sibling may run this block first; configure the build-side CONCAT only.
+        auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
+          for (auto& next_port : part_op.get_next_port_after_sink()) {
+            if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
+            auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
+            if (concat.is_build_concat()) { concat.set_concat_all(true); }
+          }
+        };
+        enable_build_concat_all(*this);
+        enable_build_concat_all(sibling);
+      }
       _num_partitions         = num_parts;
       sibling._num_partitions = num_parts;
       SIRIUS_LOG_DEBUG(

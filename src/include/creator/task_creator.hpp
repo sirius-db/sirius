@@ -17,10 +17,9 @@
 #pragma once
 
 #include "duckdb/main/client_context.hpp"
+#include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
-#include "exec/kiosk.hpp"
-#include "exec/thread_pool.hpp"
 #include "helper/helper.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -48,6 +47,7 @@ class sirius_pipeline_task_global_state;
 namespace sirius::op::scan {
 class duckdb_scan_task_global_state;
 class parquet_scan_task_global_state;
+class iceberg_scan_task_global_state;
 }  // namespace sirius::op::scan
 
 namespace sirius::planner {
@@ -169,20 +169,20 @@ class task_creator {
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
    *
-   * Acquires tickets from the kiosk (ensuring controlled concurrency), pulls task creation
-   * requests from the queue, and schedules work on the thread pool.
+   * Reserves slots from the bounded pool (ensuring controlled concurrency), pulls task
+   * creation requests from the queue, and dispatches work to the pool.
    */
   void manager_loop();
 
   std::atomic<bool> _running;
   exec::thread_pool_config _config;
-  exec::kiosk _kiosk;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
+  std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   std::thread _manager_thread;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
+  size_t _num_scans_in_plan{0};
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task

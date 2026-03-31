@@ -839,7 +839,6 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
-  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
@@ -869,7 +868,6 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
-  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
                    params->max_build_hash_table_bytes);
 }
