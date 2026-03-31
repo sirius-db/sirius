@@ -275,8 +275,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
               static_cast<int>(test.get_column_view().type().id()));
         }
         if (expr.type == duckdb::ExpressionType::COMPARE_NOT_IN) {
-          contains_column = cudf::unary_operation(
-            contains_column->view(), cudf::unary_operator::NOT, _stream, _mr);
+          contains_column =
+            cudf::unary_operation(contains_column->view(), cudf::unary_operator::NOT, _stream, _mr);
         }
         return execute_result(std::move(contains_column));
       }

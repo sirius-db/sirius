@@ -181,15 +181,18 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
 }
 
 std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
-                                                  int8_t scale,
-                                                  const std::vector<int64_t>& values)
+                                                 int8_t scale,
+                                                 const std::vector<int64_t>& values)
 {
   auto mr     = get_resource_ref(space);
   auto stream = cudf::get_default_stream();
   auto size   = static_cast<cudf::size_type>(values.size());
 
-  auto col = cudf::make_fixed_point_column(
-    cudf::data_type{cudf::type_id::DECIMAL64, -scale}, size, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL64, -scale},
+                                           size,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
   cudaMemcpy(col->mutable_view().data<int64_t>(),
              values.data(),
              sizeof(int64_t) * values.size(),
@@ -547,7 +550,7 @@ TEST_CASE("gpu_expression_executor select(data_batch) filters strings", "[expres
 
 namespace {
 using exp_executor = ::sirius::experimental::gpu_expression_executor;
-auto constexpr MAT  = ::sirius::experimental::expression_executor_strategy::MATERIALIZE;
+auto constexpr MAT = ::sirius::experimental::expression_executor_strategy::MATERIALIZE;
 
 // Shorthand: build executor, run execute(), return output table view and input table view.
 struct exec_result {
@@ -616,7 +619,8 @@ TEST_CASE("experimental execute projects references, constants, and comparisons"
       *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
 
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    exprs.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     exprs.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
     auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
     auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(50));
@@ -635,7 +639,9 @@ TEST_CASE("experimental execute projects references, constants, and comparisons"
     REQUIRE(copy_column_to_host<int32_t>(ov.column(1)) == expected_const);
 
     std::vector<uint8_t> expected_cmp;
-    for (auto v : in0) { expected_cmp.push_back(v > 50 ? 1U : 0U); }
+    for (auto v : in0) {
+      expected_cmp.push_back(v > 50 ? 1U : 0U);
+    }
     REQUIRE(copy_bool_column_to_host(ov.column(2)) == expected_cmp);
   }
 
@@ -647,12 +653,12 @@ TEST_CASE("experimental execute projects references, constants, and comparisons"
     auto input = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw);
 
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, scale), 0));
-    exprs.push_back(duckdb::make_uniq<BoundConstantExpression>(
-      Value::DECIMAL(int64_t{42}, 18, scale)));
+    exprs.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, scale), 0));
+    exprs.push_back(
+      duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{42}, 18, scale)));
     auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, scale), 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(
-      Value::DECIMAL(int64_t{64}, 18, scale));
+    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{64}, 18, scale));
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_LESSTHAN, std::move(lhs), std::move(rhs)));
 
@@ -667,7 +673,9 @@ TEST_CASE("experimental execute projects references, constants, and comparisons"
     REQUIRE(copy_column_to_host<int64_t>(ov.column(1)) == expected_const);
 
     std::vector<uint8_t> expected_cmp;
-    for (auto v : in0) { expected_cmp.push_back(v < 64 ? 1U : 0U); }
+    for (auto v : in0) {
+      expected_cmp.push_back(v < 64 ? 1U : 0U);
+    }
     REQUIRE(copy_bool_column_to_host(ov.column(2)) == expected_cmp);
   }
 
@@ -677,7 +685,8 @@ TEST_CASE("experimental execute projects references, constants, and comparisons"
       *space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 5}});
 
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
+    exprs.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
     exprs.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("hello")));
     auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0);
     auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value("str_3"));
@@ -695,7 +704,9 @@ TEST_CASE("experimental execute projects references, constants, and comparisons"
     REQUIRE(copy_string_column_to_host(ov.column(1)) == expected_const);
 
     std::vector<uint8_t> expected_cmp;
-    for (auto const& v : in0) { expected_cmp.push_back(v == "str_3" ? 1U : 0U); }
+    for (auto const& v : in0) {
+      expected_cmp.push_back(v == "str_3" ? 1U : 0U);
+    }
     REQUIRE(copy_bool_column_to_host(ov.column(2)) == expected_cmp);
   }
 }
@@ -722,7 +733,7 @@ TEST_CASE("experimental select filters rows and handles edge cases",
       ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-    auto in_vals = copy_column_to_host<int32_t>(iv.column(0));
+    auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
       if (v > 5) { expected.push_back(v); }
@@ -755,13 +766,12 @@ TEST_CASE("experimental select filters rows and handles edge cases",
 
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, scale), 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(
-      Value::DECIMAL(int64_t{64}, 18, scale));
+    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{64}, 18, scale));
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-    auto in_vals = copy_column_to_host<int64_t>(iv.column(0));
+    auto in_vals                       = copy_column_to_host<int64_t>(iv.column(0));
     std::vector<int64_t> expected;
     for (auto v : in_vals) {
       if (v > 64) { expected.push_back(v); }
@@ -781,7 +791,7 @@ TEST_CASE("experimental select filters rows and handles edge cases",
       ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-    auto in_strs = copy_string_column_to_host(iv.column(0));
+    auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& v : in_strs) {
       if (v == "str_2") { expected.push_back(v); }
@@ -799,56 +809,75 @@ TEST_CASE("experimental execute arithmetic functions", "[expression_executor][ex
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  auto input = make_input_batch(
-    *space,
-    {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
-    {std::pair<int, int>{1, 50}, std::pair<int, int>{1, 10}});
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{1, 50}, std::pair<int, int>{1, 10}});
 
   SECTION("col0 + 10")
   {
     duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(10)));
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr(
-      "+", LogicalType{LogicalTypeId::INTEGER}, {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}}, std::move(children)));
+    exprs.push_back(
+      make_func_expr("+",
+                     LogicalType{LogicalTypeId::INTEGER},
+                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
+                     std::move(children)));
 
     auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
     REQUIRE(ov.num_columns() == 1);
-    auto in0 = copy_column_to_host<int32_t>(iv.column(0));
+    auto in0  = copy_column_to_host<int32_t>(iv.column(0));
     auto out0 = copy_column_to_host<int32_t>(ov.column(0));
-    for (size_t i = 0; i < in0.size(); ++i) { REQUIRE(out0[i] == in0[i] + 10); }
+    for (size_t i = 0; i < in0.size(); ++i) {
+      REQUIRE(out0[i] == in0[i] + 10);
+    }
   }
 
   SECTION("col0 * col1")
   {
     duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr(
-      "*", LogicalType{LogicalTypeId::INTEGER}, {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}}, std::move(children)));
+    exprs.push_back(
+      make_func_expr("*",
+                     LogicalType{LogicalTypeId::INTEGER},
+                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
+                     std::move(children)));
 
     auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
-    auto in0 = copy_column_to_host<int32_t>(iv.column(0));
-    auto in1 = copy_column_to_host<int32_t>(iv.column(1));
-    auto out0 = copy_column_to_host<int32_t>(ov.column(0));
-    for (size_t i = 0; i < in0.size(); ++i) { REQUIRE(out0[i] == in0[i] * in1[i]); }
+    auto in0                           = copy_column_to_host<int32_t>(iv.column(0));
+    auto in1                           = copy_column_to_host<int32_t>(iv.column(1));
+    auto out0                          = copy_column_to_host<int32_t>(ov.column(0));
+    for (size_t i = 0; i < in0.size(); ++i) {
+      REQUIRE(out0[i] == in0[i] * in1[i]);
+    }
   }
 
   SECTION("col0 % 3")
   {
     duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr(
-      "%", LogicalType{LogicalTypeId::INTEGER}, {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}}, std::move(children)));
+    exprs.push_back(
+      make_func_expr("%",
+                     LogicalType{LogicalTypeId::INTEGER},
+                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
+                     std::move(children)));
 
     auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
-    auto in0 = copy_column_to_host<int32_t>(iv.column(0));
-    auto out0 = copy_column_to_host<int32_t>(ov.column(0));
-    for (size_t i = 0; i < in0.size(); ++i) { REQUIRE(out0[i] == in0[i] % 3); }
+    auto in0                           = copy_column_to_host<int32_t>(iv.column(0));
+    auto out0                          = copy_column_to_host<int32_t>(ov.column(0));
+    for (size_t i = 0; i < in0.size(); ++i) {
+      REQUIRE(out0[i] == in0[i] % 3);
+    }
   }
 }
 
@@ -862,22 +891,25 @@ TEST_CASE("experimental select LIKE and NOT LIKE", "[expression_executor][experi
   REQUIRE(space != nullptr);
 
   // Generates strings "str_1", "str_2", "str_3"
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 3}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 3}});
 
   SECTION("LIKE 'str_2'")
   {
     // col0 LIKE 'str_2' — exact match via LIKE
     duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
     children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_2")));
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr(
-      "~~", LogicalType{LogicalTypeId::BOOLEAN}, {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-      std::move(children)));
+    exprs.push_back(
+      make_func_expr("~~",
+                     LogicalType{LogicalTypeId::BOOLEAN},
+                     {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
+                     std::move(children)));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-    auto in_strs = copy_string_column_to_host(iv.column(0));
+    auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& s : in_strs) {
       if (s == "str_2") { expected.push_back(s); }
@@ -889,12 +921,15 @@ TEST_CASE("experimental select LIKE and NOT LIKE", "[expression_executor][experi
   {
     // col0 LIKE 'str_%' — should match all rows
     duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
     children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_%")));
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr(
-      "~~", LogicalType{LogicalTypeId::BOOLEAN}, {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-      std::move(children)));
+    exprs.push_back(
+      make_func_expr("~~",
+                     LogicalType{LogicalTypeId::BOOLEAN},
+                     {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
+                     std::move(children)));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
     REQUIRE(ov.num_rows() == iv.num_rows());
@@ -904,15 +939,18 @@ TEST_CASE("experimental select LIKE and NOT LIKE", "[expression_executor][experi
   {
     // col0 NOT LIKE 'str_1' — should exclude 'str_1' rows
     duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
     children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_1")));
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr(
-      "!~~", LogicalType{LogicalTypeId::BOOLEAN}, {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-      std::move(children)));
+    exprs.push_back(
+      make_func_expr("!~~",
+                     LogicalType{LogicalTypeId::BOOLEAN},
+                     {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
+                     std::move(children)));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-    auto in_strs = copy_string_column_to_host(iv.column(0));
+    auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& s : in_strs) {
       if (s != "str_1") { expected.push_back(s); }
@@ -996,8 +1034,8 @@ TEST_CASE("experimental execute CASE with multiple WHEN branches",
   exprs.push_back(std::move(case_expr));
 
   auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
-  auto in_vals  = copy_column_to_host<int32_t>(iv.column(0));
-  auto out_vals = copy_column_to_host<int32_t>(ov.column(0));
+  auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
+  auto out_vals                      = copy_column_to_host<int32_t>(ov.column(0));
   for (size_t i = 0; i < in_vals.size(); ++i) {
     int32_t expected = in_vals[i] < 30 ? -1 : (in_vals[i] > 70 ? 1 : 0);
     REQUIRE(out_vals[i] == expected);
@@ -1028,7 +1066,7 @@ TEST_CASE("experimental select BETWEEN", "[expression_executor][experimental]")
   exprs.push_back(std::move(between));
 
   auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-  auto in_vals = copy_column_to_host<int32_t>(iv.column(0));
+  auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
     if (v >= 20 && v <= 50) { expected.push_back(v); }
@@ -1045,13 +1083,13 @@ TEST_CASE("experimental select IN and NOT IN", "[expression_executor][experiment
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
 
   SECTION("IN (2, 4, 6)")
   {
-    auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::COMPARE_IN, LogicalType{LogicalTypeId::BOOLEAN});
+    auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
+                                                              LogicalType{LogicalTypeId::BOOLEAN});
     in_expr->children.push_back(
       duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
@@ -1062,7 +1100,7 @@ TEST_CASE("experimental select IN and NOT IN", "[expression_executor][experiment
     exprs.push_back(std::move(in_expr));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-    auto in_vals = copy_column_to_host<int32_t>(iv.column(0));
+    auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
       if (v == 2 || v == 4 || v == 6) { expected.push_back(v); }
@@ -1085,7 +1123,7 @@ TEST_CASE("experimental select IN and NOT IN", "[expression_executor][experiment
     exprs.push_back(std::move(not_in_expr));
 
     auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-    auto in_vals = copy_column_to_host<int32_t>(iv.column(0));
+    auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
       if (v != 0 && v != 1 && v != 2 && v != 3) { expected.push_back(v); }
@@ -1105,12 +1143,12 @@ TEST_CASE("experimental select IS NULL and IS NOT NULL", "[expression_executor][
 
   std::vector<int32_t> values = {10, 20, 30, 40, 50};
   std::vector<bool> valids    = {true, false, true, false, true};
-  auto input = make_int32_batch_with_nulls(*space, values, valids);
+  auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
   SECTION("IS NULL")
   {
-    auto is_null = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::OPERATOR_IS_NULL, LogicalType{LogicalTypeId::BOOLEAN});
+    auto is_null = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
+                                                              LogicalType{LogicalTypeId::BOOLEAN});
     is_null->children.push_back(
       duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
 
@@ -1145,8 +1183,8 @@ TEST_CASE("experimental select NOT operator", "[expression_executor][experimenta
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
 
   // NOT (col0 > 5) — should keep rows where col0 <= 5
   auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
@@ -1154,15 +1192,15 @@ TEST_CASE("experimental select NOT operator", "[expression_executor][experimenta
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
     duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(5)));
 
-  auto not_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_NOT, LogicalType{LogicalTypeId::BOOLEAN});
+  auto not_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
+                                                             LogicalType{LogicalTypeId::BOOLEAN});
   not_expr->children.push_back(std::move(cmp));
 
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(not_expr));
 
   auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-  auto in_vals = copy_column_to_host<int32_t>(iv.column(0));
+  auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
     if (v <= 5) { expected.push_back(v); }
@@ -1174,8 +1212,7 @@ TEST_CASE("experimental select NOT operator", "[expression_executor][experimenta
 // Conjunction with AST breaker: AND/OR mixing AST-capable and non-AST nodes
 // ---------------------------------------------------------------------------
 
-TEST_CASE("experimental select conjunction with AST breaker",
-          "[expression_executor][experimental]")
+TEST_CASE("experimental select conjunction with AST breaker", "[expression_executor][experimental]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1194,11 +1231,14 @@ TEST_CASE("experimental select conjunction with AST breaker",
     duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
 
   duckdb::vector<duckdb::unique_ptr<Expression>> like_children;
-  like_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 1));
+  like_children.push_back(
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 1));
   like_children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_%")));
-  auto like = make_func_expr(
-    "~~", LogicalType{LogicalTypeId::BOOLEAN}, {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-    std::move(like_children));
+  auto like =
+    make_func_expr("~~",
+                   LogicalType{LogicalTypeId::BOOLEAN},
+                   {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
+                   std::move(like_children));
 
   auto conjunction = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
   conjunction->children.push_back(std::move(cmp));
@@ -1208,8 +1248,8 @@ TEST_CASE("experimental select conjunction with AST breaker",
   exprs.push_back(std::move(conjunction));
 
   auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-  auto in_col0 = copy_column_to_host<int32_t>(iv.column(0));
-  auto in_col1 = copy_string_column_to_host(iv.column(1));
+  auto in_col0                       = copy_column_to_host<int32_t>(iv.column(0));
+  auto in_col1                       = copy_string_column_to_host(iv.column(1));
 
   std::vector<int32_t> expected_col0;
   for (auto v : in_col0) {
@@ -1224,8 +1264,8 @@ TEST_CASE("experimental select OR conjunction", "[expression_executor][experimen
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
 
   // col0 < 3 OR col0 > 17
   auto lt = duckdb::make_uniq<BoundComparisonExpression>(
@@ -1245,7 +1285,7 @@ TEST_CASE("experimental select OR conjunction", "[expression_executor][experimen
   exprs.push_back(std::move(disjunction));
 
   auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-  auto in_vals = copy_column_to_host<int32_t>(iv.column(0));
+  auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
     if (v < 3 || v > 17) { expected.push_back(v); }
@@ -1274,7 +1314,8 @@ TEST_CASE("experimental select with nested CASE in predicate",
     ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
     duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(50)));
-  check.then_expr = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
+  check.then_expr =
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
   case_expr->case_checks.push_back(std::move(check));
   case_expr->else_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0));
 
@@ -1287,7 +1328,7 @@ TEST_CASE("experimental select with nested CASE in predicate",
   exprs.push_back(std::move(outer_cmp));
 
   auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-  auto in_vals = copy_column_to_host<int32_t>(iv.column(0));
+  auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
     int32_t case_result = v > 50 ? v : 0;
@@ -1306,14 +1347,14 @@ TEST_CASE("experimental select IN with conjunction multi-column",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  auto input = make_input_batch(
-    *space,
-    {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}},
-    {std::pair<int, int>{0, 9}, std::pair<int, int>{0, 50}});
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}},
+                     {std::pair<int, int>{0, 9}, std::pair<int, int>{0, 50}});
 
   // WHERE col0 IN (1, 3, 5, 7) AND col1 >= 20
-  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::COMPARE_IN, LogicalType{LogicalTypeId::BOOLEAN});
+  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
+                                                            LogicalType{LogicalTypeId::BOOLEAN});
   in_expr->children.push_back(
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
   in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
@@ -1334,8 +1375,8 @@ TEST_CASE("experimental select IN with conjunction multi-column",
   exprs.push_back(std::move(conjunction));
 
   auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs);
-  auto in_col0 = copy_column_to_host<int32_t>(iv.column(0));
-  auto in_col1 = copy_column_to_host<int64_t>(iv.column(1));
+  auto in_col0                       = copy_column_to_host<int32_t>(iv.column(0));
+  auto in_col1                       = copy_column_to_host<int64_t>(iv.column(1));
   std::vector<int32_t> expected_col0;
   std::vector<int64_t> expected_col1;
   for (size_t i = 0; i < in_col0.size(); ++i) {
@@ -1359,10 +1400,10 @@ TEST_CASE("experimental execute mixed arithmetic and CASE projection",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  auto input = make_input_batch(
-    *space,
-    {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
-    {std::pair<int, int>{1, 50}, std::pair<int, int>{1, 10}});
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{1, 50}, std::pair<int, int>{1, 10}});
 
   // Output: [col0 + col1, CASE WHEN col0 > 25 THEN col1 * 2 ELSE col1 END]
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
@@ -1370,21 +1411,28 @@ TEST_CASE("experimental execute mixed arithmetic and CASE projection",
   // Expression 0: col0 + col1
   {
     duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
-    exprs.push_back(make_func_expr(
-      "+", LogicalType{LogicalTypeId::INTEGER}, {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
-      std::move(children)));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    exprs.push_back(
+      make_func_expr("+",
+                     LogicalType{LogicalTypeId::INTEGER},
+                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
+                     std::move(children)));
   }
 
   // Expression 1: CASE WHEN col0 > 25 THEN col1 * 2 ELSE col1 END
   {
     duckdb::vector<duckdb::unique_ptr<Expression>> mul_children;
-    mul_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    mul_children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
     mul_children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
-    auto then_expr = make_func_expr(
-      "*", LogicalType{LogicalTypeId::INTEGER}, {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
-      std::move(mul_children));
+    auto then_expr =
+      make_func_expr("*",
+                     LogicalType{LogicalTypeId::INTEGER},
+                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
+                     std::move(mul_children));
 
     auto case_expr = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
     BoundCaseCheck check;
@@ -1394,7 +1442,8 @@ TEST_CASE("experimental execute mixed arithmetic and CASE projection",
       duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(25)));
     check.then_expr = std::move(then_expr);
     case_expr->case_checks.push_back(std::move(check));
-    case_expr->else_expr = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1);
+    case_expr->else_expr =
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1);
     exprs.push_back(std::move(case_expr));
   }
 
@@ -1402,8 +1451,8 @@ TEST_CASE("experimental execute mixed arithmetic and CASE projection",
   REQUIRE(ov.num_columns() == 2);
   REQUIRE(ov.num_rows() == iv.num_rows());
 
-  auto in0 = copy_column_to_host<int32_t>(iv.column(0));
-  auto in1 = copy_column_to_host<int32_t>(iv.column(1));
+  auto in0  = copy_column_to_host<int32_t>(iv.column(0));
+  auto in1  = copy_column_to_host<int32_t>(iv.column(1));
   auto out0 = copy_column_to_host<int32_t>(ov.column(0));
   auto out1 = copy_column_to_host<int32_t>(ov.column(1));
   for (size_t i = 0; i < in0.size(); ++i) {

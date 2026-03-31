@@ -157,7 +157,7 @@ class gpu_expression_executor {
   };
 
   /**
-   * @brief The result placehoder for executing an expression.
+   * @brief The result placeholder for executing an expression.
    *
    * It holds either 1) an ast_result if the expression was added to the AST tree,
    *                 2) a cudf::column_view if the expression is a BOUND_REFERENCE evaluated in
@@ -213,14 +213,16 @@ class gpu_expression_executor {
     [[nodiscard]] expr_ref get_expr() const;
 
     /**
-     * @brief Returns the indices of temporary scalars that must be kept alive for the AST expression.
+     * @brief Returns the indices of temporary scalars that must be kept alive for the AST
+     * expression.
      * @return The temporary scalar indices if the payload holds an ast_result, otherwise an empty
      * vector.
      */
     [[nodiscard]] std::vector<std::size_t> get_temp_scalar_indices() const;
 
     /**
-     * @brief Returns the indices of temporary columns that must be kept alive for the AST expression.
+     * @brief Returns the indices of temporary columns that must be kept alive for the AST
+     * expression.
      * @return The temporary column indices if the payload holds an ast_result, otherwise an empty
      * vector.
      */
