@@ -81,7 +81,8 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   // can't then provide it to the operator history
   mutable std::optional<std::size_t> _estimation_basis = std::nullopt;
 
-  // The peak bytes observed to materialize the input data. We need to track this so we can subtract it from the peak bytes observed to compute the operators' peak bytes.
+  // The peak bytes observed to materialize the input data. We need to track this so we can subtract
+  // it from the peak bytes observed to compute the operators' peak bytes.
   size_t _peak_bytes_to_materialize_input = 0;
 
   /**

@@ -104,7 +104,6 @@ class pipeline_memory_history {
     double avg_ratio = weighted_ratio_sum / weight_sum;
 
     return static_cast<std::size_t>(static_cast<double>(estimated_bytes) * avg_ratio);
-    
   }
 
   /**

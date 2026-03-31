@@ -276,8 +276,9 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, i, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
-      auto peak_bytes        = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
-      // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the operators.
+      auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
+      // operators.
       peak_bytes -= local_state._peak_bytes_to_materialize_input;
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
@@ -408,7 +409,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     try {
       handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory& oom) {
-      auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+      auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
       auto input_basis = local_state.get_task_consumption_basis();
       auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
       global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
@@ -440,7 +441,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     processing_handles.emplace_back(std::move(*handle));
   }
-  
+
   local_state._peak_bytes_to_materialize_input = allocator->get_peak_allocated_bytes(stream);
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
@@ -463,8 +464,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   // Record memory metrics for future reservation estimates
   if (output_data) {
-    auto peak_bytes          = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
-    // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the operators.
+    auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+    // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
+    // operators.
     peak_bytes -= local_state._peak_bytes_to_materialize_input;
     std::size_t output_bytes = 0;
     for (const auto& batch : output_data->get_data_batches()) {
