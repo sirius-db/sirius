@@ -319,7 +319,6 @@ void sirius_pipeline::update_pipeline_status()
     // WSM TODO need to increment task created before pulling data?
     // Lets fix this by putting task creation as a method in the pipeline class so that it can be
     // done atomically.
-    bool was_finished = pipeline_finished.load();
     if (limit_exhausted ||
         (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
       if (tasks_created.load() == tasks_completed.load()) {
@@ -330,9 +329,10 @@ void sirius_pipeline::update_pipeline_status()
       }
     }
     end_nvtx_range_if_finished();
-    // Notify downstream consumers only on the transition to finished
-    // (not on repeated calls when already finished).
-    if (!was_finished && pipeline_finished.load() && on_finished) { on_finished(); }
+    // NOTE: do NOT fire on_finished for generic pipelines here. The GPU executor
+    // already handles consumer scheduling after task completion (line 264 of
+    // gpu_pipeline_executor.cpp). Firing on_finished here races with in-flight
+    // GPU tasks and causes cudaErrorIllegalAddress.
   }
 }
 
