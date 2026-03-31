@@ -31,13 +31,18 @@
 #include <duckdb/common/types.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+// standard library
+#include <numeric>
 
 namespace {
 /// Returns true if cudf::cast supports this type (fixed-width only; no STRING/LIST/STRUCT/etc.).
@@ -50,7 +55,105 @@ bool IsFixedWidth(cudf::data_type const& type)
 }  // namespace
 
 namespace sirius::experimental {
-using data_batch = cucascade::data_batch;
+using data_batch     = cucascade::data_batch;
+using execute_result = gpu_expression_executor::execute_result;
+using ast_result     = gpu_expression_executor::ast_result;
+
+//===----------------------------------------------------------------------===//
+// ast_result
+//===----------------------------------------------------------------------===//
+
+gpu_expression_executor::ast_result::ast_result(
+  expr_ref e,
+  std::vector<std::vector<std::size_t>> scalar_indices,
+  std::vector<std::vector<std::size_t>> column_indices)
+  : expr(e)
+{
+  auto const total_scalars = std::accumulate(
+    scalar_indices.begin(),
+    scalar_indices.end(),
+    std::size_t(0),
+    [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
+  temp_scalar_indices.reserve(total_scalars);
+  for (auto& vec : scalar_indices) {
+    temp_scalar_indices.insert(temp_scalar_indices.end(),
+                               std::make_move_iterator(vec.begin()),
+                               std::make_move_iterator(vec.end()));
+  }
+
+  auto const total_columns = std::accumulate(
+    column_indices.begin(),
+    column_indices.end(),
+    std::size_t(0),
+    [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
+  temp_column_indices.reserve(total_columns);
+  for (auto& vec : column_indices) {
+    temp_column_indices.insert(temp_column_indices.end(),
+                               std::make_move_iterator(vec.begin()),
+                               std::make_move_iterator(vec.end()));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// execute_result
+//===----------------------------------------------------------------------===//
+
+std::reference_wrapper<cudf::ast::expression const>
+gpu_expression_executor::execute_result::get_expr() const
+{
+  if (!is_ast()) {
+    throw std::runtime_error("[execute_result] Attempted to get expr from materialized result");
+  }
+  return std::get<ast_result>(payload).expr;
+}
+
+std::vector<std::size_t> gpu_expression_executor::execute_result::get_temp_scalar_indices() const
+{
+  if (is_ast()) { return std::get<ast_result>(payload).temp_scalar_indices; }
+  return {};
+}
+
+std::vector<std::size_t> gpu_expression_executor::execute_result::get_temp_column_indices() const
+{
+  if (is_ast()) { return std::get<ast_result>(payload).temp_column_indices; }
+  return {};
+}
+
+cudf::scalar const& gpu_expression_executor::execute_result::get_scalar() const
+{
+  if (!is_scalar()) {
+    throw std::runtime_error(
+      "[execute_result] Attempted to get scalar from non-scalar execute_result");
+  }
+  auto const& scalar_payload = std::get<std::unique_ptr<cudf::scalar>>(payload);
+  return *scalar_payload;
+}
+
+cudf::column_view gpu_expression_executor::execute_result::get_column_view() const
+{
+  if (is_ast() || is_scalar()) {
+    throw std::runtime_error(
+      "[execute_result] Attempted to get column view from non-column execute_result");
+  }
+  if (std::holds_alternative<cudf::column_view>(payload)) {
+    return std::get<cudf::column_view>(payload);
+  }
+  auto const& column_payload = std::get<std::unique_ptr<cudf::column>>(payload);
+  return column_payload->view();
+}
+
+std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::get_column()
+{
+  if (std::holds_alternative<std::unique_ptr<cudf::column>>(payload)) {
+    return std::move(std::get<std::unique_ptr<cudf::column>>(payload));
+  }
+  throw std::runtime_error(
+    "[execute_result] Attempted to get column from execute_result that does not hold a column");
+}
+
+//===----------------------------------------------------------------------===//
+// gpu_expression_executor
+//===----------------------------------------------------------------------===//
 
 gpu_expression_executor::gpu_expression_executor(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
@@ -62,6 +165,62 @@ gpu_expression_executor::gpu_expression_executor(
 {
   for (auto const& expr : expressions) {
     _expressions.push_back(expr.get());
+  }
+}
+
+std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
+{
+  std::vector<cudf::column_view> combined_column_views;
+  combined_column_views.reserve(_input_table.num_columns() + _temp_columns.size());
+  for (int column_idx = 0; column_idx < _input_table.num_columns(); ++column_idx) {
+    combined_column_views.push_back(_input_table.column(column_idx));
+  }
+
+  // We must be careful not to add invalidated temporary columns, as cuDF will throw when
+  // constructing the table_view. Since the input table has a nonzero number of columns, we can
+  // use the 0th column to produce a dummy column_view to maintain the integrity of the column
+  // indices (note that this dummy column will never be referenced).
+  for (auto const& temp_column : _temp_columns) {
+    if (temp_column) {
+      combined_column_views.push_back(temp_column->view());
+    } else {
+      combined_column_views.push_back(_input_table.column(0));
+    }
+  }
+
+  cudf::table_view combined_table_view(combined_column_views);
+  if (_strategy == expression_executor_strategy::AST_INTERPRET) {
+    return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
+  } else {
+    return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
+  }
+}
+
+void gpu_expression_executor::release_temporaries(
+  std::vector<std::size_t> const& scalar_indices,
+  std::vector<std::size_t> const& column_indices)
+{
+  for (auto const idx : scalar_indices) {
+    _temp_scalars[idx].reset();
+  }
+  for (auto const idx : column_indices) {
+    _temp_columns[idx].reset();
+  }
+}
+
+void gpu_expression_executor::release_temporaries(
+  std::vector<std::vector<std::size_t>> const& scalar_indices,
+  std::vector<std::vector<std::size_t>> const& column_indices)
+{
+  for (auto const& vec : scalar_indices) {
+    for (auto const idx : vec) {
+      _temp_scalars[idx].reset();
+    }
+  }
+  for (auto const& vec : column_indices) {
+    for (auto const idx : vec) {
+      _temp_columns[idx].reset();
+    }
   }
 }
 
@@ -81,15 +240,28 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   for (auto const _expr : _expressions) {
     auto const& expr = *_expr;
     auto result      = execute(expr, execution_mode::MATERIALIZE);
-    // BOUND_REF: pass column through without type check (same as Execute(GPUIntermediateRelation)).
-    // The column is the actual input column; no cast is valid for string/non-fixed-width.
-    if (expr.expression_class != duckdb::ExpressionClass::BOUND_REF) {
+
+    if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
+      // BOUND_REF: pass column through without type check (same as
+      // Execute(GPUIntermediateRelation)). The column is the actual input column; no cast is valid
+      // for string/non-fixed-width.
+      _output_columns.push_back(
+        std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+    } else {
       // Cast the `result` from libcudf to `return_type` if `result` has a different type.
       // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
       // Only use cudf::cast when both types are fixed-width (cast does not support
       // STRING/LIST/STRUCT).
       auto const cudf_return_type = GetCudfType(expr.return_type);
-      auto result_column          = result.get_column();
+      std::unique_ptr<cudf::column> result_column;
+      if (result.is_scalar()) {
+        // i.e., BOUND_CONSTANT: we need to materialize the scalar into a column.
+        // KEVIN: I don't know if this code path is ever actually executed.
+        result_column =
+          cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr);
+      } else {
+        result_column = result.get_column();
+      }
       if (result_column->type().id() != cudf_return_type.id()) {
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
           result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);
@@ -100,10 +272,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
             cudf::type_to_name(cudf_return_type));
         }
       }
-    } else {
-      // For BOUND_REF, we must deep copy the column to the upstream batch
-      _output_columns.push_back(
-        std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+      _output_columns.push_back(std::move(result_column));
     }
   }
 
@@ -124,11 +293,13 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data
   auto const& expr = *_expressions[0];
   D_ASSERT(expr.return_type == duckdb::LogicalType::BOOLEAN);
 
-  // Execute the expression to get the boolean mask (_input_table extracted by execute())
-  auto mask = execute(expr, execution_mode::MATERIALIZE);
+  // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
+  auto mask_batch  = execute(input_batch);
+  auto& mask_repr  = mask_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto  mask_view  = mask_repr.get_table().view().column(0);
 
   // Apply the boolean mask to filter the input batch
-  auto output_table = cudf::apply_boolean_mask(_input_table, mask.get_column_view(), _stream, _mr);
+  auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
                                                           *input_batch->get_memory_space());
@@ -136,6 +307,36 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
+}
+
+execute_result gpu_expression_executor::execute(duckdb::Expression const& expr, execution_mode mode)
+{
+  switch (expr.GetExpressionClass()) {
+    case duckdb::ExpressionClass::BOUND_BETWEEN:
+      return execute(expr.Cast<duckdb::BoundBetweenExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_CASE:
+      return execute(expr.Cast<duckdb::BoundCaseExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_CAST:
+      return execute(expr.Cast<duckdb::BoundCastExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_CONSTANT:
+      return execute(expr.Cast<duckdb::BoundConstantExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_COMPARISON:
+      return execute(expr.Cast<duckdb::BoundComparisonExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_CONJUNCTION:
+      return execute(expr.Cast<duckdb::BoundConjunctionExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_FUNCTION:
+      return execute(expr.Cast<duckdb::BoundFunctionExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_OPERATOR:
+      return execute(expr.Cast<duckdb::BoundOperatorExpression>(), mode);
+    case duckdb::ExpressionClass::BOUND_REF:
+      return execute(expr.Cast<duckdb::BoundReferenceExpression>(), mode);
+    default:
+      throw duckdb::InternalException(
+        "[gpu_expression_executor] execute called on an expression [{}] with unsupported "
+        "expression class: {}",
+        expr.ToString(),
+        static_cast<int>(expr.GetExpressionClass()));
+  }
 }
 
 std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& expr) const

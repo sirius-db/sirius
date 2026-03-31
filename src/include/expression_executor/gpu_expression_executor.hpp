@@ -41,10 +41,7 @@
 // cudf
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_view.hpp>
-#include <cudf/transform.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/traits.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
@@ -59,17 +56,42 @@
 
 namespace sirius::experimental {
 
+// The currently supported CAST return types for cuDF ASTs
 static std::array<duckdb::LogicalTypeId, 3> constexpr supported_ast_cast_types{
   {duckdb::LogicalTypeId::UBIGINT, duckdb::LogicalTypeId::BIGINT, duckdb::LogicalTypeId::DOUBLE}};
 static std::array<std::string_view, 6> constexpr supported_ast_functions{
   "+", "-", "*", "/", "//", "%"};
 
+/**
+ * @brief The expression_executor_strategy defines how the gpu_expression_executor executes.
+ * MATERIALIZE: Executes by materializing intermediate results as cudf::columns (every expression
+ *              node is a single kernel).
+ * AST_INTERPRET: Executes by constructing a cudf::ast::tree and interpreting it with cudf::compute
+ *                (monolithic kernel with large switch statement).
+ * AST_JIT: Executes by constructing a cudf::ast::tree and compiling it with cudf::compute_jit.
+ *
+ * @note Not all expression nodes have cuDF AST equivalents ('AST breakers'), so the AST-based
+ * strategies build ASTs for as many nodes as they can before encountering AST breakers. The result
+ * is a tree whose nodes are AST trees and whose edges are AST breakers.
+ */
 enum class expression_executor_strategy {
   MATERIALIZE,
   AST_INTERPRET,
   AST_JIT,
 };
 
+/**
+ * @brief The gpu_expression_executor is responsible for evaluating DuckDB expressions on the GPU
+ * using cuDF.
+ *
+ * It builds a tree of AST trees whose edges are 'AST breakers', i.e., expression
+ * operations that don't have cuDF AST equivalents (e.g., LIKE, SUBSTRING, CASE, etc.). Each AST
+ * tree is then interpreted or JIT-compiled with cuDF to produce the final result. If the
+ * expression_executor_strategy is MATERIALIZE, the AST trees are single operators and revert to
+ * direct unary/binary operators. To control how many nodes should be in an AST tree before we
+ * execute in AST mode (rather than MATERIALIZE mode), toggle the `min_ast_size` parameter in the
+ * constructor.
+ */
 class gpu_expression_executor {
   using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
 
@@ -95,33 +117,7 @@ class gpu_expression_executor {
     }
     ast_result(expr_ref e,
                std::vector<std::vector<std::size_t>> scalar_indices,
-               std::vector<std::vector<std::size_t>> column_indices)
-      : expr(e)
-    {
-      auto const total_scalars = std::accumulate(
-        scalar_indices.begin(),
-        scalar_indices.end(),
-        std::size_t(0),
-        [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
-      temp_scalar_indices.reserve(total_scalars);
-      for (auto& vec : scalar_indices) {
-        temp_scalar_indices.insert(temp_scalar_indices.end(),
-                                   std::make_move_iterator(vec.begin()),
-                                   std::make_move_iterator(vec.end()));
-      }
-
-      auto const total_columns = std::accumulate(
-        column_indices.begin(),
-        column_indices.end(),
-        std::size_t(0),
-        [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
-      temp_column_indices.reserve(total_columns);
-      for (auto& vec : column_indices) {
-        temp_column_indices.insert(temp_column_indices.end(),
-                                   std::make_move_iterator(vec.begin()),
-                                   std::make_move_iterator(vec.end()));
-      }
-    }
+               std::vector<std::vector<std::size_t>> column_indices);
   };
 
   struct execute_result {
@@ -145,56 +141,17 @@ class gpu_expression_executor {
     }
 
     [[nodiscard]] bool is_ast() const { return std::holds_alternative<ast_result>(payload); }
-    [[nodiscard]] expr_ref get_expr() const
-    {
-      if (!is_ast()) {
-        throw std::runtime_error("[execute_result] Attempted to get expr from materialized result");
-      }
-      return std::get<ast_result>(payload).expr;
-    }
-    [[nodiscard]] std::vector<std::size_t> get_temp_scalar_indices() const
-    {
-      if (is_ast()) { return std::get<ast_result>(payload).temp_scalar_indices; }
-      return {};
-    }
-    [[nodiscard]] std::vector<std::size_t> get_temp_column_indices() const
-    {
-      if (is_ast()) { return std::get<ast_result>(payload).temp_column_indices; }
-      return {};
-    }
     [[nodiscard]] bool is_scalar() const
     {
       return std::holds_alternative<std::unique_ptr<cudf::scalar>>(payload);
     }
-    [[nodiscard]] cudf::scalar const& get_scalar() const
-    {
-      if (!is_scalar()) {
-        throw std::runtime_error(
-          "[execute_result] Attempted to get scalar from non-scalar execute_result");
-      }
-      auto const& scalar_payload = std::get<std::unique_ptr<cudf::scalar>>(payload);
-      return *scalar_payload;
-    }
-    [[nodiscard]] cudf::column_view get_column_view() const
-    {
-      if (is_ast() || is_scalar()) {
-        throw std::runtime_error(
-          "[execute_result] Attempted to get column view from non-column execute_result");
-      }
-      if (std::holds_alternative<cudf::column_view>(payload)) {
-        return std::get<cudf::column_view>(payload);
-      }
-      auto const& column_payload = std::get<std::unique_ptr<cudf::column>>(payload);
-      return column_payload->view();
-    }
-    [[nodiscard]] std::unique_ptr<cudf::column> get_column()
-    {
-      if (std::holds_alternative<std::unique_ptr<cudf::column>>(payload)) {
-        return std::move(std::get<std::unique_ptr<cudf::column>>(payload));
-      }
-      throw std::runtime_error(
-        "[execute_result] Attempted to get column from execute_result that does not hold a column");
-    }
+
+    [[nodiscard]] expr_ref get_expr() const;
+    [[nodiscard]] std::vector<std::size_t> get_temp_scalar_indices() const;
+    [[nodiscard]] std::vector<std::size_t> get_temp_column_indices() const;
+    [[nodiscard]] cudf::scalar const& get_scalar() const;
+    [[nodiscard]] cudf::column_view get_column_view() const;
+    [[nodiscard]] std::unique_ptr<cudf::column> get_column();
   };
 
   enum class execution_mode {
@@ -224,61 +181,12 @@ class gpu_expression_executor {
   std::vector<std::unique_ptr<cudf::scalar>> _temp_scalars;
   std::vector<std::unique_ptr<cudf::column>> _temp_columns;
 
-  std::unique_ptr<cudf::column> execute_ast(expr_ref root_expr)
-  {
-    std::vector<cudf::column_view> combined_column_views;
-    combined_column_views.reserve(_input_table.num_columns() + _temp_columns.size());
-    for (int column_idx = 0; column_idx < _input_table.num_columns(); ++column_idx) {
-      combined_column_views.push_back(_input_table.column(column_idx));
-    }
-
-    // We must be careful not to add invalidated temporary columns, as cuDF will throw when
-    // constructing the table_view. Since the input table has a nonzero number of columns, we can
-    // use the 0th column to produce a dummy column_view to maintain the integrity of the column
-    // indices (note that this dummy column will never be referenced).
-    for (auto const& temp_column : _temp_columns) {
-      if (temp_column) {
-        combined_column_views.push_back(temp_column->view());
-      } else {
-        combined_column_views.push_back(_input_table.column(0));
-      }
-    }
-
-    cudf::table_view combined_table_view(combined_column_views);
-    if (_strategy == expression_executor_strategy::AST_INTERPRET) {
-      auto result_column = cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
-      return std::move(result_column);
-    } else {
-      auto result_column =
-        cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
-      return std::move(result_column);
-    }
-  };
+  std::unique_ptr<cudf::column> execute_ast(expr_ref root_expr);
 
   void release_temporaries(std::vector<std::size_t> const& scalar_indices,
-                           std::vector<std::size_t> const& column_indices)
-  {
-    for (auto const idx : scalar_indices) {
-      _temp_scalars[idx].reset();
-    }
-    for (auto const idx : column_indices) {
-      _temp_columns[idx].reset();
-    }
-  }
+                           std::vector<std::size_t> const& column_indices);
   void release_temporaries(std::vector<std::vector<std::size_t>> const& scalar_indices,
-                           std::vector<std::vector<std::size_t>> const& column_indices)
-  {
-    for (auto const& vec : scalar_indices) {
-      for (auto const idx : vec) {
-        _temp_scalars[idx].reset();
-      }
-    }
-    for (auto const& vec : column_indices) {
-      for (auto const idx : vec) {
-        _temp_columns[idx].reset();
-      }
-    }
-  }
+                           std::vector<std::vector<std::size_t>> const& column_indices);
 
   execute_result execute(duckdb::Expression const& expr, execution_mode mode = execution_mode::AST);
 

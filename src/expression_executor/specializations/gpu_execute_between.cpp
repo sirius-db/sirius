@@ -30,7 +30,8 @@ using execute_result = gpu_expression_executor::execute_result;
 execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression const& expr,
                                                 execution_mode mode)
 {
-  if (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size) {
+  if (_strategy != expression_executor_strategy::MATERIALIZE &&
+      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
     auto comparison_type_switch_ast = [](duckdb::BoundBetweenExpression const& expr)
       -> std::pair<cudf::ast::ast_operator, cudf::ast::ast_operator> {
       cudf::ast::ast_operator lower_op;
@@ -48,7 +49,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression c
       return {lower_op, upper_op};
     };
 
-    auto input                = execute(*expr.input, execution_mode::AST);
+    auto input = execute(*expr.input, execution_mode::AST);
     D_ASSERT(!input.is_scalar());
     auto lower                = execute(*expr.lower, execution_mode::AST);
     auto upper                = execute(*expr.upper, execution_mode::AST);

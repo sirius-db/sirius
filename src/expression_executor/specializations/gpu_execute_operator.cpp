@@ -132,7 +132,8 @@ using execute_result = gpu_expression_executor::execute_result;
 execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression const& expr,
                                                 execution_mode mode)
 {
-  if (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size) {
+  if (_strategy != expression_executor_strategy::MATERIALIZE &&
+      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
     auto operator_type_switch_ast =
       [&](duckdb::BoundOperatorExpression const& expr) -> execute_result {
       switch (expr.type) {
@@ -237,33 +238,47 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
           })) {
         // All types should be the same
         /// KEVIN: TODO: Support more types here
+        std::unique_ptr<cudf::column> contains_column;
         switch (test.get_column_view().type().id()) {
           case cudf::type_id::INT16:
-            return duckdb::sirius::ExecuteNumericIn<int16_t>::Do(
+            contains_column = duckdb::sirius::ExecuteNumericIn<int16_t>::Do(
               expr, test.get_column_view(), _mr, _stream);
+            break;
           case cudf::type_id::INT32:
-            return duckdb::sirius::ExecuteNumericIn<int32_t>::Do(
+            contains_column = duckdb::sirius::ExecuteNumericIn<int32_t>::Do(
               expr, test.get_column_view(), _mr, _stream);
+            break;
           case cudf::type_id::INT64:
-            return duckdb::sirius::ExecuteNumericIn<int64_t>::Do(
+            contains_column = duckdb::sirius::ExecuteNumericIn<int64_t>::Do(
               expr, test.get_column_view(), _mr, _stream);
+            break;
           case cudf::type_id::FLOAT32:
-            return duckdb::sirius::ExecuteNumericIn<float_t>::Do(
+            contains_column = duckdb::sirius::ExecuteNumericIn<float_t>::Do(
               expr, test.get_column_view(), _mr, _stream);
+            break;
           case cudf::type_id::FLOAT64:
-            return duckdb::sirius::ExecuteNumericIn<double_t>::Do(
+            contains_column = duckdb::sirius::ExecuteNumericIn<double_t>::Do(
               expr, test.get_column_view(), _mr, _stream);
+            break;
           case cudf::type_id::BOOL8:
-            return duckdb::sirius::ExecuteNumericIn<uint8_t>::Do(
+            contains_column = duckdb::sirius::ExecuteNumericIn<uint8_t>::Do(
               expr, test.get_column_view(), _mr, _stream);
+            break;
           case cudf::type_id::STRING:
-            return duckdb::sirius::ExecuteStringIn::Do(expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              duckdb::sirius::ExecuteStringIn::Do(expr, test.get_column_view(), _mr, _stream);
+            break;
           default:
             throw duckdb::NotImplementedException(
               "[gpu_expression_executor] execute IN called with unsupported scalar haystack type "
               "{}",
               static_cast<int>(test.get_column_view().type().id()));
         }
+        if (expr.type == duckdb::ExpressionType::COMPARE_NOT_IN) {
+          contains_column = cudf::unary_operation(
+            contains_column->view(), cudf::unary_operator::NOT, _stream, _mr);
+        }
+        return execute_result(std::move(contains_column));
       }
 
       // Some hastack referent is not a scalar

@@ -33,7 +33,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
                                        supported_ast_cast_types.end(),
                                        expr.return_type.id()) != supported_ast_cast_types.end();
 
-  if (ast_supported && (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
+  if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
+      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
     auto cast_type_switch = [](duckdb::LogicalTypeId type_id) -> cudf::ast::ast_operator {
       using enum duckdb::LogicalTypeId;
       switch (type_id) {

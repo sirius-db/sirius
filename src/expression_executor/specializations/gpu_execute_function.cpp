@@ -91,7 +91,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     std::find(supported_ast_functions.begin(), supported_ast_functions.end(), func_string) !=
     supported_ast_functions.end();
 
-  if (ast_supported && (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
+  if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
+      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
     // Only numeric binary functions are supported in AST currently
     D_ASSERT(expr.children.size() == 2);
 

@@ -32,7 +32,8 @@ using execute_result = gpu_expression_executor::execute_result;
 execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpression const& expr,
                                                 execution_mode mode)
 {
-  if (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size) {
+  if (_strategy != expression_executor_strategy::MATERIALIZE &&
+      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
     auto conjunction_type_switch_ast =
       [](duckdb::BoundConjunctionExpression const& expr) -> cudf::ast::ast_operator {
       using enum duckdb::ExpressionType;
