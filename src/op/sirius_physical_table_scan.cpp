@@ -307,5 +307,22 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   return std::make_unique<operator_data>(output_batches);
 }
 
+std::string sirius_physical_table_scan::params_to_string() const
+{
+  std::string result;
+  // Show table name from the function
+  if (!function.name.empty()) { result += " " + function.name; }
+  // Show scanned column names
+  if (!names.empty()) {
+    result += " [";
+    for (size_t i = 0; i < names.size(); i++) {
+      if (i > 0) { result += ", "; }
+      result += names[i];
+    }
+    result += "]";
+  }
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

@@ -52,5 +52,17 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   return std::make_unique<operator_data>(output_batches);
 }
 
+std::string sirius_physical_projection::params_to_string() const
+{
+  if (select_list.empty()) { return ""; }
+  std::string result = " [";
+  for (size_t i = 0; i < select_list.size(); i++) {
+    if (i > 0) { result += ", "; }
+    result += select_list[i]->ToString();
+  }
+  result += "]";
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

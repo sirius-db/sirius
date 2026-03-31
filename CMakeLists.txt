@@ -75,6 +75,7 @@ set(EXTENSION_SOURCES
     src/extension_lock.cpp
     src/fallback.cpp
     src/gpu_buffer_manager.cpp
+    src/gpu_explain.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -147,6 +148,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/util/sirius_plan_renderer.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
 
@@ -272,6 +274,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_explain.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory_management/test_cpu_cache.cpp

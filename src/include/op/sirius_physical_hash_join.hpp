@@ -192,6 +192,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   bool is_sink() const override { return true; }
 
   void finalize_operator() override;
+
+  std::string params_to_string() const override;
 };
 
 }  // namespace op

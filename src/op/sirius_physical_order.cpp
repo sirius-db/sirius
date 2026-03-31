@@ -82,5 +82,23 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   return std::make_unique<operator_data>(output_batches);
 }
 
+std::string sirius_physical_order::params_to_string() const
+{
+  if (orders.empty()) { return ""; }
+  std::string result = " [";
+  for (size_t i = 0; i < orders.size(); i++) {
+    if (i > 0) { result += ", "; }
+    result += orders[i].expression->ToString();
+    result += (orders[i].type == duckdb::OrderType::ASCENDING) ? " ASC" : " DESC";
+    if (orders[i].null_order == duckdb::OrderByNullType::NULLS_FIRST) {
+      result += " NULLS FIRST";
+    } else if (orders[i].null_order == duckdb::OrderByNullType::NULLS_LAST) {
+      result += " NULLS LAST";
+    }
+  }
+  result += "]";
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

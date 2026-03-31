@@ -46,6 +46,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
+#include "gpu_explain.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
@@ -671,6 +672,14 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  TableFunction gpu_explain("gpu_explain",
+                            {LogicalType::VARCHAR},
+                            GPUExplainFunction,
+                            GPUExplainBind);
+  gpu_explain.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  CreateTableFunctionInfo gpu_explain_info(gpu_explain);
+  catalog.CreateTableFunction(transaction, gpu_explain_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

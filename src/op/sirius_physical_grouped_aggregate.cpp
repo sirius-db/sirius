@@ -184,5 +184,36 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   }
   return std::make_unique<operator_data>(results);
 }
+std::string sirius_physical_grouped_aggregate::params_to_string() const
+{
+  std::string result;
+  if (!group_idx.empty()) {
+    result += " groups=[";
+    for (size_t i = 0; i < group_idx.size(); i++) {
+      if (i > 0) { result += ", "; }
+      result += "#" + std::to_string(group_idx[i]);
+    }
+    result += "]";
+  }
+  if (!cudf_aggregates.empty()) {
+    result += " aggs=[";
+    for (size_t i = 0; i < cudf_aggregates.size(); i++) {
+      if (i > 0) { result += ", "; }
+      switch (cudf_aggregates[i]) {
+        case cudf::aggregation::Kind::SUM: result += "SUM"; break;
+        case cudf::aggregation::Kind::MIN: result += "MIN"; break;
+        case cudf::aggregation::Kind::MAX: result += "MAX"; break;
+        case cudf::aggregation::Kind::COUNT_VALID: result += "COUNT"; break;
+        case cudf::aggregation::Kind::COUNT_ALL: result += "COUNT_ALL"; break;
+        case cudf::aggregation::Kind::MEAN: result += "AVG"; break;
+        case cudf::aggregation::Kind::NUNIQUE: result += "COUNT_DISTINCT"; break;
+        default: result += "AGG(" + std::to_string(static_cast<int>(cudf_aggregates[i])) + ")";
+      }
+    }
+    result += "]";
+  }
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

@@ -1082,5 +1082,21 @@ void sirius_physical_hash_join::finalize_operator()
   }
 }
 
+std::string sirius_physical_hash_join::params_to_string() const
+{
+  std::string result = " " + duckdb::JoinTypeToString(join_type);
+  if (!conditions.empty()) {
+    result += " (";
+    for (size_t i = 0; i < conditions.size(); i++) {
+      if (i > 0) { result += " AND "; }
+      result += conditions[i].left->ToString() + " " +
+                duckdb::ExpressionTypeToOperator(conditions[i].comparison) + " " +
+                conditions[i].right->ToString();
+    }
+    result += ")";
+  }
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

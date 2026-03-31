@@ -35,6 +35,8 @@ class sirius_physical_projection : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
+
+  std::string params_to_string() const override;
 };
 
 }  // namespace op

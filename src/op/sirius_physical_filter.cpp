@@ -66,5 +66,11 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   return std::make_unique<operator_data>(output_batches);
 }
 
+std::string sirius_physical_filter::params_to_string() const
+{
+  if (expression) { return " " + expression->ToString(); }
+  return "";
+}
+
 }  // namespace op
 }  // namespace sirius

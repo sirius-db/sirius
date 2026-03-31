@@ -125,6 +125,8 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+
+  std::string params_to_string() const override;
 };
 
 }  // namespace op

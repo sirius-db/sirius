@@ -126,5 +126,17 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   return std::make_unique<operator_data>(output_batches);
 }
 
+std::string sirius_physical_streaming_limit::params_to_string() const
+{
+  std::string result;
+  if (limit_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
+    result += " limit=" + std::to_string(limit_val.GetConstantValue());
+  }
+  if (offset_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
+    result += " offset=" + std::to_string(offset_val.GetConstantValue());
+  }
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

@@ -50,6 +50,8 @@ class sirius_physical_filter : public sirius_physical_operator {
   // 	}
 
   // 	std::string params_to_string() const override;
+
+  std::string params_to_string() const override;
 };
 
 }  // namespace op
