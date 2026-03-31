@@ -314,7 +314,23 @@ void duckdb_scan_executor::manager_loop()
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
       try {
-        auto consumers = scan_task->get_output_consumers();
+        // Collect consumer+pipeline pairs before executing the task.
+        // We use the pipeline-aware variant so that shared operators
+        // (e.g. TABLE_SCAN) get scheduled with the correct pipeline.
+        struct consumer_info {
+          op::sirius_physical_operator* op;
+          duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline;
+        };
+        std::vector<consumer_info> consumers;
+        if (auto* duckdb_task = dynamic_cast<duckdb_scan_task*>(scan_task)) {
+          for (auto& c : duckdb_task->get_output_consumers_with_pipelines()) {
+            consumers.push_back({c.op, c.pipeline});
+          }
+        } else if (auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task)) {
+          for (auto& c : parquet_task->get_output_consumers_with_pipelines()) {
+            consumers.push_back({c.op, c.pipeline});
+          }
+        }
         {
           auto output_data = get_scan_output(scan_task, stream);
           stream->synchronize();
@@ -323,8 +339,8 @@ void duckdb_scan_executor::manager_loop()
 
         t.reset();
         if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
-          for (auto* consumer : consumers) {
-            _task_creator->schedule(consumer);
+          for (auto& [consumer, pipeline] : consumers) {
+            _task_creator->schedule(consumer, pipeline);
           }
         }
 

@@ -412,6 +412,10 @@ fn extract_sort_limit_from_plan(
 /// so a reduced base_schema causes DuckDB/Sirius to read only the columns actually needed
 /// by the query. Non-parquet tables (NamedTable path) retain all columns because DuckDB
 /// maps those by position.
+/// Reduce parquet table schemas to only materialized columns.
+///
+/// SLOT_REF column references auto-adjust because `set_table_column_override`
+/// uses the reduced column list, and `slot_table_index` resolves by NAME.
 fn project_parquet_schemas(
     table_schemas: &HashMap<String, Vec<String>>,
     file_scan_map: &HashMap<String, FileScanInfo>,
@@ -477,11 +481,12 @@ pub fn translate_fragment(
         .context("TPipelineFragmentParams has no desc_tbl")?;
     let mut desc = descriptor_table::DescriptorTable::from_thrift(desc_tbl)?;
 
-    // Projection pushdown for parquet scans: reduce table_schemas to only
-    // materialized columns. For parquet LocalFiles, DuckDB matches columns by
-    // NAME, so a reduced base_schema makes DuckDB/Sirius read only needed columns.
-    // NamedTable (non-parquet) keeps all columns (DuckDB maps by POSITION).
-    let table_schemas = project_parquet_schemas(table_schemas, file_scan_map, &desc);
+    // Don't reduce parquet schemas for now — projection pushdown changes column
+    // indices and causes GROUP BY / expression reference mismatches in the Sirius
+    // GPU engine. Keep all columns; filter/projection pushdown will be added later
+    // with proper index remapping.
+    // let table_schemas = project_parquet_schemas(table_schemas, file_scan_map, &desc);
+    let table_schemas = table_schemas.clone();
 
     // Set table column overrides from DuckDB table schemas (for TVF scans).
     for (table_name, columns) in &table_schemas {
@@ -2075,18 +2080,21 @@ mod tests {
             _ => panic!("expected Root"),
         };
 
-        // Root.names should only have the 2 materialized columns (projection pushdown).
-        assert_eq!(root.names, vec!["col_a", "col_c"]);
+        // With projection pushdown disabled, all 5 columns are present.
+        assert_eq!(
+            root.names,
+            vec!["col_a", "col_b", "col_c", "col_d", "col_e"]
+        );
 
-        // ReadRel base_schema should only have the 2 materialized columns.
+        // ReadRel base_schema should have ALL columns (no projection pushdown).
         let input = root.input.as_ref().unwrap();
         match input.rel_type.as_ref().unwrap() {
             rel::RelType::Read(read) => {
                 let schema = read.base_schema.as_ref().unwrap();
                 assert_eq!(
                     schema.names,
-                    vec!["col_a", "col_c"],
-                    "ReadRel should only have materialized columns (projection pushdown)"
+                    vec!["col_a", "col_b", "col_c", "col_d", "col_e"],
+                    "ReadRel should have ALL columns (projection pushdown disabled)"
                 );
                 match &read.read_type {
                     Some(read_rel::ReadType::LocalFiles(_)) => {}

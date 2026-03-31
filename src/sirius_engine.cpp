@@ -1029,7 +1029,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                    op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
-                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::CROSS_PRODUCT) {
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
           // if the source is CONCAT, then use partial barrier type
           if ((dependent_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
@@ -1175,9 +1179,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
         auto probe_concat_pipeline    = new_scheduled[i]->dependencies[1];
         auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
-        // change probe partition barrier to partial
-        probe_partition_pipeline->get_source()->get_port("default")->type =
-          op::MemoryBarrierType::PARTIAL;
+        // Change probe partition barrier to partial.
+        // Port might be "default" (regular) or "scan" (exchange table scans).
+        {
+          auto* probe_src = probe_partition_pipeline->get_source().get();
+          if (probe_src) {
+            for (auto pid : probe_src->get_port_ids()) {
+              probe_src->get_port(pid)->type = op::MemoryBarrierType::PARTIAL;
+            }
+          }
+        }
         if (build_partition_pipeline->get_sink()->type ==
             op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           // partition pipeline only has one operator

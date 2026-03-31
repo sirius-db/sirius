@@ -2152,11 +2152,38 @@ impl PBackendService for PBackendServiceHandler {
                     let nixl_agent_for_exch_blocking = if should_retain_exch { nixl_agent.clone() } else { None };
                     let engine_for_release = engine.clone();
 
+                    // Extract hash partition info for the GPU result_collector's per-partition packing.
+                    let hash_partition_info_exch: Option<(usize, Vec<i32>)> = exchange_dests.as_ref().and_then(|e| {
+                        if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, ref partition_exprs, .. } = &e.partition {
+                            // Derive column indices from SLOT_REF partition exprs.
+                            let col_indices: Vec<i32> = partition_exprs.iter()
+                                .filter_map(|expr| {
+                                    expr.nodes.first().and_then(|n| n.slot_ref.as_ref()).map(|sr| sr.slot_id)
+                                })
+                                .enumerate()
+                                .map(|(i, _)| i as i32)
+                                .collect();
+                            if col_indices.is_empty() {
+                                // Fallback: use positional indices 0..N based on partition expr count.
+                                Some((*num_destinations, (0..partition_exprs.len() as i32).collect()))
+                            } else {
+                                Some((*num_destinations, col_indices))
+                            }
+                        } else { None }
+                    });
+
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
                         if should_retain_exch {
                             if let Err(e) = engine.retain_gpu_buffers() {
                                 tracing::warn!(error = %e, "failed to set retain_gpu_buffers for exchange fragment");
+                            }
+                            // Set up hash partition config so the GPU result_collector
+                            // produces per-partition packed buffers in the staging buffer.
+                            if let Some((num_dests, ref col_indices)) = hash_partition_info_exch {
+                                if let Err(e) = engine.set_exchange_partition(num_dests, col_indices) {
+                                    tracing::warn!(error = %e, "failed to set exchange partition for exchange fragment");
+                                }
                             }
                         }
                         let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
@@ -2169,11 +2196,20 @@ impl PBackendService for PBackendServiceHandler {
                         if is_cpu_only {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         } else if should_retain_exch {
-                            // Build location from packed staging data only.
+                            // Build location from packed staging data (whole buffer + per-partition).
+                            let partitions = engine.get_packed_partitions().unwrap_or_default();
                             match engine.get_packed_gpu() {
                                 Ok(Some((addr, size, metadata))) => {
-                                    tracing::info!(addr = format_args!("0x{addr:x}"), size, "packed GPU for exchange forward");
-                                    Ok(crate::nixl_integration::ExecutionLocation::from_packed(addr, size, metadata, ipc_bytes))
+                                    tracing::info!(
+                                        addr = format_args!("0x{addr:x}"), size,
+                                        num_partitions = partitions.len(),
+                                        "packed GPU for exchange forward"
+                                    );
+                                    let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(addr, size, metadata, ipc_bytes);
+                                    if !partitions.is_empty() {
+                                        loc.set_packed_partitions(partitions);
+                                    }
+                                    Ok(loc)
                                 }
                                 _ => {
                                     tracing::info!("no packed GPU data for exchange forward, using CPU path");

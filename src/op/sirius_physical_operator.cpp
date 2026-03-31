@@ -237,8 +237,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   });
 
   if (unfinished_barrier != _ports_list.end()) {
-    auto* producer = &((*unfinished_barrier)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    auto source = (*unfinished_barrier)->src_pipeline->get_source();
+    if (!source) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, source.get()};
   }
 
   // if no unfinished barriers, then is this operator ready to create a task?
@@ -258,8 +259,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
     });
 
   if (unfinished_pipeline != _ports_list.end()) {
-    auto* producer = &((*unfinished_pipeline)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    auto source = (*unfinished_pipeline)->src_pipeline->get_source();
+    if (!source) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, source.get()};
   }
 
   // nothing to do

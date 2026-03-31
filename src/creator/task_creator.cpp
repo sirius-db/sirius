@@ -196,6 +196,15 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   _task_creation_queue.push(std::move(request));
 }
 
+void task_creator::schedule(op::sirius_physical_operator* node,
+                            duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
+{
+  auto request      = std::make_unique<task_creation_request>();
+  request->node     = node;
+  request->pipeline = std::move(pipeline);
+  _task_creation_queue.push(std::move(request));
+}
+
 void task_creator::manager_loop()
 {
   while (_running.load()) {
@@ -211,7 +220,8 @@ void task_creator::manager_loop()
       break;
     }
 
-    auto node = request->node;
+    auto node              = request->node;
+    auto explicit_pipeline = std::move(request->pipeline);
     if (node == nullptr) { continue; }
 
     node = get_operator_for_next_task(node);
@@ -219,10 +229,12 @@ void task_creator::manager_loop()
     if (node == nullptr) { continue; }
 
     // Schedule the task creation work on the thread pool
-    _thread_pool->schedule([this, node, ticket = std::move(ticket)]() mutable {
+    _thread_pool->schedule(
+      [this, node, ticket = std::move(ticket), explicit_pipeline = std::move(explicit_pipeline)]() mutable {
       try {
-        // Get what we need to create the task
-        auto pipeline = node->get_pipeline();
+        // Use the explicit pipeline if provided (for shared operators like TABLE_SCAN),
+        // otherwise fall back to the operator's own pipeline.
+        auto pipeline = explicit_pipeline ? std::move(explicit_pipeline) : node->get_pipeline();
         std::vector<cucascade::shared_data_repository*> destination_data_repositories;
         // special handling for delim joins
         if (pipeline->get_sink()->type ==

@@ -444,6 +444,23 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
     return output_consumers;
   }
 
+  struct consumer_with_pipeline {
+    sirius_physical_operator* op;
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline;
+  };
+
+  std::vector<consumer_with_pipeline> get_output_consumers_with_pipelines()
+  {
+    auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
+    std::vector<consumer_with_pipeline> result;
+    auto ports = g_state.get_operator().get_next_port_after_sink();
+    for (auto& [child, port_id] : ports) {
+      auto* p = child->get_port(port_id);
+      result.push_back({child, p ? p->dest_pipeline : nullptr});
+    }
+    return result;
+  }
+
   /**
    * @brief Get the unique ID of this task.
    *

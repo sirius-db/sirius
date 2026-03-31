@@ -897,6 +897,10 @@ pub async fn send_nixl_to_peer(
         let remote = remote_name.clone();
 
         tokio::task::spawn_blocking(move || {
+            // Ensure the tokio worker thread has an active CUDA primary context.
+            // Without this, UCX internally calls cuDevicePrimaryCtxRetain which
+            // fails with "failed to get primary context id" → Fatal crash.
+            crate::cuda_driver::ensure_cuda_context()?;
             let src_descs = agent.create_gpu_descs(&all_src_ptrs, device_id)?;
             let dst_descs = agent.create_gpu_descs(&all_dst_ptrs, device_id)?;
             agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, &remote)

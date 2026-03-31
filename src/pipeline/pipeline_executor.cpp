@@ -167,20 +167,44 @@ std::future<void> pipeline_executor::start_query()
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  // Set on_finished callbacks on result-collector pipelines so that 0-row scans
-  // (which produce no GPU tasks) can signal the completion handler directly.
+  // Set on_finished callbacks on ALL pipelines.  When a pipeline finishes,
+  // its downstream consumers (waiting on FULL barriers) must be notified so
+  // the task creator can re-check their readiness.  Without this, consumers
+  // are scheduled once during the scan but if they return WAITING (barrier
+  // not yet met), they are dropped and never re-checked.
   auto* ch = _completion_handler.get();
   if (_current_query) {
   for (auto& pipeline : _current_query->get_pipelines()) {
-    auto sink = pipeline->get_sink();
-    if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-      pipeline->on_finished = [ch]() {
+    auto sink   = pipeline->get_sink();
+    auto source = pipeline->get_source();
+    bool is_scan =
+      source && source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN;
+    bool is_result_collector =
+      sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
+
+    pipeline->on_finished = [this, ch, is_scan, is_result_collector,
+                             pipeline_ptr = pipeline.get()]() {
+      // 1. Scan pipelines: schedule the next scan from the priority queue.
+      if (is_scan) {
+        SIRIUS_LOG_INFO("scan pipeline #{} finished, scheduling next scan + consumers",
+                        pipeline_ptr->get_pipeline_id());
+        schedule_next_scan_tasks();
+      }
+
+      // 2. ALL pipelines: notify downstream consumers that a barrier is met.
+      auto consumers = pipeline_ptr->get_output_consumers();
+      for (auto* consumer : consumers) {
+        _task_creator->schedule(consumer);
+      }
+
+      // 3. Result-collector pipelines: signal query completion for 0-row scans.
+      if (is_result_collector) {
         if (ch && !ch->is_completed()) {
           SIRIUS_LOG_INFO("pipeline on_finished: signaling completion (0-row scan)");
           ch->mark_completed();
         }
-      };
-    }
+      }
+    };
   }
   }
 
@@ -257,8 +281,6 @@ void pipeline_executor::schedule_next_scan_tasks()
       _task_creator->schedule(scan_op);
     }
     _priority_scans.pop();
-  } else {
-    SIRIUS_LOG_WARN("[schedule_next_scan_tasks] NO scan operators in queue — pipeline will hang!");
   }
 }
 
