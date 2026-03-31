@@ -69,10 +69,10 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx || !ctx->is_initialized()) { return; }
 
-  if (!is_acceleratable_query(*plan)) { return; }
-
-  // Disable optimizers that produce DuckDB-internal functions Sirius can't handle.
-  // This runs before the built-in optimizers so they won't transform the plan.
+  // Unconditionally disable optimizers that produce DuckDB-internal functions
+  // Sirius can't handle. We can't gate this on is_acceleratable_query() because
+  // the pre-optimization plan shape may differ from the post-optimization shape
+  // (e.g. subqueries get flattened). The post-hook re-enables them.
   auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
   disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
   disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
