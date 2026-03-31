@@ -21,15 +21,25 @@
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/execution/task_error_manager.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
+
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 namespace duckdb {
 class ClientContext;
 }  // namespace duckdb
+
+namespace sirius::op {
+class sirius_physical_table_scan;
+}  // namespace sirius::op
 
 namespace sirius {
 
@@ -90,6 +100,13 @@ class sirius_engine {
   //! Construct the sirius specific operator
   duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
     op::sirius_physical_operator* op);
+  //! Construct a sirius iceberg scan operator, populating delete file lists from cache.
+  duckdb::unique_ptr<op::sirius_physical_operator> construct_iceberg_scan_operator(
+    op::sirius_physical_table_scan& scan_op);
+  //! Pre-fetch iceberg table metadata (delete files) for all iceberg scans in the plan.
+  //! Must be called from initialize() BEFORE initialize_internal() assigns operator IDs
+  //! to pipeline-breaker operators (PARTITION, CONCAT, etc.).
+  void prefetch_iceberg_metadata(op::sirius_physical_operator& plan);
   //! Create a child pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
@@ -102,6 +119,14 @@ class sirius_engine {
   std::condition_variable query_finish_cv;
   //! Whether the query has finished
   bool query_finished;
+
+  // ---------------------------------------------------------------------------
+  // Iceberg metadata cache
+  //
+  // Populated by prefetch_iceberg_metadata() in initialize(), BEFORE
+  // initialize_internal() runs.  Keyed by iceberg table path string.
+  // ---------------------------------------------------------------------------
+  std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
 };
 
 }  // namespace sirius

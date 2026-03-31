@@ -27,6 +27,9 @@
 namespace sirius {
 namespace op {
 
+/// Deep-copies an ExtraOperatorInfo. Defined in sirius_physical_parquet_scan.cpp.
+duckdb::ExtraOperatorInfo copy_extra_info_parquet_scan(const duckdb::ExtraOperatorInfo& src);
+
 class sirius_physical_parquet_scan : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARQUET_SCAN;

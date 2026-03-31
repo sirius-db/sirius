@@ -47,6 +47,7 @@ class sirius_pipeline_task_global_state;
 namespace sirius::op::scan {
 class duckdb_scan_task_global_state;
 class parquet_scan_task_global_state;
+class iceberg_scan_task_global_state;
 }  // namespace sirius::op::scan
 
 namespace sirius::planner {
