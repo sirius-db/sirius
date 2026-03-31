@@ -19,7 +19,7 @@ pixi run -e doris doris-build            # without nixl (CPU/bRPC only)
 pixi run -e doris-fe doris-fe-build
 
 # Substrait DuckDB extension
-pixi run substrait-build
+pixi run -e doris substrait-build
 ```
 
 ## Running

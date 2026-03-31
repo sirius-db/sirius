@@ -69,6 +69,7 @@ clangdev = "*"
 sysroot_linux-64 = ">=2.32"
 
 [feature.doris.tasks]
+substrait-build = { cmd = "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make release", cwd = "substrait", description = "Build DuckDB substrait extension" }
 doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris workspace" }
 nixl-build = { cmd = """bash -c 'set -e
   NIXL_SRC=$PIXI_PROJECT_ROOT/doris/thirdparty/nixl

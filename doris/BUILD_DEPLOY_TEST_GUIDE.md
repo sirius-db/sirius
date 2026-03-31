@@ -55,7 +55,7 @@ Produces: `build/release/extension/sirius/sirius.duckdb_extension`
 
 ### Step 2: Build the DuckDB Substrait extension
 ```bash
-pixi run substrait-build
+pixi run -e doris substrait-build
 ```
 Produces: `substrait/build/release/extension/substrait/substrait.duckdb_extension`
 
@@ -333,7 +333,7 @@ cd sirius-doris
 
 # 3. Build (all four components)
 pixi run make release              # C++ GPU engine
-pixi run substrait-build           # Substrait extension
+pixi run -e doris substrait-build  # Substrait extension
 pixi run -e doris doris-build      # NIXL + Rust BE
 pixi run -e doris-fe doris-fe-build  # Doris FE
 
