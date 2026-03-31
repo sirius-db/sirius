@@ -31,7 +31,7 @@ def _verify_results(duckdb_rows, sirius_rows, query_name):
         # Check row counts
         if len(duckdb_rows) != len(sirius_rows):
             print(
-                f"  {query_name}: Row count mismatch - DuckDB: {len(duckdb_rows)}, Sirius: {len(sirius_rows)}"
+                f"❌ {query_name}: Row count mismatch - DuckDB: {len(duckdb_rows)}, Sirius: {len(sirius_rows)}"
             )
             return False
 
@@ -44,18 +44,18 @@ def _verify_results(duckdb_rows, sirius_rows, query_name):
             zip(duckdb_rows_sorted, sirius_rows_sorted)
         ):
             if duck_row != sirius_row:
-                print(f"  {query_name}: Row {i} mismatch")
+                print(f"❌ {query_name}: Row {i} mismatch")
                 print(f"   DuckDB:  {duck_row}")
                 print(f"   Sirius:  {sirius_row}")
                 return False
             if duck_row == 0:
-                print(f"  {query_name}: Results are empty")
+                print(f"❌ {query_name}: Results are empty")
                 return False
 
-        print(f"  {query_name}: Results match ({len(duckdb_rows)} rows)")
+        print(f"✓ {query_name}: Results match ({len(duckdb_rows)} rows)")
         return True
     except Exception as e:
-        print(f"  {query_name}: Error during verification - {e}")
+        print(f"❌ {query_name}: Error during verification - {e}")
         return False
 
 
