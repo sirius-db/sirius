@@ -95,6 +95,22 @@ class GPUExecutionFixtureBase {
     return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
   }
 
+  /// Collect all rows from a MaterializedQueryResult as sorted vectors of stringified values.
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  {
+    std::vector<std::vector<std::string>> rows;
+    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+      std::vector<std::string> row;
+      row.reserve(result.ColumnCount());
+      for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
+        row.push_back(result.GetValue(c, r).ToString());
+      }
+      rows.push_back(std::move(row));
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  }
+
   void compare_gpu_vs_cpu(const std::string& query,
                           std::optional<float> float_tolerance = std::nullopt)
   {
@@ -126,57 +142,37 @@ class GPUExecutionFixtureBase {
                 << std::endl;
     }
 
-    // Strip trailing semicolons from query for subquery wrapping
-    auto clean_query = query;
-    while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
-      clean_query.pop_back();
+    // Collect and sort rows from already-materialized results for deterministic comparison.
+    // This avoids re-running the query (which could fail for wrapped subqueries).
+    auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto gpu_rows = collect_rows(gpu_mat);
+    auto cpu_rows = collect_rows(cpu_mat);
 
-    // Use DuckDB to sort both result sets by all columns for deterministic comparison.
-    auto ncols               = gpu_result->ColumnCount();
-    std::string order_clause = " ORDER BY ";
-    for (duckdb::idx_t c = 0; c < ncols; c++) {
-      if (c > 0) order_clause += ", ";
-      order_clause += std::to_string(c + 1);
-    }
-
-    // GPU sorted (transparent execution)
-    auto gpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
-    // CPU sorted (transparent execution disabled)
-    con->Query("SET sirius_transparent_execution = false;");
-    auto cpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
-    con->Query("SET sirius_transparent_execution = true;");
-
-    REQUIRE(gpu_sorted);
-    if (gpu_sorted->HasError()) { UNSCOPED_INFO("gpu sorted error: " << gpu_sorted->GetError()); }
-    REQUIRE_FALSE(gpu_sorted->HasError());
-    REQUIRE(cpu_sorted);
-    if (cpu_sorted->HasError()) { UNSCOPED_INFO("cpu sorted error: " << cpu_sorted->GetError()); }
-    REQUIRE_FALSE(cpu_sorted->HasError());
-
-    for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-      for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-        auto gpu_value = gpu_sorted->GetValue(c, r);
-        auto cpu_value = cpu_sorted->GetValue(c, r);
-
-        if (float_tolerance.has_value() && is_floating_point(gpu_value.type().id())) {
-          double gpu_d = gpu_value.GetValue<double>();
-          double cpu_d = cpu_value.GetValue<double>();
-          double diff  = std::fabs(gpu_d - cpu_d);
-          if (diff > static_cast<double>(float_tolerance.value())) {
-            UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=[" << gpu_d
-                                 << "] CPU=[" << cpu_d << "] diff=" << diff
-                                 << " tolerance=" << float_tolerance.value());
+    for (duckdb::idx_t r = 0; r < gpu_rows.size(); r++) {
+      for (duckdb::idx_t c = 0; c < gpu_rows[r].size(); c++) {
+        if (float_tolerance.has_value()) {
+          // Check if this looks like a float value for tolerance comparison
+          try {
+            double gpu_d = std::stod(gpu_rows[r][c]);
+            double cpu_d = std::stod(cpu_rows[r][c]);
+            double diff  = std::fabs(gpu_d - cpu_d);
+            if (diff > static_cast<double>(float_tolerance.value())) {
+              UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=[" << gpu_d
+                                   << "] CPU=[" << cpu_d << "] diff=" << diff
+                                   << " tolerance=" << float_tolerance.value());
+              REQUIRE(diff <= static_cast<double>(float_tolerance.value()));
+            }
+            continue;
+          } catch (...) {
+            // Not a float, fall through to string comparison
           }
-          REQUIRE(diff <= static_cast<double>(float_tolerance.value()));
-        } else {
-          auto gpu_str = gpu_value.ToString();
-          auto cpu_str = cpu_value.ToString();
-          if (gpu_str != cpu_str) {
-            UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_str << "] CPU=["
-                                 << cpu_str << "]");
-          }
-          REQUIRE(gpu_str == cpu_str);
         }
+        if (gpu_rows[r][c] != cpu_rows[r][c]) {
+          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
+                               << "] CPU=[" << cpu_rows[r][c] << "]");
+        }
+        REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
       }
     }
   }
