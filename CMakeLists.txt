@@ -148,6 +148,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/util/plan_extraction.cpp
     src/util/sirius_plan_renderer.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)

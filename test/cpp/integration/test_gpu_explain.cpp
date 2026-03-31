@@ -39,8 +39,12 @@ class GPUExplainFixture {
 
     // Set config file so the Sirius extension initializes the GPU context.
     // Without this, join plan generation fails because it accesses SiriusContext.
-    auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
-    if (fs::exists(cfg_path)) { setenv("SIRIUS_CONFIG_FILE", cfg_path.string().c_str(), 1); }
+    // Only set if no valid config is already provided via environment (the test
+    // harness sets a non-existent sentinel path after its own DuckDB is created).
+    if (!had_prev_config_ || !fs::exists(prev_config_)) {
+      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+      if (fs::exists(cfg_path)) { setenv("SIRIUS_CONFIG_FILE", cfg_path.string().c_str(), 1); }
+    }
 
     db  = std::make_unique<duckdb::DuckDB>(nullptr);
     con = std::make_unique<duckdb::Connection>(*db);

@@ -16,14 +16,9 @@
 
 #include "gpu_explain.hpp"
 
-#include "duckdb/execution/column_binding_resolver.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/config.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "util/plan_extraction.hpp"
 #include "util/sirius_plan_renderer.hpp"
 
 namespace duckdb {
@@ -53,69 +48,21 @@ unique_ptr<FunctionData> GPUExplainBind(ClientContext& context,
     if (kv.first == "enable_optimizer") { enable_optimizer = BooleanValue::Get(kv.second); }
   }
 
-  // Save and modify optimizer settings (same pattern as gpu_execution)
-  auto original_config              = context.config;
-  auto original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
+  auto plan = sirius::util::extract_optimized_plan(context, query_str, enable_optimizer);
 
-  context.config.enable_optimizer = enable_optimizer;
+  // Capture the DuckDB logical plan text before physical planning consumes it
+  result->logical_plan_text = plan->ToString();
 
-  set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
-  disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
-  disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-#ifdef DEBUG
-  disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
-#endif
-  DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
-
+  // Generate Sirius physical plan
   try {
-    // Parse and plan the query
-    Parser parser(context.GetParserOptions());
-    parser.ParseQuery(query_str);
-    if (parser.statements.empty()) { throw BinderException("gpu_explain: empty or invalid query"); }
-    if (parser.statements.size() > 1) {
-      throw BinderException("gpu_explain: only a single statement is supported");
-    }
-
-    Planner planner(context);
-    planner.CreatePlan(std::move(parser.statements[0]));
-    D_ASSERT(planner.plan);
-
-    auto plan = std::move(planner.plan);
-
-    if (context.config.enable_optimizer) {
-      Optimizer optimizer(*planner.binder, context);
-      plan = optimizer.Optimize(std::move(plan));
-    }
-
-    plan->ResolveOperatorTypes();
-
-    ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
-    resolver.VisitOperator(*plan);
-
-    // Capture the DuckDB logical plan text before physical planning consumes it
-    result->logical_plan_text = plan->ToString();
-
-    // Generate Sirius physical plan
-    try {
-      sirius::planner::sirius_physical_plan_generator physical_planner(context);
-      auto sirius_plan         = physical_planner.create_plan(std::move(plan));
-      result->sirius_plan_text = sirius::util::render_operator_tree(*sirius_plan);
-    } catch (std::exception& e) {
-      ErrorData error(e);
-      result->error_message = error.RawMessage();
-      SIRIUS_LOG_DEBUG("gpu_explain: physical plan generation failed: {}", result->error_message);
-    }
-  } catch (...) {
-    // Restore settings before re-throwing
-    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled_optimizers;
-    context.config                                           = original_config;
-    throw;
+    sirius::planner::sirius_physical_plan_generator physical_planner(context);
+    auto sirius_plan         = physical_planner.create_plan(std::move(plan));
+    result->sirius_plan_text = sirius::util::render_operator_tree(*sirius_plan);
+  } catch (std::exception& e) {
+    ErrorData error(e);
+    result->error_message = error.RawMessage();
+    SIRIUS_LOG_DEBUG("gpu_explain: physical plan generation failed: {}", result->error_message);
   }
-
-  // Restore original settings
-  DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled_optimizers;
-  context.config                                           = original_config;
 
   // Output schema: two VARCHAR columns matching DuckDB's EXPLAIN convention
   return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
