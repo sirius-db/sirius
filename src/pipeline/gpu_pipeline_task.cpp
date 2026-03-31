@@ -316,7 +316,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       auto input_basis =
         _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
       auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-      global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
+      global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
@@ -412,7 +412,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
       auto input_basis = local_state.get_task_consumption_basis();
       auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
-      global.get_memory_history().record({input_basis, peak_bytes, std::nullopt});
+      global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
       SIRIUS_LOG_ERROR("Pipeline {}: OOM at batch {} preparing for processing, state: {}",
                        pipeline->get_pipeline_id(),

@@ -69,6 +69,35 @@ class pipeline_memory_history {
   }
 
   /**
+   * @brief Record a failed task's memory metrics.
+   *
+   * If an existing record with the same estimated_bytes and nullopt output_bytes
+   * is found, updates it with the maximum of the two peak_memory_bytes values.
+   * Otherwise, inserts a new record with output_bytes = nullopt.
+   *
+   * Thread-safe. May be called concurrently from multiple executor threads.
+   *
+   * @param estimated_bytes The estimation basis for the failed task.
+   * @param peak_memory_bytes The actual peak allocated bytes during the failed execution.
+   */
+  void record_on_failure(std::size_t estimated_bytes, std::size_t peak_memory_bytes)
+  {
+    if (estimated_bytes == 0) { return; }
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+
+      // Look for an existing failure record with the same estimated_bytes
+      for (auto& rec : _records) {
+        if (rec.estimated_bytes == estimated_bytes && !rec.output_bytes.has_value()) {
+          rec.peak_memory_bytes = std::max(rec.peak_memory_bytes, peak_memory_bytes);
+          return;
+        }
+      }
+    }
+    this->record({estimated_bytes, peak_memory_bytes, std::nullopt});
+  }
+
+  /**
    * @brief Estimate peak memory for a new task given its estimation basis.
    *
    * Uses a weighted average of historical peak/estimated ratios, where records

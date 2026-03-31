@@ -250,7 +250,6 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
     std::move(local_state),
     std::move(global_state));
 }
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -474,4 +473,125 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
   REQUIRE(estimate3.has_value());
   REQUIRE(*estimate3 < middle_consumption * 1.15);
   REQUIRE(*estimate3 > middle_consumption * 0.85);
+}
+
+// ---------------------------------------------------------------------------
+// Test: record_on_failure deduplicates OOM records by estimated_bytes and keeps
+// the maximum peak_memory_bytes.
+//
+// Uses GPU-resident batches so that lock_or_prepare_batch does not allocate,
+// making the OOM happen during the operator execute.
+//
+// Four OOM attempts:
+//   1. input=20MB, OOM on alloc=200MB  → 1 record, estimate=200MB
+//   2. input=20MB, OOM on alloc=250MB → still 1 record (same input), estimate=250MB (max updated)
+//   3. input=20MB, OOM on alloc=180MB  → still 1 record, estimate=250MB (max kept)
+//   4. input=10MB, OOM on alloc=230MB  → 2 records (different input)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
+          "[gpu_pipeline_task][history]")
+{
+  constexpr std::size_t kReservationSize = 100ULL * 1024 * 1024;  // 100 MB
+  constexpr std::size_t kOtherReservationSize =
+    350ULL * 1024 * 1024;  // 350 MB to create memory pressure
+
+  constexpr std::size_t kInputDataSize1          = 20ULL * 1024 * 1024;  // 20 MB
+  constexpr std::size_t kInputNumRows1           = kInputDataSize1 / sizeof(int64_t);
+  constexpr std::size_t kExecuteConsumptionSize1 = 200ULL * 1024 * 1024;  // 200 MB
+  constexpr std::size_t kExecuteConsumptionSize2 = 250ULL * 1024 * 1024;  // 250 MB (higher)
+  constexpr std::size_t kExecuteConsumptionSize3 = 180ULL * 1024 * 1024;  // 180 MB (lower)
+
+  constexpr std::size_t kInputDataSize2          = 10ULL * 1024 * 1024;  // 10 MB (different input)
+  constexpr std::size_t kInputNumRows2           = kInputDataSize2 / sizeof(int64_t);
+  constexpr std::size_t kExecuteConsumptionSize4 = 230ULL * 1024 * 1024;  // 230 MB
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  rmm::cuda_stream stream, stream_data_init;
+
+  auto ctx = create_pipeline_context();
+  auto global_state =
+    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
+
+  // Create memory pressure to trigger OOM
+  auto mem_pressure_reservation = f.manager->request_reservation(
+    cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU},
+    kOtherReservationSize);
+
+  // -------------------------------------------------------------------------
+  // Attempt 1: OOM with 200 MB allocation, 20 MB input
+  // -------------------------------------------------------------------------
+  {
+    auto batch              = f.create_gpu_data_batch(kInputNumRows1, stream_data_init);
+    ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize1);
+
+    auto task =
+      create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/1);
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    task->mark_as_rescheduled();
+  }
+
+  REQUIRE(global_state->get_memory_history().size() == 1);
+  auto est1 = global_state->get_memory_history().estimate_peak_memory(kInputDataSize1);
+  REQUIRE(est1.has_value());
+  REQUIRE(*est1 == kExecuteConsumptionSize1);
+
+  // -------------------------------------------------------------------------
+  // Attempt 2: OOM with 250 MB allocation, same 20 MB input
+  //   → record_on_failure should update the existing record to max(200, 250)=250
+  // -------------------------------------------------------------------------
+  {
+    auto batch              = f.create_gpu_data_batch(kInputNumRows1, stream_data_init);
+    ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize2);
+
+    auto task =
+      create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/2);
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    task->mark_as_rescheduled();
+  }
+
+  REQUIRE(global_state->get_memory_history().size() == 1);
+  auto est2 = global_state->get_memory_history().estimate_peak_memory(kInputDataSize1);
+  REQUIRE(est2.has_value());
+  REQUIRE(*est2 == kExecuteConsumptionSize2);
+
+  // -------------------------------------------------------------------------
+  // Attempt 3: OOM with 180 MB allocation, same 20 MB input
+  //   → record_on_failure should keep max(250, 180)=250
+  // -------------------------------------------------------------------------
+  {
+    auto batch              = f.create_gpu_data_batch(kInputNumRows1, stream_data_init);
+    ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize3);
+
+    auto task =
+      create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/3);
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    task->mark_as_rescheduled();
+  }
+
+  REQUIRE(global_state->get_memory_history().size() == 1);
+  auto est3 = global_state->get_memory_history().estimate_peak_memory(kInputDataSize1);
+  REQUIRE(est3.has_value());
+  REQUIRE(*est3 == kExecuteConsumptionSize2);  // still the max from attempt 2
+
+  // -------------------------------------------------------------------------
+  // Attempt 4: OOM with different input size (10 MB)
+  //   → record_on_failure should create a new record (different estimated_bytes)
+  // -------------------------------------------------------------------------
+  {
+    auto batch              = f.create_gpu_data_batch(kInputNumRows2, stream_data_init);
+    ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize4);
+
+    auto task =
+      create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/4);
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    task->mark_as_rescheduled();
+  }
+
+  REQUIRE(global_state->get_memory_history().size() == 2);
 }
