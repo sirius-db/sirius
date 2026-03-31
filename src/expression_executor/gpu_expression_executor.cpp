@@ -166,6 +166,14 @@ gpu_expression_executor::gpu_expression_executor(
   for (auto const& expr : expressions) {
     _expressions.push_back(expr.get());
   }
+  if (strategy == expression_executor_strategy::AST_INTERPRET) {
+    // We are waiting on the release of this bug fix in libcudf:
+    // https://github.com/rapidsai/cudf/pull/21447 Without this fix, decimal expressions will fail
+    // in AST_INTERPRET mode.
+    throw duckdb::InternalException(
+      "[gpu_expression_executor] expression_executor_strategy::AST_INTERPRET is not currently "
+      "supported");
+  }
 }
 
 std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
@@ -196,9 +204,8 @@ std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root
   }
 }
 
-void gpu_expression_executor::release_temporaries(
-  std::vector<std::size_t> const& scalar_indices,
-  std::vector<std::size_t> const& column_indices)
+void gpu_expression_executor::release_temporaries(std::vector<std::size_t> const& scalar_indices,
+                                                  std::vector<std::size_t> const& column_indices)
 {
   for (auto const idx : scalar_indices) {
     _temp_scalars[idx].reset();
@@ -294,9 +301,9 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data
   D_ASSERT(expr.return_type == duckdb::LogicalType::BOOLEAN);
 
   // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
-  auto mask_batch  = execute(input_batch);
-  auto& mask_repr  = mask_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  auto  mask_view  = mask_repr.get_table().view().column(0);
+  auto mask_batch = execute(input_batch);
+  auto& mask_repr = mask_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto mask_view  = mask_repr.get_table().view().column(0);
 
   // Apply the boolean mask to filter the input batch
   auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);
