@@ -246,6 +246,12 @@ void gpu_pipeline_executor::manager_loop()
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         return;
       }
+      // Synchronize the exclusive stream to ensure all GPU operations (including
+      // the result_collector's hash_partition + chunked_pack into staging) complete
+      // before we signal task completion. Without this, the Rust exchange code can
+      // access staging buffer addresses while GPU kernels are still writing to them.
+      exc_stream->synchronize();
+
       task.reset();
 
       // Check if query is complete BEFORE scheduling downstream tasks.

@@ -230,7 +230,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             std::vector<cudf::size_type> col_indices(part_cols.begin(), part_cols.end());
             auto [partitioned_table, offsets] = cudf::hash_partition(
                 view, col_indices, part_num, cudf::hash_id::HASH_MURMUR3,
-                cudf::DEFAULT_HASH_SEED, cudf::get_default_stream());
+                cudf::DEFAULT_HASH_SEED, stream);
 
             SIRIUS_LOG_INFO("[result_collector] GPU hash_partition: {} partitions, {} rows → offsets: [{}]",
                             part_num, view.num_rows(),
@@ -248,7 +248,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                 continue;
               }
               auto slice = cudf::slice(partitioned_table->view(), {start, end});
-              auto packer = cudf::chunked_pack::create(slice[0], staging_size - staging_offset);
+              auto packer = cudf::chunked_pack::create(slice[0], staging_size - staging_offset, stream);
               auto total = packer->get_total_contiguous_size();
               if (staging_offset + total > staging_size) {
                 SIRIUS_LOG_WARN("[result_collector] partition {} ({} bytes) exceeds staging", i, total);
@@ -268,7 +268,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             lgb.AccumulatePackedPartitions(std::move(packed_parts));
           } else if (staging_addr != 0 && staging_size > 0) {
             // No partitioning — single pack into staging (broadcast path).
-            auto packer = cudf::chunked_pack::create(view, staging_size);
+            auto packer = cudf::chunked_pack::create(view, staging_size, stream);
             auto total_size = packer->get_total_contiguous_size();
             if (total_size <= staging_size) {
               cudf::device_span<uint8_t> dst_span(
