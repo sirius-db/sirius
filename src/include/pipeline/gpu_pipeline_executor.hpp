@@ -18,15 +18,11 @@
 
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
-#include "exec/kiosk.hpp"
-#include "exec/thread_pool.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 
-#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 
@@ -47,11 +43,11 @@ namespace pipeline {
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
  *
- * This executor inherits from itask_executor and uses a gpu_pipeline_task_queue for
- * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
- * tasks with specialized GPU resource management.
+ * This executor inherits from itask_executor and manages a pool of threads
+ * dedicated to executing GPU pipeline tasks with specialized GPU resource
+ * management.
  */
-class gpu_pipeline_executor {
+class gpu_pipeline_executor : public sirius::parallel::itask_executor {
  public:
   /**
    * @brief Constructs a new gpu_pipeline_executor with task execution configuration
@@ -77,55 +73,11 @@ class gpu_pipeline_executor {
   gpu_pipeline_executor& operator=(gpu_pipeline_executor&&)      = delete;
 
   /**
-   * @brief Schedules a task for execution with GPU-specific logic
-   *
-   * Overrides the base class schedule method to provide specialized scheduling
-   * behavior for GPU pipeline operations, including resource allocation and
-   * GPU context management.
-   *
-   * @param task The task to schedule (must be a gpu_pipeline_task)
-   */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task);
-
-  /**
-   * @brief Starts the executor and initializes worker threads
-   *
-   * Initializes the thread pool and begins accepting tasks for execution.
-   */
-  void start();
-
-  /**
-   * @brief Stops the executor and cleanly shuts down worker threads
-   *
-   * Stops accepting new tasks and waits for all worker threads to complete
-   * their current tasks before shutting down.
-   */
-  void stop();
-
-  /**
    * @brief Set the task creator for scheduling output consumers
    *
    * @param task_creator Pointer to the task creator
    */
   void set_task_creator(sirius::creator::task_creator* task_creator);
-
-  /**
-   * @brief Drain any leftover tasks from the queue
-   *
-   * Clears the task queue of any remaining tasks from a previous query.
-   */
-  void drain_leftover_tasks();
-
-  /**
-   * @brief Drain all in-flight tasks after a query error.
-   *
-   * Interrupts the task queue so the manager loop exits, waits for all
-   * in-flight thread-pool tasks to complete (via kiosk), then resets the
-   * queue and restarts the manager thread so the executor is ready for the
-   * next query.  Must only be called after report_error() has been issued
-   * (i.e. in the execute() error path, before QueryEnd clears repositories).
-   */
-  void drain_and_wait();
 
   /**
    * @brief Check if the internal task queue is empty.
@@ -144,12 +96,12 @@ class gpu_pipeline_executor {
    */
   void set_completion_handler(completion_handler* handler) noexcept;
 
- private:
-  /**
-   * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
-   */
-  void manager_loop();
+ protected:
+  void manager_loop() override;
 
+  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
+
+ private:
   /**
    * @brief Safely casts itask to gpu_pipeline_task with type validation
    *
@@ -159,12 +111,6 @@ class gpu_pipeline_executor {
    */
   gpu_pipeline_task* cast_to_gpu_pipeline_task(sirius::parallel::itask* task);
 
-  std::atomic<bool> _running{false};
-  exec::thread_pool_config _config;
-  exec::kiosk _kiosk;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
-  std::thread _manager_thread;
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;

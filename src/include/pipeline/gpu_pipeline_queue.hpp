@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "gpu_pipeline.hpp"
 #include "parallel/task_executor.hpp"
+#include "parallel/task_queue.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <blockingconcurrentqueue.h>

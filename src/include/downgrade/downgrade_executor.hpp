@@ -18,10 +18,8 @@
 
 #include "downgrade/downgrade_task.hpp"
 #include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
-#include "exec/kiosk.hpp"
-#include "exec/thread_pool.hpp"
 #include "parallel/task.hpp"
+#include "parallel/task_executor.hpp"
 #include "task_completion.hpp"
 
 #include <cuda_runtime_api.h>
@@ -57,7 +55,7 @@ struct downgrade_repository_info {
  * dispatches tasks from the queue to the thread pool, and a thread pool that executes
  * the downgrade tasks (GPU→HOST copies, etc.).
  */
-class downgrade_executor {
+class downgrade_executor : public sirius::parallel::itask_executor {
  public:
   /**
    * @brief Constructs a new downgrade_executor bound to a specific memory space.
@@ -90,14 +88,6 @@ class downgrade_executor {
   cucascade::memory::memory_space_id get_space_id() const { return _space_id; }
 
   /**
-   * @brief Schedule a task for execution.
-   */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task);
-
-  void start();
-  void stop();
-
-  /**
    * @brief Drain all pending and in-flight downgrade tasks.
    *
    * Must be called before clearing data repositories (e.g., at QueryEnd) to ensure
@@ -126,12 +116,30 @@ class downgrade_executor {
   size_t run_downgrade_pass(std::vector<downgrade_repository_info> repositories,
                             size_t amount_to_downgrade);
 
- private:
-  /**
-   * @brief Manager loop that dispatches tasks from the queue to the thread pool.
-   */
-  void manager_loop();
+ protected:
+  void manager_loop() override;
 
+  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
+
+  /**
+   * @brief Called from start() after the manager thread is launched.
+   * Creates the CUDA stream if needed and starts the monitor thread.
+   */
+  void on_start() override;
+
+  /**
+   * @brief Called from stop() before the manager thread is joined.
+   * Joins the monitor thread.
+   */
+  void on_stop() override;
+
+  /**
+   * @brief Called from stop() after the thread pool has been stopped.
+   * Destroys the CUDA stream.
+   */
+  void on_stopped() override;
+
+ private:
   /**
    * @brief Monitor loop that polls the memory space for pressure and triggers downgrades.
    *
@@ -152,12 +160,6 @@ class downgrade_executor {
     size_t& collected_bytes);
 
  private:
-  std::atomic<bool> _running{false};
-  exec::thread_pool_config _config;
-  exec::kiosk _kiosk;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
-  std::thread _manager_thread;
   cudaStream_t _stream{nullptr};
   std::thread _monitor_thread;
 
@@ -165,7 +167,7 @@ class downgrade_executor {
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
-  task_completion_message_queue _message_queue;  ///< Owned; receives downgrade task completions
+  task_completion_message_queue _message_queue;
 };
 
 }  // namespace parallel
