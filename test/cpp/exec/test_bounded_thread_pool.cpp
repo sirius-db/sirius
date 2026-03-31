@@ -27,35 +27,6 @@ using namespace sirius::exec;
 using namespace std::chrono_literals;
 
 // =============================================================================
-// Basic schedule / execute
-// =============================================================================
-
-TEST_CASE("bounded_thread_pool basic schedule executes task", "[bounded_thread_pool]")
-{
-  bounded_thread_pool pool(2, "test");
-
-  std::atomic<bool> ran{false};
-  bool ok = pool.schedule([&ran] { ran = true; });
-
-  REQUIRE(ok);
-  pool.wait_all();
-  REQUIRE(ran.load());
-}
-
-TEST_CASE("bounded_thread_pool schedules multiple tasks", "[bounded_thread_pool]")
-{
-  bounded_thread_pool pool(4, "test");
-
-  std::atomic<int> counter{0};
-  for (int i = 0; i < 10; ++i) {
-    pool.schedule([&counter] { counter.fetch_add(1); });
-  }
-
-  pool.wait_all();
-  REQUIRE(counter.load() == 10);
-}
-
-// =============================================================================
 // Bounded concurrency
 // =============================================================================
 
@@ -71,7 +42,8 @@ TEST_CASE("bounded_thread_pool respects capacity — never exceeds N concurrent 
 
   // Schedule more tasks than capacity; each holds briefly so overlap is observable.
   for (int i = 0; i < 12; ++i) {
-    pool.schedule([&active, &peak, &mu] {
+    auto s = pool.reserve();
+    s.dispatch([&active, &peak, &mu] {
       int cur = active.fetch_add(1) + 1;
       {
         std::lock_guard lock(mu);
@@ -84,43 +56,6 @@ TEST_CASE("bounded_thread_pool respects capacity — never exceeds N concurrent 
 
   pool.wait_all();
   REQUIRE(peak.load() <= capacity);
-}
-
-// =============================================================================
-// Blocking back-pressure
-// =============================================================================
-
-TEST_CASE("bounded_thread_pool schedule blocks when at capacity", "[bounded_thread_pool]")
-{
-  constexpr int capacity = 2;
-  bounded_thread_pool pool(capacity, "test");
-
-  // Fill all slots with tasks that block on a gate.
-  std::atomic<bool> gate{false};
-  for (int i = 0; i < capacity; ++i) {
-    pool.schedule([&gate] {
-      while (!gate.load()) {
-        std::this_thread::yield();
-      }
-    });
-  }
-
-  // schedule() on a separate thread should block while pool is at capacity.
-  std::atomic<bool> third_scheduled{false};
-  std::thread t([&pool, &third_scheduled] {
-    pool.schedule([] {});
-    third_scheduled = true;
-  });
-
-  // Give the thread time to reach schedule() and confirm it's blocked.
-  std::this_thread::sleep_for(30ms);
-  REQUIRE_FALSE(third_scheduled.load());
-
-  // Release the gate — slots free up, third task can be scheduled.
-  gate = true;
-  t.join();
-  pool.wait_all();
-  REQUIRE(third_scheduled.load());
 }
 
 // =============================================================================
@@ -203,39 +138,6 @@ TEST_CASE("bounded_thread_pool slot dropped without dispatch releases slot",
 // interrupt() / resume() lifecycle
 // =============================================================================
 
-TEST_CASE("bounded_thread_pool interrupt causes schedule to return false", "[bounded_thread_pool]")
-{
-  constexpr int capacity = 1;
-  bounded_thread_pool pool(capacity, "test");
-
-  // Fill the slot so schedule() will block.
-  std::atomic<bool> gate{false};
-  pool.schedule([&gate] {
-    while (!gate.load()) {
-      std::this_thread::yield();
-    }
-  });
-
-  std::atomic<bool> schedule_returned{false};
-  std::atomic<bool> schedule_result{true};
-  std::thread t([&pool, &schedule_returned, &schedule_result] {
-    schedule_result   = pool.schedule([] {});
-    schedule_returned = true;
-  });
-
-  std::this_thread::sleep_for(30ms);
-  REQUIRE_FALSE(schedule_returned.load());
-
-  pool.interrupt();
-  t.join();
-
-  REQUIRE(schedule_returned.load());
-  REQUIRE_FALSE(schedule_result.load());  // returned false
-
-  gate = true;
-  pool.wait_all();
-}
-
 TEST_CASE("bounded_thread_pool interrupt causes reserve to return invalid slot",
           "[bounded_thread_pool]")
 {
@@ -277,18 +179,21 @@ TEST_CASE("bounded_thread_pool interrupt wakes multiple blocked callers", "[boun
   bounded_thread_pool pool(capacity, "test");
 
   std::atomic<bool> gate{false};
-  pool.schedule([&gate] {
-    while (!gate.load()) {
-      std::this_thread::yield();
-    }
-  });
+  {
+    auto s = pool.reserve();
+    s.dispatch([&gate] {
+      while (!gate.load()) {
+        std::this_thread::yield();
+      }
+    });
+  }
 
   constexpr int num_waiters = 4;
   std::atomic<int> woken{0};
   std::vector<std::thread> threads;
   for (int i = 0; i < num_waiters; ++i) {
     threads.emplace_back([&pool, &woken] {
-      pool.schedule([] {});
+      pool.reserve();  // blocks until a slot is available or interrupted
       woken.fetch_add(1);
     });
   }
@@ -306,21 +211,25 @@ TEST_CASE("bounded_thread_pool interrupt wakes multiple blocked callers", "[boun
   pool.wait_all();
 }
 
-TEST_CASE("bounded_thread_pool resume re-enables scheduling after interrupt",
-          "[bounded_thread_pool]")
+TEST_CASE("bounded_thread_pool resume re-enables reserve after interrupt", "[bounded_thread_pool]")
 {
   bounded_thread_pool pool(2, "test");
 
   pool.interrupt();
 
-  // schedule() should return false while interrupted.
-  REQUIRE_FALSE(pool.schedule([] {}));
+  // reserve() should return an invalid slot while interrupted.
+  {
+    auto s = pool.reserve();
+    REQUIRE_FALSE(s.is_valid());
+  }
 
   pool.resume();
 
-  // schedule() should work again after resume.
+  // reserve() should work again after resume.
   std::atomic<bool> ran{false};
-  REQUIRE(pool.schedule([&ran] { ran = true; }));
+  auto s = pool.reserve();
+  REQUIRE(s.is_valid());
+  s.dispatch([&ran] { ran = true; });
   pool.wait_all();
   REQUIRE(ran.load());
 }
@@ -338,7 +247,8 @@ TEST_CASE("bounded_thread_pool wait_all returns only after all tasks complete",
   constexpr int num_tasks = 8;
 
   for (int i = 0; i < num_tasks; ++i) {
-    pool.schedule([&completed] {
+    auto s = pool.reserve();
+    s.dispatch([&completed] {
       std::this_thread::sleep_for(10ms);
       completed.fetch_add(1);
     });
@@ -364,12 +274,17 @@ TEST_CASE("bounded_thread_pool exception in task does not crash the pool", "[bou
   bounded_thread_pool pool(2, "test");
 
   // Task that throws — pool should catch it and remain functional.
-  pool.schedule([] { throw std::runtime_error("intentional"); });
+  {
+    auto s = pool.reserve();
+    s.dispatch([] { throw std::runtime_error("intentional"); });
+  }
   pool.wait_all();
 
   // Pool still works after the exception.
   std::atomic<bool> ran{false};
-  REQUIRE(pool.schedule([&ran] { ran = true; }));
+  auto s = pool.reserve();
+  REQUIRE(s.is_valid());
+  s.dispatch([&ran] { ran = true; });
   pool.wait_all();
   REQUIRE(ran.load());
 }
@@ -391,7 +306,8 @@ TEST_CASE("bounded_thread_pool destructor stops cleanly with in-flight tasks",
   std::atomic<int> completed{0};
   {
     bounded_thread_pool pool(2, "test");
-    pool.schedule([&completed] {
+    auto s = pool.reserve();
+    s.dispatch([&completed] {
       std::this_thread::sleep_for(5ms);
       completed.fetch_add(1);
     });
@@ -417,7 +333,8 @@ TEST_CASE("bounded_thread_pool concurrent producers all tasks execute", "[bounde
   for (int i = 0; i < num_threads; ++i) {
     producers.emplace_back([&pool, &counter] {
       for (int j = 0; j < tasks_each; ++j) {
-        pool.schedule([&counter] { counter.fetch_add(1); });
+        auto s = pool.reserve();
+        s.dispatch([&counter] { counter.fetch_add(1); });
       }
     });
   }

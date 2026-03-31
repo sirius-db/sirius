@@ -152,19 +152,6 @@ class bounded_thread_pool {
   bounded_thread_pool& operator=(const bounded_thread_pool&) = delete;
 
   /**
-   * @brief Schedule a function — blocks when at capacity.
-   *
-   * Returns false if interrupted before a slot becomes available.
-   */
-  bool schedule(absl::AnyInvocable<void()> fn)
-  {
-    auto s = reserve();
-    if (!s) { return false; }
-    s.dispatch(std::move(fn));
-    return true;
-  }
-
-  /**
    * @brief Reserve a slot — blocks when at capacity.
    *
    * Returns an invalid slot if interrupted or stopped.
