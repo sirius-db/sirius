@@ -487,6 +487,7 @@ bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
 
   duckdb::TableFunctionInput tf_input(
     g_state._op.bind_data.get(), l_state._local_tf_state.get(), g_state._global_tf_state.get());
+  tf_input.async_result = duckdb::AsyncResultType::IMPLICIT;
 
   g_state._op.function.function(l_state._exec_ctx.client, tf_input, l_state._chunk);
 

@@ -9,9 +9,8 @@ if [ ! -f tpch-dbgen/s1/customer.tbl ]; then
     cd ..
 fi
 
-if [ ! -f test_hits.tsv ]; then
-    wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
-    gzip -d test_hits.tsv.gz
+if [ ! -f hits_0.parquet ]; then
+    wget https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
 fi
 
 cd ..

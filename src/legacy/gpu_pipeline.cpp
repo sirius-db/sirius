@@ -44,7 +44,7 @@ bool GPUPipeline::IsOrderDependent() const
     if (op.OperatorOrder() == OrderPreservationType::NO_ORDER) { return false; }
     if (op.OperatorOrder() == OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!DBConfig::GetSetting<PreserveInsertionOrderSetting>(executor.context)) { return false; }
+  if (!Settings::Get<PreserveInsertionOrderSetting>(executor.context)) { return false; }
   if (sink && sink->SinkOrderDependent()) { return true; }
   return false;
 }

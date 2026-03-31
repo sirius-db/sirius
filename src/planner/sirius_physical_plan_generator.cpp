@@ -69,7 +69,7 @@ bool sirius_physical_plan_generator::preserve_insertion_order(
     return false;
   }
   // preserve insertion order - check flags
-  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(context)) {
+  if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context)) {
     // preserving insertion order is disabled by config
     return false;
   }
@@ -88,18 +88,18 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
   // Resolve the types of each operator.
-  profiler.StartPhase(duckdb::MetricsType::PHYSICAL_PLANNER_RESOLVE_TYPES);
+  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
   op->ResolveOperatorTypes();
   profiler.EndPhase();
 
   // Resolve the column references.
-  profiler.StartPhase(duckdb::MetricsType::PHYSICAL_PLANNER_COLUMN_BINDING);
+  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
   duckdb::ColumnBindingResolver resolver;
   resolver.VisitOperator(*op);
   profiler.EndPhase();
 
   // then create the main physical plan
-  profiler.StartPhase(duckdb::MetricsType::PHYSICAL_PLANNER_CREATE_PLAN);
+  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
   auto plan = create_plan(*op);
   profiler.EndPhase();
 

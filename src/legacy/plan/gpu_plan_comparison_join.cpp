@@ -58,7 +58,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(
     default: break;
   }
   //	TODO: Extend PWMJ to handle all comparisons and projection maps
-  bool prefer_range_joins = DBConfig::GetSetting<PreferRangeJoinsSetting>(context);
+  bool prefer_range_joins = Settings::Get<PreferRangeJoinsSetting>(context);
   prefer_range_joins      = prefer_range_joins && can_iejoin;
   if (has_equality && !prefer_range_joins) {
     // Equality join with small number of keys : possible perfect join optimization
@@ -83,7 +83,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(
   }
 
   D_ASSERT(op.left_projection_map.empty());
-  idx_t nested_loop_join_threshold = DBConfig::GetSetting<NestedLoopJoinThresholdSetting>(context);
+  idx_t nested_loop_join_threshold = Settings::Get<NestedLoopJoinThresholdSetting>(context);
   if (left->estimated_cardinality < nested_loop_join_threshold ||
       right->estimated_cardinality < nested_loop_join_threshold) {
     can_iejoin = false;
@@ -91,7 +91,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(
   }
 
   if (can_merge && can_iejoin) {
-    idx_t merge_join_threshold = DBConfig::GetSetting<MergeJoinThresholdSetting>(context);
+    idx_t merge_join_threshold = Settings::Get<MergeJoinThresholdSetting>(context);
     if (left->estimated_cardinality < merge_join_threshold ||
         right->estimated_cardinality < merge_join_threshold) {
       can_iejoin = false;

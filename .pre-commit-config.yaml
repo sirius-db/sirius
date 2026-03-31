@@ -41,6 +41,7 @@ repos:
       - id: pretty-format-json
         args: [--autofix]
       - id: trailing-whitespace
+        exclude: 'test/sql/clickbench-sirius\.test'
   - repo: https://github.com/psf/black
     rev: 25.1.0
     hooks:
