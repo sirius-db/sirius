@@ -406,48 +406,6 @@ fn extract_sort_limit_from_plan(
     )
 }
 
-/// Filter table_schemas for parquet scans to only include materialized columns.
-///
-/// For parquet `ReadRel::LocalFiles`, DuckDB resolves columns by NAME (not position),
-/// so a reduced base_schema causes DuckDB/Sirius to read only the columns actually needed
-/// by the query. Non-parquet tables (NamedTable path) retain all columns because DuckDB
-/// maps those by position.
-/// Reduce parquet table schemas to only materialized columns.
-///
-/// SLOT_REF column references auto-adjust because `set_table_column_override`
-/// uses the reduced column list, and `slot_table_index` resolves by NAME.
-fn project_parquet_schemas(
-    table_schemas: &HashMap<String, Vec<String>>,
-    file_scan_map: &HashMap<String, FileScanInfo>,
-    desc: &descriptor_table::DescriptorTable,
-) -> HashMap<String, Vec<String>> {
-    table_schemas
-        .iter()
-        .map(|(name, columns)| {
-            if file_scan_map
-                .get(name)
-                .map_or(false, |fsi| fsi.format == "parquet" && !fsi.files.is_empty())
-            {
-                let filtered: Vec<String> = columns
-                    .iter()
-                    .filter(|c| desc.find_slot_by_name(c).is_some())
-                    .cloned()
-                    .collect();
-                if !filtered.is_empty() && filtered.len() < columns.len() {
-                    tracing::info!(
-                        table = %name,
-                        total_columns = columns.len(),
-                        projected_columns = filtered.len(),
-                        "projection pushdown: reduced parquet schema to materialized columns"
-                    );
-                    return (name.clone(), filtered);
-                }
-            }
-            (name.clone(), columns.clone())
-        })
-        .collect()
-}
-
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.
 ///
 /// `table_schemas` maps NamedTable names to their actual column names (in order).
@@ -481,11 +439,10 @@ pub fn translate_fragment(
         .context("TPipelineFragmentParams has no desc_tbl")?;
     let mut desc = descriptor_table::DescriptorTable::from_thrift(desc_tbl)?;
 
-    // Don't reduce parquet schemas for now — projection pushdown changes column
-    // indices and causes GROUP BY / expression reference mismatches in the Sirius
-    // GPU engine. Keep all columns; filter/projection pushdown will be added later
-    // with proper index remapping.
-    // let table_schemas = project_parquet_schemas(table_schemas, file_scan_map, &desc);
+    // Keep full file schemas for parquet scans. DuckDB's optimizer handles
+    // projection pushdown internally — it traces column references and only
+    // reads needed columns from the parquet file. Reducing base_schema here
+    // is redundant and breaks column index resolution in AGG expressions.
     let table_schemas = table_schemas.clone();
 
     // Set table column overrides from DuckDB table schemas (for TVF scans).
@@ -2029,10 +1986,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parquet_projection_pushdown() {
+    fn test_parquet_full_schema_preserved() {
         // Parquet file has 5 columns, but only 2 are materialized in the descriptor.
-        // The ReadRel base_schema should contain only the 2 materialized columns,
-        // so DuckDB/Sirius reads only needed columns from the parquet files.
+        // The ReadRel base_schema should contain ALL columns — DuckDB's optimizer
+        // handles projection pushdown internally (only reads referenced columns).
         let node = make_file_scan_node(0, 0, "wide_table");
         let plan = make_plan(vec![node]);
 
