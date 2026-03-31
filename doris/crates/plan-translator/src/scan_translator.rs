@@ -58,9 +58,11 @@ pub fn translate_file_scan(
         .unwrap_or_else(|| format!("scan_{}", node.node_id));
 
     // Build the ReadRel base_schema.
-    // DuckDB's from_substrait maps ReadRel columns to table columns by POSITION,
-    // so the base_schema MUST include ALL table columns in the correct order.
-    // Projection to the output subset happens via ProjectRel added by translate_fragment.
+    // For NamedTable (non-parquet): base_schema must include ALL table columns
+    // in the correct order, since DuckDB maps columns by POSITION.
+    // For LocalFiles (parquet): DuckDB matches columns by NAME, so the caller
+    // can pre-filter table_schemas to only materialized columns (see
+    // project_parquet_schemas in lib.rs) for projection pushdown.
     let base_schema = if let Some(columns) = table_schemas.get(&table_name) {
         build_schema_from_columns(columns, desc, tuple_id)?
     } else {

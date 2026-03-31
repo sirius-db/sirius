@@ -406,6 +406,44 @@ fn extract_sort_limit_from_plan(
     )
 }
 
+/// Filter table_schemas for parquet scans to only include materialized columns.
+///
+/// For parquet `ReadRel::LocalFiles`, DuckDB resolves columns by NAME (not position),
+/// so a reduced base_schema causes DuckDB/Sirius to read only the columns actually needed
+/// by the query. Non-parquet tables (NamedTable path) retain all columns because DuckDB
+/// maps those by position.
+fn project_parquet_schemas(
+    table_schemas: &HashMap<String, Vec<String>>,
+    file_scan_map: &HashMap<String, FileScanInfo>,
+    desc: &descriptor_table::DescriptorTable,
+) -> HashMap<String, Vec<String>> {
+    table_schemas
+        .iter()
+        .map(|(name, columns)| {
+            if file_scan_map
+                .get(name)
+                .map_or(false, |fsi| fsi.format == "parquet" && !fsi.files.is_empty())
+            {
+                let filtered: Vec<String> = columns
+                    .iter()
+                    .filter(|c| desc.find_slot_by_name(c).is_some())
+                    .cloned()
+                    .collect();
+                if !filtered.is_empty() && filtered.len() < columns.len() {
+                    tracing::info!(
+                        table = %name,
+                        total_columns = columns.len(),
+                        projected_columns = filtered.len(),
+                        "projection pushdown: reduced parquet schema to materialized columns"
+                    );
+                    return (name.clone(), filtered);
+                }
+            }
+            (name.clone(), columns.clone())
+        })
+        .collect()
+}
+
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.
 ///
 /// `table_schemas` maps NamedTable names to their actual column names (in order).
@@ -439,8 +477,14 @@ pub fn translate_fragment(
         .context("TPipelineFragmentParams has no desc_tbl")?;
     let mut desc = descriptor_table::DescriptorTable::from_thrift(desc_tbl)?;
 
+    // Projection pushdown for parquet scans: reduce table_schemas to only
+    // materialized columns. For parquet LocalFiles, DuckDB matches columns by
+    // NAME, so a reduced base_schema makes DuckDB/Sirius read only needed columns.
+    // NamedTable (non-parquet) keeps all columns (DuckDB maps by POSITION).
+    let table_schemas = project_parquet_schemas(table_schemas, file_scan_map, &desc);
+
     // Set table column overrides from DuckDB table schemas (for TVF scans).
-    for (table_name, columns) in table_schemas {
+    for (table_name, columns) in &table_schemas {
         desc.set_table_column_override(table_name.clone(), columns.clone());
     }
 
@@ -459,7 +503,7 @@ pub fn translate_fragment(
     let mut registry = ExtensionRegistry::new();
 
     // Translate the plan tree into a Substrait Rel tree.
-    let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas, file_scan_map)?;
+    let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, &table_schemas, file_scan_map)?;
 
     // Extract sort/limit specification from the Doris plan's root SORT_NODE.
     // Returns structured sort info (column names + directions) for Rust-side sorting,
@@ -1975,6 +2019,124 @@ mod tests {
                 }
                 other => panic!("expected LocalFiles, got {:?}", other),
             },
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parquet_projection_pushdown() {
+        // Parquet file has 5 columns, but only 2 are materialized in the descriptor.
+        // The ReadRel base_schema should contain only the 2 materialized columns,
+        // so DuckDB/Sirius reads only needed columns from the parquet files.
+        let node = make_file_scan_node(0, 0, "wide_table");
+        let plan = make_plan(vec![node]);
+
+        // Descriptor only materializes 2 of 5 columns.
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "col_a", TPrimitiveType::BIGINT),
+                (1, 0, 1, "col_c", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        // Full parquet schema has 5 columns.
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "wide_table_0".to_string(),
+            vec![
+                "col_a".to_string(),
+                "col_b".to_string(),
+                "col_c".to_string(),
+                "col_d".to_string(),
+                "col_e".to_string(),
+            ],
+        );
+
+        let mut file_scan_map = HashMap::new();
+        file_scan_map.insert(
+            "wide_table_0".to_string(),
+            FileScanInfo {
+                table_name: "wide_table_0".to_string(),
+                format: "parquet".to_string(),
+                files: vec![FileScanFile {
+                    path: "/data/wide_table/part-0.parquet".to_string(),
+                    start_offset: 0,
+                    length: -1,
+                }],
+            },
+        );
+
+        let result = translate_fragment(&params, &table_schemas, &file_scan_map).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+
+        // Root.names should only have the 2 materialized columns (projection pushdown).
+        assert_eq!(root.names, vec!["col_a", "col_c"]);
+
+        // ReadRel base_schema should only have the 2 materialized columns.
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => {
+                let schema = read.base_schema.as_ref().unwrap();
+                assert_eq!(
+                    schema.names,
+                    vec!["col_a", "col_c"],
+                    "ReadRel should only have materialized columns (projection pushdown)"
+                );
+                match &read.read_type {
+                    Some(read_rel::ReadType::LocalFiles(_)) => {}
+                    other => panic!("expected LocalFiles, got {:?}", other),
+                }
+            }
+            other => panic!("expected Read, got {:?}", other),
+        }
+
+        assert_eq!(result.output_names, vec!["col_a", "col_c"]);
+    }
+
+    #[test]
+    fn test_parquet_projection_pushdown_preserves_named_table() {
+        // Non-parquet (NamedTable) path should NOT filter columns, even when some
+        // columns are not materialized. NamedTable maps by POSITION, not name.
+        let node = make_file_scan_node(0, 0, "cities");
+        let plan = make_plan(vec![node]);
+
+        // Only 2 of 3 columns materialized.
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "city", TPrimitiveType::VARCHAR),
+                (2, 0, 2, "population", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "cities_0".to_string(),
+            vec!["city".to_string(), "state".to_string(), "population".to_string()],
+        );
+
+        // No file_scan_map entry → NamedTable path → all 3 columns preserved.
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+
+        // ReadRel should have ALL 3 columns (no projection pushdown for NamedTable).
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => {
+                let schema = read.base_schema.as_ref().unwrap();
+                assert_eq!(schema.names, vec!["city", "state", "population"]);
+            }
             other => panic!("expected Read, got {:?}", other),
         }
     }
