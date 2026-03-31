@@ -141,6 +141,7 @@ class LastGPUBuffers {
     partition_num_ = num_partitions;
     partition_cols_ = std::move(column_indices);
     packed_partitions_.clear();
+    staging_offset_ = 0;
   }
 
   /// Get partition config (0 = no partitioning).
@@ -169,6 +170,29 @@ class LastGPUBuffers {
     packed_partitions_ = std::move(partitions);
   }
 
+  /// Accumulate per-partition packed data from a new batch into existing
+  /// per-destination entries. On the first call, stores partitions as-is.
+  /// On subsequent calls, merges: for each destination, accumulate rows and
+  /// update metadata to the latest batch (each batch's data is at a new
+  /// staging offset; the exchange sender handles multi-region transfers).
+  void AccumulatePackedPartitions(std::vector<PackedPartition> partitions) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (packed_partitions_.empty()) {
+      packed_partitions_ = std::move(partitions);
+    } else {
+      // For each destination, keep the FIRST entry's offset but accumulate
+      // additional batch entries as new entries in a flat list.
+      // The Rust exchange code handles multiple entries per destination.
+      for (auto& p : partitions) {
+        packed_partitions_.push_back(std::move(p));
+      }
+    }
+  }
+
+  /// Track cumulative staging offset for multi-batch packing.
+  size_t GetStagingOffset() const { std::lock_guard<std::mutex> lock(mutex_); return staging_offset_; }
+  void SetStagingOffset(size_t offset) { std::lock_guard<std::mutex> lock(mutex_); staging_offset_ = offset; }
+
   std::vector<PackedPartition> TakePackedPartitions() {
     std::lock_guard<std::mutex> lock(mutex_);
     return std::move(packed_partitions_);
@@ -192,6 +216,7 @@ class LastGPUBuffers {
   int partition_num_ = 0;
   std::vector<int> partition_cols_;
   std::vector<PackedPartition> packed_partitions_;
+  size_t staging_offset_ = 0;
 };
 
 }  // namespace duckdb

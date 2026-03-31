@@ -220,13 +220,18 @@ void task_creator::manager_loop()
       break;
     }
 
-    auto node              = request->node;
+    auto* original_node    = request->node;
     auto explicit_pipeline = std::move(request->pipeline);
+    if (original_node == nullptr) { continue; }
+
+    auto* node = get_operator_for_next_task(original_node);
+
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
-
-    if (node == nullptr) { continue; }
+    // Only use the explicit pipeline if the node wasn't redirected by hint chain.
+    // When get_operator_for_next_task follows WAITING hints to a different producer,
+    // the explicit_pipeline (intended for the original node) is wrong for the new node.
+    if (node != original_node) { explicit_pipeline.reset(); }
 
     // Schedule the task creation work on the thread pool
     _thread_pool->schedule(

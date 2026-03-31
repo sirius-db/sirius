@@ -298,6 +298,7 @@ void sirius_pipeline::update_pipeline_status()
     if (!parquet_scan.has_more_partitions) {
       if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
       end_nvtx_range_if_finished();
+      if (pipeline_finished.load() && on_finished) { on_finished(); }
       return;
     }
   } else {
@@ -318,6 +319,7 @@ void sirius_pipeline::update_pipeline_status()
     // WSM TODO need to increment task created before pulling data?
     // Lets fix this by putting task creation as a method in the pipeline class so that it can be
     // done atomically.
+    bool was_finished = pipeline_finished.load();
     if (limit_exhausted ||
         (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
       if (tasks_created.load() == tasks_completed.load()) {
@@ -328,6 +330,9 @@ void sirius_pipeline::update_pipeline_status()
       }
     }
     end_nvtx_range_if_finished();
+    // Notify downstream consumers only on the transition to finished
+    // (not on repeated calls when already finished).
+    if (!was_finished && pipeline_finished.load() && on_finished) { on_finished(); }
   }
 }
 

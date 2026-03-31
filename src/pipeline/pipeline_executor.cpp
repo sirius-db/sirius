@@ -178,7 +178,8 @@ std::future<void> pipeline_executor::start_query()
     auto sink   = pipeline->get_sink();
     auto source = pipeline->get_source();
     bool is_scan =
-      source && source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN;
+      source && (source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
+                 source->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN);
     bool is_result_collector =
       sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
 

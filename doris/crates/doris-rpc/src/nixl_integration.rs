@@ -499,26 +499,30 @@ async fn send_hash_partitioned(
                 0
             };
 
-            // Each partition maps to one destination (1:1).
+            // Partition entries may come from multiple batches. With N dests
+            // and B batches, there are N*B entries: [b0_d0, b0_d1, b1_d0, b1_d1, ...].
+            // Collect all entries for each destination.
+            let num_dests = destinations.len();
             for (dest_idx, dest) in destinations.iter().enumerate() {
                 let key = ExchangeKey { query_id, node_id };
-                let partition = packed_partitions.get(dest_idx);
+
+                // Collect all entries for this destination across batches.
+                let dest_entries: Vec<&sirius_ffi::PackedPartition> = packed_partitions
+                    .iter()
+                    .skip(dest_idx)
+                    .step_by(num_dests)
+                    .filter(|p| p.packed_size > 0)
+                    .collect();
 
                 let is_local = dest.brpc_addr == local_brpc_addr;
 
-                match partition {
-                    Some(p) if p.packed_size > 0 => {
+                if !dest_entries.is_empty() {
+                    let total_rows: u32 = dest_entries.iter().map(|e| e.num_rows).sum();
+                    // Send each batch's partition data for this destination.
+                    for p in &dest_entries {
                         let part_addr = send_staging_base + p.staging_offset;
 
                         if is_local {
-                            // Self-transfer: store packed GPU data directly.
-                            tracing::info!(
-                                dest_idx,
-                                dest = %dest.brpc_addr,
-                                rows = p.num_rows,
-                                size = p.packed_size,
-                                "GPU hash partition self-transfer"
-                            );
                             exchange_buffer.store_packed_gpu(
                                 key.clone(),
                                 PackedGpuExchange {
@@ -527,53 +531,46 @@ async fn send_hash_partitioned(
                                     cudf_metadata: p.metadata.clone(),
                                 },
                             );
-                            exchange_buffer.add_block(&key, sender_id, None, true);
-                        } else {
-                            // Remote: nixl transfer this partition.
-                            if let Some(agent) = _nixl_agent {
-                                let part_buf = GpuBufferDesc { addr: part_addr, len: p.packed_size, device_id: 0 };
-                                tracing::info!(
-                                    dest_idx,
-                                    dest = %dest.brpc_addr,
-                                    rows = p.num_rows,
-                                    size = p.packed_size,
-                                    addr = format_args!("0x{part_addr:x}"),
-                                    "GPU hash partition nixl transfer"
-                                );
-                                if let Err(e) = send_nixl_to_peer(
-                                    agent, &[part_buf], &[], &[], p.num_rows,
-                                    ipc_bytes, dest, query_id, node_id, sender_id,
-                                    true, Some(&p.metadata),
-                                ).await {
-                                    tracing::warn!(error = %e, dest_idx, "nixl partition transfer failed, falling back to bRPC");
-                                    // Fall back to bRPC for this partition.
-                                    let part_ipc = &ipc_bytes; // TODO: partition-specific IPC
-                                    crate::exchange_sender::send_exchange_result(
-                                        part_ipc, &[dest.clone()], query_id, node_id, sender_id,
-                                    ).await?;
-                                }
-                            } else {
-                                // No nixl — bRPC fallback for this partition.
-                                let part_ipc = &ipc_bytes;
+                        } else if let Some(agent) = _nixl_agent {
+                            let part_buf = GpuBufferDesc { addr: part_addr, len: p.packed_size, device_id: 0 };
+                            if let Err(e) = send_nixl_to_peer(
+                                agent, &[part_buf], &[], &[], p.num_rows,
+                                ipc_bytes, dest, query_id, node_id, sender_id,
+                                true, Some(&p.metadata),
+                            ).await {
+                                tracing::warn!(error = %e, dest_idx, "nixl partition transfer failed, falling back to bRPC");
                                 crate::exchange_sender::send_exchange_result(
-                                    part_ipc, &[dest.clone()], query_id, node_id, sender_id,
+                                    ipc_bytes, &[dest.clone()], query_id, node_id, sender_id,
                                 ).await?;
                             }
-                        }
-                    }
-                    _ => {
-                        // Empty partition — still need to signal EOS so the receiver
-                        // doesn't wait forever for data that will never arrive.
-                        if is_local {
-                            exchange_buffer.add_block(&key, sender_id, None, true);
                         } else {
-                            // Send empty EOS via bRPC for remote empty partitions.
-                            crate::exchange_sender::send_eos(
-                                dest, query_id, node_id, sender_id,
-                            ).await.map_err(|e| format!("empty partition EOS: {e}"))?;
+                            crate::exchange_sender::send_exchange_result(
+                                ipc_bytes, &[dest.clone()], query_id, node_id, sender_id,
+                            ).await?;
                         }
-                        tracing::info!(dest_idx, dest = %dest.brpc_addr, is_local, "empty partition EOS sent");
                     }
+                    // Signal EOS after all batch entries for this destination.
+                    if is_local {
+                        exchange_buffer.add_block(&key, sender_id, None, true);
+                    }
+                    tracing::info!(
+                        dest_idx,
+                        dest = %dest.brpc_addr,
+                        num_entries = dest_entries.len(),
+                        total_rows,
+                        "GPU hash partition transfer complete"
+                    );
+                } else {
+                    // Empty partition — still need to signal EOS so the receiver
+                    // doesn't wait forever for data that will never arrive.
+                    if is_local {
+                        exchange_buffer.add_block(&key, sender_id, None, true);
+                    } else {
+                        crate::exchange_sender::send_eos(
+                            dest, query_id, node_id, sender_id,
+                        ).await.map_err(|e| format!("empty partition EOS: {e}"))?;
+                    }
+                    tracing::info!(dest_idx, dest = %dest.brpc_addr, is_local, "empty partition EOS sent");
                 }
             }
             return Ok(());

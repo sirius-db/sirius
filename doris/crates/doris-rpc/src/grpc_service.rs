@@ -2153,22 +2153,12 @@ impl PBackendService for PBackendServiceHandler {
                     let engine_for_release = engine.clone();
 
                     // Extract hash partition info for the GPU result_collector's per-partition packing.
+                    // Partition column indices are positional (0..N) matching the partition_exprs
+                    // order, which corresponds to the leading output columns of the data sink.
+                    // TODO: resolve actual column positions from SLOT_REF for non-leading keys.
                     let hash_partition_info_exch: Option<(usize, Vec<i32>)> = exchange_dests.as_ref().and_then(|e| {
                         if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, ref partition_exprs, .. } = &e.partition {
-                            // Derive column indices from SLOT_REF partition exprs.
-                            let col_indices: Vec<i32> = partition_exprs.iter()
-                                .filter_map(|expr| {
-                                    expr.nodes.first().and_then(|n| n.slot_ref.as_ref()).map(|sr| sr.slot_id)
-                                })
-                                .enumerate()
-                                .map(|(i, _)| i as i32)
-                                .collect();
-                            if col_indices.is_empty() {
-                                // Fallback: use positional indices 0..N based on partition expr count.
-                                Some((*num_destinations, (0..partition_exprs.len() as i32).collect()))
-                            } else {
-                                Some((*num_destinations, col_indices))
-                            }
+                            Some((*num_destinations, (0..partition_exprs.len() as i32).collect()))
                         } else { None }
                     });
 

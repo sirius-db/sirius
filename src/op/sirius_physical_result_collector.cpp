@@ -237,7 +237,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                             [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
 
             std::vector<duckdb::LastGPUBuffers::PackedPartition> packed_parts;
-            size_t staging_offset = 0;
+            size_t staging_offset = lgb.GetStagingOffset();
 
             for (int i = 0; i < part_num; i++) {
               auto start = offsets[i];
@@ -264,8 +264,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
               { duckdb::LastGPUBuffers::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = total; pp.metadata = std::move(md); pp.num_rows = static_cast<int32_t>(num_rows); packed_parts.push_back(std::move(pp)); }
               staging_offset += (total + 255) & ~255UL;  // 256-byte align
             }
-            lgb.StorePackedPartitions(std::move(packed_parts));
-            lgb.ClearPartitionConfig();
+            lgb.SetStagingOffset(staging_offset);
+            lgb.AccumulatePackedPartitions(std::move(packed_parts));
           } else if (staging_addr != 0 && staging_size > 0) {
             // No partitioning — single pack into staging (broadcast path).
             auto packer = cudf::chunked_pack::create(view, staging_size);
