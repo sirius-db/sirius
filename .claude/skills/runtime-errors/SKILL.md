@@ -1,6 +1,9 @@
 ---
 name: runtime-errors
-description: Diagnose runtime errors using Sirius log files, cuda-gdb, and Compute Sanitizer. Use when a query crashes (including segfaults), throws exceptions, hangs, or triggers unexpected fallback to CPU.
+description: >
+  Use this skill when a Sirius query crashes, segfaults, hangs, throws an exception, or unexpectedly
+  falls back to CPU. Also use when you see CUDA errors, std::bad_alloc, or the process gets killed.
+  Diagnoses issues using log analysis, cuda-gdb, AddressSanitizer, and NVIDIA Compute Sanitizer.
 argument-hint: [sql-query-or-file] [--timeout 30]
 disable-model-invocation: true
 ---
@@ -358,10 +361,6 @@ At the end of any path, present which `[SIRIUS_DIAG]` log statements should be:
 - **Removed:** Only useful for this investigation -- delete entirely
 
 ---
-
-## Why Immediate Flush Matters
-
-By default, spdlog flushes every 3 seconds (see `SIRIUS_LOG_FLUSH_SEC` in `src/include/log/logging.hpp`). When a segfault or hang occurs, buffered entries are lost. Setting `SIRIUS_LOG_LEVEL=trace` explicitly triggers `spdlog::flush_on(trace)`, which flushes after every log entry -- ensuring the last log before the crash is always visible.
 
 ## Known Segfault Patterns
 

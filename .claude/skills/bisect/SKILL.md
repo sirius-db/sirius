@@ -1,6 +1,9 @@
 ---
 name: bisect
-description: Find which commit introduced a bug by comparing behavior across a range of commits. Uses git bisect with automated build and test. Use when a bug appeared recently and you need to identify the culprit commit.
+description: >
+  Use this skill to find which commit introduced a bug or regression. Uses git bisect with automated
+  build and test. Trigger when a bug appeared recently, a query started failing, performance regressed,
+  or the user wants to compare behavior between two commits.
 argument-hint: [good-commit] [bad-commit] [test-command-or-sql]
 disable-model-invocation: true
 ---

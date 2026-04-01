@@ -1,6 +1,12 @@
 ---
 name: profile-analyzer
-description: Analyze Sirius GPU performance from nsys profiles — runs benchmarks, generates reports with kernel occupancy, memory bandwidth, operator attribution, and compares runs for regression detection.
+description: >
+  Use this skill to understand why a Sirius query is slow, identify GPU bottlenecks, or detect
+  performance regressions. Generates reports with kernel occupancy, memory bandwidth, operator
+  attribution, and cross-run comparisons. Trigger when the user mentions profiling, nsys, GPU
+  utilization, kernel analysis, performance reports, or wants to compare query timings across runs.
+  This skill focuses on measurement and reporting — for mapping hotspots to source code fixes,
+  use optimization-advisor instead.
 ---
 
 # Sirius nsys Profile Analyzer

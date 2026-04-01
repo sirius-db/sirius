@@ -1,6 +1,10 @@
 ---
 name: tpcds-benchmark
-description: Run TPC-DS benchmarks on Legacy Sirius, Super Sirius, or DuckDB CPU baseline — generate data, execute queries, and compare results across engines.
+description: >
+  Use this skill to run TPC-DS benchmarks, compare Sirius GPU performance against DuckDB CPU,
+  or test which TPC-DS queries run on GPU. Supports Legacy Sirius, Super Sirius, and DuckDB CPU
+  baseline. Trigger when the user mentions TPC-DS, wants to benchmark across engines, or needs
+  to generate TPC-DS data.
 ---
 
 # TPC-DS Benchmark Runner
