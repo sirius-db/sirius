@@ -46,7 +46,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalExpressionGet& op)
     chunk.Reset();
     auto& expr_list = op.expressions[expression_idx];
 
-    // Evaluate each column expression for this row
     duckdb::ExpressionExecutor executor(context, expr_list);
     executor.Execute(chunk);
 

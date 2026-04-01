@@ -17,8 +17,10 @@
 #include "sirius_engine.hpp"
 
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "log/logging.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
@@ -28,6 +30,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_order.hpp"
@@ -185,6 +188,11 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
   reset();
   sirius_owned_plan = std::move(plan);
+  // Pre-fetch iceberg delete-file metadata before initialize_internal() assigns
+  // operator IDs to pipeline-breaker operators (PARTITION, CONCAT, etc.).
+  // The DuckDB metadata connection is opened under InternalQueryGuard so that
+  // QueryBegin/QueryEnd side-effects on the shared SiriusContext are suppressed.
+  prefetch_iceberg_metadata(*sirius_owned_plan);
   initialize_internal(*sirius_owned_plan);
 }
 
@@ -225,6 +233,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
     if (scan_physical_op.function.name == "parquet_scan" ||
         scan_physical_op.function.name == "read_parquet") {
       return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
+    } else if (scan_physical_op.function.name == "iceberg_scan") {
+      return construct_iceberg_scan_operator(scan_physical_op);
     } else if (scan_physical_op.function.name == "seq_scan") {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
     } else {
@@ -250,13 +260,72 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
   }
 }
 
+duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_iceberg_scan_operator(
+  op::sirius_physical_table_scan& scan_op)
+{
+  auto iceberg_scan = duckdb::make_uniq<op::sirius_physical_iceberg_scan>(&scan_op);
+
+  if (!scan_op.parameters.empty()) {
+    std::string const table_path = scan_op.parameters[0].ToString();
+    auto it                      = iceberg_metadata_cache_.find(table_path);
+    if (it != iceberg_metadata_cache_.end()) {
+      iceberg_scan->positional_delete_files = it->second.positional_delete_files;
+      iceberg_scan->equality_delete_files   = it->second.equality_delete_files;
+    }
+  }
+
+  return iceberg_scan;
+}
+
+void sirius_engine::prefetch_iceberg_metadata(op::sirius_physical_operator& plan)
+{
+  // Walk the plan tree and fetch delete-file metadata for every iceberg scan.
+  // This runs in initialize() BEFORE initialize_internal() so that operator IDs
+  // for pipeline-breaker nodes (PARTITION, CONCAT, …) haven't been assigned yet.
+
+  if (plan.type != op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    if (plan.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+      auto& collector = plan.Cast<op::sirius_physical_result_collector>();
+      prefetch_iceberg_metadata(collector.plan);
+    } else {
+      for (auto& child : plan.children) {
+        prefetch_iceberg_metadata(*child);
+      }
+    }
+    return;
+  }
+
+  auto& scan_op = plan.Cast<op::sirius_physical_table_scan>();
+  if (scan_op.function.name != "iceberg_scan" || scan_op.parameters.empty()) { return; }
+
+  std::string const table_path = scan_op.parameters[0].ToString();
+  if (iceberg_metadata_cache_.count(table_path)) { return; }  // already fetched
+
+  // Opening a secondary connection triggers QueryBegin/QueryEnd on the shared
+  // SiriusContext.  InternalQueryGuard suppresses those side-effects.
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    SIRIUS_LOG_WARN("[sirius_engine] SiriusContext not available; treating iceberg '{}' as V1.",
+                    table_path);
+    iceberg_metadata_cache_.emplace(table_path, op::scan::IcebergDeleteFiles{});
+    return;
+  }
+
+  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  auto files = op::scan::read_iceberg_delete_metadata(context, table_path);
+  iceberg_metadata_cache_.emplace(table_path, std::move(files));
+}
+
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 {
   // auto &scheduler = TaskScheduler::GetScheduler(context);
-  const sirius::operator_params& op_params =
-    context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-      ->get_config()
-      .get_operator_params();
+  auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx_ptr) {
+    throw duckdb::InvalidInputException(
+      "Sirius context is not initialized. Ensure load_sirius() is called or ~/.sirius/sirius.cfg "
+      "exists.");
+  }
+  const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
   {
     // lock_guard<mutex> elock(executor_lock);
     sirius_physical_plan = &plan;
@@ -377,7 +446,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       if (current_pipeline->source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
         auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
         if (scan_op.function.name == "seq_scan" || scan_op.function.name == "parquet_scan" ||
-            scan_op.function.name == "read_parquet") {
+            scan_op.function.name == "read_parquet" || scan_op.function.name == "iceberg_scan") {
           auto new_pipeline = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
 
           auto new_scan_op = construct_sirius_specific_operator(&scan_op);
@@ -1074,6 +1143,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
           auto next_op             = dependent_pipeline->get_operators().size() == 0
@@ -1259,7 +1329,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
           const auto& scan_name = first_op.Cast<op::sirius_physical_table_scan>().function.name;
           if (scan_name != "seq_scan" && scan_name != "parquet_scan" &&
-              scan_name != "read_parquet") {
+              scan_name != "read_parquet" && scan_name != "iceberg_scan") {
             throw std::runtime_error("Unsupported scan function: " + scan_name);
           }
           // Scans have "scan" port
@@ -1271,6 +1341,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                    first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                   first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                    first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
           // ignore scan-like operators since they don't have ports
         } else if (first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
@@ -1314,6 +1385,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           }
         } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                    sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                   sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                    sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
           // ignore scan-like operators since they don't have ports
         } else if (sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||

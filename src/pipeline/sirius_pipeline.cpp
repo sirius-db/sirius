@@ -51,7 +51,7 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(engine.context)) {
+  if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(engine.context)) {
     return false;
   }
   if (sink && sink->sink_order_dependent()) { return true; }
