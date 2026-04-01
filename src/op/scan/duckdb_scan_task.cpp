@@ -22,6 +22,7 @@
 
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
+#include <log/logging.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
@@ -530,8 +531,23 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto output_data = compute_task(stream);
-  if (output_data) { publish_output(*output_data, stream); }
+  auto estimated_bytes = get_estimated_reservation_size();
+
+  // Record memory metrics for future reservation estimates.
+  // Scan tasks don't have peak memory tracking, so use output size as proxy.
+  if (auto output_data = compute_task(stream); output_data) {
+    std::size_t output_bytes = 0;
+    for (const auto& batch : output_data->get_data_batches()) {
+      if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+    }
+    auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
+    // Use the raw task consumption basis from local state when recording history
+    auto consumption_basis =
+      this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
+    g_state.get_memory_history().record({consumption_basis, output_bytes, output_bytes});
+
+    publish_output(*output_data, stream);
+  }
 }
 
 std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stream_view stream)
@@ -598,6 +614,16 @@ void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_
   std::for_each(std::make_move_iterator(output_data.get_data_batches().begin()),
                 std::make_move_iterator(output_data.get_data_batches().end()),
                 [this](auto batch) { this->_data_repo->add_data_batch(std::move(batch)); });
+}
+
+std::size_t duckdb_scan_task::get_estimated_reservation_size() const
+{
+  auto current_estimate =
+    this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
+  auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
+  auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
+  if (refined) { return *refined; }
+  return current_estimate;
 }
 
 }  // namespace sirius::op::scan

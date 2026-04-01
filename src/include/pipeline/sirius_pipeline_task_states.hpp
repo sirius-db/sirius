@@ -17,6 +17,7 @@
 #pragma once
 
 #include "parallel/task.hpp"
+#include "pipeline/pipeline_memory_history.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/memory/memory_reservation.hpp>
@@ -50,15 +51,28 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
   [[nodiscard]] sirius_pipeline* get_pipeline() { return _pipeline.get(); }
 
-  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
+  [[nodiscard]] size_t get_pipeline_id() const
+  {
+    return _pipeline ? _pipeline->get_pipeline_id() : 0;
+  }
 
   void set_pipeline(duckdb::shared_ptr<sirius_pipeline> pipeline)
   {
     _pipeline = std::move(pipeline);
   }
 
+  /**
+   * @brief Get the memory history for this pipeline's tasks.
+   *
+   * Used to record and query historical memory consumption patterns so that
+   * future tasks can make better reservation estimates.
+   */
+  pipeline_memory_history& get_memory_history() { return _memory_history; }
+  const pipeline_memory_history& get_memory_history() const { return _memory_history; }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
+  pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
 };
 
 /**
@@ -101,7 +115,25 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
   void set_reservation(std::unique_ptr<cucascade::memory::reservation> res)
   {
     _reservation = std::move(res);
+    if (_reservation) {
+      _reservation_bytes = _reservation->size();
+    } else {
+      _reservation_bytes = 0;
+    }
   }
+
+  [[nodiscard]] std::size_t get_reservation_bytes() const { return _reservation_bytes; }
+
+  /**
+   * @brief Get the basis for estimating task memory consumption.
+   *
+   * This method allows for different task types to provide their own logic for providing something
+   * as a starting point for memory reservation estimation.
+   *
+   * @return The value to use as the basis for memory consumption estimation (e.g., input data size,
+   * number of rows, etc.)
+   */
+  [[nodiscard]] virtual std::size_t get_task_consumption_basis() const = 0;
 
  protected:
   /**
@@ -114,6 +146,7 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
 
   std::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources
+  std::size_t _reservation_bytes;
 };
 
 }  // namespace pipeline

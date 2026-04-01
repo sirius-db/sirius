@@ -430,6 +430,11 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    */
   [[nodiscard]] size_t get_reserved_compressed_bytes() const { return _reserved_compressed_bytes; }
 
+  [[nodiscard]] std::size_t get_task_consumption_basis() const override
+  {
+    return get_reserved_compressed_bytes();
+  }
+
   /**
    * @brief Get the vector of row group indices assigned to this local state.
    *
@@ -488,6 +493,12 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   ~parquet_scan_task() override;
 
   //===----------Methods----------===//
+
+  /**
+   * @brief Execute the parquet scan task and record memory metrics.
+   */
+  void execute(rmm::cuda_stream_view stream) override;
+
   /**
    * @brief Compute the parquet scan task and produce a host_parquet_representation.
    *
@@ -513,11 +524,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    *
    * @return The estimated reservation size in bytes.
    */
-  [[nodiscard]] size_t get_estimated_reservation_size() const override
-  {
-    auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
-    return l_state.get_reserved_compressed_bytes();
-  }
+  [[nodiscard]] size_t get_estimated_reservation_size() const override;
 
   /**
    * @brief Get the output consumers operators for this task.
