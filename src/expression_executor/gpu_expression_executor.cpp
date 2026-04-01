@@ -166,7 +166,27 @@ gpu_expression_executor::gpu_expression_executor(
   for (auto const& expr : expressions) {
     _expressions.push_back(expr.get());
   }
-  if (strategy == expression_executor_strategy::AST_INTERPRET) {
+  if (strategy == expression_executor_strategy::AST_INTERPRET ||
+      strategy == expression_executor_strategy::AST_JIT) {
+    // We are waiting on the release of this bug fix in libcudf:
+    // https://github.com/rapidsai/cudf/pull/21447 Without this fix, decimal expressions will fail
+    // in AST_INTERPRET mode.
+    throw duckdb::InternalException(
+      "[gpu_expression_executor] expression_executor_strategy::AST_INTERPRET is not currently "
+      "supported");
+  }
+}
+
+gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expression,
+                                                 expression_executor_strategy strategy,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 std::size_t min_ast_size)
+  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+{
+  _expressions.push_back(expression);
+  if (strategy == expression_executor_strategy::AST_INTERPRET ||
+      strategy == expression_executor_strategy::AST_JIT) {
     // We are waiting on the release of this bug fix in libcudf:
     // https://github.com/rapidsai/cudf/pull/21447 Without this fix, decimal expressions will fail
     // in AST_INTERPRET mode.
@@ -238,6 +258,12 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   D_ASSERT(!_expressions.empty());
   _output_columns.clear();
   _output_columns.reserve(_expressions.size());
+
+  // Reset AST state from any previous invocation so that the tree, temp scalars, and temp columns
+  // do not accumulate stale nodes across calls.
+  _ast_tree = cudf::ast::tree{};
+  _temp_scalars.clear();
+  _temp_columns.clear();
 
   // Get the table_view from the input_batch
   auto const& input_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();

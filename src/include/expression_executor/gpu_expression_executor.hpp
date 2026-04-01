@@ -270,7 +270,8 @@ class gpu_expression_executor {
   };
 
   /**
-   * @brief Construct a gpu_expression_executor with the given expressions.
+   * @brief Construct a gpu_expression_executor with the given set of expressions (for PROJECTION
+   * operators).
    *
    * @param expressions The expressions to execute.
    * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
@@ -285,6 +286,27 @@ class gpu_expression_executor {
    */
   gpu_expression_executor(
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
+    expression_executor_strategy strategy,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
+    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    std::size_t min_ast_size                    = 2);
+
+  /**
+   * @brief Construct a gpu_expression_executor with the given expression (for FILTER operators).
+   *
+   * @param expression The expressions to execute.
+   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
+   * MATERIALIZE).
+   * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
+   * @param stream The rmm::cuda_stream_view in which to execute any cuDF operations.
+   * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
+   * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
+   * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
+   * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
+   * adding nodes to the AST tree.
+   */
+  gpu_expression_executor(
+    duckdb::Expression const* expression,
     expression_executor_strategy strategy,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
