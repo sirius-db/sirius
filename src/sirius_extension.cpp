@@ -1763,6 +1763,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     if (data.finished) { output.SetCardinality(0); return; }
     auto [addr, size] = LastGPUBuffers::GetInstance().GetPackedGPU();
     auto* md = LastGPUBuffers::GetInstance().GetPackedMetadata();
+    SIRIUS_LOG_INFO("[sirius_get_packed_gpu] addr=0x{:x} size={}", addr, size);
     if (addr == 0 || size == 0) {
       output.SetCardinality(0);
       data.finished = true;
@@ -1774,7 +1775,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     if (md && !md->empty()) {
       output.SetValue(2, 0, Value::BLOB(md->data(), md->size()));
     } else {
-      output.SetValue(2, 0, Value(LogicalType::BLOB));
+      // Return empty (non-null) BLOB so Rust's row.get::<Vec<u8>>() succeeds.
+      // A NULL BLOB causes the Rust DuckDB driver to return an error.
+      output.SetValue(2, 0, Value::BLOB(nullptr, 0));
     }
     data.finished = true;
   };
