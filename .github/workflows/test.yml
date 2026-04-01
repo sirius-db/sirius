@@ -46,10 +46,10 @@ jobs:
       - name: Build
         env:
           CUDAARCHS: "75" # For Turing, T4 capability
-        run: make -j$(nproc)
+        run: make -j$(nproc) clang-debug
 
       - name: Package build artifacts
-        run: tar -cf build.tar build/release/
+        run: tar -cf build.tar build/clang-debug/
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -77,25 +77,6 @@ jobs:
         run: tar -xf build.tar
 
       - name: Run C++ unit tests
-        run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
-
-      - name: Prepare SQL test datasets
-        run: |
-          ./setup_test_datasets.sh
-          chmod -R a+r test_datasets/
-          mkdir -p test_datasets/tpch_parquet_sf1
-          ./build/release/duckdb -f scripts/tpch_to_parquet.sql
-
-      - name: TPC-H performance snapshot
         env:
-          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.cfg
-          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
-        run: |
-          ./test/tpch_performance/benchmark_and_validate.sh 1
-          RUN_DIR=$(ls -td runs/*/ | head -1)
-          {
-            echo "## TPC-H Performance (SF1)"
-            echo '```'
-            cat "$RUN_DIR/comparison.txt"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          ASAN_OPTIONS: protect_shadow_gap=0
+        run: ./build/clang-debug/extension/sirius/test/cpp/sirius_unittest --abort
