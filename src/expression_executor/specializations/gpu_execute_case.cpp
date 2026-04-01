@@ -24,6 +24,7 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 
@@ -35,7 +36,10 @@ using execute_result = gpu_expression_executor::execute_result;
 execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression const& expr,
                                                 execution_mode mode)
 {
-  //===----------MATERIALIZE mode only (AST breaker)----------===//
+  //===----------MATERIALIZE (AST breaker)----------===//
+  // CASE cannot be represented as a cudf AST operation, so we always materialize it. If the caller
+  // requested AST mode, we materialize the result and wrap it as a temporary column that the
+  // parent's AST tree can reference.
   std::unique_ptr<cudf::column> output;
 
   // First, execute the ELSE
@@ -108,6 +112,18 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
                                   _mr);
     }
     current_result = execute_result(std::move(output));
+  }
+  if (mode == execution_mode::AST) {
+    // The caller wants an AST node. Materialize the CASE result into a temp column and return an
+    // ast_result with a column_reference to it.
+    std::unique_ptr<cudf::column> result_column;
+    if (current_result.is_scalar()) {
+      result_column =
+        cudf::make_column_from_scalar(current_result.get_scalar(), _input_table.num_rows(), _stream, _mr);
+    } else {
+      result_column = std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr);
+    }
+    return materialize_as_ast_column(std::move(result_column));
   }
   return current_result;
 }

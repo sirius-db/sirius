@@ -88,6 +88,10 @@ execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpressio
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
+  if (mode == execution_mode::AST) {
+    auto result = execute(expr, execution_mode::MATERIALIZE);
+    return materialize_as_ast_column(result.get_column());
+  }
   auto comparison_type_switch =
     [](duckdb::BoundComparisonExpression const& expr) -> cudf::binary_operator {
     using enum duckdb::ExpressionType;

@@ -1460,3 +1460,4 @@ TEST_CASE("experimental execute mixed arithmetic and CASE projection",
     REQUIRE(out1[i] == (in0[i] > 25 ? in1[i] * 2 : in1[i]));
   }
 }
+

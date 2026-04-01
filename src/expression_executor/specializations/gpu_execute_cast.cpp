@@ -72,6 +72,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
   auto child             = execute(*expr.child, execution_mode::MATERIALIZE);
   D_ASSERT(!child.is_scalar());  // CAST should never be called on a scalar
   auto result_column = cudf::cast(child.get_column_view(), return_type, _stream, _mr);
+  if (mode == execution_mode::AST) { return materialize_as_ast_column(std::move(result_column)); }
   return execute_result(std::move(result_column));
 }
 

@@ -138,6 +138,17 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with solo operation----------===//
+  // If the caller requested AST mode but we fell through (unsupported function for AST),
+  // materialize the result and wrap it as a temp column for the parent's AST tree.
+  if (mode == execution_mode::AST) {
+    auto result = execute(expr, execution_mode::MATERIALIZE);
+    if (result.is_scalar()) {
+      return materialize_as_ast_column(
+        cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    return materialize_as_ast_column(
+      std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+  }
   auto const output_type = GetCudfType(expr.return_type);
 
   //----------Numeric Binary Functions----------//
@@ -372,9 +383,24 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     }
   }
 
+  //----------Struct Functions----------//
+  // row() and struct_pack() both construct a struct column from their child expressions.
+  // row() is used by DuckDB for tuple constructors like (col1, col2).
+  if (func_string == "row" || func_string == "struct_pack") {
+    D_ASSERT(!expr.children.empty());
+    std::vector<std::unique_ptr<cudf::column>> child_cols;
+    for (const auto& expr : expr.children) {
+      auto result = execute(*expr, execution_mode::MATERIALIZE);
+      child_cols.push_back(std::move(result.get_column()));
+    }
+    auto const num_rows = child_cols[0]->size();
+    return cudf::make_structs_column(
+      num_rows, std::move(child_cols), 0, rmm::device_buffer{}, _stream, _mr);
+  }
+
   // If we reach here, it means the function is not supported in the expression executor
   throw duckdb::NotImplementedException(
-    "[gpu_expression_executor:function] execute called on unsupported function: {}", func_string);
+    "[gpu_expression_executor:function] execute called on unsupported function: %s", func_string);
 }
 
 }  // namespace sirius::experimental

@@ -354,6 +354,16 @@ class gpu_expression_executor {
   // column.
   std::unique_ptr<cudf::column> execute_ast(expr_ref root_expr);
 
+  /**
+   * @brief Stores a materialized column as a temporary and returns an ast_result referencing it.
+   *
+   * This is used by AST breakers (e.g. CASE, unsupported CAST) that cannot represent their logic
+   * as cudf AST nodes. When called with execution_mode::AST from a parent expression, they
+   * materialize their result, stash it in _temp_columns, and return an ast_result with a
+   * column_reference pointing to the temp column's index in the combined table.
+   */
+  execute_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
+
   // Release memory for the temporary scalars and columns with the given indices.
   void release_temporaries(std::vector<std::size_t> const& scalar_indices,
                            std::vector<std::size_t> const& column_indices);
