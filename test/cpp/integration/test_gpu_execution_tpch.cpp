@@ -4147,3 +4147,82 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "group by cntrycode "
     "order by cntrycode;");
 }
+
+//===----------------------------------------------------------------------===//
+// cpu_source_task tests — STATISTICS_PROPAGATION / metadata-only queries
+//
+// When STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*),
+// MIN, and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN),
+// which the Sirius planner converts to COLUMN_DATA_SCAN -> cpu_source_task.
+// These tests ensure that path works and doesn't regress.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped count(*)",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select count(*) from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - ungrouped count(*) parquet",
+                 "[integration][gpu_execution][parquet][cpu_source]")
+{
+  compare_gpu_vs_cpu("select count(*) from lineitem;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped min",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select min(n_nationkey) from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - ungrouped min parquet",
+                 "[integration][gpu_execution][parquet][cpu_source]")
+{
+  compare_gpu_vs_cpu("select min(l_orderkey) from lineitem;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped max",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select max(n_nationkey) from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - ungrouped max parquet",
+                 "[integration][gpu_execution][parquet][cpu_source]")
+{
+  compare_gpu_vs_cpu("select max(l_orderkey) from lineitem;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped min and max",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select min(n_nationkey), max(n_nationkey) from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - ungrouped min and max parquet",
+                 "[integration][gpu_execution][parquet][cpu_source]")
+{
+  compare_gpu_vs_cpu("select min(l_orderkey), max(l_orderkey) from lineitem;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped count(*) with min and max",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select count(*), min(n_nationkey), max(n_nationkey) from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - ungrouped count(*) with min and max parquet",
+                 "[integration][gpu_execution][parquet][cpu_source]")
+{
+  compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
+}

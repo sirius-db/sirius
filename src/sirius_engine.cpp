@@ -465,12 +465,18 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         } else {
           throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
         }
-      } else if (current_pipeline->source->type ==
-                   op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
-                 current_pipeline->source->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
-                 current_pipeline->source->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+      } else if (current_pipeline->source->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                 current_pipeline->source->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN ||
+                 (current_pipeline->source->type ==
+                    op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN &&
+                  current_pipeline->get_source()
+                      ->Cast<op::sirius_physical_column_data_scan>()
+                      .collection != nullptr)) {
         // CPU-side source: create a cpu_source scan pipeline (analogous to TABLE_SCAN →
-        // PARQUET_SCAN)
+        // PARQUET_SCAN).
+        // Note: COLUMN_DATA_SCAN with null collection is the LEFT_DELIM_JOIN's cached
+        // chunk scan — it is populated at runtime by the delim join's sink, not by a
+        // cpu_source_task, so we must NOT split it here.
         auto* source_op = current_pipeline->get_source().get();
 
         duckdb::unique_ptr<op::sirius_physical_cpu_source> cpu_source_op;
