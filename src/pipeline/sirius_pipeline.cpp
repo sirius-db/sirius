@@ -329,10 +329,6 @@ void sirius_pipeline::update_pipeline_status()
       }
     }
     end_nvtx_range_if_finished();
-    // NOTE: do NOT fire on_finished for generic pipelines here. The GPU executor
-    // already handles consumer scheduling after task completion (line 264 of
-    // gpu_pipeline_executor.cpp). Firing on_finished here races with in-flight
-    // GPU tasks and causes cudaErrorIllegalAddress.
   }
 }
 
