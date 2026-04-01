@@ -274,6 +274,106 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   partition_row_groups();
 }
 
+// Protected constructor: caller supplies pre-resolved file paths and column indices.
+// Skips MultiFileBindData extraction; everything else is identical to the public
+// constructor (footer reads, metadata parsing, row-group partitioning).
+parquet_scan_task_global_state::parquet_scan_task_global_state(
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+  sirius_physical_parquet_scan* scan_op,
+  std::vector<std::string> file_paths,
+  std::vector<size_t> selected_column_indices,
+  size_t approximate_batch_size)
+  : pipeline::sirius_pipeline_task_global_state(pipeline),
+    _scan_op(scan_op),
+    _approximate_batch_size(approximate_batch_size),
+    _is_projected(!selected_column_indices.empty()),
+    _selected_column_indices(std::move(selected_column_indices)),
+    _file_paths(std::move(file_paths))
+{
+  if (_file_paths.empty()) {
+    throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
+  }
+
+  constexpr size_t PARQUET_MAGIC_SIZE = 4;
+  constexpr size_t FOOTER_TAIL_SIZE   = 8;
+
+  std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
+  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> footer_buffers;
+  datasources.reserve(_file_paths.size());
+  footer_buffers.reserve(_file_paths.size());
+  _file_sizes.reserve(_file_paths.size());
+  _metadata_byte_sizes.reserve(_file_paths.size());
+  _footer_offsets.reserve(_file_paths.size());
+
+  for (auto const& file_path : _file_paths) {
+    auto datasource      = cudf::io::datasource::create(file_path);
+    auto const file_size = datasource->size();
+    datasources.push_back(std::move(datasource));
+
+#if CUDF_VERSION_NUM >= 2604
+    footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
+    auto const footer_len = footer_buffers.back()->size();
+#else
+    footer_buffers.push_back(fetch_footer_to_host_fallback(*datasources.back()));
+    auto const footer_len = footer_buffers.back()->size();
+#endif
+
+    auto const footer_offset  = file_size - FOOTER_TAIL_SIZE - footer_len;
+    auto const metadata_bytes = PARQUET_MAGIC_SIZE + footer_len + FOOTER_TAIL_SIZE;
+
+    _file_sizes.push_back(file_size);
+    _footer_offsets.push_back(footer_offset);
+    _metadata_byte_sizes.push_back(metadata_bytes);
+  }
+
+  _reader_options = cudf::io::parquet_reader_options::builder().build();
+
+  std::vector<std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader>> readers;
+  _file_metadatas.reserve(_file_paths.size());
+  readers.reserve(_file_paths.size());
+  std::for_each(
+    footer_buffers.begin(), footer_buffers.end(), [&readers, this](auto& footer_buffer) {
+      auto reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
+        cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+        _reader_options);
+      _file_metadatas.push_back(reader->parquet_metadata());
+      readers.push_back(std::move(reader));
+    });
+
+  // Apply column-name projection using the pre-computed selected_column_indices
+  if (_is_projected) {
+    if (scan_op->names.empty()) {
+      throw std::runtime_error(
+        "[parquet_scan_task_global_state] Cannot apply projection: scan has no column names");
+    }
+
+    for (auto const& meta : _file_metadatas) {
+      if (!detail::projected_columns_are_flat(meta, _selected_column_indices)) {
+        throw std::runtime_error(
+          "[parquet_scan_task_global_state] Parquet scans with projections currently only support "
+          "flat projected columns");
+      }
+    }
+
+    std::vector<std::string> projected_columns;
+    projected_columns.reserve(_selected_column_indices.size());
+    std::for_each(_selected_column_indices.begin(),
+                  _selected_column_indices.end(),
+                  [&scan_op, &projected_columns](size_t col_idx) {
+                    projected_columns.emplace_back(scan_op->names[col_idx]);
+                  });
+
+#if CUDF_VERSION_NUM >= 2604
+    _reader_options.set_column_names(std::move(projected_columns));
+#else
+    _reader_options.set_columns(std::move(projected_columns));
+#endif
+  }
+
+  accumulate_row_group_byte_sizes();
+  partition_row_groups();
+}
+
 void parquet_scan_task_global_state::accumulate_row_group_byte_sizes()
 {
   _row_group_compressed_bytes.resize(_file_metadatas.size());
@@ -458,6 +558,12 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   file_size,
                                                   _datasource);
+
+  // Propagate the post-convert hook and data-file path (non-null only for iceberg V2 scans).
+  if (g_state.has_post_convert_fn()) {
+    parquet_representation->set_post_convert_fn(g_state.get_post_convert_fn());
+    parquet_representation->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));
+  }
 
   std::shared_ptr<cucascade::data_batch> batch;
   if (_materialized_columns) {
