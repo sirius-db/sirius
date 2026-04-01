@@ -540,7 +540,10 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
     }
     auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
-    g_state.get_memory_history().record({estimated_bytes, output_bytes, output_bytes});
+    // Use the raw task consumption basis from local state when recording history
+    auto consumption_basis =
+      this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
+    g_state.get_memory_history().record({consumption_basis, output_bytes, output_bytes});
 
     publish_output(*output_data, stream);
   }
