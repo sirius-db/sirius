@@ -278,8 +278,13 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
-      // operators.
-      peak_bytes -= local_state._bytes_to_materialize_input;
+      // operators, clamping to zero to avoid unsigned underflow.
+      auto const bytes_to_materialize_input = local_state._bytes_to_materialize_input;
+      if (peak_bytes > bytes_to_materialize_input) {
+        peak_bytes -= bytes_to_materialize_input;
+      } else {
+        peak_bytes = 0;
+      }
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
       if (auto const* cc_oom =
