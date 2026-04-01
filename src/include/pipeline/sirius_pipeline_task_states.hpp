@@ -51,7 +51,10 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
   [[nodiscard]] sirius_pipeline* get_pipeline() { return _pipeline.get(); }
 
-  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
+  [[nodiscard]] size_t get_pipeline_id() const
+  {
+    return _pipeline ? _pipeline->get_pipeline_id() : 0;
+  }
 
   void set_pipeline(duckdb::shared_ptr<sirius_pipeline> pipeline)
   {
