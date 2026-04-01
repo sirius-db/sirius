@@ -86,12 +86,12 @@ pub fn partition_strategy_from_thrift(
 /// Returns `(column_indices, doris_primitive_types)`.
 pub fn resolve_partition_columns(
     partition_exprs: &[TExpr],
-    slot_descriptors: &[(i32, String)], // (slot_id, col_name) pairs
+    slot_descriptors: &[(i32, String, i32)], // (slot_id, col_name, column_pos) triples
     batch_schema: &arrow::datatypes::Schema,
 ) -> Result<(Vec<usize>, Vec<TPrimitiveType>), String> {
-    let slot_map: std::collections::HashMap<i32, &str> = slot_descriptors
+    let slot_map: std::collections::HashMap<i32, (&str, i32)> = slot_descriptors
         .iter()
-        .map(|(id, name)| (*id, name.as_str()))
+        .map(|(id, name, pos)| (*id, (name.as_str(), *pos)))
         .collect();
 
     let mut col_indices = Vec::with_capacity(partition_exprs.len());
@@ -115,13 +115,18 @@ pub fn resolve_partition_columns(
             .as_ref()
             .ok_or_else(|| "SLOT_REF node missing slot_ref field".to_string())?;
 
-        let col_name = slot_map
+        let (col_name, col_pos) = slot_map
             .get(&slot_ref.slot_id)
             .ok_or_else(|| format!("slot_id {} not found in descriptor table", slot_ref.slot_id))?;
 
-        let col_idx = batch_schema
-            .index_of(col_name)
-            .map_err(|_| format!("column '{}' not found in batch schema", col_name))?;
+        // Resolve column index: try by name first, fall back to column_pos.
+        // Computed expression slots (e.g., extract(year from col)) have empty
+        // col_name, so name-based lookup fails. Use column_pos as fallback.
+        let col_idx = if col_name.is_empty() {
+            *col_pos as usize
+        } else {
+            batch_schema.index_of(col_name).unwrap_or(*col_pos as usize)
+        };
 
         // Extract Doris primitive type from the expression's type descriptor.
         let doris_type = first_node

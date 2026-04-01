@@ -300,7 +300,7 @@ pub async fn send_exchange_with_nixl(
     nixl_only: bool,
     local_brpc_addr: &str,
     exchange_buffer: &ExchangeBuffer,
-    desc_tbl_slots: Option<&[(i32, String)]>,
+    desc_tbl_slots: Option<&[(i32, String, i32)]>,
 ) -> Result<(), String> {
     let destinations = &exch_info.destinations;
     let node_id = exch_info.dest_node_id;
@@ -473,7 +473,7 @@ async fn send_hash_partitioned(
     partition_exprs: &[doris_thrift::exprs::TExpr],
     num_destinations: usize,
     use_crc32c: bool,
-    desc_tbl_slots: Option<&[(i32, String)]>,
+    desc_tbl_slots: Option<&[(i32, String, i32)]>,
 ) -> Result<(), String> {
     use crate::hash_partitioner::{compute_dest_assignments, resolve_partition_columns, split_by_destination};
 
