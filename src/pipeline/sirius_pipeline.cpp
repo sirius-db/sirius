@@ -20,6 +20,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius_engine.hpp"
@@ -296,6 +297,13 @@ void sirius_pipeline::update_pipeline_status()
   } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
     auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
     if (!parquet_scan.has_more_partitions) {
+      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
+      end_nvtx_range_if_finished();
+      return;
+    }
+  } else if (get_source()->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+    auto& cpu_source = get_source()->Cast<op::sirius_physical_cpu_source>();
+    if (cpu_source.exhausted.load()) {
       if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
       end_nvtx_range_if_finished();
       return;

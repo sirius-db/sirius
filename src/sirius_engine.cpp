@@ -19,7 +19,9 @@
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
@@ -394,6 +396,37 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         } else {
           throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
         }
+      } else if (current_pipeline->source->type ==
+                   op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
+                 current_pipeline->source->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                 current_pipeline->source->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+        // CPU-side source: create a cpu_source scan pipeline (analogous to TABLE_SCAN →
+        // PARQUET_SCAN)
+        auto* source_op = current_pipeline->get_source().get();
+
+        duckdb::unique_ptr<op::sirius_physical_cpu_source> cpu_source_op;
+        if (source_op->type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN) {
+          auto& col_scan = source_op->Cast<op::sirius_physical_column_data_scan>();
+          cpu_source_op  = duckdb::make_uniq<op::sirius_physical_cpu_source>(
+            source_op->types, source_op->estimated_cardinality, std::move(col_scan.collection));
+        } else if (source_op->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+          cpu_source_op = duckdb::make_uniq<op::sirius_physical_cpu_source>(
+            source_op->types, source_op->estimated_cardinality, true);
+        } else {
+          // EMPTY_RESULT: no data
+          cpu_source_op = duckdb::make_uniq<op::sirius_physical_cpu_source>(
+            source_op->types, source_op->estimated_cardinality, false);
+        }
+
+        auto new_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
+        new_pipeline->source = nullptr;
+        new_pipeline->sink   = cpu_source_op.get();
+
+        current_pipeline->source = cpu_source_op.get();
+        current_pipeline->operators.insert(current_pipeline->operators.begin(), *source_op);
+
+        new_scheduled.push_back(new_pipeline);
+        new_pipeline_breakers.push_back(std::move(cpu_source_op));
       }
 
       duckdb::vector<duckdb::idx_t> join_positions;
@@ -1040,7 +1073,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           new_scheduled[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
           auto next_op             = dependent_pipeline->get_operators().size() == 0
                                        ? dependent_pipeline->get_sink().get()
@@ -1236,8 +1270,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                             static_cast<void*>(scan_port->repo));
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                   first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-          // ignore DUCKDB_SCAN and PARQUET_SCAN since it doesn't have port
+                   first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                   first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+          // ignore scan-like operators since they don't have ports
+        } else if (first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+                   first_op.type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
+                   first_op.type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                   first_op.type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+          // these operators don't have ports
         } else {
           // Most operators have "default" port
           auto* default_port = first_op.get_port("default");
@@ -1273,8 +1313,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                             static_cast<void*>(scan_port->repo));
           }
         } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                   sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-          // ignore DUCKDB_SCAN  and PARQUET_SCAN since it doesn't have port
+                   sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                   sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+          // ignore scan-like operators since they don't have ports
+        } else if (sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+                   sink->type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
+                   sink->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                   sink->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+          // these operators don't have ports
         } else {
           auto* default_port = sink->get_port("default");
           if (default_port) {
