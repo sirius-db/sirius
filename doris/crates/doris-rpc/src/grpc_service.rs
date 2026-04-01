@@ -2158,11 +2158,11 @@ impl PBackendService for PBackendServiceHandler {
                     let exchange_dests = extract_exchange_destinations(&params);
 
                     // Extract slot descriptors for hash partition column resolution.
-                    let desc_tbl_slots: Option<Vec<(i32, String, i32)>> = params
+                    let desc_tbl_slots: Option<Vec<(i32, String)>> = params
                         .desc_tbl
                         .as_ref()
                         .and_then(|dt| dt.slot_descriptors.as_ref())
-                        .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone(), s.column_pos)).collect());
+                        .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
 
                     // Extract sender_id from local_params (each BE gets a unique sender_id
                     // for the same fragment, so the receiver's ExchangeBuffer can distinguish senders).
@@ -2548,9 +2548,9 @@ impl PBackendService for PBackendServiceHandler {
                                     .and_then(|lp| lp.first())
                                     .map(|p| p.sender_id.unwrap_or(0))
                                     .unwrap_or(0);
-                                let desc_tbl_slots: Option<Vec<(i32, String, i32)>> = params.desc_tbl.as_ref()
+                                let desc_tbl_slots: Option<Vec<(i32, String)>> = params.desc_tbl.as_ref()
                                     .and_then(|dt| dt.slot_descriptors.as_ref())
-                                    .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone(), s.column_pos)).collect());
+                                    .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
                                 if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
                                     nixl_agent.as_ref(), location, &exch_info, query_id,
                                     sender_id, nixl_only, &local_brpc_addr, &exchange_buffer,
@@ -2681,11 +2681,11 @@ impl PBackendService for PBackendServiceHandler {
                             "sending execution result to exchange destinations"
                         );
                         // Extract slot descriptors for hash partition column resolution.
-                        let desc_tbl_slots: Option<Vec<(i32, String, i32)>> = params
+                        let desc_tbl_slots: Option<Vec<(i32, String)>> = params
                             .desc_tbl
                             .as_ref()
                             .and_then(|dt| dt.slot_descriptors.as_ref())
-                            .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone(), s.column_pos)).collect());
+                            .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
                         if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
                             self.nixl_agent.as_ref(),
                             location,
