@@ -236,7 +236,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                             part_num, view.num_rows(),
                             [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
 
-            std::vector<duckdb::LastGPUBuffers::PackedPartition> packed_parts;
+            std::vector<duckdb::PackedPartition> packed_parts;
             size_t staging_offset = lgb.GetStagingOffset();
 
             for (int i = 0; i < part_num; i++) {
@@ -244,7 +244,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
               auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_table->num_rows();
               auto num_rows = end - start;
               if (num_rows == 0) {
-                { duckdb::LastGPUBuffers::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
+                { duckdb::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
                 continue;
               }
               auto slice = cudf::slice(partitioned_table->view(), {start, end});
@@ -252,7 +252,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
               auto total = packer->get_total_contiguous_size();
               if (staging_offset + total > staging_size) {
                 SIRIUS_LOG_WARN("[result_collector] partition {} ({} bytes) exceeds staging", i, total);
-                { duckdb::LastGPUBuffers::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
+                { duckdb::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
                 continue;
               }
               cudf::device_span<uint8_t> dst(
@@ -261,11 +261,15 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
               auto md = packer->build_metadata();
               SIRIUS_LOG_INFO("[result_collector] partition {}: {} rows, {} bytes at staging+{}",
                               i, num_rows, total, staging_offset);
-              { duckdb::LastGPUBuffers::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = total; pp.metadata = std::move(md); pp.num_rows = static_cast<int32_t>(num_rows); packed_parts.push_back(std::move(pp)); }
+              { duckdb::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = total; pp.metadata = std::move(md); pp.num_rows = static_cast<int32_t>(num_rows); packed_parts.push_back(std::move(pp)); }
               staging_offset += (total + 255) & ~255UL;  // 256-byte align
             }
             lgb.SetStagingOffset(staging_offset);
             lgb.AccumulatePackedPartitions(std::move(packed_parts));
+            // Also set packed_gpu_addr so get_packed_gpu() returns non-None.
+            // The Rust exchange forward needs this to detect GPU-packed data.
+            lgb.StorePackedData(nullptr, staging_addr, staging_offset,
+                                std::make_unique<std::vector<uint8_t>>());
           } else if (staging_addr != 0 && staging_size > 0) {
             // No partitioning — single pack into staging (broadcast path).
             auto packer = cudf::chunked_pack::create(view, staging_size, stream);

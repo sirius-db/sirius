@@ -1033,9 +1033,12 @@ void SiriusExtension::RetainGPUBuffersFunction(
     return;
   }
 
-  LastGPUBuffers::GetInstance().SetRetainNext(true);
+  // Begin an exchange session (replaces the old retain_next flag).
+  // The session holds per-execution state for GPU packing.
+  auto session_id = LastGPUBuffers::GetInstance().BeginSession();
+  SIRIUS_LOG_INFO("[sirius_retain_gpu_buffers] began exchange session {}", session_id);
   output.SetCardinality(1);
-  output.SetValue(0, 0, Value("retain_next=true"));
+  output.SetValue(0, 0, Value("session_id=" + std::to_string(session_id)));
   data.finished = true;
 }
 
@@ -1713,7 +1716,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   // sirius_get_packed_partitions() — returns per-partition packed buffers.
   {
     struct GetPartData : public TableFunctionData {
-      std::vector<LastGPUBuffers::PackedPartition> partitions;
+      std::vector<PackedPartition> partitions;
       idx_t row_idx = 0;
     };
     auto bind = [](ClientContext&, TableFunctionBindInput&,
@@ -1774,7 +1777,10 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     if (md && !md->empty()) {
       output.SetValue(2, 0, Value::BLOB(md->data(), md->size()));
     } else {
-      output.SetValue(2, 0, Value(LogicalType::BLOB));
+      // Return empty (non-null) BLOB so Rust's row.get::<Vec<u8>>() succeeds.
+      // A NULL BLOB causes the Rust DuckDB driver to return an error.
+      uint8_t empty = 0;
+      output.SetValue(2, 0, Value::BLOB(&empty, 0));
     }
     data.finished = true;
   };
