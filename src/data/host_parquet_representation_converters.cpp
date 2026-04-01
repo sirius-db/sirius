@@ -161,7 +161,7 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     std::move(host_src.get_row_group_indices()),
     std::move(host_src.get_column_chunk_byte_ranges()),
     data_size,
-    host_src.get_uncompressed_size_in_bytes(),
+    host_src.get_logical_data_size_in_bytes(),
     host_src.get_file_size(),
     host_src.get_fallback_datasource());
   if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
