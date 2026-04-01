@@ -226,7 +226,40 @@ void task_creator::manager_loop()
 
     auto* node = get_operator_for_next_task(original_node);
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      // Path B: Zero-data pipeline detection.
+      // If the original consumer's pipeline has all upstream finished and
+      // empty ports, and no tasks were ever created, this pipeline will
+      // never produce any GPU tasks. Mark it finished and fire on_finished
+      // to propagate completion to further downstream pipelines.
+      // NOTE: Skip RESULT_COLLECTOR — firing on_finished from the task_creator
+      // triggers query teardown while this thread still holds pipeline references.
+      auto zd_pipeline = explicit_pipeline
+        ? explicit_pipeline
+        : (original_node ? original_node->get_pipeline() : nullptr);
+      if (zd_pipeline && !zd_pipeline->is_pipeline_finished()) {
+        auto first = zd_pipeline->get_source();
+        auto sink  = zd_pipeline->get_sink();
+        bool is_rc = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
+        if (!is_rc && first && first->is_source_pipeline_finished()
+            && first->all_ports_empty()
+            && !zd_pipeline->has_created_tasks()) {
+          // Atomically finalize — prevents B/B race from concurrent threads.
+          bool exp_fin = false;
+          if (zd_pipeline->finalized.compare_exchange_strong(exp_fin, true)) {
+            zd_pipeline->mark_as_finished();
+            for (auto& op : zd_pipeline->get_operators()) {
+              op.get().finalize_operator();
+            }
+            bool exp_cb = false;
+            if (zd_pipeline->on_finished_fired.compare_exchange_strong(exp_cb, true)) {
+              if (zd_pipeline->on_finished) { zd_pipeline->on_finished(); }
+            }
+          }
+        }
+      }
+      continue;
+    }
 
     // Only use the explicit pipeline if the node wasn't redirected by hint chain.
     // When get_operator_for_next_task follows WAITING hints to a different producer,

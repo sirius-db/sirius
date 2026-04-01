@@ -254,6 +254,26 @@ void gpu_pipeline_executor::manager_loop()
 
       task.reset();
 
+      // Path A: Fire on_finished for generic (non-scan, non-result-collector)
+      // pipelines. Scan pipelines fire on_finished from update_pipeline_status().
+      // Result-collector uses the query_complete path below (avoids teardown race).
+      // CAS on on_finished_fired ensures exactly-once semantics.
+      bool notified_via_on_finished = false;
+      if (pipeline && pipeline->is_pipeline_finished()) {
+        auto src  = pipeline->get_source();
+        auto sink = pipeline->get_sink();
+        bool is_scan = src && (src->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
+                               src->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN);
+        bool is_rc   = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
+        if (!is_scan && !is_rc) {
+          bool expected = false;
+          if (pipeline->on_finished_fired.compare_exchange_strong(expected, true)) {
+            if (pipeline->on_finished) { pipeline->on_finished(); }
+            notified_via_on_finished = true;
+          }
+        }
+      }
+
       // Check if query is complete BEFORE scheduling downstream tasks.
       // mark_completed() signals the future that engine.execute() is waiting on,
       // which may destroy the engine and its operators. We must not schedule
@@ -266,15 +286,13 @@ void gpu_pipeline_executor::manager_loop()
         }
       }
 
-      if (!query_complete && _task_creator) {
+      // Skip consumer scheduling when on_finished already handled it
+      // (on_finished schedules the same consumers — avoids duplicates).
+      if (!notified_via_on_finished && !query_complete && _task_creator) {
         for (auto* consumer : consumers) {
           if (consumer) { _task_creator->schedule(consumer); }
         }
         // Re-check pipeline completion after scheduling downstream tasks.
-        // A concurrent scan task may have set exhausted=true (and thus
-        // pipeline_finished=true) between the first check above and now.
-        // Without this re-check, the completion signal would be missed when
-        // this is the last GPU task for the pipeline.
         if (_completion_handler && pipeline && !_completion_handler->is_completed()) {
           auto sink = pipeline->get_sink();
           if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {

@@ -151,10 +151,24 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void mark_task_created();
   void mark_task_completed();
 
+  //! Check if any tasks have been created for this pipeline.
+  bool has_created_tasks() const { return tasks_created.load() > 0; }
+
+  //! Mark the pipeline as finished (for zero-data finalization path).
+  void mark_as_finished() { pipeline_finished.store(true); }
+
   //! Optional callback invoked when the pipeline finishes.
   //! Used to signal the completion_handler when a 0-row scan completes
   //! and no GPU tasks are created.
   std::function<void()> on_finished;
+
+  //! Exactly-once guard for on_finished callback (prevents double-fire
+  //! from concurrent GPU executor threads or task_creator paths).
+  mutable std::atomic<bool> on_finished_fired{false};
+
+  //! Exactly-once guard for the zero-data finalization path (prevents
+  //! concurrent task_creator threads from both finalizing the same pipeline).
+  mutable std::atomic<bool> finalized{false};
 
  private:
   //! Whether or not the pipeline has been readied
