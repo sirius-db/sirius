@@ -177,8 +177,6 @@ class pipeline_executor {
  private:
   void management_eventloop();
 
-  void schedule_next_scan_tasks();
-
   std::mutex _priority_scans_mutex;
   std::queue<op::sirius_physical_operator*> _priority_scans;
 

@@ -100,6 +100,7 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
   // get the base columns by projecting over the projection_ids/column_ids
   if (!table_scan.projection_ids.empty()) {
     for (auto& partition_col : partition_columns) {
+      if (partition_col >= table_scan.projection_ids.size()) { return false; }
       partition_col = table_scan.projection_ids[partition_col];
     }
   }
@@ -202,8 +203,7 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
     bits_per_group.push_back(required_bits);
     perfect_hash_bits += required_bits;
     // check if we have exceeded the bits for the hash
-    if (perfect_hash_bits >
-        duckdb::DBConfig::GetSetting<duckdb::PerfectHtThresholdSetting>(context)) {
+    if (perfect_hash_bits > duckdb::Settings::Get<duckdb::PerfectHtThresholdSetting>(context)) {
       // too many bits for perfect hash
       return false;
     }

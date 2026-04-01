@@ -145,7 +145,8 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   SORT_PARTITION,
   SORT_SAMPLE,
   DUCKDB_SCAN,
-  PARQUET_SCAN
+  PARQUET_SCAN,
+  ICEBERG_SCAN
 };
 
 std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type);

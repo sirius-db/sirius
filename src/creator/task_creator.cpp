@@ -19,9 +19,11 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/iceberg_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
@@ -41,7 +43,7 @@ namespace sirius::creator {
 
 task_creator::task_creator(exec::thread_pool_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _kiosk(config.num_threads)
+  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr)
 {
 }
 
@@ -98,11 +100,34 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
             &source_operator->Cast<op::sirius_physical_parquet_scan>(),
             op_params.scan_task_batch_size));
       }
+    } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+      SIRIUS_LOG_INFO("[task_creator::prepare_for_query] ICEBERG_SCAN operator_id={}", operator_id);
+      auto it = _parquet_scan_operator_global_state_map.find(operator_id);
+      if (it != _parquet_scan_operator_global_state_map.end()) {
+        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] rebind existing state for id={}",
+                        operator_id);
+        it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_iceberg_scan>());
+      } else {
+        SIRIUS_LOG_INFO("[task_creator::prepare_for_query] creating NEW state for id={}",
+                        operator_id);
+        const auto& op_params =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+            ->get_config()
+            .get_operator_params();
+        _parquet_scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::iceberg_scan_task_global_state>(
+            pipeline,
+            &source_operator->Cast<op::sirius_physical_iceberg_scan>(),
+            op_params.scan_task_batch_size));
+      }
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
     }
   }
+  _num_scans_in_plan =
+    _scan_operator_global_state_map.size() + _parquet_scan_operator_global_state_map.size();
 }
 
 void task_creator::drain_pending_tasks()
@@ -110,7 +135,7 @@ void task_creator::drain_pending_tasks()
   // Drain any queued task creation requests that haven't been picked up yet
   _task_creation_queue.drain();
   // Wait for any in-flight task creation lambdas to finish
-  _kiosk.wait_all();
+  _bounded_pool->wait_all();
 }
 
 void task_creator::reset(bool keep_parquet_metadata)
@@ -128,7 +153,8 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 {
   if (node == nullptr) { return nullptr; }
 
-  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+      node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
     size_t operator_id             = node->get_operator_id();
     auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
     if (parquet_task_global_state->has_more_partitions()) {
@@ -173,7 +199,7 @@ void task_creator::start_thread_pool()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
+  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(
     _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
   _manager_thread = std::thread(&task_creator::manager_loop, this);
 }
@@ -182,11 +208,12 @@ void task_creator::stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _kiosk.stop();
+  _bounded_pool->interrupt();
   _task_creation_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _kiosk.wait_all();
-  if (_thread_pool) { _thread_pool->stop(); }
+  _bounded_pool->wait_all();
+  _bounded_pool->stop();
+  _bounded_pool.reset();
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node)
@@ -199,9 +226,9 @@ void task_creator::schedule(op::sirius_physical_operator* node)
 void task_creator::manager_loop()
 {
   while (_running.load()) {
-    auto ticket = _kiosk.acquire();  // block till a thread is available
-    if (!ticket.is_valid()) {
-      SIRIUS_LOG_INFO("Task Creator: Kiosk interrupted, stopping manager loop");
+    auto slot = _bounded_pool->reserve();  // block till a thread is available
+    if (!slot) {
+      SIRIUS_LOG_INFO("Task Creator: pool interrupted, stopping manager loop");
       break;
     }
 
@@ -218,8 +245,8 @@ void task_creator::manager_loop()
 
     if (node == nullptr) { continue; }
 
-    // Schedule the task creation work on the thread pool
-    _thread_pool->schedule([this, node, ticket = std::move(ticket)]() mutable {
+    // Dispatch the task creation work to the pool
+    _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
       try {
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();
@@ -230,27 +257,31 @@ void task_creator::manager_loop()
           auto& delim_join    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
           auto partition_join = delim_join.partition_join;
           auto distinct_op    = delim_join.distinct.get();
-          for (auto& [next_op, port_id] : partition_join->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : partition_join->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
-          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : distinct_op->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
         } else if (pipeline->get_sink()->type ==
                    ::sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
           auto& delim_join      = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
           auto distinct_op      = delim_join.distinct.get();
           auto column_data_scan = delim_join.column_data_scan;
-          for (auto& [next_op, port_id] : column_data_scan->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
-          for (auto& [next_op, port_id] : distinct_op->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : distinct_op->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
         } else {
-          auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
-          for (auto& [next_op, port_id] : next_port_after_sink) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          for (auto& next_port : pipeline->get_sink()->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(
+              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
           }
         }
         // scheduling scan task
@@ -282,10 +313,15 @@ void task_creator::manager_loop()
           pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
                                           // with the task creation
           _pipeline_executor->schedule(std::move(scan_task));
-        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
+                   node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
-          auto* parquet_scan             = &node->Cast<op::sirius_physical_parquet_scan>();
+          // ICEBERG_SCAN inherits from PARQUET_SCAN; Cast<> is type-checked by enum so use
+          // static_cast for iceberg nodes.
+          auto* parquet_scan = (node->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN)
+                                 ? static_cast<op::sirius_physical_parquet_scan*>(node)
+                                 : &node->Cast<op::sirius_physical_parquet_scan>();
           while (true) {
             pipeline->mark_task_created();
             auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
@@ -317,6 +353,10 @@ void task_creator::manager_loop()
                                                             std::move(parquet_task_local_state),
                                                             parquet_task_global_state);
             _pipeline_executor->schedule(std::move(parquet_task));
+
+            // If there is only a single scan in the plan, continue creating scan tasks to create
+            // I/O parallelism. Otherwise, let the plan drive the creation of more tasks.
+            if (_num_scans_in_plan >= 2) { break; }
           }
         } else {
           // need to exhaust input batches until all ports are empty
