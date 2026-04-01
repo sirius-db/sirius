@@ -162,10 +162,10 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression 
       return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL128: {
-      auto const scale         = numeric::scale_type{-duckdb::DecimalType::GetScale(expr.return_type)};
+      auto const scale = numeric::scale_type{-duckdb::DecimalType::GetScale(expr.return_type)};
       duckdb::hugeint_t hugeint_value = expr.value.GetValueUnsafe<duckdb::hugeint_t>();
       __int128_t int128_value = (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower;
-      auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+      auto scalar             = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
         int128_value, scale, true, _stream, _mr);
       return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }

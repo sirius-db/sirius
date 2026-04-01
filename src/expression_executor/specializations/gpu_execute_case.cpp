@@ -118,10 +118,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
     // ast_result with a column_reference to it.
     std::unique_ptr<cudf::column> result_column;
     if (current_result.is_scalar()) {
-      result_column =
-        cudf::make_column_from_scalar(current_result.get_scalar(), _input_table.num_rows(), _stream, _mr);
+      result_column = cudf::make_column_from_scalar(
+        current_result.get_scalar(), _input_table.num_rows(), _stream, _mr);
     } else {
-      result_column = std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr);
+      result_column =
+        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr);
     }
     return materialize_as_ast_column(std::move(result_column));
   }

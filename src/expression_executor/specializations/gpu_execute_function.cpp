@@ -391,7 +391,13 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     std::vector<std::unique_ptr<cudf::column>> child_cols;
     for (const auto& expr : expr.children) {
       auto result = execute(*expr, execution_mode::MATERIALIZE);
-      child_cols.push_back(std::move(result.get_column()));
+      if (result.is_scalar()) {
+        child_cols.push_back(cudf::make_column_from_scalar(
+          result.get_scalar(), _input_table.num_rows(), _stream, _mr));
+      } else {
+        child_cols.push_back(
+          std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+      }
     }
     auto const num_rows = child_cols[0]->size();
     return cudf::make_structs_column(

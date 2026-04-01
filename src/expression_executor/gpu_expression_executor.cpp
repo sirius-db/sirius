@@ -209,7 +209,7 @@ std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root
 execute_result gpu_expression_executor::materialize_as_ast_column(
   std::unique_ptr<cudf::column> column)
 {
-  auto const col_idx = _input_table.num_columns() + _temp_columns.size();
+  auto const col_idx         = _input_table.num_columns() + _temp_columns.size();
   auto const temp_column_idx = _temp_columns.size();
   _temp_columns.push_back(std::move(column));
   auto col_ref = _ast_tree.emplace<cudf::ast::column_reference>(col_idx);
@@ -262,9 +262,9 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   _input_table          = input_rep.get_table().view();
 
   // Execute the expressions and emit results into _output_columns
-  for (auto & _expression : _expressions) {
+  for (auto& _expression : _expressions) {
     auto const& expr = *_expression;
-    auto result = execute(expr, execution_mode::MATERIALIZE);
+    auto result      = execute(expr, execution_mode::MATERIALIZE);
 
     if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
       // BOUND_REF: pass column through without type check (same as
