@@ -139,7 +139,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
   // Check if GPU buffer retention is requested (for nixl GPU-direct exchange).
   bool should_retain = duckdb::LastGPUBuffers::GetInstance().ShouldRetain();
-  SIRIUS_LOG_INFO("[result_collector] sink: {} batches, should_retain={}", input_batches.size(), should_retain);
   std::vector<duckdb::GPUBufferInfo> gpu_buffer_infos;
 
   for (auto const& input_batch : input_batches) {
@@ -150,9 +149,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
     }
     if (data->get_size_in_bytes() == 0) { continue; }
-
-    SIRIUS_LOG_DEBUG("[result_collector] batch tier={} size={}",
-                    static_cast<int>(data->get_current_tier()), data->get_size_in_bytes());
 
     // If data is in GPU tier, convert to HOST tier first
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
@@ -270,14 +266,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             }
             lgb.SetStagingOffset(staging_offset);
             lgb.AccumulatePackedPartitions(std::move(packed_parts));
-            // Also set the packed GPU address so get_packed_gpu() returns
-            // non-None. The Rust exchange forward needs this to construct
-            // ExecutionLocation::Gpu.
-            SIRIUS_LOG_INFO("[result_collector] StorePackedData for hash_partition: addr=0x{:x} size={}",
-                            staging_addr, staging_offset);
-            // Pass empty (non-null) metadata so get_packed_gpu() returns non-NULL BLOB.
-            lgb.StorePackedData(nullptr, staging_addr, staging_offset,
-                                std::make_unique<std::vector<uint8_t>>());
           } else if (staging_addr != 0 && staging_size > 0) {
             // No partitioning — single pack into staging (broadcast path).
             auto packer = cudf::chunked_pack::create(view, staging_size, stream);
@@ -376,10 +364,9 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
   if (!gpu_buffer_infos.empty()) {
     duckdb::LastGPUBuffers::GetInstance().Store(std::move(gpu_buffer_infos));
   }
-  // NOTE: Don't clear retain_next here. Multiple fragments share the
-  // LastGPUBuffers singleton, and clearing after one fragment's execution
-  // causes subsequent fragments to skip GPU staging. The Rust side clears
-  // the flag via release_gpu_buffers() after the exchange forward.
+  if (should_retain) {
+    duckdb::LastGPUBuffers::GetInstance().SetRetainNext(false);
+  }
 }
 
 }  // namespace op
