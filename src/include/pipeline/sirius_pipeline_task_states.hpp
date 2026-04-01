@@ -111,8 +111,12 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
    */
   void set_reservation(std::unique_ptr<cucascade::memory::reservation> res)
   {
-    _reservation       = std::move(res);
-    _reservation_bytes = _reservation->size();
+    _reservation = std::move(res);
+    if (_reservation) {
+      _reservation_bytes = _reservation->size();
+    } else {
+      _reservation_bytes = 0;
+    }
   }
 
   [[nodiscard]] std::size_t get_reservation_bytes() const { return _reservation_bytes; }

@@ -313,6 +313,8 @@ TEST_CASE(
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+  // Mark as rescheduled so the destructor does not call mark_task_completed()
+  // (which would dereference the pipeline's null source operator).
   task->mark_as_rescheduled();
 
   // Verify: memory history should have one record with the OOM peak_bytes
@@ -370,6 +372,8 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+  // Mark as rescheduled so the destructor does not call mark_task_completed()
+  // (which would dereference the pipeline's null source operator).
   task->mark_as_rescheduled();
 
   // Verify: memory history should have one record with the OOM peak_bytes
@@ -421,6 +425,8 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize1, /*task_id=*/1);
 
   task1->execute(stream);
+  // Mark as rescheduled so the destructor does not call mark_task_completed()
+  // (which would dereference the pipeline's null source operator).
   task1->mark_as_rescheduled();
 
   // Verify: memory history should have one record with the peak_bytes
@@ -448,6 +454,8 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
   local_state2_ptr->set_reservation(std::move(task_reservation2));
 
   task2->execute(stream);
+  // Mark as rescheduled so the destructor does not call mark_task_completed()
+  // (which would dereference the pipeline's null source operator).
   task2->mark_as_rescheduled();
 
   // Verify: memory history should have two records with the peak_bytes, and verify that
@@ -533,6 +541,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/1);
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    // Mark as rescheduled so the destructor does not call mark_task_completed()
+    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
   }
 
@@ -552,6 +562,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/2);
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    // Mark as rescheduled so the destructor does not call mark_task_completed()
+    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
   }
 
@@ -571,6 +583,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/3);
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    // Mark as rescheduled so the destructor does not call mark_task_completed()
+    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
   }
 
@@ -590,6 +604,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/4);
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
+    // Mark as rescheduled so the destructor does not call mark_task_completed()
+    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
   }
 

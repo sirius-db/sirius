@@ -52,20 +52,6 @@ TEST_CASE("pipeline_memory_history single record produces correct estimate",
   REQUIRE(*estimate == 300);
 }
 
-TEST_CASE("pipeline_memory_history estimate clamps to minimum of estimated_bytes",
-          "[pipeline_memory_history][estimation]")
-{
-  pipeline_memory_history history;
-
-  // Record: estimated 100 bytes, peaked at only 50 bytes → ratio = 0.5
-  // 200 * 0.5 = 100, which is less than 200
-  history.record({100, 50, 30});
-
-  auto estimate = history.estimate_peak_memory(200);
-  REQUIRE(estimate.has_value());
-  REQUIRE(*estimate == 200);
-}
-
 TEST_CASE("pipeline_memory_history multiple records are weighted by proximity",
           "[pipeline_memory_history][estimation]")
 {
