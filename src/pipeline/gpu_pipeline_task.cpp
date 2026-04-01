@@ -469,8 +469,12 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   if (output_data) {
     auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
     // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
-    // operators.
-    peak_bytes -= local_state._bytes_to_materialize_input;
+    // operators. Clamp at zero to avoid size_t underflow when estimates exceed the observed peak.
+    if (peak_bytes > local_state._bytes_to_materialize_input) {
+      peak_bytes -= local_state._bytes_to_materialize_input;
+    } else {
+      peak_bytes = 0;
+    }
     std::size_t output_bytes = 0;
     for (const auto& batch : output_data->get_data_batches()) {
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
