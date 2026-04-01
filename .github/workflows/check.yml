@@ -49,13 +49,21 @@ jobs:
         build-type:
           - release
           - debug
+        cudf-channel:
+          - stable
         exclude:
           - compiler: gcc
             build-type: debug
           - compiler: clang
             build-type: release
+        include:
+          - arch: arm64
+            compiler: gcc
+            build-type: release
+            cudf-channel: nightly
       fail-fast: false
     runs-on: ${{ format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
+    continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -65,10 +73,11 @@ jobs:
         with:
           cache: false
           pixi-version: v0.65.0
-          activate-environment: true
+          environments: ${{ case(matrix.cudf-channel == 'nightly', 'nightly-runner', 'default') }}
+          activate-environment: ${{ matrix.cudf-channel != 'nightly' }}
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      - run: make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+      - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
         env:
           CUDAARCHS: "100"
