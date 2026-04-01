@@ -264,7 +264,18 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, source.get()};
   }
 
-  // nothing to do
+  // nothing to do — log port states for debugging pipeline hangs
+  {
+    std::string port_info;
+    for (auto& p : _ports_list) {
+      auto barrier = (p->type == MemoryBarrierType::FULL) ? "FULL" :
+                     (p->type == MemoryBarrierType::PARTIAL) ? "PART" : "PIPE";
+      bool src_fin = p->src_pipeline ? p->src_pipeline->is_pipeline_finished() : true;
+      port_info += std::format("[{} repo={} src_fin={}] ", barrier, p->repo->total_size(), src_fin);
+    }
+    SIRIUS_LOG_DEBUG("[get_next_task_hint] op {} (id={}) → nullopt: {}",
+                    get_name(), get_operator_id(), port_info);
+  }
   return std::nullopt;
 }
 

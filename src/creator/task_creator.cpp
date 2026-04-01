@@ -228,12 +228,6 @@ void task_creator::manager_loop()
 
     if (node == nullptr) {
       // Path B: Zero-data pipeline detection.
-      // If the original consumer's pipeline has all upstream finished and
-      // empty ports, and no tasks were ever created, this pipeline will
-      // never produce any GPU tasks. Mark it finished and fire on_finished
-      // to propagate completion to further downstream pipelines.
-      // NOTE: Skip RESULT_COLLECTOR — firing on_finished from the task_creator
-      // triggers query teardown while this thread still holds pipeline references.
       auto zd_pipeline = explicit_pipeline
         ? explicit_pipeline
         : (original_node ? original_node->get_pipeline() : nullptr);
@@ -241,9 +235,12 @@ void task_creator::manager_loop()
         auto first = zd_pipeline->get_source();
         auto sink  = zd_pipeline->get_sink();
         bool is_rc = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
-        if (!is_rc && first && first->is_source_pipeline_finished()
-            && first->all_ports_empty()
-            && !zd_pipeline->has_created_tasks()) {
+        bool src_done = first && first->is_source_pipeline_finished();
+        bool ports_empty = first && first->all_ports_empty();
+        bool no_tasks = !zd_pipeline->has_created_tasks();
+        SIRIUS_LOG_DEBUG("[task_creator] pipeline #{} nullptr: src_done={} ports_empty={} no_tasks={} is_rc={}",
+                        zd_pipeline->get_pipeline_id(), src_done, ports_empty, no_tasks, is_rc);
+        if (!is_rc && src_done && ports_empty && no_tasks) {
           // Atomically finalize — prevents B/B race from concurrent threads.
           bool exp_fin = false;
           if (zd_pipeline->finalized.compare_exchange_strong(exp_fin, true)) {

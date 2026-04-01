@@ -259,17 +259,27 @@ void gpu_pipeline_executor::manager_loop()
       // Result-collector uses the query_complete path below (avoids teardown race).
       // CAS on on_finished_fired ensures exactly-once semantics.
       bool notified_via_on_finished = false;
-      if (pipeline && pipeline->is_pipeline_finished()) {
-        auto src  = pipeline->get_source();
-        auto sink = pipeline->get_sink();
-        bool is_scan = src && (src->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                               src->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN);
-        bool is_rc   = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
-        if (!is_scan && !is_rc) {
-          bool expected = false;
-          if (pipeline->on_finished_fired.compare_exchange_strong(expected, true)) {
-            if (pipeline->on_finished) { pipeline->on_finished(); }
-            notified_via_on_finished = true;
+      if (pipeline) {
+        bool finished = pipeline->is_pipeline_finished();
+        SIRIUS_LOG_DEBUG("[gpu_exec] pipeline #{} task done, finished={}",
+                        pipeline->get_pipeline_id(), finished);
+        if (finished) {
+          auto src  = pipeline->get_source();
+          auto sink = pipeline->get_sink();
+          bool is_scan = src && (src->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
+                                 src->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN);
+          bool is_rc   = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
+          if (!is_scan && !is_rc) {
+            bool expected = false;
+            if (pipeline->on_finished_fired.compare_exchange_strong(expected, true)) {
+              SIRIUS_LOG_INFO("[gpu_exec] pipeline #{} on_finished firing (generic)",
+                              pipeline->get_pipeline_id());
+              if (pipeline->on_finished) { pipeline->on_finished(); }
+              notified_via_on_finished = true;
+            }
+          } else if (is_rc) {
+            SIRIUS_LOG_INFO("[gpu_exec] pipeline #{} finished (RESULT_COLLECTOR)",
+                            pipeline->get_pipeline_id());
           }
         }
       }

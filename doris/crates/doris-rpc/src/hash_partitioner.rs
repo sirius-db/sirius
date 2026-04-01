@@ -97,7 +97,7 @@ pub fn resolve_partition_columns(
     let mut col_indices = Vec::with_capacity(partition_exprs.len());
     let mut doris_types = Vec::with_capacity(partition_exprs.len());
 
-    for expr in partition_exprs {
+    for (expr_ordinal, expr) in partition_exprs.iter().enumerate() {
         let first_node = expr
             .nodes
             .first()
@@ -122,10 +122,12 @@ pub fn resolve_partition_columns(
         // Resolve column index: try by name first, fall back to column_pos.
         // Computed expression slots (e.g., extract(year from col)) have empty
         // col_name, so name-based lookup fails. Use column_pos as fallback.
+        // If column_pos is negative (-1 = unset), use the expression's ordinal.
+        let pos_fallback = if *col_pos >= 0 { *col_pos as usize } else { expr_ordinal };
         let col_idx = if col_name.is_empty() {
-            *col_pos as usize
+            pos_fallback
         } else {
-            batch_schema.index_of(col_name).unwrap_or(*col_pos as usize)
+            batch_schema.index_of(col_name).unwrap_or(pos_fallback)
         };
 
         // Extract Doris primitive type from the expression's type descriptor.
