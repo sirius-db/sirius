@@ -25,6 +25,18 @@ pub mod scan_translator;
 mod test_helpers;
 pub mod type_mapper;
 
+/// Deduplicate column names by appending `_N` suffixes for duplicates.
+/// Self-joins (e.g., `nation n1, nation n2`) produce duplicate column names.
+/// Substrait plans use column indices, so names just need to be unique.
+fn dedup_column_names(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    names.into_iter().map(|name| {
+        let count = seen.entry(name.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 { name } else { format!("{}_{}", name, *count - 1) }
+    }).collect()
+}
+
 /// Substrait extension URIs for standard function sets.
 pub const URI_COMPARISON: &str =
     "https://github.com/substrait-io/substrait/blob/main/extensions/functions_comparison.yaml";
@@ -576,9 +588,9 @@ pub fn translate_fragment(
     // mock aliases ("expr_0", "expr_1"...) that break name-based matching.
     let output_column_indices: Option<Vec<usize>> = None;
     let root_names = if !rel_names.is_empty() {
-        rel_names.clone()
+        dedup_column_names(rel_names.clone())
     } else {
-        output_names.clone()
+        dedup_column_names(output_names.clone())
     };
     let result_output_names = output_names;
 
