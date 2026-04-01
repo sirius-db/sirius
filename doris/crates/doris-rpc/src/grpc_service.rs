@@ -2254,7 +2254,32 @@ impl PBackendService for PBackendServiceHandler {
 
                     match exec_result {
                         Ok(Ok(location)) => {
-                            if let Some(exch_info) = exchange_dests {
+                            if let Some(mut exch_info) = exchange_dests {
+                                // The FE's destinations list may only include REMOTE BEs.
+                                // In Doris's standard model, local delivery is handled by the
+                                // internal pipeline. In our model, we need to explicitly include
+                                // the local BE as a destination for hash-partitioned exchanges
+                                // so the local exchange buffer receives data from this sender.
+                                let has_local = exch_info.destinations.iter().any(|d| d.brpc_addr == local_brpc_addr);
+                                if !has_local {
+                                    let num_senders = get_num_senders(&params, exch_info.dest_node_id);
+                                    if num_senders > 1 || !exch_info.destinations.is_empty() {
+                                        info!(
+                                            dest_node_id = exch_info.dest_node_id,
+                                            existing_dests = exch_info.destinations.len(),
+                                            "adding local BE as exchange destination (FE only listed remote BEs)"
+                                        );
+                                        exch_info.destinations.push(crate::exchange_sender::ExchangeDest {
+                                            brpc_addr: local_brpc_addr.clone(),
+                                            finst_id: (0, 0), // local, not used for bRPC
+                                        });
+                                        // Update partition strategy's num_destinations if hash-partitioned.
+                                        if let crate::hash_partitioner::PartitionStrategy::Hash { ref mut num_destinations, .. } = exch_info.partition {
+                                            *num_destinations = exch_info.destinations.len();
+                                        }
+                                    }
+                                }
+
                                 let query_id = (params.query_id.hi, params.query_id.lo);
                                 if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
                                     nixl_agent.as_ref(),
@@ -2505,7 +2530,19 @@ impl PBackendService for PBackendServiceHandler {
 
                     match exec_result {
                         Ok(Ok(location)) => {
-                            if let Some(exch_info) = exchange_dests {
+                            if let Some(mut exch_info) = exchange_dests {
+                                // Add local BE as destination if missing (same fix as exchange receiver path).
+                                let has_local = exch_info.destinations.iter().any(|d| d.brpc_addr == local_brpc_addr);
+                                if !has_local && !exch_info.destinations.is_empty() {
+                                    exch_info.destinations.push(crate::exchange_sender::ExchangeDest {
+                                        brpc_addr: local_brpc_addr.clone(),
+                                        finst_id: (0, 0),
+                                    });
+                                    if let crate::hash_partitioner::PartitionStrategy::Hash { ref mut num_destinations, .. } = exch_info.partition {
+                                        *num_destinations = exch_info.destinations.len();
+                                    }
+                                }
+
                                 let query_id = (params.query_id.hi, params.query_id.lo);
                                 let sender_id = params.local_params.as_ref()
                                     .and_then(|lp| lp.first())
