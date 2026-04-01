@@ -267,9 +267,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
     auto result      = execute(expr, execution_mode::MATERIALIZE);
 
     if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
-      // BOUND_REF: pass column through without type check (same as
-      // Execute(GPUIntermediateRelation)). The column is the actual input column; no cast is valid
-      // for string/non-fixed-width.
+      // BOUND_REF: pass column through without type check
       _output_columns.push_back(
         std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
     } else {
@@ -280,14 +278,15 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
       auto const cudf_return_type = GetCudfType(expr.return_type);
       std::unique_ptr<cudf::column> result_column;
       if (result.is_scalar()) {
-        // i.e., BOUND_CONSTANT: we need to materialize the scalar into a column.
-        // KEVIN: I don't know if this code path is ever actually executed.
         result_column =
           cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr);
+      } else if (result.is_column_view()) {
+        result_column = std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
       } else {
         result_column = result.get_column();
       }
       if (result_column->type().id() != cudf_return_type.id()) {
+        // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
           result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);
         } else {

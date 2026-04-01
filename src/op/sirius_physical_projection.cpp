@@ -41,7 +41,10 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
   // duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
   sirius::experimental::gpu_expression_executor gpu_expression_executor(
-    select_list, sirius::experimental::expression_executor_strategy::MATERIALIZE);
+    select_list,
+    sirius::experimental::expression_executor_strategy::MATERIALIZE,
+    cudf::get_current_device_resource_ref(),
+    stream);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

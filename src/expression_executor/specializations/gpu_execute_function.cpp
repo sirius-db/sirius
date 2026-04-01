@@ -76,8 +76,10 @@
 #define LENGTH_FUNC_STR         "length"
 #define REGEXP_REPLACE_FUNC_STR "regexp_replace"
 #define ERROR_FUNC_STR          "error"
+#define ROW_FUNC_STR            "row"
+#define STRUCT_PACK_FUNC_STR    "struct_pack"
 
-#define SPLIT_DELIMITER "%"
+#define SPLIT_DELIMITER "%"  // These are not used in new expression executor
 #define WARP_SIZE       32
 
 namespace sirius::experimental {
@@ -386,7 +388,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   //----------Struct Functions----------//
   // row() and struct_pack() both construct a struct column from their child expressions.
   // row() is used by DuckDB for tuple constructors like (col1, col2).
-  if (func_string == "row" || func_string == "struct_pack") {
+  if (func_string == ROW_FUNC_STR || func_string == STRUCT_PACK_FUNC_STR) {
     D_ASSERT(!expr.children.empty());
     std::vector<std::unique_ptr<cudf::column>> child_cols;
     for (const auto& expr : expr.children) {

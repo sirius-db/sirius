@@ -206,6 +206,18 @@ class gpu_expression_executor {
       return std::holds_alternative<std::unique_ptr<cudf::scalar>>(payload);
     }
 
+    /// @brief Returns true if the payload holds a cudf::column_view.
+    [[nodiscard]] bool is_column_view() const
+    {
+      return std::holds_alternative<cudf::column_view>(payload);
+    }
+
+    /// @brief Returns true if the payload holds an owned cudf::column.
+    [[nodiscard]] bool is_owned_column() const
+    {
+      return std::holds_alternative<std::unique_ptr<cudf::column>>(payload);
+    }
+
     /**
      * @brief Returns the AST expression reference from the payload.
      * @throws std::runtime_error if the payload does not hold an ast_result.
