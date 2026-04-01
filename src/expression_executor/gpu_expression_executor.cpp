@@ -312,7 +312,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   // Create the data representation
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(
-      std::move(std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr)),
+      std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr),
       *input_batch->get_memory_space());
 
   // Create the data batch and return

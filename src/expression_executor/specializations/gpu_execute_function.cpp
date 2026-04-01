@@ -177,8 +177,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
 
     // The start and len arguments of SUBSTRING are assumed to be constants
-    D_ASSERT(expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
-    D_ASSERT(expr.children[2]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(expr.children[1]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(expr.children[2]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
     auto const& start_expr = expr.children[1]->Cast<duckdb::BoundConstantExpression>();
     auto const& len_expr   = expr.children[2]->Cast<duckdb::BoundConstantExpression>();
 
@@ -201,7 +201,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   auto setup_string_matching = [&]() -> std::pair<execute_result, std::string> {
     // Children should be <input column, comparator scalar>
     D_ASSERT(expr.children.size() == 2);
-    D_ASSERT(expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(expr.children[1]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
 
     auto input                 = execute(*expr.children[0], execution_mode::MATERIALIZE);
     auto const& match_str_expr = expr.children[1]->Cast<duckdb::BoundConstantExpression>();
@@ -286,7 +286,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   if (func_string == DATE_TRUNC_FUNC_STR) {
     D_ASSERT(expr.children.size() == 2);
     // The first child is the frequency, which should be a constant string
-    D_ASSERT(expr.children[0]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(expr.children[0]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
     auto const& freq_expr = expr.children[0]->Cast<duckdb::BoundConstantExpression>();
     auto const& freq_str  = freq_expr.value.GetValue<std::string>();
     auto input            = execute(*expr.children[1], execution_mode::MATERIALIZE);
@@ -336,8 +336,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   if (func_string == REGEXP_REPLACE_FUNC_STR) {
     // The input should be <input column, pattern string scalar, replace string scalar>
     D_ASSERT(expr.children.size() == 3);
-    D_ASSERT(expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
-    D_ASSERT(expr.children[2]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(expr.children[1]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(expr.children[2]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
 
     auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
     D_ASSERT(!input.is_scalar());

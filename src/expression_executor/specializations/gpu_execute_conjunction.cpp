@@ -62,7 +62,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpressi
 
     if (mode == execution_mode::AST) {
       //===----------1: AST Mode----------===//
-      return std::move(output);
+      return output;
     }
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     // JIT compile the AST Subtree
@@ -104,7 +104,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpressi
                                                 _mr);
     output             = execute_result(std::move(output_column));
   }
-  return std::move(output);
+  return output;
 }
 
 }  // namespace sirius::experimental

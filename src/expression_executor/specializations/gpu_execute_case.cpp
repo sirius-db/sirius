@@ -109,7 +109,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
     }
     current_result = execute_result(std::move(output));
   }
-  return std::move(current_result);
+  return current_result;
 }
 }  // namespace sirius::experimental
 
@@ -126,7 +126,7 @@ std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
     result->AddChild(*case_check.then_expr);
   }
   result->AddChild(*expr.else_expr);
-  return std::move(result);
+  return result;
 }
 
 /**
@@ -185,7 +185,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpr
                                         execution_stream,
                                         resource_ref);
   }
-  return std::move(current_output);
+  return current_output;
 }
 
 }  // namespace sirius

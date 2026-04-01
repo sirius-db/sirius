@@ -150,7 +150,7 @@ std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
   auto result = std::make_unique<GpuExpressionState>(expr, root);
   result->AddChild(*expr.left);
   result->AddChild(*expr.right);
-  return std::move(result);
+  return result;
 }
 
 // Helper object to reduce bloat in Execute()

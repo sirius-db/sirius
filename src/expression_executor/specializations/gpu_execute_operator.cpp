@@ -162,7 +162,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
                          {output.get_temp_column_indices(), comparator.get_temp_column_indices()}));
           }
 
-          if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return std::move(output); }
+          if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return output; }
           auto not_expr =
             _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
           return execute_result(ast_result(
@@ -213,7 +213,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
 
     if (mode == execution_mode::AST) {
       //===----------1: AST Mode----------===//
-      return std::move(output);
+      return output;
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
@@ -312,7 +312,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
         output                          = execute_result(std::move(combined_comparison_column));
       }
 
-      if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return std::move(output); }
+      if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return output; }
       auto not_comparison_column =
         cudf::unary_operation(output.get_column_view(), cudf::unary_operator::NOT, _stream, _mr);
       return execute_result(std::move(not_comparison_column));
