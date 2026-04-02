@@ -147,17 +147,15 @@ TEST_CASE("column property - projection preserves uniqueness for passthrough col
   con.Query("CREATE TABLE proj_table (id INTEGER PRIMARY KEY, val DOUBLE)");
   con.Query("INSERT INTO proj_table VALUES (1, 10.0), (2, 20.0)");
 
-  // This projection reorders: val first, id second
+  // Output is [val, id] — projection reorders columns from [id, val]
   auto plan = generate_sirius_plan(con, "SELECT val, id FROM proj_table");
 
   REQUIRE(plan);
-  // After projection, id should still be unique but at the new position
-  // The plan structure may vary, so check the root output
-  bool found_unique = false;
-  for (size_t i = 0; i < plan->output_column_properties.size(); i++) {
-    if (plan->output_column_properties[i].is_unique) { found_unique = true; }
-  }
-  REQUIRE(found_unique);
+  REQUIRE(plan->output_column_properties.size() == 2);
+  // val (output index 0) is not unique
+  REQUIRE_FALSE(plan->output_column_properties[0].is_unique);
+  // id (output index 1) is the PK — should be unique even after reordering
+  REQUIRE(plan->output_column_properties[1].is_unique);
 }
 
 TEST_CASE("column property - filter preserves uniqueness", "[column_property]")
@@ -168,21 +166,15 @@ TEST_CASE("column property - filter preserves uniqueness", "[column_property]")
   con.Query("CREATE TABLE t (id INTEGER PRIMARY KEY, val DOUBLE)");
   con.Query("INSERT INTO t VALUES (1, 10.0), (2, 20.0), (3, 30.0)");
 
+  // Output is [id, val] — filter should preserve uniqueness from scan
   auto plan = generate_sirius_plan(con, "SELECT id, val FROM t WHERE val > 15.0");
 
-  // Walk to find the root — it should have uniqueness on col 0 (id is PK)
   REQUIRE(plan);
-  // The plan should propagate uniqueness through filter
-  // Find the outermost operator and check its output properties
-  bool found_unique = false;
-  auto& props       = plan->output_column_properties;
-  for (size_t i = 0; i < props.size(); i++) {
-    if (props[i].is_unique) {
-      found_unique = true;
-      break;
-    }
-  }
-  REQUIRE(found_unique);
+  REQUIRE(plan->output_column_properties.size() == 2);
+  // id (output index 0) is the PK — should remain unique through filter
+  REQUIRE(plan->output_column_properties[0].is_unique);
+  // val (output index 1) is not unique
+  REQUIRE_FALSE(plan->output_column_properties[1].is_unique);
 }
 
 TEST_CASE("column property - aggregate marks group keys unique", "[column_property]")
