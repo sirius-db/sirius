@@ -6,6 +6,6 @@ edition = "2021"
 [dependencies]
 duckdb.workspace = true
 # Match duckdb's arrow version for IPC serialization (workspace uses 54).
-arrow = { version = "56", features = ["ipc"] }
+arrow = { version = "58", features = ["ipc"] }
 thiserror.workspace = true
 tracing.workspace = true
