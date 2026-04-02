@@ -298,21 +298,30 @@ class GPUIntermediateRelation {
           SIRIUS_LOG_INFO("[finalize_pending_views]   col {} STRING data=0x{:x} rows={} child_addr=0x{:x} child_rows={} last_offset={}",
                           c, data_addr, col.size(), child_addr, child.size(), last_offset);
         } else {
-          SIRIUS_LOG_INFO("[finalize_pending_views]   col {} type={} data=0x{:x} rows={} null_cnt={} children={}",
+          SIRIUS_LOG_INFO("[finalize_pending_views]   col {} type={} data=0x{:x} rows={} null_cnt={} children={} offset={}",
                           c, static_cast<int>(col.type().id()), data_addr,
-                          col.size(), col.null_count(), col.num_children());
+                          col.size(), col.null_count(), col.num_children(), col.offset());
         }
       }
     }
     static rmm::mr::cuda_memory_resource cuda_mr;
-    // Synchronize to ensure all prior async operations (D2D copies, kernel launches)
-    // are complete before we read from those buffers.
-    auto sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-      SIRIUS_LOG_ERROR("[finalize_pending_views] cudaDeviceSynchronize failed: {} ({})",
-                       cudaGetErrorString(sync_err), static_cast<int>(sync_err));
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+
+    // Try concatenating incrementally to identify which view causes the failure.
+    if (pending_views.size() > 1) {
+      for (size_t i = 0; i < pending_views.size(); i++) {
+        try {
+          std::vector<cudf::table_view> single = {pending_views[i]};
+          auto test = cudf::concatenate(single, cudf::get_default_stream(), &cuda_mr);
+          SIRIUS_LOG_INFO("[finalize_pending_views] single view {} OK: {} rows", i, test->num_rows());
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("[finalize_pending_views] single view {} FAILED: {}", i, e.what());
+        }
+        cudaGetLastError(); // Clear error for next attempt
+      }
     }
-    cudaGetLastError(); // Clear any sticky CUDA error from prior operations.
+
     auto merged = cudf::concatenate(pending_views, cudf::get_default_stream(), &cuda_mr);
     packed_cudf_table = merged.release();
     pending_views.clear();
