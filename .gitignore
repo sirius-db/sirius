@@ -29,6 +29,7 @@ cufile.log
 .pixi/*
 !.pixi/config.toml
 compile_commands.json
+.cache
 
 # Zed editor settings
 .zed
