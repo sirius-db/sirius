@@ -1794,6 +1794,15 @@ impl PBackendService for PBackendServiceHandler {
                                         }
                                     }
                                 }
+                                // Finalize THIS table's pending views NOW while staging data
+                                // is still valid. packed_owned (with RECV staging leases) is
+                                // alive in this scope. SEND staging hasn't been reused yet.
+                                // IMPORTANT: finalize only THIS table, not all — other tables'
+                                // leases may have been dropped by previous loop iterations.
+                                if let Err(e) = eng.finalize_exchange_table(&reg_table) {
+                                    tracing::warn!(error = %e, table = %reg_table,
+                                                  "finalize_exchange_table failed during registration");
+                                }
                                 eng.get_table_columns(&reg_table)
                                     .map_err(|e| sirius_ffi::EngineError::ExecFailed(e.to_string()))
                             }).await;

@@ -830,6 +830,19 @@ impl SiriusEngine {
         Ok(())
     }
 
+    /// Finalize a single exchange table's pending views.
+    /// Must be called while the packed buffer data is still valid (leases alive).
+    pub fn finalize_exchange_table(&self, table_name: &str) -> Result<(), EngineError> {
+        let sql = format!("SELECT * FROM sirius_finalize_exchange_table('{}')", table_name);
+        let mut stmt = self.conn
+            .prepare(&sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .collect();
+        Ok(())
+    }
+
     /// Tell the C++ result collector where the nixl staging buffer is.
     ///
     /// After this, GPU results will be packed directly into the staging buffer

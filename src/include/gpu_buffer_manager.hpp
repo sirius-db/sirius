@@ -166,6 +166,7 @@ class GPUBufferManager {
   /// Must be called BEFORE the staging buffer is reused (e.g. before
   /// BeginSession() on a new fragment that packs into the same staging).
   void finalizeExchangeTables();
+  void finalizeExchangeTable(const string& table_name);
 
  private:
   // Private constructor

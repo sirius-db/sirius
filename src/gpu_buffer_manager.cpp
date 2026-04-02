@@ -642,17 +642,26 @@ void GPUBufferManager::registerExternalTable(
 void GPUBufferManager::finalizeExchangeTables() {
   for (auto& [name, rel] : tables) {
     if (name.find("__EXCH_") != std::string::npos && rel && !rel->pending_views.empty()) {
-      SIRIUS_LOG_INFO("[finalizeExchangeTables] finalizing '{}': {} pending views, {} total rows",
-                      name, rel->pending_views.size(), rel->pending_total_rows);
-      try {
-        rel->finalize_pending_views();
-        SIRIUS_LOG_INFO("[finalizeExchangeTables] '{}' finalized: {} cols, {} rows",
-                        name, rel->packed_cudf_table->num_columns(),
-                        rel->packed_cudf_table->num_rows());
-      } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR("[finalizeExchangeTables] failed for '{}': {}", name, e.what());
-      }
+      finalizeExchangeTable(name);
     }
+  }
+}
+
+void GPUBufferManager::finalizeExchangeTable(const string& table_name) {
+  string up = table_name;
+  transform(up.begin(), up.end(), up.begin(), ::toupper);
+  auto it = tables.find(up);
+  if (it == tables.end() || !it->second || it->second->pending_views.empty()) return;
+
+  SIRIUS_LOG_INFO("[finalizeExchangeTable] finalizing '{}': {} pending views, {} total rows",
+                  up, it->second->pending_views.size(), it->second->pending_total_rows);
+  try {
+    it->second->finalize_pending_views();
+    SIRIUS_LOG_INFO("[finalizeExchangeTable] '{}' finalized: {} cols, {} rows",
+                    up, it->second->packed_cudf_table->num_columns(),
+                    it->second->packed_cudf_table->num_rows());
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_ERROR("[finalizeExchangeTable] failed for '{}': {}", up, e.what());
   }
 }
 

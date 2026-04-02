@@ -1867,6 +1867,35 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     catalog.CreateTableFunction(transaction, info);
   }
 
+  // sirius_finalize_exchange_table(table_name) — finalize a single exchange table.
+  {
+    struct FinalizeOneData : public TableFunctionData {
+      bool finished = false;
+      string table_name;
+    };
+    auto bind = [](ClientContext&, TableFunctionBindInput& input,
+                    vector<LogicalType>& return_types, vector<string>& names) -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::VARCHAR};
+      names = {"status"};
+      auto result = make_uniq<FinalizeOneData>();
+      result->table_name = input.inputs[0].GetValue<string>();
+      return std::move(result);
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<FinalizeOneData>();
+      if (data.finished) { output.SetCardinality(0); return; }
+      data.finished = true;
+      if (buffer_is_initialized) {
+        GPUBufferManager::GetInstance().finalizeExchangeTable(data.table_name);
+      }
+      output.SetValue(0, 0, Value("finalized"));
+      output.SetCardinality(1);
+    };
+    TableFunction f("sirius_finalize_exchange_table", {LogicalType::VARCHAR}, func, bind);
+    CreateTableFunctionInfo info(f);
+    catalog.CreateTableFunction(transaction, info);
+  }
+
   // sirius_get_packed_gpu() — returns the packed GPU buffer from cudf::pack().
   // Returns: addr (BIGINT), size (BIGINT), metadata (BLOB).
   struct GetPackedGPUData : public TableFunctionData { bool finished = false; };

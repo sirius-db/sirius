@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/common/types.hpp"
 #include "helper/common.h"
+#include "log/logging.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/table/table.hpp>
@@ -276,6 +277,19 @@ class GPUIntermediateRelation {
   /// cudf::unpack. cudf::concatenate handles all column types correctly.
   void finalize_pending_views() {
     if (pending_views.empty()) return;
+    // Log details about each pending view for debugging.
+    for (size_t v = 0; v < pending_views.size(); v++) {
+      auto& pv = pending_views[v];
+      SIRIUS_LOG_INFO("[finalize_pending_views] view {}/{}: {} cols, {} rows",
+                      v, pending_views.size(), pv.num_columns(), pv.num_rows());
+      for (cudf::size_type c = 0; c < pv.num_columns() && c < 3; c++) {
+        auto col = pv.column(c);
+        auto data_addr = reinterpret_cast<uintptr_t>(col.head<uint8_t>());
+        SIRIUS_LOG_INFO("[finalize_pending_views]   col {} type={} data=0x{:x} rows={} null_cnt={} children={}",
+                        c, static_cast<int>(col.type().id()), data_addr,
+                        col.size(), col.null_count(), col.num_children());
+      }
+    }
     static rmm::mr::cuda_memory_resource cuda_mr;
     cudaGetLastError(); // Clear any sticky CUDA error from prior operations.
     auto merged = cudf::concatenate(pending_views, cudf::get_default_stream(), &cuda_mr);

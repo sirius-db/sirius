@@ -23,6 +23,8 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -251,6 +253,114 @@ TEST_CASE("concatenate packed tables with cuda_mr", "[exchange]") {
   auto merged = cudf::concatenate(views, stream, &cuda_mr);
   REQUIRE(merged->num_rows() == 4700);
   REQUIRE(merged->num_columns() == 16);
+}
+
+TEST_CASE("pack_unpack DECIMAL128 child columns", "[exchange]") {
+  // Investigate whether cudf::pack/unpack adds phantom children to DECIMAL128 columns.
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+
+  auto table = make_mixed_table(1000); // 3 INT32 + 6 DECIMAL128
+  auto view = table->view();
+
+  // Check original: DECIMAL128 should have 0 children
+  for (cudf::size_type c = 3; c < view.num_columns(); c++) {
+    auto col = view.column(c);
+    INFO("col " << c << " type=" << static_cast<int>(col.type().id())
+         << " children=" << col.num_children());
+    CHECK(col.num_children() == 0);
+  }
+
+  // Pack and unpack
+  auto packed = cudf::pack(view, stream, mr);
+  auto unpacked = cudf::unpack(packed.metadata->data(),
+                               static_cast<const uint8_t*>(packed.gpu_data->data()));
+
+  // Check unpacked: do DECIMAL128 columns gain phantom children?
+  bool has_phantom_children = false;
+  for (cudf::size_type c = 3; c < unpacked.num_columns(); c++) {
+    auto col = unpacked.column(c);
+    INFO("unpacked col " << c << " type=" << static_cast<int>(col.type().id())
+         << " children=" << col.num_children());
+    if (col.num_children() > 0) {
+      has_phantom_children = true;
+    }
+  }
+
+  if (has_phantom_children) {
+    WARN("DECIMAL128 columns from cudf::unpack have phantom children");
+    static rmm::mr::cuda_memory_resource cuda_mr;
+    cudaGetLastError();
+    std::vector<cudf::table_view> views = {unpacked};
+    auto result = cudf::concatenate(views, stream, &cuda_mr);
+    CHECK(result->num_rows() == 1000);
+  }
+
+  SECTION("after hash_partition") {
+    // Reproduce production path: hash_partition → pack → unpack → concatenate.
+    // hash_partition output may have different internal structure than raw columns.
+    std::vector<cudf::size_type> col_indices = {0}; // partition by first INT32 col
+    auto [partitioned, offsets] = cudf::hash_partition(
+        view, col_indices, 2, cudf::hash_id::HASH_MURMUR3,
+        cudf::DEFAULT_HASH_SEED, stream);
+
+    // Pack the first partition
+    auto start = offsets[0];
+    auto end = offsets[1];
+    if (end > start) {
+      auto slice = cudf::slice(partitioned->view(), {start, end});
+      auto part_packed = cudf::pack(slice[0], stream, mr);
+      auto part_unpacked = cudf::unpack(part_packed.metadata->data(),
+                                        static_cast<const uint8_t*>(part_packed.gpu_data->data()));
+
+      // Check for phantom children
+      for (cudf::size_type c = 3; c < part_unpacked.num_columns(); c++) {
+        auto col = part_unpacked.column(c);
+        INFO("hash_partition unpacked col " << c << " type=" << static_cast<int>(col.type().id())
+             << " children=" << col.num_children());
+        if (col.num_children() > 0) {
+          WARN("hash_partition DECIMAL128 has phantom child after pack/unpack");
+        }
+      }
+
+      // Try concatenate
+      static rmm::mr::cuda_memory_resource cuda_mr;
+      cudaGetLastError();
+      std::vector<cudf::table_view> views = {part_unpacked};
+      auto result = cudf::concatenate(views, stream, &cuda_mr);
+      CHECK(result->num_rows() == (end - start));
+    }
+  }
+}
+
+TEST_CASE("concatenate 12 packed views with INT32+DECIMAL columns", "[exchange]") {
+  // Reproduces Q3 __EXCH_..._5: 12 views from separate cudf::pack buffers,
+  // 8 cols (INT32 + DECIMAL128), ~1000 rows each. cudf::concatenate should work.
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  // Create 12 packed buffers and accumulate views
+  std::vector<cudf::packed_columns> packed_buffers;
+  std::vector<cudf::table_view> views;
+
+  for (int i = 0; i < 12; i++) {
+    auto table = make_mixed_table(800 + i * 50); // 3 INT32 + 6 DECIMAL128
+    auto packed = cudf::pack(table->view(), stream, mr);
+    auto unpacked = cudf::unpack(packed.metadata->data(),
+                                 static_cast<const uint8_t*>(packed.gpu_data->data()));
+    views.push_back(unpacked);
+    packed_buffers.push_back(std::move(packed));
+  }
+
+  REQUIRE(views.size() == 12);
+
+  // Concatenate all views
+  cudaGetLastError();
+  auto result = cudf::concatenate(views, stream, &cuda_mr);
+  REQUIRE(result->num_columns() == 9);
+  // Total rows: sum of 800+0*50, 800+1*50, ..., 800+11*50 = 12*800 + 50*(0+1+...+11) = 9600+3300=12900
+  REQUIRE(result->num_rows() == 12900);
 }
 
 TEST_CASE("pack_unpack with STRING columns", "[exchange]") {

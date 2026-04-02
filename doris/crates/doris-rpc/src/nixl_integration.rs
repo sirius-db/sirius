@@ -374,20 +374,37 @@ pub async fn send_exchange_with_nixl(
     for dest in &local_dests {
         let key = ExchangeKey { query_id, node_id };
 
-        // Broadcast packed entries: store each entry as PackedGpuExchange.
+        // Broadcast packed entries: copy from staging to owned buffer.
+        // CRITICAL: We must copy because release_gpu_buffers (called after each leaf
+        // fragment) clears completed sessions and resets staging offset. The next leaf
+        // fragment will overwrite the staging data. D2D copy is fast (~µs for KB/MB).
         if !packed_broadcast.is_empty() {
             let staging_base = buffers.first().map(|b| b.addr).unwrap_or(0);
             for entry in packed_broadcast {
                 if entry.packed_size == 0 { continue; }
-                let gpu_addr = if entry.overflow_gpu_addr != 0 {
+                let src_addr = if entry.overflow_gpu_addr != 0 {
                     entry.overflow_gpu_addr
                 } else {
                     staging_base + entry.staging_offset
                 };
+                // D2D copy to new cudaMalloc buffer (independent of staging).
+                let owned_addr = match crate::cuda_driver::cuda_alloc(entry.packed_size) {
+                    Ok(addr) => {
+                        if let Err(e) = crate::cuda_driver::cuda_memcpy_dtod(addr, src_addr, entry.packed_size) {
+                            tracing::warn!(error = %e, "self-transfer D2D copy failed, using staging addr");
+                            crate::cuda_driver::cuda_free(addr).ok();
+                            src_addr
+                        } else { addr }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "self-transfer cudaMalloc failed, using staging addr");
+                        src_addr
+                    }
+                };
                 exchange_buffer.store_packed_gpu(
                     key.clone(),
                     PackedGpuExchange {
-                        gpu_addr,
+                        gpu_addr: owned_addr,
                         gpu_size: entry.packed_size,
                         cudf_metadata: entry.metadata.clone(),
                         _staging_lease: None,
@@ -396,30 +413,43 @@ pub async fn send_exchange_with_nixl(
             }
             exchange_buffer.add_block(&key, sender_id, None, true);
             tracing::info!(dest = %dest.brpc_addr, sender_id, num_entries = packed_broadcast.len(),
-                          "self-transfer: broadcast packed GPU path complete");
+                          "self-transfer: broadcast packed GPU (D2D copied from staging)");
             continue;
         }
 
-        // Single packed GPU data: store directly.
+        // Single packed GPU data: copy from staging to owned buffer.
         if let Some(ref md) = packed_metadata {
             if let Some(buf) = buffers.first() {
+                let owned_addr = match crate::cuda_driver::cuda_alloc(buf.len) {
+                    Ok(addr) => {
+                        if let Err(e) = crate::cuda_driver::cuda_memcpy_dtod(addr, buf.addr, buf.len) {
+                            tracing::warn!(error = %e, "self-transfer D2D copy failed");
+                            crate::cuda_driver::cuda_free(addr).ok();
+                            buf.addr
+                        } else { addr }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "self-transfer cudaMalloc failed");
+                        buf.addr
+                    }
+                };
                 tracing::info!(
                     dest = %dest.brpc_addr,
-                    gpu_addr = format_args!("0x{:x}", buf.addr),
-                    gpu_size = buf.len,
-                    "self-transfer: packed GPU path (zero copies)"
+                    src = format_args!("0x{:x}", buf.addr),
+                    dst = format_args!("0x{:x}", owned_addr),
+                    size = buf.len,
+                    "self-transfer: packed GPU path (D2D copy from staging)"
                 );
                 exchange_buffer.store_packed_gpu(
                     key.clone(),
                     PackedGpuExchange {
-                        gpu_addr: buf.addr,
+                        gpu_addr: owned_addr,
                         gpu_size: buf.len,
                         cudf_metadata: md.to_vec(),
                         _staging_lease: None,
                     },
                 );
                 exchange_buffer.add_block(&key, sender_id, None, true);
-                tracing::info!(dest = %dest.brpc_addr, sender_id, "self-transfer: complete (GPU-direct)");
                 continue;
             }
         }
@@ -630,10 +660,19 @@ async fn send_hash_partitioned(
                         };
 
                         if is_local {
+                            // D2D copy from staging to owned buffer (staging may be
+                            // released/reused between leaf fragments of the same query).
+                            let owned_addr = crate::cuda_driver::cuda_alloc(p.packed_size)
+                                .and_then(|addr| {
+                                    crate::cuda_driver::cuda_memcpy_dtod(addr, part_addr, p.packed_size)
+                                        .map(|_| addr)
+                                        .map_err(|e| { crate::cuda_driver::cuda_free(addr).ok(); e })
+                                })
+                                .unwrap_or(part_addr);
                             exchange_buffer.store_packed_gpu(
                                 key.clone(),
                                 PackedGpuExchange {
-                                    gpu_addr: part_addr,
+                                    gpu_addr: owned_addr,
                                     gpu_size: p.packed_size,
                                     cudf_metadata: p.metadata.clone(),
                                     _staging_lease: None,
