@@ -18,13 +18,13 @@
 
 #include "log/logging.hpp"
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/sirius_converter_registry.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
 #include <optional>

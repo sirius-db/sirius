@@ -313,8 +313,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
   try {
-    handles_opt =
-      local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    handles_opt = local_state._input_data->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();
@@ -323,10 +322,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
     SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
                      pipeline->get_pipeline_id());
-    throw oom_reschedule_exception(std::move(local_state._input_data),
-                                   0,
-                                   std::string("OOM while preparing batches for processing: ") +
-                                     oom.what());
+    throw oom_reschedule_exception(
+      std::move(local_state._input_data),
+      0,
+      std::string("OOM while preparing batches for processing: ") + oom.what());
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
                      pipeline->get_pipeline_id(),
@@ -336,12 +335,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   if (!handles_opt) {
     // trick to retry the task
-    throw oom_reschedule_exception(std::move(local_state._input_data),
-                                   0,
-                                   "Failed to lock or prepare batches for processing");
+    throw oom_reschedule_exception(
+      std::move(local_state._input_data), 0, "Failed to lock or prepare batches for processing");
   }
-  std::vector<cucascade::data_batch_processing_handle> processing_handles =
-    std::move(*handles_opt);
+  std::vector<cucascade::data_batch_processing_handle> processing_handles = std::move(*handles_opt);
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
