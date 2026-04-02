@@ -19,7 +19,6 @@
 #include "config.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
@@ -36,6 +35,7 @@
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -43,30 +43,34 @@ namespace duckdb {
 
 namespace {
 
-static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.cfg";
+static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
 static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
 
-std::string get_config_file_path()
+/// Resolve the config file path. Search order:
+///   1. SIRIUS_CONFIG_FILE environment variable (explicit path)
+///   2. ./sirius.yaml in the current working directory
+///   3. ~/.sirius/sirius.yaml in the user's home directory
+/// Returns std::nullopt if none of the candidates exist.
+std::optional<std::string> get_config_file_path()
 {
-  std::string config_path;
+  // 1. Explicit env var — return as-is (caller checks existence)
+  const char* env = std::getenv(std::string(CONFIG_FILE_ENV_NAME).c_str());
+  if (env != nullptr) { return std::string(env); }
 
-  const char* config_path_cstr = std::getenv(std::string(CONFIG_FILE_ENV_NAME).c_str());
-  if (config_path_cstr != nullptr) {
-    config_path = std::string(config_path_cstr);
-  } else {
-    // construct default path
-    const char* home_dir = std::getenv("HOME");
-    if (home_dir == nullptr) {
-      throw std::runtime_error(
-        "HOME environment variable is not set. Skipping Sirius config file loading.");
-    }
-    config_path = std::string(home_dir) + "/" + std::string(CONFIG_FILE_DIR) + "/" +
-                  std::string(CONFIG_FILE_NAME);
+  // 2. Current working directory
+  auto cwd_path = std::filesystem::current_path() / std::string(CONFIG_FILE_NAME);
+  if (std::filesystem::exists(cwd_path)) { return cwd_path.string(); }
+
+  // 3. Home directory
+  const char* home_dir = std::getenv("HOME");
+  if (home_dir != nullptr) {
+    auto home_path =
+      std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) / std::string(CONFIG_FILE_NAME);
+    if (std::filesystem::exists(home_path)) { return home_path.string(); }
   }
 
-  // check if file exists
-  return config_path;
+  return std::nullopt;
 }
 
 }  // namespace
@@ -386,30 +390,28 @@ void SiriusContextExtensionCallback::OnExtensionLoadFail(DatabaseInstance& db,
 
 void SiriusContextExtensionCallback::read_config_file_if_exists()
 {
-  auto config_path = get_config_file_path();
-  if (!std::filesystem::exists(config_path)) {
-    spdlog::info("Sirius configuration file does not exist at path: {}. Skipping loading.",
-                 config_path);
+  // Check for explicit disable (used by benchmarks/tests that need pure CPU execution)
+  if (auto* val = std::getenv("SIRIUS_DISABLE"); val != nullptr && std::string(val) != "0") {
+    spdlog::info("Sirius disabled via SIRIUS_DISABLE environment variable.");
     return;
   }
-  config_.load_from_file(config_path);
-  spdlog::info("Loaded Sirius configuration from file: {}", config_path);
 
-  // Determine lock prefix: check if $HOME/.sirius directory exists
-  std::string lock_prefix = "/var/tmp";
-  const char* home_dir    = std::getenv("HOME");
-  if (home_dir != nullptr) {
-    std::string sirius_dir = std::string(home_dir) + "/" + std::string(CONFIG_FILE_DIR);
-    if (!std::filesystem::exists(sirius_dir)) {
-      // Create the directory if it doesn't exist
-      std::filesystem::create_directories(sirius_dir);
-      spdlog::info("Created Sirius directory: {}", sirius_dir);
-    }
-    lock_prefix = sirius_dir;
+  auto config_path = get_config_file_path();
+  if (config_path && std::filesystem::exists(*config_path)) {
+    config_.load_from_file(*config_path);
+    spdlog::info("Loaded Sirius configuration from file: {}", *config_path);
+  } else if (config_path) {
+    // SIRIUS_CONFIG_FILE was explicitly set but points to a non-existent file — error
+    auto msg = "SIRIUS_CONFIG_FILE points to non-existent file: " + *config_path;
+    spdlog::error("{}", msg);
+    throw std::runtime_error(msg);
+  } else {
+    spdlog::info("No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
+                 "~/.sirius/sirius.yaml). Using defaults.");
+    config_.apply_defaults();
   }
 
-  extension_lock_ = std::make_unique<sirius::extension_lock>("sirius", lock_prefix);
-  context_        = duckdb::make_shared_ptr<SiriusContext>();
+  context_ = duckdb::make_shared_ptr<SiriusContext>();
   context_->initialize(config_);
 }
 

@@ -30,7 +30,7 @@ option(ENABLE_STREAM_CHECK
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
-find_package(libconfig++ REQUIRED CONFIG)
+find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
@@ -72,7 +72,6 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/extension_lock.cpp
     src/fallback.cpp
     src/gpu_buffer_manager.cpp
     src/memory/defragmenter_oom_policy.cpp
@@ -247,7 +246,7 @@ set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
                                                        ON)
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA ${LIBCONFIG++_LIBRARIES}
+target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
                       absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->

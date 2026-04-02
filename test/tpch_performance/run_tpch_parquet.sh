@@ -82,10 +82,9 @@ if [ "$ENGINE" == "sirius" ]; then
     DUCKDB="$SIRIUS_DUCKDB"
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
 else
-    # Use the same binary but without Sirius config so the extension doesn't initialize.
+    # Use the same binary but disable Sirius so the extension doesn't initialize.
     DUCKDB="$SIRIUS_DUCKDB"
-    unset SIRIUS_CONFIG_FILE 2>/dev/null || true
-    export SIRIUS_CONFIG_FILE=
+    export SIRIUS_DISABLE=1
     QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 fi
 

@@ -6,71 +6,93 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 **File:** `src/include/sirius_config.hpp`
 
-The `sirius_config` class loads configuration from a `.cfg` file (libconfig++ format) or uses defaults. It provides:
+The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
 - Hardware topology (GPU count, NUMA layout)
 - Memory space configurations (GPU, Host, Disk)
 - Thread pool configs for all executor types
 - Operator parameters (batch sizes, limits)
 
-### Loading
+### Config File Resolution
+
+Sirius searches for a config file in this order:
+
+1. **`SIRIUS_CONFIG_FILE`** environment variable — explicit path
+2. **`./sirius.yaml`** — current working directory
+3. **`~/.sirius/sirius.yaml`** — user's home directory
+
+If no config file is found, Sirius initializes with built-in defaults. Set `SIRIUS_DISABLE=1` to prevent Sirius from initializing (e.g. for CPU-only benchmarks).
+
+### Byte Suffixes
+
+Any integer config value that represents bytes supports human-readable suffixes:
+
+| Suffix | Base | Example | Bytes |
+|--------|------|---------|-------|
+| `K`, `KB` | 1000 | `500K` | 500,000 |
+| `Ki`, `KiB` | 1024 | `500Ki` | 512,000 |
+| `M`, `MB` | 1000² | `512M` | 512,000,000 |
+| `Mi`, `MiB` | 1024² | `512Mi` | 536,870,912 |
+| `G`, `GB` | 1000³ | `8G` | 8,000,000,000 |
+| `Gi`, `GiB` | 1024³ | `8Gi` | 8,589,934,592 |
+| `T`, `TB` | 1000⁴ | `1T` | 1,000,000,000,000 |
+| `Ti`, `TiB` | 1024⁴ | `1Ti` | 1,099,511,627,776 |
+
+Fractional values are supported (e.g. `1.5Gi`). Follows the Kubernetes/systemd convention.
+
+```yaml
+sirius:
+  memory:
+    host:
+      capacity_bytes: 64Gi       # 68,719,476,736 bytes
+      block_size: 1Mi            # 1,048,576 bytes
+  operator_params:
+    scan_task_batch_size: 512Mi  # 536,870,912 bytes
+```
+
+### Loading (C++ API)
 
 ```cpp
 sirius_config config;
-config.load_from_file("/path/to/config.cfg");  // Optional
+config.load_from_file("/path/to/config.yaml");  // Optional
 ```
-
-If no config file is provided, all parameters use defaults.
 
 ### Example Config File
 
-```cfg
-sirius = {
-  topology = {
-    num_gpus = 1;
-  };
-  memory = {
-    gpu = {
-      usage_limit_fraction = 0.9;
-      reservation_limit_fraction = 1.0;
-      downgrade_trigger_fraction = 0.8;
-      downgrade_stop_fraction = 0.6;
-    };
-    host = {
-      capacity_bytes = 471200000000;
-      initial_number_pools = 785;
-      pool_size = 512;
-      block_size = 1048576;
-    };
-  };
-  executor = {
-    pipeline = {
-      num_threads = 4;
-      thread_name_prefix = "sirius_pipeline_executor";
-    };
-    downgrade = {
-      num_threads = 1;
-      thread_name_prefix = "sirius_downgrade_executor";
-    };
-    duckdb_scan = {
-      num_threads = 4;
-      thread_name_prefix = "sirius_scan_executor";
-      cache = true;
-      cache_decoded_table = true;
-      cache_in_gpu = false;
-    };
-    task_creator = {
-      num_threads = 2;
-    };
-  };
-  operator_params = {
-    scan_task_batch_size = 5368709120;     // 5 GB
-    default_scan_task_varchar_size = 256;
-    max_sort_partition_bytes = 0;          // 0 = auto (33% GPU memory)
-    hash_partition_bytes = 5368709120;     // 5 GB
-    concat_batch_bytes = 5368709120;       // 5 GB
-  };
-};
+```yaml
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.6
+    host:
+      capacity_bytes: 471200000000
+      initial_number_pools: 785
+      pool_size: 512
+      block_size: 1048576
+  executor:
+    pipeline:
+      num_threads: 4
+      thread_name_prefix: "sirius_pipeline_executor"
+    downgrade:
+      num_threads: 1
+      thread_name_prefix: "sirius_downgrade_executor"
+    duckdb_scan:
+      num_threads: 4
+      thread_name_prefix: "sirius_scan_executor"
+      cache: "parquet"
+    task_creator:
+      num_threads: 2
+  operator_params:
+    scan_task_batch_size: 5368709120     # 5 GB
+    default_scan_task_varchar_size: 256
+    max_sort_partition_bytes: 0          # 0 = auto (33% GPU memory)
+    hash_partition_bytes: 5368709120     # 5 GB
+    concat_batch_bytes: 5368709120       # 5 GB
 ```
 
 ## Operator Parameters

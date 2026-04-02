@@ -20,8 +20,6 @@
 #include <cucascade/memory/common.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
-#include <libconfig.h++>
-
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>
@@ -42,11 +40,15 @@ struct finally {
 TEST_CASE("Sirius configuration loading from file with configurator",
           "[sirius][context][isolated_context]")
 {
-  finally cleanup_env{[]() { unsetenv("SIRIUS_CONFIG_FILE"); }};
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
 
   std::source_location loc = std::source_location::current();
-  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" / "configurator.cfg";
+  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" / "configurator.yaml";
 
+  unsetenv("SIRIUS_DISABLE");
   setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
 
   duckdb::DuckDB db(nullptr);
@@ -69,11 +71,15 @@ TEST_CASE("Sirius configuration loading from file with configurator",
 TEST_CASE("Sirius configuration loading from file with spaces",
           "[sirius][context][isolated_context]")
 {
-  finally cleanup_env{[]() { unsetenv("SIRIUS_CONFIG_FILE"); }};
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
 
   std::source_location loc = std::source_location::current();
-  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" / "spaces.cfg";
+  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" / "spaces.yaml";
 
+  unsetenv("SIRIUS_DISABLE");
   setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
 
   duckdb::DuckDB db(nullptr);

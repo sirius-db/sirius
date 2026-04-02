@@ -40,7 +40,7 @@ using namespace cucascade::memory;
 
 static std::filesystem::path get_test_config_path()
 {
-  return std::filesystem::path(__FILE__).parent_path() / "memory.cfg";
+  return std::filesystem::path(__FILE__).parent_path() / "memory.yaml";
 }
 
 static memory_space* get_host_space(duckdb::SiriusContext& sirius_ctx)

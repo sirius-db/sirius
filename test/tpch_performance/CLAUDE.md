@@ -6,7 +6,7 @@ This directory contains benchmarking, profiling, and performance testing tools f
 
 - Sirius must be built: `pixi run make -j12` (from project root)
 - Binary: `build/release/duckdb` with Sirius extension at `build/release/extension/sirius/sirius.duckdb_extension`
-- Sirius config: `test/cpp/integration/integration.cfg` (set `SIRIUS_CONFIG_FILE` env var)
+- Sirius config: `test/cpp/integration/integration.yaml` (set `SIRIUS_CONFIG_FILE` env var)
 - Parquet data must exist in `test_datasets/tpch_parquet_sf<N>/` (auto-generated if missing)
 
 ## Generating Test Data
@@ -62,7 +62,7 @@ All commands run from the **project root** directory.
 `benchmark_and_validate.sh` runs all 22 TPC-H queries for both Sirius and DuckDB, compares results for correctness, and produces a timestamped run directory with comprehensive output.
 
 ```bash
-export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.cfg
+export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
 # Example:
@@ -72,7 +72,7 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.cfg
 Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 - `run_info.txt` — git branch/revision, tree clean/dirty, build freshness, hostname, memory, CPUs, GPUs, filesystem read benchmark
 - `run_info.patch` — full git diff when tree is dirty
-- `sirius_config.cfg` — copy of the Sirius config used
+- `sirius_config.yaml` — copy of the Sirius config used
 - `sirius/` and `duckdb/` — per-engine logs, per-query results and timings
 - `validation.csv` — per-query match/error status
 - `comparison.txt` — cold/warm timing table with speedup ratios
@@ -83,7 +83,7 @@ Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 `run_tpch_parquet.sh` is the core runner used by all benchmarks. It runs all queries in a single DuckDB session with 2 iterations each (cold + warm, back-to-back) and auto-generates missing datasets.
 
 ```bash
-export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.cfg
+export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 # Run Sirius on queries 1-22
 ./test/tpch_performance/run_tpch_parquet.sh sirius 100 $(seq 1 22)
@@ -109,7 +109,7 @@ Environment variables:
 
 ### Thread configuration sweep
 
-Runs Sirius-only across multiple thread configurations (pipeline, scan, task_creator threads) to find optimal settings. Modifies `integration.cfg` during the run and restores baseline when done.
+Runs Sirius-only across multiple thread configurations (pipeline, scan, task_creator threads) to find optimal settings. Modifies `integration.yaml` during the run and restores baseline when done.
 
 ```bash
 bash test/tpch_performance/sweep_threads.sh
@@ -134,7 +134,7 @@ A suite of scripts for GPU performance profiling and analysis using NVIDIA Nsigh
 `profile_tpch_nsys.sh` runs each query in its own DuckDB process wrapped by nsys, producing per-query `.nsys-rep` and `.sqlite` files.
 
 ```bash
-export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.cfg
+export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 # Profile all queries at SF300 with 2M row groups
 ./test/tpch_performance/profile_tpch_nsys.sh 300_rg2m
@@ -224,7 +224,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 
 ## Sirius Configuration
 
-The Sirius config file (`test/cpp/integration/integration.cfg`) controls:
+The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - **GPU memory**: `usage_limit_fraction`, `reservation_limit_fraction`
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`

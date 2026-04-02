@@ -32,9 +32,9 @@ To change configs use `scripts/patch_config.py`.
 
 ```bash
 cd scripts
-pixi run python patch_config.py sirius.cfg \\
+pixi run python patch_config.py sirius.yaml \\
         --opt sirius.executor.pipeline.num_threads=4 \\
-        --opt sirius.executor.duckdb_scan.cache=true \\
+        --opt sirius.executor.duckdb_scan.cache=parquet \\
         --opt sirius.operator_params.scan_task_batch_size=536870912
 ```
 
@@ -58,5 +58,5 @@ Arguments:
 Create optimization report with the following information:
 - Baseline configuration and performance metrics
 - Each configuration tested, the parameters changed, and the resulting performance metrics
-- Optimal configuration in `optimal_sirius.cfg` file and its performance metrics report in `optimal_config_report.txt`
+- Optimal configuration in `optimal_sirius.yaml` file and its performance metrics report in `optimal_config_report.txt`
 - Insights and recommendations for future tuning efforts based on the observed performance trends.

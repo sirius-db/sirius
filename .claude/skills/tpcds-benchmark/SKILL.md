@@ -134,13 +134,13 @@ Super Sirius uses `gpu_execution`. **Requires `SIRIUS_CONFIG_FILE` to be set.**
 
 **All 99 queries:**
 ```bash
-export SIRIUS_CONFIG_FILE=/path/to/config.cfg
+export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 bash test/tpcds_performance/run_tpcds_super.sh <parquet_dir> [options]
 ```
 
 **GPU-only queries (15 queries):**
 ```bash
-export SIRIUS_CONFIG_FILE=/path/to/config.cfg
+export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 bash test/tpcds_performance/run_tpcds_super_gpu.sh <parquet_dir> [options]
 ```
 
@@ -151,15 +151,15 @@ Options:
 Examples:
 ```bash
 # Run all queries
-export SIRIUS_CONFIG_FILE=~/sirius_config.cfg
+export SIRIUS_CONFIG_FILE=~/sirius_config.yaml
 bash test/tpcds_performance/run_tpcds_super.sh test_datasets/tpcds_parquet_sf1
 
 # Run GPU-only queries
-export SIRIUS_CONFIG_FILE=~/sirius_config.cfg
+export SIRIUS_CONFIG_FILE=~/sirius_config.yaml
 bash test/tpcds_performance/run_tpcds_super_gpu.sh test_datasets/tpcds_parquet_sf10
 
 # Run specific queries with custom output
-export SIRIUS_CONFIG_FILE=~/sirius_config.cfg
+export SIRIUS_CONFIG_FILE=~/sirius_config.yaml
 bash test/tpcds_performance/run_tpcds_super.sh /data/tpcds_parquet_sf100 --queries 3 7 --output-dir /results/super_sf100
 ```
 
@@ -205,7 +205,7 @@ query,run1_time,run1_status,run2_time,run2_status
 ```bash
 # Example: compare Super Sirius vs DuckDB CPU
 # 1. Run both benchmarks (same queries, same data)
-export SIRIUS_CONFIG_FILE=~/sirius_config.cfg
+export SIRIUS_CONFIG_FILE=~/sirius_config.yaml
 bash test/tpcds_performance/run_tpcds_super.sh test_datasets/tpcds_parquet_sf1 --queries 3 7 42 --output-dir results_super/
 bash test/tpcds_performance/run_tpcds_duckdb.sh --parquet-dir test_datasets/tpcds_parquet_sf1 --queries 3 7 42 --output-dir results_duckdb/
 
@@ -238,7 +238,7 @@ bash test/tpcds_performance/generate_tpcds_data.sh 1 --format parquet
 bash test/tpcds_performance/run_tpcds_duckdb.sh --parquet-dir test_datasets/tpcds_parquet_sf1 --output-dir results/duckdb_sf1/
 
 # 3. Super Sirius (GPU-compatible queries)
-export SIRIUS_CONFIG_FILE=~/sirius_config.cfg
+export SIRIUS_CONFIG_FILE=~/sirius_config.yaml
 bash test/tpcds_performance/run_tpcds_super_gpu.sh test_datasets/tpcds_parquet_sf1 --output-dir results/super_sf1/
 
 # 4. Compare

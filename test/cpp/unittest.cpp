@@ -94,15 +94,15 @@ int main(int argc, char* argv[])
   // Create shared test environments. Both start PAUSED and are only activated
   // by the listener for tests with the matching tag. This avoids GPU memory
   // conflicts with operator tests that use their own memory managers.
-  // Only one environment can be active at a time (each owns the extension lock).
+  // Only one environment can be active at a time.
   auto scan_config_path =
-    std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "scan" / "memory.cfg";
+    std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "scan" / "memory.yaml";
   sirius::test::shared_test_env scan_env(scan_config_path);
   scan_env.pause();
   sirius::test::g_shared_env = &scan_env;
 
   auto integration_config_path =
-    std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "integration.cfg";
+    std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "integration.yaml";
   sirius::test::shared_test_env integration_env(integration_config_path);
   integration_env.pause();
   sirius::test::g_integration_env = &integration_env;
