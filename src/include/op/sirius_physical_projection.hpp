@@ -34,6 +34,9 @@ class sirius_physical_projection : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  //! Propagate uniqueness for passthrough BoundReferenceExpression columns only.
+  void propagate_column_properties_from_child(size_t child_idx = 0) override;
+
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
 };
 

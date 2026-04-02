@@ -49,6 +49,9 @@ class sirius_physical_order : public sirius_physical_operator {
   duckdb::vector<duckdb::idx_t> projections;
   bool is_index_sort;
 
+  //! Propagate uniqueness through the order's projection map.
+  void propagate_column_properties_from_child(size_t child_idx = 0) override;
+
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }

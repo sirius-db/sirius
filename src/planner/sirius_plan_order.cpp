@@ -38,14 +38,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
     auto order = duckdb::make_uniq<sirius::op::sirius_physical_order>(
       op.types, std::move(op.orders), std::move(projection_map), op.estimated_cardinality);
     order->children.push_back(std::move(plan));
-    // Propagate uniqueness through projection map
-    auto& child_props = order->children[0]->output_column_properties;
-    for (duckdb::idx_t i = 0; i < order->projections.size(); i++) {
-      auto src_idx = order->projections[i];
-      if (src_idx < child_props.size()) {
-        order->output_column_properties[i] = child_props[src_idx];
-      }
-    }
+    order->propagate_column_properties_from_child();
     plan = std::move(order);
   }
   return plan;

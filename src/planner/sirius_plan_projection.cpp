@@ -52,31 +52,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalProjection& op)
     }
   }
 
-  // Save expression references before moving them into the projection
-  duckdb::vector<duckdb::optional_idx> passthrough_indices;
-  passthrough_indices.reserve(op.expressions.size());
-  for (auto& expr : op.expressions) {
-    if (expr->type == duckdb::ExpressionType::BOUND_REF) {
-      passthrough_indices.emplace_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
-    } else {
-      passthrough_indices.emplace_back();
-    }
-  }
-
   auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
     op.types, std::move(op.expressions), op.estimated_cardinality);
   projection->children.push_back(std::move(plan));
-
-  // Propagate uniqueness for passthrough columns
-  auto& child_props = projection->children[0]->output_column_properties;
-  for (duckdb::idx_t i = 0; i < passthrough_indices.size(); i++) {
-    if (passthrough_indices[i].IsValid()) {
-      auto src_idx = passthrough_indices[i].GetIndex();
-      if (src_idx < child_props.size()) {
-        projection->output_column_properties[i] = child_props[src_idx];
-      }
-    }
-  }
+  projection->propagate_column_properties_from_child();
   return std::move(projection);
 }
 

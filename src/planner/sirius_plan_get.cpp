@@ -241,14 +241,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     } else {
       projection->children.push_back(std::move(node));
     }
-    // Propagate uniqueness: each output column i maps to child column column_ids[i]
-    auto& child_props = projection->children[0]->output_column_properties;
-    for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
-      auto col_id = column_ids[i].GetPrimaryIndex();
-      if (col_id < child_props.size()) {
-        projection->output_column_properties[i] = child_props[col_id];
-      }
-    }
+    projection->propagate_column_properties_from_child();
     return std::move(projection);
   }
 

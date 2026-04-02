@@ -88,6 +88,14 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_count_distinct = false;
 
  public:
+  //! Mark group key columns as unique (GROUP BY output keys are always unique).
+  void propagate_column_properties_from_child(size_t child_idx = 0) override
+  {
+    for (size_t i = 0; i < group_idx.size() && i < output_column_properties.size(); i++) {
+      output_column_properties[i].is_unique = true;
+    }
+  }
+
   std::vector<int> get_output_grouping_indices() const
   {
     std::vector<int> indices(group_idx.size());

@@ -43,6 +43,14 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   duckdb::unique_ptr<duckdb::DistinctAggregateData> distinct_data;
   duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
 
+  //! Ungrouped aggregate output is a single row — all columns are trivially unique.
+  void propagate_column_properties_from_child(size_t child_idx = 0) override
+  {
+    for (auto& prop : output_column_properties) {
+      prop.is_unique = true;
+    }
+  }
+
   bool is_source() const override { return true; }
 
  public:

@@ -177,11 +177,28 @@ class sirius_physical_operator {
     return output_column_properties;
   }
 
-  //! Copy output column properties from a child operator (1:1 column mapping)
-  void propagate_column_properties_from_child(size_t child_idx = 0)
+  //! Propagate output column properties from a child operator.
+  //! Default: 1:1 copy from child. Override in subclasses for operator-specific logic
+  //! (e.g., projection passthrough, aggregate group key marking).
+  virtual void propagate_column_properties_from_child(size_t child_idx = 0)
   {
     if (child_idx < children.size() && children[child_idx]) {
       output_column_properties = children[child_idx]->output_column_properties;
+    }
+  }
+
+  //! Propagate output column properties through a projection map.
+  //! output[i] gets properties from child[projection_map[i]].
+  void propagate_column_properties_from_child(const duckdb::vector<duckdb::idx_t>& projection_map,
+                                              size_t child_idx = 0)
+  {
+    if (child_idx >= children.size() || !children[child_idx]) { return; }
+    auto& child_props = children[child_idx]->output_column_properties;
+    for (duckdb::idx_t i = 0; i < projection_map.size() && i < output_column_properties.size();
+         i++) {
+      if (projection_map[i] < child_props.size()) {
+        output_column_properties[i] = child_props[projection_map[i]];
+      }
     }
   }
 

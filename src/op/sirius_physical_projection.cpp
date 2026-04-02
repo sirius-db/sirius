@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_projection.hpp"
 
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -31,6 +32,19 @@ sirius_physical_projection::sirius_physical_projection(
       SiriusPhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
     select_list(std::move(select_list))
 {
+}
+
+void sirius_physical_projection::propagate_column_properties_from_child(size_t child_idx)
+{
+  if (child_idx >= children.size() || !children[child_idx]) { return; }
+  auto& child_props = children[child_idx]->output_column_properties;
+  for (duckdb::idx_t i = 0; i < select_list.size() && i < output_column_properties.size(); i++) {
+    if (select_list[i]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      auto& ref = select_list[i]->Cast<duckdb::BoundReferenceExpression>();
+      if (ref.index < child_props.size()) { output_column_properties[i] = child_props[ref.index]; }
+    }
+    // Non-passthrough expressions keep default is_unique=false
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_projection::execute(const operator_data& input_data,

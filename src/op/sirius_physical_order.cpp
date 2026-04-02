@@ -37,6 +37,17 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType>
 {
 }
 
+void sirius_physical_order::propagate_column_properties_from_child(size_t child_idx)
+{
+  if (child_idx >= children.size() || !children[child_idx]) { return; }
+  auto& child_props = children[child_idx]->output_column_properties;
+  for (duckdb::idx_t i = 0; i < projections.size() && i < output_column_properties.size(); i++) {
+    if (projections[i] < child_props.size()) {
+      output_column_properties[i] = child_props[projections[i]];
+    }
+  }
+}
+
 std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_data& input_data,
                                                               rmm::cuda_stream_view stream)
 {
