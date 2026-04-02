@@ -4,7 +4,7 @@ description: >
   Use this skill when a Sirius query crashes, segfaults, hangs, throws an exception, or unexpectedly
   falls back to CPU. Also use when you see CUDA errors, std::bad_alloc, or the process gets killed.
   Diagnoses issues using log analysis, cuda-gdb, AddressSanitizer, and NVIDIA Compute Sanitizer.
-argument-hint: [sql-query-or-file] [--timeout 30]
+argument-hint: "[sql-query-or-file] [--timeout 30]"
 disable-model-invocation: true
 ---
 

@@ -4,7 +4,7 @@ description: >
   Use this skill to find which commit introduced a bug or regression. Uses git bisect with automated
   build and test. Trigger when a bug appeared recently, a query started failing, performance regressed,
   or the user wants to compare behavior between two commits.
-argument-hint: [good-commit] [bad-commit] [test-command-or-sql]
+argument-hint: "[good-commit] [bad-commit] [test-command-or-sql]"
 disable-model-invocation: true
 ---
 
