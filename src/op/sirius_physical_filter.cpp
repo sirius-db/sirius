@@ -27,7 +27,7 @@ namespace op {
 sirius_physical_filter::sirius_physical_filter(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
 {

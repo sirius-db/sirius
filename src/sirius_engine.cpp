@@ -465,11 +465,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         }
       }
 
-      duckdb::vector<duckdb::idx_t> join_positions;
+      duckdb::vector<std::size_t> join_positions;
       duckdb::shared_ptr<pipeline::sirius_pipeline> previous_pipeline = nullptr;
       op::sirius_physical_concat* prev_concat_ptr                     = nullptr;
 
-      for (duckdb::idx_t op_idx = 0; op_idx < current_pipeline->operators.size(); op_idx++) {
+      for (std::size_t op_idx = 0; op_idx < current_pipeline->operators.size(); op_idx++) {
         if (current_pipeline->operators[op_idx].get().type ==
               op::SiriusPhysicalOperatorType::HASH_JOIN ||
             current_pipeline->operators[op_idx].get().type ==
@@ -503,7 +503,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
       if (!join_positions.empty()) {
         for (size_t hj_idx = 0; hj_idx < join_positions.size(); hj_idx++) {
-          duckdb::idx_t join_pos = join_positions[hj_idx];
+          std::size_t join_pos = join_positions[hj_idx];
           duckdb::unique_ptr<op::sirius_physical_concat> concat_op;
 
           // Create a PARTITION and CONCAT operator
@@ -546,7 +546,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             if (hj_idx == 0) {
               // Move operators from current pipeline to new pipeline except for the last operator
               // before the join
-              for (duckdb::idx_t j = 0; j < join_pos - 1; j++) {
+              for (std::size_t j = 0; j < join_pos - 1; j++) {
                 new_pipeline->operators.push_back(current_pipeline->operators[j]);
               }
               // set the sink to the operator before the join
@@ -555,7 +555,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             } else {
               // Move operators from current pipeline to new pipeline except for the last operator
               // before the join
-              for (duckdb::idx_t j = join_positions[hj_idx - 1]; j < join_pos - 1; j++) {
+              for (std::size_t j = join_positions[hj_idx - 1]; j < join_pos - 1; j++) {
                 new_pipeline->operators.push_back(current_pipeline->operators[j]);
               }
               // set the sink to the operator before the join
@@ -748,8 +748,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto& child_types = current_pipeline->operators.size() > 0
                                 ? current_pipeline->operators.back().get().types
                                 : current_pipeline->source->types;
-          duckdb::vector<duckdb::idx_t> identity_proj;
-          for (duckdb::idx_t i = 0; i < child_types.size(); i++) {
+          duckdb::vector<std::size_t> identity_proj;
+          for (std::size_t i = 0; i < child_types.size(); i++) {
             identity_proj.push_back(i);
           }
           order_ptr->projections = std::move(identity_proj);
@@ -793,7 +793,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         {
           bool is_identity = (original_projections.size() == order_ptr->types.size());
           if (is_identity) {
-            for (duckdb::idx_t i = 0; i < original_projections.size(); i++) {
+            for (std::size_t i = 0; i < original_projections.size(); i++) {
               if (original_projections[i] != i) {
                 is_identity = false;
                 break;

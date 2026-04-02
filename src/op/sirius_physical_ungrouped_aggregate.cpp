@@ -50,7 +50,7 @@ namespace op {
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
@@ -472,7 +472,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_AGGREGATE, std::move(types), estimated_cardinality),

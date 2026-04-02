@@ -28,11 +28,11 @@ namespace sirius {
 namespace op {
 
 sirius_physical_cte::sirius_physical_cte(std::string ctename,
-                                         duckdb::idx_t table_index,
+                                         std::size_t table_index,
                                          duckdb::vector<duckdb::LogicalType> types,
                                          duckdb::unique_ptr<sirius_physical_operator> top,
                                          duckdb::unique_ptr<sirius_physical_operator> bottom,
-                                         duckdb::idx_t estimated_cardinality)
+                                         std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::CTE, std::move(types), estimated_cardinality),
     table_index(table_index),

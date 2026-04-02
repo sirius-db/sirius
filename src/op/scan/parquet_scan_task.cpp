@@ -136,9 +136,9 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
   // This ensures the parquet reader produces columns in the same order that
   // the TABLE_SCAN filter expects (column_ids order), since the filter's
   // BoundReferenceExpression indices are offsets into column_ids.
-  std::unordered_set<duckdb::idx_t> projected_set(scan_op.projection_ids.begin(),
-                                                  scan_op.projection_ids.end());
-  for (duckdb::idx_t i = 0; i < scan_op.column_ids.size(); i++) {
+  std::unordered_set<std::size_t> projected_set(scan_op.projection_ids.begin(),
+                                                scan_op.projection_ids.end());
+  for (std::size_t i = 0; i < scan_op.column_ids.size(); i++) {
     if (projected_set.count(i)) { push_unique(scan_op.column_ids[i].GetPrimaryIndex()); }
   }
   return selected_column_indices;
