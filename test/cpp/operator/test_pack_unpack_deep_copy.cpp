@@ -363,6 +363,216 @@ TEST_CASE("concatenate 12 packed views with INT32+DECIMAL columns", "[exchange]"
   REQUIRE(result->num_rows() == 12900);
 }
 
+/// Create a table matching Q3 __EXCH_..._5 schema: INT32 keys + STRING + DECIMAL128 values.
+/// This is what cudf::hash_partition produces for a join result.
+std::unique_ptr<cudf::table> make_q3_exchange_table(cudf::size_type num_rows) {
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource();
+  std::vector<std::unique_ptr<cudf::column>> cols;
+
+  // 2 INT32 key columns (l_orderkey, o_shippriority)
+  for (int c = 0; c < 2; c++) {
+    auto scalar = cudf::numeric_scalar<int32_t>(c * 1000 + 1, true, stream);
+    cols.push_back(cudf::sequence(num_rows, scalar, cudf::numeric_scalar<int32_t>(1, true, stream), stream, mr));
+  }
+
+  // 2 STRING columns (simulating o_orderstatus, l_shipmode)
+  for (int s = 0; s < 2; s++) {
+    std::vector<std::string> strings;
+    for (int i = 0; i < num_rows; i++) {
+      strings.push_back("val_" + std::to_string(s) + "_" + std::to_string(i % 100));
+    }
+    std::vector<int32_t> offsets = {0};
+    std::string chars;
+    for (auto& str : strings) {
+      chars += str;
+      offsets.push_back(static_cast<int32_t>(chars.size()));
+    }
+    auto offsets_col = cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::INT32}, num_rows + 1,
+        cudf::mask_state::UNALLOCATED, stream);
+    cudaMemcpy(offsets_col->mutable_view().data<int32_t>(), offsets.data(),
+               offsets.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    rmm::device_buffer chars_buf(chars.size(), stream, mr);
+    cudaMemcpy(chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice);
+    cols.push_back(cudf::make_strings_column(
+        num_rows, std::move(offsets_col), std::move(chars_buf), 0,
+        rmm::device_buffer{0, stream, mr}));
+  }
+
+  // 4 DECIMAL128 value columns (revenue, price, discount, tax)
+  for (int c = 0; c < 4; c++) {
+    auto dtype = cudf::data_type{cudf::type_id::DECIMAL128, -2};
+    auto col = cudf::make_fixed_width_column(dtype, num_rows, cudf::mask_state::UNALLOCATED, stream);
+    cols.push_back(std::move(col));
+  }
+
+  return std::make_unique<cudf::table>(std::move(cols)); // 2 INT32 + 2 STRING + 4 DECIMAL128 = 8 cols
+}
+
+TEST_CASE("Q3 exchange: hash_partition + pack + unpack + concatenate with STRING cols", "[exchange][q3]") {
+  // Reproduces the exact Q3 exchange scenario:
+  // 1. Create table with INT32 + STRING + DECIMAL128 (8 cols, ~1000 rows)
+  // 2. hash_partition into 2 partitions
+  // 3. Pack each partition separately (simulating per-batch cudf::chunked_pack)
+  // 4. Unpack all into views
+  // 5. Concatenate all views (simulating finalize_pending_views)
+  //
+  // Repeat for multiple "batches" to simulate concurrent GPU pipeline threads.
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  // Simulate 8 GPU pipeline batches (like the production Q3 leaf execution)
+  constexpr int NUM_BATCHES = 8;
+  constexpr int NUM_PARTITIONS = 2;
+
+  // Accumulate packed buffers and views per partition (simulating ExchangeBuffer)
+  std::vector<cudf::packed_columns> all_packed; // Keep packed buffers alive
+  std::vector<cudf::table_view> partition_0_views;
+  std::vector<cudf::table_view> partition_1_views;
+
+  for (int batch = 0; batch < NUM_BATCHES; batch++) {
+    auto table = make_q3_exchange_table(800 + batch * 100);
+    auto view = table->view();
+
+    // Hash partition
+    std::vector<cudf::size_type> key_cols = {0}; // Partition by first INT32
+    auto [partitioned, offsets] = cudf::hash_partition(
+        view, key_cols, NUM_PARTITIONS, cudf::hash_id::HASH_MURMUR3,
+        cudf::DEFAULT_HASH_SEED, stream);
+
+    // Pack each partition separately
+    for (int p = 0; p < NUM_PARTITIONS; p++) {
+      auto start = offsets[p];
+      auto end = (p + 1 < NUM_PARTITIONS) ? offsets[p + 1] : partitioned->num_rows();
+      if (end <= start) continue;
+
+      auto slice = cudf::slice(partitioned->view(), {start, end});
+      auto packed = cudf::pack(slice[0], stream, mr);
+      auto unpacked = cudf::unpack(packed.metadata->data(),
+                                   static_cast<const uint8_t*>(packed.gpu_data->data()));
+
+      if (p == 0) {
+        partition_0_views.push_back(unpacked);
+      } else {
+        partition_1_views.push_back(unpacked);
+      }
+      all_packed.push_back(std::move(packed));
+    }
+  }
+
+  INFO("partition 0: " << partition_0_views.size() << " views");
+  INFO("partition 1: " << partition_1_views.size() << " views");
+  REQUIRE(partition_0_views.size() > 0);
+  REQUIRE(partition_1_views.size() > 0);
+
+  // Log column info for first view
+  {
+    auto& pv = partition_0_views[0];
+    for (cudf::size_type c = 0; c < pv.num_columns(); c++) {
+      auto col = pv.column(c);
+      INFO("  partition 0 view 0 col " << c << " type=" << static_cast<int>(col.type().id())
+           << " children=" << col.num_children() << " rows=" << col.size());
+    }
+  }
+
+  SECTION("concatenate partition 0 views") {
+    cudaGetLastError();
+    auto result = cudf::concatenate(partition_0_views, stream, &cuda_mr);
+    CHECK(result->num_columns() == 8);
+    CHECK(result->num_rows() > 0);
+    INFO("partition 0 concatenated: " << result->num_rows() << " rows");
+  }
+
+  SECTION("concatenate partition 1 views") {
+    cudaGetLastError();
+    auto result = cudf::concatenate(partition_1_views, stream, &cuda_mr);
+    CHECK(result->num_columns() == 8);
+    CHECK(result->num_rows() > 0);
+    INFO("partition 1 concatenated: " << result->num_rows() << " rows");
+  }
+
+  SECTION("simulate D2D copy then concatenate") {
+    // Simulate the self-transfer D2D copy path:
+    // 1. D2D copy each packed buffer to a new cudaMalloc region
+    // 2. Re-unpack from the new address
+    // 3. Concatenate all re-unpacked views
+    std::vector<cudf::table_view> copied_views;
+    std::vector<void*> owned_ptrs; // For cleanup
+
+    for (auto& packed : all_packed) {
+      size_t size = packed.gpu_data->size();
+      void* new_ptr = nullptr;
+      REQUIRE(cudaMalloc(&new_ptr, size) == cudaSuccess);
+      REQUIRE(cudaMemcpy(new_ptr, packed.gpu_data->data(), size, cudaMemcpyDeviceToDevice) == cudaSuccess);
+
+      auto view = cudf::unpack(packed.metadata->data(), static_cast<const uint8_t*>(new_ptr));
+      copied_views.push_back(view);
+      owned_ptrs.push_back(new_ptr);
+    }
+
+    cudaGetLastError();
+    auto result = cudf::concatenate(copied_views, stream, &cuda_mr);
+    CHECK(result->num_columns() == 8);
+    CHECK(result->num_rows() > 0);
+    INFO("D2D concatenated: " << result->num_rows() << " rows from " << copied_views.size() << " views");
+
+    for (auto ptr : owned_ptrs) cudaFree(ptr);
+  }
+
+  SECTION("simulate staging overwrite then concatenate (should fail)") {
+    // Simulate the bug: pack into a single staging-like buffer,
+    // then overwrite the staging with new data, then try to concatenate
+    // the views that reference the overwritten region.
+    size_t staging_size = 64UL << 20; // 64MB staging
+    void* staging = nullptr;
+    REQUIRE(cudaMalloc(&staging, staging_size) == cudaSuccess);
+
+    std::vector<cudf::table_view> stale_views;
+    std::vector<std::unique_ptr<std::vector<uint8_t>>> metadatas;
+
+    // Pack first batch into staging
+    {
+      auto table = make_q3_exchange_table(1000);
+      auto packed = cudf::pack(table->view(), stream, mr);
+      size_t size = packed.gpu_data->size();
+      REQUIRE(size <= staging_size);
+      REQUIRE(cudaMemcpy(staging, packed.gpu_data->data(), size, cudaMemcpyDeviceToDevice) == cudaSuccess);
+      auto view = cudf::unpack(packed.metadata->data(), static_cast<const uint8_t*>(staging));
+      stale_views.push_back(view);
+      metadatas.push_back(std::move(packed.metadata));
+    }
+
+    // Overwrite staging with DIFFERENT data (simulating next session)
+    {
+      auto table = make_q3_exchange_table(2000); // Different row count!
+      auto packed = cudf::pack(table->view(), stream, mr);
+      size_t size = packed.gpu_data->size();
+      REQUIRE(size <= staging_size);
+      REQUIRE(cudaMemcpy(staging, packed.gpu_data->data(), size, cudaMemcpyDeviceToDevice) == cudaSuccess);
+      // Don't create a view — we just overwrote the staging
+    }
+
+    // Try to concatenate the stale view — data was overwritten
+    // This should either crash, produce wrong results, or give a CUDA error.
+    cudaGetLastError();
+    bool stale_concat_failed = false;
+    try {
+      auto result = cudf::concatenate(stale_views, stream, &cuda_mr);
+      // If it succeeds, the data is wrong (overwritten by second batch)
+      WARN("stale view concatenation succeeded (data is likely corrupt)");
+    } catch (const std::exception& e) {
+      stale_concat_failed = true;
+      INFO("stale view concatenation failed as expected: " << e.what());
+    }
+
+    cudaFree(staging);
+    // We don't CHECK stale_concat_failed — it may or may not crash depending on
+    // whether the overwritten data happens to produce valid column metadata.
+  }
+}
+
 TEST_CASE("pack_unpack with STRING columns", "[exchange]") {
   // Reproduces Q3/Q14 exchange table issue: tables with STRING columns
   // packed into staging → unpacked → deep copy fails, concatenate works.
