@@ -41,6 +41,21 @@
 namespace sirius {
 namespace op {
 
+/// Create a device_uvector containing the sequence [0, 1, 2, ..., num_rows-1].
+static std::unique_ptr<rmm::device_uvector<cudf::size_type>> make_sequential_indices(
+  cudf::size_type num_rows, rmm::cuda_stream_view stream)
+{
+  auto indices  = std::make_unique<rmm::device_uvector<cudf::size_type>>(num_rows, stream);
+  auto host_seq = std::vector<cudf::size_type>(num_rows);
+  std::iota(host_seq.begin(), host_seq.end(), 0);
+  cudaMemcpyAsync(indices->data(),
+                  host_seq.data(),
+                  num_rows * sizeof(cudf::size_type),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  return indices;
+}
+
 /// Recursively collect all BoundReferenceExpression indices from an expression tree.
 static void collect_bound_ref_indices(duckdb::Expression& expr,
                                       std::unordered_set<duckdb::idx_t>& indices)
@@ -800,8 +815,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         _build_table              = std::move(build_batch);
         if (unique_build_keys &&
             (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
-          SIRIUS_LOG_DEBUG("Operator {}: using distinct_hash_join (unique build keys)",
-                           this->get_operator_id());
           _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
             build_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
         } else {
@@ -838,15 +851,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         if (_distinct_hash_table) {
           // distinct_hash_join::left_join returns only build indices; probe indices are 0..N-1
           right_indices = _distinct_hash_table->left_join(probe_keys, stream);
-          auto num_rows = static_cast<cudf::size_type>(right_indices->size());
-          left_indices  = std::make_unique<rmm::device_uvector<cudf::size_type>>(num_rows, stream);
-          auto host_seq = std::vector<cudf::size_type>(num_rows);
-          std::iota(host_seq.begin(), host_seq.end(), 0);
-          cudaMemcpyAsync(left_indices->data(),
-                          host_seq.data(),
-                          num_rows * sizeof(cudf::size_type),
-                          cudaMemcpyHostToDevice,
-                          stream.value());
+          left_indices  = make_sequential_indices(
+            static_cast<cudf::size_type>(right_indices->size()), stream);
         } else {
           auto result   = _hash_table->left_join(probe_keys, {}, stream);
           left_indices  = std::move(result.first);
@@ -1056,15 +1062,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       if (unique_build_keys) {
         cudf::distinct_hash_join ht(right_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
         right_indices = ht.left_join(left_keys, stream);
-        auto num_rows = static_cast<cudf::size_type>(right_indices->size());
-        left_indices  = std::make_unique<rmm::device_uvector<cudf::size_type>>(num_rows, stream);
-        auto host_seq = std::vector<cudf::size_type>(num_rows);
-        std::iota(host_seq.begin(), host_seq.end(), 0);
-        cudaMemcpyAsync(left_indices->data(),
-                        host_seq.data(),
-                        num_rows * sizeof(cudf::size_type),
-                        cudaMemcpyHostToDevice,
-                        stream.value());
+        left_indices  = make_sequential_indices(
+          static_cast<cudf::size_type>(right_indices->size()), stream);
       } else {
         auto join_result =
           cudf::left_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
