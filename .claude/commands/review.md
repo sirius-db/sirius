@@ -1,22 +1,32 @@
 ---
 description: Review code changes on the current branch for bugs, quality issues, and style violations. Supports quick summary or deep interactive file-by-file review.
+argument-hint: "[PR-number]"
 ---
 
 # Code Review
 
-Review all changes on the current branch compared to the base branch.
+Review code changes for bugs, quality issues, and style violations.
 
 ## Steps
 
-1. Identify the base branch (usually `dev`) and run `git diff dev...HEAD --stat` to show a summary of changed files.
-2. If there are also unstaged/staged changes, include those with `git diff --stat` and `git diff --cached --stat`.
+1. **Determine the diff source:**
+   - If a PR number is provided as an argument (e.g., `/review 534`), use `gh pr diff <number>` to get the diff without checking out the branch.
+   - If no argument is provided, review the current branch: use `git diff dev...HEAD` to diff against the base branch.
+
+2. Get the file summary:
+   - For PR review: `gh pr diff <number> --stat` for the summary, `gh pr view <number> --json title,body,state,author` for context.
+   - For current branch: `git diff dev...HEAD --stat`, plus `git diff --stat` and `git diff --cached --stat` for unstaged/staged changes.
+
 3. Present the file list with lines added/removed per file.
+
 4. Ask the user which review mode they want:
 
    **Quick review** — Scan all changes and produce a summary report.
 
    **Deep review** — Walk through each changed file interactively:
-   - Show the diff for one file at a time (using `git diff dev...HEAD -- <file>`), displaying it chunk by chunk so the user can read it like a GitHub PR review.
+   - Show the diff for one file at a time, displaying it chunk by chunk so the user can read it like a GitHub PR review.
+   - For PR review: `gh pr diff <number> -- <file>` (note: gh doesn't support per-file diff, so filter the full diff output by file path).
+   - For current branch: `git diff dev...HEAD -- <file>`.
    - After showing each file's diff, pause and ask: "Any questions about this file, or move to next?"
    - The user can ask questions about specific lines, request explanations, or ask for fixes inline.
    - After all files are reviewed, produce the summary report.

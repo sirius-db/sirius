@@ -10,9 +10,9 @@ Build Sirius using pixi and run the tests the user selects.
 
 1. Build Sirius using pixi:
    ```
-   pixi run bash -c "source setup_sirius.sh && CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make"
+   pixi run make
    ```
-   If build fails, diagnose and fix. If OOM, retry with `CMAKE_BUILD_PARALLEL_LEVEL=8`.
+   If build fails, diagnose and fix. If OOM, retry with `CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make`.
 
 2. After a successful build, present the user with test options:
 
@@ -29,10 +29,10 @@ Build Sirius using pixi and run the tests the user selects.
    Wait for the user to choose before proceeding.
 
 3. Run the selected tests using pixi:
-   - **All SQL logic tests**: `pixi run bash -c "source setup_sirius.sh && make test"`
-   - **Specific SQL test**: `pixi run bash -c "source setup_sirius.sh && build/release/test/unittest --test-dir . <test-file>"`
-   - **All C++ unit tests**: `pixi run bash -c "source setup_sirius.sh && build/release/extension/sirius/test/cpp/sirius_unittest"`
-   - **Specific C++ unit test**: `pixi run bash -c "source setup_sirius.sh && build/release/extension/sirius/test/cpp/sirius_unittest '<name-or-tag>'"`
+   - **All SQL logic tests**: `pixi run make test`
+   - **Specific SQL test**: `pixi run bash -c "build/release/test/unittest --test-dir . <test-file>"`
+   - **All C++ unit tests**: `pixi run bash -c "build/release/extension/sirius/test/cpp/sirius_unittest"`
+   - **Specific C++ unit test**: `pixi run bash -c "build/release/extension/sirius/test/cpp/sirius_unittest '<name-or-tag>'"`
    - **Auto-detect**: Check `git diff dev --name-only` to identify changed files, then run the most relevant tests. Explain the reasoning to the user before running.
 
 4. If tests fail:
