@@ -65,8 +65,8 @@ std::optional<std::string> get_config_file_path()
   // 3. Home directory
   const char* home_dir = std::getenv("HOME");
   if (home_dir != nullptr) {
-    auto home_path =
-      std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) / std::string(CONFIG_FILE_NAME);
+    auto home_path = std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) /
+                     std::string(CONFIG_FILE_NAME);
     if (std::filesystem::exists(home_path)) { return home_path.string(); }
   }
 
@@ -406,8 +406,9 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     spdlog::error("{}", msg);
     throw std::runtime_error(msg);
   } else {
-    spdlog::info("No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
-                 "~/.sirius/sirius.yaml). Using defaults.");
+    spdlog::info(
+      "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
+      "~/.sirius/sirius.yaml). Using defaults.");
     config_.apply_defaults();
   }
 

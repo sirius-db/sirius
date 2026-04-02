@@ -20,6 +20,7 @@
 #include <cucascade/memory/common.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
+
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>

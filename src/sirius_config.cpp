@@ -37,8 +37,10 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_spac
   yaml::reader r(node, "gpu_memory_space");
   r.optional("device_id", opt.device_id);
   r.optional("per_stream_reservation", opt.per_stream_reservation);
-  r.optional("reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
-  r.optional("downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
+  r.optional(
+    "reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
+  r.optional(
+    "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
   r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
   r.reject_unknown();
@@ -48,8 +50,10 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
 {
   yaml::reader r(node, "host_memory_space");
   r.optional("numa_id", opt.numa_id);
-  r.optional("reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
-  r.optional("downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
+  r.optional(
+    "reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
+  r.optional(
+    "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
   r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
   r.optional("block_size", yaml::bytes(opt.block_size));
@@ -147,7 +151,8 @@ struct gpu_mem_config {
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
                                       : std::variant<double, std::uint64_t>{res_frac};
-    r.optional("downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
+    r.optional(
+      "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
     r.optional("track_per_stream_reservation", opt.track_per_stream_reservation);
     r.reject_unknown();
@@ -189,7 +194,8 @@ struct host_mem_config {
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
                                       : std::variant<double, std::uint64_t>{res_frac};
-    r.optional("downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
+    r.optional(
+      "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
     r.optional("block_size", yaml::bytes(opt.block_size));
     r.optional("pool_size", opt.pool_size);
@@ -273,97 +279,93 @@ void sirius_config::apply_defaults()
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
 {
   try {
-  YAML::Node root;
-  try {
-    root = YAML::LoadFile(config_path.string());
-  } catch (const YAML::Exception& e) {
-    throw std::runtime_error("failed to parse YAML: " + std::string(e.what()));
-  }
-
-  yaml::reader top(root);
-  auto sirius_node = top.optional_node("sirius");
-  top.reject_unknown();
-
-  if (!sirius_node) {
-    throw std::runtime_error("missing top-level 'sirius' key");
-  }
-
-  yaml::reader r(*sirius_node, "sirius");
-
-  // Topology
-  topology topo;
-  r.optional("topology", topo);
-
-  // High-level memory config (mutually exclusive with space config)
-  gpu_mem_config gpu_cfg;
-  host_mem_config host_cfg;
-  disk_mem_config disk_cfg;
-
-  if (auto mem_node = r.optional_node("memory")) {
-    yaml::reader mr(*mem_node, "sirius.memory");
-    if (auto n = mr.optional_node("gpu")) gpu_mem_config::from_yaml(*n, gpu_cfg);
-    if (auto n = mr.optional_node("host")) host_mem_config::from_yaml(*n, host_cfg);
-    if (auto n = mr.optional_node("disk")) disk_mem_config::from_yaml(*n, disk_cfg);
-    mr.reject_unknown();
-  }
-
-  // Executors
-  if (auto exec_node = r.optional_node("executor")) {
-    yaml::reader er(*exec_node, "sirius.executor");
-    if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
-    if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
-    if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
-    if (auto n = er.optional_node("duckdb_scan")) sirius::from_yaml(*n, _scan_executor_config);
-    er.reject_unknown();
-  }
-
-  // Operator params
-  if (auto n = r.optional_node("operator_params")) {
-    sirius::from_yaml(*n, _operator_params);
-  }
-
-  // Explicit space configs (low-level API)
-  std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
-  std::vector<cucascade::memory::host_memory_space_config> host_space_configs;
-  std::vector<cucascade::memory::disk_memory_space_config> disk_space_configs;
-
-  if (auto space_node = r.optional_node("space")) {
-    yaml::reader sr(*space_node, "sirius.space");
-    if (auto n = sr.optional_node("gpu")) read_yaml_vec(*n, gpu_space_configs);
-    if (auto n = sr.optional_node("host")) read_yaml_vec(*n, host_space_configs);
-    if (auto n = sr.optional_node("disk")) read_yaml_vec(*n, disk_space_configs);
-    sr.reject_unknown();
-  }
-
-  r.reject_unknown();
-
-  // Build memory space configs
-  _memory_space_configs.clear();
-
-  std::copy(gpu_space_configs.begin(),
-            gpu_space_configs.end(),
-            std::back_inserter(_memory_space_configs));
-  std::copy(host_space_configs.begin(),
-            host_space_configs.end(),
-            std::back_inserter(_memory_space_configs));
-  std::copy(disk_space_configs.begin(),
-            disk_space_configs.end(),
-            std::back_inserter(_memory_space_configs));
-
-  bool using_configurator = _memory_space_configs.empty();
-  if (using_configurator) {
-    cucascade::memory::reservation_manager_configurator builder;
-    if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
-      builder.set_number_of_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids));
-    } else {
-      const auto& gpu_ids = std::get<std::vector<int>>(topo.num_gpus_or_gpu_ids);
-      builder.set_gpu_ids(gpu_ids);
+    YAML::Node root;
+    try {
+      root = YAML::LoadFile(config_path.string());
+    } catch (const YAML::Exception& e) {
+      throw std::runtime_error("failed to parse YAML: " + std::string(e.what()));
     }
-    gpu_cfg.setup_configurator(builder);
-    host_cfg.setup_configurator(builder);
-    disk_cfg.setup_configurator(builder);
-    _memory_space_configs = builder.build(_hw_topology);
-  }
+
+    yaml::reader top(root);
+    auto sirius_node = top.optional_node("sirius");
+    top.reject_unknown();
+
+    if (!sirius_node) { throw std::runtime_error("missing top-level 'sirius' key"); }
+
+    yaml::reader r(*sirius_node, "sirius");
+
+    // Topology
+    topology topo;
+    r.optional("topology", topo);
+
+    // High-level memory config (mutually exclusive with space config)
+    gpu_mem_config gpu_cfg;
+    host_mem_config host_cfg;
+    disk_mem_config disk_cfg;
+
+    if (auto mem_node = r.optional_node("memory")) {
+      yaml::reader mr(*mem_node, "sirius.memory");
+      if (auto n = mr.optional_node("gpu")) gpu_mem_config::from_yaml(*n, gpu_cfg);
+      if (auto n = mr.optional_node("host")) host_mem_config::from_yaml(*n, host_cfg);
+      if (auto n = mr.optional_node("disk")) disk_mem_config::from_yaml(*n, disk_cfg);
+      mr.reject_unknown();
+    }
+
+    // Executors
+    if (auto exec_node = r.optional_node("executor")) {
+      yaml::reader er(*exec_node, "sirius.executor");
+      if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
+      if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
+      if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
+      if (auto n = er.optional_node("duckdb_scan")) sirius::from_yaml(*n, _scan_executor_config);
+      er.reject_unknown();
+    }
+
+    // Operator params
+    if (auto n = r.optional_node("operator_params")) { sirius::from_yaml(*n, _operator_params); }
+
+    // Explicit space configs (low-level API)
+    std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
+    std::vector<cucascade::memory::host_memory_space_config> host_space_configs;
+    std::vector<cucascade::memory::disk_memory_space_config> disk_space_configs;
+
+    if (auto space_node = r.optional_node("space")) {
+      yaml::reader sr(*space_node, "sirius.space");
+      if (auto n = sr.optional_node("gpu")) read_yaml_vec(*n, gpu_space_configs);
+      if (auto n = sr.optional_node("host")) read_yaml_vec(*n, host_space_configs);
+      if (auto n = sr.optional_node("disk")) read_yaml_vec(*n, disk_space_configs);
+      sr.reject_unknown();
+    }
+
+    r.reject_unknown();
+
+    // Build memory space configs
+    _memory_space_configs.clear();
+
+    std::copy(gpu_space_configs.begin(),
+              gpu_space_configs.end(),
+              std::back_inserter(_memory_space_configs));
+    std::copy(host_space_configs.begin(),
+              host_space_configs.end(),
+              std::back_inserter(_memory_space_configs));
+    std::copy(disk_space_configs.begin(),
+              disk_space_configs.end(),
+              std::back_inserter(_memory_space_configs));
+
+    bool using_configurator = _memory_space_configs.empty();
+    if (using_configurator) {
+      cucascade::memory::reservation_manager_configurator builder;
+      if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
+        builder.set_number_of_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids));
+      } else {
+        const auto& gpu_ids = std::get<std::vector<int>>(topo.num_gpus_or_gpu_ids);
+        builder.set_gpu_ids(gpu_ids);
+      }
+      gpu_cfg.setup_configurator(builder);
+      host_cfg.setup_configurator(builder);
+      disk_cfg.setup_configurator(builder);
+      _memory_space_configs = builder.build(_hw_topology);
+    }
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +

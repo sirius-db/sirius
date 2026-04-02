@@ -102,7 +102,7 @@ TEST_CASE("yaml reader byte suffix parsing", "[config_opt][bytes]")
 {
   SECTION("plain integers work with bytes()")
   {
-    auto node = YAML::Load("size: 1024");
+    auto node          = YAML::Load("size: 1024");
     std::uint64_t size = 0;
     yaml::reader r(node);
     r.optional("size", yaml::bytes(size));
@@ -111,7 +111,7 @@ TEST_CASE("yaml reader byte suffix parsing", "[config_opt][bytes]")
 
   SECTION("binary suffixes (Ki/KiB = 1024)")
   {
-    auto node = YAML::Load(R"(a: "4Ki"
+    auto node       = YAML::Load(R"(a: "4Ki"
 b: "4KiB"
 c: "1GiB"
 d: "2MiB")");
@@ -129,7 +129,7 @@ d: "2MiB")");
 
   SECTION("decimal suffixes (K/KB/G/GB = 1000)")
   {
-    auto node = YAML::Load(R"(a: "4K"
+    auto node       = YAML::Load(R"(a: "4K"
 b: "4KB"
 c: "1G"
 d: "1T")");
@@ -147,7 +147,7 @@ d: "1T")");
 
   SECTION("fractional values")
   {
-    auto node = YAML::Load(R"(si: "1.5G"
+    auto node        = YAML::Load(R"(si: "1.5G"
 bi: "1.5Gi")");
     std::uint64_t si = 0, bi = 0;
     yaml::reader r(node);
@@ -167,7 +167,7 @@ bi: "1.5Gi")");
 
   SECTION("invalid suffix throws")
   {
-    auto node = YAML::Load(R"(size: "8X")");
+    auto node          = YAML::Load(R"(size: "8X")");
     std::uint64_t size = 0;
     yaml::reader r(node);
     REQUIRE_THROWS_AS(r.optional("size", size), std::runtime_error);

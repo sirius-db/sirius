@@ -88,7 +88,9 @@ inline std::uint64_t parse_bytes(std::string_view sv)
 
   // Find where the numeric part ends
   size_t pos = 0;
-  while (pos < sv.size() && (std::isdigit(sv[pos]) || sv[pos] == '.' || sv[pos] == '-')) { ++pos; }
+  while (pos < sv.size() && (std::isdigit(sv[pos]) || sv[pos] == '.' || sv[pos] == '-')) {
+    ++pos;
+  }
 
   if (pos == 0) { throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'"); }
 
@@ -96,15 +98,17 @@ inline std::uint64_t parse_bytes(std::string_view sv)
   auto suffix   = sv.substr(pos);
 
   // Strip leading whitespace from suffix
-  while (!suffix.empty() && suffix[0] == ' ') { suffix.remove_prefix(1); }
+  while (!suffix.empty() && suffix[0] == ' ') {
+    suffix.remove_prefix(1);
+  }
 
   if (suffix.empty() || suffix == "B" || suffix == "b") {
     return static_cast<std::uint64_t>(number);
   }
 
   // Determine if binary (Ki, Mi, Gi, Ti, KiB, MiB, GiB, TiB) or decimal (K, KB, M, MB, ...)
-  char unit    = static_cast<char>(std::toupper(static_cast<unsigned char>(suffix[0])));
-  bool binary  = (suffix.size() >= 2 && suffix[1] == 'i');
+  char unit   = static_cast<char>(std::toupper(static_cast<unsigned char>(suffix[0])));
+  bool binary = (suffix.size() >= 2 && suffix[1] == 'i');
 
   std::uint64_t base = binary ? 1024ULL : 1000ULL;
   std::uint64_t multiplier;
@@ -113,8 +117,7 @@ inline std::uint64_t parse_bytes(std::string_view sv)
     case 'M': multiplier = base * base; break;
     case 'G': multiplier = base * base * base; break;
     case 'T': multiplier = base * base * base * base; break;
-    default:
-      throw std::runtime_error("unknown byte suffix: '" + std::string(suffix) + "'");
+    default: throw std::runtime_error("unknown byte suffix: '" + std::string(suffix) + "'");
   }
 
   return static_cast<std::uint64_t>(number * static_cast<double>(multiplier));
@@ -152,7 +155,10 @@ struct bytes_value {
 };
 
 template <std::integral T>
-bytes_value<T> bytes(T& v) { return {v}; }
+bytes_value<T> bytes(T& v)
+{
+  return {v};
+}
 
 template <std::integral T>
 void read_yaml(const YAML::Node& node, bytes_value<T>& out)
@@ -174,7 +180,10 @@ struct optional_bytes_value {
 };
 
 template <std::integral T>
-optional_bytes_value<T> bytes(std::optional<T>& v) { return {v}; }
+optional_bytes_value<T> bytes(std::optional<T>& v)
+{
+  return {v};
+}
 
 template <std::integral T>
 void read_yaml(const YAML::Node& node, optional_bytes_value<T>& out)
@@ -234,9 +243,9 @@ class reader {
     : node_(node), context_(std::move(context))
   {
     if (node_.IsDefined() && !node_.IsNull() && !node_.IsMap()) {
-      throw std::runtime_error(
-        context_.empty() ? "expected a mapping, got " + type_name(node_)
-                         : context_ + ": expected a mapping, got " + type_name(node_));
+      throw std::runtime_error(context_.empty()
+                                 ? "expected a mapping, got " + type_name(node_)
+                                 : context_ + ": expected a mapping, got " + type_name(node_));
     }
   }
 
@@ -254,7 +263,8 @@ class reader {
     }
   }
 
-  /// Read an optional field into a std::optional. Sets to the value if present, leaves as-is if not.
+  /// Read an optional field into a std::optional. Sets to the value if present, leaves as-is if
+  /// not.
   template <typename T>
   void optional(const std::string& key, std::optional<T>& out)
   {
@@ -313,10 +323,7 @@ class reader {
   }
 
   /// Check whether a key exists in the map.
-  [[nodiscard]] bool has(const std::string& key) const
-  {
-    return find(key).IsDefined();
-  }
+  [[nodiscard]] bool has(const std::string& key) const { return find(key).IsDefined(); }
 
   /// Throw if the map contains keys that were not consumed by optional/required calls.
   void reject_unknown() const
@@ -325,10 +332,9 @@ class reader {
     for (auto it = node_.begin(); it != node_.end(); ++it) {
       auto key = it->first.as<std::string>();
       if (!consumed_.contains(key)) {
-        throw std::runtime_error(
-          context_.empty()
-            ? "unknown config key: '" + key + "'"
-            : "unknown config key: '" + key + "' in " + context_);
+        throw std::runtime_error(context_.empty()
+                                   ? "unknown config key: '" + key + "'"
+                                   : "unknown config key: '" + key + "' in " + context_);
       }
     }
   }
@@ -344,8 +350,7 @@ class reader {
     return {};
   }
 
-  [[nodiscard]] std::string format_error(const std::string& key,
-                                         const std::string& msg) const
+  [[nodiscard]] std::string format_error(const std::string& key, const std::string& msg) const
   {
     if (context_.empty()) return "'" + key + "': " + msg;
     return "'" + context_ + "." + key + "': " + msg;
