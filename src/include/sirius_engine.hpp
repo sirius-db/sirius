@@ -43,6 +43,7 @@ class sirius_physical_table_scan;
 
 namespace sirius {
 
+struct operator_params;
 class sirius_interface;
 
 class sirius_engine {
@@ -127,6 +128,71 @@ class sirius_engine {
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
+
+ private:
+  // --- initialize_internal decomposition ---
+
+  //! Schedule meta-pipelines in dependency order and deep-copy them
+  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> schedule_and_copy_pipelines(
+    pipeline::sirius_meta_pipeline& root_pipeline);
+
+  //! Main pipeline splitting orchestrator
+  void split_pipelines(
+    duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& copied_scheduled,
+    const sirius::operator_params& op_params);
+
+  //! Replace TABLE_SCAN source with concrete scan operator (DUCKDB_SCAN/PARQUET_SCAN/ICEBERG_SCAN)
+  void split_table_scan_source(duckdb::shared_ptr<pipeline::sirius_pipeline>& current_pipeline);
+
+  //! Split intermediate joins (HASH_JOIN/NESTED_LOOP_JOIN in operators, not sink)
+  void split_intermediate_joins(duckdb::shared_ptr<pipeline::sirius_pipeline>& current_pipeline,
+                                const sirius::operator_params& op_params);
+
+  //! Split HASH_JOIN/NESTED_LOOP_JOIN sink with PARTITION -> CONCAT
+  void split_join_sink(duckdb::shared_ptr<pipeline::sirius_pipeline>& current_pipeline,
+                       const sirius::operator_params& op_params);
+
+  //! Split HASH_GROUP_BY/UNGROUPED_AGGREGATE sink with PARTITION -> MERGE
+  void split_group_aggregate_sink(
+    duckdb::shared_ptr<pipeline::sirius_pipeline>& current_pipeline,
+    duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& copied_scheduled,
+    size_t pipeline_idx,
+    const sirius::operator_params& op_params);
+
+  //! Split ORDER_BY sink with SORT_SAMPLE -> SORT_PARTITION -> MERGE_SORT
+  void split_order_by_sink(
+    duckdb::shared_ptr<pipeline::sirius_pipeline>& current_pipeline,
+    duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& copied_scheduled,
+    size_t pipeline_idx,
+    const sirius::operator_params& op_params);
+
+  //! Split TOP_N sink with MERGE_TOP_N
+  void split_top_n_sink(
+    duckdb::shared_ptr<pipeline::sirius_pipeline>& current_pipeline,
+    duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& copied_scheduled,
+    size_t pipeline_idx);
+
+  //! Split LEFT_DELIM_JOIN/RIGHT_DELIM_JOIN sink
+  void split_delim_join_sink(
+    duckdb::shared_ptr<pipeline::sirius_pipeline>& current_pipeline,
+    duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& copied_scheduled,
+    size_t pipeline_idx,
+    const sirius::operator_params& op_params);
+
+  //! Build source-to-pipeline map, assign pipeline IDs, create data repositories
+  void wire_data_repositories();
+
+  //! Set pipeline parents from sink->next_port_after_sink
+  void setup_pipeline_parents();
+
+  //! Push sink into operators vector, set source alias, wire dependencies
+  void finalize_pipeline_structure();
+
+  //! Link build/probe partition operators for coordinated hashing
+  void link_join_partition_siblings();
+
+  //! Log detailed pipeline debug info
+  void log_pipeline_debug_info() const;
 };
 
 }  // namespace sirius
