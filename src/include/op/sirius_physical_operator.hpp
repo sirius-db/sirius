@@ -28,6 +28,7 @@
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/types.hpp"
+#include "op/column_property.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 
 #include <cucascade/data/data_batch.hpp>
@@ -131,6 +132,7 @@ class sirius_physical_operator {
       estimated_cardinality(estimated_cardinality),
       operator_id(next_operator_id++)
   {
+    output_column_properties.resize(this->types.size());
   }
   sirius_physical_operator() : operator_id(next_operator_id++) {}
   virtual ~sirius_physical_operator() {}
@@ -141,6 +143,8 @@ class sirius_physical_operator {
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
   duckdb::vector<duckdb::LogicalType> types;
+  //! Per-column metadata (e.g., uniqueness) for this operator's output columns
+  std::vector<column_property> output_column_properties;
   //! The estimated cardinality of this physical operator
   duckdb::idx_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
@@ -166,6 +170,20 @@ class sirius_physical_operator {
 
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<duckdb::LogicalType>& get_types() const { return types; }
+
+  //! Return per-column property metadata for this operator's output
+  const std::vector<column_property>& get_output_column_properties() const
+  {
+    return output_column_properties;
+  }
+
+  //! Copy output column properties from a child operator (1:1 column mapping)
+  void propagate_column_properties_from_child(size_t child_idx = 0)
+  {
+    if (child_idx < children.size() && children[child_idx]) {
+      output_column_properties = children[child_idx]->output_column_properties;
+    }
+  }
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }

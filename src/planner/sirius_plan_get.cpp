@@ -14,15 +14,62 @@
  * limitations under the License.
  */
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-// #include "duckdb/common/types.hpp"
 
 namespace sirius::planner {
+
+/// Mark output columns as unique based on single-column UNIQUE/PRIMARY KEY constraints.
+/// table must be obtained via op.GetTable() BEFORE op.bind_data is moved away.
+static void mark_unique_columns_from_constraints(
+  duckdb::optional_ptr<duckdb::TableCatalogEntry> table,
+  sirius::op::sirius_physical_table_scan& node)
+{
+  if (!table) { return; }
+
+  auto& constraints = table->GetConstraints();
+  for (auto& constraint : constraints) {
+    if (constraint->type != duckdb::ConstraintType::UNIQUE) { continue; }
+    auto& unique_constraint = constraint->Cast<duckdb::UniqueConstraint>();
+    // Only handle single-column constraints (HasIndex() is true for index-based single-column)
+    if (!unique_constraint.HasIndex()) { continue; }
+    auto table_col_idx = unique_constraint.GetIndex().index;
+
+    // Find which position in column_ids corresponds to this table column
+    duckdb::optional_idx col_ids_pos;
+    for (duckdb::idx_t i = 0; i < node.column_ids.size(); i++) {
+      if (node.column_ids[i].GetPrimaryIndex() == table_col_idx) {
+        col_ids_pos = i;
+        break;
+      }
+    }
+    if (!col_ids_pos.IsValid()) { continue; }
+
+    // Map through projection_ids to find the output index
+    if (!node.projection_ids.empty()) {
+      for (duckdb::idx_t out_idx = 0; out_idx < node.projection_ids.size(); out_idx++) {
+        if (node.projection_ids[out_idx] == col_ids_pos.GetIndex()) {
+          if (out_idx < node.output_column_properties.size()) {
+            node.output_column_properties[out_idx].is_unique = true;
+          }
+          break;
+        }
+      }
+    } else {
+      // No projection_ids: output maps 1:1 with column_ids
+      auto out_idx = col_ids_pos.GetIndex();
+      if (out_idx < node.output_column_properties.size()) {
+        node.output_column_properties[out_idx].is_unique = true;
+      }
+    }
+  }
+}
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
   duckdb::TableFilterSet& table_filters, const duckdb::vector<duckdb::ColumnIndex>& column_ids)
@@ -50,6 +97,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
+
+  // Save table pointer before bind_data is moved into the scan node.
+  // GetTable() requires bind_data, which will be consumed by make_uniq below.
+  auto table_entry = op.GetTable();
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
@@ -146,6 +197,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                                                                 std::move(op.extra_info),
                                                                 std::move(op.parameters),
                                                                 std::move(op.virtual_columns));
+    mark_unique_columns_from_constraints(table_entry, *node);
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -160,6 +212,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // in that case we just return the node
         if (filter) {
           filter->children.push_back(std::move(node));
+          filter->propagate_column_properties_from_child();
           return std::move(filter);
         }
         return std::move(node);
@@ -183,9 +236,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         std::move(types), std::move(expressions), op.estimated_cardinality);
     if (filter) {
       filter->children.push_back(std::move(node));
+      filter->propagate_column_properties_from_child();
       projection->children.push_back(std::move(filter));
     } else {
       projection->children.push_back(std::move(node));
+    }
+    // Propagate uniqueness: each output column i maps to child column column_ids[i]
+    auto& child_props = projection->children[0]->output_column_properties;
+    for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+      auto col_id = column_ids[i].GetPrimaryIndex();
+      if (col_id < child_props.size()) {
+        projection->output_column_properties[i] = child_props[col_id];
+      }
     }
     return std::move(projection);
   }
@@ -203,9 +265,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns));
+  mark_unique_columns_from_constraints(table_entry, *node);
   node->dynamic_filters = op.dynamic_filters;
   if (filter) {
     filter->children.push_back(std::move(node));
+    filter->propagate_column_properties_from_child();
     return std::move(filter);
   }
   return std::move(node);

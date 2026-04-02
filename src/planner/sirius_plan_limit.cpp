@@ -71,6 +71,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalLimit& op)
   }
 
   limit->children.push_back(std::move(plan));
+  limit->propagate_column_properties_from_child();
   return limit;
 }
 

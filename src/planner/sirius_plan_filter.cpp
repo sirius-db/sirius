@@ -33,6 +33,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
     auto filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(
       plan->types, std::move(op.expressions), op.estimated_cardinality);
     filter->children.push_back(std::move(plan));
+    filter->propagate_column_properties_from_child();
     plan = std::move(filter);
   }
   if (op.HasProjectionMap()) {
@@ -45,6 +46,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
     auto proj = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
       op.types, std::move(select_list), op.estimated_cardinality);
     proj->children.push_back(std::move(plan));
+    for (duckdb::idx_t i = 0; i < op.projection_map.size(); i++) {
+      auto src_idx = op.projection_map[i];
+      if (src_idx < proj->children[0]->output_column_properties.size()) {
+        proj->output_column_properties[i] = proj->children[0]->output_column_properties[src_idx];
+      }
+    }
     plan = std::move(proj);
   }
   return plan;

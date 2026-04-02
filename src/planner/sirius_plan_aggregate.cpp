@@ -31,6 +31,18 @@
 
 namespace sirius::planner {
 
+/// Mark group key columns as unique on a grouped aggregate operator.
+/// GROUP BY output keys are always unique by definition.
+static void mark_group_keys_unique(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& op)
+{
+  auto& agg = op->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  for (size_t i = 0; i < agg.group_idx.size(); i++) {
+    if (i < op->output_column_properties.size()) {
+      op->output_column_properties[i].is_unique = true;
+    }
+  }
+}
+
 static uint32_t required_bits_for_value(uint32_t n)
 {
   duckdb::idx_t required_bits = 0;
@@ -273,6 +285,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
                                              sirius::op::sirius_physical_ungrouped_aggregate>(
         op.types, std::move(op.expressions), op.estimated_cardinality, op.distinct_validity);
       group_by->children.push_back(std::move(plan));
+      // Ungrouped aggregate output is a single row — all columns are trivially unique
+      for (auto& prop : group_by->output_column_properties) {
+        prop.is_unique = true;
+      }
       return group_by;
     }
     throw duckdb::NotImplementedException("Non simple aggregation is not supported");
@@ -306,6 +322,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       group_validity,
       op.distinct_validity);
     group_by->children.push_back(std::move(plan));
+    mark_group_keys_unique(group_by);
     return group_by;
   }
 
@@ -328,6 +345,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       group_validity,
       op.distinct_validity);
     group_by->children.push_back(std::move(plan));
+    mark_group_keys_unique(group_by);
     return group_by;
   }
 
@@ -343,6 +361,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     group_validity,
     op.distinct_validity);
   group_by->children.push_back(std::move(plan));
+  mark_group_keys_unique(group_by);
   return group_by;
 }
 
