@@ -35,26 +35,10 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <cstdio>
-#include <numeric>
 #include <unordered_set>
 
 namespace sirius {
 namespace op {
-
-/// Create a device_uvector containing the sequence [0, 1, 2, ..., num_rows-1].
-static std::unique_ptr<rmm::device_uvector<cudf::size_type>> make_sequential_indices(
-  cudf::size_type num_rows, rmm::cuda_stream_view stream)
-{
-  auto indices  = std::make_unique<rmm::device_uvector<cudf::size_type>>(num_rows, stream);
-  auto host_seq = std::vector<cudf::size_type>(num_rows);
-  std::iota(host_seq.begin(), host_seq.end(), 0);
-  cudaMemcpyAsync(indices->data(),
-                  host_seq.data(),
-                  num_rows * sizeof(cudf::size_type),
-                  cudaMemcpyHostToDevice,
-                  stream.value());
-  return indices;
-}
 
 /// Recursively collect all BoundReferenceExpression indices from an expression tree.
 static void collect_bound_ref_indices(duckdb::Expression& expr,
@@ -813,14 +797,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         _build_table              = std::move(build_batch);
-        if (unique_build_keys &&
-            (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
-          _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
-            build_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
-        } else {
-          _hash_table =
-            std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
-        }
+        _hash_table.build(build_keys, unique_build_keys, cudf::null_equality::UNEQUAL, stream);
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
                                // batches to proceed.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
@@ -838,28 +815,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       cudf::table_view probe_keys = probe_keys_result.keys;
 
       if (join_type == duckdb::JoinType::INNER) {
-        if (_distinct_hash_table) {
-          auto result   = _distinct_hash_table->inner_join(probe_keys, stream);
-          left_indices  = std::move(result.first);
-          right_indices = std::move(result.second);
-        } else {
-          auto result   = _hash_table->inner_join(probe_keys, {}, stream);
-          left_indices  = std::move(result.first);
-          right_indices = std::move(result.second);
-        }
+        auto result   = _hash_table.inner_join(probe_keys, stream);
+        left_indices  = std::move(result.first);
+        right_indices = std::move(result.second);
       } else if (join_type == duckdb::JoinType::LEFT) {
-        if (_distinct_hash_table) {
-          // distinct_hash_join::left_join returns only build indices; probe indices are 0..N-1
-          right_indices = _distinct_hash_table->left_join(probe_keys, stream);
-          left_indices  = make_sequential_indices(
-            static_cast<cudf::size_type>(right_indices->size()), stream);
-        } else {
-          auto result   = _hash_table->left_join(probe_keys, {}, stream);
-          left_indices  = std::move(result.first);
-          right_indices = std::move(result.second);
-        }
+        auto result   = _hash_table.left_join(probe_keys, stream);
+        left_indices  = std::move(result.first);
+        right_indices = std::move(result.second);
       } else if (join_type == duckdb::JoinType::OUTER) {
-        auto result   = _hash_table->full_join(probe_keys, {}, stream);
+        auto result   = _hash_table.full_join(probe_keys, stream);
         left_indices  = std::move(result.first);
         right_indices = std::move(result.second);
       } else {
@@ -1046,30 +1010,28 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     cudf::table_view left_keys  = left_keys_result.keys;
     cudf::table_view right_keys = right_keys_result.keys;
 
-    if (join_type == duckdb::JoinType::INNER) {
-      if (unique_build_keys) {
-        cudf::distinct_hash_join ht(right_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
-        auto join_result = ht.inner_join(left_keys, stream);
-        left_indices     = std::move(join_result.first);
-        right_indices    = std::move(join_result.second);
-      } else {
-        auto join_result =
-          cudf::inner_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
-        left_indices  = std::move(join_result.first);
-        right_indices = std::move(join_result.second);
-      }
+    if (join_type == duckdb::JoinType::INNER && unique_build_keys) {
+      build_hash_table ht;
+      ht.build(right_keys, true, cudf::null_equality::UNEQUAL, stream);
+      auto result   = ht.inner_join(left_keys, stream);
+      left_indices  = std::move(result.first);
+      right_indices = std::move(result.second);
+    } else if (join_type == duckdb::JoinType::INNER) {
+      auto join_result =
+        cudf::inner_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
+      left_indices  = std::move(join_result.first);
+      right_indices = std::move(join_result.second);
+    } else if (join_type == duckdb::JoinType::LEFT && unique_build_keys) {
+      build_hash_table ht;
+      ht.build(right_keys, true, cudf::null_equality::UNEQUAL, stream);
+      auto result   = ht.left_join(left_keys, stream);
+      left_indices  = std::move(result.first);
+      right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::LEFT) {
-      if (unique_build_keys) {
-        cudf::distinct_hash_join ht(right_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
-        right_indices = ht.left_join(left_keys, stream);
-        left_indices  = make_sequential_indices(
-          static_cast<cudf::size_type>(right_indices->size()), stream);
-      } else {
-        auto join_result =
-          cudf::left_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
-        left_indices  = std::move(join_result.first);
-        right_indices = std::move(join_result.second);
-      }
+      auto join_result =
+        cudf::left_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
+      left_indices  = std::move(join_result.first);
+      right_indices = std::move(join_result.second);
     } else if (join_type == duckdb::JoinType::RIGHT) {
       auto join_result =
         cudf::left_join(right_keys, left_keys, cudf::null_equality::UNEQUAL, stream);
@@ -1125,7 +1087,6 @@ void sirius_physical_hash_join::finalize_operator()
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
-    _distinct_hash_table.reset();
     _build_table.reset();
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;

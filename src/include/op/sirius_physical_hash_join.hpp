@@ -25,6 +25,7 @@
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "op/build_hash_table.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -162,9 +163,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::STANDARD;
   BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
   uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
-  std::unique_ptr<cudf::hash_join> _hash_table;  // generic hash join (BUILD_PROBE mode)
-  std::unique_ptr<cudf::distinct_hash_join>
-    _distinct_hash_table;  // distinct hash join for unique build keys (BUILD_PROBE only)
+  build_hash_table _hash_table;
   std::shared_ptr<::cucascade::data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>

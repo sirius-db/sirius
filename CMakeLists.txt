@@ -104,6 +104,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_filter.cpp
     src/op/sirius_physical_grouped_aggregate.cpp
     src/op/sirius_physical_grouped_aggregate_merge.cpp
+    src/op/build_hash_table.cpp
     src/op/sirius_physical_hash_join.cpp
     src/op/sirius_physical_limit.cpp
     src/op/sirius_physical_merge_sort.cpp
