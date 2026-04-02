@@ -392,6 +392,15 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 "transfer_complete: packed cudf buffer received, storing for GPU-direct registration"
             );
 
+            // Move the staging lease from pending_buffers into the PackedGpuExchange.
+            // This keeps the RECV staging region alive until the exchange fragment
+            // consumes and finalizes the data (cudf::concatenate reads from staging).
+            let staging_lease = self.pending_buffers.lock().unwrap().remove(&pending_key)
+                .and_then(|pb| match pb {
+                    PendingDstBuffers::Staged(mut leases) => leases.pop(),
+                    _ => None,
+                });
+
             let key = crate::exchange_buffer::ExchangeKey {
                 query_id: (query_id_hi, query_id_lo),
                 node_id: req.node_id,
@@ -402,6 +411,7 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                     gpu_addr: dst_buf.addr as usize,
                     gpu_size: dst_buf.len as usize,
                     cudf_metadata: req.packed_cudf_metadata.clone(),
+                    _staging_lease: staging_lease,
                 },
             );
             // Signal EOS (no PBlock data — the exchange task will use packed GPU path).
@@ -413,98 +423,22 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             }));
         }
 
-        // Fallback: D2H GPU buffer reconstruction → PBlock path.
-        let ipc_bytes = if !req.dst_null_masks.is_empty() {
-            // Sub-buffer info available — try D2H reconstruction.
-            // Run D2H on a blocking thread to avoid stalling the tokio runtime.
-            let dst_buffers = req.dst_buffers.clone();
-            let dst_null_masks = req.dst_null_masks.clone();
-            let dst_offsets = req.dst_offsets.clone();
-            let columns = req.columns.clone();
-            let null_counts = req.null_counts.clone();
-            let num_rows = req.num_rows;
-
-            let d2h_result = tokio::task::spawn_blocking(move || {
-                crate::gpu_buffer_reconstruct::reconstruct_ipc_from_gpu_buffers(
-                    &dst_buffers,
-                    &dst_null_masks,
-                    &dst_offsets,
-                    &columns,
-                    &null_counts,
-                    num_rows,
-                )
-            })
-            .await
-            .map_err(|e| format!("D2H spawn_blocking: {e}"))
-            .and_then(|r| r);
-
-            match d2h_result {
-                Ok(ipc) => {
-                    info!(
-                        ipc_len = ipc.len(),
-                        "transfer_complete: reconstructed Arrow IPC from GPU buffers (D2H)"
-                    );
-                    ipc
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "GPU buffer reconstruction failed, falling back to gRPC IPC"
-                    );
-                    req.arrow_ipc_data.clone()
-                }
-            }
-        } else {
-            // No sub-buffer info — use gRPC IPC fallback (old protocol).
-            req.arrow_ipc_data.clone()
-        };
-
-        // Now free destination GPU buffers (deregister + cuda_free).
-        let removed = self.pending_buffers.lock().unwrap().remove(&pending_key);
-        let (freed_count, was_staged) = match &removed {
-            Some(PendingDstBuffers::Registered(r)) => (r.len(), false),
-            Some(PendingDstBuffers::Staged(s)) => (s.len(), true),
-            None => (0, false),
-        };
-        info!(
-            freed = freed_count,
-            was_staged,
-            "transfer_complete: released pending GPU buffers"
+        // All nixl transfers must use packed cudf format. The legacy per-column
+        // D2H path (reconstruct_ipc_from_gpu_buffers) has been removed.
+        warn!(
+            "transfer_complete: received non-packed transfer (packed_cudf_metadata is empty). \
+             All nixl transfers must use cudf::pack format."
         );
+
+        // Free any pending destination GPU buffers.
+        let removed = self.pending_buffers.lock().unwrap().remove(&pending_key);
         drop(removed);
 
-        // Convert Arrow IPC to PBlock.
-        let (pblock, _num_rows) = match crate::arrow_to_pblock::arrow_ipc_to_pblock(&ipc_bytes) {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(error = %e, "arrow_ipc_to_pblock failed in transfer_complete");
-                return Ok(Response::new(PNixlTransferCompleteResponse {
-                    status_code: 1,
-                    error_msgs: vec![format!("arrow_ipc_to_pblock: {e}")],
-                }));
-            }
-        };
-
-        // Feed into ExchangeBuffer and signal EOS for this sender.
-        let key = crate::exchange_buffer::ExchangeKey {
-            query_id: (query_id_hi, query_id_lo),
-            node_id: req.node_id,
-        };
-
-        self.exchange_buffer.add_block(&key, req.sender_id, Some(pblock), false);
-        let all_done = self.exchange_buffer.add_block(&key, req.sender_id, None, true);
-
-        info!(
-            query_id = ?(query_id_hi, query_id_lo),
-            node_id = req.node_id,
-            sender_id = req.sender_id,
-            all_done,
-            "transfer_complete: fed PBlock into ExchangeBuffer"
-        );
-
         Ok(Response::new(PNixlTransferCompleteResponse {
-            status_code: 0,
-            error_msgs: vec![],
+            status_code: 1,
+            error_msgs: vec![
+                "non-packed nixl transfer not supported — all transfers must use cudf::pack format".into()
+            ],
         }))
     }
 

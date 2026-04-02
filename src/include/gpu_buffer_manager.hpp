@@ -161,6 +161,12 @@ class GPUBufferManager {
                              const cudf::table_view& view,
                              const vector<string>& column_names);
 
+  /// Finalize all exchange tables that have pending views.
+  /// Runs cudf::concatenate to materialize views into owned cudf::tables.
+  /// Must be called BEFORE the staging buffer is reused (e.g. before
+  /// BeginSession() on a new fragment that packs into the same staging).
+  void finalizeExchangeTables();
+
  private:
   // Private constructor
   GPUBufferManager(size_t cache_size_per_gpu,

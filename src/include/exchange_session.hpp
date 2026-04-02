@@ -30,6 +30,27 @@ struct PackedPartition {
   size_t packed_size;
   std::unique_ptr<std::vector<uint8_t>> metadata;
   int32_t num_rows;
+
+  /// When non-zero, this partition overflowed the staging buffer and was packed
+  /// into a separate rmm::device_buffer at this address. The staging_offset
+  /// field is unused in this case.
+  uintptr_t overflow_gpu_addr = 0;
+  /// Owns the rmm::device_buffer backing overflow_gpu_addr (RAII).
+  std::shared_ptr<void> overflow_data;
+};
+
+/// Packed GPU buffer for a single batch in the broadcast path.
+/// Mirrors PackedPartition but is used for the broadcast accumulation path
+/// where each input batch is independently packed into the staging buffer.
+struct PackedBroadcastEntry {
+  size_t staging_offset;
+  size_t packed_size;
+  std::unique_ptr<std::vector<uint8_t>> metadata;
+  int32_t num_rows;
+
+  /// Overflow fields (same semantics as PackedPartition).
+  uintptr_t overflow_gpu_addr = 0;
+  std::shared_ptr<void> overflow_data;
 };
 
 /// Per-execution exchange session holding all GPU buffer state for a single
@@ -60,6 +81,8 @@ class ExchangeSession {
 
   // Per-partition packed data (accumulated across batches)
   std::vector<PackedPartition> packed_partitions;
+  // Per-batch broadcast packed data (accumulated across batches)
+  std::vector<PackedBroadcastEntry> packed_broadcast_entries;
   size_t staging_offset = 0;
 
   // --- Retained data (keeps GPU memory alive until transfer done) ---
@@ -87,6 +110,11 @@ class ExchangeSession {
     for (auto& p : parts) {
       packed_partitions.push_back(std::move(p));
     }
+  }
+
+  /// Accumulate a single broadcast packed entry from one input batch.
+  void accumulate_broadcast(PackedBroadcastEntry entry) {
+    packed_broadcast_entries.push_back(std::move(entry));
   }
 
   /// Keep a type-erased reference to GPU data alive.

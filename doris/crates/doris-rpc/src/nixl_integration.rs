@@ -44,6 +44,9 @@ pub enum ExecutionLocation {
         /// Per-partition packed buffers from GPU hash_partition + chunked_pack.
         /// When present, each entry has (staging_offset, size, cudf_metadata, num_rows).
         packed_partitions: Vec<sirius_ffi::PackedPartition>,
+        /// Per-batch broadcast packed buffers. When present, each entry is a
+        /// packed cudf buffer that should be sent to ALL exchange destinations.
+        packed_broadcast: Vec<sirius_ffi::PackedBroadcastEntry>,
     },
 }
 
@@ -64,6 +67,37 @@ impl ExecutionLocation {
             _staging_leases: vec![],
             packed_metadata: Some(metadata),
             packed_partitions: vec![],
+            packed_broadcast: vec![],
+        }
+    }
+
+    /// Create a GPU location from broadcast packed entries.
+    ///
+    /// Used when the broadcast path accumulates per-batch packed GPU buffers
+    /// in the staging region.
+    pub fn from_broadcast_entries(
+        staging_addr: usize,
+        entries: Vec<sirius_ffi::PackedBroadcastEntry>,
+        ipc_bytes: Vec<u8>,
+    ) -> Self {
+        Self::Gpu {
+            buffers: vec![GpuBufferDesc { addr: staging_addr, len: 0, device_id: 0 }],
+            column_info: vec![],
+            column_buffers: vec![],
+            num_rows: entries.iter().map(|e| e.num_rows).sum(),
+            schema_ipc: vec![],
+            ipc_bytes,
+            _staging_leases: vec![],
+            packed_metadata: None,
+            packed_partitions: vec![],
+            packed_broadcast: entries,
+        }
+    }
+
+    /// Store per-batch broadcast packed GPU buffers.
+    pub fn set_packed_broadcast(&mut self, entries: Vec<sirius_ffi::PackedBroadcastEntry>) {
+        if let Self::Gpu { packed_broadcast, .. } = self {
+            *packed_broadcast = entries;
         }
     }
 
@@ -266,6 +300,7 @@ pub fn detect_execution_location(
                     _staging_leases: vec![],
                     packed_metadata: None,
                     packed_partitions: vec![],
+                    packed_broadcast: vec![],
                 };
             }
             Ok(None) => {
@@ -322,9 +357,10 @@ pub async fn send_exchange_with_nixl(
     }
 
     // Extract packed info from location (if available).
-    let (packed_metadata, buffers) = match &location {
-        ExecutionLocation::Gpu { packed_metadata, buffers, .. } => (packed_metadata.as_deref(), buffers.as_slice()),
-        _ => (None, &[][..]),
+    let (packed_metadata, buffers, packed_broadcast) = match &location {
+        ExecutionLocation::Gpu { packed_metadata, buffers, packed_broadcast, .. } =>
+            (packed_metadata.as_deref(), buffers.as_slice(), packed_broadcast.as_slice()),
+        _ => (None, &[][..], &[][..]),
     };
 
     // Broadcast / Random: send all rows to all destinations (existing behavior).
@@ -338,7 +374,33 @@ pub async fn send_exchange_with_nixl(
     for dest in &local_dests {
         let key = ExchangeKey { query_id, node_id };
 
-        // If packed GPU data is available, store it directly — no PBlock needed.
+        // Broadcast packed entries: store each entry as PackedGpuExchange.
+        if !packed_broadcast.is_empty() {
+            let staging_base = buffers.first().map(|b| b.addr).unwrap_or(0);
+            for entry in packed_broadcast {
+                if entry.packed_size == 0 { continue; }
+                let gpu_addr = if entry.overflow_gpu_addr != 0 {
+                    entry.overflow_gpu_addr
+                } else {
+                    staging_base + entry.staging_offset
+                };
+                exchange_buffer.store_packed_gpu(
+                    key.clone(),
+                    PackedGpuExchange {
+                        gpu_addr,
+                        gpu_size: entry.packed_size,
+                        cudf_metadata: entry.metadata.clone(),
+                        _staging_lease: None,
+                    },
+                );
+            }
+            exchange_buffer.add_block(&key, sender_id, None, true);
+            tracing::info!(dest = %dest.brpc_addr, sender_id, num_entries = packed_broadcast.len(),
+                          "self-transfer: broadcast packed GPU path complete");
+            continue;
+        }
+
+        // Single packed GPU data: store directly.
         if let Some(ref md) = packed_metadata {
             if let Some(buf) = buffers.first() {
                 tracing::info!(
@@ -353,6 +415,7 @@ pub async fn send_exchange_with_nixl(
                         gpu_addr: buf.addr,
                         gpu_size: buf.len,
                         cudf_metadata: md.to_vec(),
+                        _staging_lease: None,
                     },
                 );
                 exchange_buffer.add_block(&key, sender_id, None, true);
@@ -403,6 +466,7 @@ pub async fn send_exchange_with_nixl(
             _staging_leases,
             packed_partitions: _,
             packed_metadata,
+            packed_broadcast,
         } => {
             let Some(agent) = nixl_agent else {
                 if nixl_only {
@@ -424,6 +488,44 @@ pub async fn send_exchange_with_nixl(
                 return crate::exchange_sender::send_exchange_result(
                     &ipc_bytes, &remote_dests, query_id, node_id, sender_id,
                 ).await;
+            }
+
+            // Broadcast with packed entries: send each entry to all destinations.
+            if !packed_broadcast.is_empty() {
+                tracing::info!(
+                    num_entries = packed_broadcast.len(),
+                    num_dests = remote_dests.len(),
+                    "sending broadcast GPU exchange data (per-batch packed)"
+                );
+                let staging_base = buffers.first().map(|b| b.addr).unwrap_or(0);
+                for entry in &packed_broadcast {
+                    if entry.packed_size == 0 { continue; }
+                    // Determine the GPU address of this entry.
+                    let gpu_addr = if entry.overflow_gpu_addr != 0 {
+                        entry.overflow_gpu_addr
+                    } else {
+                        staging_base + entry.staging_offset
+                    };
+                    let buf_desc = GpuBufferDesc { addr: gpu_addr, len: entry.packed_size, device_id: 0 };
+
+                    for dest in &remote_dests {
+                        if let Err(e) = send_nixl_to_peer(
+                            agent, &[buf_desc.clone()], &[], &[], entry.num_rows,
+                            &ipc_bytes, dest, query_id, node_id, sender_id,
+                            true, Some(&entry.metadata),
+                        ).await {
+                            if nixl_only {
+                                return Err(format!("nixl-only: broadcast nixl transfer to {} failed: {}", dest.brpc_addr, e));
+                            }
+                            tracing::warn!(error = %e, dest = %dest.brpc_addr, "broadcast nixl transfer failed, falling back to bRPC");
+                            crate::exchange_sender::send_exchange_result(
+                                &ipc_bytes, &remote_dests, query_id, node_id, sender_id,
+                            ).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                return Ok(());
             }
 
             // Packed buffers are always in the staging region.
@@ -520,7 +622,12 @@ async fn send_hash_partitioned(
                     let total_rows: u32 = dest_entries.iter().map(|e| e.num_rows).sum();
                     // Send each batch's partition data for this destination.
                     for p in &dest_entries {
-                        let part_addr = send_staging_base + p.staging_offset;
+                        // Use overflow address if partition didn't fit in staging.
+                        let part_addr = if p.overflow_gpu_addr != 0 {
+                            p.overflow_gpu_addr
+                        } else {
+                            send_staging_base + p.staging_offset
+                        };
 
                         if is_local {
                             exchange_buffer.store_packed_gpu(
@@ -529,21 +636,32 @@ async fn send_hash_partitioned(
                                     gpu_addr: part_addr,
                                     gpu_size: p.packed_size,
                                     cudf_metadata: p.metadata.clone(),
+                                    _staging_lease: None,
                                 },
                             );
                         } else if let Some(agent) = _nixl_agent {
+                            // Overflow buffers are not in the pre-registered staging region;
+                            // send_nixl_to_peer will handle registration (staged=false triggers
+                            // on-demand registration via register_gpu_buffers).
+                            let is_staged = p.overflow_gpu_addr == 0;
                             let part_buf = GpuBufferDesc { addr: part_addr, len: p.packed_size, device_id: 0 };
                             if let Err(e) = send_nixl_to_peer(
                                 agent, &[part_buf], &[], &[], p.num_rows,
                                 ipc_bytes, dest, query_id, node_id, sender_id,
-                                true, Some(&p.metadata),
+                                is_staged, Some(&p.metadata),
                             ).await {
+                                if _nixl_only {
+                                    return Err(format!("nixl-only: partition transfer to {} failed: {}", dest.brpc_addr, e));
+                                }
                                 tracing::warn!(error = %e, dest_idx, "nixl partition transfer failed, falling back to bRPC");
                                 crate::exchange_sender::send_exchange_result(
                                     ipc_bytes, &[dest.clone()], query_id, node_id, sender_id,
                                 ).await?;
                             }
                         } else {
+                            if _nixl_only {
+                                return Err("nixl-only: no nixl agent for hash partition transfer".to_string());
+                            }
                             crate::exchange_sender::send_exchange_result(
                                 ipc_bytes, &[dest.clone()], query_id, node_id, sender_id,
                             ).await?;
@@ -938,7 +1056,7 @@ pub async fn send_nixl_to_peer(
             .collect(),
         num_rows,
         sender_id,
-        arrow_ipc_data: ipc_bytes.to_vec(),
+        arrow_ipc_data: vec![], // No longer sent — all transfers use packed cudf
         dst_null_masks: response.dst_null_masks,
         dst_offsets: response.dst_offsets,
         null_counts,
@@ -1077,6 +1195,7 @@ mod tests {
             _staging_leases: vec![],
                     packed_metadata: None,
                     packed_partitions: vec![],
+                    packed_broadcast: vec![],
         };
         assert_eq!(location.into_ipc_bytes(), ipc);
     }
@@ -1102,6 +1221,7 @@ mod tests {
             _staging_leases: vec![],
                     packed_metadata: None,
                     packed_partitions: vec![],
+                    packed_broadcast: vec![],
         };
         match location {
             ExecutionLocation::Gpu { buffers, num_rows, _staging_leases, .. } => {
@@ -1132,6 +1252,7 @@ mod tests {
             _staging_leases: vec![],
                     packed_metadata: None,
                     packed_partitions: vec![],
+                    packed_broadcast: vec![],
         };
         let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
         let dests = vec![ExchangeDest {
@@ -1169,6 +1290,7 @@ mod tests {
             _staging_leases: vec![],
                     packed_metadata: None,
                     packed_partitions: vec![],
+                    packed_broadcast: vec![],
         };
         let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
         let dests = vec![ExchangeDest {

@@ -120,7 +120,76 @@ impl Drop for NixlRegisteredBuffer {
     }
 }
 
-/// Cached RMM pool registration info.
+/// Tracks GPU-direct transfer health with adaptive cooldown.
+///
+/// Instead of permanently disabling GPU transfers on the first timeout,
+/// uses a 3-strike cooldown: after 3 consecutive failures, disables for
+/// 60 seconds, then re-enables. Successful transfers reset the counter.
+struct TransferHealth {
+    consecutive_failures: std::sync::atomic::AtomicU32,
+    disabled_until: Mutex<Option<std::time::Instant>>,
+}
+
+impl TransferHealth {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+            disabled_until: Mutex::new(None),
+        }
+    }
+
+    /// Check if GPU transfers are currently enabled.
+    fn is_enabled(&self) -> bool {
+        let guard = self.disabled_until.lock().unwrap();
+        match *guard {
+            None => true,
+            Some(until) => {
+                if std::time::Instant::now() >= until {
+                    // Cooldown expired — re-enable.
+                    drop(guard);
+                    self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                    *self.disabled_until.lock().unwrap() = None;
+                    info!("GPU-direct transfers re-enabled after cooldown");
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Record a successful transfer.
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a transfer failure. Returns true if transfers are now disabled.
+    fn record_failure(&self) -> bool {
+        let failures = self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if failures >= 3 {
+            let cooldown = std::time::Duration::from_secs(60);
+            *self.disabled_until.lock().unwrap() = Some(std::time::Instant::now() + cooldown);
+            warn!(
+                consecutive_failures = failures,
+                cooldown_secs = 60,
+                "GPU-direct transfers disabled for 60s cooldown after {} consecutive failures",
+                failures
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Compute timeout duration based on data size.
+    /// Base: 30s. Scales with data: +1s per 100MB.
+    fn timeout_for_size(&self, data_bytes: usize) -> std::time::Duration {
+        let base_secs = 30u64;
+        let size_secs = (data_bytes / (100 * 1024 * 1024)) as u64;
+        std::time::Duration::from_secs(base_secs + size_secs)
+    }
+}
+
 /// Wraps a nixl Agent with cached peer metadata.
 ///
 /// SAFETY: The UnsafeCell<Option<GpuStagingBuffer>> is only mutated at startup
@@ -132,10 +201,8 @@ pub struct NixlExchange {
     backend: Backend,
     /// Cache of loaded remote agent metadata: peer_addr → agent_name
     remote_agents: Mutex<HashMap<String, String>>,
-    /// Whether GPU-direct transfers are available (UCX has CUDA support).
-    /// Starts `true`, set to `false` on first transfer timeout (indicates
-    /// UCX cannot handle GPU memory on this system).
-    gpu_transfer_enabled: std::sync::atomic::AtomicBool,
+    /// GPU-direct transfer health tracking with adaptive cooldown.
+    transfer_health: TransferHealth,
     /// Pre-allocated GPU staging buffer for nixl transfers. When present,
     /// source buffers are packed into this buffer via cudf::chunked_pack.
     /// UnsafeCell allows mutation at startup via register_staging_from_addr.
@@ -219,7 +286,7 @@ impl NixlExchange {
             agent,
             backend,
             remote_agents: Mutex::new(HashMap::new()),
-            gpu_transfer_enabled: std::sync::atomic::AtomicBool::new(true),
+            transfer_health: TransferHealth::new(),
             staging: std::cell::UnsafeCell::new(staging),
             cached_metadata: Mutex::new(None),
         };
@@ -314,20 +381,20 @@ impl NixlExchange {
         self.get_fresh_metadata()
     }
 
-    /// Whether GPU-direct transfers (RDMA/UCX) are available.
+    /// Whether GPU-direct transfers (RDMA/UCX) are currently available.
     ///
-    /// Starts `true`, set to `false` on first transfer timeout. Callers
-    /// should check this before attempting `transfer_gpu_to_gpu`.
+    /// Uses adaptive cooldown: after 3 consecutive failures, disabled for 60s,
+    /// then automatically re-enabled.
     pub fn gpu_transfer_enabled(&self) -> bool {
-        self.gpu_transfer_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.transfer_health.is_enabled()
     }
 
-    /// Disable GPU-direct transfers (e.g. after a transfer timeout).
+    /// Force-disable GPU-direct transfers (for testing or manual override).
+    /// Internally records enough consecutive failures to trigger cooldown.
     pub fn disable_gpu_transfer(&self) {
-        warn!("disabling GPU-direct transfers (will use bRPC fallback)");
-        self.gpu_transfer_enabled
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3 {
+            self.transfer_health.record_failure();
+        }
     }
 
     /// Ensure the RMM pool containing `any_rmm_ptr` is registered with nixl.
@@ -523,6 +590,21 @@ impl NixlExchange {
         dst_descs: &XferDescList,
         remote_agent: &str,
     ) -> Result<(), String> {
+        self.transfer_gpu_to_gpu_with_size(src_descs, dst_descs, remote_agent, 0)
+    }
+
+    /// GPU-to-GPU transfer with data-size-based timeout.
+    ///
+    /// Timeout scales with data size: base 30s + 1s per 100MB.
+    /// On failure: records in TransferHealth. After 3 consecutive failures,
+    /// disables for 60s cooldown, then auto-re-enables.
+    pub fn transfer_gpu_to_gpu_with_size(
+        &self,
+        src_descs: &XferDescList,
+        dst_descs: &XferDescList,
+        remote_agent: &str,
+        data_bytes: usize,
+    ) -> Result<(), String> {
         let req = self
             .agent
             .create_xfer_req(XferOp::Write, src_descs, dst_descs, remote_agent, None)
@@ -534,14 +616,13 @@ impl NixlExchange {
             .map_err(|e| format!("post_xfer_req: {e}"))?;
 
         if !in_progress {
-            // Completed immediately
             info!("nixl transfer completed immediately");
+            self.transfer_health.record_success();
             return Ok(());
         }
 
-        // Poll until complete, with a timeout. On timeout, disable GPU-direct
-        // transfers for all future calls (UCX likely can't handle GPU memory).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let timeout = self.transfer_health.timeout_for_size(data_bytes);
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             match self
                 .agent
@@ -550,12 +631,16 @@ impl NixlExchange {
             {
                 XferStatus::Success => {
                     info!("nixl transfer complete");
+                    self.transfer_health.record_success();
                     return Ok(());
                 }
                 XferStatus::InProgress => {
                     if std::time::Instant::now() >= deadline {
-                        self.disable_gpu_transfer();
-                        return Err("nixl transfer timed out after 10s (UCX may not support GPU memory on this system)".to_string());
+                        self.transfer_health.record_failure();
+                        return Err(format!(
+                            "nixl transfer timed out after {}s (data_size={})",
+                            timeout.as_secs(), data_bytes
+                        ));
                     }
                     std::thread::yield_now();
                 }

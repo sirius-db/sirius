@@ -580,7 +580,17 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
     if (!table_name.empty()) {
       std::string up = table_name;
       std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+      // Strip schema prefix (e.g. "MEMORY.MAIN.__EXCH_..." → "__EXCH_...").
+      auto last_dot = up.rfind('.');
+      if (last_dot != std::string::npos) {
+        up = up.substr(last_dot + 1);
+      }
       auto it = bm.tables.find(up);
+      SIRIUS_LOG_INFO("[duckdb_scan_task] GPU-resident check: table='{}' found={} cols={} len={}",
+                      up, it != bm.tables.end(),
+                      (it != bm.tables.end() && it->second) ? it->second->columns.size() : 0,
+                      (it != bm.tables.end() && it->second && !it->second->columns.empty() && it->second->columns[0])
+                        ? it->second->columns[0]->column_length : 0);
       if (it != bm.tables.end() && !it->second->columns.empty() &&
           it->second->columns[0]->column_length > 0) {
         auto num_cached_rows = it->second->columns[0]->column_length;
@@ -599,6 +609,14 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
         SIRIUS_LOG_INFO("[duckdb_scan_task] table '{}' already GPU-resident ({} rows) — producing GPU batch directly",
                         table_name, num_cached_rows);
 
+        // Finalize pending views (concatenate multi-sender data) if not yet done.
+        if (!it->second->pending_views.empty()) {
+          try {
+            it->second->finalize_pending_views();
+          } catch (const std::exception& e) {
+            SIRIUS_LOG_ERROR("[duckdb_scan_task] finalize_pending_views failed: {}", e.what());
+          }
+        }
         auto* cached_ptr = it->second->packed_cudf_table;
         if (!cached_ptr) {
           SIRIUS_LOG_WARN("[duckdb_scan_task] no packed_cudf_table — falling through to DuckDB scan");

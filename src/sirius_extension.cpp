@@ -1632,6 +1632,15 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 
       SIRIUS_LOG_INFO("[register_packed_table] unpacked: {} cols, {} rows", num_cols, num_rows);
 
+      // Log column data pointers for debugging address validity.
+      for (cudf::size_type c = 0; c < num_cols && c < 3; c++) {
+        auto col = view.column(c);
+        auto data_addr = reinterpret_cast<uintptr_t>(col.data<uint8_t>());
+        SIRIUS_LOG_INFO("[register_packed_table] col {} type={} data=0x{:x} size={} null_count={}",
+                        c, static_cast<int>(col.type().id()), data_addr,
+                        col.size(), col.null_count());
+      }
+
       // Register the unpacked table_view directly in GPUBufferManager::tables.
       // Column pointers reference the packed buffer (zero-copy).
       // GPU scan operators will read directly from these pointers.
@@ -1763,8 +1772,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     };
     auto bind = [](ClientContext&, TableFunctionBindInput&,
                     vector<LogicalType>& return_types, vector<string>& names) -> unique_ptr<FunctionData> {
-      return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BLOB, LogicalType::INTEGER};
-      names = {"partition_id", "staging_offset", "packed_size", "metadata", "num_rows"};
+      return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BLOB, LogicalType::INTEGER, LogicalType::BIGINT};
+      names = {"partition_id", "staging_offset", "packed_size", "metadata", "num_rows", "overflow_gpu_addr"};
       auto result = make_uniq<GetPartData>();
       result->partitions = LastGPUBuffers::GetInstance().TakePackedPartitions();
       return std::move(result);
@@ -1783,12 +1792,77 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
           output.SetValue(3, count, Value(LogicalType::BLOB));
         }
         output.SetValue(4, count, Value::INTEGER(p.num_rows));
+        output.SetValue(5, count, Value::BIGINT(static_cast<int64_t>(p.overflow_gpu_addr)));
         count++;
         data.row_idx++;
       }
       output.SetCardinality(count);
     };
     TableFunction f("sirius_get_packed_partitions", {}, func, bind);
+    CreateTableFunctionInfo info(f);
+    catalog.CreateTableFunction(transaction, info);
+  }
+
+  // sirius_get_packed_broadcast() — returns per-batch broadcast packed buffers.
+  {
+    struct GetBcastData : public TableFunctionData {
+      std::vector<PackedBroadcastEntry> entries;
+      idx_t row_idx = 0;
+    };
+    auto bind = [](ClientContext&, TableFunctionBindInput&,
+                    vector<LogicalType>& return_types, vector<string>& names) -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BLOB, LogicalType::INTEGER, LogicalType::BIGINT};
+      names = {"entry_id", "staging_offset", "packed_size", "metadata", "num_rows", "overflow_gpu_addr"};
+      auto result = make_uniq<GetBcastData>();
+      result->entries = LastGPUBuffers::GetInstance().TakePackedBroadcastEntries();
+      return std::move(result);
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<GetBcastData>();
+      idx_t count = 0;
+      while (data.row_idx < data.entries.size() && count < STANDARD_VECTOR_SIZE) {
+        auto& e = data.entries[data.row_idx];
+        output.SetValue(0, count, Value::INTEGER(static_cast<int32_t>(data.row_idx)));
+        output.SetValue(1, count, Value::BIGINT(static_cast<int64_t>(e.staging_offset)));
+        output.SetValue(2, count, Value::BIGINT(static_cast<int64_t>(e.packed_size)));
+        if (e.metadata && !e.metadata->empty()) {
+          output.SetValue(3, count, Value::BLOB(e.metadata->data(), e.metadata->size()));
+        } else {
+          output.SetValue(3, count, Value(LogicalType::BLOB));
+        }
+        output.SetValue(4, count, Value::INTEGER(e.num_rows));
+        output.SetValue(5, count, Value::BIGINT(static_cast<int64_t>(e.overflow_gpu_addr)));
+        count++;
+        data.row_idx++;
+      }
+      output.SetCardinality(count);
+    };
+    TableFunction f("sirius_get_packed_broadcast", {}, func, bind);
+    CreateTableFunctionInfo info(f);
+    catalog.CreateTableFunction(transaction, info);
+  }
+
+  // sirius_finalize_exchange_tables() — materializes pending views into owned cudf::tables.
+  // Must be called BEFORE BeginSession() or any operation that reuses the staging buffer.
+  {
+    struct FinalizeData : public TableFunctionData { bool finished = false; };
+    auto bind = [](ClientContext&, TableFunctionBindInput&,
+                    vector<LogicalType>& return_types, vector<string>& names) -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::VARCHAR};
+      names = {"status"};
+      return make_uniq<FinalizeData>();
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<FinalizeData>();
+      if (data.finished) { output.SetCardinality(0); return; }
+      data.finished = true;
+      if (buffer_is_initialized) {
+        GPUBufferManager::GetInstance().finalizeExchangeTables();
+      }
+      output.SetValue(0, 0, Value("finalized"));
+      output.SetCardinality(1);
+    };
+    TableFunction f("sirius_finalize_exchange_tables", {}, func, bind);
     CreateTableFunctionInfo info(f);
     catalog.CreateTableFunction(transaction, info);
   }

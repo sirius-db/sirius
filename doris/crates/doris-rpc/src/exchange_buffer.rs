@@ -37,7 +37,6 @@ struct ExchangeEntry {
 
 /// GPU-side packed buffer info for direct table registration.
 /// Stored by transfer_complete when cudf packed transfer is used.
-#[derive(Clone, Debug)]
 pub struct PackedGpuExchange {
     /// GPU address of the packed buffer (in receiver's staging region).
     pub gpu_addr: usize,
@@ -45,6 +44,19 @@ pub struct PackedGpuExchange {
     pub gpu_size: usize,
     /// cudf::pack() metadata for cudf::unpack() on receiver.
     pub cudf_metadata: Vec<u8>,
+    /// Staging lease keeping the RECV buffer region alive until the exchange
+    /// fragment finishes processing. Dropped when ExchangeBuffer entry is consumed.
+    pub _staging_lease: Option<crate::gpu_staging_buffer::StagingLease>,
+}
+
+impl std::fmt::Debug for PackedGpuExchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedGpuExchange")
+            .field("gpu_addr", &format_args!("0x{:x}", self.gpu_addr))
+            .field("gpu_size", &self.gpu_size)
+            .field("has_lease", &self._staging_lease.is_some())
+            .finish()
+    }
 }
 
 /// Concurrent buffer for exchange data arriving from multiple senders.

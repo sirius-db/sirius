@@ -1706,6 +1706,7 @@ impl PBackendService for PBackendServiceHandler {
 
                     // Decode PBlocks (or register packed GPU tables) as exchange tables.
                     let mut table_schemas = std::collections::HashMap::<String, Vec<String>>::new();
+                    let mut any_gpu_registration_failed = false;
                     for &node_id in &exchange_node_ids {
                         let key = ExchangeKey { query_id, node_id };
                         let table_name = exchange_table_name(query_id.1, node_id);
@@ -1808,9 +1809,11 @@ impl PBackendService for PBackendServiceHandler {
                                 Ok(Err(e)) => {
                                     warn!(error = %e, table = %table_name,
                                           "packed GPU registration failed, falling back to PBlock path");
+                                    any_gpu_registration_failed = true;
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "spawn_blocking panicked during GPU registration");
+                                    any_gpu_registration_failed = true;
                                 }
                             }
                         }
@@ -2134,9 +2137,36 @@ impl PBackendService for PBackendServiceHandler {
                     });
 
                     let (exec_plan, output_names) =
-                        {
-                            // All exchange fragments go through Substrait (GPU).
-                            // No SQL, no CPU fallback — data stays on GPU.
+                        if let Some(union_sql) = generate_exchange_union_sql(&params) {
+                            // 1. UNION_NODE: trivial SQL (DuckDB SetRel broken for Substrait)
+                            info!(sql = %union_sql, "exchange fragment using UNION SQL path");
+                            (ExecPlan::SqlCpuOnly(union_sql), None)
+                        } else if let Some(agg_sql) = generate_exchange_agg_merge_sql(&params, &table_schemas) {
+                            // 2. AGG merge: GPU engine can't do partial aggregate finalization
+                            //    (AVG decomposition produces extra columns that never merge back).
+                            //    Use CPU SQL path: count→SUM, avg→(SUM/COUNT), etc.
+                            info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path");
+                            (ExecPlan::SqlCpuOnly(agg_sql), None)
+                        } else if any_gpu_registration_failed {
+                            // GPU table registration failed — some exchange tables are CPU-only.
+                            // Must use CPU Substrait to avoid GPU engine hanging on invalid tables.
+                            match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
+                                Ok(plan) => {
+                                    info!("exchange fragment using CPU Substrait (GPU registration failed)");
+                                    let exec = ExecPlan::SubstraitCpuOnly {
+                                        bytes: plan.substrait_bytes,
+                                        sort_limit_sql: plan.sort_limit_sql,
+                                    };
+                                    (exec, Some(plan.output_names))
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Substrait translation failed for exchange fragment");
+                                    store.store_error(finst_id, fragment_finst_id, format!("Substrait translation: {e}"));
+                                    return;
+                                }
+                            }
+                        } else {
+                            // 3. Everything else (SORT, JOIN, plain exchange): Substrait GPU path.
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
                                     info!("exchange fragment using GPU Substrait path");
@@ -2194,6 +2224,12 @@ impl PBackendService for PBackendServiceHandler {
 
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
+                        // Finalize exchange tables BEFORE retain_gpu_buffers creates a
+                        // new session (which resets staging_offset to 0). This materializes
+                        // pending_views from staging into owned cudf::tables via concatenate.
+                        if let Err(e) = engine.finalize_exchange_tables() {
+                            tracing::warn!(error = %e, "finalize_exchange_tables failed");
+                        }
                         if should_retain_exch {
                             if let Err(e) = engine.retain_gpu_buffers() {
                                 tracing::warn!(error = %e, "failed to set retain_gpu_buffers for exchange fragment");
@@ -2216,23 +2252,41 @@ impl PBackendService for PBackendServiceHandler {
                         if is_cpu_only {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         } else if should_retain_exch {
-                            // Build location from packed staging data (whole buffer + per-partition).
+                            // Build location from packed staging data.
                             let partitions = engine.get_packed_partitions().unwrap_or_default();
-                            let loc = match engine.get_packed_gpu() {
-                                Ok(Some((addr, size, metadata))) => {
-                                    tracing::info!(
-                                        addr = format_args!("0x{addr:x}"), size,
-                                        num_partitions = partitions.len(),
-                                        "packed GPU for exchange forward"
-                                    );
-                                    let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(addr, size, metadata, ipc_bytes);
-                                    if !partitions.is_empty() {
+                            let loc = if !partitions.is_empty() {
+                                // Hash-partitioned: per-partition packed GPU buffers.
+                                match engine.get_packed_gpu() {
+                                    Ok(Some((addr, size, metadata))) => {
+                                        tracing::info!(
+                                            addr = format_args!("0x{addr:x}"), size,
+                                            num_partitions = partitions.len(),
+                                            "packed GPU for hash-partitioned exchange forward"
+                                        );
+                                        let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(addr, size, metadata, ipc_bytes);
                                         loc.set_packed_partitions(partitions);
+                                        loc
                                     }
-                                    loc
+                                    _ => {
+                                        tracing::info!("no packed GPU data despite partitions, using CPU path");
+                                        crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
+                                    }
                                 }
-                                _ => {
-                                    tracing::info!("no packed GPU data for exchange forward, using CPU path");
+                            } else {
+                                // Broadcast: per-batch packed GPU buffers.
+                                let broadcast_entries = engine.get_packed_broadcast_entries().unwrap_or_default();
+                                if !broadcast_entries.is_empty() {
+                                    let packed = engine.get_packed_gpu().ok().flatten();
+                                    let staging_addr = packed.as_ref().map(|(a, _, _)| *a).unwrap_or(0);
+                                    tracing::info!(
+                                        num_entries = broadcast_entries.len(),
+                                        staging_addr = format_args!("0x{staging_addr:x}"),
+                                        "packed GPU for broadcast exchange forward"
+                                    );
+                                    crate::nixl_integration::ExecutionLocation::from_broadcast_entries(
+                                        staging_addr, broadcast_entries, ipc_bytes)
+                                } else {
+                                    tracing::info!("no packed GPU data for broadcast exchange, using CPU IPC path");
                                     crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                                 }
                             };
@@ -2333,6 +2387,7 @@ impl PBackendService for PBackendServiceHandler {
                                     }
                                     info!(%finst_id, "exchange fragment execution complete");
                                 }
+                                release_retained_exch();
                             }
                         }
                         Ok(Err(e)) => {
@@ -2513,17 +2568,20 @@ impl PBackendService for PBackendServiceHandler {
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                         }
-                        // Build location from packed staging data only (no old GPUBufferManager path).
+                        // Build location: GPU path only for hash-partitioned (has partitions).
+                        // Broadcast uses CPU IPC (staging only holds last batch).
                         let location = if should_retain {
                             let partitions = engine.get_packed_partitions().unwrap_or_default();
-                            let packed = engine.get_packed_gpu().ok().flatten();
-                            let loc = if let Some((addr, size, metadata)) = packed {
-                                let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
-                                    addr, size, metadata, ipc_bytes);
-                                if !partitions.is_empty() {
+                            let loc = if !partitions.is_empty() {
+                                let packed = engine.get_packed_gpu().ok().flatten();
+                                if let Some((addr, size, metadata)) = packed {
+                                    let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
+                                        addr, size, metadata, ipc_bytes);
                                     loc.set_packed_partitions(partitions);
+                                    loc
+                                } else {
+                                    crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                                 }
-                                loc
                             } else {
                                 crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                             };
@@ -2589,10 +2647,11 @@ impl PBackendService for PBackendServiceHandler {
                 .unwrap_or(false);
             let hash_partition_info: Option<(usize, Vec<i32>)> = if is_hash_partitioned {
                 exchange_dests.as_ref().and_then(|e| {
-                    if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, .. } = &e.partition {
-                        // TODO: resolve actual column indices from partition_exprs.
-                        // For now, use first N columns as partition keys.
-                        let col_indices: Vec<i32> = (0..2).collect(); // assume 2 GROUP BY cols
+                    if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, ref partition_exprs, .. } = &e.partition {
+                        // Partition columns are the leading output columns from the AGG/data node.
+                        // For AGG→EXCHANGE plans: output = [group_by_keys..., agg_results...],
+                        // and partition_exprs reference the group_by_keys (first N columns).
+                        let col_indices: Vec<i32> = (0..partition_exprs.len() as i32).collect();
                         Some((*num_destinations, col_indices))
                     } else { None }
                 })
@@ -2628,28 +2687,39 @@ impl PBackendService for PBackendServiceHandler {
                 // buffers) entirely — those RMM sub-allocations can't be registered with
                 // nixl (UCX rejects them). The packed staging buffer is pre-registered.
                 let location = if should_retain {
-                    // Check per-partition packed data first (GPU hash_partition), then
-                    // single packed buffer (broadcast cudf::pack).
                     let partitions = engine.get_packed_partitions().unwrap_or_default();
-                    let packed = engine.get_packed_gpu().ok().flatten();
-                    if let Some((addr, size, metadata)) = packed {
-                        tracing::info!(addr = format_args!("0x{addr:x}"), size, metadata_len = metadata.len(),
-                                      "packed GPU buffer from staging");
-                        let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
-                            addr, size, metadata, ipc_bytes);
-                        if !partitions.is_empty() {
-                            tracing::info!(num_partitions = partitions.len(), "got GPU packed partitions");
+                    if !partitions.is_empty() {
+                        // Hash-partitioned: per-partition packed GPU buffers.
+                        let packed = engine.get_packed_gpu().ok().flatten();
+                        if let Some((addr, size, metadata)) = packed {
+                            tracing::info!(addr = format_args!("0x{addr:x}"), size, metadata_len = metadata.len(),
+                                          num_partitions = partitions.len(),
+                                          "packed GPU for hash-partitioned exchange");
+                            let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
+                                addr, size, metadata, ipc_bytes);
                             loc.set_packed_partitions(partitions);
+                            loc
+                        } else {
+                            tracing::info!("partitions present but no packed GPU, using CPU path");
+                            crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                         }
-                        loc
-                    } else if !partitions.is_empty() {
-                        tracing::info!(num_partitions = partitions.len(), "got GPU packed partitions (no single pack)");
-                        let mut loc = crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes);
-                        // Partitions without a single packed buffer — fall through to CPU
-                        loc
                     } else {
-                        tracing::info!("no packed GPU data, using CPU IPC path");
-                        crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
+                        // Broadcast: per-batch packed GPU buffers (accumulated across batches).
+                        let broadcast_entries = engine.get_packed_broadcast_entries().unwrap_or_default();
+                        if !broadcast_entries.is_empty() {
+                            let packed = engine.get_packed_gpu().ok().flatten();
+                            let staging_addr = packed.as_ref().map(|(a, _, _)| *a).unwrap_or(0);
+                            tracing::info!(
+                                num_entries = broadcast_entries.len(),
+                                staging_addr = format_args!("0x{staging_addr:x}"),
+                                "packed GPU for broadcast exchange"
+                            );
+                            crate::nixl_integration::ExecutionLocation::from_broadcast_entries(
+                                staging_addr, broadcast_entries, ipc_bytes)
+                        } else {
+                            tracing::info!("no packed GPU data for broadcast, using CPU IPC path");
+                            crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
+                        }
                     }
                 } else {
                     crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)

@@ -100,6 +100,7 @@ impl NixlTransferEngine {
             _staging_leases: vec![],
             packed_metadata: None,
             packed_partitions: vec![],
+            packed_broadcast: vec![],
         };
 
         // Try staging buffer (D2D copy into pre-registered cuMemAlloc region).

@@ -20,6 +20,10 @@
 #include "duckdb/common/types.hpp"
 #include "helper/common.h"
 
+#include <cudf/concatenate.hpp>
+#include <cudf/table/table.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+
 namespace duckdb {
 
 class GPUBufferManager;
@@ -252,12 +256,35 @@ class GPUIntermediateRelation {
   vector<shared_ptr<GPUColumn>> columns;
   size_t column_count;
 
-  /// When set, this relation was populated from a cudf::unpack'd packed buffer.
-  /// The packed_table owns the GPU memory (via rmm::device_buffer deep copy).
   /// Pre-owned cudf::table from registerExternalTable (cudf::unpack'd data).
   /// Raw pointer — ownership managed manually by the exchange lifecycle.
   /// nullptr when not populated from packed nixl transfer.
   cudf::table* packed_cudf_table = nullptr;
+
+  /// Pending table_views accumulated from multiple senders (zero-copy).
+  /// Each view points into a packed/staging buffer that stays alive until
+  /// release_gpu_buffers(). Call finalize_pending_views() to concatenate
+  /// them into a single cudf::table for duckdb_scan_task.
+  std::vector<cudf::table_view> pending_views;
+  size_t pending_total_rows = 0;
+
+  /// Concatenate all pending views into a single owned cudf::table.
+  /// Called just before GPU execution of the exchange fragment.
+  ///
+  /// Always uses cudf::concatenate (even for single view) because
+  /// cudf::table(column_view) deep copy fails for string columns from
+  /// cudf::unpack. cudf::concatenate handles all column types correctly.
+  void finalize_pending_views() {
+    if (pending_views.empty()) return;
+    static rmm::mr::cuda_memory_resource cuda_mr;
+    cudaGetLastError(); // Clear any sticky CUDA error from prior operations.
+    auto merged = cudf::concatenate(pending_views, cudf::get_default_stream(), &cuda_mr);
+    packed_cudf_table = merged.release();
+    pending_views.clear();
+    if (packed_cudf_table) {
+      pending_total_rows = static_cast<size_t>(packed_cudf_table->num_rows());
+    }
+  }
 };
 
 }  // namespace duckdb

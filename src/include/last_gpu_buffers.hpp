@@ -79,15 +79,23 @@ class LastGPUBuffers {
   /// The session is stored as active until take_session() moves it out.
   uint64_t BeginSession() {
     std::lock_guard<std::mutex> lock(mutex_);
-    // If there's an existing active session, move it to completed
-    // (it was from a previous execution that hasn't released yet).
+    // Carry forward the staging offset from the previous session so that
+    // new sessions pack AFTER the old data. This prevents overwriting
+    // staging data that is still referenced by pending_views in exchange tables.
+    // The offset only resets to 0 on ClearCompletedSessions (release_gpu_buffers).
+    size_t carry_offset = 0;
     if (active_session_) {
+      carry_offset = active_session_->staging_offset;
       completed_sessions_.push_back(std::move(active_session_));
+    } else {
+      // Check completed sessions for the highest offset.
+      for (auto& s : completed_sessions_) {
+        carry_offset = std::max(carry_offset, s->staging_offset);
+      }
     }
     auto session = std::make_unique<ExchangeSession>();
     session->session_id = next_session_id_++;
-    // Allocate staging lease: for now, entire staging buffer.
-    // TODO: proper suballocator when concurrent sessions needed.
+    session->staging_offset = carry_offset;
     session->staging_lease_base = staging_addr_;
     session->staging_lease_size = staging_size_;
     auto id = session->session_id;
@@ -185,6 +193,19 @@ class LastGPUBuffers {
     if (active_session_) active_session_->staging_offset = offset;
   }
 
+  /// Atomically reserve a contiguous region in the staging buffer.
+  /// Returns the starting offset. If the reservation would exceed max_size,
+  /// returns the current offset (caller checks and handles overflow).
+  size_t ReserveStagingRegion(size_t aligned_size, size_t max_size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_session_) return 0;
+    size_t offset = active_session_->staging_offset;
+    if (offset + aligned_size <= max_size) {
+      active_session_->staging_offset = offset + aligned_size;
+    }
+    return offset;
+  }
+
   void AccumulatePackedPartitions(std::vector<PackedPartition> partitions) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_session_) {
@@ -233,6 +254,21 @@ class LastGPUBuffers {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_session_) {
       return std::move(active_session_->packed_partitions);
+    }
+    return {};
+  }
+
+  void AccumulatePackedBroadcast(PackedBroadcastEntry entry) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_session_) {
+      active_session_->accumulate_broadcast(std::move(entry));
+    }
+  }
+
+  std::vector<PackedBroadcastEntry> TakePackedBroadcastEntries() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_session_) {
+      return std::move(active_session_->packed_broadcast_entries);
     }
     return {};
   }

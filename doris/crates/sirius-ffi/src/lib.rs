@@ -768,7 +768,7 @@ impl SiriusEngine {
     /// Get per-partition packed GPU buffers from the last GPU execution.
     pub fn get_packed_partitions(&self) -> Result<Vec<PackedPartition>, EngineError> {
         let mut stmt = self.conn
-            .prepare("SELECT partition_id, staging_offset, packed_size, metadata, num_rows FROM sirius_get_packed_partitions()")
+            .prepare("SELECT partition_id, staging_offset, packed_size, metadata, num_rows, overflow_gpu_addr FROM sirius_get_packed_partitions()")
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         let mut rows = stmt.query([]).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         let mut result = Vec::new();
@@ -778,15 +778,56 @@ impl SiriusEngine {
             let packed_size: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let metadata: Vec<u8> = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let num_rows: i32 = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let overflow_gpu_addr: i64 = row.get(5).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             result.push(PackedPartition {
                 partition_id: partition_id as usize,
                 staging_offset: staging_offset as usize,
                 packed_size: packed_size as usize,
                 metadata,
                 num_rows: num_rows as u32,
+                overflow_gpu_addr: overflow_gpu_addr as usize,
             });
         }
         Ok(result)
+    }
+
+    /// Get per-batch broadcast packed GPU buffers from the last GPU execution.
+    pub fn get_packed_broadcast_entries(&self) -> Result<Vec<PackedBroadcastEntry>, EngineError> {
+        let mut stmt = self.conn
+            .prepare("SELECT entry_id, staging_offset, packed_size, metadata, num_rows, overflow_gpu_addr FROM sirius_get_packed_broadcast()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt.query([]).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+            let entry_id: i32 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let staging_offset: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let packed_size: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let metadata: Vec<u8> = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let num_rows: i32 = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let overflow_gpu_addr: i64 = row.get(5).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            result.push(PackedBroadcastEntry {
+                entry_id: entry_id as usize,
+                staging_offset: staging_offset as usize,
+                packed_size: packed_size as usize,
+                metadata,
+                num_rows: num_rows as u32,
+                overflow_gpu_addr: overflow_gpu_addr as usize,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Finalize all exchange tables that have pending views.
+    /// Runs cudf::concatenate to materialize views from staging into owned tables.
+    /// Must be called BEFORE BeginSession() or any staging buffer reuse.
+    pub fn finalize_exchange_tables(&self) -> Result<(), EngineError> {
+        let mut stmt = self.conn
+            .prepare("SELECT * FROM sirius_finalize_exchange_tables()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .collect();
+        Ok(())
     }
 
     /// Tell the C++ result collector where the nixl staging buffer is.
@@ -879,6 +920,21 @@ pub struct PackedPartition {
     pub packed_size: usize,
     pub metadata: Vec<u8>,
     pub num_rows: u32,
+    /// When non-zero, this partition overflowed the staging buffer and lives at
+    /// this GPU address in a separate rmm::device_buffer.
+    pub overflow_gpu_addr: usize,
+}
+
+/// A per-batch packed GPU buffer for the broadcast exchange path.
+#[derive(Debug, Clone)]
+pub struct PackedBroadcastEntry {
+    pub entry_id: usize,
+    pub staging_offset: usize,
+    pub packed_size: usize,
+    pub metadata: Vec<u8>,
+    pub num_rows: u32,
+    /// When non-zero, this entry overflowed the staging buffer.
+    pub overflow_gpu_addr: usize,
 }
 
 /// A GPU buffer that has been staged (copied) into the nixl staging region.

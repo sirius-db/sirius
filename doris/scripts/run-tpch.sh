@@ -169,7 +169,7 @@ TIMEOUT_COUNT=0
 run_tpch_query() {
     local qnum="$1"
     local sql="$2"
-    local timeout="${3:-120}"
+    local timeout="${3:-30}"
 
     # Rewrite table references to local() TVF
     local rewritten
@@ -309,7 +309,7 @@ get_query_list() {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 # Increase query timeout for complex queries
-fe_query "SET GLOBAL query_timeout = 300" >/dev/null 2>&1 || true
+fe_query "SET GLOBAL query_timeout = 30" >/dev/null 2>&1 || true
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"

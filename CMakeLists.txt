@@ -249,9 +249,18 @@ target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
 set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
                                                        ON)
 
-# Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA ${LIBCONFIG++_LIBRARIES}
+# Link libconfig++ statically so the loadable extension is self-contained
+# (avoids undefined symbols when dlopen'd from processes without libconfig++).
+find_library(LIBCONFIGPP_STATIC libconfig++.a REQUIRED)
+target_link_libraries(sirius_extension PkgConfig::NUMA ${LIBCONFIGPP_STATIC}
                       absl::any_invocable)
+# The loadable extension also needs substrait symbols (SubstraitToDuckDB,
+# substrait::Plan) which are in the substrait static library. Use whole-archive
+# to ensure all symbols are included since the linker can't resolve the
+# dependency order between the sirius .o files and the substrait archive.
+target_link_libraries(sirius_loadable_extension PkgConfig::NUMA ${LIBCONFIGPP_STATIC}
+                      absl::any_invocable
+                      -Wl,--whole-archive substrait_extension -Wl,--no-whole-archive)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
@@ -302,6 +311,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_pack_unpack_deep_copy.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp

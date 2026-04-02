@@ -139,6 +139,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
   // Check if GPU buffer retention is requested (for nixl GPU-direct exchange).
   bool should_retain = duckdb::LastGPUBuffers::GetInstance().ShouldRetain();
+  SIRIUS_LOG_INFO("[result_collector] sink called: {} batches, should_retain={}", input_batches.size(), should_retain);
   std::vector<duckdb::GPUBufferInfo> gpu_buffer_infos;
 
   for (auto const& input_batch : input_batches) {
@@ -149,6 +150,9 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
     }
     if (data->get_size_in_bytes() == 0) { continue; }
+
+    SIRIUS_LOG_INFO("[result_collector] batch: tier={} size={}",
+                    static_cast<int>(data->get_current_tier()), data->get_size_in_bytes());
 
     // If data is in GPU tier, convert to HOST tier first
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
@@ -225,6 +229,9 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
           auto [part_num, part_cols] = lgb.GetPartitionConfig();
 
+          SIRIUS_LOG_INFO("[result_collector] retain path: part_num={} part_cols={} staging_addr=0x{:x}",
+                          part_num, part_cols.size(), staging_addr);
+
           if (part_num > 0 && !part_cols.empty() && staging_addr != 0) {
             // GPU hash partition + per-partition pack into staging.
             std::vector<cudf::size_type> col_indices(part_cols.begin(), part_cols.end());
@@ -237,7 +244,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                             [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
 
             std::vector<duckdb::PackedPartition> packed_parts;
-            size_t staging_offset = lgb.GetStagingOffset();
+
+            // Estimate total staging space needed: full table packed size as upper bound.
+            // Reserve atomically to prevent concurrent sink() calls from overlapping.
+            auto total_estimate = cudf::chunked_pack::create(view, 1UL << 20, stream)->get_total_contiguous_size();
+            size_t aligned_estimate = (total_estimate + 255) & ~255UL;
+            // Add some padding for per-partition alignment overhead.
+            aligned_estimate += static_cast<size_t>(part_num) * 256;
+            size_t staging_offset = lgb.ReserveStagingRegion(aligned_estimate, staging_size);
 
             for (int i = 0; i < part_num; i++) {
               auto start = offsets[i];
@@ -248,54 +262,99 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                 continue;
               }
               auto slice = cudf::slice(partitioned_table->view(), {start, end});
-              auto packer = cudf::chunked_pack::create(slice[0], staging_size - staging_offset, stream);
-              auto total = packer->get_total_contiguous_size();
+              auto total = cudf::chunked_pack::create(slice[0], 1UL << 20, stream)->get_total_contiguous_size();
               if (staging_offset + total > staging_size) {
-                SIRIUS_LOG_WARN("[result_collector] partition {} ({} bytes) exceeds staging", i, total);
-                { duckdb::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
-                continue;
+                // Overflow: pack into separate rmm::device_buffer instead of dropping data.
+                SIRIUS_LOG_WARN("[result_collector] partition {} ({} bytes) overflows staging, using rmm::device_buffer", i, total);
+                auto packed = cudf::pack(slice[0]);
+                auto addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
+                auto size = packed.gpu_data->size();
+                duckdb::PackedPartition pp;
+                pp.staging_offset = 0;
+                pp.packed_size = size;
+                pp.metadata = std::move(packed.metadata);
+                pp.num_rows = static_cast<int32_t>(num_rows);
+                pp.overflow_gpu_addr = addr;
+                pp.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
+                packed_parts.push_back(std::move(pp));
+              } else {
+                auto packer = cudf::chunked_pack::create(slice[0], staging_size - staging_offset, stream);
+                cudf::device_span<uint8_t> dst(
+                  reinterpret_cast<uint8_t*>(staging_addr + staging_offset), staging_size - staging_offset);
+                while (packer->has_next()) { packer->next(dst); }
+                auto md = packer->build_metadata();
+                SIRIUS_LOG_INFO("[result_collector] partition {}: {} rows, {} bytes at staging+{}",
+                                i, num_rows, total, staging_offset);
+                duckdb::PackedPartition pp;
+                pp.staging_offset = staging_offset;
+                pp.packed_size = total;
+                pp.metadata = std::move(md);
+                pp.num_rows = static_cast<int32_t>(num_rows);
+                packed_parts.push_back(std::move(pp));
+                staging_offset += (total + 255) & ~255UL;  // 256-byte align
               }
-              cudf::device_span<uint8_t> dst(
-                reinterpret_cast<uint8_t*>(staging_addr + staging_offset), staging_size - staging_offset);
-              while (packer->has_next()) { packer->next(dst); }
-              auto md = packer->build_metadata();
-              SIRIUS_LOG_INFO("[result_collector] partition {}: {} rows, {} bytes at staging+{}",
-                              i, num_rows, total, staging_offset);
-              { duckdb::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = total; pp.metadata = std::move(md); pp.num_rows = static_cast<int32_t>(num_rows); packed_parts.push_back(std::move(pp)); }
-              staging_offset += (total + 255) & ~255UL;  // 256-byte align
             }
-            lgb.SetStagingOffset(staging_offset);
             lgb.AccumulatePackedPartitions(std::move(packed_parts));
             // Also set packed_gpu_addr so get_packed_gpu() returns non-None.
             // The Rust exchange forward needs this to detect GPU-packed data.
             lgb.StorePackedData(nullptr, staging_addr, staging_offset,
                                 std::make_unique<std::vector<uint8_t>>());
           } else if (staging_addr != 0 && staging_size > 0) {
-            // No partitioning — single pack into staging (broadcast path).
-            auto packer = cudf::chunked_pack::create(view, staging_size, stream);
-            auto total_size = packer->get_total_contiguous_size();
-            if (total_size <= staging_size) {
+            // Broadcast path: accumulate each batch as a separate entry.
+            // Reserve a staging region atomically BEFORE packing, to prevent
+            // concurrent sink() calls from overlapping in the staging buffer.
+            auto total_size = cudf::chunked_pack::create(view, 1UL << 20, stream)->get_total_contiguous_size();
+            size_t aligned_size = (total_size + 255) & ~255UL;
+            size_t staging_offset = lgb.ReserveStagingRegion(aligned_size, staging_size);
+
+            if (staging_offset + total_size <= staging_size) {
+              // Fits in staging buffer — pack into reserved region.
+              auto packer = cudf::chunked_pack::create(view, staging_size - staging_offset, stream);
               cudf::device_span<uint8_t> dst_span(
-                reinterpret_cast<uint8_t*>(staging_addr), staging_size);
+                reinterpret_cast<uint8_t*>(staging_addr + staging_offset), staging_size - staging_offset);
               while (packer->has_next()) { packer->next(dst_span); }
               auto metadata = packer->build_metadata();
-              SIRIUS_LOG_INFO("[result_collector] chunked_pack into staging: {} bytes at 0x{:x}",
-                              total_size, staging_addr);
-              lgb.StorePackedData(nullptr, staging_addr, total_size, std::move(metadata));
+              SIRIUS_LOG_INFO("[result_collector] broadcast batch: {} rows, {} bytes at staging+{}",
+                              view.num_rows(), total_size, staging_offset);
+              duckdb::PackedBroadcastEntry entry;
+              entry.staging_offset = staging_offset;
+              entry.packed_size = total_size;
+              entry.metadata = std::move(metadata);
+              entry.num_rows = static_cast<int32_t>(view.num_rows());
+              lgb.AccumulatePackedBroadcast(std::move(entry));
             } else {
+              // Overflow: pack into separate rmm::device_buffer.
+              SIRIUS_LOG_WARN("[result_collector] broadcast batch ({} bytes) overflows staging, using rmm::device_buffer", total_size);
               auto packed = cudf::pack(view);
               auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
               auto gpu_size = packed.gpu_data->size();
-              auto gpu_data_ptr = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
-              lgb.StorePackedData(std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
+              duckdb::PackedBroadcastEntry entry;
+              entry.staging_offset = 0;
+              entry.packed_size = gpu_size;
+              entry.metadata = std::move(packed.metadata);
+              entry.num_rows = static_cast<int32_t>(view.num_rows());
+              entry.overflow_gpu_addr = gpu_addr;
+              entry.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
+              lgb.AccumulatePackedBroadcast(std::move(entry));
             }
+            // Keep StorePackedData for the Rust side to detect GPU-packed data.
+            lgb.StorePackedData(nullptr, staging_addr, lgb.GetStagingOffset(),
+                                std::make_unique<std::vector<uint8_t>>());
           } else {
+            // No staging buffer — pack into rmm::device_buffer.
             auto packed = cudf::pack(view);
             auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
             auto gpu_size = packed.gpu_data->size();
-            SIRIUS_LOG_INFO("[result_collector] cudf::pack: {} bytes at 0x{:x}", gpu_size, gpu_addr);
-            auto gpu_data_ptr = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
-            lgb.StorePackedData(std::move(gpu_data_ptr), gpu_addr, gpu_size, std::move(packed.metadata));
+            SIRIUS_LOG_INFO("[result_collector] cudf::pack (no staging): {} bytes at 0x{:x}", gpu_size, gpu_addr);
+            duckdb::PackedBroadcastEntry entry;
+            entry.staging_offset = 0;
+            entry.packed_size = gpu_size;
+            entry.metadata = std::move(packed.metadata);
+            entry.num_rows = static_cast<int32_t>(view.num_rows());
+            entry.overflow_gpu_addr = gpu_addr;
+            entry.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
+            lgb.AccumulatePackedBroadcast(std::move(entry));
+            lgb.StorePackedData(nullptr, 0, 0, std::make_unique<std::vector<uint8_t>>());
           }
         }
       }

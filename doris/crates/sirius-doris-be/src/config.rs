@@ -58,16 +58,20 @@ pub struct BeConfig {
     #[arg(long, default_value = "2GB")]
     pub gpu_processing_size: String,
 
-    /// Disable bRPC exchange fallback: require nixl GPU-direct for all inter-BE
-    /// exchanges. Queries fail instead of silently falling back to bRPC.
-    /// Useful for debugging/iterating on the nixl exchange path.
+    /// Require nixl GPU-direct for all inter-BE exchanges.
+    /// When enabled, queries fail instead of silently falling back to bRPC.
     #[arg(long, default_value_t = false)]
     pub nixl_only: bool,
 
-    /// GPU staging buffer size for nixl transfers (e.g. "512MB", "1GB").
-    /// When set, a fixed GPU buffer is allocated via cuMemAlloc and registered
-    /// with nixl once at startup, avoiding per-transfer alloc+register cycles.
+    /// Allow bRPC fallback when nixl GPU-direct transfer fails.
+    /// Overrides --nixl-only when set to true.
+    #[arg(long, default_value_t = false)]
+    pub allow_brpc_fallback: bool,
+
+    /// GPU staging buffer size for nixl transfers (e.g. "512MB", "1GB", "2GB").
+    /// Split equally between send and recv staging. Each is pre-allocated via
+    /// cudaMalloc and registered with nixl once at startup.
     /// Set to "0" to disable (falls back to per-transfer cuMemAlloc).
-    #[arg(long, default_value = "512MB")]
+    #[arg(long, default_value = "2GB")]
     pub gpu_staging_size: String,
 }

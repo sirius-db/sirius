@@ -610,37 +610,50 @@ void GPUBufferManager::registerExternalTable(
     }
   }
 
-  // Store a deep copy of the cudf::table for use by duckdb_scan_task.
-  // This avoids going through GPUColumn::convertToCudfColumn() which may
-  // not handle all column types from cudf::unpack correctly.
-  // Deep copy into a new cudf::table owned by this GPUIntermediateRelation.
-  auto* owned_table = new cudf::table(view, cudf::get_default_stream());
-
-  // If the table already exists (multiple senders), concatenate the new data.
+  // If the table already exists (multiple senders), we need to concatenate.
+  // Both views point into staging/packed buffers that stay alive until
+  // release_gpu_buffers(). We accumulate views and concatenate at the end.
   auto existing = tables.find(up_table_name);
-  if (existing != tables.end() && existing->second->packed_cudf_table) {
-    // Concatenate: existing + new → merged table.
-    std::vector<cudf::table_view> views;
-    views.push_back(existing->second->packed_cudf_table->view());
-    views.push_back(owned_table->view());
-    auto merged = cudf::concatenate(views, cudf::get_default_stream());
-    delete existing->second->packed_cudf_table;
-    delete owned_table;
-    existing->second->packed_cudf_table = merged.release();
-    // Update column lengths.
-    auto new_rows = static_cast<size_t>(existing->second->packed_cudf_table->num_rows());
+  if (existing != tables.end()) {
+    // Accumulate the view for later concatenation.
+    existing->second->pending_views.push_back(view);
+    auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
+    existing->second->pending_total_rows = total_rows;
     for (auto& col : existing->second->columns) {
-      if (col) col->column_length = new_rows;
+      if (col) col->column_length = total_rows;
     }
-    SIRIUS_LOG_INFO("[registerExternalTable] appended to '{}', now {} rows",
-                    up_table_name, new_rows);
+    SIRIUS_LOG_INFO("[registerExternalTable] appended view to '{}', now {} total rows ({} views pending)",
+                    up_table_name, total_rows, existing->second->pending_views.size());
     return;
   }
 
-  rel->packed_cudf_table = owned_table;
+  // First registration: store the view directly (zero-copy).
+  // The packed buffer stays alive until release_gpu_buffers().
+  // packed_cudf_table is set to nullptr — duckdb_scan_task will
+  // use the finalized table after finalize_pending_views().
+  rel->packed_cudf_table = nullptr;
+  rel->pending_views.push_back(view);
+  rel->pending_total_rows = num_rows;
   tables[up_table_name] = rel;
-  SIRIUS_LOG_INFO("[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy GPU + cudf::table owned)",
+  SIRIUS_LOG_INFO("[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy, deferred deep copy)",
                   up_table_name, num_cols, num_rows);
+}
+
+void GPUBufferManager::finalizeExchangeTables() {
+  for (auto& [name, rel] : tables) {
+    if (name.find("__EXCH_") != std::string::npos && rel && !rel->pending_views.empty()) {
+      SIRIUS_LOG_INFO("[finalizeExchangeTables] finalizing '{}': {} pending views, {} total rows",
+                      name, rel->pending_views.size(), rel->pending_total_rows);
+      try {
+        rel->finalize_pending_views();
+        SIRIUS_LOG_INFO("[finalizeExchangeTables] '{}' finalized: {} cols, {} rows",
+                        name, rel->packed_cudf_table->num_columns(),
+                        rel->packed_cudf_table->num_rows());
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("[finalizeExchangeTables] failed for '{}': {}", name, e.what());
+      }
+    }
+  }
 }
 
 }  // namespace duckdb

@@ -290,7 +290,7 @@ async fn run(
     );
 
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, config.nixl_only, nixl_agent, local_brpc_addr).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, config.nixl_only && !config.allow_brpc_fallback, nixl_agent, local_brpc_addr).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }

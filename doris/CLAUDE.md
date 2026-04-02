@@ -129,8 +129,9 @@ pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root < /tmp/test.sql
 
 - **DuckDB connection is !Sync**: Wrapped in `Arc<Mutex<SiriusEngine>>`. Use `prepare() +
   query_arrow().collect()` for table functions, NOT `execute_batch` (leaves connection "busy").
-- **Exchange fragments MUST use `SqlCpuOnly`**: Running `gpu_execution()` on a CPU-side
-  exchange table causes DuckDB INTERNAL error that invalidates the database.
+- **Exchange fragments use GPU Substrait**: Packed GPU tables (from nixl) are registered
+  via `register_packed_table` and executed on GPU. Only CPU-registered exchange tables
+  (from bRPC PBlock decode) must use `SqlCpuOnly` to avoid DuckDB INTERNAL errors.
 - **`Notify::notify_one()` not `notify_waiters()`**: The latter doesn't store a permit —
   notifications are lost if no task is waiting. ExchangeBuffer uses `notify_one()`.
 - **Thrift deserialization**: FE uses TBinaryProtocol (NOT compact) for fetch_data results
@@ -142,10 +143,10 @@ pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root < /tmp/test.sql
 - **count(*) without GROUP BY**: DuckDB optimizes to DUMMY_SCAN, GPU engine hangs.
   Always use `SELECT *` for GPU warmup, not `count(*)`.
 - **DuckDB SetRel(UNION_ALL) broken**: Exchange-collecting fragments use SQL path instead.
-- **Hash partitioned exchange (CPU path)**: `hash_partitioner.rs` routes rows by CRC32/CRC32C
-  hash of partition columns. GPU path (Phase 4) not yet implemented — falls back to CPU bRPC.
-  Supports `HASH_PARTITIONED` and `BUCKET_SHUFFLE_HASH_PARTITIONED`; only SLOT_REF partition
-  expressions (not CAST/FUNCTION_CALL). Legacy DATE (type 9) hashes as string repr.
+- **Hash partitioned exchange**: GPU path uses `cudf::hash_partition` (MURMUR3) + per-partition
+  `cudf::chunked_pack` into staging, transferred via nixl. CPU fallback available with
+  `--allow-brpc-fallback` (uses CRC32/CRC32C hash in `hash_partitioner.rs`).
+  Only SLOT_REF partition expressions supported (not CAST/FUNCTION_CALL).
 
 ## Doris Protocol Notes
 
