@@ -261,6 +261,14 @@ class LastGPUBuffers {
     // managed via BeginSession/TakeSession/EndSession.
   }
 
+  /// Clear all completed sessions (whose data has been sent).
+  /// Called from release_gpu_buffers after exchange forward completes.
+  void ClearCompletedSessions() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    completed_sessions_.clear();
+    buffers_.clear();
+  }
+
  private:
   LastGPUBuffers() = default;
   mutable std::mutex mutex_;

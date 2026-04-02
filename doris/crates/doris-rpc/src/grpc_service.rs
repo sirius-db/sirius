@@ -2218,7 +2218,7 @@ impl PBackendService for PBackendServiceHandler {
                         } else if should_retain_exch {
                             // Build location from packed staging data (whole buffer + per-partition).
                             let partitions = engine.get_packed_partitions().unwrap_or_default();
-                            match engine.get_packed_gpu() {
+                            let loc = match engine.get_packed_gpu() {
                                 Ok(Some((addr, size, metadata))) => {
                                     tracing::info!(
                                         addr = format_args!("0x{addr:x}"), size,
@@ -2229,13 +2229,18 @@ impl PBackendService for PBackendServiceHandler {
                                     if !partitions.is_empty() {
                                         loc.set_packed_partitions(partitions);
                                     }
-                                    Ok(loc)
+                                    loc
                                 }
                                 _ => {
                                     tracing::info!("no packed GPU data for exchange forward, using CPU path");
-                                    Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
+                                    crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                                 }
-                            }
+                            };
+                            // Move session to completed BEFORE releasing engine lock.
+                            // This prevents subsequent fragment executions from interfering
+                            // with this session's packed GPU data.
+                            let _ = engine.take_current_session();
+                            Ok(loc)
                         } else {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         }
@@ -2512,7 +2517,7 @@ impl PBackendService for PBackendServiceHandler {
                         let location = if should_retain {
                             let partitions = engine.get_packed_partitions().unwrap_or_default();
                             let packed = engine.get_packed_gpu().ok().flatten();
-                            if let Some((addr, size, metadata)) = packed {
+                            let loc = if let Some((addr, size, metadata)) = packed {
                                 let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
                                     addr, size, metadata, ipc_bytes);
                                 if !partitions.is_empty() {
@@ -2521,7 +2526,10 @@ impl PBackendService for PBackendServiceHandler {
                                 loc
                             } else {
                                 crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                            }
+                            };
+                            // Move session to completed BEFORE releasing engine lock.
+                            let _ = engine.take_current_session();
+                            loc
                         } else {
                             crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                         };
@@ -2646,6 +2654,10 @@ impl PBackendService for PBackendServiceHandler {
                 } else {
                     crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                 };
+                // Move session to completed BEFORE releasing engine lock.
+                if should_retain {
+                    let _ = engine.take_current_session();
+                }
                 tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
                 Ok(location)
             })

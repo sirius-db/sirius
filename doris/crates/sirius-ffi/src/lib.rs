@@ -645,6 +645,20 @@ impl SiriusEngine {
         Ok(staged)
     }
 
+    /// Move the active exchange session to completed_sessions.
+    /// Must be called while the engine lock is held, AFTER get_packed_gpu/partitions
+    /// but BEFORE unlocking. This ensures the session's GPU data is safe from
+    /// interference by subsequent fragment executions.
+    pub fn take_current_session(&self) -> Result<(), EngineError> {
+        let mut stmt = self.conn
+            .prepare("SELECT * FROM sirius_take_current_session()")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let _: Vec<_> = stmt.query_arrow([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .collect();
+        Ok(())
+    }
+
     /// Release previously retained GPU buffers (after nixl transfer or on error).
     pub fn release_gpu_buffers(&self) -> Result<(), EngineError> {
         let mut stmt = self.conn

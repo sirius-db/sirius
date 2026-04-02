@@ -1090,8 +1090,9 @@ void SiriusExtension::ReleaseGPUBuffersFunction(
       }
     }
   }
-  LastGPUBuffers::GetInstance().ReleaseRetainedData();
-  LastGPUBuffers::GetInstance().Clear();
+  // Clear completed sessions (from previous fragments that already sent data).
+  // Don't touch the active session — it may belong to a concurrent fragment.
+  LastGPUBuffers::GetInstance().ClearCompletedSessions();
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value("released"));
@@ -1535,6 +1536,36 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                     RetainGPUBuffersBind);
   CreateTableFunctionInfo retain_gpu_buffers_info(retain_gpu_buffers);
   catalog.CreateTableFunction(transaction, retain_gpu_buffers_info);
+
+  // sirius_take_current_session() — moves active session to completed_sessions.
+  {
+    struct TakeSessionData : public TableFunctionData { bool finished = false; };
+    auto take_bind = [](ClientContext&, TableFunctionBindInput&,
+                        vector<LogicalType>& return_types, vector<string>& names) -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::VARCHAR};
+      names = {"status"};
+      return make_uniq<TakeSessionData>();
+    };
+    auto take_func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<TakeSessionData>();
+      if (data.finished) { output.SetCardinality(0); return; }
+      auto session = LastGPUBuffers::GetInstance().TakeSession();
+      if (session) {
+        auto id = session->session_id;
+        LastGPUBuffers::GetInstance().StoreCompletedSession(std::move(session));
+        SIRIUS_LOG_INFO("[sirius_take_current_session] moved session {} to completed", id);
+        output.SetCardinality(1);
+        output.SetValue(0, 0, Value("taken_session_id=" + std::to_string(id)));
+      } else {
+        output.SetCardinality(1);
+        output.SetValue(0, 0, Value("no_active_session"));
+      }
+      data.finished = true;
+    };
+    TableFunction take_session("sirius_take_current_session", {}, take_func, take_bind);
+    CreateTableFunctionInfo take_session_info(take_session);
+    catalog.CreateTableFunction(transaction, take_session_info);
+  }
 
   TableFunction release_gpu_buffers("sirius_release_gpu_buffers",
                                      {},
