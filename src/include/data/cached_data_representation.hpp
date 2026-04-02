@@ -81,9 +81,9 @@ class cached_shared_representation : public cucascade::idata_representation {
   /**
    * @copydoc idata_representation::get_logical_data_size_in_bytes
    */
-  [[nodiscard]] std::size_t get_logical_data_size_in_bytes() const override
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
   {
-    return _representation->get_logical_data_size_in_bytes();
+    return _representation->get_uncompressed_data_size_in_bytes();
   }
 
   /**
