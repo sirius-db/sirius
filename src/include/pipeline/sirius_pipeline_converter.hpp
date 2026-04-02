@@ -60,8 +60,7 @@ class sirius_pipeline_converter {
     sirius_meta_pipeline& root_pipeline);
 
   // Phase 2: Split pipelines by operator type
-  void split_pipelines(
-    duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled);
+  void split_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled);
   void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_join_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
@@ -69,17 +68,15 @@ class sirius_pipeline_converter {
     duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
     duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
     size_t pipeline_idx);
-  void split_order_by_sink(
-    duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
-    duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
-    size_t pipeline_idx);
+  void split_order_by_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
+                           duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+                           size_t pipeline_idx);
   void split_top_n_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
                         duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                         size_t pipeline_idx);
-  void split_delim_join_sink(
-    duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
-    duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
-    size_t pipeline_idx);
+  void split_delim_join_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
+                             duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+                             size_t pipeline_idx);
 
   // Phase 3: Wire data repositories
   void wire_data_repositories();

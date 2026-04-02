@@ -822,8 +822,7 @@ void sirius_pipeline_converter::wire_data_repositories()
         }
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARTITION ||
-               scheduled_[i]->sink->type ==
-                 op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
+               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
@@ -903,8 +902,7 @@ void sirius_pipeline_converter::setup_pipeline_parents()
     // --- Set pipeline parents ---
     if (scheduled_[i]->sink.get()) {
       if (scheduled_[i]->sink.get()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-        auto& delim_join =
-          scheduled_[i]->sink.get()->Cast<op::sirius_physical_right_delim_join>();
+        auto& delim_join = scheduled_[i]->sink.get()->Cast<op::sirius_physical_right_delim_join>();
         auto partition_join = delim_join.partition_join;
         auto* distinct_op   = delim_join.distinct.get();
         for (auto& next_port : partition_join->get_next_port_after_sink()) {
@@ -921,9 +919,8 @@ void sirius_pipeline_converter::setup_pipeline_parents()
         }
       } else if (scheduled_[i]->sink.get()->type ==
                  op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-        auto& delim_join =
-          scheduled_[i]->sink.get()->Cast<op::sirius_physical_left_delim_join>();
-        auto* distinct_op     = delim_join.distinct.get();
+        auto& delim_join  = scheduled_[i]->sink.get()->Cast<op::sirius_physical_left_delim_join>();
+        auto* distinct_op = delim_join.distinct.get();
         auto column_data_scan = delim_join.column_data_scan;
         for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
           if (next_port.next_operator->get_port(next_port.next_operator_port_name)->dest_pipeline) {
