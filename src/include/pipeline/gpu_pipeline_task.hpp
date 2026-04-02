@@ -66,6 +66,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
                                          size_t start_operator_index = 0)
     : _input_data(std::move(input_data)), _start_operator_index(start_operator_index)
   {
+    _bytes_to_materialize_input = get_estimated_bytes_to_materialize_input();
   }
 
   std::unique_ptr<op::operator_data> _input_data;  ///< Input data batches for the pipeline
@@ -76,12 +77,50 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
 
+  // We want to cache the estimation basis, because its going to be calculated from the inputs, but
+  // if the inputs change due to preparing for processing then we will loose this information and we
+  // can't then provide it to the operator history
+  mutable std::optional<std::size_t> _estimation_basis = std::nullopt;
+
+  // The peak bytes observed to materialize the input data. We need to track this so we can subtract
+  // it from the peak bytes observed to compute the operators' peak bytes.
+  size_t _bytes_to_materialize_input = 0;
+
   /**
    * @brief Get a const pointer to the reservation (non-owning).
    *
    * @return const cucascade::memory::reservation* Pointer to the reservation, or nullptr
    */
   const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
+
+  [[nodiscard]] std::size_t get_task_consumption_basis() const override
+  {
+    if (_estimation_basis) { return *_estimation_basis; }
+    std::size_t input_size = 0;
+    if (_input_data) {
+      for (const auto& batch : _input_data->get_data_batches()) {
+        if (batch && batch->get_data()) {
+          input_size += batch->get_data()->get_size_in_bytes();
+        }
+      }
+    }
+    _estimation_basis = input_size;
+    return *_estimation_basis;
+  }
+
+  [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input() const
+  {
+    std::size_t input_size = 0;
+    if (_input_data) {
+      for (const auto& batch : _input_data->get_data_batches()) {
+        if (batch && batch->get_data() &&
+            batch->get_data()->get_current_tier() != cucascade::memory::Tier::GPU) {
+          input_size += batch->get_data()->get_size_in_bytes();
+        }
+      }
+    }
+    return input_size;
+  }
 };
 
 /**

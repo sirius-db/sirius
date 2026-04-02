@@ -18,6 +18,8 @@
 
 #include "log/logging.hpp"
 
+#include <algorithm>
+
 namespace sirius {
 namespace op {
 
@@ -76,19 +78,42 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     virtual_columns(std::move(virtual_columns_p)),
     gen_row_id_column(column_ids.back().IsRowIdColumn())
 {
-  // Build scanned_types: the types of ALL columns DuckDB will output, in column_ids order.
-  // DuckDB's table function fills the DataChunk with columns in column_ids order, regardless
-  // of projection_ids. projection_ids only control which columns the PhysicalTableScan keeps
-  // after the scan function returns. Since Sirius handles projection at the TABLE_SCAN level,
-  // we must initialize the DataChunk with ALL column_ids types in their original order.
-  auto num_cols = column_ids.size();
-  for (duckdb::idx_t i = 0; i < num_cols; i++) {
-    auto col_idx = column_ids[i].GetPrimaryIndex();
-    if (column_ids[i].IsRowIdColumn()) {
-      // ROW_ID virtual column
-      scanned_types.push_back(duckdb::LogicalType::BIGINT);
-    } else {
-      scanned_types.push_back(returned_types[col_idx]);
+  // Sort projection_ids so that DuckDB's ReferenceColumns() outputs columns in
+  // ascending column_ids order. This matches the parquet scan convention (where
+  // make_selected_column_indices iterates column_ids in order) and the expectation
+  // of build_batch_column_map in sirius_physical_table_scan::execute.
+  std::sort(projection_ids.begin(), projection_ids.end());
+
+  // Build scanned_types: the types of columns DuckDB will actually output.
+  //
+  // When projection_ids is non-empty, DuckDB's seq_scan uses CanRemoveFilterColumns()
+  // and ReferenceColumns() internally to output only the projected columns.
+  // The DataChunk must have matching types, otherwise ReferenceColumns triggers
+  // a type mismatch assertion.
+  //
+  // When projection_ids is empty, DuckDB outputs all column_ids columns.
+  //
+  // Both scan paths (parquet + duckdb) produce only projected columns in sorted
+  // order. build_batch_column_map in sirius_physical_table_scan::execute remaps
+  // filter/projection indices to actual batch column positions.
+  if (!projection_ids.empty()) {
+    for (auto pid : projection_ids) {
+      auto col_idx = column_ids[pid].GetPrimaryIndex();
+      if (column_ids[pid].IsRowIdColumn()) {
+        scanned_types.push_back(duckdb::LogicalType::BIGINT);
+      } else {
+        scanned_types.push_back(returned_types[col_idx]);
+      }
+    }
+  } else {
+    auto num_cols = column_ids.size();
+    for (duckdb::idx_t i = 0; i < num_cols; i++) {
+      auto col_idx = column_ids[i].GetPrimaryIndex();
+      if (column_ids[i].IsRowIdColumn()) {
+        scanned_types.push_back(duckdb::LogicalType::BIGINT);
+      } else {
+        scanned_types.push_back(returned_types[col_idx]);
+      }
     }
   }
 

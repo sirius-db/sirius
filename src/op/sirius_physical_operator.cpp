@@ -194,8 +194,8 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
 {
   for (auto& batch : output_data.get_data_batches()) {
-    for (auto& [next_op, port_id] : next_port_after_sink) {
-      next_op->push_data_batch(port_id, batch);
+    for (auto& next_port_info : next_port_after_sink) {
+      next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name, batch);
     }
   }
 }
@@ -214,13 +214,12 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
   if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }
 }
 
-void sirius_physical_operator::add_next_port_after_sink(
-  std::pair<sirius_physical_operator*, std::string_view> port_locator)
+void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
-  next_port_after_sink.push_back(port_locator);
+  next_port_after_sink.push_back(port_info);
 }
 
-std::vector<std::pair<sirius_physical_operator*, std::string_view>>&
+std::vector<sirius_physical_operator::next_port_info>&
 sirius_physical_operator::get_next_port_after_sink()
 {
   return next_port_after_sink;

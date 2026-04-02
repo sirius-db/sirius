@@ -84,7 +84,7 @@ bool GPUPhysicalPlanGenerator::PreserveInsertionOrder(ClientContext& context,
     return false;
   }
   // preserve insertion order - check flags
-  if (!DBConfig::GetSetting<PreserveInsertionOrderSetting>(context)) {
+  if (!Settings::Get<PreserveInsertionOrderSetting>(context)) {
     // preserving insertion order is disabled by config
     return false;
   }
@@ -101,18 +101,18 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(unique_ptr<
   auto& profiler = QueryProfiler::Get(context);
 
   // Resolve the types of each operator.
-  profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_RESOLVE_TYPES);
+  profiler.StartPhase(MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
   op->ResolveOperatorTypes();
   profiler.EndPhase();
 
   // Resolve the column references.
-  profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_COLUMN_BINDING);
+  profiler.StartPhase(MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
   ColumnBindingResolver resolver;
   resolver.VisitOperator(*op);
   profiler.EndPhase();
 
   // then create the main physical plan
-  profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_CREATE_PLAN);
+  profiler.StartPhase(MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
   auto plan = CreatePlan(*op);
   profiler.EndPhase();
 

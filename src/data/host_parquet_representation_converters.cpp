@@ -89,6 +89,12 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
                                                     host_src.get_row_group_indices().end())});
 
   auto result = cudf::io::read_parquet(opts, stream, mr_ref);
+
+  // Apply the post-convert hook (used by iceberg scan for V2 delete filtering).
+  if (host_src.has_post_convert_fn()) {
+    result.tbl = host_src.apply_post_convert(std::move(result.tbl), stream);
+  }
+
   stream.synchronize();
 
   return std::make_unique<cucascade::gpu_table_representation>(
@@ -147,7 +153,7 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
   auto cloned_reader       = std::make_unique<hybrid_scan_reader>(
     host_src.get_parquet_reader()->parquet_metadata(), host_src.get_reader_options());
-  return std::make_unique<host_parquet_representation>(
+  auto dst = std::make_unique<host_parquet_representation>(
     const_cast<cucascade::memory::memory_space*>(target_memory_space),
     std::move(dst_allocation),
     std::move(cloned_reader),
@@ -155,9 +161,14 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     std::move(host_src.get_row_group_indices()),
     std::move(host_src.get_column_chunk_byte_ranges()),
     data_size,
-    host_src.get_uncompressed_size_in_bytes(),
+    host_src.get_logical_data_size_in_bytes(),
     host_src.get_file_size(),
     host_src.get_fallback_datasource());
+  if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
+  if (!host_src.get_data_file_path().empty()) {
+    dst->set_data_file_path(host_src.get_data_file_path());
+  }
+  return dst;
 }
 
 }  // namespace detail

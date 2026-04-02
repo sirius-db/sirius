@@ -753,7 +753,8 @@ class TableScanGetSizeTask : public BaseExecutorTask {
     auto& l_state_scan = l_state->Cast<GPUTableScanLocalSourceState>();
     TableFunctionInput data(
       op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
-    auto chunk = make_uniq<DataChunk>();
+    data.async_result = AsyncResultType::IMPLICIT;
+    auto chunk        = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
 
     while (true) {
@@ -826,7 +827,8 @@ class TableScanCoalesceTask : public BaseExecutorTask {
     auto& l_state_scan = l_state->Cast<GPUTableScanLocalSourceState>();
     TableFunctionInput data(
       op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
-    auto chunk = make_uniq<DataChunk>();
+    data.async_result = AsyncResultType::IMPLICIT;
+    auto chunk        = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
     uint64_t row_offset_aligned, row_offset_unaligned;
     vector<uint64_t> column_data_offsets_aligned, column_data_offsets_unaligned;
@@ -1004,7 +1006,11 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext& exec_c
   for (const auto& it : to_string_result) {
     SIRIUS_LOG_INFO("[GetDataDuckDBOpt] to_string: {}={}", it.first, it.second);
     if (it.first.compare("Table") == 0) {
-      table_name = it.second;
+      // DuckDB v1.5.0 returns a fully qualified name (e.g. "memory.main.hits").
+      // Extract just the table name (last dot-separated component).
+      auto& qualified = it.second;
+      auto dot        = qualified.rfind('.');
+      table_name      = (dot == string::npos) ? qualified : qualified.substr(dot + 1);
       break;
     }
   }
@@ -1450,7 +1456,11 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext& exec_cont
   string table_name;
   for (const auto& it : to_string_result) {
     if (it.first.compare("Table") == 0) {
-      table_name = it.second;
+      // DuckDB v1.5.0 returns a fully qualified name (e.g. "memory.main.hits").
+      // Extract just the table name (last dot-separated component).
+      auto& qualified = it.second;
+      auto dot        = qualified.rfind('.');
+      table_name      = (dot == string::npos) ? qualified : qualified.substr(dot + 1);
       break;
     }
   }
@@ -1478,6 +1488,7 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext& exec_cont
 
   TableFunctionInput data(
     bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
+  data.async_result = AsyncResultType::IMPLICIT;
 
   if (function.function) {
     auto start           = std::chrono::high_resolution_clock::now();
@@ -1749,7 +1760,11 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
   string table_name;
   for (const auto& it : to_string_result) {
     if (it.first.compare("Table") == 0) {
-      table_name = it.second;
+      // DuckDB v1.5.0 returns a fully qualified name (e.g. "memory.main.hits").
+      // Extract just the table name (last dot-separated component).
+      auto& qualified = it.second;
+      auto dot        = qualified.rfind('.');
+      table_name      = (dot == string::npos) ? qualified : qualified.substr(dot + 1);
       break;
     }
   }

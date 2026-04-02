@@ -22,6 +22,7 @@
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
 
@@ -41,7 +42,7 @@ void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const
 {
   error.FinalizeError();
-  if (client_context.config.errors_as_json) {
+  if (duckdb::Settings::Get<duckdb::ErrorsAsJSONSetting>(client_context)) {
     error.ConvertErrorToJSON();
   } else {
     error.AddErrorLocation(query);

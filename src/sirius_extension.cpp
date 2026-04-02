@@ -36,6 +36,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
@@ -100,6 +101,11 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -188,6 +194,11 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -1976,7 +1987,6 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
-  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
@@ -2006,7 +2016,6 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
-  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
                    params->max_build_hash_table_bytes);
 }
@@ -2165,7 +2174,7 @@ static void LoadInternal(ExtensionLoader& loader)
 
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
-  config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
+  config.GetCallbackManager().Register(make_shared_ptr<duckdb::SiriusContextExtensionCallback>());
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);

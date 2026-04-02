@@ -86,6 +86,12 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/duckdb_scan_task.cpp
+    src/op/scan/equality_delete_filter.cpp
+    src/op/scan/iceberg_avro_reader.cpp
+    src/op/scan/iceberg_delete_pipeline.cpp
+    src/op/scan/iceberg_metadata_reader.cpp
+    src/op/scan/iceberg_scan_task.cpp
+    src/op/scan/positional_delete_filter.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp
     src/op/sirius_physical_column_data_scan.cpp
@@ -105,6 +111,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator.cpp
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
+    src/op/sirius_physical_iceberg_scan.cpp
     src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
@@ -161,6 +168,7 @@ endif()
 set(CUDA_SOURCES
     src/cuda/allocator.cu
     src/cuda/communication.cu
+    src/cuda/iceberg/equality_delete_mask.cu
     src/cuda/cudf/cudf_aggregate.cu
     src/cuda/cudf/cudf_duplicate_elimination.cu
     src/cuda/cudf/cudf_groupby.cu
@@ -270,10 +278,11 @@ set(TEST_SOURCES
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
+    test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
-    test/cpp/exec/test_kiosk.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
@@ -299,6 +308,8 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_pipeline_memory_history.cpp
+    test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
@@ -319,7 +330,12 @@ target_include_directories(
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
-target_link_libraries(sirius_unittest sirius_extension)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static)
+link_extension_libraries(sirius_unittest "")
+# DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
+# that conflict with inline definitions from headers included in test files.
+target_link_options(sirius_unittest PRIVATE
+                    "LINKER:--allow-multiple-definition")
 
 # Precompile Catch2 header (18K lines) once instead of in every test file
 target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)

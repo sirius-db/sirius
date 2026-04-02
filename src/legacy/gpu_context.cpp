@@ -22,6 +22,7 @@
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
 #include "sirius_extension.hpp"
@@ -69,7 +70,7 @@ unique_ptr<PendingQueryResult> GPUContext::GPUPendingStatementOrPreparedStatemen
 void GPUContext::GPUProcessError(ErrorData& error, const string& query) const
 {
   error.FinalizeError();
-  if (client_context.config.errors_as_json) {
+  if (Settings::Get<ErrorsAsJSONSetting>(client_context)) {
     error.ConvertErrorToJSON();
   } else {
     error.AddErrorLocation(query);

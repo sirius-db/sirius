@@ -18,12 +18,10 @@
 
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
-#include "exec/kiosk.hpp"
-#include "exec/thread_pool.hpp"
 #include "op/scan/config.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "parallel/task.hpp"
+#include "parallel/task_executor.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -56,9 +54,9 @@ namespace sirius::op::scan {
  * @brief A task executor for duckdb scan tasks.
  *
  * This class manages a pool of threads dedicated to executing DuckDB scan
- * tasks with kiosk-based concurrency control.
+ * tasks with bounded concurrency control.
  */
-class duckdb_scan_executor {
+class duckdb_scan_executor : public sirius::parallel::itask_executor {
  public:
   /**
    * @brief Constructs a new duckdb_scan_executor with task execution configuration
@@ -84,33 +82,6 @@ class duckdb_scan_executor {
   duckdb_scan_executor& operator=(duckdb_scan_executor&&)      = delete;
 
   /**
-   * @brief Schedule a new task for execution.
-   *
-   * @param task The task to be scheduled.
-   */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task);
-
-  /**
-   * @brief Starts the executor and initializes worker threads
-   *
-   * Initializes the thread pool and begins accepting tasks for execution.
-   */
-  void start();
-
-  /**
-   * @brief Stops the executor and cleanly shuts down worker threads
-   *
-   * Stops accepting new tasks and waits for all worker threads to complete
-   * their current tasks before shutting down.
-   */
-  void stop();
-
-  /**
-   * @brief Wait for all scheduled tasks to complete.
-   */
-  void wait_all();
-
-  /**
    * @brief Get the number of threads in the thread pool for this executor.
    *
    * @return The number of threads in the thread pool for this executor.
@@ -118,27 +89,16 @@ class duckdb_scan_executor {
   [[nodiscard]] int32_t get_num_threads() const { return _config.num_threads; }
 
   /**
+   * @brief Wait for all scheduled tasks to complete.
+   */
+  void wait_all() { itask_executor::wait_all(); }
+
+  /**
    * @brief Set the task creator for scheduling output consumers
    *
    * @param task_creator Pointer to the task creator
    */
   void set_task_creator(sirius::creator::task_creator* task_creator);
-
-  /**
-   * @brief Drain any leftover tasks from the queue
-   *
-   * Clears the task queue of any remaining tasks from a previous query.
-   */
-  void drain_leftover_tasks();
-
-  /**
-   * @brief Drain tasks and wait for all in-flight work to complete.
-   *
-   * Interrupts the manager loop so it releases its kiosk ticket, waits for
-   * all in-flight thread-pool tasks, then restarts the manager so the
-   * executor is ready for the next query.  Used during error cleanup.
-   */
-  void drain_and_wait();
 
   /**
    * @brief Set the completion handler for query completion signaling
@@ -191,12 +151,10 @@ class duckdb_scan_executor {
   void prepare_cache_for_scan_operators(
     const std::vector<sirius::op::sirius_physical_operator*>& scan_operators);
 
- private:
-  /**
-   * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
-   */
-  void manager_loop();
+ protected:
+  void manager_loop() override;
 
+ private:
   /**
    * @brief Submit a scan task request to pipeline_executor
    */
@@ -216,18 +174,12 @@ class duckdb_scan_executor {
   cache_level _cache_level{cache_level::NONE};
   bool _preload_mode{false};
 
-  std::atomic<bool> _running{false};
-  exec::thread_pool_config _config;
-  exec::kiosk _kiosk;
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
-  std::thread _manager_thread;
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
+  cucascade::memory::memory_space* _gpu_memory_space{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   sirius::pipeline::completion_handler* _completion_handler{nullptr};
-  cucascade::memory::memory_space* _gpu_memory_space{nullptr};
 };
 
 }  // namespace sirius::op::scan
