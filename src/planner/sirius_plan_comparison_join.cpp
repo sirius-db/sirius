@@ -17,6 +17,7 @@
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -91,23 +92,34 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto& hash_join      = join->Cast<sirius::op::sirius_physical_hash_join>();
     hash_join.join_stats = std::move(op.join_stats);
 
-    // Check if all equality build keys are unique (enables cudf::distinct_hash_join for INNER)
+    // Check if all equality build keys are unique (enables cudf::distinct_hash_join)
     bool all_build_keys_unique = true;
     bool has_equality_key      = false;
+    auto& build_props          = hash_join.children[1]->get_output_column_properties();
     for (auto& cond : hash_join.conditions) {
       if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
           cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
         continue;
       }
       has_equality_key = true;
-      if (cond.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-        auto& ref         = cond.right->Cast<duckdb::BoundReferenceExpression>();
-        auto& build_props = hash_join.children[1]->get_output_column_properties();
-        if (ref.index >= build_props.size() || !build_props[ref.index].is_unique) {
+      // Extract the build-side column index, unwrapping BOUND_CAST if present
+      duckdb::idx_t build_col_idx;
+      auto right_class = cond.right->GetExpressionClass();
+      if (right_class == duckdb::ExpressionClass::BOUND_REF) {
+        build_col_idx = cond.right->Cast<duckdb::BoundReferenceExpression>().index;
+      } else if (right_class == duckdb::ExpressionClass::BOUND_CAST) {
+        auto& cast = cond.right->Cast<duckdb::BoundCastExpression>();
+        if (cast.child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          build_col_idx = cast.child->Cast<duckdb::BoundReferenceExpression>().index;
+        } else {
           all_build_keys_unique = false;
           break;
         }
       } else {
+        all_build_keys_unique = false;
+        break;
+      }
+      if (build_col_idx >= build_props.size() || !build_props[build_col_idx].is_unique) {
         all_build_keys_unique = false;
         break;
       }
