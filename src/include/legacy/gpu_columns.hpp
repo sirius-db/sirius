@@ -282,15 +282,36 @@ class GPUIntermediateRelation {
       auto& pv = pending_views[v];
       SIRIUS_LOG_INFO("[finalize_pending_views] view {}/{}: {} cols, {} rows",
                       v, pending_views.size(), pv.num_columns(), pv.num_rows());
-      for (cudf::size_type c = 0; c < pv.num_columns() && c < 3; c++) {
+      for (cudf::size_type c = 0; c < pv.num_columns(); c++) {
         auto col = pv.column(c);
         auto data_addr = reinterpret_cast<uintptr_t>(col.head<uint8_t>());
-        SIRIUS_LOG_INFO("[finalize_pending_views]   col {} type={} data=0x{:x} rows={} null_cnt={} children={}",
-                        c, static_cast<int>(col.type().id()), data_addr,
-                        col.size(), col.null_count(), col.num_children());
+        // For STRING columns, also log child (offsets) info.
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child = col.child(0); // offsets column
+          auto child_addr = reinterpret_cast<uintptr_t>(child.head<uint8_t>());
+          // Read the last offset value (D2H) to check if it's absolute or relative.
+          int32_t last_offset = 0;
+          if (child.size() > 0) {
+            auto* offset_ptr = child.data<int32_t>() + child.size() - 1;
+            cudaMemcpy(&last_offset, offset_ptr, sizeof(int32_t), cudaMemcpyDeviceToHost);
+          }
+          SIRIUS_LOG_INFO("[finalize_pending_views]   col {} STRING data=0x{:x} rows={} child_addr=0x{:x} child_rows={} last_offset={}",
+                          c, data_addr, col.size(), child_addr, child.size(), last_offset);
+        } else {
+          SIRIUS_LOG_INFO("[finalize_pending_views]   col {} type={} data=0x{:x} rows={} null_cnt={} children={}",
+                          c, static_cast<int>(col.type().id()), data_addr,
+                          col.size(), col.null_count(), col.num_children());
+        }
       }
     }
     static rmm::mr::cuda_memory_resource cuda_mr;
+    // Synchronize to ensure all prior async operations (D2D copies, kernel launches)
+    // are complete before we read from those buffers.
+    auto sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess) {
+      SIRIUS_LOG_ERROR("[finalize_pending_views] cudaDeviceSynchronize failed: {} ({})",
+                       cudaGetErrorString(sync_err), static_cast<int>(sync_err));
+    }
     cudaGetLastError(); // Clear any sticky CUDA error from prior operations.
     auto merged = cudf::concatenate(pending_views, cudf::get_default_stream(), &cuda_mr);
     packed_cudf_table = merged.release();

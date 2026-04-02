@@ -662,13 +662,30 @@ async fn send_hash_partitioned(
                         if is_local {
                             // D2D copy from staging to owned buffer (staging may be
                             // released/reused between leaf fragments of the same query).
-                            let owned_addr = crate::cuda_driver::cuda_alloc(p.packed_size)
-                                .and_then(|addr| {
-                                    crate::cuda_driver::cuda_memcpy_dtod(addr, part_addr, p.packed_size)
-                                        .map(|_| addr)
-                                        .map_err(|e| { crate::cuda_driver::cuda_free(addr).ok(); e })
-                                })
-                                .unwrap_or(part_addr);
+                            let owned_addr = match crate::cuda_driver::cuda_alloc(p.packed_size) {
+                                Ok(addr) => match crate::cuda_driver::cuda_memcpy_dtod(addr, part_addr, p.packed_size) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            src = format_args!("0x{part_addr:x}"),
+                                            dst = format_args!("0x{addr:x}"),
+                                            size = p.packed_size,
+                                            "hash partition self-transfer: D2D copy OK"
+                                        );
+                                        addr
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, src = format_args!("0x{part_addr:x}"),
+                                            "hash partition self-transfer: D2D COPY FAILED — using stale staging addr!");
+                                        crate::cuda_driver::cuda_free(addr).ok();
+                                        part_addr
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, size = p.packed_size,
+                                        "hash partition self-transfer: cudaMalloc FAILED — using stale staging addr!");
+                                    part_addr
+                                }
+                            };
                             exchange_buffer.store_packed_gpu(
                                 key.clone(),
                                 PackedGpuExchange {
