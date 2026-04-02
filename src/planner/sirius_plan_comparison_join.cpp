@@ -14,16 +14,148 @@
  * limitations under the License.
  */
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 
 namespace sirius::planner {
+
+/// Returns a set of output column indices proven to form a unique key for the
+/// given logical operator subtree, or an empty set if uniqueness cannot be proven.
+static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
+{
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_GET: {
+      auto& get  = op.Cast<duckdb::LogicalGet>();
+      auto table = get.GetTable();
+      if (!table) { return {}; }
+
+      const auto& constraints = table->GetConstraints();
+      const auto& column_ids  = get.GetColumnIds();
+      const auto& proj_ids    = get.projection_ids;
+
+      // Build map: table column logical index → LogicalGet output position.
+      std::unordered_map<duckdb::idx_t, duckdb::idx_t> col_to_output;
+      if (proj_ids.empty()) {
+        for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+          col_to_output[column_ids[i].GetPrimaryIndex()] = i;
+        }
+      } else {
+        for (duckdb::idx_t i = 0; i < proj_ids.size(); i++) {
+          col_to_output[column_ids[proj_ids[i]].GetPrimaryIndex()] = i;
+        }
+      }
+
+      // Find the smallest PRIMARY KEY constraint whose columns are all present in the output.
+      // Only PK is used (not plain UNIQUE) because PK guarantees NOT NULL — a nullable UNIQUE
+      // column can contain duplicate NULLs which would violate distinct_hash_join's contract.
+      std::unordered_set<duckdb::idx_t> best;
+      for (const auto& constraint : constraints) {
+        if (constraint->type != duckdb::ConstraintType::UNIQUE) { continue; }
+        auto& unique = constraint->Cast<duckdb::UniqueConstraint>();
+        if (!unique.IsPrimaryKey()) { continue; }
+        auto logical_indexes = unique.GetLogicalIndexes(table->GetColumns());
+
+        std::unordered_set<duckdb::idx_t> candidate;
+        bool all_present = true;
+        for (const auto& idx : logical_indexes) {
+          auto it = col_to_output.find(idx.index);
+          if (it == col_to_output.end()) {
+            all_present = false;
+            break;
+          }
+          candidate.insert(it->second);
+        }
+        if (all_present && !candidate.empty() && (best.empty() || candidate.size() < best.size())) {
+          best = std::move(candidate);
+        }
+      }
+      return best;
+    }
+
+    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+      auto& aggr = op.Cast<duckdb::LogicalAggregate>();
+      // Only single grouping set — no CUBE/ROLLUP/GROUPING SETS.
+      if (aggr.grouping_sets.size() > 1 || aggr.groups.empty()) { return {}; }
+      std::unordered_set<duckdb::idx_t> unique_set;
+      for (duckdb::idx_t i = 0; i < aggr.groups.size(); i++) {
+        unique_set.insert(i);
+      }
+      return unique_set;
+    }
+
+    case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
+    case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
+      // These operators only truncate rows — no column remapping.
+      if (op.children.empty()) { return {}; }
+      return prove_unique_columns(*op.children[0]);
+    }
+
+    case duckdb::LogicalOperatorType::LOGICAL_FILTER: {
+      if (op.children.empty()) { return {}; }
+      auto child_unique = prove_unique_columns(*op.children[0]);
+      if (child_unique.empty()) { return {}; }
+      auto& filter = op.Cast<duckdb::LogicalFilter>();
+      if (!filter.HasProjectionMap()) { return child_unique; }
+      // Remap through projection_map: output[i] = child[projection_map[i]].
+      std::unordered_set<duckdb::idx_t> remapped;
+      for (duckdb::idx_t i = 0; i < filter.projection_map.size(); i++) {
+        if (child_unique.count(filter.projection_map[i])) { remapped.insert(i); }
+      }
+      return (remapped.size() == child_unique.size()) ? remapped
+                                                      : std::unordered_set<duckdb::idx_t>{};
+    }
+
+    case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: {
+      if (op.children.empty()) { return {}; }
+      auto child_unique = prove_unique_columns(*op.children[0]);
+      if (child_unique.empty()) { return {}; }
+      auto& order = op.Cast<duckdb::LogicalOrder>();
+      if (!order.HasProjectionMap()) { return child_unique; }
+      std::unordered_set<duckdb::idx_t> remapped;
+      for (duckdb::idx_t i = 0; i < order.projection_map.size(); i++) {
+        if (child_unique.count(order.projection_map[i])) { remapped.insert(i); }
+      }
+      return (remapped.size() == child_unique.size()) ? remapped
+                                                      : std::unordered_set<duckdb::idx_t>{};
+    }
+
+    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
+      if (op.children.empty()) { return {}; }
+      auto child_unique = prove_unique_columns(*op.children[0]);
+      if (child_unique.empty()) { return {}; }
+
+      auto& proj = op.Cast<duckdb::LogicalProjection>();
+      // Remap child unique indices through projection expressions.
+      // Only direct BoundReferenceExpression pass-throughs are safe.
+      std::unordered_set<duckdb::idx_t> remapped;
+      for (duckdb::idx_t i = 0; i < proj.expressions.size(); i++) {
+        auto& expr = proj.expressions[i];
+        if (expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
+        auto child_idx = expr->Cast<duckdb::BoundReferenceExpression>().index;
+        if (child_unique.count(child_idx)) { remapped.insert(i); }
+      }
+      // All child unique columns must map through.
+      if (remapped.size() == child_unique.size()) { return remapped; }
+      return {};
+    }
+
+    default: return {};
+  }
+}
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
@@ -32,10 +164,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   D_ASSERT(op.children.size() == 2);
   duckdb::idx_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   duckdb::idx_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
-  auto left                     = create_plan(*op.children[0]);
-  auto right                    = create_plan(*op.children[1]);
-  left->estimated_cardinality   = lhs_cardinality;
-  right->estimated_cardinality  = rhs_cardinality;
+
+  // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
+  auto build_side_unique_cols = prove_unique_columns(*op.children[1]);
+
+  auto left                    = create_plan(*op.children[0]);
+  auto right                   = create_plan(*op.children[1]);
+  left->estimated_cardinality  = lhs_cardinality;
+  right->estimated_cardinality = rhs_cardinality;
 
   if (op.conditions.empty()) {
     throw duckdb::NotImplementedException("Cross product not supported in GPU");
@@ -87,7 +223,49 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
       op_params.max_build_hash_table_bytes);
-    join->Cast<sirius::op::sirius_physical_hash_join>().join_stats = std::move(op.join_stats);
+    auto& hj      = join->Cast<sirius::op::sirius_physical_hash_join>();
+    hj.join_stats = std::move(op.join_stats);
+
+    // --- Detect build-side key uniqueness ---
+    // Gate: only for pure COMPARE_EQUAL conditions (NOT_DISTINCT_FROM needs null_equality::EQUAL).
+    bool all_compare_equal = true;
+    for (const auto& c : hj.conditions) {
+      if (c.comparison == duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
+      if (c.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        all_compare_equal = false;
+        break;
+      }
+      // Inequality conditions are fine — only equality conditions drive the hash table.
+    }
+    if (all_compare_equal) {
+      // Extract build-side (right) column indices from equality conditions.
+      // Only accept direct BoundReferenceExpression (skip if any has a cast).
+      std::unordered_set<duckdb::idx_t> build_key_cols;
+      bool keys_extractable = true;
+      for (const auto& c : hj.conditions) {
+        if (c.comparison != duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
+        if (c.right->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+          keys_extractable = false;
+          break;
+        }
+        build_key_cols.insert(c.right->Cast<duckdb::BoundReferenceExpression>().index);
+      }
+      if (keys_extractable && !build_key_cols.empty()) {
+        // build_side_unique_cols was computed before create_plan (which moves logical node data).
+        // proven_unique ⊆ build_key_cols  →  build keys are unique.
+        if (!build_side_unique_cols.empty()) {
+          bool is_subset = true;
+          for (auto col : build_side_unique_cols) {
+            if (!build_key_cols.count(col)) {
+              is_subset = false;
+              break;
+            }
+          }
+          if (is_subset) { hj.unique_build_keys = true; }
+        }
+      }
+    }
+
     return join;
   }
 
