@@ -260,7 +260,7 @@ class gpu_expression_executor {
      * @brief Moves the owned cudf::column out of the payload.
      * @throws std::runtime_error if the payload does not hold a std::unique_ptr<cudf::column>.
      */
-    [[nodiscard]] std::unique_ptr<cudf::column> get_column();
+    [[nodiscard]] std::unique_ptr<cudf::column> release_column();
   };
 
   /**

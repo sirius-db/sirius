@@ -142,7 +142,7 @@ cudf::column_view gpu_expression_executor::execute_result::get_column_view() con
   return column_payload->view();
 }
 
-std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::get_column()
+std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::release_column()
 {
   if (std::holds_alternative<std::unique_ptr<cudf::column>>(payload)) {
     return std::move(std::get<std::unique_ptr<cudf::column>>(payload));
@@ -283,7 +283,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
       } else if (result.is_column_view()) {
         result_column = std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
       } else {
-        result_column = result.get_column();
+        result_column = result.release_column();
       }
       if (result_column->type().id() != cudf_return_type.id()) {
         // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
