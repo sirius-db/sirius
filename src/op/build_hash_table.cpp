@@ -43,8 +43,8 @@ void build_hash_table::build(cudf::table_view build_keys,
                              rmm::cuda_stream_view stream)
 {
   reset();
-  bool use_distinct = unique_keys && (join_type == duckdb::JoinType::INNER ||
-                                      join_type == duckdb::JoinType::LEFT);
+  bool use_distinct =
+    unique_keys && (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT);
   if (use_distinct) {
     _distinct = std::make_unique<cudf::distinct_hash_join>(build_keys, null_eq, 0.5, stream);
   } else {
