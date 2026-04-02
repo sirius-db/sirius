@@ -147,7 +147,7 @@ On allocation failure:
 - Fixed-size block pools: 64MB blocks, 1024 blocks per pool
 - Automatic NUMA node affinity
 - Used for GPU↔CPU transfers and scan caching
-- Configured via `pinned_memory_size` parameter in `gpu_buffer_init()`
+- Configured via `sirius.cfg` (memory manager settings in cuCascade)
 
 ## Key Files
 
