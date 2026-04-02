@@ -20,7 +20,6 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
-#include "duckdb/common/exception.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -29,6 +28,7 @@
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -240,7 +240,7 @@ class sirius_physical_operator {
   {
     // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw duckdb::InternalException(
+      throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<TARGET&>(*this);
@@ -250,7 +250,7 @@ class sirius_physical_operator {
   const TARGET& Cast() const
   {
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw duckdb::InternalException(
+      throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<const TARGET&>(*this);

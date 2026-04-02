@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "sirius/exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -127,7 +128,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
 
   for (auto const& ord : orders) {
     if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw duckdb::NotImplementedException("Merge sort only supports bound reference expressions");
+      throw not_implemented_exception("Merge sort only supports bound reference expressions");
     }
     auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     order_key_idx.push_back(idx);

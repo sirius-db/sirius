@@ -21,6 +21,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/search.hpp>
 
@@ -78,8 +79,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
 
   for (auto const& ord : orders) {
     if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw duckdb::NotImplementedException(
-        "Sort partition only supports bound reference expressions");
+      throw not_implemented_exception("Sort partition only supports bound reference expressions");
     }
     auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     order_key_idx.push_back(idx);
