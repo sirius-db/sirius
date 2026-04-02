@@ -797,7 +797,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         _build_table              = std::move(build_batch);
-        _hash_table.build(build_keys, unique_build_keys, cudf::null_equality::UNEQUAL, stream);
+        _hash_table.build(
+          build_keys, unique_build_keys, join_type, cudf::null_equality::UNEQUAL, stream);
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
                                // batches to proceed.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
@@ -1012,7 +1013,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
     if (join_type == duckdb::JoinType::INNER && unique_build_keys) {
       build_hash_table ht;
-      ht.build(right_keys, true, cudf::null_equality::UNEQUAL, stream);
+      ht.build(right_keys, true, join_type, cudf::null_equality::UNEQUAL, stream);
       auto result   = ht.inner_join(left_keys, stream);
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
@@ -1023,7 +1024,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       right_indices = std::move(join_result.second);
     } else if (join_type == duckdb::JoinType::LEFT && unique_build_keys) {
       build_hash_table ht;
-      ht.build(right_keys, true, cudf::null_equality::UNEQUAL, stream);
+      ht.build(right_keys, true, join_type, cudf::null_equality::UNEQUAL, stream);
       auto result   = ht.left_join(left_keys, stream);
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cudf/cudf_utils.hpp"
+#include "duckdb/common/enums/join_type.hpp"
 
 #include <memory>
 
@@ -38,8 +39,10 @@ class build_hash_table {
   build_hash_table& operator=(build_hash_table&&)      = default;
 
   /// Build the hash table from the given keys.
+  /// Uses distinct_hash_join when unique_keys is true and join_type supports it (INNER, LEFT).
   void build(cudf::table_view build_keys,
              bool unique_keys,
+             duckdb::JoinType join_type,
              cudf::null_equality null_eq,
              rmm::cuda_stream_view stream);
 

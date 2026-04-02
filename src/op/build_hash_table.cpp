@@ -38,11 +38,14 @@ static std::unique_ptr<rmm::device_uvector<cudf::size_type>> make_sequential_ind
 
 void build_hash_table::build(cudf::table_view build_keys,
                              bool unique_keys,
+                             duckdb::JoinType join_type,
                              cudf::null_equality null_eq,
                              rmm::cuda_stream_view stream)
 {
   reset();
-  if (unique_keys) {
+  bool use_distinct = unique_keys && (join_type == duckdb::JoinType::INNER ||
+                                      join_type == duckdb::JoinType::LEFT);
+  if (use_distinct) {
     _distinct = std::make_unique<cudf::distinct_hash_join>(build_keys, null_eq, 0.5, stream);
   } else {
     _generic = std::make_unique<cudf::hash_join>(build_keys, null_eq, stream);
