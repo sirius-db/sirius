@@ -5,6 +5,7 @@ description: >
   Trigger when the user wants to tune performance, optimize config parameters, find the best thread
   count, batch size, or cache mode, or benchmark different Sirius configurations against each other.
   Also use when the user mentions "config tuning", "parameter sweep", or "optimal settings".
+disable-model-invocation: true
 ---
 
 # Sirius Config Optimizer
@@ -82,7 +83,7 @@ Arguments:
 ## Before Running
 
 - **Ask the user** if they want to rebuild the code if there are upstream changes
-- Build with pixi: `pixi run -e clang make release`
+- Build with pixi: `pixi run make release`
 - Ensure `SIRIUS_CONFIG_FILE` is set and points to a valid config file
 
 ## Output

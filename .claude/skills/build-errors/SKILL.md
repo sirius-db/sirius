@@ -5,7 +5,6 @@ description: >
   linker errors, CUDA compilation issues, missing headers, or template instantiation failures.
   Analyzes errors, suggests fixes, and iteratively rebuilds until success.
 argument-hint: "[preset] [--max-iterations N]"
-disable-model-invocation: true
 ---
 
 # Build Error Analyzer
