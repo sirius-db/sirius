@@ -144,10 +144,9 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
  * @return A cudf scalar holding the same value.
  * @throws InvalidInputException if the type is not supported by GetCudfType.
  */
-inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(
-  Value const& val,
-  LogicalType const& logical_type,
-  rmm::cuda_stream_view stream)
+inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
+                                                             LogicalType const& logical_type,
+                                                             rmm::cuda_stream_view stream)
 {
   auto cudf_type = GetCudfType(logical_type);
 
@@ -163,11 +162,14 @@ inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(
     case cudf::type_id::UINT8:
       return std::make_unique<cudf::numeric_scalar<uint8_t>>(val.GetValue<uint8_t>(), true, stream);
     case cudf::type_id::UINT16:
-      return std::make_unique<cudf::numeric_scalar<uint16_t>>(val.GetValue<uint16_t>(), true, stream);
+      return std::make_unique<cudf::numeric_scalar<uint16_t>>(
+        val.GetValue<uint16_t>(), true, stream);
     case cudf::type_id::UINT32:
-      return std::make_unique<cudf::numeric_scalar<uint32_t>>(val.GetValue<uint32_t>(), true, stream);
+      return std::make_unique<cudf::numeric_scalar<uint32_t>>(
+        val.GetValue<uint32_t>(), true, stream);
     case cudf::type_id::UINT64:
-      return std::make_unique<cudf::numeric_scalar<uint64_t>>(val.GetValue<uint64_t>(), true, stream);
+      return std::make_unique<cudf::numeric_scalar<uint64_t>>(
+        val.GetValue<uint64_t>(), true, stream);
     case cudf::type_id::FLOAT32:
       return std::make_unique<cudf::numeric_scalar<float>>(val.GetValue<float>(), true, stream);
     case cudf::type_id::FLOAT64:
@@ -186,15 +188,18 @@ inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(
     case cudf::type_id::DECIMAL32:
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
         val.GetValueUnsafe<typename numeric::decimal32::rep>(),
-        numeric::scale_type{-DecimalType::GetScale(logical_type)}, true, stream);
+        numeric::scale_type{-DecimalType::GetScale(logical_type)},
+        true,
+        stream);
     case cudf::type_id::DECIMAL64:
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
         val.GetValueUnsafe<typename numeric::decimal64::rep>(),
-        numeric::scale_type{-DecimalType::GetScale(logical_type)}, true, stream);
+        numeric::scale_type{-DecimalType::GetScale(logical_type)},
+        true,
+        stream);
     // DECIMAL128 not supported: DuckDB doesn't export GetValueUnsafe<__int128>.
     // Falls through to string representation.
-    default:
-      return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
+    default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
   }
 }
 

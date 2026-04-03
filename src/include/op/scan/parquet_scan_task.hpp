@@ -300,8 +300,8 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
 
   /// Metadata for a hive partition column (not present in parquet files).
   struct hive_partition_column {
-    std::string column_name;    ///< Partition column name (e.g. "year")
-    size_t duckdb_column_index; ///< Index in scan_op->names / column_ids
+    std::string column_name;     ///< Partition column name (e.g. "year")
+    size_t duckdb_column_index;  ///< Index in scan_op->names / column_ids
   };
 
   /// True if this scan involves hive-partitioned files.
