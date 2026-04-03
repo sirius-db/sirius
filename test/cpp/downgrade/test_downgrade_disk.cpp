@@ -48,37 +48,6 @@ using namespace sirius::parallel;
 
 namespace {
 
-std::unique_ptr<sirius::memory::sirius_memory_reservation_manager>
-make_test_memory_manager_with_disk(size_t host_capacity, size_t disk_capacity)
-{
-  sirius::converter_registry::reset_for_testing();
-
-  cucascade::memory::reservation_manager_configurator builder;
-  const size_t gpu_capacity = 2ull << 30;
-  const double limit_ratio  = 0.75;
-
-  builder.set_number_of_gpus(1)
-    .set_gpu_usage_limit(gpu_capacity)
-    .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
-
-  // Add disk tier — use a temp directory
-  if (disk_capacity > 0) {
-    auto tmp_dir = std::filesystem::temp_directory_path() / "sirius_test_disk";
-    std::filesystem::create_directories(tmp_dir);
-    builder.set_disk_mounting_point(0, disk_capacity, tmp_dir.string());
-  }
-
-  auto space_configs = builder.build();
-  auto manager       = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
-
-  sirius::converter_registry::initialize();
-  return manager;
-}
-
 cucascade::memory::memory_space* get_gpu_space(
   sirius::memory::sirius_memory_reservation_manager& mgr)
 {
@@ -103,6 +72,35 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   return sirius::make_data_batch(std::move(table), gpu_space);
 }
 
+// Pre-exhaust all HOST capacity so that subsequent make_reservation_or_null calls
+// return null (rather than throwing). Returns held reservations — caller must keep
+// them alive for the duration of the test.
+//
+// Background: fixed_size_host_memory_resource::reserve() throws when
+// bytes > _memory_limit, but returns nullptr when all slots are in use.
+// We drain HOST by claiming 1MB (the minimum block size) chunks until null.
+std::vector<std::unique_ptr<cucascade::memory::reservation>> exhaust_host_capacity(
+  sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+{
+  std::vector<std::unique_ptr<cucascade::memory::reservation>> held;
+
+  auto* host_space = mem_mgr.get_memory_space(cucascade::memory::Tier::HOST, 0);
+  if (!host_space) {
+    auto spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (!spaces.empty())
+      host_space = const_cast<cucascade::memory::memory_space*>(spaces.front());
+  }
+  if (!host_space) return held;
+
+  constexpr size_t kBlockSize = 1ull << 20;  // 1 MB (minimum reservation block)
+  while (true) {
+    auto res = host_space->make_reservation_or_null(kBlockSize);
+    if (!res) break;
+    held.push_back(std::move(res));
+  }
+  return held;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -111,10 +109,38 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
 
 TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_disk]")
 {
-  // HOST capacity = 0 forces fallback to DISK
-  auto mem_mgr = make_test_memory_manager_with_disk(0, 4ull << 30);
+  // Set HOST capacity small (2MB, limit = 1.5MB after 0.75 fraction).
+  // Pre-exhaust HOST so make_reservation_or_null returns null gracefully.
+  // DISK (4GB) must then be chosen by any_memory_space_in_tiers{HOST, DISK}.
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 2ull << 30;
+  const size_t host_capacity = 2ull << 20;  // 2 MB — small enough to exhaust quickly
+  const double limit_ratio   = 0.75;
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "sirius_test_disk";
+  std::filesystem::create_directories(tmp_dir);
+
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio)
+    .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
+
+  auto space_configs = builder.build();
+  auto mem_mgr       = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+    std::move(space_configs));
+  sirius::converter_registry::initialize();
+
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
+
+  // Pre-exhaust HOST so make_reservation_or_null returns null for HOST
+  auto held_host = exhaust_host_capacity(*mem_mgr);
+  REQUIRE_FALSE(held_host.empty());
 
   cucascade::shared_data_repository_manager repo_mgr;
   sirius::task_completion_message_queue msg_queue;
@@ -134,8 +160,30 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
 
 TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
 {
-  // HOST capacity = 4GB, DISK capacity = 4GB; HOST should be preferred
-  auto mem_mgr = make_test_memory_manager_with_disk(4ull << 30, 4ull << 30);
+  // HOST (4GB) and DISK (4GB) both available — HOST is listed first in tier preference,
+  // so any_memory_space_in_tiers{HOST, DISK} must pick HOST.
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity = 2ull << 30;
+  const double limit_ratio  = 0.75;
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "sirius_test_disk";
+  std::filesystem::create_directories(tmp_dir);
+
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(4ull << 30)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio)
+    .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
+
+  auto space_configs = builder.build();
+  auto mem_mgr       = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+    std::move(space_configs));
+  sirius::converter_registry::initialize();
+
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
@@ -157,8 +205,27 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
 
 TEST_CASE("Downgrade task throws when both HOST and DISK reservation fail", "[downgrade_disk]")
 {
-  // HOST capacity = 0, DISK capacity = 0 — both tiers exhausted
-  auto mem_mgr = make_test_memory_manager_with_disk(0, 0);
+  // Register HOST with 0-byte reservation limit so that any reserve() call throws.
+  // No DISK tier. The exception from fixed_size_host_memory_resource::reserve must
+  // propagate out of downgrade_task::execute().
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity = 2ull << 30;
+  const double limit_ratio  = 0.75;
+
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(2ull << 20)
+    .use_host_per_gpu()
+    .set_reservation_limit_per_host(0);  // limit = 0: any request > 0 bytes throws
+
+  auto space_configs = builder.build();
+  auto mem_mgr       = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+    std::move(space_configs));
+  sirius::converter_registry::initialize();
+
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
