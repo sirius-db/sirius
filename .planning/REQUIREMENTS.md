@@ -70,32 +70,32 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RAPI-01 | Pending | Pending |
-| RAPI-02 | Pending | Pending |
-| RAPI-03 | Pending | Pending |
-| RAPI-04 | Pending | Pending |
-| RAPI-05 | Pending | Pending |
-| EXEC-01 | Pending | Pending |
-| EXEC-02 | Pending | Pending |
-| EXEC-03 | Pending | Pending |
-| EXEC-04 | Pending | Pending |
-| EXEC-05 | Pending | Pending |
-| LIFE-01 | Pending | Pending |
-| LIFE-02 | Pending | Pending |
-| LIFE-03 | Pending | Pending |
-| LIFE-04 | Pending | Pending |
-| LIFE-05 | Pending | Pending |
-| CAND-01 | Pending | Pending |
-| CAND-02 | Pending | Pending |
-| PIPE-01 | Pending | Pending |
-| PIPE-02 | Pending | Pending |
-| PIPE-03 | Pending | Pending |
+| RAPI-01 | Phase 2 | Pending |
+| RAPI-02 | Phase 2 | Pending |
+| RAPI-03 | Phase 2 | Pending |
+| RAPI-04 | Phase 2 | Pending |
+| RAPI-05 | Phase 2 | Pending |
+| EXEC-01 | Phase 1 | Pending |
+| EXEC-02 | Phase 1 | Pending |
+| EXEC-03 | Phase 2 | Pending |
+| EXEC-04 | Phase 2 | Pending |
+| EXEC-05 | Phase 2 | Pending |
+| LIFE-01 | Phase 3 | Pending |
+| LIFE-02 | Phase 3 | Pending |
+| LIFE-03 | Phase 3 | Pending |
+| LIFE-04 | Phase 3 | Pending |
+| LIFE-05 | Phase 3 | Pending |
+| CAND-01 | Phase 1 | Pending |
+| CAND-02 | Phase 1 | Pending |
+| PIPE-01 | Phase 3 | Pending |
+| PIPE-02 | Phase 3 | Pending |
+| PIPE-03 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 20 total
-- Mapped to phases: 0
-- Unmapped: 20
+- Mapped to phases: 20
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-03*
-*Last updated: 2026-04-03 after initial definition*
+*Last updated: 2026-04-03 after roadmap creation*
