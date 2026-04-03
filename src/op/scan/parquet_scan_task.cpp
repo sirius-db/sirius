@@ -327,8 +327,7 @@ void parquet_scan_task_global_state::initialize_from_files()
         } else {
           // This is a pure filter column that is not among the expected output columns.
           auto const projection_id = _scan_op->projection_ids[i];
-          pure_filter_column_indices.insert(
-            _scan_op->column_ids[projection_id].GetPrimaryIndex());
+          pure_filter_column_indices.insert(_scan_op->column_ids[projection_id].GetPrimaryIndex());
         }
       }
     }
