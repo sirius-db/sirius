@@ -48,8 +48,12 @@ duckdb_scan_executor::duckdb_scan_executor(
     _task_request_publisher(std::move(task_request_publisher)),
     _mem_mgr(mem_mgr)
 {
-  auto gpu_spaces   = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  _gpu_memory_space = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  for (auto* space : gpu_spaces) {
+    _gpu_memory_spaces.push_back(const_cast<cucascade::memory::memory_space*>(space));
+  }
+  // Keep backward compat: _gpu_memory_space points to first GPU for stream pool init
+  _gpu_memory_space = _gpu_memory_spaces.empty() ? nullptr : _gpu_memory_spaces[0];
   _stream_pool      = std::make_unique<cucascade::memory::exclusive_stream_pool>(
     rmm::cuda_device_id(_gpu_memory_space->get_device_id()), config.num_threads);
 }
@@ -144,6 +148,41 @@ void duckdb_scan_executor::submit_scan_request()
     _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
 }
 
+int duckdb_scan_executor::select_target_gpu()
+{
+  if (_gpu_memory_spaces.size() <= 1) {
+    return _gpu_memory_spaces.empty() ? 0 : _gpu_memory_spaces[0]->get_device_id();
+  }
+
+  // Proportional distribution based on available GPU memory.
+  // GPU with 2x free memory gets 2x batches.
+  size_t total_available = 0;
+  for (auto* space : _gpu_memory_spaces) {
+    total_available += space->get_available_memory();
+  }
+
+  if (total_available == 0) {
+    // All GPUs full, round-robin fallback
+    auto idx = _scan_round_robin.fetch_add(1) % _gpu_memory_spaces.size();
+    return _gpu_memory_spaces[idx]->get_device_id();
+  }
+
+  // Weighted selection: use round-robin counter as deterministic distribution seed
+  auto counter    = _scan_round_robin.fetch_add(1);
+  size_t target   = counter % total_available;
+  size_t cumulative = 0;
+  for (auto* space : _gpu_memory_spaces) {
+    cumulative += space->get_available_memory();
+    if (target < cumulative) {
+      SIRIUS_LOG_DEBUG("Scan executor: distributing scan batch to GPU {} (available: {} bytes)",
+                       space->get_device_id(),
+                       space->get_available_memory());
+      return space->get_device_id();
+    }
+  }
+  return _gpu_memory_spaces.back()->get_device_id();
+}
+
 std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
   pipeline::sirius_pipeline_itask* task, rmm::cuda_stream_view stream)
 {
@@ -234,15 +273,30 @@ void duckdb_scan_executor::manager_loop()
     auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
+
+      // Select target GPU for this scan batch (proportional to available memory)
+      int target_gpu_id = select_target_gpu();
+
       if (_cache_level != cache_level::NONE) {
         bool wrap_batch_data     = _cache_level != cache_level::TABLE_GPU;
         bool cache_decoded_table = _cache_level == cache_level::TABLE_HOST;
+
+        // Find the GPU memory space for the target GPU
+        cucascade::memory::memory_space* target_gpu_space = _gpu_memory_space;
+        for (auto* space : _gpu_memory_spaces) {
+          if (space->get_device_id() == target_gpu_id) {
+            target_gpu_space = space;
+            break;
+          }
+        }
         parquet_task->set_materialized_columns(
-          wrap_batch_data, cache_decoded_table, _gpu_memory_space);
+          wrap_batch_data, cache_decoded_table, target_gpu_space);
       }
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
-        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
+        cucascade::memory::any_memory_space_in_tier_with_preference{
+          cucascade::memory::Tier::HOST, static_cast<size_t>(target_gpu_id)},
+        bytes_needed);
       if (!reservation) {
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to acquire host memory reservation");
         _completion_handler->report_error(

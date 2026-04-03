@@ -31,6 +31,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace sirius::op {
 class sirius_physical_operator;
@@ -160,6 +161,16 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
    */
   void submit_scan_request();
 
+  /**
+   * @brief Select the target GPU for the next scan batch.
+   *
+   * Distributes scan batches across GPUs proportional to available GPU memory.
+   * Falls back to round-robin when all GPUs are at capacity.
+   *
+   * @return The device_id of the GPU to target for the next scan batch.
+   */
+  int select_target_gpu();
+
   std::unique_ptr<op::operator_data> get_scan_output(pipeline::sirius_pipeline_itask* task,
                                                      rmm::cuda_stream_view stream);
 
@@ -177,7 +188,9 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
-  cucascade::memory::memory_space* _gpu_memory_space{nullptr};
+  cucascade::memory::memory_space* _gpu_memory_space{nullptr};  ///< First GPU space (backward compat)
+  std::vector<cucascade::memory::memory_space*> _gpu_memory_spaces;  ///< All GPU memory spaces
+  std::atomic<size_t> _scan_round_robin{0};  ///< Round-robin counter for scan distribution
   sirius::creator::task_creator* _task_creator{nullptr};
   sirius::pipeline::completion_handler* _completion_handler{nullptr};
 };
