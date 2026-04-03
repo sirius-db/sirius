@@ -21,6 +21,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 
 namespace sirius {
@@ -48,23 +49,33 @@ bool downgrade_task::execute(rmm::cuda_stream_view stream)
 
   try {
     auto data_size   = batch->get_data()->get_size_in_bytes();
+    // DG-01: Try HOST first, fall back to DISK
     auto reservation = res_mgr.request_reservation(
-      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
-    if (!reservation) {
+      cucascade::memory::any_memory_space_in_tiers{
+        {cucascade::memory::Tier::HOST, cucascade::memory::Tier::DISK}},
+      data_size);
+    if (\!reservation) {
       batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
       return false;
     }
 
     // Reservation identifies a memory_space (tier + device). Fetch its default allocator.
     auto mem_space = res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
-    if (!mem_space) {
+    if (\!mem_space) {
       batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
       return false;
     }
 
-    // Use the centralized converter registry to convert GPU representation to HOST
+    // DG-02 + DG-03: Select representation type based on granted tier
     auto& converter_registry = sirius::converter_registry::get();
-    batch->convert_to<cucascade::host_data_representation>(converter_registry, mem_space, stream);
+    if (reservation->tier() == cucascade::memory::Tier::DISK) {
+      SIRIUS_LOG_INFO("[downgrade] disk fallback: batch {} ({} B)",
+                      batch->get_batch_id(),
+                      data_size);
+      batch->convert_to<cucascade::disk_data_representation>(converter_registry, mem_space, stream);
+    } else {
+      batch->convert_to<cucascade::host_data_representation>(converter_registry, mem_space, stream);
+    }
 
     // Release the in-transit lock, restoring the batch to its previous state
     batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
