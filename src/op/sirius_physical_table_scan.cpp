@@ -96,14 +96,15 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
-  const auto& raw_input_batches = input_data.get_data_batches();
+  auto& input                   = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& raw_input_batches = input.get_data_batches();
 
   // For parquet scan pipelines, filter and projection are already applied in
   // parquet_scan_task and the host_parquet_representation converters.
@@ -140,7 +141,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After concatenation (or if only one batch), work with a single batch.
   const auto& batch_ref =
     single_batch ? single_batch : (!raw_input_batches.empty() ? raw_input_batches[0] : nullptr);
-  if (!batch_ref || !batch_ref->get_data()) { return std::make_unique<operator_data>(); }
+  if (!batch_ref || !batch_ref->get_data()) {
+    return std::make_unique<pipelineable_operator_data>();
+  }
 
   // Apply table filters as a GPU expression if present.
   std::shared_ptr<cucascade::data_batch> output_batch;
@@ -153,7 +156,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (filter_expr != nullptr) {
     duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
     output_batch = gpu_expression_executor.select(batch_ref, stream);
-    if (!output_batch) { return std::make_unique<operator_data>(); }
+    if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
   } else {
     output_batch = batch_ref;
   }
@@ -212,7 +215,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.push_back(std::move(output_batch));
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 }  // namespace op

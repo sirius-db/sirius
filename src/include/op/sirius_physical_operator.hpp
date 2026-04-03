@@ -62,23 +62,40 @@ struct task_creation_hint {
 };
 
 /**
- * @brief Container for operator data batches.
+ * @brief Generic base class for operator input/output data.
  *
- * Wraps a collection of data batches that can be passed between operators.
+ * This is an intentionally minimal base class with no opinion on what the
+ * data should be. Derived classes define the concrete data representation.
  */
 class operator_data {
  public:
-  operator_data() = default;
-  explicit operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+  operator_data()          = default;
+  virtual ~operator_data() = default;
+
+  operator_data(const operator_data&)            = default;
+  operator_data& operator=(const operator_data&) = default;
+  operator_data(operator_data&&)                 = default;
+  operator_data& operator=(operator_data&&)      = default;
+};
+
+/**
+ * @brief Operator data carrying a collection of data batches for pipeline execution.
+ *
+ * This is the standard data container used by pipeline operators. It wraps a
+ * vector of data batches that flow between operators in a pipeline.
+ */
+class pipelineable_operator_data : public operator_data {
+ public:
+  pipelineable_operator_data() = default;
+  explicit pipelineable_operator_data(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))
   {
   }
 
-  virtual ~operator_data() = default;
-
   /**
-   * @brief Get mutable data batches.
-   * @return Mutable reference to vector of data batch pointers
+   * @brief Get the data batches.
+   * @return Const reference to vector of data batch pointers
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const
@@ -91,16 +108,17 @@ class operator_data {
 };
 
 /**
- * @brief Container for partitioned operator data.
+ * @brief Operator data with partition index for partitioned pipeline execution.
  *
- * Extends operator_data to include partition index information.
+ * Extends pipelineable_operator_data to include partition index information,
+ * used by partition-aware operators (partition, concat, etc.).
  */
-class partitioned_operator_data : public operator_data {
+class partitioned_operator_data : public pipelineable_operator_data {
  public:
   partitioned_operator_data() = default;
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx)
-    : operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
   }
 

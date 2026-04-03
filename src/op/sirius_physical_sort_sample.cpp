@@ -78,12 +78,13 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                                                     rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   // After boundaries are computed, just pass through
   if (_boundaries_computed.load()) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<operator_data>(input_data);
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   SIRIUS_LOG_DEBUG("Sort sample: computing partition boundaries from {} batches",
@@ -101,7 +102,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
   if (valid_batches.empty() || !space) {
     _boundaries_computed.store(true);
-    return std::make_unique<operator_data>(input_data);
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // 2. Concatenate all sample batches into one table
@@ -248,7 +249,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                    _partition_boundaries ? _partition_boundaries->num_rows() : 0,
                    duration.count() / 1000.0);
 
-  return std::make_unique<operator_data>(input_data);
+  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
 }
 
 }  // namespace op

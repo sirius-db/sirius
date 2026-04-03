@@ -126,8 +126,10 @@ void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
 {
   if (data == nullptr) { return; }
+  auto* pipelineable_data = dynamic_cast<const op::pipelineable_operator_data*>(data);
+  if (pipelineable_data == nullptr) { return; }
   const auto& expected_types = op.get_types();
-  const auto& batches        = data->get_data_batches();
+  const auto& batches        = pipelineable_data->get_data_batches();
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
@@ -170,9 +172,10 @@ void log_operator_data(const op::sirius_physical_operator& op,
                        const char* label,
                        const std::string& extra_info = "")
 {
-  std::string batch_rows = "";
-  size_t total_bytes     = 0;
-  for (auto& batch : data.get_data_batches()) {
+  auto& pipelineable_data = dynamic_cast<const op::pipelineable_operator_data&>(data);
+  std::string batch_rows  = "";
+  size_t total_bytes      = 0;
+  for (auto& batch : pipelineable_data.get_data_batches()) {
     auto view = get_cudf_table_view(*batch);
     batch_rows += std::to_string(view.num_rows()) + "  ";
     total_bytes += batch->get_data()->get_size_in_bytes();
@@ -184,7 +187,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
     op.get_name(),
     op.get_operator_id(),
     label,
-    data.get_data_batches().size(),
+    pipelineable_data.get_data_batches().size(),
     batch_rows,
     total_bytes,
     static_cast<double>(total_bytes) / (1024.0 * 1024.0),
@@ -395,9 +398,15 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
-  processing_handles.reserve(local_state._input_data->get_data_batches().size());
+  auto* pipelineable_input =
+    dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
+  if (!pipelineable_input) {
+    throw std::runtime_error(
+      "gpu_pipeline_task::execute: input_data is not pipelineable_operator_data");
+  }
+  processing_handles.reserve(pipelineable_input->get_data_batches().size());
 
-  for (const auto& batch : local_state._input_data->get_data_batches()) {
+  for (const auto& batch : pipelineable_input->get_data_batches()) {
     auto* resident_space = batch->get_memory_space();
     if (requested_memory_space && resident_space &&
         resident_space->get_id() != requested_memory_space->get_id()) {
@@ -476,8 +485,12 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       peak_bytes = 0;
     }
     std::size_t output_bytes = 0;
-    for (const auto& batch : output_data->get_data_batches()) {
-      if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+    auto* pipelineable_output =
+      dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
+    if (pipelineable_output) {
+      for (const auto& batch : pipelineable_output->get_data_batches()) {
+        if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+      }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
@@ -502,7 +515,10 @@ std::size_t gpu_pipeline_task::get_input_size() const
   auto& local_state      = _local_state->cast<gpu_pipeline_task_local_state>();
   std::size_t input_size = 0;
   if (!local_state._input_data) { return 0; }
-  for (const auto& batch : local_state._input_data->get_data_batches()) {
+  auto* pipelineable_input =
+    dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
+  if (!pipelineable_input) { return 0; }
+  for (const auto& batch : pipelineable_input->get_data_batches()) {
     if (!batch || !batch->get_data()) { continue; }
     input_size += batch->get_data()->get_size_in_bytes();
   }
