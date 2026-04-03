@@ -31,7 +31,9 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // duckdb
+#include <duckdb/common/hive_partitioning.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/types/date.hpp>
 
 // cudf
 #include "cucascade/data/cpu_data_representation.hpp"
@@ -39,10 +41,12 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/cached_data_representation.hpp"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #if CUDF_VERSION_NUM >= 2604
 #include <cudf/io/parquet_io_utils.hpp>
 #endif
@@ -91,29 +95,40 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
 namespace detail {
 
 bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
-                                std::vector<size_t> const& selected_column_indices)
+                                std::vector<std::string> const& projected_column_names)
 {
-  // Empty files are effectively "flat" for our purposes here.
   if (meta.row_groups.empty()) { return true; }
   auto const& cols = meta.row_groups.front().columns;
 
+  // Build name → column index map for the parquet file.
+  std::unordered_map<std::string, size_t> name_to_idx;
+  for (size_t i = 0; i < cols.size(); ++i) {
+    if (!cols[i].meta_data.path_in_schema.empty()) {
+      name_to_idx[cols[i].meta_data.path_in_schema[0]] = i;
+    }
+  }
+
   // Flat leaf column => path length == 1.
-  // For projections, we only need this property to hold for the projected (selected) leaf columns.
   return std::all_of(
-    selected_column_indices.begin(), selected_column_indices.end(), [&cols](auto col_idx) {
-      return col_idx < cols.size() && cols[col_idx].meta_data.path_in_schema.size() == 1;
+    projected_column_names.begin(), projected_column_names.end(),
+    [&cols, &name_to_idx](auto const& col_name) {
+      auto it = name_to_idx.find(col_name);
+      return it != name_to_idx.end() && cols[it->second].meta_data.path_in_schema.size() == 1;
     });
 }
 
-std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op)
+std::vector<size_t> make_selected_column_indices(
+  sirius_physical_parquet_scan const& scan_op,
+  std::unordered_set<size_t> const& hive_partition_indices)
 {
   // Deduplication set
   std::unordered_set<size_t> seen;
   std::vector<size_t> selected_column_indices;
 
   // In case there are duplicate columns in the projection list, we deduplicate, in order
-  auto push_unique = [&selected_column_indices, &seen](auto col_idx) {
+  auto push_unique = [&selected_column_indices, &seen, &hive_partition_indices](auto col_idx) {
     if (duckdb::IsVirtualColumn(col_idx)) { return; }
+    if (hive_partition_indices.count(col_idx)) { return; }
     if (seen.insert(col_idx).second) {
       // Insert successful (not yet seen)
       selected_column_indices.push_back(col_idx);
@@ -156,8 +171,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _scan_op(scan_op),
     _approximate_batch_size(approximate_batch_size),
-    _is_projected(!scan_op->projection_ids.empty()),
-    _selected_column_indices(detail::make_selected_column_indices(*scan_op))
+    _is_projected(!scan_op->projection_ids.empty())
 {
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
@@ -177,6 +191,17 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
   }
+
+  // Detect hive partition columns — these exist in the DuckDB schema but not in parquet files.
+  // Their values come from directory paths (e.g., partition_col=42/).
+  auto const& hive_indexes = bind_data.reader_bind.hive_partitioning_indexes;
+  for (auto const& hpi : hive_indexes) {
+    _hive_partition_index_set.insert(hpi.index);
+    _hive_partition_columns.push_back({hpi.value, hpi.index});
+  }
+
+  // Build selected column indices, excluding hive partition columns.
+  _selected_column_indices = detail::make_selected_column_indices(*scan_op, _hive_partition_index_set);
 
   auto files = bind_data.file_list->GetAllFiles();
   _file_paths.reserve(files.size());
@@ -235,30 +260,55 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       readers.push_back(std::move(reader));
     });
 
-  // Apply projections by column name using DuckDB's bound column names.
+  // Detect columns in the DuckDB schema that don't exist in the parquet files
+  // (partition columns, filename columns, etc.) and remove them from the projection.
+  if (!_file_metadatas.empty() && !_selected_column_indices.empty()) {
+    auto const& first_meta = _file_metadatas[0];
+    std::unordered_set<std::string> parquet_col_names;
+    for (size_t i = 1; i < first_meta.schema.size(); ++i) {
+      if (first_meta.schema[i].num_children == 0) {
+        parquet_col_names.insert(first_meta.schema[i].name);
+      }
+    }
+
+    std::vector<size_t> filtered_indices;
+    for (auto idx : _selected_column_indices) {
+      if (idx < scan_op->names.size() && parquet_col_names.count(scan_op->names[idx])) {
+        filtered_indices.push_back(idx);
+      } else if (idx < scan_op->names.size()) {
+        _hive_partition_index_set.insert(idx);
+        _hive_partition_columns.push_back({scan_op->names[idx], idx});
+        SIRIUS_LOG_INFO("[parquet_scan] Column '{}' (idx={}) not in parquet schema — "
+                        "treating as partition column.",
+                        scan_op->names[idx], idx);
+      }
+    }
+
+    if (filtered_indices.size() != _selected_column_indices.size()) {
+      _selected_column_indices = std::move(filtered_indices);
+    }
+  }
+
+  // Apply projections by column name using DuckDB's (filtered) bound column names.
   if (_is_projected) {
     if (scan_op->names.empty()) {
       throw std::runtime_error(
         "[parquet_scan_task_global_state] Cannot apply projection: scan has no column names");
     }
 
-    // We currently only support flat schemas for parquet scans with projections
-    /// TODO: Support nested schemas for projected scans
+    std::vector<std::string> projected_columns;
+    projected_columns.reserve(_selected_column_indices.size());
+    for (auto col_idx : _selected_column_indices) {
+      projected_columns.emplace_back(scan_op->names[col_idx]);
+    }
+
     for (auto const& meta : _file_metadatas) {
-      if (!detail::projected_columns_are_flat(meta, _selected_column_indices)) {
+      if (!detail::projected_columns_are_flat(meta, projected_columns)) {
         throw std::runtime_error(
           "[parquet_scan_task_global_state] Parquet scans with projections currently only support "
           "flat projected columns");
       }
     }
-
-    std::vector<std::string> projected_columns;
-    projected_columns.reserve(_selected_column_indices.size());
-    std::for_each(_selected_column_indices.begin(),
-                  _selected_column_indices.end(),
-                  [&scan_op, &projected_columns](size_t col_idx) {
-                    projected_columns.emplace_back(scan_op->names[col_idx]);
-                  });
 
 #if CUDF_VERSION_NUM >= 2604
     _reader_options.set_column_names(std::move(projected_columns));
@@ -267,11 +317,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 #endif
   }
 
-  // Compute the byte counts per row group for the selected columns for task partitioning
   accumulate_row_group_byte_sizes();
-
-  // Partition the row groups into ranges for each scan task
   partition_row_groups();
+
+  // Build partition injection function if this scan has partition columns.
+  init_hive_partitions(bind_data, scan_op);
 }
 
 // Protected constructor: caller supplies pre-resolved file paths and column indices.
@@ -340,28 +390,58 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       readers.push_back(std::move(reader));
     });
 
-  // Apply column-name projection using the pre-computed selected_column_indices
+  // Detect columns in the DuckDB schema that don't exist in the parquet files
+  // (partition columns, filename columns, etc.) and remove them from the projection.
+  // This handles Iceberg partition columns which aren't in hive_partitioning_indexes.
+  if (!_file_metadatas.empty() && !_selected_column_indices.empty()) {
+    auto const& first_meta = _file_metadatas[0];
+    std::unordered_set<std::string> parquet_col_names;
+    // Collect leaf column names from the parquet schema (skip root at index 0).
+    for (size_t i = 1; i < first_meta.schema.size(); ++i) {
+      if (first_meta.schema[i].num_children == 0) {
+        parquet_col_names.insert(first_meta.schema[i].name);
+      }
+    }
+
+    std::vector<size_t> filtered_indices;
+    for (auto idx : _selected_column_indices) {
+      if (idx < scan_op->names.size() && parquet_col_names.count(scan_op->names[idx])) {
+        filtered_indices.push_back(idx);
+      } else if (idx < scan_op->names.size()) {
+        // This column is not in the parquet file — treat as partition column.
+        _hive_partition_index_set.insert(idx);
+        _hive_partition_columns.push_back({scan_op->names[idx], idx});
+        SIRIUS_LOG_INFO("[parquet_scan] Column '{}' (idx={}) not in parquet schema — "
+                        "treating as partition column.",
+                        scan_op->names[idx], idx);
+      }
+    }
+
+    if (filtered_indices.size() != _selected_column_indices.size()) {
+      _selected_column_indices = std::move(filtered_indices);
+    }
+  }
+
+  // Apply column-name projection using the (filtered) selected_column_indices
   if (_is_projected) {
     if (scan_op->names.empty()) {
       throw std::runtime_error(
         "[parquet_scan_task_global_state] Cannot apply projection: scan has no column names");
     }
 
+    std::vector<std::string> projected_columns;
+    projected_columns.reserve(_selected_column_indices.size());
+    for (auto col_idx : _selected_column_indices) {
+      projected_columns.emplace_back(scan_op->names[col_idx]);
+    }
+
     for (auto const& meta : _file_metadatas) {
-      if (!detail::projected_columns_are_flat(meta, _selected_column_indices)) {
+      if (!detail::projected_columns_are_flat(meta, projected_columns)) {
         throw std::runtime_error(
           "[parquet_scan_task_global_state] Parquet scans with projections currently only support "
           "flat projected columns");
       }
     }
-
-    std::vector<std::string> projected_columns;
-    projected_columns.reserve(_selected_column_indices.size());
-    std::for_each(_selected_column_indices.begin(),
-                  _selected_column_indices.end(),
-                  [&scan_op, &projected_columns](size_t col_idx) {
-                    projected_columns.emplace_back(scan_op->names[col_idx]);
-                  });
 
 #if CUDF_VERSION_NUM >= 2604
     _reader_options.set_column_names(std::move(projected_columns));
@@ -374,6 +454,108 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   partition_row_groups();
 }
 
+void parquet_scan_task_global_state::init_hive_partitions(
+  duckdb::MultiFileBindData const& bind_data, sirius_physical_parquet_scan* scan_op)
+{
+  // Populate metadata from DuckDB's hive_partitioning_indexes if not already
+  // detected by schema comparison in the constructor.
+  if (_hive_partition_columns.empty()) {
+    auto const& hive_indexes = bind_data.reader_bind.hive_partitioning_indexes;
+    for (auto const& hpi : hive_indexes) {
+      _hive_partition_index_set.insert(hpi.index);
+      _hive_partition_columns.push_back({hpi.value, hpi.index});
+    }
+  }
+
+  // Nothing to do if no partition columns were detected (by either path).
+  if (_hive_partition_columns.empty()) return;
+
+  // Build the output column map: for each column in the DuckDB schema,
+  // record whether it's a data column (with its cudf table index) or
+  // a partition column (with its name and DuckDB type).
+  struct col_source {
+    bool is_partition;
+    size_t data_col_idx;
+    std::string partition_name;
+    duckdb::LogicalType duckdb_type;
+  };
+  std::vector<col_source> output_map;
+
+  size_t data_idx = 0;
+  for (size_t i = 0; i < scan_op->names.size(); ++i) {
+    if (_hive_partition_index_set.count(i)) {
+      output_map.push_back({true, 0, scan_op->names[i], scan_op->returned_types[i]});
+    } else {
+      bool selected = false;
+      for (auto si : _selected_column_indices) {
+        if (si == i) { selected = true; break; }
+      }
+      if (selected) {
+        output_map.push_back({false, data_idx++, {}, {}});
+      }
+    }
+  }
+
+  SIRIUS_LOG_INFO("[parquet_scan] Hive partitions detected: {} partition col(s), {} data col(s), "
+                  "{} output col(s).",
+                  _hive_partition_columns.size(), data_idx, output_map.size());
+
+  _partition_inject_fn = [output_map = std::move(output_map)](
+                           std::unique_ptr<cudf::table> tbl,
+                           std::string const& file_path,
+                           rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
+    if (!tbl || tbl->num_rows() == 0) return tbl;
+
+    auto partitions = duckdb::HivePartitioning::Parse(file_path);
+    auto const num_rows = tbl->num_rows();
+
+    std::vector<std::unique_ptr<cudf::column>> output_columns;
+    output_columns.reserve(output_map.size());
+
+    for (auto const& src : output_map) {
+      if (!src.is_partition) {
+        output_columns.push_back(std::make_unique<cudf::column>(
+          tbl->get_column(static_cast<cudf::size_type>(src.data_col_idx)), stream));
+      } else {
+        auto it = partitions.find(src.partition_name);
+        std::string val_str = (it != partitions.end()) ? it->second : "";
+
+        auto phys_type = src.duckdb_type.InternalType();
+        auto log_type_id = src.duckdb_type.id();
+        if (log_type_id == duckdb::LogicalTypeId::DATE) {
+          // Parse "YYYY-MM-DD" to days since epoch via DuckDB.
+          auto date = duckdb::Date::FromString(val_str);
+          auto scalar = cudf::numeric_scalar<int32_t>(duckdb::Date::EpochDays(date), true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        } else if (phys_type == duckdb::PhysicalType::INT32) {
+          auto scalar = cudf::numeric_scalar<int32_t>(std::stoi(val_str), true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        } else if (phys_type == duckdb::PhysicalType::INT64) {
+          auto scalar = cudf::numeric_scalar<int64_t>(std::stoll(val_str), true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        } else if (phys_type == duckdb::PhysicalType::VARCHAR) {
+          auto scalar = cudf::string_scalar(val_str, true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        } else if (phys_type == duckdb::PhysicalType::BOOL) {
+          auto scalar = cudf::numeric_scalar<bool>(val_str == "true" || val_str == "1", true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        } else if (phys_type == duckdb::PhysicalType::DOUBLE) {
+          auto scalar = cudf::numeric_scalar<double>(std::stod(val_str), true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        } else if (phys_type == duckdb::PhysicalType::FLOAT) {
+          auto scalar = cudf::numeric_scalar<float>(std::stof(val_str), true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        } else {
+          auto scalar = cudf::string_scalar(val_str, true, stream);
+          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
+        }
+      }
+    }
+
+    return std::make_unique<cudf::table>(std::move(output_columns));
+  };
+}
+
 void parquet_scan_task_global_state::accumulate_row_group_byte_sizes()
 {
   _row_group_compressed_bytes.resize(_file_metadatas.size());
@@ -384,21 +566,43 @@ void parquet_scan_task_global_state::accumulate_row_group_byte_sizes()
     _row_group_uncompressed_bytes[file_idx].reserve(total_rg);
     _row_group_compressed_bytes[file_idx].reserve(total_rg);
 
-    auto add_rg_bytes = [this, file_idx](cudf::io::parquet::RowGroup const& rg) {
+    // Map DuckDB column indices to parquet column indices by name.
+    // _selected_column_indices are DuckDB-level, but rg.columns uses parquet-level indices.
+    std::vector<size_t> parquet_col_indices;
+    if (!meta.row_groups.empty()) {
+      auto const& cols = meta.row_groups.front().columns;
+      std::unordered_map<std::string, size_t> name_to_pq_idx;
+      for (size_t i = 0; i < cols.size(); ++i) {
+        if (!cols[i].meta_data.path_in_schema.empty()) {
+          name_to_pq_idx[cols[i].meta_data.path_in_schema[0]] = i;
+        }
+      }
+      for (auto duckdb_idx : _selected_column_indices) {
+        if (duckdb_idx < _scan_op->names.size()) {
+          auto it = name_to_pq_idx.find(_scan_op->names[duckdb_idx]);
+          if (it != name_to_pq_idx.end()) {
+            parquet_col_indices.push_back(it->second);
+          }
+        }
+      }
+    }
+
+    auto add_rg_bytes = [this, file_idx, &parquet_col_indices](
+                          cudf::io::parquet::RowGroup const& rg) {
       size_t uncompressed_bytes = 0;
       size_t compressed_bytes   = 0;
 
-      std::for_each(_selected_column_indices.begin(),
-                    _selected_column_indices.end(),
-                    [&uncompressed_bytes, &compressed_bytes, &rg](size_t col_idx) {
-                      auto const& column_metadata = rg.columns[col_idx].meta_data;
-                      if (column_metadata.total_uncompressed_size > 0) {
-                        uncompressed_bytes += column_metadata.total_uncompressed_size;
-                      }
-                      if (column_metadata.total_compressed_size > 0) {
-                        compressed_bytes += column_metadata.total_compressed_size;
-                      }
-                    });
+      for (auto pq_idx : parquet_col_indices) {
+        if (pq_idx < rg.columns.size()) {
+          auto const& column_metadata = rg.columns[pq_idx].meta_data;
+          if (column_metadata.total_uncompressed_size > 0) {
+            uncompressed_bytes += column_metadata.total_uncompressed_size;
+          }
+          if (column_metadata.total_compressed_size > 0) {
+            compressed_bytes += column_metadata.total_compressed_size;
+          }
+        }
+      }
 
       _row_group_uncompressed_bytes[file_idx].push_back(uncompressed_bytes);
       _row_group_compressed_bytes[file_idx].push_back(compressed_bytes);
@@ -578,9 +782,15 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   file_size,
                                                   _datasource);
 
-  // Propagate the post-convert hook and data-file path (non-null only for iceberg V2 scans).
+  // Propagate the post-convert hook and data-file path.
   if (g_state.has_post_convert_fn()) {
     parquet_representation->set_post_convert_fn(g_state.get_post_convert_fn());
+  }
+  if (g_state.has_hive_partitions()) {
+    parquet_representation->set_partition_inject_fn(g_state.get_partition_inject_fn());
+  }
+  // Always set the data file path if we have any hooks that need it.
+  if (g_state.has_post_convert_fn() || g_state.has_hive_partitions()) {
     parquet_representation->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));
   }
 

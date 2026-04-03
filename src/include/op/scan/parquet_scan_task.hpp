@@ -33,6 +33,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
+#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/main/client_context.hpp>
 
 // cudf
@@ -48,6 +49,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -60,10 +62,16 @@ namespace detail {
  * @brief Compute the parquet column indices to read for the given scan operator.
  *
  * Applies projection_ids / column_ids to select only the needed columns.
- * Virtual columns and duplicates are excluded/deduplicated.
+ * Virtual columns, duplicates, and hive partition columns are excluded.
  * Defined in parquet_scan_task.cpp.
+ *
+ * @param scan_op              The physical scan operator.
+ * @param hive_partition_indices Column indices that are hive partition columns
+ *                               (not present in parquet files). Empty if no partitioning.
  */
-std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op);
+std::vector<size_t> make_selected_column_indices(
+  sirius_physical_parquet_scan const& scan_op,
+  std::unordered_set<size_t> const& hive_partition_indices = {});
 }  // namespace detail
 
 //===----------------------------------------------------------------------===//
@@ -286,6 +294,46 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return _selected_column_indices;
   }
 
+  // -------------------------------------------------------------------------
+  // Hive partition column support
+  // -------------------------------------------------------------------------
+
+  /// Metadata for a hive partition column (not present in parquet files).
+  struct hive_partition_column {
+    std::string column_name;    ///< Partition column name (e.g. "year")
+    size_t duckdb_column_index; ///< Index in scan_op->names / column_ids
+  };
+
+  /// True if this scan involves hive-partitioned files.
+  [[nodiscard]] bool has_hive_partitions() const { return !_hive_partition_columns.empty(); }
+
+  /// Return the partition injection function (may be null).
+  [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
+  {
+    return _partition_inject_fn;
+  }
+
+  /// Return the hive partition column metadata.
+  [[nodiscard]] std::vector<hive_partition_column> const& get_hive_partition_columns() const
+  {
+    return _hive_partition_columns;
+  }
+
+  /// Return the set of DuckDB column indices that are hive partitions.
+  [[nodiscard]] std::unordered_set<size_t> const& get_hive_partition_index_set() const
+  {
+    return _hive_partition_index_set;
+  }
+
+  /**
+   * @brief Initialize hive partition metadata and build the injection function.
+   *
+   * Called from both the public constructor (plain parquet) and the iceberg
+   * subclass constructor. Safe to call after base construction.
+   */
+  void init_hive_partitions(duckdb::MultiFileBindData const& bind_data,
+                            sirius_physical_parquet_scan* scan_op);
+
  protected:
   /**
    * @brief Protected constructor for subclasses that pre-process the file list.
@@ -355,6 +403,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /// Optional hook called after each batch is decompressed to a GPU table.
   /// Null for plain parquet scans; set by iceberg_scan_task_global_state.
   post_convert_fn_t _post_convert_fn;
+
+  /// Optional partition column injection (null unless hive-partitioned).
+  partition_inject_fn_t _partition_inject_fn;
+
+  /// Hive partition columns (not present in parquet files).
+  std::vector<hive_partition_column> _hive_partition_columns;
+  std::unordered_set<size_t> _hive_partition_index_set;
 };
 
 //===----------------------------------------------------------------------===//

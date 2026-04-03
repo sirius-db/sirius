@@ -159,7 +159,13 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
     file_paths.push_back(f.path);
   }
 
-  auto selected = detail::make_selected_column_indices(*scan_op);
+  // Exclude hive partition columns from the parquet read projection
+  // (same filtering the base parquet constructor does for plain parquet scans).
+  std::unordered_set<size_t> hive_partition_indices;
+  for (auto const& hpi : bind_data.reader_bind.hive_partitioning_indexes) {
+    hive_partition_indices.insert(hpi.index);
+  }
+  auto selected = detail::make_selected_column_indices(*scan_op, hive_partition_indices);
 
   return {std::move(file_paths), std::move(selected)};
 }
@@ -175,6 +181,10 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   : iceberg_scan_task_global_state(
       std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size)
 {
+  // Propagate hive partition info to the base class so it can build
+  // the partition injection function (same as the public constructor does).
+  auto& bind_data = scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
+  init_hive_partitions(bind_data, scan_op);
 }
 
 iceberg_scan_task_global_state::iceberg_scan_task_global_state(

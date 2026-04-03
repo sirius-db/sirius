@@ -95,6 +95,11 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
     result.tbl = host_src.apply_post_convert(std::move(result.tbl), stream);
   }
 
+  // Inject hive partition columns (constant values from file path).
+  if (host_src.has_partition_inject_fn()) {
+    result.tbl = host_src.apply_partition_inject(std::move(result.tbl), stream);
+  }
+
   stream.synchronize();
 
   return std::make_unique<cucascade::gpu_table_representation>(
@@ -165,6 +170,9 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     host_src.get_file_size(),
     host_src.get_fallback_datasource());
   if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
+  if (host_src.has_partition_inject_fn()) {
+    dst->set_partition_inject_fn(host_src.get_partition_inject_fn());
+  }
   if (!host_src.get_data_file_path().empty()) {
     dst->set_data_file_path(host_src.get_data_file_path());
   }
