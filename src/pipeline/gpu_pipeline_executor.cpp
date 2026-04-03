@@ -70,11 +70,8 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: pool interrupted, stopping manager loop");
       break;
     }
-    if (!_task_request_publisher.send(
-          std::make_unique<pipeline::task_request>(_memory_space->get_device_id(), false))) {
-      SIRIUS_LOG_INFO("GPU Pipeline Executor: Failed to send task request, channel is closed");
-      break;
-    }
+    // Task request sending removed: management_eventloop now pushes tasks directly
+    // to this executor based on data locality preference (push model).
     auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
