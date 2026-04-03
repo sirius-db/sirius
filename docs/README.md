@@ -3,7 +3,7 @@
   <img src="sirius-full.png" alt="Diagram" width="500"/>
 </p>
 
-Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
+Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB, MatrixOne and Doris (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
 
 <!-- ![Architecture](sirius-architecture.png) -->
 <p align="center">
@@ -69,6 +69,8 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
   <a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" width="200" align="middle"/></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://www.vastdata.com/"><img src="https://upload.wikimedia.org/wikipedia/commons/3/36/VAST_Data_logo.svg" alt="VAST Data" width="200" align="middle"/></a>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.matrixorigin.io/"><img src="matrixorgin.png" alt="MatrixOrigin" width="200" align="middle"/></a>
 </p>
 
 ## Future Roadmap
