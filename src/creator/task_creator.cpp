@@ -31,10 +31,14 @@
 #include "planner/query.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
+#include <algorithm>
 #include <optional>
+#include <unordered_map>
 
 namespace sirius::creator {
 
@@ -43,9 +47,19 @@ namespace sirius::creator {
 //------------------------------------------------------------------------------
 
 task_creator::task_creator(exec::thread_pool_config config,
-                           sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr)
+                           sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+                           const cucascade::memory::system_topology_info* sys_topology)
+  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _sys_topology(sys_topology)
 {
+  // Build NUMA node -> first GPU device mapping for HOST data locality routing
+  if (_sys_topology) {
+    for (size_t i = 0; i < _sys_topology->gpus.size(); ++i) {
+      auto numa = _sys_topology->gpus[i].numa_node;
+      if (numa >= 0 && _numa_to_gpu.find(numa) == _numa_to_gpu.end()) {
+        _numa_to_gpu[numa] = static_cast<int>(_sys_topology->gpus[i].id);
+      }
+    }
+  }
 }
 
 task_creator::~task_creator() { stop(); }
@@ -424,8 +438,57 @@ void task_creator::manager_loop()
 
             auto local_state =
               std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
+
+            // Compute preferred GPU based on data locality (SCHED-01, SCHED-02)
+            {
+              std::optional<int> preferred_device_id;
+              if (local_state->_input_data &&
+                  !local_state->_input_data->get_data_batches().empty()) {
+                std::unordered_map<int, size_t> gpu_bytes;
+                std::unordered_map<int, size_t> host_bytes;
+                for (const auto& batch : local_state->_input_data->get_data_batches()) {
+                  auto* space = batch->get_memory_space();
+                  if (!space || !batch->get_data()) { continue; }
+                  auto size = batch->get_data()->get_size_in_bytes();
+                  if (space->get_tier() == cucascade::memory::Tier::GPU) {
+                    gpu_bytes[space->get_device_id()] += size;
+                  } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
+                    host_bytes[space->get_device_id()] += size;
+                  }
+                }
+                if (!gpu_bytes.empty()) {
+                  // SCHED-01: Route to GPU with most data by bytes
+                  preferred_device_id = std::max_element(gpu_bytes.begin(),
+                                                         gpu_bytes.end(),
+                                                         [](const auto& a, const auto& b) {
+                                                           return a.second < b.second;
+                                                         })
+                                          ->first;
+                } else if (!host_bytes.empty() && !_numa_to_gpu.empty()) {
+                  // SCHED-02: No GPU data, route to GPU on same NUMA as host data
+                  auto top_host = std::max_element(host_bytes.begin(),
+                                                   host_bytes.end(),
+                                                   [](const auto& a, const auto& b) {
+                                                     return a.second < b.second;
+                                                   })
+                                    ->first;
+                  auto it = _numa_to_gpu.find(top_host);
+                  if (it != _numa_to_gpu.end()) { preferred_device_id = it->second; }
+                }
+                SIRIUS_LOG_DEBUG(
+                  "Task Creator: locality score gpu_sources={} host_sources={} preferred_device={}",
+                  gpu_bytes.size(),
+                  host_bytes.size(),
+                  preferred_device_id.value_or(-1));
+              }
+              if (preferred_device_id.has_value()) {
+                local_state->set_preferred_device_id(preferred_device_id.value());
+              }
+            }
+
+            auto task_id = get_next_task_id();
             auto task =
-              std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
+              std::make_unique<pipeline::gpu_pipeline_task>(task_id,
                                                             destination_data_repositories,
                                                             std::move(local_state),
                                                             gpu_pipeline_task_global_state);

@@ -29,6 +29,7 @@
 #include <blockingconcurrentqueue.h>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -37,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <variant>
 
 namespace sirius::pipeline {
@@ -83,9 +85,11 @@ class task_creator {
    *
    * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
    * @param mem_res_mgr Reference to the memory reservation manager.
+   * @param sys_topology Optional system topology info for NUMA-aware GPU routing.
    */
   task_creator(exec::thread_pool_config config,
-               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
+               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+               const cucascade::memory::system_topology_info* sys_topology = nullptr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -202,6 +206,11 @@ class task_creator {
   std::unique_ptr<duckdb::ThreadContext> _thread_context;
   std::unique_ptr<duckdb::ExecutionContext> _execution_context;
   std::mutex _global_state_mutex;  // Protect concurrent access to the map
+
+  /// System topology for NUMA-aware GPU routing (non-owning, may be null)
+  const cucascade::memory::system_topology_info* _sys_topology{nullptr};
+  /// Maps NUMA node ID -> first GPU device_id on that NUMA node (for HOST data locality)
+  std::unordered_map<int, int> _numa_to_gpu;
 };
 
 }  // namespace sirius::creator

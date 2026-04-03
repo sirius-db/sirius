@@ -23,6 +23,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 #include <memory>
+#include <optional>
 
 namespace sirius {
 namespace pipeline {
@@ -70,9 +71,27 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   pipeline_memory_history& get_memory_history() { return _memory_history; }
   const pipeline_memory_history& get_memory_history() const { return _memory_history; }
 
+  /**
+   * @brief Set the preferred GPU device ID for this pipeline's tasks.
+   *
+   * This is a pipeline-level default that can be overridden per-task
+   * via gpu_pipeline_task_local_state::set_preferred_device_id().
+   *
+   * @param device_id The GPU device ID where data locality is highest
+   */
+  void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
+
+  /**
+   * @brief Get the preferred GPU device ID for this pipeline's tasks.
+   *
+   * @return The preferred device ID, or std::nullopt if not set
+   */
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
   pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
+  std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
 };
 
 /**
