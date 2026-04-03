@@ -18,3 +18,7 @@
 [submodule "duckdb-python"]
 	path = duckdb-python
 	url = https://github.com/duckdb/duckdb-python.git
+[submodule ".claude/claude-tools"]
+	path = .claude/claude-tools
+	url = https://github.com/sirius-db/claude-tools.git
+	branch = main
