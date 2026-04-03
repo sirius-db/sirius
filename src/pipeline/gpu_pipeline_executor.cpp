@@ -86,8 +86,10 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
     SIRIUS_LOG_TRACE(
-      "GPU Pipeline Executor: Acquiring memory reservation of {} bytes for task {}. Memory "
+      "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
+      "{}. Memory "
       "available: {}, total reserved: {}, max: {}",
+      gpu_task->get_pipeline_id(),
       bytes_needs,
       gpu_task->get_task_id(),
       _memory_space->get_available_memory(),
@@ -103,6 +105,15 @@ void gpu_pipeline_executor::manager_loop()
           std::to_string(gpu_task->get_task_id()));
       }
       break;
+    } else if (reservation->size() != bytes_needs) {
+      SIRIUS_LOG_WARN(
+        "GPU Pipeline Executor: Acquired memory reservation does not match requested size for "
+        "pipeline {} of {} bytes needed for task "
+        "{}. Reservation size: {}",
+        gpu_task->get_pipeline_id(),
+        bytes_needs,
+        gpu_task->get_task_id(),
+        reservation->size());
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {

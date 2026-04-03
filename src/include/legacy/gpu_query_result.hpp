@@ -59,8 +59,7 @@ class GPUQueryResult : public QueryResult {
 
   //! Fetches a DataChunk from the query result.
   //! This will consume the result (i.e. the result can only be scanned once with this function)
-  DUCKDB_API unique_ptr<DataChunk> Fetch() override;
-  DUCKDB_API unique_ptr<DataChunk> FetchRaw() override;
+  DUCKDB_API unique_ptr<DataChunk> FetchInternal() override;
   //! Converts the QueryResult to a string
   DUCKDB_API string ToString() override;
   DUCKDB_API string ToBox(ClientContext& context, const BoxRendererConfig& config) override;
