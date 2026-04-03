@@ -25,9 +25,9 @@
  * array, map, record).  Any other Avro feature (enum, fixed, …) will throw.
  */
 
-#include <op/scan/iceberg_avro_reader.hpp>
-
 #include "miniz.hpp"
+
+#include <op/scan/iceberg_avro_reader.hpp>
 
 #include <array>
 #include <cstring>
@@ -54,25 +54,26 @@ std::vector<uint8_t> inflate_deflate(const uint8_t* data, size_t size)
   if (duckdb_miniz::mz_inflateInit2(&strm, -15) != duckdb_miniz::MZ_OK) {
     throw std::runtime_error("avro: deflate init failed");
   }
-  strm.next_in = data;
-  strm.avail_in = static_cast<unsigned>(size);
-  strm.next_out = out.data();
+  strm.next_in   = data;
+  strm.avail_in  = static_cast<unsigned>(size);
+  strm.next_out  = out.data();
   strm.avail_out = static_cast<unsigned>(out.size());
 
   while (true) {
     auto status = duckdb_miniz::mz_inflate(&strm, duckdb_miniz::MZ_FINISH);
     if (status == duckdb_miniz::MZ_STREAM_END) break;
-    if (status == duckdb_miniz::MZ_BUF_ERROR || (status == duckdb_miniz::MZ_OK && strm.avail_out == 0)) {
+    if (status == duckdb_miniz::MZ_BUF_ERROR ||
+        (status == duckdb_miniz::MZ_OK && strm.avail_out == 0)) {
       // Need more output space.
       auto used = out.size() - strm.avail_out;
       out.resize(out.size() * 2);
-      strm.next_out = out.data() + used;
+      strm.next_out  = out.data() + used;
       strm.avail_out = static_cast<unsigned>(out.size() - used);
       continue;
     }
     duckdb_miniz::mz_inflateEnd(&strm);
-    throw std::runtime_error("avro: deflate decompression failed (status=" +
-                             std::to_string(status) + ")");
+    throw std::runtime_error(
+      "avro: deflate decompression failed (status=" + std::to_string(status) + ")");
   }
   out.resize(strm.total_out);
   duckdb_miniz::mz_inflateEnd(&strm);
@@ -632,8 +633,8 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
         throw std::runtime_error("avro: deflate block size out of bounds");
       }
       decompressed = inflate_deflate(p, static_cast<size_t>(byte_count));
-      bp = decompressed.data();
-      bp_end = bp + decompressed.size();
+      bp           = decompressed.data();
+      bp_end       = bp + decompressed.size();
       p += byte_count;  // advance past compressed bytes
     } else {
       bp_end = end;
@@ -724,8 +725,8 @@ std::vector<std::string> read_iceberg_manifest_delete_files(const std::string& p
         throw std::runtime_error("avro: deflate block size out of bounds");
       }
       decompressed = inflate_deflate(p, static_cast<size_t>(byte_count));
-      bp = decompressed.data();
-      bp_end = bp + decompressed.size();
+      bp           = decompressed.data();
+      bp_end       = bp + decompressed.size();
       p += byte_count;
     } else {
       bp_end = end;

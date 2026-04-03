@@ -777,3 +777,53 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
            "SELECT fruit, count FROM iceberg_scan('" + multi_data_path + "') ORDER BY count",
            {{"apple", 1}, {"cherry", 3}, {"date", 4}, {"fig", 6}});
 }
+
+//===----------------------------------------------------------------------===//
+// Hive-partitioned parquet scan tests
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Test fixture for hive-partitioned parquet scans via gpu_execution.
+ *
+ * Dataset: test/cpp/integration/data/hive_partitioned/
+ *   year=2024/month=01/data.parquet  (id=1, name=alice, amount=100.5)
+ *   year=2024/month=02/data.parquet  (id=2, name=bob,   amount=200.75)
+ *   year=2025/month=01/data.parquet  (id=3, name=charlie, amount=300.25)
+ *
+ * Partition columns (year, month) are NOT in the parquet files — their
+ * values come from the directory paths.
+ */
+class GPUExecutionHivePartitionFixture : public MultiFormatFixtureBase {
+ public:
+  GPUExecutionHivePartitionFixture()
+  {
+    hive_path =
+      (get_project_root() / "test/cpp/integration/data/hive_partitioned/**/*.parquet").string();
+  }
+
+  std::string hive_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - basic scan with partition columns",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT * FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - filter on data column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT * FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) WHERE id >= 2 ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - aggregation on data column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT SUM(amount) as total FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true)");
+}
