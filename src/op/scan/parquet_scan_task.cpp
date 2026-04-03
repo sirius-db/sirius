@@ -33,7 +33,6 @@
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
-#include <duckdb/common/types/date.hpp>
 
 // cudf
 #include "cucascade/data/cpu_data_representation.hpp"
@@ -467,12 +466,15 @@ void parquet_scan_task_global_state::init_hive_partitions(
     }
   }
 
-  // Nothing to do if no partition columns were detected (by either path).
   if (_hive_partition_columns.empty()) return;
 
   // Build the output column map: for each column in the DuckDB schema,
   // record whether it's a data column (with its cudf table index) or
   // a partition column (with its name and DuckDB type).
+  //
+  // Scan ALL names — not just _selected_column_indices — to catch partition
+  // columns that weren't in the selected set (e.g., multi-partition tables
+  // where DuckDB assigns some partition columns special column_ids).
   struct col_source {
     bool is_partition;
     size_t data_col_idx;
@@ -486,6 +488,7 @@ void parquet_scan_task_global_state::init_hive_partitions(
     if (_hive_partition_index_set.count(i)) {
       output_map.push_back({true, 0, scan_op->names[i], scan_op->returned_types[i]});
     } else {
+      // Check if this column was selected for parquet reading.
       bool selected = false;
       for (auto si : _selected_column_indices) {
         if (si == i) { selected = true; break; }
@@ -517,38 +520,12 @@ void parquet_scan_task_global_state::init_hive_partitions(
         output_columns.push_back(std::make_unique<cudf::column>(
           tbl->get_column(static_cast<cudf::size_type>(src.data_col_idx)), stream));
       } else {
+        // Parse partition value from file path, cast to target type via DuckDB.
         auto it = partitions.find(src.partition_name);
         std::string val_str = (it != partitions.end()) ? it->second : "";
-
-        auto phys_type = src.duckdb_type.InternalType();
-        auto log_type_id = src.duckdb_type.id();
-        if (log_type_id == duckdb::LogicalTypeId::DATE) {
-          // Parse "YYYY-MM-DD" to days since epoch via DuckDB.
-          auto date = duckdb::Date::FromString(val_str);
-          auto scalar = cudf::numeric_scalar<int32_t>(duckdb::Date::EpochDays(date), true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        } else if (phys_type == duckdb::PhysicalType::INT32) {
-          auto scalar = cudf::numeric_scalar<int32_t>(std::stoi(val_str), true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        } else if (phys_type == duckdb::PhysicalType::INT64) {
-          auto scalar = cudf::numeric_scalar<int64_t>(std::stoll(val_str), true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        } else if (phys_type == duckdb::PhysicalType::VARCHAR) {
-          auto scalar = cudf::string_scalar(val_str, true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        } else if (phys_type == duckdb::PhysicalType::BOOL) {
-          auto scalar = cudf::numeric_scalar<bool>(val_str == "true" || val_str == "1", true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        } else if (phys_type == duckdb::PhysicalType::DOUBLE) {
-          auto scalar = cudf::numeric_scalar<double>(std::stod(val_str), true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        } else if (phys_type == duckdb::PhysicalType::FLOAT) {
-          auto scalar = cudf::numeric_scalar<float>(std::stof(val_str), true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        } else {
-          auto scalar = cudf::string_scalar(val_str, true, stream);
-          output_columns.push_back(cudf::make_column_from_scalar(scalar, num_rows, stream));
-        }
+        auto duckdb_val = duckdb::Value(val_str).DefaultCastAs(src.duckdb_type);
+        auto scalar = duckdb::DuckDBValueToCudfScalar(duckdb_val, src.duckdb_type, stream);
+        output_columns.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
       }
     }
 
