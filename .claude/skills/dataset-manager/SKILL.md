@@ -1,6 +1,10 @@
 ---
 name: dataset-manager
-description: Manage TPC-H parquet datasets — generate data at any scale factor, consolidate small parquet files into fewer larger files, inspect dataset layout, and optimize row group sizes. Uses rewrite_parquet.py which auto-selects cudf (GPU) or pyarrow (CPU) with OOM fallback.
+description: >
+  Use this skill to generate TPC-H test data, consolidate parquet files, inspect dataset layout,
+  or optimize row group sizes. Trigger when the user needs test data at a specific scale factor,
+  wants to merge small parquet files, check dataset structure, or prepare data for benchmarks.
+  Auto-selects cudf (GPU) or pyarrow (CPU) with OOM fallback.
 ---
 
 # TPC-H Dataset Manager

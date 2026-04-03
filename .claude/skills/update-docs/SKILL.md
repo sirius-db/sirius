@@ -1,6 +1,10 @@
 ---
 name: update-docs
-description: Incrementally updates Super Sirius documentation by inspecting merged PRs since the last update. Use when user says "update docs", "refresh documentation", or "sync docs with code changes". Reads commit marker from docs/super-sirius/README.md, inspects PR diffs, and updates affected doc files.
+description: >
+  Use this skill to update Super Sirius documentation after code changes. Trigger when the user says
+  "update docs", "refresh documentation", "sync docs with code changes", or after merging PRs that
+  changed the Super Sirius codebase. Inspects merged PRs since the last update and patches affected
+  doc files.
 ---
 
 # Update Super Sirius Documentation
