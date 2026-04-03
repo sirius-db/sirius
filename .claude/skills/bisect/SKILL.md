@@ -38,9 +38,7 @@ Find which commit introduced a bug using `git bisect` with automated build+test.
    ```bash
    #!/bin/bash
    set -e
-   # Build (replace <preset> with user's chosen preset)
-   CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make <preset> 2>&1 | tail -5
-   if [ $? -ne 0 ]; then exit 125; fi  # skip if build fails
+   # Build  (look in Claude.md)
 
    # Run test
    <test_command>
