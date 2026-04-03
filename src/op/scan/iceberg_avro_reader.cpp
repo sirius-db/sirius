@@ -16,7 +16,7 @@
 
 /**
  * Minimal Avro Object Container File reader for Iceberg manifest-list and
- * manifest files.  Supports "null" (uncompressed) and "deflate" codecs.
+ * manifest files.  Only the "null" (uncompressed) codec is supported.
  *
  * Avro binary encoding reference: https://avro.apache.org/docs/current/spec.html
  *
@@ -24,8 +24,6 @@
  * the Iceberg manifest schemas (null, boolean, int, long, bytes, string, union,
  * array, map, record).  Any other Avro feature (enum, fixed, …) will throw.
  */
-
-#include "miniz.hpp"
 
 #include <op/scan/iceberg_avro_reader.hpp>
 
@@ -40,47 +38,6 @@
 #include <vector>
 
 namespace sirius::op::scan {
-
-namespace {
-
-/// Decompress a raw deflate block (Avro "deflate" codec = RFC 1951, no gzip header).
-std::vector<uint8_t> inflate_deflate(const uint8_t* data, size_t size)
-{
-  // Start with 4x estimate, grow if needed.
-  std::vector<uint8_t> out(size * 4);
-  duckdb_miniz::mz_stream strm{};
-  // -MZ_DEFAULT_WINDOW_BITS = raw deflate (no zlib/gzip header).
-  // -15 = raw deflate (no zlib/gzip header), window bits = 15
-  if (duckdb_miniz::mz_inflateInit2(&strm, -15) != duckdb_miniz::MZ_OK) {
-    throw std::runtime_error("avro: deflate init failed");
-  }
-  strm.next_in   = data;
-  strm.avail_in  = static_cast<unsigned>(size);
-  strm.next_out  = out.data();
-  strm.avail_out = static_cast<unsigned>(out.size());
-
-  while (true) {
-    auto status = duckdb_miniz::mz_inflate(&strm, duckdb_miniz::MZ_FINISH);
-    if (status == duckdb_miniz::MZ_STREAM_END) break;
-    if (status == duckdb_miniz::MZ_BUF_ERROR ||
-        (status == duckdb_miniz::MZ_OK && strm.avail_out == 0)) {
-      // Need more output space.
-      auto used = out.size() - strm.avail_out;
-      out.resize(out.size() * 2);
-      strm.next_out  = out.data() + used;
-      strm.avail_out = static_cast<unsigned>(out.size() - used);
-      continue;
-    }
-    duckdb_miniz::mz_inflateEnd(&strm);
-    throw std::runtime_error(
-      "avro: deflate decompression failed (status=" + std::to_string(status) + ")");
-  }
-  out.resize(strm.total_out);
-  duckdb_miniz::mz_inflateEnd(&strm);
-  return out;
-}
-
-}  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
 // Avro binary primitives
@@ -541,7 +498,7 @@ static AvroHeader parse_avro_header(const uint8_t*& p, const uint8_t* end)
 
   if (schema_json.empty()) { throw std::runtime_error("avro: missing avro.schema metadata"); }
   if (header.codec.empty()) { header.codec = "null"; }
-  if (header.codec != "null" && header.codec != "deflate") {
+  if (header.codec != "null") {
     throw std::runtime_error("avro: unsupported codec '" + header.codec + "'");
   }
 
@@ -622,53 +579,40 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
     int64_t count = read_vlong(p, end);
     if (count == 0) break;
     if (count < 0) { count = -count; }
-    int64_t byte_count = read_vlong(p, end);
-
-    // For deflate codec, decompress the block bytes before parsing.
-    const uint8_t* bp = p;
-    const uint8_t* bp_end;
-    std::vector<uint8_t> decompressed;
-    if (hdr.codec == "deflate") {
-      if (byte_count < 0 || p + byte_count > end) {
-        throw std::runtime_error("avro: deflate block size out of bounds");
-      }
-      decompressed = inflate_deflate(p, static_cast<size_t>(byte_count));
-      bp           = decompressed.data();
-      bp_end       = bp + decompressed.size();
-      p += byte_count;  // advance past compressed bytes
-    } else {
-      bp_end = end;
-    }
+    read_vlong(p, end);  // byte_count — always present in OCF blocks; skip it
 
     for (int64_t row = 0; row < count; ++row) {
-      advance_to_field(first_idx, hdr.schema, bp, bp_end);
+      const uint8_t* row_start = p;
+
+      // Skip fields before the first interesting field
+      advance_to_field(first_idx, hdr.schema, p, end);
 
       std::string mp_val;
       int ct_val = 0;
 
       if (mp_first) {
-        mp_val = read_bytes_val(bp, bp_end);
+        mp_val = read_bytes_val(p, end);  // manifest_path (string)
+        // Skip fields between the two
         for (int i = first_idx + 1; i < second_idx; ++i) {
-          skip_avro_value(hdr.schema.record_fields[i].type, bp, bp_end);
+          skip_avro_value(hdr.schema.record_fields[i].type, p, end);
         }
-        ct_val = read_vint(bp, bp_end);
+        ct_val = read_vint(p, end);  // content (int)
       } else {
-        ct_val = read_vint(bp, bp_end);
+        ct_val = read_vint(p, end);  // content (int)
+        // Skip fields between the two
         for (int i = first_idx + 1; i < second_idx; ++i) {
-          skip_avro_value(hdr.schema.record_fields[i].type, bp, bp_end);
+          skip_avro_value(hdr.schema.record_fields[i].type, p, end);
         }
-        mp_val = read_bytes_val(bp, bp_end);
+        mp_val = read_bytes_val(p, end);  // manifest_path (string)
       }
 
+      // Skip remaining fields in this row
       for (std::size_t i = second_idx + 1; i < hdr.schema.record_fields.size(); ++i) {
-        skip_avro_value(hdr.schema.record_fields[i].type, bp, bp_end);
+        skip_avro_value(hdr.schema.record_fields[i].type, p, end);
       }
 
       result.emplace_back(std::move(mp_val), ct_val);
     }
-
-    // For uncompressed codec, advance p past the block bytes.
-    if (hdr.codec != "deflate") { p = bp; }
 
     // Verify + consume sync marker
     if (end - p < 16) { throw std::runtime_error("avro: truncated sync marker"); }
@@ -715,57 +659,46 @@ std::vector<std::string> read_iceberg_manifest_delete_files(const std::string& p
     int64_t count = read_vlong(p, end);
     if (count == 0) break;
     if (count < 0) { count = -count; }
-    int64_t byte_count = read_vlong(p, end);
-
-    const uint8_t* bp = p;
-    const uint8_t* bp_end;
-    std::vector<uint8_t> decompressed;
-    if (hdr.codec == "deflate") {
-      if (byte_count < 0 || p + byte_count > end) {
-        throw std::runtime_error("avro: deflate block size out of bounds");
-      }
-      decompressed = inflate_deflate(p, static_cast<size_t>(byte_count));
-      bp           = decompressed.data();
-      bp_end       = bp + decompressed.size();
-      p += byte_count;
-    } else {
-      bp_end = end;
-    }
+    read_vlong(p, end);  // byte_count — always present in OCF blocks
 
     for (int64_t row = 0; row < count; ++row) {
-      advance_to_field(df_idx, hdr.schema, bp, bp_end);
-      advance_to_field(first_df_idx, df_type, bp, bp_end);
+      // Skip top-level fields before data_file
+      advance_to_field(df_idx, hdr.schema, p, end);
+
+      // Now inside data_file record: skip to first interesting field
+      advance_to_field(first_df_idx, df_type, p, end);
 
       std::string file_path;
       int file_content = 0;
 
       if (content_first) {
-        file_content = read_vint(bp, bp_end);
+        file_content = read_vint(p, end);
         for (int i = first_df_idx + 1; i < second_df_idx; ++i) {
-          skip_avro_value(df_type.record_fields[i].type, bp, bp_end);
+          skip_avro_value(df_type.record_fields[i].type, p, end);
         }
-        file_path = read_bytes_val(bp, bp_end);
+        file_path = read_bytes_val(p, end);
       } else {
-        file_path = read_bytes_val(bp, bp_end);
+        file_path = read_bytes_val(p, end);
         for (int i = first_df_idx + 1; i < second_df_idx; ++i) {
-          skip_avro_value(df_type.record_fields[i].type, bp, bp_end);
+          skip_avro_value(df_type.record_fields[i].type, p, end);
         }
-        file_content = read_vint(bp, bp_end);
+        file_content = read_vint(p, end);
       }
 
+      // Skip remaining data_file fields
       for (std::size_t i = second_df_idx + 1; i < df_type.record_fields.size(); ++i) {
-        skip_avro_value(df_type.record_fields[i].type, bp, bp_end);
+        skip_avro_value(df_type.record_fields[i].type, p, end);
       }
 
       if (file_content == target_content) { result.push_back(std::move(file_path)); }
 
+      // Skip remaining top-level fields after data_file
       for (std::size_t i = df_idx + 1; i < hdr.schema.record_fields.size(); ++i) {
-        skip_avro_value(hdr.schema.record_fields[i].type, bp, bp_end);
+        skip_avro_value(hdr.schema.record_fields[i].type, p, end);
       }
     }
 
-    if (hdr.codec != "deflate") { p = bp; }
-
+    // Sync marker
     if (end - p < 16) { throw std::runtime_error("avro: truncated sync marker"); }
     if (std::memcmp(p, hdr.sync_marker.data(), 16) != 0) {
       throw std::runtime_error("avro: sync marker mismatch");

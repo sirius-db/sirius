@@ -57,25 +57,18 @@ IcebergDeleteFiles read_iceberg_delete_metadata(duckdb::ClientContext& context,
     // Parse manifest-list Avro → list of (manifest_path, content_type).
     auto manifests = read_iceberg_manifest_list(manifest_list_path);
 
-    // Iceberg manifest-list content field:
-    //   0 = data manifest (contains data file entries)
-    //   1 = delete manifest (contains delete file entries of ANY type)
-    // The actual delete type (positional vs equality) is in data_file.content
-    // INSIDE each manifest entry, not in the manifest list.
-    constexpr int kDeleteManifest  = 1;
-    constexpr int kPositionDeletes = 1;  // data_file.content value
-    constexpr int kEqualityDeletes = 2;  // data_file.content value
+    constexpr int kPositionDeletes = 1;
+    constexpr int kEqualityDeletes = 2;
 
     for (auto const& [mpath, mcontent] : manifests) {
-      if (mcontent == kDeleteManifest) {
-        // Read positional delete entries from this manifest.
-        auto pos_files = read_iceberg_manifest_delete_files(mpath, kPositionDeletes);
-        for (auto& f : pos_files) {
+      if (mcontent == kPositionDeletes) {
+        auto del_files = read_iceberg_manifest_delete_files(mpath, kPositionDeletes);
+        for (auto& f : del_files) {
           files.positional_delete_files.push_back(std::move(f));
         }
-        // Read equality delete entries from the same manifest.
-        auto eq_files = read_iceberg_manifest_delete_files(mpath, kEqualityDeletes);
-        for (auto& f : eq_files) {
+      } else if (mcontent == kEqualityDeletes) {
+        auto del_files = read_iceberg_manifest_delete_files(mpath, kEqualityDeletes);
+        for (auto& f : del_files) {
           files.equality_delete_files.push_back(std::move(f));
         }
       }
