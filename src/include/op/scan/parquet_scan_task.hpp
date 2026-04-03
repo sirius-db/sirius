@@ -44,6 +44,9 @@
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
+// sirius scan operator data
+#include <op/scan/parquet_scan_operator_data.hpp>
+
 // standard library
 #include <atomic>
 #include <memory>
@@ -57,13 +60,27 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 namespace detail {
 /**
- * @brief Compute the parquet column indices to read for the given scan operator.
+ * @brief Compute the parquet column indices to read given column and projection id vectors.
  *
  * Applies projection_ids / column_ids to select only the needed columns.
  * Virtual columns and duplicates are excluded/deduplicated.
  * Defined in parquet_scan_task.cpp.
+ *
+ * @param column_ids     All column ids exposed by the table function.
+ * @param projection_ids Subset of column_ids positions selected by the planner (empty = no
+ *                       projection).
  */
-std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op);
+std::vector<size_t> make_selected_column_indices(
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids);
+
+/**
+ * @brief Return true if all selected projected columns have a flat (depth-1) schema.
+ *
+ * Defined in parquet_scan_task.cpp.
+ */
+bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
+                                std::vector<size_t> const& selected_column_indices);
 }  // namespace detail
 
 //===----------------------------------------------------------------------===//
@@ -81,29 +98,8 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
  public:
-  /**
-   * @brief Struct representing a range of row groups assigned to a scan task.
-   */
-  struct row_group_range {
-    row_group_range(size_t file_idx,
-                    size_t start_row_group_p,
-                    size_t row_group_count_p,
-                    size_t reserved_uncompressed_bytes_p,
-                    size_t reserved_compressed_bytes_p)
-      : file_idx(file_idx),
-        start_row_group(start_row_group_p),
-        row_group_count(row_group_count_p),
-        reserved_uncompressed_bytes(reserved_uncompressed_bytes_p),
-        reserved_compressed_bytes(reserved_compressed_bytes_p)
-    {
-    }
-
-    size_t file_idx;
-    size_t start_row_group;
-    size_t row_group_count;
-    size_t reserved_uncompressed_bytes;
-    size_t reserved_compressed_bytes;
-  };
+  /// Row-group range type shared with the new metadata/GPU scan operators.
+  using row_group_range = ::sirius::op::scan::row_group_range;
 
   //===----------Constructor----------===//
   /**
