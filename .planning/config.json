@@ -1,0 +1,36 @@
+{
+  "agent_skills": {},
+  "brave_search": false,
+  "commit_docs": true,
+  "exa_search": false,
+  "firecrawl": false,
+  "git": {
+    "branching_strategy": "none",
+    "milestone_branch_template": "gsd/{milestone}-{slug}",
+    "phase_branch_template": "gsd/phase-{phase}-{slug}",
+    "quick_branch_template": null
+  },
+  "granularity": "coarse",
+  "hooks": {
+    "context_warnings": true
+  },
+  "mode": "yolo",
+  "model_profile": "quality",
+  "parallelization": true,
+  "search_gitignored": false,
+  "workflow": {
+    "auto_advance": false,
+    "discuss_mode": "discuss",
+    "node_repair": true,
+    "node_repair_budget": 2,
+    "nyquist_validation": false,
+    "plan_check": true,
+    "research": true,
+    "research_before_questions": false,
+    "skip_discuss": false,
+    "text_mode": false,
+    "ui_phase": true,
+    "ui_safety_gate": true,
+    "verifier": true
+  }
+}
