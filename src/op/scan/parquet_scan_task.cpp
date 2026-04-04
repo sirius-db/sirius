@@ -206,130 +206,18 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 
   auto files = bind_data.file_list->GetAllFiles();
   _file_paths.reserve(files.size());
-  std::for_each(
-    files.begin(), files.end(), [this](auto const& file) { _file_paths.push_back(file.path); });
-
-  // Construct the io_sources and read the footers.
-  // Also record each file's total size and footer offset so that scan tasks
-  // can cache the parquet header+footer alongside the column-chunk data,
-  // eliminating all file I/O during subsequent (preload) iterations.
-  constexpr size_t PARQUET_MAGIC_SIZE = 4;
-  constexpr size_t FOOTER_TAIL_SIZE   = 8;  // 4-byte footer_len + 4-byte magic
-
-  std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
-  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> footer_buffers;
-  datasources.reserve(files.size());
-  footer_buffers.reserve(files.size());
-  _file_sizes.reserve(files.size());
-  _metadata_byte_sizes.reserve(files.size());
-  _footer_offsets.reserve(files.size());
-
-  for (auto const& file_path : _file_paths) {
-    auto datasource      = cudf::io::datasource::create(file_path);
-    auto const file_size = datasource->size();
-    datasources.push_back(std::move(datasource));
-
-#if CUDF_VERSION_NUM >= 2604
-    footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
-    auto const footer_len = footer_buffers.back()->size();
-#else
-    footer_buffers.push_back(fetch_footer_to_host_fallback(*datasources.back()));
-    auto const footer_len = footer_buffers.back()->size();
-#endif
-
-    auto const footer_offset  = file_size - FOOTER_TAIL_SIZE - footer_len;
-    auto const metadata_bytes = PARQUET_MAGIC_SIZE + footer_len + FOOTER_TAIL_SIZE;
-
-    _file_sizes.push_back(file_size);
-    _footer_offsets.push_back(footer_offset);
-    _metadata_byte_sizes.push_back(metadata_bytes);
+  for (auto const& file : files) {
+    _file_paths.push_back(file.path);
   }
 
-  // Initialize reader options for applying projections (FUTURE: filters)
-  _reader_options = cudf::io::parquet_reader_options::builder().build();
-
-  // Construct the file readers and parse the metadata
-  std::vector<std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader>> readers;
-  _file_metadatas.reserve(files.size());
-  readers.reserve(files.size());
-  std::for_each(
-    footer_buffers.begin(), footer_buffers.end(), [&readers, this](auto& footer_buffer) {
-      auto reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
-        cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-        _reader_options);
-      _file_metadatas.push_back(reader->parquet_metadata());
-      readers.push_back(std::move(reader));
-    });
-
-  // Detect columns in the DuckDB schema that don't exist in the parquet files
-  // (partition columns, filename columns, etc.) and remove them from the projection.
-  if (!_file_metadatas.empty() && !_selected_column_indices.empty()) {
-    auto const& first_meta = _file_metadatas[0];
-    std::unordered_set<std::string> parquet_col_names;
-    for (size_t i = 1; i < first_meta.schema.size(); ++i) {
-      if (first_meta.schema[i].num_children == 0) {
-        parquet_col_names.insert(first_meta.schema[i].name);
-      }
-    }
-
-    std::vector<size_t> filtered_indices;
-    for (auto idx : _selected_column_indices) {
-      if (idx < scan_op->names.size() && parquet_col_names.count(scan_op->names[idx])) {
-        filtered_indices.push_back(idx);
-      } else if (idx < scan_op->names.size()) {
-        _hive_partition_index_set.insert(idx);
-        _hive_partition_columns.push_back({scan_op->names[idx], idx});
-        SIRIUS_LOG_INFO(
-          "[parquet_scan] Column '{}' (idx={}) not in parquet schema — "
-          "treating as partition column.",
-          scan_op->names[idx],
-          idx);
-      }
-    }
-
-    if (filtered_indices.size() != _selected_column_indices.size()) {
-      _selected_column_indices = std::move(filtered_indices);
-    }
-  }
-
-  // Apply projections by column name using DuckDB's (filtered) bound column names.
-  if (_is_projected) {
-    if (scan_op->names.empty()) {
-      throw std::runtime_error(
-        "[parquet_scan_task_global_state] Cannot apply projection: scan has no column names");
-    }
-
-    std::vector<std::string> projected_columns;
-    projected_columns.reserve(_selected_column_indices.size());
-    for (auto col_idx : _selected_column_indices) {
-      projected_columns.emplace_back(scan_op->names[col_idx]);
-    }
-
-    for (auto const& meta : _file_metadatas) {
-      if (!detail::projected_columns_are_flat(meta, projected_columns)) {
-        throw std::runtime_error(
-          "[parquet_scan_task_global_state] Parquet scans with projections currently only support "
-          "flat projected columns");
-      }
-    }
-
-#if CUDF_VERSION_NUM >= 2604
-    _reader_options.set_column_names(std::move(projected_columns));
-#else
-    _reader_options.set_columns(std::move(projected_columns));
-#endif
-  }
-
-  accumulate_row_group_byte_sizes();
-  partition_row_groups();
+  // Shared initialization: footer reads, partition detection, projection, partitioning.
+  initialize_scan(scan_op);
 
   // Build partition injection function if this scan has partition columns.
   init_hive_partitions(bind_data, scan_op);
 }
 
 // Protected constructor: caller supplies pre-resolved file paths and column indices.
-// Skips MultiFileBindData extraction; everything else is identical to the public
-// constructor (footer reads, metadata parsing, row-group partitioning).
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_parquet_scan* scan_op,
@@ -347,6 +235,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
   }
 
+  initialize_scan(scan_op);
+}
+
+void parquet_scan_task_global_state::initialize_scan(sirius_physical_parquet_scan* scan_op)
+{
+  // -----------------------------------------------------------------------
+  // 1. Read parquet footers and parse file metadata.
+  // -----------------------------------------------------------------------
   constexpr size_t PARQUET_MAGIC_SIZE = 4;
   constexpr size_t FOOTER_TAIL_SIZE   = 8;
 
@@ -381,25 +277,23 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 
   _reader_options = cudf::io::parquet_reader_options::builder().build();
 
-  std::vector<std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader>> readers;
   _file_metadatas.reserve(_file_paths.size());
-  readers.reserve(_file_paths.size());
-  std::for_each(
-    footer_buffers.begin(), footer_buffers.end(), [&readers, this](auto& footer_buffer) {
-      auto reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
-        cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-        _reader_options);
-      _file_metadatas.push_back(reader->parquet_metadata());
-      readers.push_back(std::move(reader));
-    });
+  std::for_each(footer_buffers.begin(), footer_buffers.end(), [this](auto& footer_buffer) {
+    auto reader = std::make_unique<hybrid_scan_reader>(
+      cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+      _reader_options);
+    _file_metadatas.push_back(reader->parquet_metadata());
+  });
 
-  // Detect columns in the DuckDB schema that don't exist in the parquet files
-  // (partition columns, filename columns, etc.) and remove them from the projection.
-  // This handles Iceberg partition columns which aren't in hive_partitioning_indexes.
+  // -----------------------------------------------------------------------
+  // 2. Detect partition columns (present in DuckDB schema but not in parquet).
+  //    Compares DuckDB column names against the first file's parquet schema.
+  //    Detected partition columns are removed from _selected_column_indices
+  //    and recorded in _hive_partition_columns for injection after GPU read.
+  // -----------------------------------------------------------------------
   if (!_file_metadatas.empty() && !_selected_column_indices.empty()) {
     auto const& first_meta = _file_metadatas[0];
     std::unordered_set<std::string> parquet_col_names;
-    // Collect leaf column names from the parquet schema (skip root at index 0).
     for (size_t i = 1; i < first_meta.schema.size(); ++i) {
       if (first_meta.schema[i].num_children == 0) {
         parquet_col_names.insert(first_meta.schema[i].name);
@@ -411,7 +305,6 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       if (idx < scan_op->names.size() && parquet_col_names.count(scan_op->names[idx])) {
         filtered_indices.push_back(idx);
       } else if (idx < scan_op->names.size()) {
-        // This column is not in the parquet file — treat as partition column.
         _hive_partition_index_set.insert(idx);
         _hive_partition_columns.push_back({scan_op->names[idx], idx});
         SIRIUS_LOG_INFO(
@@ -427,7 +320,9 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     }
   }
 
-  // Apply column-name projection using the (filtered) selected_column_indices
+  // -----------------------------------------------------------------------
+  // 3. Apply column projection by name.
+  // -----------------------------------------------------------------------
   if (_is_projected) {
     if (scan_op->names.empty()) {
       throw std::runtime_error(
@@ -455,6 +350,9 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 #endif
   }
 
+  // -----------------------------------------------------------------------
+  // 4. Partition row groups into scan tasks.
+  // -----------------------------------------------------------------------
   accumulate_row_group_byte_sizes();
   partition_row_groups();
 }

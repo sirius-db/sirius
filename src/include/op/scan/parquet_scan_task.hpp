@@ -367,6 +367,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   void make_selected_column_indices(sirius_physical_parquet_scan const& scan_op);
 
   /**
+   * @brief Shared initialization: read footers, detect partitions, apply projection, partition RGs.
+   *
+   * Called by both constructors after _file_paths and _selected_column_indices are set.
+   */
+  void initialize_scan(sirius_physical_parquet_scan* scan_op);
+
+  /**
    * @brief Accumulate the compressed and uncompressed byte sizes for each row group in the file
    * metadata, which are needed for partitioning the row groups into scan tasks.
    */

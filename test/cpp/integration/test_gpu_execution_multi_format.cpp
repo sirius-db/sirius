@@ -821,6 +821,30 @@ TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - filter on partition column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT id, name, year FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) WHERE year = 2024 ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - group by partition column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT year, SUM(amount) as total FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) GROUP BY year ORDER BY year");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - reversed column order",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT year, month, amount, name, id FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - aggregation on data column",
                  "[integration][gpu_execution][hive_partition]")
 {
