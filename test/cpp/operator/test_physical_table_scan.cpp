@@ -344,9 +344,8 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
   REQUIRE(view.num_rows() == 0);
 }
 
-TEST_CASE(
-  "parquet_scan with translatable filter sets table_scan passthrough",
-  "[physical_table_scan][passthrough]")
+TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
+          "[physical_table_scan][passthrough]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -419,9 +418,8 @@ TEST_CASE(
   REQUIRE(host_data == data_vals);
 }
 
-TEST_CASE(
-  "parquet_scan with decimal filter does not set passthrough",
-  "[physical_table_scan][passthrough]")
+TEST_CASE("parquet_scan with decimal filter does not set passthrough",
+          "[physical_table_scan][passthrough]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -436,22 +434,22 @@ TEST_CASE(
   std::vector<int32_t> data_vals{10, 20, 30, 50, 70};
   constexpr int32_t decimal_scale = -2;
 
-  auto col0 = cudf::make_fixed_point_column(
-    cudf::data_type{cudf::type_id::DECIMAL64, decimal_scale},
-    static_cast<cudf::size_type>(dec_raw.size()),
-    cudf::mask_state::UNALLOCATED,
-    stream,
-    mr);
+  auto col0 =
+    cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL64, decimal_scale},
+                                  static_cast<cudf::size_type>(dec_raw.size()),
+                                  cudf::mask_state::UNALLOCATED,
+                                  stream,
+                                  mr);
   cudaMemcpy(col0->mutable_view().data<int64_t>(),
              dec_raw.data(),
              sizeof(int64_t) * dec_raw.size(),
              cudaMemcpyHostToDevice);
 
   auto col1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                         static_cast<cudf::size_type>(data_vals.size()),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         mr);
+                                        static_cast<cudf::size_type>(data_vals.size()),
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        mr);
   cudaMemcpy(col1->mutable_view().data<int32_t>(),
              data_vals.data(),
              sizeof(int32_t) * data_vals.size(),

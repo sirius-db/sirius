@@ -816,8 +816,7 @@ TEST_CASE("parquet_scan_task - decimal filter does not prune row groups",
 
   // Create table with a DECIMAL column
   {
-    auto result =
-      con.Query("CREATE TABLE " + table_name + " (id INTEGER, amount DECIMAL(10,2))");
+    auto result = con.Query("CREATE TABLE " + table_name + " (id INTEGER, amount DECIMAL(10,2))");
     REQUIRE(result);
     REQUIRE(!result->HasError());
 
@@ -854,7 +853,7 @@ TEST_CASE("parquet_scan_task - decimal filter does not prune row groups",
     auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
       duckdb::ExpressionType::COMPARE_LESSTHAN,
       duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 10, 2));  // 6250.00
-    table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter));  // amount column
+    table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter));   // amount column
     return table_filters;
   };
 
