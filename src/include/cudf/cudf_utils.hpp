@@ -197,8 +197,8 @@ inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
         numeric::scale_type{-DecimalType::GetScale(logical_type)},
         true,
         stream);
-    // DECIMAL128 not supported: DuckDB doesn't export GetValueUnsafe<__int128>.
-    // Falls through to string representation.
+    // For unsupported types (DECIMAL128, STRUCT, etc.), fall back to string.
+    // Better than crashing — the column will be STRING instead of native type.
     default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
   }
 }

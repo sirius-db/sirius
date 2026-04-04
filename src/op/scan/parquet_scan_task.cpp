@@ -474,35 +474,39 @@ void parquet_scan_task_global_state::init_hive_partitions(
 
   if (_hive_partition_columns.empty()) return;
 
-  // Build the output column map: for each column in the DuckDB schema,
-  // record whether it's a data column (with its cudf table index) or
-  // a partition column (with its name and DuckDB type).
+  // Build the output column map in the order the pipeline expects.
   //
-  // Scan ALL names — not just _selected_column_indices — to catch partition
-  // columns that weren't in the selected set (e.g., multi-partition tables
-  // where DuckDB assigns some partition columns special column_ids).
+  // cuDF returns data columns in _selected_column_indices order (which
+  // follows column_ids order). We build a DuckDB-index → cuDF-position
+  // map, then iterate column_ids to produce the output in the order
+  // DuckDB's pipeline operators expect.
   struct col_source {
     bool is_partition;
     size_t data_col_idx;
     std::string partition_name;
     duckdb::LogicalType duckdb_type;
   };
-  std::vector<col_source> output_map;
 
-  size_t data_idx = 0;
-  for (size_t i = 0; i < scan_op->names.size(); ++i) {
-    if (_hive_partition_index_set.count(i)) {
-      output_map.push_back({true, 0, scan_op->names[i], scan_op->returned_types[i]});
+  // Map DuckDB primary index → cuDF column position.
+  std::unordered_map<size_t, size_t> duckdb_to_cudf;
+  for (size_t i = 0; i < _selected_column_indices.size(); ++i) {
+    duckdb_to_cudf[_selected_column_indices[i]] = i;
+  }
+
+  // Build output_map in column_ids order (the order the pipeline expects).
+  std::vector<col_source> output_map;
+  std::unordered_set<size_t> seen;
+  for (auto const& col_id : scan_op->column_ids) {
+    auto primary_idx = col_id.GetPrimaryIndex();
+    if (duckdb::IsVirtualColumn(primary_idx)) continue;
+    if (!seen.insert(primary_idx).second) continue;
+
+    if (_hive_partition_index_set.count(primary_idx)) {
+      output_map.push_back(
+        {true, 0, scan_op->names[primary_idx], scan_op->returned_types[primary_idx]});
     } else {
-      // Check if this column was selected for parquet reading.
-      bool selected = false;
-      for (auto si : _selected_column_indices) {
-        if (si == i) {
-          selected = true;
-          break;
-        }
-      }
-      if (selected) { output_map.push_back({false, data_idx++, {}, {}}); }
+      auto it = duckdb_to_cudf.find(primary_idx);
+      if (it != duckdb_to_cudf.end()) { output_map.push_back({false, it->second, {}, {}}); }
     }
   }
 
@@ -510,7 +514,7 @@ void parquet_scan_task_global_state::init_hive_partitions(
     "[parquet_scan] Hive partitions detected: {} partition col(s), {} data col(s), "
     "{} output col(s).",
     _hive_partition_columns.size(),
-    data_idx,
+    duckdb_to_cudf.size(),
     output_map.size());
 
   _partition_inject_fn = [output_map = std::move(output_map)](
@@ -521,20 +525,22 @@ void parquet_scan_task_global_state::init_hive_partitions(
 
     auto partitions     = duckdb::HivePartitioning::Parse(file_path);
     auto const num_rows = tbl->num_rows();
+    auto data_columns   = tbl->release();  // move columns out, no GPU copy
 
     std::vector<std::unique_ptr<cudf::column>> output_columns;
     output_columns.reserve(output_map.size());
 
     for (auto const& src : output_map) {
       if (!src.is_partition) {
-        output_columns.push_back(std::make_unique<cudf::column>(
-          tbl->get_column(static_cast<cudf::size_type>(src.data_col_idx)), stream));
+        output_columns.push_back(std::move(data_columns[src.data_col_idx]));
       } else {
-        // Parse partition value from file path, cast to target type via DuckDB.
-        auto it             = partitions.find(src.partition_name);
-        std::string val_str = (it != partitions.end()) ? it->second : "";
-        auto duckdb_val     = duckdb::Value(val_str).DefaultCastAs(src.duckdb_type);
-        auto scalar         = duckdb::DuckDBValueToCudfScalar(duckdb_val, src.duckdb_type, stream);
+        auto it = partitions.find(src.partition_name);
+        if (it == partitions.end()) {
+          throw std::runtime_error("[parquet_scan] Missing hive partition key '" +
+                                   src.partition_name + "' in file path: " + file_path);
+        }
+        auto duckdb_val = duckdb::Value(it->second).DefaultCastAs(src.duckdb_type);
+        auto scalar     = duckdb::DuckDBValueToCudfScalar(duckdb_val, src.duckdb_type, stream);
         output_columns.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
       }
     }
