@@ -71,7 +71,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   LEFT_DELIM_JOIN,
   RIGHT_DELIM_JOIN,
   POSITIONAL_JOIN,
-  ASOF_JOIN,
+  ASOF_HASH_JOIN,
   // -----------------------------
   // SetOps
   // -----------------------------

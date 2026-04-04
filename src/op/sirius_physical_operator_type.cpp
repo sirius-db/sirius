@@ -52,7 +52,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::HASH_JOIN: return "HASH_JOIN";
     case SiriusPhysicalOperatorType::PIECEWISE_MERGE_JOIN: return "PIECEWISE_MERGE_JOIN";
     case SiriusPhysicalOperatorType::IE_JOIN: return "IE_JOIN";
-    case SiriusPhysicalOperatorType::ASOF_JOIN: return "ASOF_JOIN";
+    case SiriusPhysicalOperatorType::ASOF_HASH_JOIN: return "ASOF_HASH_JOIN";
     case SiriusPhysicalOperatorType::CROSS_PRODUCT: return "CROSS_PRODUCT";
     case SiriusPhysicalOperatorType::POSITIONAL_JOIN: return "POSITIONAL_JOIN";
     case SiriusPhysicalOperatorType::POSITIONAL_SCAN: return "POSITIONAL_SCAN";
