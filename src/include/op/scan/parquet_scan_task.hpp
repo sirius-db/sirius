@@ -442,7 +442,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    */
   [[nodiscard]] std::size_t get_reserved_compressed_bytes() const
   {
-    return _partition.reserved_compressed_bytes;
+    return _partition.reserved_compressed_bytes + _metadata_bytes;
   }
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override

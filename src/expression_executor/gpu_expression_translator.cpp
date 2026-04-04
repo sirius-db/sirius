@@ -599,6 +599,10 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
       //   true,
       //   _stream,
       //   _resource_ref);
+      SIRIUS_LOG_DEBUG(
+        "[expression_translator] DECIMAL types are not supported in expression translator due to "
+        "cuDF bug");
+      return std::nullopt;
     }
     default: {
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}",
@@ -706,6 +710,16 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   duckdb::BoundReferenceExpression const& expr, cudf::ast::table_reference const table_src)
 {
+  // We need to disable DECIMAL types in the expression translator for now because of cuDF bug.
+  auto const cudf_type = GetCudfType(expr.return_type);
+  if (cudf_type.id() == cudf::type_id::DECIMAL32 || cudf_type.id() == cudf::type_id::DECIMAL64 ||
+      cudf_type.id() == cudf::type_id::DECIMAL128) {
+    SIRIUS_LOG_DEBUG(
+      "[expression_translator] DECIMAL types are not supported in expression translator due to "
+      "cuDF bug");
+    return std::nullopt;
+  }
+
   if (_column_name_resolver) {
     return _ast_tree.emplace<cudf::ast::column_name_reference>(_column_name_resolver(expr.index));
   }

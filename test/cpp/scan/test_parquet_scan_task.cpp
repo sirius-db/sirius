@@ -20,6 +20,7 @@
 #include <utils/utils.hpp>
 
 // sirius
+#include <exec/config.hpp>
 #include <op/scan/duckdb_scan_task_queue.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
@@ -65,6 +66,31 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
                                    size_t,
                                    cucascade::memory::memory_reservation_manager&,
                                    rmm::cuda_stream_view);
+
+/**
+ * Minimal concrete executor for scan task tests.
+ */
+class scan_test_executor : public sirius::parallel::itask_executor {
+ public:
+  explicit scan_test_executor(sirius::exec::thread_pool_config config)
+    : itask_executor(std::move(config))
+  {
+  }
+
+ protected:
+  void manager_loop() override
+  {
+    while (_running.load()) {
+      auto slot = _bounded_pool->reserve();
+      if (!slot) { break; }
+      auto task = _task_queue.pop();
+      if (!task) { break; }
+      _bounded_pool->dispatch(std::move(slot), [t = std::move(task)]() mutable {
+        t->execute(cudf::get_default_stream());
+      });
+    }
+  }
+};
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,
@@ -185,7 +211,8 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
                                                                     0,
                                                                     std::move(extra_info),
                                                                     duckdb::vector<duckdb::Value>(),
-                                                                    std::move(virtual_columns));
+                                                                    std::move(virtual_columns),
+                                                                    nullptr);
 }
 
 static duckdb::unique_ptr<duckdb::TableFilterSet> make_id_constant_filter(
@@ -348,10 +375,8 @@ static void run_parquet_scan_test(std::string const& table_name,
 
   cucascade::shared_data_repository data_repo;
 
-  sirius::parallel::task_executor_config executor_config{num_threads, false};
-  auto task_queue =
-    std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
-  sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));
+  sirius::exec::thread_pool_config executor_config{num_threads, "scan_test"};
+  scan_test_executor executor(executor_config);
 
   auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
     executor.start();
@@ -448,10 +473,8 @@ static void run_multi_file_parquet_scan_test(
 
   cucascade::shared_data_repository data_repo;
 
-  sirius::parallel::task_executor_config executor_config{num_threads, false};
-  auto task_queue =
-    std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
-  sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));
+  sirius::exec::thread_pool_config executor_config{num_threads, "scan_test"};
+  scan_test_executor executor(executor_config);
 
   auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
     executor.start();
@@ -534,10 +557,8 @@ static void run_parquet_scan_test_with_filter(
 
   cucascade::shared_data_repository data_repo;
 
-  sirius::parallel::task_executor_config executor_config{num_threads, false};
-  auto task_queue =
-    std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
-  sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));
+  sirius::exec::thread_pool_config executor_config{num_threads, "scan_test"};
+  scan_test_executor executor(executor_config);
 
   auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
     executor.start();
@@ -786,42 +807,71 @@ TEST_CASE("parquet_scan_task - decimal filter does not prune row groups",
   // Decimal expression translation is disabled (cuDF bug workaround), so a
   // decimal filter cannot be pushed down to the parquet reader. All row groups
   // must remain — no pruning should occur.
-  // 100000 rows / 5000 per row group = 20 row groups; all 20 survive.
   constexpr size_t num_rows       = 100000;
   constexpr size_t row_group_size = 5000;
+  std::string const table_name    = "parquet_rg_prune_decimal";
 
-  // We can't use run_row_group_pruning_test because it asserts a specific pruned
-  // partition count. Instead, verify that the decimal filter leaves all partitions.
-  run_row_group_pruning_test(
-    "parquet_rg_prune_decimal",
-    row_group_size,
-    20,  // all 20 row groups survive (no pruning)
-    [num_rows](duckdb::Connection& con, std::string const& table_name) {
-      auto result = con.Query("CREATE TABLE " + table_name + " (id INTEGER, amount DECIMAL(10,2))");
-      REQUIRE(result);
-      REQUIRE(!result->HasError());
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
 
-      constexpr size_t BATCH_SIZE = 1000;
-      for (size_t start = 0; start < num_rows; start += BATCH_SIZE) {
-        size_t end             = std::min(start + BATCH_SIZE, num_rows);
-        std::string insert_sql = "INSERT INTO " + table_name +
-                                 " SELECT i, "
-                                 "CAST(i * 1.25 AS DECIMAL(10,2)) "
-                                 "FROM generate_series(" +
-                                 std::to_string(start) + ", " + std::to_string(end - 1) + ") t(i)";
-        auto insert_result = con.Query(insert_sql);
-        REQUIRE(insert_result);
-        REQUIRE(!insert_result->HasError());
-      }
-    },
-    []() {
-      auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-      auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
-        duckdb::ExpressionType::COMPARE_LESSTHAN,
-        duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 10, 2));  // 6250.00
-      table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter));   // amount column
-      return table_filters;
-    });
+  // Create table with a DECIMAL column
+  {
+    auto result =
+      con.Query("CREATE TABLE " + table_name + " (id INTEGER, amount DECIMAL(10,2))");
+    REQUIRE(result);
+    REQUIRE(!result->HasError());
+
+    constexpr size_t BATCH_SIZE = 1000;
+    for (size_t start = 0; start < num_rows; start += BATCH_SIZE) {
+      size_t end             = std::min(start + BATCH_SIZE, num_rows);
+      std::string insert_sql = "INSERT INTO " + table_name +
+                               " SELECT i, "
+                               "CAST(i * 1.25 AS DECIMAL(10,2)) "
+                               "FROM generate_series(" +
+                               std::to_string(start) + ", " + std::to_string(end - 1) + ") t(i)";
+      auto insert_result = con.Query(insert_sql);
+      REQUIRE(insert_result);
+      REQUIRE(!insert_result->HasError());
+    }
+  }
+
+  auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  auto const total_partitions = count_row_group_partitions(client_ctx, parquet_path.string());
+  REQUIRE(total_partitions > 1);
+
+  // Build decimal filter: amount < 6250.00
+  auto make_filters = []() {
+    auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_LESSTHAN,
+      duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 10, 2));  // 6250.00
+    table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter));  // amount column
+    return table_filters;
+  };
+
+  auto const pruned_partitions =
+    count_row_group_partitions(client_ctx, parquet_path.string(), 1, make_filters());
+
+  // Decimal filter can't be translated → no pruning → all partitions survive
+  REQUIRE(pruned_partitions == total_partitions);
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result = con.Query("DROP TABLE " + table_name);
+  REQUIRE(drop_result);
+  REQUIRE(!drop_result->HasError());
+  std::filesystem::remove(parquet_path);
 }
 
 TEST_CASE("parquet_scan_task - filter prunes row groups with date comparison",

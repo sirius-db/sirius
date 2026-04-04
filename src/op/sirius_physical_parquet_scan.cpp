@@ -84,8 +84,9 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
       auto const primary_idx = column_ids[ref_index].GetPrimaryIndex();
       return names[primary_idx];
     };
+    auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
     auto duckdb_expression = convert_table_filters_to_expression(
-      *table_filters, column_ids, returned_types, projection_ids);
+      *table_filters, column_ids, returned_types, batch_column_map);
     if (duckdb_expression) {
       gpu_expression_translator translator(rmm::cuda_stream_default,
                                            cudf::get_current_device_resource_ref());
@@ -101,9 +102,6 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
       }
       // Move the duckdb_expression into the table scan
       if (table_scan) { table_scan->filter_expr = std::move(duckdb_expression); }
-    } else {
-      throw std::runtime_error(
-        "[sirius_physical_parquet_scan] Failed to convert table filters to duckdb expression.");
     }
   } else {
     translated_filter = std::nullopt;
