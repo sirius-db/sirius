@@ -307,7 +307,7 @@ void parquet_scan_task_global_state::initialize_scan(sirius_physical_parquet_sca
       } else if (idx < scan_op->names.size()) {
         _hive_partition_index_set.insert(idx);
         _hive_partition_columns.push_back({scan_op->names[idx], idx});
-        SIRIUS_LOG_INFO(
+        SIRIUS_LOG_DEBUG(
           "[parquet_scan] Column '{}' (idx={}) not in parquet schema — "
           "treating as partition column.",
           scan_op->names[idx],

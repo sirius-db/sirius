@@ -141,8 +141,8 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
  * @param val          The DuckDB value to convert.
  * @param logical_type The DuckDB logical type (determines cudf type via GetCudfType).
  * @param stream       CUDA stream for device operations.
- * @return A cudf scalar holding the same value.
- * @throws InvalidInputException if the type is not supported by GetCudfType.
+ * @return A cudf scalar holding the same value. Falls back to string_scalar
+ *         for unsupported cudf types (DECIMAL128, STRUCT, etc.).
  */
 inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
                                                              LogicalType const& logical_type,

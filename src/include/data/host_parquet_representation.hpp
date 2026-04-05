@@ -318,9 +318,11 @@ class host_parquet_representation : public cucascade::idata_representation {
 
   [[nodiscard]] bool has_partition_inject_fn() const { return _partition_inject_fn != nullptr; }
 
+  /// Only call after checking has_partition_inject_fn().
   [[nodiscard]] std::unique_ptr<cudf::table> apply_partition_inject(
     std::unique_ptr<cudf::table> tbl, rmm::cuda_stream_view stream)
   {
+    D_ASSERT(_partition_inject_fn);
     return _partition_inject_fn(std::move(tbl), _data_file_path, stream);
   }
 
