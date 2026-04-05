@@ -20,3 +20,12 @@ rm -f "$project_root/duckdb/CMakeUserPresets.json"
 if [[ ! -e "$cmake_presets_dst" ]]; then
   ln -s "$cmake_presets_src" "$cmake_presets_dst"
 fi
+
+# Ensure all git submodules (including .claude/claude-tools) are initialized
+if git -C "$project_root" submodule status | grep -q '^-'; then
+  echo "Initializing git submodules..."
+  git -C "$project_root" submodule update --init --recursive
+fi
+
+mkdir -p build
+pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh
