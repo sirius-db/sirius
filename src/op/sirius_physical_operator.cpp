@@ -17,15 +17,55 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include "gpu_executor.hpp"
+#include "log/logging.hpp"
+#include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/error.hpp>
 
 #include <optional>
 
 namespace sirius {
 namespace op {
+
+//===--------------------------------------------------------------------===//
+// pipelineable_operator_data
+//===--------------------------------------------------------------------===//
+
+std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+pipelineable_operator_data::prepare_for_processing(
+  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+{
+  std::vector<::cucascade::data_batch_processing_handle> handles;
+  handles.reserve(_data_batches.size());
+
+  for (const auto& batch : _data_batches) {
+    std::optional<::cucascade::data_batch_processing_handle> handle;
+    try {
+      handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+    } catch (const rmm::out_of_memory&) {
+      SIRIUS_LOG_ERROR(
+        "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+      throw;
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "pipelineable_operator_data: Unknown error at batch {} preparing for processing, "
+        "state: {}: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()),
+        e.what());
+      throw;
+    }
+    if (!handle) { return std::nullopt; }
+    handles.emplace_back(std::move(*handle));
+  }
+
+  return handles;
+}
 
 //===--------------------------------------------------------------------===//
 // Operator

@@ -24,14 +24,11 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
-#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
-#include <data/sirius_converter_registry.hpp>
 
 #include <format>
 #include <optional>
@@ -40,87 +37,6 @@ namespace sirius {
 namespace pipeline {
 
 namespace {
-
-std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
-  const std::shared_ptr<cucascade::data_batch>& batch,
-  const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream)
-{
-  using status = cucascade::lock_for_processing_status;
-  const auto* target_space =
-    requested_memory_space != nullptr ? requested_memory_space : batch->get_memory_space();
-  if (target_space == nullptr) { return std::nullopt; }
-
-  // NOTE: only works in single gpu setup
-  // wait for processing in case a shared batch is in transit in another thread.
-  auto lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
-
-  auto cancel_task_if_needed = []() {
-    SIRIUS_LOG_ERROR(
-      "gpu_pipeline_task: failed to lock batch for processing and cannot prepare batch for "
-      "processing. This likely means the batch is in transit and there is a bug in "
-      "the in-transit locking logic. Cancelling task to avoid deadlock.");
-  };
-
-  while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
-    try {
-      auto& registry = sirius::converter_registry::get();
-      switch (requested_memory_space->get_tier()) {
-        case cucascade::memory::Tier::GPU: {
-          auto prev_state = batch->get_state();
-          if (!batch->try_to_lock_for_in_transit()) {
-            auto current_state = batch->get_state();
-            if (current_state == cucascade::batch_state::in_transit) {
-              // If another thread has taken the in_transit lock, wait to acquire the processing
-              // lock.
-              lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
-              continue;
-            }
-            cancel_task_if_needed();
-            return std::nullopt;
-          }
-          try {
-            batch->convert_to<cucascade::gpu_table_representation>(
-              registry, requested_memory_space, stream);
-          } catch (...) {
-            batch->try_to_release_in_transit();
-            throw;
-          }
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-          break;
-        }
-        case cucascade::memory::Tier::HOST: {
-          auto prev_state = batch->get_state();
-          if (!batch->try_to_lock_for_in_transit()) {
-            cancel_task_if_needed();
-            return std::nullopt;
-          }
-          try {
-            batch->convert_to<cucascade::host_data_representation>(
-              registry, requested_memory_space, stream);
-          } catch (...) {
-            batch->try_to_release_in_transit();
-            throw;
-          }
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-          break;
-        }
-        default: cancel_task_if_needed(); return std::nullopt;
-      }
-
-      lock_result = batch->try_to_lock_for_processing(requested_memory_space->get_id());
-    } catch (...) {
-      throw;
-    }
-  }
-
-  if (!lock_result.success) {
-    cancel_task_if_needed();
-    return std::nullopt;
-  }
-
-  return std::move(lock_result.handle);
-}
 
 void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
@@ -394,67 +310,43 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     allocator->reset_stream_reservation(stream);
   };
 
-  std::vector<cucascade::data_batch_processing_handle> processing_handles;
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
   auto* pipelineable_input =
-    dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
+    dynamic_cast<op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) {
     throw std::runtime_error(
       "gpu_pipeline_task::execute: input_data is not pipelineable_operator_data");
   }
-  processing_handles.reserve(pipelineable_input->get_data_batches().size());
 
-  for (const auto& batch : pipelineable_input->get_data_batches()) {
-    auto* resident_space = batch->get_memory_space();
-    if (requested_memory_space && resident_space &&
-        resident_space->get_id() != requested_memory_space->get_id()) {
-      SIRIUS_LOG_TRACE(
-        "Pipeline {}: fetching batch {} from tier {} to tier {} for operator {} (id={})",
-        pipeline->get_pipeline_id(),
-        batch->get_batch_id(),
-        static_cast<int>(resident_space->get_tier()),
-        static_cast<int>(requested_memory_space->get_tier()),
-        first_op.get_name(),
-        first_op.get_operator_id());
-    }
-    std::optional<cucascade::data_batch_processing_handle> handle;
-    try {
-      handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
-    } catch (const rmm::out_of_memory& oom) {
-      auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
-      auto input_basis = local_state.get_task_consumption_basis();
-      auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
-      global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+  std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
+  try {
+    handles_opt = pipelineable_input->prepare_for_processing(requested_memory_space, stream);
+  } catch (const rmm::out_of_memory& oom) {
+    auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
+    auto input_basis = local_state.get_task_consumption_basis();
+    auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
+    global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
-      SIRIUS_LOG_ERROR("Pipeline {}: OOM at batch {} preparing for processing, state: {}",
-                       pipeline->get_pipeline_id(),
-                       batch->get_batch_id(),
-                       static_cast<int>(batch->get_state()));
-      throw oom_reschedule_exception(std::move(local_state._input_data),
-                                     0,
-                                     "Failed to lock or prepare batch " +
-                                       std::to_string(batch->get_batch_id()) + " for processing");
-    } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR(
-        "Unknown error: {};  in lock or prepare for pipeline {}, batch {}, state: {}",
-        e.what(),
-        pipeline->get_pipeline_id(),
-        batch->get_batch_id(),
-        static_cast<int>(batch->get_state()));
-      throw;
-    }
-    if (!handle) {
-      // trick to retry the task
-      throw oom_reschedule_exception(std::move(local_state._input_data),
-                                     0,
-                                     "Failed to lock or prepare batch " +
-                                       std::to_string(batch->get_batch_id()) + " for processing");
-      return;
-    }
-    processing_handles.emplace_back(std::move(*handle));
+    SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
+                     pipeline->get_pipeline_id());
+    throw oom_reschedule_exception(
+      std::move(local_state._input_data),
+      0,
+      std::string("OOM while preparing batches for processing: ") + oom.what());
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
+                     pipeline->get_pipeline_id(),
+                     e.what());
+    throw;
   }
+
+  if (!handles_opt) {
+    throw oom_reschedule_exception(
+      std::move(local_state._input_data), 0, "Failed to lock or prepare batches for processing");
+  }
+  std::vector<cucascade::data_batch_processing_handle> processing_handles = std::move(*handles_opt);
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =

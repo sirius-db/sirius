@@ -38,6 +38,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace sirius {
 
@@ -102,6 +103,25 @@ class pipelineable_operator_data : public operator_data {
   {
     return _data_batches;
   }
+
+  /**
+   * @brief Lock all data batches for processing in the requested memory space.
+   *
+   * Iterates over all batches and locks (or converts then locks) each one into the
+   * requested memory space. Returns the processing handles that keep the batches locked
+   * until they go out of scope.
+   *
+   * Returns std::nullopt if any batch fails to lock (triggers a retry/reschedule).
+   * Propagates rmm::out_of_memory so the caller can record metrics and reschedule.
+   *
+   * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
+   *                                current space.
+   * @param stream                  CUDA stream used for any data-movement kernels.
+   * @return Processing handles for all batches, or std::nullopt on lock failure.
+   */
+  virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                         rmm::cuda_stream_view stream);
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
