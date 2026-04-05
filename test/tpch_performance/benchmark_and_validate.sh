@@ -235,7 +235,7 @@ fi
 
 # Parse optional flags
 DUCKDB_RESULTS_DIR=""
-DUCKDB_MULTI_SESSION=false
+MULTI_SESSION=false
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
@@ -263,7 +263,7 @@ while [ $# -gt 1 ]; do
             shift 2
             ;;
         --multi-session)
-            DUCKDB_MULTI_SESSION=true
+            MULTI_SESSION=true
             shift
             ;;
         *)
@@ -490,7 +490,7 @@ for engine in $ENGINES; do
     fi
     EXTRA_ARGS+=(--iterations "$NUM_ITERATIONS")
     EXTRA_ARGS+=(--timeout "$QUERY_TIMEOUT")
-    if [ "$DUCKDB_MULTI_SESSION" = true ] && [ "$engine" = "duckdb" ]; then
+    if [ "$MULTI_SESSION" = true ]; then
         EXTRA_ARGS+=(--multi-session)
     fi
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \

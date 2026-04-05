@@ -123,12 +123,6 @@ for TABLE_NAME in "${TPCH_TABLES[@]}"; do
     VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet([${FILE_LIST}]);"$'\n'
 done
 
-# Reject --multi-session for sirius (GPU cache requires single session).
-if [ "$MULTI_SESSION" = true ] && [ "$ENGINE" = "sirius" ]; then
-    echo "ERROR: --multi-session is only supported for the duckdb engine"
-    exit 1
-fi
-
 if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
@@ -347,11 +341,21 @@ run_multi_session() {
         echo ""
         echo "========== Q${q} =========="
 
-        # Build per-query SQL: views + timer + N iterations of the query.
+        # Build per-query SQL: views + scan cache level (sirius) + timer + N iterations.
         local TEMP_SQL
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
             printf '%s\n' "$VIEW_SQL"
+            if [ "$ENGINE" = "sirius" ]; then
+                if [ -n "$SCAN_CACHE_LEVEL" ]; then
+                    # Explicit --cache-level overrides all per-query defaults
+                    printf "SET scan_cache_level = '%s';\n" "$SCAN_CACHE_LEVEL"
+                elif echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
+                    printf "SET scan_cache_level = 'table_host';\n"
+                else
+                    printf "SET scan_cache_level = 'table_gpu';\n"
+                fi
+            fi
             printf ".timer on\n"
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
                 cat "$QUERY_FILE"
@@ -360,12 +364,17 @@ run_multi_session() {
         } > "$TEMP_SQL"
 
         # Run in a fresh DuckDB process.
+        # For sirius, set SIRIUS_LOG_DIR to the per-query directory so logs are isolated.
         local OUTPUT=""
         local Q_EXIT=0
+        local RUN_ENV=("$DUCKDB" -f "$TEMP_SQL")
+        if [ "$ENGINE" = "sirius" ] && [ -n "${Q_DIR:-}" ]; then
+            RUN_ENV=(env SIRIUS_LOG_DIR="$Q_DIR" "${RUN_ENV[@]}")
+        fi
         if [ "$SESSION_TIMEOUT" -gt 0 ] 2>/dev/null; then
-            OUTPUT=$(timeout "$SESSION_TIMEOUT" "$DUCKDB" -f "$TEMP_SQL" 2>&1) || Q_EXIT=$?
+            OUTPUT=$(timeout "$SESSION_TIMEOUT" "${RUN_ENV[@]}" 2>&1) || Q_EXIT=$?
         else
-            OUTPUT=$("$DUCKDB" -f "$TEMP_SQL" 2>&1) || Q_EXIT=$?
+            OUTPUT=$("${RUN_ENV[@]}" 2>&1) || Q_EXIT=$?
         fi
 
         rm -f "$TEMP_SQL"
@@ -446,7 +455,7 @@ fi
 # (one per iteration) into one query segment and copy it to Q_DIR/sirius.log.
 # The combined log is kept in OUTPUT_DIR.
 # ---------------------------------------------------------------------------
-if [ "$ENGINE" = "sirius" ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]} -gt 0 ]; then
+if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]} -gt 0 ]; then
     # spdlog daily sink names files sirius_YYYY-MM-DD.log; find the most recent one.
     LOG_FILE=""
     for f in "$OUTPUT_DIR"/sirius*.log; do
