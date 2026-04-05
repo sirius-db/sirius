@@ -20,14 +20,16 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/table/table.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
-#include <cudf/table/table.hpp>
-#include <cudf/utilities/default_stream.hpp>
-#include <rmm/cuda_stream.hpp>
 
 #include <filesystem>
 #include <memory>

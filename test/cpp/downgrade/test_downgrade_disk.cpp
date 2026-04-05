@@ -87,8 +87,7 @@ std::vector<std::unique_ptr<cucascade::memory::reservation>> exhaust_host_capaci
   auto* host_space = mem_mgr.get_memory_space(cucascade::memory::Tier::HOST, 0);
   if (!host_space) {
     auto spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (!spaces.empty())
-      host_space = const_cast<cucascade::memory::memory_space*>(spaces.front());
+    if (!spaces.empty()) host_space = const_cast<cucascade::memory::memory_space*>(spaces.front());
   }
   if (!host_space) return held;
 
@@ -131,8 +130,8 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
     .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
 
   auto space_configs = builder.build();
-  auto mem_mgr       = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
   sirius::converter_registry::initialize();
 
   auto* gpu_space = get_gpu_space(*mem_mgr);
@@ -180,8 +179,8 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
     .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
 
   auto space_configs = builder.build();
-  auto mem_mgr       = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
   sirius::converter_registry::initialize();
 
   auto* gpu_space = get_gpu_space(*mem_mgr);
@@ -222,8 +221,8 @@ TEST_CASE("Downgrade task throws when both HOST and DISK reservation fail", "[do
     .set_reservation_limit_per_host(0);  // limit = 0: any request > 0 bytes throws
 
   auto space_configs = builder.build();
-  auto mem_mgr       = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
   sirius::converter_registry::initialize();
 
   auto* gpu_space = get_gpu_space(*mem_mgr);

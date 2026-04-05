@@ -69,9 +69,8 @@ bool downgrade_task::execute(rmm::cuda_stream_view stream)
     // DG-02 + DG-03: Select representation type based on granted tier
     auto& converter_registry = sirius::converter_registry::get();
     if (reservation->tier() == cucascade::memory::Tier::DISK) {
-      SIRIUS_LOG_INFO("[downgrade] disk fallback: batch {} ({} B)",
-                      batch->get_batch_id(),
-                      data_size);
+      SIRIUS_LOG_INFO(
+        "[downgrade] disk fallback: batch {} ({} B)", batch->get_batch_id(), data_size);
       batch->convert_to<cucascade::disk_data_representation>(converter_registry, mem_space, stream);
     } else {
       batch->convert_to<cucascade::host_data_representation>(converter_registry, mem_space, stream);
