@@ -111,32 +111,47 @@ void downgrade_executor::processing_loop()
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
-    // 1. Collect candidates (single-threaded)
+    auto& req = request;  // unique_ptr<downgrade_request>
+
+    // 1. Collect repos
     std::vector<downgrade_repository_info> repos;
     _data_repo_mgr.for_each_repository(
       [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
 
-    auto candidates = collect_all_candidates(repos, request->target_bytes);
+    // 2. Collect candidates
+    auto candidates = collect_all_candidates(repos, req->target_bytes);
 
-    // 2. Dispatch all to pool
+    // 3. Incremental dispatch with predicate checking
     for (auto& batch : candidates) {
+      if (req->satisfied.load(std::memory_order_acquire)) break;
+
       auto slot = _pool->reserve();
       if (!slot) break;  // interrupted
+
+      auto batch_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
+
       _pool->dispatch(
         std::move(slot),
-        [batch = std::move(batch), &res_mgr = _reservation_manager,
-         stream = rmm::cuda_stream_view{_stream}]() {
+        [batch = std::move(batch), req_ptr = req.get(), &res_mgr = _reservation_manager,
+         stream = rmm::cuda_stream_view{_stream}, batch_size]() {
           downgrade_task task{batch, res_mgr};
           try {
             task.execute(stream);
+            req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
+            if (req_ptr->predicate && req_ptr->predicate()) {
+              req_ptr->satisfied.store(true, std::memory_order_release);
+            }
           } catch (const std::exception& e) {
             SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
           }
         });
     }
 
-    // 3. Wait for all dispatched batch downgrades to complete
+    // 4. Let in-flight batches finish
     _pool->wait_all();
+
+    // 5. Fulfill the promise with total bytes freed
+    req->result.set_value(req->bytes_freed.load(std::memory_order_relaxed));
   }
 }
 
@@ -148,8 +163,12 @@ void downgrade_executor::monitor_loop()
     if (_memory_space && _memory_space->should_downgrade_memory()) {
       size_t amount = _memory_space->get_amount_to_downgrade();
       if (amount > 0) {
-        auto req         = std::make_unique<downgrade_request>();
+        auto req          = std::make_unique<downgrade_request>();
         req->target_bytes = amount;
+        req->predicate    = [&freed = req->bytes_freed, amount]() {
+          return freed.load(std::memory_order_relaxed) >= amount;
+        };
+        // Fire-and-forget: monitor does not wait for the result
         _request_queue.push(std::move(req));
       }
     }
@@ -282,48 +301,33 @@ std::vector<std::shared_ptr<cucascade::data_batch>> downgrade_executor::collect_
   return all_candidates;
 }
 
-// --- Public downgrade pass methods ---
+// --- Public request API ---
 
-size_t downgrade_executor::run_downgrade_pass_all_repos(size_t amount_to_downgrade)
+std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 {
-  std::vector<downgrade_repository_info> repos;
-  _data_repo_mgr.for_each_repository(
-    [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
-  if (repos.empty()) return 0;
-  return run_downgrade_pass(std::move(repos), amount_to_downgrade);
+  auto req          = std::make_unique<downgrade_request>();
+  req->target_bytes = bytes;
+  req->predicate    = [&freed = req->bytes_freed, bytes]() {
+    return freed.load(std::memory_order_relaxed) >= bytes;
+  };
+  auto future = req->result.get_future();
+  _request_queue.push(std::move(req));
+  return future;
 }
 
-size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_info> repositories,
-                                              size_t amount_to_downgrade)
+size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 {
-  auto all_candidates = collect_all_candidates(repositories, amount_to_downgrade);
+  return request_free_memory(bytes).get();
+}
 
-  if (all_candidates.empty()) return 0;
-
-  size_t task_count = 0;
-  for (auto& batch : all_candidates) {
-    auto data_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
-    SIRIUS_LOG_TRACE("[downgrade] scheduling batch {} ({} B) on tier {}",
-                     batch->get_batch_id(),
-                     data_size,
-                     static_cast<int>(_space_id.tier));
-    auto slot = _pool->reserve();
-    if (!slot) break;
-    _pool->dispatch(
-      std::move(slot),
-      [batch = std::move(batch), &res_mgr = _reservation_manager,
-       stream = rmm::cuda_stream_view{_stream}]() {
-        downgrade_task task{batch, res_mgr};
-        try {
-          task.execute(stream);
-        } catch (const std::exception& e) {
-          SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
-        }
-      });
-    ++task_count;
-  }
-
-  return task_count;
+std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
+{
+  auto req          = std::make_unique<downgrade_request>();
+  req->target_bytes = 0;  // collect all available candidates
+  req->predicate    = std::move(predicate);
+  auto future       = req->result.get_future();
+  _request_queue.push(std::move(req));
+  return future;
 }
 
 }  // namespace parallel
