@@ -12,22 +12,21 @@ The downgrade executor must reliably free GPU memory on demand — both asynchro
 
 ### Validated
 
-(None yet — ship to validate)
+- [x] Own thread pool (drop itask_executor): the downgrade_executor no longer inherits from `itask_executor`; it owns its own `bounded_thread_pool` and request queue — *Validated in Phase 1: Foundation*
+- [x] Sequential request processing: requests are queued and executed one at a time (only one thread pool wave active at once) — *Validated in Phase 1: Foundation*
+- [x] Candidate selection logic preserved: `collect_candidates_from_partition` and `run_downgrade_pass` selection/prioritization logic (partitioned repos first, non-active partitions first, last-to-first order) remains intact — *Validated in Phase 1: Foundation*
+- [x] Predicate-based request API: the fundamental unit of work is a request that takes a lambda `() -> bool` predicate and downgrades data_batches until the predicate returns true or candidates are exhausted — *Validated in Phase 2: Request Execution and API*
+- [x] Byte-based convenience API: `request_free_memory(size_t bytes)` wraps the predicate API with a lambda that checks current memory consumption against the target — *Validated in Phase 2: Request Execution and API*
+- [x] Blocking API: `request_free_memory_and_wait(size_t bytes)` blocks until the request completes and returns the number of bytes actually freed — *Validated in Phase 2: Request Execution and API*
+- [x] Async API: `request_free_memory(size_t bytes)` returns `std::future<size_t>` that the caller can poll or wait on later — *Validated in Phase 2: Request Execution and API*
+- [x] Predicate checked after each batch: after every individual data_batch downgrade completes, the predicate is evaluated; if true, no new batches are dispatched (in-flight batches finish naturally) — *Validated in Phase 2: Request Execution and API*
+- [x] Concurrent batch downgrades within a request: a thread pool performs multiple batch downgrades simultaneously within a single request — *Validated in Phase 2: Request Execution and API*
+- [x] Partial fulfillment: if not enough idle batches exist to satisfy the request, free what's available and return the actual bytes freed — *Validated in Phase 2: Request Execution and API*
 
 ### Active
 
-- [ ] Predicate-based request API: the fundamental unit of work is a request that takes a lambda `() -> bool` predicate and downgrades data_batches until the predicate returns true or candidates are exhausted
-- [ ] Byte-based convenience API: `request_free_memory(size_t bytes)` wraps the predicate API with a lambda that checks current memory consumption against the target
-- [ ] Blocking API: `request_free_memory_and_wait(size_t bytes)` blocks until the request completes and returns the number of bytes actually freed
-- [ ] Async API: `request_free_memory(size_t bytes)` returns `std::future<size_t>` that the caller can poll or wait on later
-- [ ] Predicate checked after each batch: after every individual data_batch downgrade completes, the predicate is evaluated; if true, no new batches are dispatched (in-flight batches finish naturally)
-- [ ] Concurrent batch downgrades within a request: a thread pool performs multiple batch downgrades simultaneously within a single request
-- [ ] Sequential request processing: requests are queued and executed one at a time (only one thread pool wave active at once)
 - [ ] Monitor loop preserved: the existing polling loop that checks `should_downgrade_memory()` continues to exist, using the blocking API to trigger downgrade passes
-- [ ] Own thread pool (drop itask_executor): the downgrade_executor no longer inherits from `itask_executor`; it owns its own `bounded_thread_pool` and request queue
 - [ ] Retain start/stop/drain semantics: `start()`, `stop()`, `drain()` methods continue to exist with equivalent behavior to today, used by `SiriusContext`
-- [ ] Partial fulfillment: if not enough idle batches exist to satisfy the request, free what's available and return the actual bytes freed
-- [ ] Candidate selection logic preserved: `collect_candidates_from_partition` and `run_downgrade_pass` selection/prioritization logic (partitioned repos first, non-active partitions first, last-to-first order) remains intact, modifiable if needed
 
 ### Out of Scope
 
@@ -56,11 +55,11 @@ The downgrade executor must reliably free GPU memory on demand — both asynchro
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Drop itask_executor inheritance | The base class queue-of-tasks model doesn't fit queue-of-requests; fighting the abstraction adds complexity | — Pending |
-| Predicate as fundamental API | More flexible than byte-count-only; byte-based API is a thin wrapper | — Pending |
-| std::future for async result | Simple, standard, no callback complexity; caller can poll or block | — Pending |
-| Sequential request processing | Avoids contention between concurrent requests competing for the same batches | — Pending |
-| Predicate checked after each batch (not per-wave) | Enables earliest possible early-exit, minimizing unnecessary downgrades | — Pending |
+| Drop itask_executor inheritance | The base class queue-of-tasks model doesn't fit queue-of-requests; fighting the abstraction adds complexity | ✓ Validated Phase 1 |
+| Predicate as fundamental API | More flexible than byte-count-only; byte-based API is a thin wrapper | ✓ Validated Phase 2 |
+| std::future for async result | Simple, standard, no callback complexity; caller can poll or block | ✓ Validated Phase 2 |
+| Sequential request processing | Avoids contention between concurrent requests competing for the same batches | ✓ Validated Phase 1 |
+| Predicate checked after each batch (not per-wave) | Enables earliest possible early-exit, minimizing unnecessary downgrades | ✓ Validated Phase 2 |
 
 ## Evolution
 
@@ -80,4 +79,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-03 after initialization*
+*Last updated: 2026-04-06 after Phase 2 completion — request execution engine and full public API verified*
