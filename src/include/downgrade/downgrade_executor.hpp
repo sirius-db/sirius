@@ -48,8 +48,10 @@ namespace parallel {
  */
 struct downgrade_request {
   size_t target_bytes{0};
-  std::function<bool()> predicate;  // Phase 1: present but unused
-  std::promise<size_t> result;      // Phase 1: present but unused
+  std::function<bool()> predicate;
+  std::promise<size_t> result;
+  std::atomic<size_t> bytes_freed{0};
+  std::atomic<bool> satisfied{false};
 };
 
 /**
@@ -106,31 +108,36 @@ class downgrade_executor {
   cucascade::memory::memory_space_id get_space_id() const { return _space_id; }
 
   /**
-   * @brief Perform a downgrade pass across all known repositories.
+   * @brief Asynchronously request GPU memory reclamation.
    *
-   * Collects repositories from the data_repository_manager and delegates
-   * to run_downgrade_pass.
+   * Constructs a predicate that checks bytes_freed >= bytes and enqueues
+   * a downgrade request. Returns immediately with a future.
    *
-   * @param amount_to_downgrade Target bytes of data to downgrade
-   * @return size_t Number of downgrade tasks dispatched
+   * @param bytes Target bytes to free
+   * @return std::future<size_t> Resolves to actual bytes freed (may be less than requested)
    */
-  size_t run_downgrade_pass_all_repos(size_t amount_to_downgrade);
+  std::future<size_t> request_free_memory(size_t bytes);
 
   /**
-   * @brief Perform a downgrade pass with an explicit list of repositories.
+   * @brief Synchronously request GPU memory reclamation.
    *
-   * Uses this executor's bound memory space as the source tier. Walks through
-   * the provided repositories using the prioritization rules:
-   * 1. Partitioned repos first, then by descending data size on this tier
-   * 2. Within each repo, iterate partitions from last to first
-   * 3. First pass: non-active partitions; second pass: active partitions
+   * Blocks until the request completes and returns the actual bytes freed.
    *
-   * @param repositories Vector of repository pointers to scan
-   * @param amount_to_downgrade Target bytes of data to downgrade
-   * @return size_t Number of downgrade tasks dispatched
+   * @param bytes Target bytes to free
+   * @return size_t Actual bytes freed (may be less than requested)
    */
-  size_t run_downgrade_pass(std::vector<downgrade_repository_info> repositories,
-                            size_t amount_to_downgrade);
+  size_t request_free_memory_and_wait(size_t bytes);
+
+  /**
+   * @brief Asynchronously request a predicate-driven downgrade.
+   *
+   * Dispatches batch downgrades until the predicate returns true or
+   * candidates are exhausted. In-flight batches finish naturally.
+   *
+   * @param predicate Callable returning true when the caller's condition is met
+   * @return std::future<size_t> Resolves to total bytes freed
+   */
+  std::future<size_t> request_downgrade(std::function<bool()> predicate);
 
  private:
   void processing_loop();
