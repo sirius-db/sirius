@@ -4,153 +4,150 @@
 
 ## APIs & External Services
 
-**DuckDB Core:**
-- DuckDB 1.4.4 (submodule `duckdb/`)
-  - Integration: Sirius is a DuckDB extension loaded via `LOAD 'sirius.duckdb_extension'`
-  - API: DuckDB C++ extension API for plan generation, operator execution, result collection
-  - Usage: `gpu_execution('SELECT ...')` table function entry point
-  - Type hints: Uses DuckDB's physical plan AST, expression types, vector batches
+**GPU Compute APIs:**
+- CUDA Runtime API - Direct GPU kernel execution and memory management
+- NVIDIA CUDA Profiler API (`cudaProfilerStart/Stop`) - Performance profiling hooks in `src/sirius_extension.cpp`
+- NVIDIA Management Library (NVML) - GPU device monitoring and telemetry
 
-**RAPIDS GPU Libraries:**
-- libcudf 26.02.x - GPU dataframe operations
-  - Headers: `<cudf/io/parquet.hpp>`, `<cudf/io/experimental/hybrid_scan.hpp>`, `<cudf/io/datasource.hpp>`, `<cudf/io/parquet_schema.hpp>`
-  - Operators: `cudf::left_join()`, `cudf::inner_join()`, `cudf::stable_sort_keys()`, `cudf::groupby::aggregate()`
-  - Usage: Join operators (`src/cuda/operator/hash_join_*.cu`), aggregation (`src/cuda/cudf/cudf_groupby.cu`), ordering (`src/cuda/cudf/cudf_orderby.cu`)
-  - Client: `libcudf.so` (linked via CMake find_package)
-
-- RMM (RAPIDS Memory Manager)
-  - Headers: `<rmm/cuda_stream_view.hpp>`
-  - Purpose: GPU memory allocation, stream management, resource pools
-  - Usage: Memory reservations in `src/memory/sirius_memory_reservation_manager.cpp`
-
-**GPU Acceleration:**
-- NVIDIA CUDA Runtime (cudart)
-  - Profiler API: `cudaProfilerStart()`, `cudaProfilerStop()` (linked via libcudart)
-  - Usage: Performance profiling in `src/sirius_extension.cpp`
-  - Streams: CUDA stream management for concurrent kernel execution
-
-- CUDA Libraries:
-  - libcurand-dev: Random number generation on GPU
-  - curand: CUDA random number generation kernels
+**DuckDB Extension Interface:**
+- DuckDB Extension API - Sirius loads as unsigned DuckDB extension via `LOAD` command
+- DuckDB table functions - Custom SQL interface via `gpu_execution()` and `gpu_buffer_init()` procedures
+- DuckDB physical plan interface - Query optimization and execution planning integration
 
 ## Data Storage
 
 **Databases:**
-- DuckDB - In-process SQL database
-  - Connection: Via DuckDB C++ API (`duckdb::Connection`, `duckdb::ClientContext`)
-  - Primary use: Query parsing, optimization, CPU fallback execution
+- DuckDB 1.4.4 - In-process SQL database (extension targets)
+  - Connection: In-process via `duckdb.connect()`
+  - Client: DuckDB C++ API (headers in `duckdb/` submodule)
+  - Configuration: `allow_unsigned_extensions=true` required for Sirius loading
 
 **File Storage:**
-- Local Parquet Files
-  - Scanned via cuDF and DuckDB parquet readers
-  - Implementation: `src/op/scan/parquet_scan_task.cpp`
-  - Format support: Parquet 1.0+
-  - Schema discovery: Via parquet metadata (footer reads)
-
-- Iceberg Table Format
-  - Metadata: Iceberg manifests and delete files
-  - Implementation: `src/op/scan/iceberg_scan_task.cpp`, `src/op/scan/iceberg_metadata_reader.cpp`
-  - Delete handling: Positional and equality delete filters (`src/op/scan/iceberg_delete_filter.cpp`)
-  - Avro support: `src/op/scan/iceberg_avro_reader.cpp` (for manifest files)
-
-**GPU Memory Storage:**
-- GPU Device Memory
-  - Allocated via: RMM memory pools
-  - Tiered management: cuCascade handles spilling to host/disk
-
-- Host Memory (Pinned)
-  - GPU-accessible pinned memory for zero-copy transfers
-  - Controlled via: `use_pin_memory` config option
+- Parquet files - Primary columnar data format
+  - Reading: via `src/op/scan/parquet_scan_task.cpp` with DuckDB's parquet reader
+  - Format: DuckDB-compatible Parquet files (scanned into GPU memory)
+  - Conversion: `src/data/host_parquet_representation.cpp` manages CPU<->GPU transfer
+- Iceberg tables - Delta lake format support
+  - Reading: `src/op/scan/iceberg_scan_task.cpp` with Avro metadata parsing
+  - Delete filters: `src/op/scan/equality_delete_filter.cpp`, `src/op/scan/positional_delete_filter.cpp`
+  - Metadata: `src/op/scan/iceberg_metadata_reader.cpp`
+  - Avro format: `src/op/scan/iceberg_avro_reader.cpp` for Iceberg metadata rows
+- Local filesystem - Direct file I/O for data sources and test datasets
 
 **Caching:**
-- CPU Cache
-  - Implementation: `src/cpu_cache.cpp`
-  - Purpose: Cache frequently accessed host data to avoid repeated GPU transfers
-  - Controlled via: `use_pin_memory_for_caching` config option
+- CPU-side caching: Scan result caching via `src/op/scan/cached_ranges.cpp`
+- GPU tiered memory: cuCascade manages GPU/host/disk spilling (`cucascade/` submodule)
+- Configuration: `SIRIUS_CACHE_LEVEL` environment option controls CPU cache behavior
+
+## Memory Management
+
+**GPU Memory:**
+- RMM (RAPIDS Memory Manager) - GPU memory allocation and pooling
+  - Device allocators: `src/cuda/allocator.cu`
+  - Stream pooling: `cucascade/memory/stream_pool.hpp`
+- cuCascade - Tiered memory (GPU/host/disk) for data exceeding GPU capacity
+  - Data repository: `cucascade/data/data_repository.hpp`
+  - Memory reservation: `cucascade/memory/memory_reservation.hpp`
+  - OOM handling: `src/memory/defragmenter_oom_policy.cpp`
+
+**CPU Memory:**
+- Pinned host memory - DuckDB-allocated pinned memory via `cudf::pinned_memory`
+- Configuration: `USE_PIN_MEM_FOR_CPU_PROCESSING`, `USE_PIN_MEM_FOR_CACHING` in `src/config.cpp`
 
 ## Authentication & Identity
 
 **Auth Provider:**
-- Not applicable - Sirius is a query execution engine, auth delegated to DuckDB/host
+- None - Sirius uses DuckDB's authentication context
+- Database access: Inherits DuckDB connection credentials and permissions
+- Extension security: Requires unsigned extension flag (`allow_unsigned_extensions=true`)
 
 ## Monitoring & Observability
 
-**Error Tracking:**
-- None detected - Error handling via C++ exceptions
+**Logging:**
+- spdlog (1.8.*) - Structured logging framework
+  - Configuration: `src/log/logging.hpp`
+  - Log directory: `$SIRIUS_LOG_DIR` (default: `${CMAKE_BINARY_DIR}/log`)
+  - Log level: `$SIRIUS_LOG_LEVEL` (default: `info`)
+  - Flush interval: 3 seconds (configurable via `Config::LOG_FLUSH_SECONDS`)
+- Query logging: Query begin/end events in `src/sirius_context.cpp`
+- Pipeline logging: Per-operator row counts and execution state
 
-**Logs:**
-- spdlog (1.8.x) - Structured logging framework
-  - Configuration: `SIRIUS_LOG_LEVEL` (trace, debug, info, warn, error), `SIRIUS_LOG_DIR`
-  - Usage: Logging in `src/include/log/logging.hpp`
-  - Sink: File-based logging to `$SIRIUS_LOG_DIR` or `${CMAKE_BINARY_DIR}/log`
-  - Per-component: Log files in `build/release/extension/sirius/test/cpp/log` for unit tests
+**Error Tracking:**
+- Structured error handling via C++ exceptions
+- Backtrace support: `src/util/segfault_backtrace_handler.cpp` for crash analysis
+- Stream check library: Optional CUDA stream validation (loaded from `$SIRIUS_STREAM_CHECK_LIB`)
 
 **Performance Profiling:**
-- NVIDIA Nsys Integration
-  - Entry point: CUDA Profiler API via libcudart
-  - Used by: `/profile-analyzer` Claude Code skill for kernel analysis
-  - Output: nsys profile files (`.qdrep`)
+- NVIDIA nsys integration - CUDA profiler hooks via `cudaProfilerStart/Stop` in extension initialization
+- Performance test harness: `test/tpch_performance/` for TPC-H benchmarking
 
 ## CI/CD & Deployment
 
 **Hosting:**
-- GitHub (source control)
-  - Submodules: duckdb, cucascade, duckdb-python
-  - Integration: Sirius delivered as loadable DuckDB extension
+- GitHub-based repository (sirius)
+- Build artifacts: `build/release/extension/sirius/` directory
 
-**CI Pipeline:**
-- Not explicitly configured in source (relies on DuckDB extension CI tools)
-- Build integration: `extension-ci-tools` included via Makefile
+**Build System:**
+- CMake 4.1+ with DuckDB extension template
+- Parallel compilation: `CMAKE_BUILD_PARALLEL_LEVEL` variable for tuning
+- Presets: `cmake/CMakePresets.json` defines build configurations
 
-**Distribution:**
-- Static extension: `build/release/extension/sirius/sirius.duckdb_extension`
-- Loadable extension: `build/release/extension/sirius/sirius_loadable.duckdb_extension`
-- Python package: `duckdb-python/` (links against Sirius extension)
+**Testing:**
+- C++ unit tests: `test/cpp/` with Catch2 framework
+- SQL logic tests: DuckDB test runner in `duckdb/test/`
+- Integration tests: TPC-H and TPC-DS benchmarking
 
 ## Environment Configuration
 
-**Required env vars:**
-- `CUDA_VISIBLE_DEVICES` - GPU device selection (inherited from CUDA runtime)
-- `SIRIUS_LOG_LEVEL` - Logging verbosity (optional, default: info)
-- `SIRIUS_LOG_DIR` - Log output directory (optional, default: `${CMAKE_BINARY_DIR}/log`)
+**Required env vars for build:**
+- `PIXI_PROJECT_ROOT` - Project root (set by pixi automatically)
+- `CMAKE_CUDA_ARCHITECTURES` - GPU target architectures (auto-set by pixi CUDAARCHS feature)
+- `DUCKDB_SOURCE_PATH` - DuckDB source for Python builds (set in duckdb-python task)
 
-**Runtime config (via DuckDB CALL commands):**
-- `gpu_buffer_init(gpu_mem, pinned_mem)` - Initialize GPU buffer pools (legacy mode)
-- `gpu_execution('SELECT ...')` - Execute query on GPU (Super Sirius)
-- `gpu_processing('SELECT ...')` - Execute query on GPU (legacy mode)
+**Required env vars for runtime:**
+- None mandatory; all have sensible defaults
+- Optional: `SIRIUS_LOG_DIR`, `SIRIUS_LOG_LEVEL`, `SIRIUS_CONFIG_FILE` for customization
 
-**Build-time configuration:**
-- `CMAKE_CUDA_ARCHITECTURES` - Target GPU architectures (auto-detected if not set)
-- `ENABLE_STREAM_CHECK` - Build stream-check debugging library (default: OFF)
+**Secrets location:**
+- Configuration file: `~/.sirius/sirius.cfg` (user home directory)
+- Environment variables: No sensitive data should be passed via env vars
+- DuckDB config: `allow_unsigned_extensions=true` must be set in connection config
 
 ## Webhooks & Callbacks
 
 **Incoming:**
-- None detected
+- None - Sirius is a query processing library, not a network service
 
 **Outgoing:**
-- None detected (Sirius is a query execution engine, no external API calls)
+- CUDA device callbacks: Stream callbacks registered with CUDA runtime for async event handling
+- No external API calls or webhooks
 
-## Integration Patterns
+## Test Data & Benchmarks
 
-**DuckDB Extension Model:**
-- Sirius intercepts DuckDB's physical plan execution
-- Physical plan transformation: `sirius_physical_plan_generator` converts DuckDB logical plans to GPU-executable plans
-- Fallback: Unsupported operations automatically downgrade to DuckDB CPU execution via `src/fallback.cpp`
-- Result collection: GPU results marshaled back to DuckDB's vector format via `src/op/result/host_table_chunk_reader.cpp`
+**TPC-H Benchmarking:**
+- Dataset generation: `test/tpch_performance/generate_test_data.py`
+- Performance testing: `test/tpch_performance/performance_test.py`
+- Scale factors: Configurable (1, 10, 100+ supported)
+- Dataset format: Parquet files in `test_datasets/tpch_parquet_sf{N}/`
 
-**GPU Computation Pipeline:**
-1. DuckDB sends physical plan to Sirius
-2. Plan generator creates GPU operators (`src/op/*.cpp`)
-3. Pipeline executor schedules operators as tasks (`src/parallel/task_executor.cpp`)
-4. CUDA kernels execute on GPU (via cuDF and custom kernels in `src/cuda/`)
-5. Results spilled to GPU memory via cuCascade tiered memory management
-6. Results transferred to host and collected by result collector
+**TPC-DS Benchmarking:**
+- Dataset generation: `test_datasets/generate_tpch/` and `test_datasets/tpcds_parquet_sf1/`
+- Supported scale factors: SF1, SF10
+- Integration tests: `test/cpp/integration/test_gpu_execution_tpch.cpp`
 
-**Data Format Conversions:**
-- Parquet → GPU Dataframe: `src/data/host_parquet_representation_converters.cpp`
-- Arrow → GPU Dataframe: Via cuDF's Arrow C Data Interface
-- DuckDB Vector → GPU Memory: Task-based copying with stream management
+**Iceberg Test Data:**
+- Metadata reading: `test_datasets/gen_iceberg_test_data.py`
+- Format: Apache Iceberg with Avro metadata
+
+## Code Quality & Linting
+
+**External Tools:**
+- pre-commit hooks: `.pre-commit-config.yaml` with:
+  - clang-format (v20.1.4+) for C++/CUDA formatting
+  - black (v25.1.0) for Python formatting
+  - cmake-format (v0.6.13) for CMake files
+  - codespell (v2.4.1) for spell checking with custom words in `.codespell_words`
+  - Standard hooks (trailing whitespace, JSON formatting, TOML validation)
 
 ---
 
