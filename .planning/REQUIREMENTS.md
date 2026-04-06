@@ -23,11 +23,11 @@
 
 ### Lifecycle & Integration
 
-- [ ] **LIFE-01**: `start()`, `stop()`, and `drain()` methods exist with equivalent behavior to today, compatible with `SiriusContext` usage
-- [ ] **LIFE-02**: `drain()` guarantees no downgrade tasks hold `shared_ptr<data_batch>` references after it returns
-- [ ] **LIFE-03**: The monitor loop continues to exist, polling `should_downgrade_memory()` and using the blocking API (`request_free_memory_and_wait`) to trigger downgrade passes
-- [ ] **LIFE-04**: All public APIs are thread-safe without external synchronization by the caller
-- [ ] **LIFE-05**: CUDA stream created on start, destroyed on stop; workers call `cudaSetDevice` on thread init
+- [x] **LIFE-01**: `start()`, `stop()`, and `drain()` methods exist with equivalent behavior to today, compatible with `SiriusContext` usage
+- [x] **LIFE-02**: `drain()` guarantees no downgrade tasks hold `shared_ptr<data_batch>` references after it returns
+- [x] **LIFE-03**: The monitor loop continues to exist, polling `should_downgrade_memory()` and using the blocking API (`request_free_memory_and_wait`) to trigger downgrade passes
+- [x] **LIFE-04**: All public APIs are thread-safe without external synchronization by the caller
+- [x] **LIFE-05**: CUDA stream created on start, destroyed on stop; workers call `cudaSetDevice` on thread init
 
 ### Candidate Selection
 
@@ -80,11 +80,11 @@
 | EXEC-03 | Phase 2 | Complete |
 | EXEC-04 | Phase 2 | Complete |
 | EXEC-05 | Phase 2 | Complete |
-| LIFE-01 | Phase 3 | Pending |
-| LIFE-02 | Phase 3 | Pending |
-| LIFE-03 | Phase 3 | Pending |
-| LIFE-04 | Phase 3 | Pending |
-| LIFE-05 | Phase 3 | Pending |
+| LIFE-01 | Phase 3 | Complete |
+| LIFE-02 | Phase 3 | Complete |
+| LIFE-03 | Phase 3 | Complete |
+| LIFE-04 | Phase 3 | Complete |
+| LIFE-05 | Phase 3 | Complete |
 | CAND-01 | Phase 1 | Complete |
 | CAND-02 | Phase 1 | Complete |
 | PIPE-01 | Phase 3 | Complete |
