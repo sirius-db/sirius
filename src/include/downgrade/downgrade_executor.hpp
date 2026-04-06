@@ -131,27 +131,29 @@ class downgrade_executor {
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
-   * Dispatches batch downgrades until the predicate returns true or
-   * candidates are exhausted. In-flight batches finish naturally.
+   * Collects up to target_bytes worth of candidates and dispatches batch
+   * downgrades until the predicate returns true or candidates are exhausted.
+   * In-flight batches finish naturally.
    *
+   * @param target_bytes Approximate bytes to collect as candidates
    * @param predicate Callable returning true when the caller's condition is met
    * @return std::future<size_t> Resolves to total bytes freed
    */
-  std::future<size_t> request_downgrade(std::function<bool()> predicate);
+  std::future<size_t> request_downgrade(size_t target_bytes, std::function<bool()> predicate);
 
  private:
   void processing_loop();
   void monitor_loop();
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> collect_all_candidates(
-    const std::vector<downgrade_repository_info>& repositories, size_t target_bytes);
+  std::vector<std::weak_ptr<cucascade::data_batch>> collect_all_candidates(
+    const std::vector<downgrade_repository_info>& repositories, size_t amount_to_downgrade);
 
   static size_t get_repo_data_size_on_tier(cucascade::shared_data_repository* repo,
                                            cucascade::memory::Tier tier);
 
   static bool is_partition_active(cucascade::shared_data_repository* repo, size_t partition_idx);
 
-  static std::vector<std::shared_ptr<cucascade::data_batch>> collect_candidates_from_partition(
+  static std::vector<std::weak_ptr<cucascade::data_batch>> collect_candidates_from_partition(
     cucascade::shared_data_repository* repo,
     size_t partition_idx,
     cucascade::memory::memory_space_id source_space,

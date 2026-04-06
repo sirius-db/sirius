@@ -121,8 +121,11 @@ void downgrade_executor::processing_loop()
     auto candidates = collect_all_candidates(repos, req->target_bytes);
 
     // 3. Incremental dispatch with predicate checking
-    for (auto& batch : candidates) {
+    for (auto& weak_batch : candidates) {
       if (req->satisfied.load(std::memory_order_acquire)) break;
+
+      auto batch = weak_batch.lock();
+      if (!batch) continue;  // batch was freed elsewhere — skip
 
       auto slot = _pool->reserve();
       if (!slot) break;  // interrupted
@@ -213,7 +216,7 @@ bool downgrade_executor::is_partition_active(cucascade::shared_data_repository* 
   return false;
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>>
+std::vector<std::weak_ptr<cucascade::data_batch>>
 downgrade_executor::collect_candidates_from_partition(
   cucascade::shared_data_repository* repo,
   size_t partition_idx,
@@ -221,7 +224,7 @@ downgrade_executor::collect_candidates_from_partition(
   size_t max_bytes,
   size_t& collected_bytes)
 {
-  std::vector<std::shared_ptr<cucascade::data_batch>> candidates;
+  std::vector<std::weak_ptr<cucascade::data_batch>> candidates;
   auto batch_ids = repo->get_batch_ids(partition_idx);
   for (auto id : batch_ids) {
     if (max_bytes > 0 && collected_bytes >= max_bytes) break;
@@ -232,15 +235,15 @@ downgrade_executor::collect_candidates_from_partition(
     if (!ms || ms->get_id() != source_space) continue;
 
     collected_bytes += batch->get_data()->get_size_in_bytes();
-    candidates.push_back(std::move(batch));
+    candidates.emplace_back(batch);
   }
   return candidates;
 }
 
 // --- Candidate collection helper ---
 
-std::vector<std::shared_ptr<cucascade::data_batch>> downgrade_executor::collect_all_candidates(
-  const std::vector<downgrade_repository_info>& repositories, size_t target_bytes)
+std::vector<std::weak_ptr<cucascade::data_batch>> downgrade_executor::collect_all_candidates(
+  const std::vector<downgrade_repository_info>& repositories, size_t amount_to_downgrade)
 {
   auto source_tier = _space_id.tier;
 
@@ -264,19 +267,18 @@ std::vector<std::shared_ptr<cucascade::data_batch>> downgrade_executor::collect_
       return a.tier_data_size > b.tier_data_size;
     });
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> all_candidates;
+  std::vector<std::weak_ptr<cucascade::data_batch>> all_candidates;
   size_t collected_bytes = 0;
-  bool has_byte_limit    = (target_bytes > 0);
 
   // Pass 1: Non-active partitions (last to first)
   for (auto& sr : scored_repos) {
-    if (has_byte_limit && collected_bytes >= target_bytes) break;
+    if (collected_bytes >= amount_to_downgrade) break;
     for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-      if (has_byte_limit && collected_bytes >= target_bytes) break;
+      if (collected_bytes >= amount_to_downgrade) break;
       size_t pidx = i - 1;
       if (is_partition_active(sr.repo, pidx)) continue;
-      auto candidates =
-        collect_candidates_from_partition(sr.repo, pidx, _space_id, target_bytes, collected_bytes);
+      auto candidates = collect_candidates_from_partition(
+        sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
       for (auto& c : candidates) {
         all_candidates.push_back(std::move(c));
       }
@@ -284,15 +286,15 @@ std::vector<std::shared_ptr<cucascade::data_batch>> downgrade_executor::collect_
   }
 
   // Pass 2: Active partitions (last to first)
-  if (!has_byte_limit || collected_bytes < target_bytes) {
+  if (collected_bytes < amount_to_downgrade) {
     for (auto& sr : scored_repos) {
-      if (has_byte_limit && collected_bytes >= target_bytes) break;
+      if (collected_bytes >= amount_to_downgrade) break;
       for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-        if (has_byte_limit && collected_bytes >= target_bytes) break;
+        if (collected_bytes >= amount_to_downgrade) break;
         size_t pidx = i - 1;
         if (!is_partition_active(sr.repo, pidx)) continue;
         auto candidates = collect_candidates_from_partition(
-          sr.repo, pidx, _space_id, target_bytes, collected_bytes);
+          sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
         for (auto& c : candidates) {
           all_candidates.push_back(std::move(c));
         }
@@ -322,10 +324,11 @@ size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
   return request_free_memory(bytes).get();
 }
 
-std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
+std::future<size_t> downgrade_executor::request_downgrade(size_t target_bytes,
+                                                          std::function<bool()> predicate)
 {
   auto req          = std::make_unique<downgrade_request>();
-  req->target_bytes = 0;  // collect all available candidates
+  req->target_bytes = target_bytes;
   req->predicate    = std::move(predicate);
   auto future       = req->result.get_future();
   _request_queue.push(std::move(req));
