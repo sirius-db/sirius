@@ -23,16 +23,14 @@ The downgrade executor must reliably free GPU memory on demand — both asynchro
 - [x] Concurrent batch downgrades within a request: a thread pool performs multiple batch downgrades simultaneously within a single request — *Validated in Phase 2: Request Execution and API*
 - [x] Partial fulfillment: if not enough idle batches exist to satisfy the request, free what's available and return the actual bytes freed — *Validated in Phase 2: Request Execution and API*
 
-### Active
-
-None — all requirements validated.
-
-### Recently Validated (Phase 3)
-
 - [x] Monitor loop preserved: the existing polling loop that checks `should_downgrade_memory()` continues to exist, triggering downgrade passes via the internal request queue — *Validated in Phase 3: Lifecycle and Pipeline Integration*
 - [x] Retain start/stop/drain semantics: `start()`, `stop()`, `drain()` methods continue to exist with equivalent behavior to today, used by `SiriusContext` — *Validated in Phase 3: Lifecycle and Pipeline Integration*
 - [x] gpu_pipeline_executor integration: retry-with-downgrade loop calls `request_free_memory_and_wait` up to 5 times when reservation falls short — *Validated in Phase 3: Lifecycle and Pipeline Integration*
 - [x] SiriusContext initialization order: downgrade executors created before pipeline_executor so pointers are available at construction — *Validated in Phase 3: Lifecycle and Pipeline Integration*
+
+### Active
+
+None — v1.0 milestone complete. See v2 requirements in archived REQUIREMENTS.md for future work (observability, cancellation, adaptive polling).
 
 ### Out of Scope
 
@@ -87,4 +85,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-06 after Phase 3 completion — all 3 phases complete, milestone v1.0 done. Downgrade executor redesign fully integrated into pipeline and verified with lifecycle tests.*
+*Last updated: 2026-04-06 after v1.0 milestone — all 20 requirements validated across 3 phases, 6 plans. Redesign complete and integrated.*
