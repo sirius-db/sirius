@@ -30,7 +30,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Rewrite downgrade_task as plain struct and downgrade_executor as standalone class
+- [x] 01-01-PLAN.md — Rewrite downgrade_task as plain struct and downgrade_executor as standalone class
 - [ ] 01-02-PLAN.md — Update tests for new types, build and verify
 
 ### Phase 2: Request Execution and API

@@ -15,8 +15,8 @@
 
 ### Execution Engine
 
-- [ ] **EXEC-01**: The downgrade_executor owns its own `bounded_thread_pool` and does not inherit from `itask_executor`
-- [ ] **EXEC-02**: Requests are queued and executed one at a time (sequential request processing); only one request's batch downgrades are active at any moment
+- [x] **EXEC-01**: The downgrade_executor owns its own `bounded_thread_pool` and does not inherit from `itask_executor`
+- [x] **EXEC-02**: Requests are queued and executed one at a time (sequential request processing); only one request's batch downgrades are active at any moment
 - [ ] **EXEC-03**: Within a single request, multiple data_batch downgrades execute concurrently via the thread pool
 - [ ] **EXEC-04**: The predicate is checked after each individual batch downgrade completes; if true, no new batches are dispatched but in-flight batches finish naturally
 - [ ] **EXEC-05**: Individual batch downgrade failures are non-fatal — logged and skipped, execution continues with remaining candidates
@@ -31,8 +31,8 @@
 
 ### Candidate Selection
 
-- [ ] **CAND-01**: Existing candidate selection and prioritization logic is preserved: partitioned repos first, non-active partitions first, last-to-first partition order, two-pass (non-active then active)
-- [ ] **CAND-02**: `collect_candidates_from_partition` and `run_downgrade_pass` selection logic is carried forward (modifiable if needed but functionally equivalent)
+- [x] **CAND-01**: Existing candidate selection and prioritization logic is preserved: partitioned repos first, non-active partitions first, last-to-first partition order, two-pass (non-active then active)
+- [x] **CAND-02**: `collect_candidates_from_partition` and `run_downgrade_pass` selection logic is carried forward (modifiable if needed but functionally equivalent)
 
 ### Pipeline Integration
 
@@ -75,8 +75,8 @@
 | RAPI-03 | Phase 2 | Pending |
 | RAPI-04 | Phase 2 | Pending |
 | RAPI-05 | Phase 2 | Pending |
-| EXEC-01 | Phase 1 | Pending |
-| EXEC-02 | Phase 1 | Pending |
+| EXEC-01 | Phase 1 | Complete |
+| EXEC-02 | Phase 1 | Complete |
 | EXEC-03 | Phase 2 | Pending |
 | EXEC-04 | Phase 2 | Pending |
 | EXEC-05 | Phase 2 | Pending |
@@ -85,8 +85,8 @@
 | LIFE-03 | Phase 3 | Pending |
 | LIFE-04 | Phase 3 | Pending |
 | LIFE-05 | Phase 3 | Pending |
-| CAND-01 | Phase 1 | Pending |
-| CAND-02 | Phase 1 | Pending |
+| CAND-01 | Phase 1 | Complete |
+| CAND-02 | Phase 1 | Complete |
 | PIPE-01 | Phase 3 | Pending |
 | PIPE-02 | Phase 3 | Pending |
 | PIPE-03 | Phase 3 | Pending |
