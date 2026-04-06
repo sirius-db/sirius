@@ -32,6 +32,10 @@ namespace sirius::op {
 class sirius_physical_operator;
 }  // namespace sirius::op
 
+namespace sirius::parallel {
+class downgrade_executor;
+}  // namespace sirius::parallel
+
 namespace sirius {
 
 namespace creator {
@@ -59,7 +63,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   explicit gpu_pipeline_executor(
     exec::thread_pool_config config,
     cucascade::memory::memory_space* mem_space,
-    exec::publisher<std::unique_ptr<task_request>> task_request_publisher);
+    exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
+    sirius::parallel::downgrade_executor* downgrade_executor = nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -114,6 +119,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
+  sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
 };

@@ -18,6 +18,7 @@
 
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
+#include "downgrade/downgrade_executor.hpp"
 #include "cuda_runtime_api.h"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -36,11 +37,13 @@ namespace pipeline {
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
-  exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
+  exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
+  sirius::parallel::downgrade_executor* downgrade_executor)
   : sirius::parallel::itask_executor(config),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
-    _memory_space(mem_space)
+    _memory_space(mem_space),
+    _downgrade_executor(downgrade_executor)
 {
 }
 
