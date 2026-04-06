@@ -17,10 +17,10 @@
 #pragma once
 
 #include "downgrade/downgrade_task.hpp"
+#include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
-#include "parallel/task.hpp"
-#include "parallel/task_executor.hpp"
-#include "task_completion.hpp"
+#include "exec/interruptible_mpmc.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -30,12 +30,27 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <atomic>
+#include <functional>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
 
 namespace sirius {
 namespace parallel {
+
+/**
+ * @brief A request to free GPU memory by downgrading data batches.
+ *
+ * Enqueued into the executor's request queue by the monitor loop or by
+ * external callers. The processing loop dequeues one request at a time
+ * and dispatches batch downgrades to the thread pool.
+ */
+struct downgrade_request {
+  size_t target_bytes{0};
+  std::function<bool()> predicate;  // Phase 1: present but unused
+  std::promise<size_t> result;      // Phase 1: present but unused
+};
 
 /**
  * @brief Information about a repository to consider for downgrade candidate selection.
@@ -48,19 +63,18 @@ struct downgrade_repository_info {
  * @brief Executor specialized for performing memory downgrade operations across tier hierarchies.
  *
  * Each downgrade_executor is bound to a specific memory space (e.g., GPU:0, HOST:0) and
- * monitors it for memory pressure. When `should_downgrade_memory()` triggers, it automatically
- * iterates all repositories in the data_repository_manager and schedules downgrade tasks.
+ * monitors it for memory pressure. When `should_downgrade_memory()` triggers, it enqueues
+ * a downgrade_request. The processing thread dequeues requests sequentially, collects
+ * candidate batches, and dispatches downgrade tasks to the thread pool.
  *
- * The executor runs a monitor thread that polls the memory space, a manager thread that
- * dispatches tasks from the queue to the thread pool, and a thread pool that executes
- * the downgrade tasks (GPU→HOST copies, etc.).
+ * This is a standalone class with its own thread pool and request queue.
  */
-class downgrade_executor : public sirius::parallel::itask_executor {
+class downgrade_executor {
  public:
   /**
    * @brief Constructs a new downgrade_executor bound to a specific memory space.
    *
-   * @param config Configuration for the task executor (thread count, etc.)
+   * @param config Configuration for the thread pool (thread count, etc.)
    * @param data_repo_mgr Reference to the data repository manager
    * @param space_id The memory space this executor is responsible for downgrading FROM
    * @param memory_space Pointer to the memory space (for pressure queries; nullptr disables
@@ -82,70 +96,48 @@ class downgrade_executor : public sirius::parallel::itask_executor {
   downgrade_executor(downgrade_executor&&)                 = delete;
   downgrade_executor& operator=(downgrade_executor&&)      = delete;
 
+  void start();
+  void stop();
+  void drain();
+
   /**
    * @brief Get the memory space this executor is responsible for.
    */
   cucascade::memory::memory_space_id get_space_id() const { return _space_id; }
 
   /**
-   * @brief Drain all pending and in-flight downgrade tasks.
+   * @brief Perform a downgrade pass across all known repositories.
    *
-   * Must be called before clearing data repositories (e.g., at QueryEnd) to ensure
-   * no downgrade tasks hold shared_ptr<data_batch> references to batches that are
-   * about to be destroyed.
+   * Collects repositories from the data_repository_manager and delegates
+   * to run_downgrade_pass.
    *
-   * Closes the queue (discarding pending tasks), waits for in-flight tasks to finish,
-   * then re-opens the queue so new tasks can be scheduled for the next query.
+   * @param amount_to_downgrade Target bytes of data to downgrade
+   * @return size_t Number of downgrade tasks dispatched
    */
-  void drain();
+  size_t run_downgrade_pass_all_repos(size_t amount_to_downgrade);
 
   /**
    * @brief Perform a downgrade pass with an explicit list of repositories.
    *
-   * Uses this executor's bound memory space as the source tier and its stored
-   * reservation manager. Walks through the provided repositories using the
-   * prioritization rules:
+   * Uses this executor's bound memory space as the source tier. Walks through
+   * the provided repositories using the prioritization rules:
    * 1. Partitioned repos first, then by descending data size on this tier
    * 2. Within each repo, iterate partitions from last to first
    * 3. First pass: non-active partitions; second pass: active partitions
    *
    * @param repositories Vector of repository pointers to scan
    * @param amount_to_downgrade Target bytes of data to downgrade
-   * @return size_t Number of downgrade tasks scheduled
+   * @return size_t Number of downgrade tasks dispatched
    */
   size_t run_downgrade_pass(std::vector<downgrade_repository_info> repositories,
                             size_t amount_to_downgrade);
 
- protected:
-  void manager_loop() override;
-
-  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
-
-  /**
-   * @brief Called from start() after the manager thread is launched.
-   * Creates the CUDA stream if needed and starts the monitor thread.
-   */
-  void on_start() override;
-
-  /**
-   * @brief Called from stop() before the manager thread is joined.
-   * Joins the monitor thread.
-   */
-  void on_stop() override;
-
-  /**
-   * @brief Called from stop() after the thread pool has been stopped.
-   * Destroys the CUDA stream.
-   */
-  void on_stopped() override;
-
  private:
-  /**
-   * @brief Monitor loop that polls the memory space for pressure and triggers downgrades.
-   *
-   * Iterates all repositories via data_repository_manager::for_each_repository().
-   */
+  void processing_loop();
   void monitor_loop();
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> collect_all_candidates(
+    const std::vector<downgrade_repository_info>& repositories, size_t target_bytes);
 
   static size_t get_repo_data_size_on_tier(cucascade::shared_data_repository* repo,
                                            cucascade::memory::Tier tier);
@@ -160,14 +152,18 @@ class downgrade_executor : public sirius::parallel::itask_executor {
     size_t& collected_bytes);
 
  private:
-  cudaStream_t _stream{nullptr};
+  exec::thread_pool_config _config;
+  std::unique_ptr<exec::bounded_thread_pool> _pool;
+  exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
+  std::thread _processing_thread;
   std::thread _monitor_thread;
+  std::atomic<bool> _running{false};
+  cudaStream_t _stream{nullptr};
 
   cucascade::shared_data_repository_manager& _data_repo_mgr;
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
-  task_completion_message_queue _message_queue;
 };
 
 }  // namespace parallel

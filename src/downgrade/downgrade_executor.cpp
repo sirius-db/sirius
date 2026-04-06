@@ -16,10 +16,8 @@
 
 #include "downgrade/downgrade_executor.hpp"
 
-#include "duckdb/common/types/uuid.hpp"
 #include "log/logging.hpp"
 
-#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <algorithm>
@@ -35,74 +33,110 @@ downgrade_executor::downgrade_executor(
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager)
-  : sirius::parallel::itask_executor(std::move(config)),
+  : _config(std::move(config)),
     _data_repo_mgr(data_repo_mgr),
     _space_id(space_id),
     _memory_space(memory_space),
     _reservation_manager(reservation_manager)
 {
-  if (_memory_space) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
 }
 
 downgrade_executor::~downgrade_executor() { stop(); }
 
-void downgrade_executor::drain()
+void downgrade_executor::start()
 {
-  // Stop then restart — ensures all in-flight tasks complete and the queue is empty
-  stop();
-  start();
-}
+  bool expected = false;
+  if (!_running.compare_exchange_strong(expected, true)) { return; }
 
-absl::AnyInvocable<void() noexcept> downgrade_executor::get_per_thread_init()
-{
+  if (_memory_space) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
+
+  _request_queue.reactivate();
+
+  absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space) {
     auto device_id = _memory_space->get_device_id();
-    return [device_id]() noexcept { cudaSetDevice(device_id); };
+    per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
   }
-  return nullptr;
+
+  _pool = std::make_unique<exec::bounded_thread_pool>(
+    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list,
+    std::move(per_thread_init));
+
+  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+
+  if (_memory_space) {
+    _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
+  }
 }
 
-void downgrade_executor::on_start()
+void downgrade_executor::stop()
 {
-  if (_memory_space && !_stream) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
-  _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
-}
+  bool expected = true;
+  if (!_running.compare_exchange_strong(expected, false)) { return; }
 
-void downgrade_executor::on_stop()
-{
+  _pool->interrupt();
+  _request_queue.interrupt();
+
   if (_monitor_thread.joinable()) { _monitor_thread.join(); }
-}
+  if (_processing_thread.joinable()) { _processing_thread.join(); }
 
-void downgrade_executor::on_stopped()
-{
+  _pool->wait_all();
+  _pool->stop();
+  _pool.reset();
+
   if (_stream) {
     cudaStreamDestroy(_stream);
     _stream = nullptr;
   }
 }
 
-void downgrade_executor::manager_loop()
+void downgrade_executor::drain()
+{
+  _pool->interrupt();
+  _request_queue.interrupt();
+
+  if (_processing_thread.joinable()) { _processing_thread.join(); }
+
+  _pool->wait_all();
+  _request_queue.drain();
+  _pool->resume();
+  _request_queue.reactivate();
+
+  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+}
+
+void downgrade_executor::processing_loop()
 {
   while (_running.load()) {
-    auto slot = _bounded_pool->reserve();  // block until a thread is available
-    if (!slot) {
-      SIRIUS_LOG_INFO("[downgrade] pool interrupted, stopping manager loop");
-      break;
+    auto request = _request_queue.pop();
+    if (!request) break;  // interrupted
+
+    // 1. Collect candidates (single-threaded)
+    std::vector<downgrade_repository_info> repos;
+    _data_repo_mgr.for_each_repository(
+      [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
+
+    auto candidates = collect_all_candidates(repos, request->target_bytes);
+
+    // 2. Dispatch all to pool
+    for (auto& batch : candidates) {
+      auto slot = _pool->reserve();
+      if (!slot) break;  // interrupted
+      _pool->dispatch(
+        std::move(slot),
+        [batch = std::move(batch), &res_mgr = _reservation_manager,
+         stream = rmm::cuda_stream_view{_stream}]() {
+          downgrade_task task{batch, res_mgr};
+          try {
+            task.execute(stream);
+          } catch (const std::exception& e) {
+            SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
+          }
+        });
     }
-    auto task = _task_queue.pop();  // block until a task is available
-    if (!task) {
-      SIRIUS_LOG_INFO("[downgrade] task queue interrupted, stopping manager loop");
-      break;
-    }
-    _bounded_pool->dispatch(
-      std::move(slot), [task = std::move(task), stream = rmm::cuda_stream_view{_stream}]() mutable {
-        try {
-          task->execute(stream);
-        } catch (const std::exception& e) {
-          // Downgrade failures are non-fatal — log and continue.
-          SIRIUS_LOG_ERROR("[downgrade] task execution failed: {}", e.what());
-        }
-      });
+
+    // 3. Wait for all dispatched batch downgrades to complete
+    _pool->wait_all();
   }
 }
 
@@ -114,11 +148,9 @@ void downgrade_executor::monitor_loop()
     if (_memory_space && _memory_space->should_downgrade_memory()) {
       size_t amount = _memory_space->get_amount_to_downgrade();
       if (amount > 0) {
-        // Collect all repositories from the manager
-        std::vector<downgrade_repository_info> repos;
-        _data_repo_mgr.for_each_repository(
-          [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
-        if (!repos.empty()) { run_downgrade_pass(std::move(repos), amount); }
+        auto req         = std::make_unique<downgrade_request>();
+        req->target_bytes = amount;
+        _request_queue.push(std::move(req));
       }
     }
     // Brief sleep to avoid busy-spinning; the monitor re-checks after each interval
@@ -185,10 +217,10 @@ downgrade_executor::collect_candidates_from_partition(
   return candidates;
 }
 
-// --- Main selection + scheduling logic ---
+// --- Candidate collection helper ---
 
-size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_info> repositories,
-                                              size_t amount_to_downgrade)
+std::vector<std::shared_ptr<cucascade::data_batch>> downgrade_executor::collect_all_candidates(
+  const std::vector<downgrade_repository_info>& repositories, size_t target_bytes)
 {
   auto source_tier = _space_id.tier;
 
@@ -217,13 +249,13 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
 
   // Pass 1: Non-active partitions (last to first)
   for (auto& sr : scored_repos) {
-    if (collected_bytes >= amount_to_downgrade) break;
+    if (collected_bytes >= target_bytes) break;
     for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-      if (collected_bytes >= amount_to_downgrade) break;
+      if (collected_bytes >= target_bytes) break;
       size_t pidx = i - 1;
       if (is_partition_active(sr.repo, pidx)) continue;
       auto candidates = collect_candidates_from_partition(
-        sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
+        sr.repo, pidx, _space_id, target_bytes, collected_bytes);
       for (auto& c : candidates) {
         all_candidates.push_back(std::move(c));
       }
@@ -231,15 +263,15 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
   }
 
   // Pass 2: Active partitions (last to first)
-  if (collected_bytes < amount_to_downgrade) {
+  if (collected_bytes < target_bytes) {
     for (auto& sr : scored_repos) {
-      if (collected_bytes >= amount_to_downgrade) break;
+      if (collected_bytes >= target_bytes) break;
       for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-        if (collected_bytes >= amount_to_downgrade) break;
+        if (collected_bytes >= target_bytes) break;
         size_t pidx = i - 1;
         if (!is_partition_active(sr.repo, pidx)) continue;
         auto candidates = collect_candidates_from_partition(
-          sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
+          sr.repo, pidx, _space_id, target_bytes, collected_bytes);
         for (auto& c : candidates) {
           all_candidates.push_back(std::move(c));
         }
@@ -247,10 +279,26 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
     }
   }
 
-  if (all_candidates.empty()) return 0;
+  return all_candidates;
+}
 
-  auto global_state = std::make_shared<downgrade_task_global_state>(
-    _reservation_manager, _data_repo_mgr, _message_queue);
+// --- Public downgrade pass methods ---
+
+size_t downgrade_executor::run_downgrade_pass_all_repos(size_t amount_to_downgrade)
+{
+  std::vector<downgrade_repository_info> repos;
+  _data_repo_mgr.for_each_repository(
+    [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
+  if (repos.empty()) return 0;
+  return run_downgrade_pass(std::move(repos), amount_to_downgrade);
+}
+
+size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_info> repositories,
+                                              size_t amount_to_downgrade)
+{
+  auto all_candidates = collect_all_candidates(repositories, amount_to_downgrade);
+
+  if (all_candidates.empty()) return 0;
 
   size_t task_count = 0;
   for (auto& batch : all_candidates) {
@@ -258,11 +306,20 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
     SIRIUS_LOG_TRACE("[downgrade] scheduling batch {} ({} B) on tier {}",
                      batch->get_batch_id(),
                      data_size,
-                     static_cast<int>(source_tier));
-    auto local_state = std::make_unique<downgrade_task_local_state>(
-      duckdb::UUIDv7().GenerateRandomUUID().lower, 0, std::move(batch));
-    auto task = std::make_unique<downgrade_task>(std::move(local_state), global_state);
-    schedule(std::move(task));
+                     static_cast<int>(_space_id.tier));
+    auto slot = _pool->reserve();
+    if (!slot) break;
+    _pool->dispatch(
+      std::move(slot),
+      [batch = std::move(batch), &res_mgr = _reservation_manager,
+       stream = rmm::cuda_stream_view{_stream}]() {
+        downgrade_task task{batch, res_mgr};
+        try {
+          task.execute(stream);
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
+        }
+      });
     ++task_count;
   }
 
