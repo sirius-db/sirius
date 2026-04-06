@@ -39,9 +39,8 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <chrono>
+#include <atomic>
 #include <memory>
-#include <thread>
 #include <vector>
 
 using namespace sirius::parallel;
@@ -130,7 +129,7 @@ TEST_CASE("Downgrade executor starts and stops cleanly", "[downgrade_executor]")
   REQUIRE_NOTHROW(executor.stop());
 }
 
-TEST_CASE("run_downgrade_pass with empty repositories returns 0", "[downgrade_executor]")
+TEST_CASE("request_free_memory_and_wait with no repositories returns 0", "[downgrade_executor]")
 {
   auto mem_mgr = make_test_memory_manager();
   cucascade::shared_data_repository_manager repo_mgr;
@@ -138,9 +137,8 @@ TEST_CASE("run_downgrade_pass with empty repositories returns 0", "[downgrade_ex
   auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
   executor.start();
 
-  std::vector<downgrade_repository_info> repos;
-  size_t scheduled = executor.run_downgrade_pass(repos, 1024);
-  REQUIRE(scheduled == 0);
+  size_t freed = executor.request_free_memory_and_wait(1024);
+  REQUIRE(freed == 0);
 
   executor.stop();
 }
@@ -162,46 +160,31 @@ TEST_CASE("Single downgrade task executes correctly", "[downgrade_executor]")
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 }
 
-TEST_CASE("run_downgrade_pass downgrades GPU batches from a single non-partitioned repo",
-          "[downgrade_executor]")
+TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
   cucascade::shared_data_repository_manager repo_mgr;
-
-  cucascade::shared_data_repository repo;
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto batch1 = make_gpu_batch(*gpu_space);
   auto batch2 = make_gpu_batch(*gpu_space);
   auto batch3 = make_gpu_batch(*gpu_space);
-  repo.add_data_batch(batch1);
-  repo.add_data_batch(batch2);
-  repo.add_data_batch(batch3);
+  repo->add_data_batch(batch1);
+  repo->add_data_batch(batch2);
+  repo->add_data_batch(batch3);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
   REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
   REQUIRE(batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
   executor.start();
 
-  std::vector<downgrade_repository_info> repos = {{&repo}};
-  size_t scheduled                             = executor.run_downgrade_pass(repos, 1ull << 30);
-  REQUIRE(scheduled == 3);
-
-  auto deadline = std::chrono::steady_clock::now() + 10s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    bool all_on_host = true;
-    if (batch1->get_memory_space()->get_tier() != cucascade::memory::Tier::HOST)
-      all_on_host = false;
-    if (batch2->get_memory_space()->get_tier() != cucascade::memory::Tier::HOST)
-      all_on_host = false;
-    if (batch3->get_memory_space()->get_tier() != cucascade::memory::Tier::HOST)
-      all_on_host = false;
-    if (all_on_host) break;
-    std::this_thread::sleep_for(50ms);
-  }
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
 
   REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
   REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
@@ -210,37 +193,41 @@ TEST_CASE("run_downgrade_pass downgrades GPU batches from a single non-partition
   executor.stop();
 }
 
-TEST_CASE("run_downgrade_pass respects amount_to_downgrade limit", "[downgrade_executor]")
+TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
   cucascade::shared_data_repository_manager repo_mgr;
-
-  cucascade::shared_data_repository repo;
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   for (int i = 0; i < 5; ++i) {
     auto batch = make_gpu_batch(*gpu_space);
     batches.push_back(batch);
-    repo.add_data_batch(batch);
+    repo->add_data_batch(batch);
   }
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   size_t one_batch_size = batches[0]->get_data()->get_size_in_bytes();
   REQUIRE(one_batch_size > 0);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
   executor.start();
 
-  std::vector<downgrade_repository_info> repos = {{&repo}};
-  size_t scheduled                             = executor.run_downgrade_pass(repos, one_batch_size);
-  REQUIRE(scheduled >= 1);
-  REQUIRE(scheduled < 5);
+  size_t freed = executor.request_free_memory_and_wait(one_batch_size);
+  REQUIRE(freed >= one_batch_size);
+
+  size_t host_count = 0;
+  for (auto& b : batches) {
+    if (b->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+  }
+  REQUIRE(host_count >= 1);
 
   executor.stop();
 }
 
-TEST_CASE("run_downgrade_pass prioritizes partitioned repos over non-partitioned",
+TEST_CASE("request_free_memory prioritizes partitioned repos over non-partitioned",
           "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
@@ -249,34 +236,30 @@ TEST_CASE("run_downgrade_pass prioritizes partitioned repos over non-partitioned
 
   cucascade::shared_data_repository_manager repo_mgr;
 
-  cucascade::shared_data_repository repo_non_partitioned;
-  auto batch_np1 = make_gpu_batch(*gpu_space);
-  auto batch_np2 = make_gpu_batch(*gpu_space);
-  repo_non_partitioned.add_data_batch(batch_np1);
-  repo_non_partitioned.add_data_batch(batch_np2);
+  auto repo_non_partitioned = std::make_unique<cucascade::shared_data_repository>();
+  auto batch_np1            = make_gpu_batch(*gpu_space);
+  auto batch_np2            = make_gpu_batch(*gpu_space);
+  repo_non_partitioned->add_data_batch(batch_np1);
+  repo_non_partitioned->add_data_batch(batch_np2);
 
-  cucascade::shared_data_repository repo_partitioned;
-  auto batch_p0 = make_gpu_batch(*gpu_space);
-  auto batch_p1 = make_gpu_batch(*gpu_space);
-  auto batch_p2 = make_gpu_batch(*gpu_space);
-  repo_partitioned.add_data_batch(batch_p0, 0);
-  repo_partitioned.add_data_batch(batch_p1, 1);
-  repo_partitioned.add_data_batch(batch_p2, 2);
+  auto repo_partitioned = std::make_unique<cucascade::shared_data_repository>();
+  auto batch_p0         = make_gpu_batch(*gpu_space);
+  auto batch_p1         = make_gpu_batch(*gpu_space);
+  auto batch_p2         = make_gpu_batch(*gpu_space);
+  repo_partitioned->add_data_batch(batch_p0, 0);
+  repo_partitioned->add_data_batch(batch_p1, 1);
+  repo_partitioned->add_data_batch(batch_p2, 2);
+
+  repo_mgr.add_new_repository(1, "out", std::move(repo_non_partitioned));
+  repo_mgr.add_new_repository(2, "out", std::move(repo_partitioned));
 
   size_t one_batch_size = batch_p0->get_data()->get_size_in_bytes();
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
   executor.start();
 
-  std::vector<downgrade_repository_info> repos = {{&repo_non_partitioned}, {&repo_partitioned}};
-  size_t scheduled                             = executor.run_downgrade_pass(repos, one_batch_size);
-  REQUIRE(scheduled >= 1);
-
-  auto deadline = std::chrono::steady_clock::now() + 10s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
-    std::this_thread::sleep_for(50ms);
-  }
+  size_t freed = executor.request_free_memory_and_wait(one_batch_size);
+  REQUIRE(freed >= one_batch_size);
 
   REQUIRE(batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
   REQUIRE(batch_np1->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
@@ -285,40 +268,31 @@ TEST_CASE("run_downgrade_pass prioritizes partitioned repos over non-partitioned
   executor.stop();
 }
 
-TEST_CASE("run_downgrade_pass iterates partitions from last to first", "[downgrade_executor]")
+TEST_CASE("request_free_memory iterates partitions from last to first", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
   cucascade::shared_data_repository_manager repo_mgr;
-
-  cucascade::shared_data_repository repo;
+  auto repo     = std::make_unique<cucascade::shared_data_repository>();
   auto batch_p0 = make_gpu_batch(*gpu_space);
   auto batch_p1 = make_gpu_batch(*gpu_space);
   auto batch_p2 = make_gpu_batch(*gpu_space);
   auto batch_p3 = make_gpu_batch(*gpu_space);
-  repo.add_data_batch(batch_p0, 0);
-  repo.add_data_batch(batch_p1, 1);
-  repo.add_data_batch(batch_p2, 2);
-  repo.add_data_batch(batch_p3, 3);
+  repo->add_data_batch(batch_p0, 0);
+  repo->add_data_batch(batch_p1, 1);
+  repo->add_data_batch(batch_p2, 2);
+  repo->add_data_batch(batch_p3, 3);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   size_t two_batches = batch_p0->get_data()->get_size_in_bytes() * 2;
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
   executor.start();
 
-  std::vector<downgrade_repository_info> repos = {{&repo}};
-  size_t scheduled                             = executor.run_downgrade_pass(repos, two_batches);
-  REQUIRE(scheduled == 2);
-
-  auto deadline = std::chrono::steady_clock::now() + 10s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (batch_p3->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST &&
-        batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST)
-      break;
-    std::this_thread::sleep_for(50ms);
-  }
+  size_t freed = executor.request_free_memory_and_wait(two_batches);
+  REQUIRE(freed >= two_batches);
 
   REQUIRE(batch_p3->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
   REQUIRE(batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
@@ -328,40 +302,31 @@ TEST_CASE("run_downgrade_pass iterates partitions from last to first", "[downgra
   executor.stop();
 }
 
-TEST_CASE("run_downgrade_pass skips active partitions in first pass", "[downgrade_executor]")
+TEST_CASE("request_free_memory skips active partitions in first pass", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
   cucascade::shared_data_repository_manager repo_mgr;
-
-  cucascade::shared_data_repository repo;
+  auto repo     = std::make_unique<cucascade::shared_data_repository>();
   auto batch_p0 = make_gpu_batch(*gpu_space);
   auto batch_p1 = make_gpu_batch(*gpu_space);
   auto batch_p2 = make_gpu_batch(*gpu_space);
-  repo.add_data_batch(batch_p0, 0);
-  repo.add_data_batch(batch_p1, 1);
-  repo.add_data_batch(batch_p2, 2);
+  repo->add_data_batch(batch_p0, 0);
+  repo->add_data_batch(batch_p1, 1);
+  repo->add_data_batch(batch_p2, 2);
 
   REQUIRE(batch_p1->try_to_create_task());
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   size_t three_batches = batch_p0->get_data()->get_size_in_bytes() * 3;
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
   executor.start();
 
-  std::vector<downgrade_repository_info> repos = {{&repo}};
-  size_t scheduled                             = executor.run_downgrade_pass(repos, three_batches);
-  REQUIRE(scheduled >= 2);
-
-  auto deadline = std::chrono::steady_clock::now() + 10s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST &&
-        batch_p0->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST)
-      break;
-    std::this_thread::sleep_for(50ms);
-  }
+  size_t freed = executor.request_free_memory_and_wait(three_batches);
+  REQUIRE(freed > 0);
 
   REQUIRE(batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
   REQUIRE(batch_p0->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
@@ -371,19 +336,18 @@ TEST_CASE("run_downgrade_pass skips active partitions in first pass", "[downgrad
   executor.stop();
 }
 
-TEST_CASE("run_downgrade_pass skips batches already on HOST", "[downgrade_executor]")
+TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
   cucascade::shared_data_repository_manager repo_mgr;
-
-  cucascade::shared_data_repository repo;
+  auto repo       = std::make_unique<cucascade::shared_data_repository>();
   auto gpu_batch  = make_gpu_batch(*gpu_space);
   auto gpu_batch2 = make_gpu_batch(*gpu_space);
-  repo.add_data_batch(gpu_batch);
-  repo.add_data_batch(gpu_batch2);
+  repo->add_data_batch(gpu_batch);
+  repo->add_data_batch(gpu_batch2);
 
   // Pre-downgrade one batch to HOST manually
   auto& registry   = sirius::converter_registry::get();
@@ -399,19 +363,106 @@ TEST_CASE("run_downgrade_pass skips batches already on HOST", "[downgrade_execut
   gpu_batch->try_to_release_in_transit();
   REQUIRE(gpu_batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
   executor.start();
 
-  std::vector<downgrade_repository_info> repos = {{&repo}};
-  size_t scheduled                             = executor.run_downgrade_pass(repos, 1ull << 30);
-  REQUIRE(scheduled == 1);
-
-  auto deadline = std::chrono::steady_clock::now() + 10s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (gpu_batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
-    std::this_thread::sleep_for(50ms);
-  }
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
   REQUIRE(gpu_batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+// --- New API tests ---
+
+TEST_CASE("request_free_memory returns future that resolves to bytes freed", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  cucascade::shared_data_repository_manager repo_mgr;
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  executor.start();
+
+  auto future  = executor.request_free_memory(1ull << 30);
+  size_t freed = future.get();
+  REQUIRE(freed > 0);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  cucascade::shared_data_repository_manager repo_mgr;
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (int i = 0; i < 5; ++i) {
+    auto batch = make_gpu_batch(*gpu_space);
+    batches.push_back(batch);
+    repo->add_data_batch(batch);
+  }
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  std::atomic<size_t> call_count{0};
+
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  executor.start();
+
+  // Predicate returns true on first call — should stop after ~1 batch
+  auto future = executor.request_downgrade([&call_count]() {
+    call_count.fetch_add(1, std::memory_order_relaxed);
+    return true;  // satisfied immediately after first batch
+  });
+
+  size_t freed = future.get();
+  REQUIRE(freed > 0);
+
+  // With pool width=1 and predicate satisfied immediately, at most 1-2 batches downgraded
+  size_t host_count = 0;
+  for (auto& b : batches) {
+    if (b->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+  }
+  REQUIRE(host_count >= 1);
+  REQUIRE(host_count <= 2);
+
+  executor.stop();
+}
+
+TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
+          "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  cucascade::shared_data_repository_manager repo_mgr;
+  auto repo         = std::make_unique<cucascade::shared_data_repository>();
+  auto batch        = make_gpu_batch(*gpu_space);
+  size_t batch_size = batch->get_data()->get_size_in_bytes();
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  executor.start();
+
+  // Request far more than available
+  size_t freed = executor.request_free_memory_and_wait(1ull << 40);
+  // Should get only the one batch's worth
+  REQUIRE(freed == batch_size);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 
   executor.stop();
 }
