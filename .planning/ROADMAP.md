@@ -30,8 +30,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 2 plans
 
 Plans:
-- [x] 01-01-PLAN.md — Rewrite downgrade_task as plain struct and downgrade_executor as standalone class
-- [x] 01-02-PLAN.md — Update tests for new types, build and verify
+- [x] 01-01-PLAN.md -- Rewrite downgrade_task as plain struct and downgrade_executor as standalone class
+- [x] 01-02-PLAN.md -- Update tests for new types, build and verify
 
 ### Phase 2: Request Execution and API
 **Goal**: Callers can submit predicate-based and byte-based downgrade requests and receive results via std::future or blocking call
@@ -43,11 +43,11 @@ Plans:
   3. When fewer idle batches exist than needed to satisfy a request, the executor frees what is available and the returned byte count reflects partial fulfillment
   4. Individual batch downgrade failures are logged and skipped without crashing the executor or aborting the request
   5. Multiple data_batch downgrades within a single request execute concurrently via the thread pool
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
+- [ ] 02-01-PLAN.md -- Incremental dispatch engine and public API surface
+- [ ] 02-02-PLAN.md -- Rewrite tests for new API, build and verify
 
 ### Phase 3: Lifecycle and Pipeline Integration
 **Goal**: The redesigned executor is a drop-in replacement: SiriusContext manages it via start/stop/drain, the monitor loop uses it, and gpu_pipeline_executor reclaims memory through it
@@ -59,7 +59,7 @@ Plans:
   3. gpu_pipeline_executor calls request_free_memory_and_wait when a reservation falls short, retries up to 5 times, then proceeds with partial reservation
   4. All public APIs are safe to call concurrently from monitor thread, query threads, and allocation-failure callbacks without external synchronization
   5. CUDA stream is created on start and destroyed on stop; worker threads call cudaSetDevice on init
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
 - [ ] 03-01: TBD
