@@ -47,7 +47,7 @@ Plans:
 
 Plans:
 - [x] 02-01-PLAN.md -- Incremental dispatch engine and public API surface
-- [ ] 02-02-PLAN.md -- Rewrite tests for new API, build and verify
+- [x] 02-02-PLAN.md -- Rewrite tests for new API, build and verify
 
 ### Phase 3: Lifecycle and Pipeline Integration
 **Goal**: The redesigned executor is a drop-in replacement: SiriusContext manages it via start/stop/drain, the monitor loop uses it, and gpu_pipeline_executor reclaims memory through it
