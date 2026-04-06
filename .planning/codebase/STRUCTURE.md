@@ -5,369 +5,373 @@
 ## Directory Layout
 
 ```
-sirius/
-├── src/
-│   ├── sirius_extension.cpp           # DuckDB extension entry point, table function registration
-│   ├── sirius_interface.cpp           # Query execution interface, bridges DuckDB → GPU execution
-│   ├── sirius_engine.cpp              # Query executor, pipeline scheduling and execution
-│   ├── sirius_context.cpp             # Per-connection context for GPU state
-│   ├── config.cpp                     # Runtime configuration (GPU policies, batch sizes)
-│   ├── gpu_buffer_manager.cpp         # GPU memory allocation and management
-│   ├── cpu_cache.cpp                  # CPU-side caching layer
-│   ├── fallback.cpp                   # Fallback detection (unsupported ops/types)
-│   ├── extension_lock.cpp             # Synchronization for extension initialization
-│   ├── sirius_config.cpp              # Configuration variable bindings
-│   │
-│   ├── include/                       # All public headers mirror src/ structure
-│   │   ├── sirius_interface.hpp       # Query interface class
-│   │   ├── sirius_engine.hpp          # Query executor class
-│   │   ├── config.hpp                 # Config constants and flags
-│   │   ├── fallback.hpp               # Fallback checker interface
-│   │   ├── helper/                    # Utility headers (types, helpers)
-│   │   ├── log/                       # Logging infrastructure
-│   │   ├── util/                      # Misc utilities
-│   │   ├── op/                        # Physical operator headers
-│   │   ├── planner/                   # Planning headers
-│   │   ├── pipeline/                  # Pipeline orchestration headers
-│   │   ├── expression_executor/       # Expression evaluation headers
-│   │   ├── data/                      # Data representation headers
-│   │   ├── memory/                    # Memory management headers
-│   │   ├── exec/                      # Execution infrastructure (threads, queues)
-│   │   ├── creator/                   # Task creation headers
-│   │   ├── downgrade/                 # CPU fallback headers
-│   │   ├── cudf/                      # cuDF utility headers
-│   │   ├── parallel/                  # Task and queue headers
-│   │   └── legacy/                    # Legacy GPU engine (deprecated)
-│   │
-│   ├── planner/                       # Planning logic
-│   │   ├── sirius_physical_plan_generator.cpp  # Main plan generator
-│   │   ├── query.cpp                           # Query preprocessing
-│   │   ├── sirius_plan_*.cpp                   # Operator-specific builders (filter, aggregate, join, etc.)
-│   │   └── [12 operator-specific plan files]
-│   │
-│   ├── op/                            # Physical operators
-│   │   ├── sirius_physical_operator.cpp        # Base operator class
-│   │   ├── sirius_physical_operator_type.cpp   # Operator type enumeration
-│   │   ├── sirius_physical_filter.cpp          # Filter operator
-│   │   ├── sirius_physical_projection.cpp      # Projection operator
-│   │   ├── sirius_physical_hash_join.cpp       # Hash join operator
-│   │   ├── sirius_physical_nested_loop_join.cpp
-│   │   ├── sirius_physical_delim_join.cpp      # Delimited join operator
-│   │   ├── sirius_physical_grouped_aggregate.cpp
-│   │   ├── sirius_physical_grouped_aggregate_merge.cpp
-│   │   ├── sirius_physical_ungrouped_aggregate.cpp
-│   │   ├── sirius_physical_ungrouped_aggregate_merge.cpp
-│   │   ├── sirius_physical_table_scan.cpp      # DuckDB table scan
-│   │   ├── sirius_physical_parquet_scan.cpp    # Parquet file scan
-│   │   ├── sirius_physical_iceberg_scan.cpp    # Iceberg table scan
-│   │   ├── sirius_physical_duckdb_scan.cpp     # Intermediate DuckDB result scan
-│   │   ├── sirius_physical_column_data_scan.cpp # CTE column data scan
-│   │   ├── sirius_physical_order.cpp           # Order by operator
-│   │   ├── sirius_physical_partition.cpp       # Partition for sort/join
-│   │   ├── sirius_physical_sort_partition.cpp
-│   │   ├── sirius_physical_sort_sample.cpp
-│   │   ├── sirius_physical_merge_sort.cpp      # Merge multiple sorted streams
-│   │   ├── sirius_physical_top_n.cpp           # Top-N operator
-│   │   ├── sirius_physical_top_n_merge.cpp
-│   │   ├── sirius_physical_limit.cpp           # Limit operator
-│   │   ├── sirius_physical_cte.cpp             # Common table expression
-│   │   ├── sirius_physical_result_collector.cpp # Final sink, materializes results
-│   │   ├── sirius_physical_dummy_scan.cpp      # Empty source
-│   │   ├── sirius_physical_empty_result.cpp    # Empty result
-│   │   ├── sirius_physical_concat.cpp          # Union/concatenation
-│   │   ├── sirius_physical_partition_consumer_operator.cpp
-│   │   └── scan/                      # Scan-specific infrastructure
-│   │       ├── duckdb_scan_task.cpp
-│   │       ├── duckdb_scan_executor.cpp
-│   │       ├── parquet_scan_task.cpp
-│   │       ├── iceberg_scan_task.cpp
-│   │       ├── iceberg_metadata_reader.cpp
-│   │       ├── iceberg_delete_pipeline.cpp
-│   │       ├── iceberg_avro_reader.cpp
-│   │       ├── equality_delete_filter.cpp
-│   │       ├── positional_delete_filter.cpp
-│   │       ├── prefetched_data_source.cpp
-│   │       └── cached_ranges.cpp
-│   │
-│   ├── pipeline/                      # Execution orchestration
-│   │   ├── sirius_pipeline.cpp        # Single source-sink pipeline
-│   │   ├── sirius_meta_pipeline.cpp   # Multiple pipelines with same sink
-│   │   ├── pipeline_executor.cpp      # CPU pipeline executor
-│   │   ├── gpu_pipeline_executor.cpp  # GPU pipeline executor
-│   │   ├── gpu_pipeline_task.cpp      # GPU task wrapper
-│   │   ├── gpu_pipeline_queue.cpp     # GPU task queue
-│   │   ├── pipeline_queue.cpp         # CPU task queue
-│   │   ├── task_request.cpp           # Task request descriptor
-│   │   └── [headers in include/pipeline/]
-│   │
-│   ├── expression_executor/           # SQL expression evaluation
-│   │   ├── gpu_expression_executor.cpp     # Main executor (filter, project)
-│   │   ├── gpu_expression_translator.cpp   # AST → cuDF kernel dispatch
-│   │   ├── gpu_expression_executor_state.cpp
-│   │   └── regex/                     # Regular expression support
-│   │       └── regex_playground.hpp
-│   │
-│   ├── cuda/                          # GPU kernels
-│   │   ├── allocator.cu               # RMM allocator setup
-│   │   ├── utils.cu                   # GPU utility functions
-│   │   ├── communication.cu           # GPU-CPU data transfer
-│   │   ├── print.cu                   # GPU memory debugging
-│   │   └── operator/                  # Specialized kernels
-│   │       ├── hash_join_inner.cu     # Inner hash join kernel
-│   │       ├── hash_join_single.cu    # Single-probe hash join
-│   │       ├── hash_join_right.cu     # Right hash join kernel
-│   │       ├── nested_loop_join.cu    # Nested loop join kernel
-│   │       ├── comparison_expression.cu    # Comparison operators
-│   │       ├── arbitrary_expression.cu    # Complex expressions
-│   │       ├── strings_matching.cu    # String matching
-│   │       ├── substring.cu           # Substring extraction
-│   │       ├── strlen_from_offsets.cu
-│   │       ├── empty_str_check.cu
-│   │       └── materialize.cu         # Result materialization
-│   │
-│   ├── creator/                       # Task creation from operators
-│   │   └── task_creator.cpp
-│   │
-│   ├── downgrade/                     # CPU fallback execution
-│   │   ├── downgrade_executor.cpp     # Execute as DuckDB CPU operator
-│   │   └── downgrade_task.cpp         # Task wrapper for downgrade
-│   │
-│   └── legacy/                        # Legacy gpu_processing (deprecated)
-│       ├── gpu_executor.cpp
-│       ├── gpu_context.cpp
-│       ├── gpu_physical_plan_generator.cpp
-│       ├── gpu_meta_pipeline.cpp
-│       ├── gpu_pipeline.cpp
-│       ├── gpu_table_function.cpp
-│       ├── gpu_query_result.cpp
-│       ├── gpu_pipeline_hashmap.cpp
-│       └── operator/                  # Legacy operators (deprecated)
-│
-├── test/
-│   ├── cpp/                           # C++ unit tests (Catch2)
-│   │   ├── [test files by component]
-│   │   └── log/                       # Unit test logs
-│   ├── sql/                           # SQL logic tests
-│   │   ├── tpch-sirius.test
-│   │   └── [other SQL test files]
-│   └── tpch_performance/              # TPC-H performance benchmarks
-│       ├── performance_test.py
-│       └── generate_test_data.py
-│
-├── docs/
-│   ├── super-sirius/                  # Super Sirius architecture documentation
-│   │   └── README.md                  # Index and reading order
-│   └── logos/                         # Brand assets
-│
-├── CMakeLists.txt                     # Main build configuration
-├── extension_config.cmake             # Extension manifest
-├── Makefile                           # Build wrapper
-├── pixi.toml                          # Development environment (Pixi)
-├── .clang-format                      # C++ formatting rules
-├── .clang-tidy                        # C++ linting rules
-├── .pre-commit-config.yaml            # Pre-commit hooks
-├── .codespell_words                   # Custom spell-check dictionary
-├── CLAUDE.md                          # This codebase's Claude guidelines
-└── README.md                          # Project overview
+/home/bwyogatama/sirius/
+├── cmake/                          # CMake helper modules
+├── docs/                           # Documentation
+│   ├── super-sirius/              # Super Sirius architecture docs
+│   ├── gpu_execution.md           # Legacy GPU processing docs
+│   └── DEVELOPMENT.md             # Development guidelines
+├── src/                            # Main source code (C++/CUDA)
+│   ├── include/                   # Headers mirroring src/ structure
+│   │   ├── config.hpp             # Configuration enums and types
+│   │   ├── sirius_context.hpp     # Per-connection subsystem ownership
+│   │   ├── sirius_engine.hpp      # Pipeline orchestration
+│   │   ├── sirius_interface.hpp   # DuckDB-facing API
+│   │   ├── sirius_extension.hpp   # Extension registration
+│   │   ├── op/                    # Physical operator headers
+│   │   ├── pipeline/              # Pipeline execution headers
+│   │   ├── planner/               # Physical plan generator headers
+│   │   ├── creator/               # Task creator headers
+│   │   ├── expression_executor/   # GPU expression eval headers
+│   │   ├── memory/                # Memory management headers
+│   │   ├── data/                  # Data conversion headers
+│   │   ├── util/                  # Utility headers
+│   │   └── helper/                # Helper type definitions
+│   ├── op/                        # Physical operator implementations
+│   │   ├── scan/                  # Scan operators (DuckDB, Parquet, Iceberg)
+│   │   ├── aggregate/             # Grouping/aggregation implementations
+│   │   ├── order/                 # Sorting implementations
+│   │   ├── merge/                 # Merge implementations (for distributed sorts, aggs)
+│   │   ├── partition/             # Partition operator for hash joins
+│   │   ├── result/                # Result collection
+│   │   ├── sirius_physical_*.cpp  # ~30 operator types
+│   │   └── sirius_physical_operator.cpp  # Base class
+│   ├── pipeline/                  # Pipeline execution
+│   │   ├── gpu_pipeline_executor.cpp    # GPU worker executor
+│   │   ├── pipeline_executor.cpp        # Top-level coordination
+│   │   ├── sirius_pipeline.cpp          # Pipeline graph representation
+│   │   ├── sirius_meta_pipeline.cpp     # Meta-pipeline builder
+│   │   ├── gpu_pipeline_task.cpp        # GPU task type
+│   │   └── task_request.cpp             # Task request types
+│   ├── planner/                   # Physical plan generation
+│   │   ├── sirius_physical_plan_generator.cpp  # Logical→Physical translator
+│   │   ├── sirius_plan_*.cpp                    # Specialized plan builders (~20 files)
+│   │   └── query.cpp                           # Query context
+│   ├── creator/                   # Task creation
+│   │   ├── task_creator.cpp       # Hint chain following, task dispatch
+│   │   └── task_creation_hint     # Task readiness hints
+│   ├── expression_executor/       # GPU expression evaluation
+│   │   ├── gpu_expression_executor.cpp         # Main executor
+│   │   ├── gpu_expression_translator.cpp       # AST→cuDF translation
+│   │   ├── gpu_expression_executor_state.cpp   # Execution state
+│   │   ├── specializations/                    # Specialized operators
+│   │   │   ├── gpu_execute_*.cpp               # Cast, comparison, function, etc.
+│   │   │   └── gpu_dispatch_*.cu               # CUDA dispatch kernels
+│   │   └── regex/                              # Regex expression handling
+│   ├── cuda/                      # CUDA kernels and GPU code
+│   │   ├── operator/              # Operator kernels (joins, aggregates, sorts)
+│   │   ├── expression_executor/   # GPU expression dispatch
+│   │   ├── cudf/                  # cuDF wrapper kernels
+│   │   ├── iceberg/               # Iceberg delete mask kernels
+│   │   ├── allocator.cu           # GPU memory allocation
+│   │   ├── communication.cu       # Inter-GPU communication
+│   │   └── utils.cu               # GPU utility functions
+│   ├── memory/                    # Memory management
+│   │   ├── sirius_memory_reservation_manager.cpp  # Reservation tracking
+│   │   ├── defragmenter_oom_policy.cpp            # OOM defragmentation
+│   │   ├── host_table_utils.cpp                   # Host memory utilities
+│   │   └── multiple_blocks_allocation_accessor.cpp # Multi-block allocation
+│   ├── downgrade/                 # GPU→Host spilling
+│   │   ├── downgrade_executor.cpp  # Monitor and execute spilling
+│   │   └── downgrade_task.cpp      # Spill task type
+│   ├── data/                      # Data conversion and representation
+│   │   ├── host_parquet_representation.cpp       # Parquet metadata cache
+│   │   ├── host_parquet_representation_converters.cpp  # Parquet→GPU conversion
+│   │   └── sirius_converter_registry.cpp         # Converter registry
+│   ├── parallel/                  # Thread pool management
+│   │   └── task_executor.cpp      # Worker thread pool executor
+│   ├── util/                      # Utilities
+│   │   ├── stream_check_wrapper.cpp  # CUDA stream debugging
+│   │   └── segfault_backtrace_handler.cpp  # Backtrace on crash
+│   ├── legacy/                    # Legacy GPU execution code (being phased out)
+│   │   ├── CMakeLists.txt         # Legacy build config (can be deleted)
+│   │   ├── operator/              # Legacy operator impls
+│   │   ├── plan/                  # Legacy plan generators
+│   │   └── gpu_context.hpp        # Legacy context
+│   ├── sirius_extension.cpp       # Extension registration entry point
+│   ├── sirius_interface.cpp       # Query lifecycle management
+│   ├── sirius_engine.cpp          # Pipeline building and execution orchestration
+│   ├── sirius_context.cpp         # Subsystem ownership and lifecycle
+│   ├── sirius_config.cpp          # Configuration management
+│   ├── gpu_buffer_manager.cpp     # GPU buffer pool (legacy, superseded by RMM)
+│   ├── cpu_cache.cpp              # Scan result caching
+│   ├── fallback.cpp               # CPU fallback logic
+│   ├── extension_lock.cpp         # Extension-level mutex
+│   └── config.cpp                 # Runtime configuration
+├── test/                          # Tests
+│   ├── cpp/                       # C++ unit and integration tests
+│   │   ├── operator/              # Operator-specific tests
+│   │   │   ├── aggregate/         # Aggregate operator tests
+│   │   │   ├── test_physical_*.cpp  # Individual operator tests
+│   │   │   └── ...
+│   │   ├── pipeline/              # Pipeline execution tests
+│   │   ├── scan/                  # Scan executor tests
+│   │   ├── memory_management/     # Memory management tests
+│   │   ├── integration/           # End-to-end integration tests
+│   │   ├── expression_executor/   # Expression executor tests
+│   │   ├── parallel/              # Thread pool tests
+│   │   ├── downgrade/             # Spilling tests
+│   │   ├── data/                  # Data conversion tests
+│   │   ├── config/                # Configuration tests
+│   │   ├── exec/                  # Execution tests
+│   │   ├── utils/                 # Test utilities (sirius_test_env, utils)
+│   │   ├── integration/           # Multi-format and TPC-H integration tests
+│   │   └── unittest.cpp           # Main test runner (Catch2)
+│   ├── sql/                       # SQL Logic Tests
+│   │   ├── tpch-sirius.test       # TPC-H test cases
+│   │   ├── tpcds*.test            # TPC-DS test cases
+│   │   └── ...
+│   ├── answers/                   # Expected query results for SQL Logic Tests
+│   │   └── tpch/, tpch-mod/       # Reference answers
+│   ├── cpp/                       # C++ tests (organized by component)
+│   ├── tpch_performance/          # TPC-H performance benchmarks
+│   │   ├── tpch_queries/          # SQL query files
+│   │   ├── generate_test_data.py  # Data generator
+│   │   └── performance_test.py    # Benchmark runner
+│   └── tpcds_performance/         # TPC-DS performance benchmarks
+├── docs/super-sirius/             # Architecture documentation
+│   ├── README.md                  # Doc index and reading order
+│   ├── architecture-overview.md   # Component ownership, thread model
+│   ├── execution-flow.md          # Step-by-step query execution
+│   ├── pipeline-execution.md      # Pipeline scheduling details
+│   ├── physical-plan-generation.md # Plan translation details
+│   ├── operators.md               # Operator reference
+│   ├── expression-executor.md     # Expression evaluation
+│   ├── scan.md                    # Scan operators and caching
+│   ├── memory-management.md       # Memory reservation and spilling
+│   ├── data-management.md         # Data batches and repositories
+│   ├── configuration.md           # Config options reference
+│   ├── optimizations.md           # Performance optimizations
+│   └── task-creator.md            # Task scheduling algorithm
+├── tools/                         # Utility scripts
+│   └── parse_pipeline_log.py      # Pipeline log parser for debugging
+├── scripts/                       # Build/test scripts
+│   └── clickbench_runner/         # ClickBench runner script
+├── CMakeLists.txt                 # Root CMake build config
+├── extension_config.cmake         # Extension list (sirius, json, tpcds, tpch, etc.)
+├── Makefile                       # Build wrapper
+├── CLAUDE.md                      # Development guidelines (this project)
+├── LICENSE                        # Apache 2.0
+└── README.md                      # Project overview
 ```
 
 ## Directory Purposes
 
-**`src/`**
-- Purpose: All source code (C++ implementations and CUDA kernels)
-- Contains: Extension logic, operators, planning, execution, utilities
-- Key files: Extension entry point, main executor, operator implementations
+**src/include/ ↔ src/**
+- Headers in `include/` mirror the `src/` directory structure
+- Each `.cpp` file in `src/` has a corresponding `.hpp` in `src/include/`
+- Pattern: `src/op/sirius_physical_filter.cpp` ↔ `src/include/op/sirius_physical_filter.hpp`
 
-**`src/include/`**
-- Purpose: All public headers, mirrors `src/` structure
-- Contains: Class definitions, type declarations, function signatures
-- Convention: Each `.cpp` file has corresponding `.hpp` in `include/`
+**src/op/**
+- Home of all physical operators (30+ implementations)
+- Each operator `sirius_physical_<name>` has:
+  - Header: `src/include/op/sirius_physical_<name>.hpp`
+  - Implementation: `src/op/sirius_physical_<name>.cpp`
+  - Optional CUDA kernel: `src/cuda/operator/<name>.cu`
+- Organized into subdirectories by operator family: `scan/`, `aggregate/`, `order/`, `merge/`, `partition/`, `result/`
 
-**`src/planner/`**
-- Purpose: Logical→physical plan translation
-- Contains: Plan generator, operator-specific builders
-- Key files: `sirius_physical_plan_generator.cpp` (dispatcher), `sirius_plan_*.cpp` (builders)
+**src/cuda/**
+- All GPU kernel code (.cu files)
+- Mirrors operator structure: `src/cuda/operator/`, `src/cuda/cudf/`, `src/cuda/expression_executor/`, `src/cuda/iceberg/`
+- Kernels called from CPU-side operator implementations via CUDA kernel launches
 
-**`src/op/`**
-- Purpose: Physical operator implementations
-- Contains: Filter, projection, joins, aggregation, scans, results
-- Pattern: One file per operator type, all inherit from `sirius_physical_operator`
-- Subdirectory `scan/`: Infrastructure for various data source types
+**src/pipeline/**
+- Pipeline execution orchestration and task management
+- `sirius_pipeline.cpp`: Pipeline graph representation (source, operators, sink, dependencies)
+- `sirius_meta_pipeline.cpp`: Meta-pipeline builder (recursively walks physical plan)
+- `gpu_pipeline_executor.cpp`: GPU worker threads (acquire tickets, pop tasks, execute, push results)
+- `pipeline_executor.cpp`: Top-level coordination (starts executors, schedules initial tasks)
 
-**`src/op/scan/`**
-- Purpose: Scan operator task management
-- Contains: Task creation for table scans, parquet, iceberg
-- Handles: Metadata reading, delete filters, data prefetching
+**src/planner/**
+- Physical plan generation from DuckDB's logical operators
+- `sirius_physical_plan_generator.cpp`: Main entry point, dispatches to specialized builders
+- `sirius_plan_<type>.cpp`: Specialized plan builders (~20 files, one per operator type)
+- Pattern: `LogicalOperator` → `sirius_physical_operator`, handle pipeline splitting and operator injection
 
-**`src/op/aggregate/`**
-- Purpose: Grouping and aggregation utilities
-- Contains: Aggregate implementation helpers, utility functions
-- Used by: Grouped and ungrouped aggregate operators
+**src/expression_executor/**
+- GPU-side expression evaluation via cuDF
+- `gpu_expression_executor.cpp`: Main API (add expressions, set inputs, execute/select)
+- `gpu_expression_translator.cpp`: Walks DuckDB expression AST, builds cuDF operations
+- `specializations/`: Type-specific and operator-specific implementations (cast, comparison, functions)
+- `regex/`: Regular expression handling on GPU
 
-**`src/op/merge/` and `src/op/order/` and `src/op/partition/`**
-- Purpose: Specialized operator implementations
-- Contains: Merge sort, order (top-n, limit), partition logic
-- Note: May be hidden in include structure; these are utility implementations
+**src/creator/**
+- Task scheduling based on data availability
+- `task_creator.cpp`: Manager loop implements hint chain following
+- Receives schedule callbacks from GPU/scan executors
+- Determines which operator is ready next based on data repositories
 
-**`src/pipeline/`**
-- Purpose: Pipeline graph construction and execution
-- Contains: Pipeline definition, meta-pipeline hierarchies, task executors
-- Key files: `sirius_pipeline.cpp` (single pipeline), `sirius_meta_pipeline.cpp` (multi-pipeline graph)
+**src/downgrade/**
+- GPU→Host memory spilling under pressure
+- `downgrade_executor.cpp`: Monitor thread polls memory pressure, dispatches spill tasks
+- Called when GPU memory reservation fails
 
-**`src/expression_executor/`**
-- Purpose: SQL expression evaluation on GPU
-- Contains: Expression AST traversal, cuDF kernel dispatch, type casting
-- Used by: Filter, projection, join condition operators
+**src/memory/**
+- Memory reservation and allocation tracking
+- `sirius_memory_reservation_manager.cpp`: Central reservation authority
+- Tracks GPU/host/disk memory via cuCascade integration
+- Per-memory-space downgrade executors
 
-**`src/cuda/`**
-- Purpose: GPU kernels
-- Contains: Specialized operations impossible or inefficient in C++ (joins, aggregation)
-- Note: `.cu` files compiled by NVCC to GPU object code
+**src/data/**
+- Data type conversions between DuckDB and GPU formats
+- `host_parquet_representation.cpp`: Caches Parquet metadata
+- `host_parquet_representation_converters.cpp`: Converts Parquet→GPU format
+- `sirius_converter_registry.cpp`: Registry of type converters
 
-**`src/creator/`**
-- Purpose: Convert operators to executable tasks
-- Contains: Task creation logic, parallelism decisions
-- Used by: Pipeline executor to generate work
+**test/cpp/**
+- C++ unit and integration tests (Catch2 framework)
+- Organized by component: `operator/`, `pipeline/`, `scan/`, `memory_management/`, etc.
+- `unittest.cpp`: Main test runner
+- Entry point: `build/release/extension/sirius/test/cpp/sirius_unittest`
 
-**`src/downgrade/`**
-- Purpose: CPU fallback when GPU unavailable
-- Contains: Downgrade task wrapper, DuckDB execution delegation
-- Used by: Execution layer when OOM or unsupported type detected
-
-**`src/legacy/`**
-- Purpose: Deprecated gpu_processing code path (old execution engine)
-- Status: Kept for compatibility, all new development targets Super Sirius
-- Do not modify: Unless specifically maintaining legacy mode
-
-**`test/cpp/`**
-- Purpose: C++ unit tests using Catch2 framework
-- Structure: Mirrors `src/` structure (e.g., `test/cpp/op/` tests `src/op/`)
-- Logs: Test output written to `build/release/extension/sirius/test/cpp/log`
-
-**`test/sql/`**
-- Purpose: End-to-end SQL logic tests
-- Format: DuckDB SQL Logic Test files (`.test`)
+**test/sql/**
+- SQL Logic Tests (DuckDB's test framework)
+- `.test` files contain SQL queries and expected results
 - Run via: `build/release/test/unittest --test-dir . test/sql/tpch-sirius.test`
 
-**`test/tpch_performance/`**
-- Purpose: Performance benchmarking
-- Contains: Scale factor data generation, query execution, result comparison
-- Run via: Python scripts with built duckdb-python
+**test/tpch_performance/ & test/tpcds_performance/**
+- Performance benchmarks (Python scripts)
+- `generate_test_data.py`: Generates TPC-H/TPC-DS parquet at scale factor
+- `performance_test.py`: Runs queries, measures execution time, compares CPU vs GPU
 
-**`docs/super-sirius/`**
-- Purpose: Architecture documentation for Super Sirius
-- Contains: Design docs, module descriptions, API references
-- Read order: See `README.md` in directory
+**docs/super-sirius/**
+- Architecture and design documentation
+- Must read before modifying Super Sirius code
+- References actual file paths and function signatures
 
 ## Key File Locations
 
 **Entry Points:**
-- `src/sirius_extension.cpp`: DuckDB extension registration and `gpu_execution` table function
-- `src/sirius_interface.cpp`: Query execution entry point (`sirius_execute_query()`)
-- `src/sirius_engine.cpp`: Pipeline execution entry point (`execute()`)
-- `src/planner/sirius_physical_plan_generator.cpp`: Planning entry point (`create_plan()`)
+- `src/sirius_extension.cpp`: DuckDB extension registration, `CALL gpu_execution()` handler
+- `src/sirius_interface.cpp`: Query preparation and lifecycle (begin → execute → fetch)
+- `src/sirius_engine.cpp`: Pipeline building and execution orchestration
 
 **Configuration:**
-- `src/config.cpp` / `src/include/config.hpp`: Runtime flags (memory policies, batch sizes, debug options)
-- `src/sirius_config.cpp`: Configuration variable bindings to DuckDB settings
-- `pixi.toml`: Development environment setup and dependencies
-- `CMakeLists.txt`: Build configuration, compiler flags, CUDA settings
-- `extension_config.cmake`: Extension manifest (which extensions to load)
+- `src/config.cpp`: Runtime config (memory sizes, thread counts, operator tuning)
+- `src/sirius_config.cpp`: Configuration option definitions
+- `src/include/config.hpp`: Configuration enums and option names
 
 **Core Logic:**
-- `src/op/sirius_physical_operator.cpp` / `src/include/op/sirius_physical_operator.hpp`: Base operator class and pipeline building
-- `src/pipeline/sirius_meta_pipeline.cpp`: Pipeline graph construction and dependency resolution
-- `src/sirius_engine.cpp`: Query execution and task scheduling
-- `src/expression_executor/gpu_expression_executor.cpp`: Expression evaluation dispatcher
+- `src/planner/sirius_physical_plan_generator.cpp`: Plan generation dispatcher
+- `src/include/op/sirius_physical_operator.hpp`: Base operator class
+- `src/include/pipeline/sirius_pipeline.hpp`: Pipeline graph representation
+- `src/include/pipeline/pipeline_executor.hpp`: Top-level executor interface
 
 **Testing:**
-- `test/cpp/`: Unit tests (grep for test files by component)
-- `test/sql/tpch-sirius.test`: SQL logic tests for TPC-H queries
-- `test/tpch_performance/performance_test.py`: Benchmark runner
+- `test/cpp/unittest.cpp`: Catch2 test runner (main entry)
+- `test/cpp/utils/sirius_test_env.cpp`: Test environment setup
+- `test/cpp/integration/test_gpu_execution_tpch.cpp`: TPC-H integration tests
+
+**Memory Management:**
+- `src/include/memory/sirius_memory_reservation_manager.hpp`: Reservation API
+- `src/memory/sirius_memory_reservation_manager.cpp`: Reservation implementation
+- `src/downgrade/downgrade_executor.cpp`: Spilling implementation
+
+**Data Flow:**
+- `src/op/scan/duckdb_scan_executor.cpp`: Scan task execution
+- `src/op/scan/parquet_scan_task.cpp`: Parquet read logic
+- `src/include/data/cached_data_representation.hpp`: Inter-operator data transfer
 
 ## Naming Conventions
 
 **Files:**
-- `sirius_physical_*.cpp`: Physical operator implementations
-- `sirius_plan_*.cpp`: Planning logic for specific operators
-- `gpu_*.cpp`: GPU-related infrastructure (legacy mostly; new code uses sirius_ prefix)
-- `*.cu`: CUDA kernel files
+- C++ source: `snake_case.cpp`
+- Headers: `snake_case.hpp`
+- CUDA kernels: `snake_case.cu`
+- Tests: `test_<component>.cpp` or `test_<functionality>.cpp`
+- SQL logic tests: `<benchmark>.test` (e.g., `tpch-sirius.test`)
 
 **Directories:**
-- `include/`: Public headers (mirror src/ structure)
-- `op/`: Physical operators
-- `planner/`: Planning logic
-- `pipeline/`: Execution orchestration
-- `expression_executor/`: Expression evaluation
-- `cuda/`: GPU kernels
-- `legacy/`: Deprecated code
-- `scan/`: Scan-specific infrastructure
+- Source: `snake_case/` (e.g., `expression_executor/`, `memory_management/`)
+- Tests: `snake_case/` organized by component tested (e.g., `test/cpp/operator/aggregate/`)
 
 **Classes/Types:**
-- `sirius_physical_operator`: Base physical operator
-- `sirius_pipeline`: Single source-sink pipeline
-- `sirius_meta_pipeline`: Multi-pipeline graph
-- `sirius_engine`: Query executor
-- `sirius_interface`: Query interface
-- `sirius_context`: Per-connection context
-- All in `namespace sirius` (planning) or `namespace sirius::op` (operators)
+- Operators: `sirius_physical_<name>` (e.g., `sirius_physical_hash_join`)
+- Executors: `<name>_executor` (e.g., `gpu_pipeline_executor`, `duckdb_scan_executor`)
+- Task types: `<name>_task` (e.g., `gpu_pipeline_task`, `parquet_scan_task`)
+- Managers: `<name>_manager` (e.g., `sirius_memory_reservation_manager`)
 
 **Functions:**
-- `create_plan()`: Planning dispatch (multiple overloads per operator type)
-- `execute()`: Operator execution (takes input data, CUDA stream)
-- `get_global_sink_state()`: Allocate sink state (for aggregation, join build)
-- `get_local_sink_state()`: Per-thread sink state
-- `is_source()`, `is_sink()`: Operator type checking
+- Private helpers: `snake_case_impl()` or `<verb>_<noun>()`
+- Virtual operator methods: `execute()`, `sink()`, `get_operator_state()`
+- Lifecycle: `initialize()`, `terminate()`, `cleanup()`
+
+**Headers Organization:**
+- Public API: `src/include/<component>/<name>.hpp`
+- Forward declarations: `src/include/<component>/fwd.hpp` (if complex)
+- Implementation details: `#include` in .cpp only
 
 ## Where to Add New Code
 
-**New GPU Operator:**
-1. Header: `src/include/op/sirius_physical_MY_OP.hpp` (declare class inheriting from `sirius_physical_operator`)
-2. Implementation: `src/op/sirius_physical_MY_OP.cpp` (implement `execute()`, state methods)
-3. CUDA kernels (if needed): `src/cuda/operator/my_op.cu`
-4. Planning: `src/planner/sirius_plan_my_op.cpp` (create physical operator from logical)
-5. Registration: Add case in `sirius_physical_plan_generator::create_plan(LogicalOperator&)` switch statement
-6. Tests: `test/cpp/op/sirius_physical_my_op_test.cpp` (unit tests) and SQL tests in `test/sql/`
+**New Operator:**
+1. Header: `src/include/op/sirius_physical_<name>.hpp`
+   - Extend `sirius_physical_operator`
+   - Define `SiriusPhysicalOperatorType::<NAME>` in `src/include/op/sirius_physical_operator_type.hpp`
+2. Implementation: `src/op/sirius_physical_<name>.cpp`
+   - Implement required virtual methods (execute, sink, is_source, is_sink, etc.)
+3. GPU kernel (if needed): `src/cuda/operator/<name>.cu`
+4. Plan builder: `src/planner/sirius_plan_<name>.cpp`
+   - Add case in `sirius_physical_plan_generator::create_plan()`
+5. Tests:
+   - Unit test: `test/cpp/operator/test_physical_<name>.cpp`
+   - SQL logic test: Add query to `test/sql/tpch-sirius.test` or similar
 
-**New Expression Type:**
-1. Handler: Add case in `src/expression_executor/gpu_expression_translator.cpp` to dispatch to cuDF kernel
-2. Kernel (if needed): `src/cuda/operator/my_expression.cu`
-3. Tests: `test/cpp/expression_executor/`
+**New Configuration Option:**
+1. Add enum value to `config_option.hpp`
+2. Add default + description in `sirius_config.cpp` (register with `Config::RegisterOption()`)
+3. Add getter function in `config.hpp` or `config.cpp`
+4. Document in `docs/super-sirius/configuration.md`
 
-**Bug Fix or Small Enhancement:**
-1. Locate affected operator or module in `src/`
-2. Update implementation in `.cpp` and `.hpp` as needed
-3. Update unit tests in `test/cpp/` if logic changes
-4. Add SQL test in `test/sql/` if user-visible behavior changes
+**New Scan Source (Table Type):**
+1. Create operator: `src/op/sirius_physical_<source>_scan.cpp/hpp`
+2. Create scan task: `src/op/scan/<source>_scan_task.cpp/hpp`
+3. Create executor: `src/op/scan/<source>_scan_executor.cpp/hpp`
+4. Register in plan generator: `sirius_plan_get.cpp`
 
-**Utility Function:**
-- Shared code: `src/helper/` (helpers, types, utils)
-- Stream management: `src/util/` (CUDA stream wrappers)
-- Memory: `src/include/memory/` (memory management utilities)
+**New Expression Type Support:**
+1. Add specialization: `src/expression_executor/specializations/gpu_execute_<op>.cpp`
+2. Add CUDA dispatch: `src/cuda/expression_executor/gpu_dispatch_<op>.cu`
+3. Update `gpu_expression_translator.cpp` to route expression type
+4. Add tests: `test/cpp/expression_executor/test_<op>.cpp`
 
-**Integration with New DuckDB Feature:**
-1. Update `sirius_extension.cpp` if new callbacks needed
-2. Add planning in `sirius_physical_plan_generator.cpp` or throw `NotImplementedException` for fallback
-3. If GPU acceleration is desired, implement new operator
+**Utilities/Helpers:**
+- Shared helpers: `src/util/<name>.cpp/hpp`
+- Math/memory utilities: `src/cuda/utils.cu`
+- Test utilities: `test/cpp/utils/<name>.cpp/hpp`
 
 ## Special Directories
 
-**`build/`:**
-- Purpose: Build output directory (generated, not committed)
-- Contains: Compiled binaries, object files, test logs
-- Key artifacts: `build/release/extension/sirius/sirius.duckdb_extension` (loadable extension)
-- Test logs: `build/release/extension/sirius/test/cpp/log/`
+**src/legacy/**
+- Purpose: Legacy GPU processing code being phased out
+- Generated: No (hand-maintained, separate from Super Sirius)
+- Committed: Yes (for historical reference)
+- Note: Can be deleted entirely by removing `src/legacy/CMakeLists.txt` from main CMake build
 
-**`.claude/`:**
-- Purpose: Claude Code configuration and skills
-- Contains: Skills for profiling, dataset management, benchmarking
-- Status: Auto-generated, checked in
-- Skills: `/profile-analyzer`, `/dataset-manager`, `/tpcds-benchmark`, `/module-context`
+**build/release/**
+- Purpose: Build outputs (generated)
+- Generated: Yes
+- Committed: No
+- Contents:
+  - `extension/sirius/sirius.duckdb_extension`: Static extension
+  - `extension/sirius/sirius_loadable.duckdb_extension`: Loadable extension
+  - `extension/sirius/test/cpp/sirius_unittest`: C++ test binary
+  - `test/unittest`: SQL logic test runner
 
-**`log/`:**
-- Purpose: Runtime logs directory (generated, not committed)
-- Contains: Sirius execution logs if `SIRIUS_LOG_DIR` not set
-- Controlled by: `SIRIUS_LOG_LEVEL` environment variable
+**test_datasets/tpch_parquet_sf1/, tpcds_parquet_sf1/**
+- Purpose: Pre-generated benchmark data (Parquet format)
+- Generated: Yes (via `test/tpch_performance/generate_test_data.py`)
+- Committed: No (generated on-demand)
+
+**parquet/**
+- Purpose: Sample Parquet files for local testing
+- Generated: No (hand-created test data)
+- Committed: Yes
+
+**.planning/codebase/**
+- Purpose: GSD mapping documents (this directory)
+- Generated: Yes (by Claude GSD agent)
+- Committed: Yes
+- Contents: ARCHITECTURE.md, STRUCTURE.md, STACK.md, etc.
 
 ---
 

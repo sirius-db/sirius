@@ -4,256 +4,237 @@
 
 ## Pattern Overview
 
-**Overall:** Sirius is a GPU-native SQL query execution engine (Super Sirius) that integrates with DuckDB as an extension. It uses a **pipeline-based execution model** with task scheduling and graceful CPU fallback.
+**Overall:** Pipelined GPU-accelerated SQL execution engine integrated as a DuckDB extension
 
 **Key Characteristics:**
-- **GPU-accelerated execution**: RAPIDS cuDF and CUDA kernels for data processing
-- **Pipeline architecture**: Operators connected via pipelines; source-sink relationships
-- **Task-based execution**: Tasks scheduled across CUDA streams and thread pools
-- **Layered operators**: Physical operators with source/sink/regular node types
-- **Fallback mechanism**: Transparent degradation to DuckDB CPU execution when needed
-- **Memory-tiered**: cuCascade integration for GPU/host/disk memory management
+- Task-based pipeline parallelism with multiple dedicated thread pools (GPU execution, scan, task creation, downgrade)
+- Lazy pipeline construction from DuckDB's logical plan via dynamic operator splitting
+- Tiered memory management (GPU/pinned host/disk) with graceful spilling via cuCascade
+- Graceful fallback to DuckDB CPU execution for unsupported operations
+- Data flow through typed batches via shared repositories with barrier-based synchronization
 
 ## Layers
 
-**Extension/Interface Layer:**
-- Purpose: Bridge between DuckDB and Sirius GPU execution
-- Location: `src/sirius_extension.cpp`, `src/sirius_interface.cpp`, `src/sirius_context.cpp`
-- Contains: Table function registration, query routing, error handling
-- Depends on: DuckDB public API, Configuration system
-- Used by: DuckDB runtime calling `CALL gpu_execution(...)` or `CALL gpu_processing(...)`
+**Extension Layer:**
+- Purpose: DuckDB integration surface, query lifecycle management
+- Location: `src/sirius_extension.cpp`, `src/sirius_interface.cpp`
+- Contains: Table function bindings, query preparation, result collection
+- Depends on: DuckDB parsing/optimization, SiriusContext, sirius_engine
+- Used by: DuckDB client via `CALL gpu_execution('SELECT ...')`
 
 **Planning Layer:**
-- Purpose: Convert DuckDB logical plans to Sirius physical plans
-- Location: `src/planner/sirius_physical_plan_generator.cpp`, `src/planner/sirius_plan_*.cpp`
-- Contains: Operator-specific plan builders (filter, aggregate, join, projection, etc.)
-- Depends on: DuckDB logical operator types, sirius physical operators
-- Used by: `sirius_interface` during query preparation phase
-- Key files: `src/planner/sirius_plan_filter.cpp`, `src/planner/sirius_plan_aggregate.cpp`, `src/planner/sirius_plan_comparison_join.cpp`, etc.
+- Purpose: Translate DuckDB's logical plan to Sirius physical operators with GPU-aware splitting
+- Location: `src/planner/`, `src/include/planner/`
+- Contains: `sirius_physical_plan_generator`, specialized plan builders (filter, aggregate, join, order, etc.)
+- Depends on: DuckDB logical operators, operator type definitions
+- Used by: sirius_engine.initialize()
 
-**Physical Operator Layer:**
-- Purpose: Execute GPU operations on data batches
-- Location: `src/op/sirius_physical_*.cpp`, `src/include/op/sirius_physical_*.hpp`
-- Contains: Source operators (table scan, parquet scan, iceberg scan), sink operators (aggregate, join, partition), regular operators (filter, projection, limit, order, etc.)
-- Depends on: Data batch API (cuCascade), CUDA kernels, Expression executor
-- Used by: Pipeline executor to transform data
-- **Base class**: `sirius_physical_operator` (`src/include/op/sirius_physical_operator.hpp`) with `execute()` and state management methods
-- **Operator types**: Defined in `src/op/sirius_physical_operator_type.cpp` (FILTER, PROJECTION, HASH_JOIN, NESTED_LOOP_JOIN, GROUPED_AGGREGATE, etc.)
+**Execution Engine:**
+- Purpose: Orchestrate pipeline construction, execution lifecycle, memory management
+- Location: `src/sirius_engine.cpp`, `src/include/sirius_engine.hpp`
+- Contains: Pipeline graph building, initialization, execution coordination
+- Depends on: Physical operators, pipeline builders, task creators, memory managers
+- Used by: sirius_interface
 
-**Pipeline/Execution Layer:**
-- Purpose: Organize operators into pipelines and schedule execution tasks
-- Location: `src/pipeline/sirius_pipeline.cpp`, `src/pipeline/sirius_meta_pipeline.cpp`, `src/sirius_engine.cpp`
-- Contains: Pipeline scheduling, task creation, execution state management
-- Depends on: Physical operators, task scheduler, thread pool
-- Used by: Query execution flow
-- Key types: `sirius_pipeline` (single source-sink pathway), `sirius_meta_pipeline` (multiple pipelines with same sink), `sirius_engine` (query executor)
+**Operator Layer:**
+- Purpose: GPU-accelerated (or fallback) implementations of SQL operations
+- Location: `src/op/`, `src/include/op/`, `src/cuda/operator/`
+- Contains: ~30 operator types (FILTER, PROJECTION, HASH_JOIN, AGGREGATE, ORDER, etc.)
+- Depends on: cuDF, expression executor, data batches, memory reservations
+- Used by: GPU pipeline executor during task execution
 
-**Task Execution Layer:**
-- Purpose: Create and execute tasks across GPU and CPU
-- Location: `src/creator/task_creator.cpp`, `src/pipeline/gpu_pipeline_executor.cpp`, `src/pipeline/pipeline_executor.cpp`
-- Contains: Task creation from operators, thread pool management, GPU stream scheduling
-- Depends on: CUDA stream API, thread pool, bounded queue
-- Used by: Pipeline executor for parallelism
+**Pipeline Execution Layer:**
+- Purpose: Multi-threaded task scheduling and execution with resource management
+- Location: `src/pipeline/`, `src/include/pipeline/`
+- Contains: `pipeline_executor`, `gpu_pipeline_executor`, `sirius_pipeline`, pipeline metadata
+- Depends on: Operators, task creator, scan executor, downgrade executor
+- Used by: sirius_engine
 
-**Expression Evaluation Layer:**
-- Purpose: Evaluate SQL expressions on GPU
-- Location: `src/expression_executor/gpu_expression_executor.cpp`, `src/expression_executor/gpu_expression_translator.cpp`
-- Contains: Expression AST to cuDF kernel dispatch, binary/unary operators, type casting
-- Depends on: DuckDB expression API, cuDF kernel selection
-- Used by: Filter, projection, join condition evaluation
+**Task Creation Layer:**
+- Purpose: Dynamic task scheduling based on data availability in operator ports
+- Location: `src/creator/`, `src/include/creator/`
+- Contains: `task_creator` with hint chain following
+- Depends on: Operators, GPU/scan executors, data repositories
+- Used by: GPU and scan executor callbacks
 
-**Data Layer:**
-- Purpose: Represent and transform data between DuckDB and GPU formats
-- Location: `src/include/data/`, converter registry, batch utilities
-- Contains: Data batch representation, parquet/iceberg converters, type mapping
-- Depends on: Arrow/Parquet libraries, cuDF column format
-- Used by: Scan operators, result collection
+**Scan Layer:**
+- Purpose: Async data ingestion from DuckDB tables or Parquet files to GPU
+- Location: `src/op/scan/`, `src/include/op/scan/`
+- Contains: `duckdb_scan_executor`, `parquet_scan_task`, caching logic, Iceberg metadata
+- Depends on: DuckDB table functions, Parquet reader, caching infrastructure
+- Used by: task creator, data repositories
 
 **Memory Management Layer:**
-- Purpose: Coordinate GPU memory allocation and tiered caching
-- Location: `src/gpu_buffer_manager.cpp`, `src/include/memory/`
-- Contains: GPU memory reservation, OOM handling, tiered memory (GPU/host/disk via cuCascade)
-- Depends on: RMM allocator, cuCascade data repository, DuckDB memory manager
-- Used by: All GPU operators for allocation
+- Purpose: Tiered GPU/host/disk memory allocation with reservation and spilling
+- Location: `src/memory/`, `src/include/memory/`, cuCascade integration
+- Contains: `sirius_memory_reservation_manager`, downgrade executor, defragmentation
+- Depends on: RMM, cuCascade, GPU allocator
+- Used by: GPU pipeline executor, downgrade executor
 
-**CUDA Kernel Layer:**
-- Purpose: Low-level GPU computation
-- Location: `src/cuda/operator/*.cu`, `src/cuda/*.cu`
-- Contains: Hash join kernels, nested loop join, sort, aggregation, expression evaluation
-- Depends on: CUDA runtime, cuDF libraries, RMM
-- Used by: Physical operators via kernel dispatch
+**Expression Executor Layer:**
+- Purpose: Evaluate DuckDB bound expressions on GPU via cuDF
+- Location: `src/expression_executor/`, `src/cuda/expression_executor/`
+- Contains: `GpuExpressionExecutor`, expression translators, specializations for ops
+- Depends on: cuDF, DuckDB expression AST
+- Used by: Operators (FILTER, PROJECTION, HASH_JOIN predicates, aggregates)
 
-**Fallback Layer:**
-- Purpose: Execute on CPU when GPU path is unavailable
-- Location: `src/fallback.cpp`
-- Contains: Fallback detection (unsupported operators/types), DuckDB CPU delegation
-- Depends on: DuckDB physical operators, execution context
-- Used by: Planning phase and operator-level fallback
+**Data Management Layer:**
+- Purpose: Typed data interchange between operators and external storage
+- Location: `src/data/`, `src/include/data/`
+- Contains: Parquet representation converters, cached data representation, converter registry
+- Depends on: Parquet metadata, cuDF, host memory management
+- Used by: Scan operators, data repositories
 
-**Configuration Layer:**
-- Purpose: Runtime and compile-time configuration
-- Location: `src/config.cpp`, `src/include/config.hpp`
-- Contains: GPU memory policies, kernel selection flags, scan batch sizes, logging
-- Depends on: None (low-level)
-- Used by: All layers for behavior control
+**Context Layer:**
+- Purpose: Ownership and lifecycle management of all subsystems per DuckDB connection
+- Location: `src/sirius_context.cpp`, `src/include/sirius_context.hpp`
+- Contains: SiriusContext (config, memory manager, executor references, query state)
+- Depends on: All subsystems below
+- Used by: Extension, interface, engine
 
 ## Data Flow
 
 **Query Execution Flow:**
 
-1. **Query Entry** (`sirius_interface::sirius_execute_query`)
-   - User calls `CALL gpu_execution('SELECT ...')`
-   - Query string → `sirius_interface`
-
-2. **Planning Phase** (`sirius_physical_plan_generator::create_plan`)
-   - DuckDB logical plan → Sirius physical plan
-   - Traversal of logical operators, creates matching sirius physical operators
-   - Type resolution, cardinality estimation
-   - Result: Tree of `sirius_physical_operator` nodes
-
-3. **Pipeline Building** (`sirius_meta_pipeline::build`, `sirius_engine::initialize_internal`)
-   - Physical plan → Pipeline graph
-   - Identifies sources (scan operators) and sinks (aggregation, join build)
-   - Creates `sirius_pipeline` for each source-sink path
-   - Builds `sirius_meta_pipeline` hierarchy
-
-4. **Task Scheduling** (`sirius_engine::execute`)
-   - Pipeline graph → Task queue
-   - `task_creator` converts operators to executable tasks
-   - Tasks assigned to GPU streams and CPU thread pool
-   - Dependencies resolved (join build must complete before probe)
-
-5. **Execution** (`gpu_pipeline_executor`, `pipeline_executor`)
-   - Tasks execute operator logic on data batches
-   - Input batches → operator's `execute()` → output batches
-   - Results flow through pipelines toward sinks
-
-6. **Result Collection** (`sirius_physical_result_collector`)
-   - Final sink operator materializes results
-   - Data converted back to DuckDB format
-   - QueryResult returned to user
-
-**Fallback Path:**
-- During planning: Unsupported operator types → throw `NotImplementedException` → catch in `sirius_extension` → delegate to DuckDB
-- During execution: OOM or unsupported data type → fallback task queued, executes on CPU
-- Transparent to user: CPU results merged with GPU results
+1. **Parse & Optimize** → DuckDB generates optimized logical plan
+2. **Physical Plan Generation** → `sirius_physical_plan_generator::create_plan()` converts to Sirius operators
+3. **Pipeline Construction** → `sirius_engine::initialize()` builds pipeline graph:
+   - `sirius_meta_pipeline::build()` recursively walks physical plan
+   - Streaming operators (FILTER, PROJECTION) added to current pipeline
+   - Blocking operators (JOIN, AGGREGATE, ORDER) become sinks, spawn child pipelines
+   - Pipeline boundaries inject PARTITION/CONCAT/MERGE operators
+   - Data repositories created with barrier types (FULL, PARTIAL, PIPELINE)
+4. **Execution Start** → `sirius_engine::execute()`:
+   - Creates query context with pipeline hashmap
+   - Calls `pipeline_executor.start_query()`
+   - Main thread blocks on completion future
+5. **Scan Phase** → `duckdb_scan_executor` workers:
+   - Pop scan tasks, acquire host memory
+   - Execute DuckDB table function or Parquet reads
+   - Convert to GPU-compatible data batches
+   - Publish to shared data repositories
+   - Schedule downstream consumers via `task_creator->schedule()`
+6. **GPU Execution Phase** → `gpu_pipeline_executor` workers (per GPU):
+   - Acquire kiosk ticket (rate limiting)
+   - Pop GPU pipeline task
+   - Acquire GPU memory reservation
+   - Lock/prepare input batches (transfer to GPU if needed)
+   - Iterate all pipeline operators: call `execute()` on each (source → sink)
+   - Call sink's `sink()` method to push results downstream
+   - Schedule downstream consumers or mark query complete
+   - On OOM: reschedule with backoff
+7. **Task Creation Cycle** → `task_creator` threads:
+   - Receive `schedule(operator*)` calls
+   - Call `operator->get_next_task_hint()` to check data availability
+   - If ready: create GPU task or scan task
+   - If waiting: recursively follow producer chain
+   - Dispatch to GPU or scan executor queue
+8. **Memory Pressure Management** → `downgrade_executor` monitor threads:
+   - Poll GPU memory pressure every ~10ms
+   - If threshold exceeded: move batches from GPU→host
+   - Publish to repositories, update downstream operators
+9. **Completion** → When `RESULT_COLLECTOR` pipeline finishes:
+   - `completion_handler->mark_completed()` signals future
+   - Main thread wakes, extracts materialized result
+   - Returns `QueryResult` to DuckDB
 
 **State Management:**
-- `sirius_active_query_context`: Per-query state (prepared statement, engine, progress bar)
-- `sirius_engine`: Per-query executor state (pipelines, scheduled tasks, results)
-- Operator `sink_state`/`source_state`: Per-operator execution state (hash tables for joins, group partitions for aggregation)
+- Operator state: Global (`GlobalOperatorState`, `GlobalSinkState`) per operator, local per thread
+- Pipeline state: `sirius_pipeline` tracks dependencies, batch indexes, parent relationships
+- Data movement: `shared_data_repository` holds typed data batches with producer/consumer tracking
+- Memory state: Tracked via `sirius_memory_reservation_manager` with per-space downgrade executors
 
 ## Key Abstractions
 
 **sirius_physical_operator:**
-- Purpose: Base class for GPU-executable operations
-- Examples: `sirius_physical_filter.cpp`, `sirius_physical_hash_join.cpp`, `sirius_physical_grouped_aggregate.cpp`
-- Pattern: Each operator implements `execute(input_data, stream) → output_data`
-- Hierarchy: Operators can be sources (is_source()), sinks (is_sink()), or regular
-- Metadata: Type, estimated cardinality, column types, child operators
+- Purpose: Base class for all GPU-executable operations
+- Examples: `sirius_physical_hash_join.hpp`, `sirius_physical_grouped_aggregate.hpp`, `sirius_physical_table_scan.hpp`
+- Pattern: Virtual methods for operator/sink/source states, `execute()` for streaming, `sink()` for aggregation/grouping
 
 **sirius_pipeline:**
-- Purpose: Source + operators + sink as single logical unit
-- Contains: Ordered list of operators, sink reference, batch index for ordering
-- Scheduling: Single pipeline can have multiple parallel tasks from different batches
-- Dependencies: May depend on other pipelines (e.g., probe after join build)
-
-**sirius_meta_pipeline:**
-- Purpose: Multiple pipelines sharing same sink (e.g., different join probe paths)
-- Contains: Vector of `sirius_pipeline`, internal dependency graph
-- Use case: Hash join (build pipeline, probe pipeline) or union branches
-- Features: Batch index assignment, finish events for double-finalize operations
+- Purpose: Represents a sequence of operators from source to sink
+- Examples: `src/include/pipeline/sirius_pipeline.hpp`
+- Pattern: Tracks operators, source, sink, dependencies, batch indexes; knows parent pipelines and order requirements
 
 **operator_data & partitioned_operator_data:**
-- Purpose: Container for data batches flowing between operators
-- Holds: Vector of cuCascade data_batch pointers
-- `partitioned_operator_data`: Adds partition index for partitioned operations
+- Purpose: Typed containers for data batches flowing between operators
+- Examples: `src/include/op/sirius_physical_operator.hpp`
+- Pattern: Wraps `std::vector<std::shared_ptr<cucascade::data_batch>>`; subclass tracks partition index
 
-**task_creation_hint:**
-- Purpose: Signal to pipeline executor whether task is ready or waiting
-- Values: `WAITING_FOR_INPUT_DATA` (block until parent produces), `READY` (execute immediately)
+**shared_data_repository:**
+- Purpose: Centralized buffer for inter-pipeline data transfer with synchronization
+- Examples: Created in `sirius_engine::insert_repository()` with barrier types
+- Pattern: Holds data batches, tracks producer/consumer counts, notifies task creator when data available
+
+**GpuExpressionExecutor:**
+- Purpose: Evaluates DuckDB bound expressions on GPU via cuDF
+- Examples: `src/include/expression_executor/gpu_expression_executor.hpp`
+- Pattern: Parses expression AST, dispatches to specialized cuDF operations, handles type conversions
+
+**SiriusContext:**
+- Purpose: Per-connection ownership hierarchy
+- Examples: `src/include/sirius_context.hpp`
+- Pattern: Registered as `ClientContextState`, owns config, memory manager, all executors, query state
 
 ## Entry Points
 
-**`src/sirius_extension.cpp` - DuckDB Extension Registration:**
-- Location: `ExtensionLoad()` function
-- Triggers: DuckDB `LOAD 'sirius.duckdb_extension'`
-- Responsibilities:
-  - Register `gpu_execution` table function (main entry point)
-  - Register `gpu_processing` table function (legacy)
-  - Register configuration callbacks
-  - Hook into DuckDB initialization
+**CALL gpu_execution('SELECT ...'):**
+- Location: `src/sirius_extension.cpp` → `GPUExecutionBind()`, `GPUExecutionFunction()`
+- Triggers: Table function bind → parse/optimize → physical plan generation
+- Responsibilities: Extract SQL, prepare statement, manage result collection
 
-**`src/sirius_interface.cpp` - Query Execution Interface:**
-- Location: `sirius_interface::sirius_execute_query()`
-- Triggers: Table function calls with SQL string
-- Responsibilities:
-  - Prepare SQL statement via DuckDB planner
-  - Generate physical plan via `sirius_physical_plan_generator`
-  - Create sirius engine
-  - Execute pipeline graph
-  - Return results
+**sirius_interface::sirius_execute_query():**
+- Location: `src/sirius_interface.cpp`
+- Triggers: Pipeline construction, execution, result extraction
+- Responsibilities: Query lifecycle (begin → execute → fetch → cleanup)
 
-**`src/sirius_engine.cpp` - Query Executor:**
-- Location: `sirius_engine::execute()`
-- Triggers: Execution of pipeline graph
-- Responsibilities:
-  - Schedule pipelines respecting dependencies
-  - Create tasks for each pipeline
-  - Drive execution loop
-  - Collect results from sink operator
+**sirius_engine::execute():**
+- Location: `src/sirius_engine.cpp`
+- Triggers: Starts pipeline executor, waits on completion future
+- Responsibilities: Coordinate GPU and scan execution
 
-**`src/planner/sirius_physical_plan_generator.cpp` - Planning:**
-- Location: `sirius_physical_plan_generator::create_plan()`
-- Triggers: Query preparation phase
-- Responsibilities:
-  - Transform logical plan to physical plan
-  - Select GPU-executable operators or raise `NotImplementedException` for fallback
-  - Resolve column bindings and types
+**pipeline_executor::start_query():**
+- Location: `src/include/pipeline/pipeline_executor.hpp` (forward decl), implementation in executor
+- Triggers: Spawns sub-executor threads, queues initial scan tasks
+- Responsibilities: Distribute completion handler, manage task scheduling
+
+**task_creator manager loop:**
+- Location: `src/include/creator/task_creator.hpp`
+- Triggers: Receives schedule callbacks from GPU/scan executors
+- Responsibilities: Determine task readiness, dispatch to executors
+
+**gpu_pipeline_executor worker loop:**
+- Location: `src/include/pipeline/gpu_pipeline_executor.hpp`
+- Triggers: Pops tasks from queue, acquires reservations
+- Responsibilities: Execute all operators in pipeline, call sink(), handle OOM
+
+**duckdb_scan_executor worker loop:**
+- Location: `src/include/op/scan/duckdb_scan_executor.hpp`
+- Triggers: Pops scan tasks from queue
+- Responsibilities: Execute DuckDB scan, convert data, publish to repositories
 
 ## Error Handling
 
-**Strategy:** Layered fallback with explicit error propagation
+**Strategy:** Exception propagation with graceful cleanup and optional CPU fallback
 
 **Patterns:**
-- **Planning-time fallback**: Unsupported logical operator → `NotImplementedException` → caught in `sirius_extension` → re-execute on DuckDB CPU
-- **Execution-time OOM**: Out of GPU memory → `oom_reschedule_exception` → task rescheduled with downgrade to CPU
-- **Type unsupported**: NESTED_TYPES, some temporal types → fallback operator created during planning
-- **Operator unsupported**: WINDOW, UNNEST, etc. → planning layer raises exception
-- **Expression unsupported**: Complex expressions → expression executor falls back to cuDF or CPU
-
-**Error propagation:**
-- Exceptions bubble up through pipeline executor
-- Caught at interface level in `sirius_interface::sirius_execute_query()`
-- Errors formatted and attached to `QueryResult`
-- User receives error message with query location info
+- **GPU OOM:** `oom_reschedule_exception` caught in GPU executor, retry up to 10 times with 5ms backoff (progressive reductions possible)
+- **Unsupported operators:** Throw `NotImplementedException` during planning, caught by fallback layer
+- **Query errors:** Exception caught in GPU/scan executor, routed to `completion_handler->report_error()` which drains queues and propagates to main thread
+- **Task execution failures:** `drain_after_error()` stops task creation, drains queues, signals completion with error
+- **CPU fallback:** If enabled in config, `sirius_extension` catches plan errors and re-executes via DuckDB CPU path
 
 ## Cross-Cutting Concerns
 
-**Logging:**
-- Framework: spdlog
-- Configuration: `SIRIUS_LOG_LEVEL` env var (trace, debug, info, warn, error)
-- Macros: `SIRIUS_LOG_DEBUG()`, `SIRIUS_LOG_INFO()`, etc. in `src/include/log/logging.hpp`
-- Sink: File-based (log directory at `SIRIUS_LOG_DIR`)
+**Logging:** spdlog-based structured logging controlled by `SIRIUS_LOG_LEVEL` (trace, debug, info, warn, error), output to `SIRIUS_LOG_DIR` or CMAKE_BINARY_DIR/log
 
-**Validation:**
-- Operator verification: `sirius_physical_operator::verify()` checks tree invariants
-- Cardinality estimation: Propagated through planning layer
-- Type validation: Column types resolved at planning time via `ResolveOperatorTypes()`
+**Validation:** Operator `verify()` called after plan generation; runtime assertions via `D_ASSERT()` on batch counts, types, operator IDs
 
-**Authentication:**
-- None (extension runs in same process as DuckDB)
-- Inherits DuckDB catalog security
+**Authentication:** None (DuckDB handles client auth)
 
-**GPU Stream Management:**
-- CUDA streams allocated per task via `rmm::cuda_stream_view`
-- Stream passed through execution pipeline
-- Automatic synchronization at pipeline boundaries (meta-pipeline dependencies)
+**Rate Limiting:** Kiosk tickets used in GPU and scan executors to bound concurrent worker threads
 
-**NVTX Profiling:**
-- Instrumentation markers via `nvtx3::scoped_range` in key functions
-- Names match function/operator names for easy tracing
-- Used with NVIDIA Nsys profiler for performance analysis
+**Profiling:** NVTX3 annotations for kernel occupancy, pipeline range tracking; namespace `duckdb::sirius` for GPU expression executor
 
 ---
 
