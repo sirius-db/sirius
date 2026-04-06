@@ -27,11 +27,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. A downgrade_request struct exists and requests enqueue into a mutex-protected FIFO queue consumed by a dedicated processing thread
   3. Candidate collection (collect_candidates_from_partition, two-pass prioritization) is wired into the request processing path and produces the same candidate ordering as the current implementation
   4. Only one request's processing is active at any time (sequential request execution)
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
+- [ ] 01-01-PLAN.md — Rewrite downgrade_task as plain struct and downgrade_executor as standalone class
+- [ ] 01-02-PLAN.md — Update tests for new types, build and verify
 
 ### Phase 2: Request Execution and API
 **Goal**: Callers can submit predicate-based and byte-based downgrade requests and receive results via std::future or blocking call
