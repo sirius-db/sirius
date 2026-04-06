@@ -76,8 +76,8 @@ class pipeline_executor {
     const exec::thread_pool_config& scan_executor_config,
     sirius::memory::sirius_memory_reservation_manager& mem_mgr,
     const cucascade::memory::system_topology_info* sys_topology = nullptr,
-    const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
-      downgrade_executors = nullptr);
+    const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors =
+      nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.

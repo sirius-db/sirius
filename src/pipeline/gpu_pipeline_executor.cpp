@@ -18,8 +18,8 @@
 
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
-#include "downgrade/downgrade_executor.hpp"
 #include "cuda_runtime_api.h"
+#include "downgrade/downgrade_executor.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -122,8 +122,7 @@ void gpu_pipeline_executor::manager_loop()
           kMaxDowngradeRetries);
 
         reservation.reset();  // release partial reservation before downgrade
-        size_t freed =
-          _downgrade_executor->request_free_memory_and_wait(shortfall);
+        size_t freed = _downgrade_executor->request_free_memory_and_wait(shortfall);
         if (freed == 0) {
           SIRIUS_LOG_DEBUG(
             "GPU Pipeline Executor: downgrade freed 0 bytes, stopping retry "
