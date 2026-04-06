@@ -31,7 +31,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 Plans:
 - [x] 01-01-PLAN.md — Rewrite downgrade_task as plain struct and downgrade_executor as standalone class
-- [ ] 01-02-PLAN.md — Update tests for new types, build and verify
+- [x] 01-02-PLAN.md — Update tests for new types, build and verify
 
 ### Phase 2: Request Execution and API
 **Goal**: Callers can submit predicate-based and byte-based downgrade requests and receive results via std::future or blocking call
