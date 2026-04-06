@@ -48,25 +48,24 @@ void downgrade_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
 
-  if (_memory_space) { cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); }
+  cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
 
   _request_queue.reactivate();
 
   absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space) {
-    auto device_id = _memory_space->get_device_id();
+    auto device_id  = _memory_space->get_device_id();
     per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
   }
 
-  _pool = std::make_unique<exec::bounded_thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list,
-    std::move(per_thread_init));
+  _pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
+                                                      _config.thread_name_prefix,
+                                                      _config.cpu_affinity_list,
+                                                      std::move(per_thread_init));
 
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 
-  if (_memory_space) {
-    _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
-  }
+  if (_memory_space) { _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this); }
 }
 
 void downgrade_executor::stop()
@@ -130,21 +129,23 @@ void downgrade_executor::processing_loop()
 
       auto batch_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
 
-      _pool->dispatch(
-        std::move(slot),
-        [batch = std::move(batch), req_ptr = req.get(), &res_mgr = _reservation_manager,
-         stream = rmm::cuda_stream_view{_stream}, batch_size]() {
-          downgrade_task task{batch, res_mgr};
-          try {
-            task.execute(stream);
-            req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
-            if (req_ptr->predicate && req_ptr->predicate()) {
-              req_ptr->satisfied.store(true, std::memory_order_release);
-            }
-          } catch (const std::exception& e) {
-            SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
-          }
-        });
+      _pool->dispatch(std::move(slot),
+                      [batch    = std::move(batch),
+                       req_ptr  = req.get(),
+                       &res_mgr = _reservation_manager,
+                       stream   = rmm::cuda_stream_view{_stream},
+                       batch_size]() {
+                        downgrade_task task{batch, res_mgr};
+                        try {
+                          task.execute(stream);
+                          req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
+                          if (req_ptr->predicate && req_ptr->predicate()) {
+                            req_ptr->satisfied.store(true, std::memory_order_release);
+                          }
+                        } catch (const std::exception& e) {
+                          SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
+                        }
+                      });
     }
 
     // 4. Let in-flight batches finish
@@ -265,16 +266,17 @@ std::vector<std::shared_ptr<cucascade::data_batch>> downgrade_executor::collect_
 
   std::vector<std::shared_ptr<cucascade::data_batch>> all_candidates;
   size_t collected_bytes = 0;
+  bool has_byte_limit    = (target_bytes > 0);
 
   // Pass 1: Non-active partitions (last to first)
   for (auto& sr : scored_repos) {
-    if (collected_bytes >= target_bytes) break;
+    if (has_byte_limit && collected_bytes >= target_bytes) break;
     for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-      if (collected_bytes >= target_bytes) break;
+      if (has_byte_limit && collected_bytes >= target_bytes) break;
       size_t pidx = i - 1;
       if (is_partition_active(sr.repo, pidx)) continue;
-      auto candidates = collect_candidates_from_partition(
-        sr.repo, pidx, _space_id, target_bytes, collected_bytes);
+      auto candidates =
+        collect_candidates_from_partition(sr.repo, pidx, _space_id, target_bytes, collected_bytes);
       for (auto& c : candidates) {
         all_candidates.push_back(std::move(c));
       }
@@ -282,11 +284,11 @@ std::vector<std::shared_ptr<cucascade::data_batch>> downgrade_executor::collect_
   }
 
   // Pass 2: Active partitions (last to first)
-  if (collected_bytes < target_bytes) {
+  if (!has_byte_limit || collected_bytes < target_bytes) {
     for (auto& sr : scored_repos) {
-      if (collected_bytes >= target_bytes) break;
+      if (has_byte_limit && collected_bytes >= target_bytes) break;
       for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-        if (collected_bytes >= target_bytes) break;
+        if (has_byte_limit && collected_bytes >= target_bytes) break;
         size_t pidx = i - 1;
         if (!is_partition_active(sr.repo, pidx)) continue;
         auto candidates = collect_candidates_from_partition(
