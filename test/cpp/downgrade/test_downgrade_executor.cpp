@@ -20,8 +20,6 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "downgrade/downgrade_task.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "task_completion.hpp"
-
 // data utilities
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -153,15 +151,10 @@ TEST_CASE("Single downgrade task executes correctly", "[downgrade_executor]")
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  sirius::task_completion_message_queue msg_queue;
-
   auto batch = make_gpu_batch(*gpu_space);
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  auto global_state = std::make_shared<downgrade_task_global_state>(*mem_mgr, repo_mgr, msg_queue);
-  auto local_state  = std::make_unique<downgrade_task_local_state>(0, 0, batch);
-  downgrade_task task(std::move(local_state), global_state);
+  downgrade_task task{batch, *mem_mgr};
 
   rmm::cuda_stream stream;
   REQUIRE_NOTHROW(task.execute(stream));
