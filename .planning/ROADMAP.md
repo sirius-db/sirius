@@ -46,7 +46,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md -- Incremental dispatch engine and public API surface
+- [x] 02-01-PLAN.md -- Incremental dispatch engine and public API surface
 - [ ] 02-02-PLAN.md -- Rewrite tests for new API, build and verify
 
 ### Phase 3: Lifecycle and Pipeline Integration
@@ -72,6 +72,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation | 0/2 | Not started | - |
-| 2. Request Execution and API | 0/2 | Not started | - |
+| 1. Foundation | 2/2 | Complete | 2026-04-06 |
+| 2. Request Execution and API | 1/2 | In progress | - |
 | 3. Lifecycle and Pipeline Integration | 0/2 | Not started | - |

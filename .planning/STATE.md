@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 2 context gathered
-last_updated: "2026-04-06T14:33:42.170Z"
-last_activity: 2026-04-06
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-04-06T15:12:40Z"
+last_activity: 2026-04-06 -- Completed 02-01 request execution and API
 progress:
   total_phases: 3
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 0
+  total_plans: 4
+  completed_plans: 3
+  percent: 50
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-03)
 
 **Core value:** Reliably free GPU memory on demand with predictable completion semantics
-**Current focus:** Phase 01 — foundation
+**Current focus:** Phase 02 — request-execution-and-api
 
 ## Current Position
 
-Phase: 2
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-04-06
+Phase: 02 (request-execution-and-api) — EXECUTING
+Plan: 2 of 2
+Status: Plan 01 complete, Plan 02 next
+Last activity: 2026-04-06 -- Completed 02-01 request execution and API
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [#####░░░░░] 50%
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ Progress: [░░░░░░░░░░] 0%
 
 *Updated after each plan completion*
 | Phase 01-foundation P01 | 3min | 2 tasks | 4 files |
+| Phase 02-request-execution-and-api P01 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -64,6 +65,8 @@ Recent decisions affecting current work:
 - Roadmap: Compressed research's 4 phases to 3 (coarse granularity) by merging core execution with API surface and deferring observability to v2
 - [Phase 01-foundation]: Dropped itask_executor inheritance -- queue-of-requests model replaces queue-of-tasks
 - [Phase 01-foundation]: Kept run_downgrade_pass synchronous for backward compat; CUDA stream creation deferred to start()
+- [Phase 02-request-execution-and-api]: Predicate-driven incremental dispatch replaces collect-all/dispatch-all pattern
+- [Phase 02-request-execution-and-api]: run_downgrade_pass methods removed; replaced by request_free_memory/request_downgrade API
 
 ### Pending Todos
 
@@ -76,6 +79,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-06T14:33:42.168Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-request-execution-and-api/02-CONTEXT.md
+Last session: 2026-04-06T15:12:40Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: .planning/phases/02-request-execution-and-api/02-02-PLAN.md

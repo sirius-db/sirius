@@ -7,19 +7,19 @@
 
 ### Request API
 
-- [ ] **RAPI-01**: The fundamental unit of work is a request that takes a predicate `std::function<bool()>` and downgrades data_batches until the predicate returns true or candidates are exhausted
-- [ ] **RAPI-02**: `request_free_memory(size_t bytes)` wraps the predicate API with a lambda that checks current memory consumption against the target; returns `std::future<size_t>` (non-blocking)
-- [ ] **RAPI-03**: `request_free_memory_and_wait(size_t bytes)` blocks until the request completes and returns the number of bytes actually freed
-- [ ] **RAPI-04**: The predicate-based API also supports async usage, returning `std::future<size_t>` for callers that provide a custom predicate
-- [ ] **RAPI-05**: If not enough idle batches exist to satisfy the request, the executor frees what is available and returns the actual bytes freed (partial fulfillment)
+- [x] **RAPI-01**: The fundamental unit of work is a request that takes a predicate `std::function<bool()>` and downgrades data_batches until the predicate returns true or candidates are exhausted
+- [x] **RAPI-02**: `request_free_memory(size_t bytes)` wraps the predicate API with a lambda that checks current memory consumption against the target; returns `std::future<size_t>` (non-blocking)
+- [x] **RAPI-03**: `request_free_memory_and_wait(size_t bytes)` blocks until the request completes and returns the number of bytes actually freed
+- [x] **RAPI-04**: The predicate-based API also supports async usage, returning `std::future<size_t>` for callers that provide a custom predicate
+- [x] **RAPI-05**: If not enough idle batches exist to satisfy the request, the executor frees what is available and returns the actual bytes freed (partial fulfillment)
 
 ### Execution Engine
 
 - [x] **EXEC-01**: The downgrade_executor owns its own `bounded_thread_pool` and does not inherit from `itask_executor`
 - [x] **EXEC-02**: Requests are queued and executed one at a time (sequential request processing); only one request's batch downgrades are active at any moment
-- [ ] **EXEC-03**: Within a single request, multiple data_batch downgrades execute concurrently via the thread pool
-- [ ] **EXEC-04**: The predicate is checked after each individual batch downgrade completes; if true, no new batches are dispatched but in-flight batches finish naturally
-- [ ] **EXEC-05**: Individual batch downgrade failures are non-fatal — logged and skipped, execution continues with remaining candidates
+- [x] **EXEC-03**: Within a single request, multiple data_batch downgrades execute concurrently via the thread pool
+- [x] **EXEC-04**: The predicate is checked after each individual batch downgrade completes; if true, no new batches are dispatched but in-flight batches finish naturally
+- [x] **EXEC-05**: Individual batch downgrade failures are non-fatal — logged and skipped, execution continues with remaining candidates
 
 ### Lifecycle & Integration
 
@@ -70,16 +70,16 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RAPI-01 | Phase 2 | Pending |
-| RAPI-02 | Phase 2 | Pending |
-| RAPI-03 | Phase 2 | Pending |
-| RAPI-04 | Phase 2 | Pending |
-| RAPI-05 | Phase 2 | Pending |
+| RAPI-01 | Phase 2 | Complete |
+| RAPI-02 | Phase 2 | Complete |
+| RAPI-03 | Phase 2 | Complete |
+| RAPI-04 | Phase 2 | Complete |
+| RAPI-05 | Phase 2 | Complete |
 | EXEC-01 | Phase 1 | Complete |
 | EXEC-02 | Phase 1 | Complete |
-| EXEC-03 | Phase 2 | Pending |
-| EXEC-04 | Phase 2 | Pending |
-| EXEC-05 | Phase 2 | Pending |
+| EXEC-03 | Phase 2 | Complete |
+| EXEC-04 | Phase 2 | Complete |
+| EXEC-05 | Phase 2 | Complete |
 | LIFE-01 | Phase 3 | Pending |
 | LIFE-02 | Phase 3 | Pending |
 | LIFE-03 | Phase 3 | Pending |
