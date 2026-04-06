@@ -20,7 +20,6 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "downgrade/downgrade_task.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "task_completion.hpp"
 
 // data utilities
 #include <data/data_batch_utils.hpp>
@@ -95,7 +94,7 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   auto stream = cudf::get_default_stream();
   auto mr     = gpu_space.get_default_allocator();
 
-  std::vector<cudf::data_type> col_types                 = {cudf::data_type{cudf::type_id::INT32}};
+  std::vector<cudf::data_type> col_types = {cudf::data_type{cudf::type_id::INT32}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
@@ -127,16 +126,15 @@ TEST_CASE("start_stop_cycle", "[downgrade_lifecycle]")
 
   // First start/stop cycle
   REQUIRE_NOTHROW(executor.start());
-  // Verify executor is operational by scheduling a trivial pass (empty repos = 0 scheduled)
-  std::vector<downgrade_repository_info> repos;
-  size_t scheduled = executor.run_downgrade_pass(repos, 1024);
-  REQUIRE(scheduled == 0);
+  // Verify executor is operational by requesting a trivial free (no repos = 0 freed)
+  size_t freed = executor.request_free_memory_and_wait(1024);
+  REQUIRE(freed == 0);
   REQUIRE_NOTHROW(executor.stop());
 
   // Second start/stop cycle -- verifies re-entry is safe
   REQUIRE_NOTHROW(executor.start());
-  scheduled = executor.run_downgrade_pass(repos, 1024);
-  REQUIRE(scheduled == 0);
+  freed = executor.request_free_memory_and_wait(1024);
+  REQUIRE(freed == 0);
   REQUIRE_NOTHROW(executor.stop());
 
   // Third cycle for good measure
@@ -152,23 +150,24 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
 
   cucascade::shared_data_repository_manager repo_mgr;
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
-  executor.start();
-
-  // Create a repo with some batches and schedule downgrade passes
-  cucascade::shared_data_repository repo;
+  // Create a repo with some batches and register with manager
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto batch1 = make_gpu_batch(*gpu_space);
   auto batch2 = make_gpu_batch(*gpu_space);
   auto batch3 = make_gpu_batch(*gpu_space);
-  repo.add_data_batch(batch1);
-  repo.add_data_batch(batch2);
-  repo.add_data_batch(batch3);
+  repo->add_data_batch(batch1);
+  repo->add_data_batch(batch2);
+  repo->add_data_batch(batch3);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  std::vector<downgrade_repository_info> repos = {{&repo}};
-  size_t scheduled = executor.run_downgrade_pass(repos, 1ull << 30);
-  REQUIRE(scheduled == 3);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  executor.start();
 
-  // Wait for completion
+  // Request downgrade of all GPU data
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
+
+  // Wait for batches to reach HOST
   auto deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
     if (batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST &&
@@ -182,13 +181,13 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
   REQUIRE_NOTHROW(executor.drain());
 
   // After drain, the executor should be operational for new requests
-  cucascade::shared_data_repository repo2;
+  auto repo2  = std::make_unique<cucascade::shared_data_repository>();
   auto batch4 = make_gpu_batch(*gpu_space);
-  repo2.add_data_batch(batch4);
+  repo2->add_data_batch(batch4);
+  repo_mgr.add_new_repository(2, "out", std::move(repo2));
 
-  std::vector<downgrade_repository_info> repos2 = {{&repo2}};
-  scheduled = executor.run_downgrade_pass(repos2, 1ull << 30);
-  REQUIRE(scheduled == 1);
+  freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
 
   deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -208,23 +207,23 @@ TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
 
   cucascade::shared_data_repository_manager repo_mgr;
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
-  executor.start();
-
-  // Create a repo with GPU data
-  cucascade::shared_data_repository repo;
+  // Create a repo with GPU data and register with manager
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
   auto batch = make_gpu_batch(*gpu_space);
-  repo.add_data_batch(batch);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  // Record the use_count before scheduling -- the test + repo hold references
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Record the use_count before scheduling -- the test holds a reference
   long count_before = batch.use_count();
 
-  // Schedule downgrade
-  std::vector<downgrade_repository_info> repos = {{&repo}};
-  size_t scheduled = executor.run_downgrade_pass(repos, 1ull << 30);
-  REQUIRE(scheduled == 1);
+  // Request downgrade
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
 
   // Wait for downgrade to complete
   auto deadline = std::chrono::steady_clock::now() + 10s;
@@ -239,7 +238,6 @@ TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
   executor.drain();
 
   // After drain, the executor should not hold any extra shared_ptr<data_batch> references.
-  // The only holders should be: this test variable + the repository.
   // use_count should be back to what it was before scheduling.
   REQUIRE(batch.use_count() <= count_before);
 
@@ -254,17 +252,14 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
 
   cucascade::shared_data_repository_manager repo_mgr;
 
-  // Create a repo with GPU data and register it with the manager via add_new_repository
-  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  // Create a repo with GPU data and register it with the manager
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto batch1 = make_gpu_batch(*gpu_space, 100000);
   auto batch2 = make_gpu_batch(*gpu_space, 100000);
   auto batch3 = make_gpu_batch(*gpu_space, 100000);
   repo->add_data_batch(batch1);
   repo->add_data_batch(batch2);
   repo->add_data_batch(batch3);
-
-  // Keep a raw pointer before moving into the manager
-  auto* repo_ptr = repo.get();
   repo_mgr.add_new_repository(42, "default", std::move(repo));
 
   REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
@@ -279,7 +274,7 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
   // Note: whether downgrades actually happen depends on should_downgrade_memory() returning true.
   // With a small amount of data, the monitor may not trigger. This test verifies the monitor
   // loop runs without crashing and the executor remains operational.
-  auto deadline = std::chrono::steady_clock::now() + 2s;
+  auto deadline      = std::chrono::steady_clock::now() + 2s;
   bool any_downgraded = false;
   while (std::chrono::steady_clock::now() < deadline) {
     if (batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST ||
@@ -292,11 +287,10 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
   }
 
   // Even if the monitor didn't trigger (not enough pressure), verify the executor is healthy
-  // by manually running a downgrade pass
+  // by manually requesting a downgrade
   if (!any_downgraded) {
-    std::vector<downgrade_repository_info> repos = {{repo_ptr}};
-    size_t scheduled = executor.run_downgrade_pass(repos, 1ull << 30);
-    REQUIRE(scheduled >= 1);
+    size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+    REQUIRE(freed > 0);
 
     deadline = std::chrono::steady_clock::now() + 10s;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -320,17 +314,17 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
-  // Launch 4 threads, each scheduling downgrade passes concurrently
+  // Launch 4 threads, each requesting memory reclamation concurrently
   std::atomic<int> completed{0};
   std::vector<std::thread> threads;
   for (int i = 0; i < 4; ++i) {
-    threads.emplace_back([&executor, &repo_mgr, gpu_space, &completed]() {
-      cucascade::shared_data_repository repo;
+    threads.emplace_back([&executor, &repo_mgr, gpu_space, &completed, i]() {
+      auto repo  = std::make_unique<cucascade::shared_data_repository>();
       auto batch = make_gpu_batch(*gpu_space, 500);
-      repo.add_data_batch(batch);
+      repo->add_data_batch(batch);
+      repo_mgr.add_new_repository(100 + i, "out", std::move(repo));
 
-      std::vector<downgrade_repository_info> repos = {{&repo}};
-      executor.run_downgrade_pass(repos, 1ull << 30);
+      executor.request_free_memory_and_wait(1ull << 30);
 
       // Wait for the batch to be downgraded
       auto deadline = std::chrono::steady_clock::now() + 10s;
@@ -355,13 +349,13 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
 
   // Verify no crash and executor is still operational after drain
   // Submit + complete another request
-  cucascade::shared_data_repository repo_final;
+  auto repo_final  = std::make_unique<cucascade::shared_data_repository>();
   auto final_batch = make_gpu_batch(*gpu_space, 500);
-  repo_final.add_data_batch(final_batch);
+  repo_final->add_data_batch(final_batch);
+  repo_mgr.add_new_repository(200, "out", std::move(repo_final));
 
-  std::vector<downgrade_repository_info> repos = {{&repo_final}};
-  size_t scheduled = executor.run_downgrade_pass(repos, 1ull << 30);
-  REQUIRE(scheduled == 1);
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
 
   auto deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -388,13 +382,13 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
   executor.start();
 
   // Submit a request that requires GPU->HOST copy (uses the stream internally)
-  cucascade::shared_data_repository repo1;
+  auto repo1  = std::make_unique<cucascade::shared_data_repository>();
   auto batch1 = make_gpu_batch(*gpu_space);
-  repo1.add_data_batch(batch1);
+  repo1->add_data_batch(batch1);
+  repo_mgr.add_new_repository(1, "out", std::move(repo1));
 
-  std::vector<downgrade_repository_info> repos1 = {{&repo1}};
-  size_t scheduled = executor.run_downgrade_pass(repos1, 1ull << 30);
-  REQUIRE(scheduled == 1);
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
 
   auto deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -410,13 +404,13 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
   executor.start();
 
   // Submit another request to verify stream is usable again
-  cucascade::shared_data_repository repo2;
+  auto repo2  = std::make_unique<cucascade::shared_data_repository>();
   auto batch2 = make_gpu_batch(*gpu_space);
-  repo2.add_data_batch(batch2);
+  repo2->add_data_batch(batch2);
+  repo_mgr.add_new_repository(2, "out", std::move(repo2));
 
-  std::vector<downgrade_repository_info> repos2 = {{&repo2}};
-  scheduled = executor.run_downgrade_pass(repos2, 1ull << 30);
-  REQUIRE(scheduled == 1);
+  freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
 
   deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
