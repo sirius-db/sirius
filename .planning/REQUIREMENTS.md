@@ -36,9 +36,9 @@
 
 ### Pipeline Integration
 
-- [ ] **PIPE-01**: In `gpu_pipeline_executor`, when `reservation->size() < bytes_needs`, call `request_free_memory_and_wait` on the downgrade_executor for the shortfall bytes, then retry `make_reservation`
-- [ ] **PIPE-02**: The downgrade-then-retry loop runs up to 5 attempts; if after 5 attempts the full reservation cannot be obtained, proceed with the partial reservation (current behavior)
-- [ ] **PIPE-03**: The `gpu_pipeline_executor` has access to the `downgrade_executor` for its memory space (passed at construction or available via context)
+- [x] **PIPE-01**: In `gpu_pipeline_executor`, when `reservation->size() < bytes_needs`, call `request_free_memory_and_wait` on the downgrade_executor for the shortfall bytes, then retry `make_reservation`
+- [x] **PIPE-02**: The downgrade-then-retry loop runs up to 5 attempts; if after 5 attempts the full reservation cannot be obtained, proceed with the partial reservation (current behavior)
+- [x] **PIPE-03**: The `gpu_pipeline_executor` has access to the `downgrade_executor` for its memory space (passed at construction or available via context)
 
 ## v2 Requirements
 
@@ -87,9 +87,9 @@
 | LIFE-05 | Phase 3 | Pending |
 | CAND-01 | Phase 1 | Complete |
 | CAND-02 | Phase 1 | Complete |
-| PIPE-01 | Phase 3 | Pending |
-| PIPE-02 | Phase 3 | Pending |
-| PIPE-03 | Phase 3 | Pending |
+| PIPE-01 | Phase 3 | Complete |
+| PIPE-02 | Phase 3 | Complete |
+| PIPE-03 | Phase 3 | Complete |
 
 **Coverage:**
 - v1 requirements: 20 total

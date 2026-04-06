@@ -62,7 +62,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 03-01-PLAN.md -- Pipeline integration: inject downgrade_executor into gpu_pipeline_executor, retry-with-downgrade loop, SiriusContext reorder
+- [x] 03-01-PLAN.md -- Pipeline integration: inject downgrade_executor into gpu_pipeline_executor, retry-with-downgrade loop, SiriusContext reorder
 - [ ] 03-02-PLAN.md -- Lifecycle tests: verify start/stop/drain, shared_ptr release, monitor loop, concurrency, CUDA stream lifecycle
 
 ## Progress
