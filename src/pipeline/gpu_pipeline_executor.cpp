@@ -108,10 +108,71 @@ void gpu_pipeline_executor::manager_loop()
           std::to_string(gpu_task->get_task_id()));
       }
       break;
-    } else if (reservation->size() != bytes_needs) {
+    } else if (reservation->size() < bytes_needs && _downgrade_executor) {
+      static constexpr int kMaxDowngradeRetries = 5;
+      for (int attempt = 1; attempt <= kMaxDowngradeRetries; ++attempt) {
+        size_t shortfall = bytes_needs - reservation->size();
+        SIRIUS_LOG_DEBUG(
+          "GPU Pipeline Executor: reservation shortfall {} bytes for pipeline {} "
+          "task {}, requesting downgrade (attempt {}/{})",
+          shortfall,
+          gpu_task->get_pipeline_id(),
+          gpu_task->get_task_id(),
+          attempt,
+          kMaxDowngradeRetries);
+
+        reservation.reset();  // release partial reservation before downgrade
+        size_t freed =
+          _downgrade_executor->request_free_memory_and_wait(shortfall);
+        if (freed == 0) {
+          SIRIUS_LOG_DEBUG(
+            "GPU Pipeline Executor: downgrade freed 0 bytes, stopping retry "
+            "for task {}",
+            gpu_task->get_task_id());
+          reservation = _memory_space->make_reservation(bytes_needs);
+          break;
+        }
+
+        reservation = _memory_space->make_reservation(bytes_needs);
+        if (!reservation) {
+          SIRIUS_LOG_ERROR(
+            "GPU Pipeline Executor: reservation failed after downgrade for "
+            "task {}",
+            gpu_task->get_task_id());
+          break;
+        }
+        if (reservation->size() >= bytes_needs) break;
+      }
+
+      if (!reservation) {
+        SIRIUS_LOG_ERROR(
+          "GPU Pipeline Executor: Failed to acquire memory reservation after "
+          "downgrade for task {}",
+          gpu_task->get_task_id());
+        if (_completion_handler) {
+          _completion_handler->report_error(
+            "GPU Pipeline Executor: Failed to acquire memory reservation "
+            "after downgrade for task " +
+            std::to_string(gpu_task->get_task_id()));
+        }
+        break;
+      }
+      if (reservation->size() < bytes_needs) {
+        SIRIUS_LOG_WARN(
+          "GPU Pipeline Executor: after {} downgrade attempts, reservation "
+          "still partial ({}/{} bytes) for pipeline {} task {} -- proceeding "
+          "with partial reservation",
+          kMaxDowngradeRetries,
+          reservation->size(),
+          bytes_needs,
+          gpu_task->get_pipeline_id(),
+          gpu_task->get_task_id());
+      }
+    } else if (reservation->size() < bytes_needs) {
+      // No downgrade executor available -- warn and proceed (original behavior)
       SIRIUS_LOG_WARN(
-        "GPU Pipeline Executor: Acquired memory reservation does not match requested size for "
-        "pipeline {} of {} bytes needed for task "
+        "GPU Pipeline Executor: Acquired memory reservation does not match "
+        "requested size for pipeline {} of {} bytes needed for task "
         "{}. Reservation size: {}",
         gpu_task->get_pipeline_id(),
         bytes_needs,
