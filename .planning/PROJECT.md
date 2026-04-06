@@ -25,8 +25,14 @@ The downgrade executor must reliably free GPU memory on demand — both asynchro
 
 ### Active
 
-- [ ] Monitor loop preserved: the existing polling loop that checks `should_downgrade_memory()` continues to exist, using the blocking API to trigger downgrade passes
-- [ ] Retain start/stop/drain semantics: `start()`, `stop()`, `drain()` methods continue to exist with equivalent behavior to today, used by `SiriusContext`
+None — all requirements validated.
+
+### Recently Validated (Phase 3)
+
+- [x] Monitor loop preserved: the existing polling loop that checks `should_downgrade_memory()` continues to exist, triggering downgrade passes via the internal request queue — *Validated in Phase 3: Lifecycle and Pipeline Integration*
+- [x] Retain start/stop/drain semantics: `start()`, `stop()`, `drain()` methods continue to exist with equivalent behavior to today, used by `SiriusContext` — *Validated in Phase 3: Lifecycle and Pipeline Integration*
+- [x] gpu_pipeline_executor integration: retry-with-downgrade loop calls `request_free_memory_and_wait` up to 5 times when reservation falls short — *Validated in Phase 3: Lifecycle and Pipeline Integration*
+- [x] SiriusContext initialization order: downgrade executors created before pipeline_executor so pointers are available at construction — *Validated in Phase 3: Lifecycle and Pipeline Integration*
 
 ### Out of Scope
 
@@ -60,6 +66,8 @@ The downgrade executor must reliably free GPU memory on demand — both asynchro
 | std::future for async result | Simple, standard, no callback complexity; caller can poll or block | ✓ Validated Phase 2 |
 | Sequential request processing | Avoids contention between concurrent requests competing for the same batches | ✓ Validated Phase 1 |
 | Predicate checked after each batch (not per-wave) | Enables earliest possible early-exit, minimizing unnecessary downgrades | ✓ Validated Phase 2 |
+| Monitor uses fire-and-forget, not blocking API | Monitor is internal to executor; pushing to its own queue is more efficient than calling the external blocking API | ✓ Validated Phase 3 |
+| Constructor injection for downgrade_executor* | nullptr default preserves backward compatibility; matching by space_id ensures correct GPU affinity | ✓ Validated Phase 3 |
 
 ## Evolution
 
@@ -79,4 +87,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-06 after Phase 2 completion — request execution engine and full public API verified*
+*Last updated: 2026-04-06 after Phase 3 completion — all 3 phases complete, milestone v1.0 done. Downgrade executor redesign fully integrated into pipeline and verified with lifecycle tests.*
