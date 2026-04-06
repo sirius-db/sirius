@@ -62,8 +62,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 03-01: TBD
-- [ ] 03-02: TBD
+- [ ] 03-01-PLAN.md -- Pipeline integration: inject downgrade_executor into gpu_pipeline_executor, retry-with-downgrade loop, SiriusContext reorder
+- [ ] 03-02-PLAN.md -- Lifecycle tests: verify start/stop/drain, shared_ptr release, monitor loop, concurrency, CUDA stream lifecycle
 
 ## Progress
 
@@ -73,5 +73,5 @@ Phases execute in numeric order: 1 -> 2 -> 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation | 2/2 | Complete | 2026-04-06 |
-| 2. Request Execution and API | 1/2 | In progress | - |
+| 2. Request Execution and API | 2/2 | Complete | 2026-04-06 |
 | 3. Lifecycle and Pipeline Integration | 0/2 | Not started | - |
