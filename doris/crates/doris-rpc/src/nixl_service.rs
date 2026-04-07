@@ -402,29 +402,15 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 "transfer_complete: packed cudf buffer received, storing for GPU-direct registration"
             );
 
-            // Data integrity check: verify transferred data isn't all zeros or garbage.
-            if dst_buf.len >= 32 {
-                let addr = dst_buf.addr as usize;
-                let len = dst_buf.len as usize;
-                if let (Ok(first16), Ok(last16)) = (
-                    crate::cuda_driver::gpu_to_host(addr, 16),
-                    crate::cuda_driver::gpu_to_host(addr + len - 16, 16),
-                ) {
-                    let all_zero_first = first16.iter().all(|&b| b == 0);
-                    let all_zero_last = last16.iter().all(|&b| b == 0);
-                    if all_zero_first && all_zero_last {
-                        warn!(
-                            gpu_addr = format_args!("0x{addr:x}"), gpu_size = len,
-                            "transfer_complete: SUSPECT — both first and last 16 bytes are all zeros"
-                        );
-                    } else {
-                        info!(
-                            first = format_args!("{:02x}{:02x}{:02x}{:02x}", first16[0], first16[1], first16[2], first16[3]),
-                            last = format_args!("{:02x}{:02x}{:02x}{:02x}", last16[0], last16[1], last16[2], last16[3]),
-                            "transfer_complete: data integrity spot check OK"
-                        );
-                    }
-                }
+            // FULL buffer checksum: D2H the entire buffer and compute checksum.
+            if let Ok(buf) = crate::cuda_driver::gpu_to_host(dst_buf.addr as usize, dst_buf.len as usize) {
+                let checksum: u64 = buf.iter().map(|&b| b as u64).sum();
+                info!(
+                    gpu_addr = format_args!("0x{:x}", dst_buf.addr),
+                    gpu_size = dst_buf.len,
+                    checksum,
+                    "transfer_complete: RECEIVER buffer checksum"
+                );
             }
 
             // Move ONE staging lease from pending_buffers into the PackedGpuExchange.

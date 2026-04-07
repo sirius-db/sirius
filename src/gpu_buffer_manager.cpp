@@ -686,6 +686,16 @@ void GPUBufferManager::registerExternalTablePacked(
   auto existing = tables.find(up_table_name);
   if (existing != tables.end()) {
     existing->second->pending_metadata.push_back(std::move(metadata));
+    // Validate GPU data: sync first to ensure all prior writes are visible
+    cudaDeviceSynchronize();
+    {
+      int32_t first4 = 0;
+      cudaMemcpy(&first4, gpu_data, 4, cudaMemcpyDeviceToHost);
+      bool looks_like_ascii = (first4 > 0x20000000 && first4 < 0x7f7f7f7f);
+      SIRIUS_LOG_INFO("[registerExternalTablePacked] GPU data at 0x{:x} first4={} (0x{:08x}) ascii={}",
+                      reinterpret_cast<uintptr_t>(gpu_data), first4,
+                      static_cast<uint32_t>(first4), looks_like_ascii);
+    }
     // Unpack from the STORED metadata (stable pointer).
     auto& stored_md = existing->second->pending_metadata.back();
     auto* md_ptr = reinterpret_cast<const uint8_t*>(stored_md.data());

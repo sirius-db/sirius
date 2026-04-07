@@ -243,6 +243,24 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                             part_num, view.num_rows(),
                             [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
 
+            // Validate hash_partition output: check first INT32 value and STRING offsets.
+            for (cudf::size_type c = 0; c < partitioned_table->view().num_columns(); c++) {
+              auto col = partitioned_table->view().column(c);
+              if (col.type().id() == cudf::type_id::INT32 && col.size() > 0) {
+                int32_t first_val = 0;
+                cudaMemcpy(&first_val, col.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
+                SIRIUS_LOG_INFO("[result_collector] hash_part col {} INT32 first_val={}", c, first_val);
+              }
+              if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0 && col.size() > 0) {
+                auto child = col.child(0);
+                int32_t first_off = 0, last_off = 0;
+                cudaMemcpy(&first_off, child.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(&last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+                SIRIUS_LOG_INFO("[result_collector] hash_part col {} STRING first_off={} last_off={} offset={}",
+                                c, first_off, last_off, col.offset());
+              }
+            }
+
             std::vector<duckdb::PackedPartition> packed_parts;
 
             // Estimate total staging space needed: full table packed size as upper bound.
@@ -285,6 +303,34 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                 auto md = packer->build_metadata();
                 SIRIUS_LOG_INFO("[result_collector] partition {}: {} rows, {} bytes at staging+{}",
                                 i, num_rows, total, staging_offset);
+                // Validate: read first 4 bytes of packed buffer — should be INT32 if col 0 is INT32
+                {
+                  int32_t packed_first4 = 0;
+                  cudaMemcpy(&packed_first4, reinterpret_cast<void*>(staging_addr + staging_offset),
+                             4, cudaMemcpyDeviceToHost);
+                  auto first_col_type = slice[0].column(0).type().id();
+                  bool looks_ascii = (packed_first4 > 0x20000000 && packed_first4 < 0x7f7f7f7f);
+                  SIRIUS_LOG_INFO("[result_collector] partition {} packed first4={} (0x{:08x}) col0_type={} ascii={}",
+                                  i, packed_first4, static_cast<uint32_t>(packed_first4),
+                                  static_cast<int>(first_col_type), looks_ascii);
+                  if (looks_ascii && first_col_type == cudf::type_id::INT32) {
+                    // SENDER-SIDE CORRUPTION DETECTED! Also pack with cudf::pack for comparison.
+                    SIRIUS_LOG_ERROR("[result_collector] SENDER CORRUPTION: partition {} has ASCII at INT32 offset 0!", i);
+                    auto ref_packed = cudf::pack(slice[0]);
+                    int32_t ref_first4 = 0;
+                    cudaMemcpy(&ref_first4, ref_packed.gpu_data->data(), 4, cudaMemcpyDeviceToHost);
+                    SIRIUS_LOG_ERROR("[result_collector] cudf::pack first4={} (0x{:08x}) — {}",
+                                    ref_first4, static_cast<uint32_t>(ref_first4),
+                                    (ref_first4 > 0x20000000 && ref_first4 < 0x7f7f7f7f) ? "ALSO ASCII" : "OK (INT32)");
+                    // Dump the pre-pack slice info
+                    for (cudf::size_type c = 0; c < slice[0].num_columns() && c < 3; c++) {
+                      auto col = slice[0].column(c);
+                      SIRIUS_LOG_ERROR("[result_collector] slice col {} type={} rows={} offset={} data=0x{:x}",
+                                      c, static_cast<int>(col.type().id()), col.size(), col.offset(),
+                                      reinterpret_cast<uintptr_t>(col.head<uint8_t>()));
+                    }
+                  }
+                }
                 duckdb::PackedPartition pp;
                 pp.staging_offset = staging_offset;
                 pp.packed_size = total;

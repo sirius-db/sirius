@@ -24,6 +24,7 @@
 #include <cudf/types.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/gather.hpp>
 #include <cudf/partitioning.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -1255,6 +1256,255 @@ TEST_CASE("nixl recv staging: concurrent writes to adjacent regions", "[exchange
   CHECK(result->num_rows() > 0);
 
   cudaFree(staging);
+}
+
+/// Create a table matching the exact Q3 exchange schema:
+/// INT32, STRING, STRING, INT32, STRING, DECIMAL64, STRING, STRING
+/// Uses TPC-H-like string patterns.
+std::unique_ptr<cudf::table> make_q3_exact_schema(cudf::size_type num_rows) {
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource();
+  std::vector<std::unique_ptr<cudf::column>> cols;
+
+  // Col 0: INT32 (l_orderkey-like)
+  {
+    auto scalar = cudf::numeric_scalar<int32_t>(1, true, stream);
+    auto step = cudf::numeric_scalar<int32_t>(3, true, stream);
+    cols.push_back(cudf::sequence(num_rows, scalar, step, stream, mr));
+  }
+
+  // Helper to make a STRING column with variable-length strings
+  auto make_str_col = [&](const char* prefix, int avg_len) {
+    std::vector<std::string> strings;
+    for (int i = 0; i < num_rows; i++) {
+      std::string s = std::string(prefix) + "_";
+      // Vary length to mimic real data
+      int len = avg_len + (i % 20) - 10;
+      if (len < 3) len = 3;
+      for (int j = s.size(); j < len; j++) s += ('a' + (j + i) % 26);
+      strings.push_back(s);
+    }
+    std::vector<int32_t> offsets = {0};
+    std::string chars;
+    for (auto& s : strings) { chars += s; offsets.push_back(static_cast<int32_t>(chars.size())); }
+    auto offsets_col = cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::INT32}, num_rows + 1,
+        cudf::mask_state::UNALLOCATED, stream);
+    cudaMemcpy(offsets_col->mutable_view().data<int32_t>(), offsets.data(),
+               offsets.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    rmm::device_buffer chars_buf(chars.size(), stream, mr);
+    cudaMemcpy(chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice);
+    return cudf::make_strings_column(
+        num_rows, std::move(offsets_col), std::move(chars_buf), 0,
+        rmm::device_buffer{0, stream, mr});
+  };
+
+  // Col 1: STRING (~18 chars, like l_shipmode)
+  cols.push_back(make_str_col("shipmode", 18));
+  // Col 2: STRING (~25 chars, like o_orderpriority)
+  cols.push_back(make_str_col("priority", 25));
+  // Col 3: INT32 (o_shippriority-like)
+  {
+    auto scalar = cudf::numeric_scalar<int32_t>(0, true, stream);
+    cols.push_back(cudf::sequence(num_rows, scalar, stream, mr));
+  }
+  // Col 4: STRING (~15 chars, like l_returnflag)
+  cols.push_back(make_str_col("returnflag", 15));
+  // Col 5: DECIMAL64 (scale=-2, like l_extendedprice)
+  {
+    auto dtype = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+    auto col = cudf::make_fixed_width_column(dtype, num_rows, cudf::mask_state::UNALLOCATED, stream);
+    // Fill with some values
+    std::vector<int64_t> vals(num_rows);
+    for (int i = 0; i < num_rows; i++) vals[i] = 10000 + i * 7;
+    cudaMemcpy(col->mutable_view().data<int64_t>(), vals.data(),
+               vals.size() * sizeof(int64_t), cudaMemcpyHostToDevice);
+    cols.push_back(std::move(col));
+  }
+  // Col 6: STRING (~8 chars, like o_clerk)
+  cols.push_back(make_str_col("clerk", 8));
+  // Col 7: STRING (~70 chars, like l_comment)
+  cols.push_back(make_str_col("comment_field_with_longer_text", 70));
+
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+TEST_CASE("cudf chunked_pack STRING corruption reproducer", "[exchange][cudf_bug]") {
+  // Self-contained reproducer for cudf::chunked_pack bug:
+  // hash_partition + slice + chunked_pack produces packed buffer where
+  // STRING column offsets contain chars data instead of INT32 offsets.
+  //
+  // Schema: INT32, STRING, STRING, INT32, STRING, DECIMAL64, STRING, STRING
+  // (matches TPC-H Q3 exchange table)
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  // Try different row counts and pre-slice offsets.
+  // The bug may depend on STRING columns with non-zero offset() from prior slicing.
+  // Also test with gather-produced columns (simulates GPU pipeline join output).
+  // cudf::gather creates new STRING columns that may have different internal layout
+  // than manually created ones.
+  SECTION("gather then hash_partition then pack") {
+    auto table = make_q3_exact_schema(4000);
+    auto stream = cudf::get_default_stream();
+
+    // Create gather map (select ~half the rows, non-contiguous)
+    std::vector<int32_t> gather_indices;
+    for (int i = 0; i < 4000; i += 2) gather_indices.push_back(i);  // every other row
+    auto indices_col = cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::INT32}, gather_indices.size(),
+        cudf::mask_state::UNALLOCATED, stream);
+    cudaMemcpy(indices_col->mutable_view().data<int32_t>(), gather_indices.data(),
+               gather_indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    // Gather — produces new columns from non-contiguous source rows
+    auto gathered = cudf::gather(table->view(), indices_col->view(),
+                                 cudf::out_of_bounds_policy::DONT_CHECK, stream);
+
+    // hash_partition the gathered result
+    std::vector<cudf::size_type> key_cols = {0};
+    auto [partitioned, offsets] = cudf::hash_partition(
+        gathered->view(), key_cols, 2, cudf::hash_id::HASH_MURMUR3,
+        cudf::DEFAULT_HASH_SEED, stream);
+
+    for (int p = 0; p < 2; p++) {
+      auto start = offsets[p];
+      auto end = (p + 1 < 2) ? offsets[p + 1] : partitioned->num_rows();
+      if (end <= start) continue;
+
+      auto slice = cudf::slice(partitioned->view(), {start, end});
+
+      auto packer_probe = cudf::chunked_pack::create(slice[0], 1UL << 20, stream);
+      auto total = packer_probe->get_total_contiguous_size();
+      size_t buf_size = std::max(total, size_t{1UL << 20});
+      auto packer = cudf::chunked_pack::create(slice[0], buf_size, stream);
+      void* buf = nullptr;
+      REQUIRE(cudaMalloc(&buf, buf_size) == cudaSuccess);
+      cudf::device_span<uint8_t> dst(static_cast<uint8_t*>(buf), buf_size);
+      while (packer->has_next()) { packer->next(dst); }
+      auto md = packer->build_metadata();
+
+      auto unpacked = cudf::unpack(md->data(), static_cast<const uint8_t*>(buf));
+      REQUIRE(unpacked.num_columns() == 8);
+
+      for (cudf::size_type c = 0; c < unpacked.num_columns(); c++) {
+        auto col = unpacked.column(c);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child = col.child(0);
+          int32_t first_offset = 0, last_offset = 0;
+          if (child.size() > 1) {
+            cudaMemcpy(&first_offset, child.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+            INFO("gather p=" << p << " col=" << c << " first=" << first_offset
+                 << " last=" << last_offset << " rows=" << col.size());
+            CHECK(first_offset == 0);
+            CHECK(last_offset > 0);
+            CHECK(last_offset < col.size() * 200);
+          }
+        }
+      }
+      cudaFree(buf);
+    }
+  }
+
+  for (int total_rows : {903, 1800, 2000, 4000, 8000}) {
+    for (int pre_slice_offset : {0, 100, 500, 903, 1000}) {
+    SECTION("total_rows=" + std::to_string(total_rows) + " pre_slice=" + std::to_string(pre_slice_offset)) {
+      // Create a larger table then slice to get columns with non-zero offset.
+      // This simulates the GPU pipeline producing views into larger allocations.
+      auto full_table = make_q3_exact_schema(total_rows + pre_slice_offset);
+      cudf::table_view input_view;
+      if (pre_slice_offset > 0) {
+        auto slices = cudf::slice(full_table->view(),
+            {pre_slice_offset, total_rows + pre_slice_offset});
+        input_view = slices[0]; // View with non-zero offset — DO NOT deep copy
+      } else {
+        input_view = full_table->view();
+      }
+      // Verify offset is non-zero for STRING columns (for pre_slice > 0)
+      if (pre_slice_offset > 0) {
+        for (cudf::size_type c = 0; c < input_view.num_columns(); c++) {
+          auto col = input_view.column(c);
+          if (col.type().id() == cudf::type_id::STRING) {
+            INFO("col " << c << " offset=" << col.offset());
+          }
+        }
+      }
+      REQUIRE(input_view.num_columns() == 8);
+      REQUIRE(input_view.num_rows() == total_rows);
+
+      // hash_partition into 2 partitions
+      std::vector<cudf::size_type> key_cols = {0};
+      auto [partitioned, offsets] = cudf::hash_partition(
+          input_view, key_cols, 2, cudf::hash_id::HASH_MURMUR3,
+          cudf::DEFAULT_HASH_SEED, stream);
+
+      // Try each partition
+      for (int p = 0; p < 2; p++) {
+        auto start = offsets[p];
+        auto end = (p + 1 < 2) ? offsets[p + 1] : partitioned->num_rows();
+        if (end <= start) continue;
+
+        auto slice = cudf::slice(partitioned->view(), {start, end});
+        auto nrows = slice[0].num_rows();
+
+        // chunked_pack into a buffer — use total size as buffer size
+        auto packer_probe = cudf::chunked_pack::create(slice[0], 1UL << 20, stream);
+        auto total = packer_probe->get_total_contiguous_size();
+        size_t buf_size = std::max(total, size_t{1UL << 20});
+        auto packer = cudf::chunked_pack::create(slice[0], buf_size, stream);
+        void* buf = nullptr;
+        REQUIRE(cudaMalloc(&buf, buf_size) == cudaSuccess);
+        cudf::device_span<uint8_t> dst(static_cast<uint8_t*>(buf), buf_size);
+        while (packer->has_next()) { packer->next(dst); }
+        auto md = packer->build_metadata();
+
+        // Unpack
+        auto unpacked = cudf::unpack(md->data(), static_cast<const uint8_t*>(buf));
+        REQUIRE(unpacked.num_columns() == 8);
+        REQUIRE(unpacked.num_rows() == nrows);
+
+        // Validate STRING column offsets
+        bool corrupt = false;
+        for (cudf::size_type c = 0; c < unpacked.num_columns(); c++) {
+          auto col = unpacked.column(c);
+          if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+            auto child = col.child(0);
+            int32_t first_offset = 0, last_offset = 0;
+            if (child.size() > 1) {
+              cudaMemcpy(&first_offset, child.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
+              cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1,
+                        4, cudaMemcpyDeviceToHost);
+              INFO("rows=" << total_rows << " p=" << p << " col=" << c
+                   << " first_offset=" << first_offset << " last_offset=" << last_offset
+                   << " nrows=" << nrows);
+              if (first_offset != 0 || last_offset > nrows * 200 || last_offset < 0) {
+                WARN("CORRUPT STRING offsets: col " << c
+                     << " first=" << first_offset << " last=" << last_offset);
+                corrupt = true;
+              }
+            }
+          }
+        }
+
+        // Try concatenation
+        if (!corrupt) {
+          cudaGetLastError();
+          std::vector<cudf::table_view> views = {unpacked};
+          auto result = cudf::concatenate(views, stream, &cuda_mr);
+          CHECK(result->num_rows() == nrows);
+        }
+
+        if (corrupt) {
+          FAIL("cudf::chunked_pack produced corrupt STRING offsets!");
+        }
+
+        cudaFree(buf);
+      }
+    }
+    } // pre_slice_offset
+  }
 }
 
 TEST_CASE("reproduce Q3 corruption from dumped data", "[exchange][reproduce]") {
