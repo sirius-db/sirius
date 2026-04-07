@@ -85,7 +85,7 @@ class downgrade_executor {
    * @param reservation_manager Reference to the memory reservation manager
    */
   explicit downgrade_executor(
-    exec::thread_pool_config config,
+    exec::downgrade_executor_config config,
     cucascade::shared_data_repository_manager& data_repo_mgr,
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
@@ -162,7 +162,7 @@ class downgrade_executor {
     size_t& collected_bytes);
 
  private:
-  exec::thread_pool_config _config;
+  exec::downgrade_executor_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _pool;
   exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
   std::thread _processing_thread;

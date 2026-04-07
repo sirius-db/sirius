@@ -18,10 +18,11 @@
 
 #include "memory/sirius_memory_reservation_manager.hpp"
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 
 #include <memory>
-#include <rmm/cuda_stream_view.hpp>
 
 namespace sirius {
 namespace parallel {

@@ -94,7 +94,7 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   auto stream = cudf::get_default_stream();
   auto mr     = gpu_space.get_default_allocator();
 
-  std::vector<cudf::data_type> col_types = {cudf::data_type{cudf::type_id::INT32}};
+  std::vector<cudf::data_type> col_types                 = {cudf::data_type{cudf::type_id::INT32}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
@@ -104,9 +104,12 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
 
 downgrade_executor make_test_executor(cucascade::shared_data_repository_manager& repo_mgr,
                                       cucascade::memory::memory_space* gpu_space,
-                                      sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+                                      sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                                      uint64_t monitor_period_ms = 0)
 {
-  sirius::exec::thread_pool_config config{1, "downgrade"};
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool       = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period_ms = monitor_period_ms};
   return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
@@ -266,15 +269,15 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
   REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
   REQUIRE(batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  // Start executor with real memory_space -- monitor loop is enabled
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  // Start executor with monitor enabled (non-zero period)
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr, /*monitor_period_ms=*/10);
   executor.start();
 
   // Wait up to 2s for the monitor to detect pressure and trigger downgrade.
   // Note: whether downgrades actually happen depends on should_downgrade_memory() returning true.
   // With a small amount of data, the monitor may not trigger. This test verifies the monitor
   // loop runs without crashing and the executor remains operational.
-  auto deadline      = std::chrono::steady_clock::now() + 2s;
+  auto deadline       = std::chrono::steady_clock::now() + 2s;
   bool any_downgraded = false;
   while (std::chrono::steady_clock::now() < deadline) {
     if (batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST ||
@@ -375,7 +378,6 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
 
   cucascade::shared_data_repository_manager repo_mgr;
 
-  // Create executor with real memory_space so CUDA stream is created
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
 
   // First start -- stream should be created

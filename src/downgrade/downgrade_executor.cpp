@@ -29,7 +29,7 @@ namespace sirius {
 namespace parallel {
 
 downgrade_executor::downgrade_executor(
-  exec::thread_pool_config config,
+  exec::downgrade_executor_config config,
   cucascade::shared_data_repository_manager& data_repo_mgr,
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
@@ -59,14 +59,16 @@ void downgrade_executor::start()
     per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
   }
 
-  _pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
-                                                      _config.thread_name_prefix,
-                                                      _config.cpu_affinity_list,
+  _pool = std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
+                                                      _config.thread_pool.thread_name_prefix,
+                                                      _config.thread_pool.cpu_affinity_list,
                                                       std::move(per_thread_init));
 
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 
-  if (_memory_space) { _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this); }
+  if (_memory_space && _config.monitor_period_ms > 0) {
+    _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
+  }
 }
 
 void downgrade_executor::stop()
@@ -192,7 +194,7 @@ void downgrade_executor::monitor_loop()
       }
     }
     // Brief sleep to avoid busy-spinning; the monitor re-checks after each interval
-    std::this_thread::sleep_for(10ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(_config.monitor_period_ms));
   }
 }
 
