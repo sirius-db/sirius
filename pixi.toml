@@ -71,8 +71,19 @@ zip = "*"
 [feature.vcpkg.activation]
 scripts = ["scripts/vcpkg.sh"]
 
+[feature.duckdb-python.dependencies]
+pip = "*"
+python = ">=3.12"
+pybind11 = ">=2.6.0"
+scikit-build-core = ">=0.11.4"
+setuptools-scm = ">=8.0"
+
+[feature.duckdb-python.tasks]
+build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
+
 [environments]
 default = ["dev-libs", "cuda13"]
 cuda12 = ["dev-libs", "cuda12"]
+duckdb-python = ["duckdb-python"]
 vcpkg = ["vcpkg", "cuda13"]
 vcpkg-cuda12 = ["vcpkg", "cuda12"]
