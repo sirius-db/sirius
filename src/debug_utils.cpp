@@ -8,7 +8,10 @@
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 
+#include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -19,6 +22,8 @@
 #include <spdlog/fmt/fmt.h>
 
 #include <cuda_runtime.h>
+
+#include <algorithm>
 
 namespace sirius {
 
@@ -183,6 +188,192 @@ void debug_nulls(cucascade::data_batch const& batch,
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_nulls failed: {}", e.what());
   } catch (...) {
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_nulls failed: unknown error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// debug_head
+// ---------------------------------------------------------------------------
+
+void debug_head(cucascade::data_batch const& batch,
+                cudf::size_type n,
+                rmm::cuda_stream_view stream,
+                DebugFormat format,
+                std::vector<std::string> const& col_names)
+{
+  try {
+    if (!is_gpu_tier(batch, "debug_head")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
+    stream.synchronize();
+
+    auto num_cols = tv.num_columns();
+
+    // D-13: Empty batch handling
+    if (tv.num_rows() == 0) {
+      std::string output;
+      output += fmt::format("[SIRIUS_DIAG] head: batch_id={} rows=0 cols={}\n",
+                            batch.get_batch_id(), num_cols);
+      output += "[SIRIUS_DIAG]   (empty batch)\n";
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    // D-12: Clamp N to actual row count
+    auto keep = std::min(n, tv.num_rows());
+
+    // HEAD-03: cudf::slice for zero-copy row selection
+    cudf::table_view sliced_tv = tv;
+    if (keep < tv.num_rows()) {
+      auto slices = cudf::slice(tv, {0, keep}, stream);
+      sliced_tv   = slices.front();
+    }
+
+    auto num_rows = sliced_tv.num_rows();
+
+    // Build column names
+    std::vector<std::string> names(num_cols);
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      names[c] = (static_cast<std::size_t>(c) < col_names.size())
+                   ? col_names[static_cast<std::size_t>(c)]
+                   : fmt::format("col[{}]", c);
+    }
+
+    // Extract string representations for each cell: cells[col][row]
+    std::vector<std::vector<std::string>> cells(num_cols);
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      auto const& col = sliced_tv.column(c);
+      auto nulls      = copy_null_mask_to_host(col, stream);
+      cells[c].resize(num_rows);
+
+      auto tid = col.type().id();
+
+      // Helper lambda: copy typed data from GPU, format each value.
+      // col.data<T>() is offset-adjusted in cuDF 26.02 -- do NOT add col.offset().
+      // But null_mask() is NOT offset-adjusted, so use col.offset() + r for null checks.
+      auto extract_numeric = [&]<typename T>() {
+        std::vector<T> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<T>(),
+                        sizeof(T) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";  // D-06
+          } else {
+            if constexpr (std::is_floating_point_v<T>) {
+              cells[c][r] = fmt::format("{:g}", host_vals[r]);  // D-04
+            } else if constexpr (std::is_same_v<T, int8_t>) {
+              cells[c][r] = fmt::format("{}", static_cast<int>(host_vals[r]));
+            } else {
+              cells[c][r] = fmt::format("{}", host_vals[r]);
+            }
+          }
+        }
+      };
+
+      // BOOL8 special handling (stored as int8_t, display as true/false per D-05)
+      auto extract_bool = [&]() {
+        std::vector<int8_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int8_t>(),
+                        sizeof(int8_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = host_vals[r] ? "true" : "false";  // D-05
+          }
+        }
+      };
+
+      switch (tid) {
+        case cudf::type_id::INT8: extract_numeric.template operator()<int8_t>(); break;
+        case cudf::type_id::INT16: extract_numeric.template operator()<int16_t>(); break;
+        case cudf::type_id::INT32: extract_numeric.template operator()<int32_t>(); break;
+        case cudf::type_id::INT64: extract_numeric.template operator()<int64_t>(); break;
+        case cudf::type_id::UINT8: extract_numeric.template operator()<uint8_t>(); break;
+        case cudf::type_id::UINT16: extract_numeric.template operator()<uint16_t>(); break;
+        case cudf::type_id::UINT32: extract_numeric.template operator()<uint32_t>(); break;
+        case cudf::type_id::UINT64: extract_numeric.template operator()<uint64_t>(); break;
+        case cudf::type_id::FLOAT32: extract_numeric.template operator()<float>(); break;
+        case cudf::type_id::FLOAT64: extract_numeric.template operator()<double>(); break;
+        case cudf::type_id::BOOL8: extract_bool(); break;
+        default:
+          // Unsupported types (STRING, DECIMAL, TIMESTAMP, DATE) -- Phase 3
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            cells[c][r] = "(unsupported)";
+          }
+          break;
+      }
+    }
+
+    // Build output string
+    std::string output;
+    output += fmt::format("[SIRIUS_DIAG] head: batch_id={} rows={} cols={} showing={}\n",
+                          batch.get_batch_id(), tv.num_rows(), num_cols, num_rows);
+
+    if (format == DebugFormat::CSV) {
+      // CSV format (HEAD-02)
+      output += "[SIRIUS_DIAG]   ";
+      for (cudf::size_type c = 0; c < num_cols; ++c) {
+        if (c > 0) { output += ","; }
+        output += names[c];
+      }
+      output += "\n";
+      for (cudf::size_type r = 0; r < num_rows; ++r) {
+        output += "[SIRIUS_DIAG]   ";
+        for (cudf::size_type c = 0; c < num_cols; ++c) {
+          if (c > 0) { output += ","; }
+          output += cells[c][r];
+        }
+        output += "\n";
+      }
+    } else {
+      // ALIGNED format (HEAD-01, D-03: dynamic column widths)
+      std::vector<std::size_t> widths(num_cols);
+      for (cudf::size_type c = 0; c < num_cols; ++c) {
+        widths[c] = names[c].size();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          widths[c] = std::max(widths[c], cells[c][r].size());
+        }
+        widths[c] += 2;  // padding
+      }
+
+      // Header row
+      output += "[SIRIUS_DIAG]   ";
+      for (cudf::size_type c = 0; c < num_cols; ++c) {
+        output += fmt::format("{:<{}s}", names[c], widths[c]);
+      }
+      output += "\n";
+
+      // Separator row
+      output += "[SIRIUS_DIAG]   ";
+      for (cudf::size_type c = 0; c < num_cols; ++c) {
+        output += std::string(widths[c], '-');
+      }
+      output += "\n";
+
+      // Data rows
+      for (cudf::size_type r = 0; r < num_rows; ++r) {
+        output += "[SIRIUS_DIAG]   ";
+        for (cudf::size_type c = 0; c < num_cols; ++c) {
+          output += fmt::format("{:<{}s}", cells[c][r], widths[c]);
+        }
+        output += "\n";
+      }
+    }
+
+    SIRIUS_LOG_DEBUG("{}", output);
+
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_head failed: {}", e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_head failed: unknown error");
   }
 }
 
