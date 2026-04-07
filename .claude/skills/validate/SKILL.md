@@ -1,6 +1,9 @@
 ---
 name: validate
-description: Diagnose incorrect query results by comparing against DuckDB CPU, analyzing per-operator row counts and data checksums to pinpoint the faulty operator. Use when a query returns wrong results.
+description: >
+  Use this skill when a Sirius query returns wrong results, missing rows, extra rows, or incorrect
+  values compared to DuckDB CPU. Pinpoints the faulty operator using per-operator row counts and
+  data checksums. Also detects CUDA stream synchronization issues that cause garbage data.
 argument-hint: [sql-query-or-file]
 disable-model-invocation: true
 ---

@@ -1,6 +1,12 @@
 ---
 name: optimization-advisor
-description: Identify code optimization targets from nsys profiles — maps GPU hotspots to source functions, detects efficiency bottlenecks, sync overhead, memory issues, and parallelism opportunities.
+description: >
+  Use this skill to find exactly which source code to optimize for better GPU performance. Maps nsys
+  profile hotspots to specific Sirius source files and functions, classifies bottlenecks as GPU-bound,
+  CPU-bound, or sync-bound, and recommends actionable code changes. Trigger when the user wants to
+  know what to optimize, where to focus coding effort, or wants source-level optimization guidance.
+  This skill focuses on actionable source code targets — for generating performance reports and
+  measurements, use profile-analyzer instead.
 ---
 
 # Sirius Code Optimization Advisor

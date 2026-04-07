@@ -1,6 +1,9 @@
 ---
 name: race-check
-description: Detect race conditions using ThreadSanitizer and NVIDIA Compute Sanitizer memcheck. Use when you suspect data races, deadlocks, or non-deterministic behavior in Sirius.
+description: >
+  Use this skill when query results are non-deterministic, differ between runs, or you suspect data
+  races, deadlocks, or thread safety issues. Uses ThreadSanitizer (CPU) and NVIDIA Compute Sanitizer
+  (GPU) to detect and diagnose race conditions.
 argument-hint: [sql-query-or-test-name]
 disable-model-invocation: true
 ---
