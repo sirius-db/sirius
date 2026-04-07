@@ -308,12 +308,17 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                 // Use cudf::pack (not chunked_pack) — chunked_pack has a bug where
                 // STRING chars data overwrites fixed-width column positions for specific
                 // hash_partition + slice outputs. cudf::pack produces correct output.
+                // Synchronize the stream to ensure the hash_partition + slice is complete.
+                stream.synchronize();
                 auto packed = cudf::pack(slice[0], stream);
+                // Synchronize again to ensure pack is complete before D2D copy.
+                stream.synchronize();
                 auto total = packed.gpu_data->size();
-                // Copy to staging (sync to ensure data is visible before validation/nixl read)
-                cudaMemcpy(reinterpret_cast<void*>(staging_addr + staging_offset),
-                           packed.gpu_data->data(), total,
-                           cudaMemcpyDeviceToDevice);
+                // D2D copy to staging — use the SAME stream to maintain ordering.
+                cudaMemcpyAsync(reinterpret_cast<void*>(staging_addr + staging_offset),
+                               packed.gpu_data->data(), total,
+                               cudaMemcpyDeviceToDevice, stream.value());
+                stream.synchronize();
                 auto md = std::move(packed.metadata);
                 SIRIUS_LOG_INFO("[result_collector] partition {}: {} rows, {} bytes at staging+{}",
                                 i, num_rows, total, staging_offset);

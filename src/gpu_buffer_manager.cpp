@@ -703,6 +703,25 @@ void GPUBufferManager::registerExternalTablePacked(
     auto& stored_md = existing->second->pending_metadata.back();
     auto* md_ptr = reinterpret_cast<const uint8_t*>(stored_md.data());
     cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
+
+    // Check if cudf::unpack modified the GPU data.
+    {
+      int32_t post_unpack_first4 = 0;
+      cudaMemcpy(&post_unpack_first4, gpu_data, 4, cudaMemcpyDeviceToHost);
+      SIRIUS_LOG_INFO("[registerExternalTablePacked] after unpack: first4=0x{:08x}",
+                      static_cast<uint32_t>(post_unpack_first4));
+    }
+
+    // Also check a PREVIOUS view's data to see if it was corrupted by THIS unpack.
+    if (!existing->second->pending_gpu_ptrs.empty()) {
+      auto prev_ptr = existing->second->pending_gpu_ptrs.back();
+      int32_t prev_first4 = 0;
+      cudaMemcpy(&prev_first4, prev_ptr, 4, cudaMemcpyDeviceToHost);
+      bool prev_ascii = (prev_first4 > 0x20000000 && prev_first4 < 0x7f7f7f7f);
+      SIRIUS_LOG_INFO("[registerExternalTablePacked] previous view gpu=0x{:x} first4=0x{:08x} ascii={}",
+                      reinterpret_cast<uintptr_t>(prev_ptr), static_cast<uint32_t>(prev_first4), prev_ascii);
+    }
+
     existing->second->pending_views.push_back(view);
     existing->second->pending_gpu_ptrs.push_back(gpu_data);
     auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
