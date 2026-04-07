@@ -325,6 +325,12 @@ class GPUIntermediateRelation {
       pending_views.clear();
       for (size_t i = 0; i < pending_metadata.size(); i++) {
         auto* md_ptr = reinterpret_cast<const uint8_t*>(pending_metadata[i].data());
+        // Verify the GPU data is still valid before re-unpacking.
+        int32_t first4 = 0;
+        cudaMemcpy(&first4, pending_gpu_ptrs[i], 4, cudaMemcpyDeviceToHost);
+        SIRIUS_LOG_INFO("[finalize_pending_views] re-unpack view {}: gpu_ptr=0x{:x} first4=0x{:08x}",
+                        i, reinterpret_cast<uintptr_t>(pending_gpu_ptrs[i]),
+                        static_cast<uint32_t>(first4));
         auto view = cudf::unpack(md_ptr, pending_gpu_ptrs[i]);
         pending_views.push_back(view);
       }
