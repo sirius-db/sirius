@@ -29,7 +29,10 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. All debug functions accept `rmm::cuda_stream_view` and use stream-scoped sync — `cudaDeviceSynchronize` does not appear in any new code
   4. A debug function called on a non-GPU-tier batch logs a warning and returns without crashing
   5. A debug function that encounters an internal exception logs the error and returns without propagating the exception to the caller
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 01-01-PLAN.md — Create debug_utils header, implementation with all infrastructure invariants, and CMake integration
+- [ ] 01-02-PLAN.md — Comprehensive Catch2 unit tests for debug_schema, debug_nulls, and copy_null_mask_to_host
 
 ### Phase 2: Numeric Row Preview and Column Statistics
 **Goal**: Developers can call `debug_head(batch, N, stream)` and see the first N rows in aligned-column and CSV format for all numeric types, and call `debug_stats(batch, stream)` to see GPU-computed min, max, and sum per numeric column — all output routed through `[SIRIUS_DIAG]`
@@ -72,7 +75,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Infrastructure and Metadata Inspection | 0/TBD | Not started | - |
+| 1. Infrastructure and Metadata Inspection | 0/2 | Planning complete | - |
 | 2. Numeric Row Preview and Column Statistics | 0/TBD | Not started | - |
 | 3. Full Type Coverage and Checksums | 0/TBD | Not started | - |
 | 4. Diff, Sampling, and Skill Integration | 0/TBD | Not started | - |
