@@ -32,6 +32,7 @@
 #include <rmm/mr/pool_memory_resource.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <vector>
 
@@ -1254,6 +1255,95 @@ TEST_CASE("nixl recv staging: concurrent writes to adjacent regions", "[exchange
   CHECK(result->num_rows() > 0);
 
   cudaFree(staging);
+}
+
+TEST_CASE("reproduce Q3 corruption from dumped data", "[exchange][reproduce]") {
+  // Load actual metadata + GPU data dumped from the corrupt production run.
+  // If cudf::unpack produces corrupt STRING offsets from this data,
+  // we've reproduced the bug in a unit test.
+  auto stream = cudf::get_default_stream();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  auto project_root = std::filesystem::path(SIRIUS_PROJECT_ROOT);
+  auto dump_dir = project_root / "log";
+
+  // Try view 8 (first corrupt one in latest run)
+  auto md_path = dump_dir / "corrupt_exchange_view_8.metadata";
+  auto gpu_path = dump_dir / "corrupt_exchange_view_8.gpudata";
+
+  if (!std::filesystem::exists(md_path) || !std::filesystem::exists(gpu_path)) {
+    WARN("Skipping: dump files not found at " << dump_dir.string());
+    return;
+  }
+
+  // Load metadata from file
+  std::vector<uint8_t> metadata;
+  {
+    std::ifstream f(md_path, std::ios::binary | std::ios::ate);
+    auto size = f.tellg();
+    f.seekg(0);
+    metadata.resize(size);
+    f.read(reinterpret_cast<char*>(metadata.data()), size);
+    INFO("Loaded metadata: " << metadata.size() << " bytes from " << md_path.string());
+  }
+
+  // Load GPU data from file and upload to GPU
+  std::vector<uint8_t> host_data;
+  {
+    std::ifstream f(gpu_path, std::ios::binary | std::ios::ate);
+    auto size = f.tellg();
+    f.seekg(0);
+    host_data.resize(size);
+    f.read(reinterpret_cast<char*>(host_data.data()), size);
+    INFO("Loaded GPU data: " << host_data.size() << " bytes from " << gpu_path.string());
+  }
+
+  // Upload to GPU
+  void* gpu_buf = nullptr;
+  REQUIRE(cudaMalloc(&gpu_buf, host_data.size()) == cudaSuccess);
+  REQUIRE(cudaMemcpy(gpu_buf, host_data.data(), host_data.size(), cudaMemcpyHostToDevice) == cudaSuccess);
+
+  // Unpack
+  auto view = cudf::unpack(metadata.data(), static_cast<const uint8_t*>(gpu_buf));
+  INFO("Unpacked: " << view.num_columns() << " cols, " << view.num_rows() << " rows");
+  REQUIRE(view.num_columns() > 0);
+  REQUIRE(view.num_rows() > 0);
+
+  // Validate STRING column offsets
+  bool any_corrupt = false;
+  for (cudf::size_type c = 0; c < view.num_columns(); c++) {
+    auto col = view.column(c);
+    if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+      auto child = col.child(0);
+      int32_t last_offset = 0;
+      if (child.size() > 0) {
+        REQUIRE(cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1,
+                          sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess);
+        INFO("col " << c << " STRING last_offset=" << last_offset << " rows=" << col.size());
+        if (last_offset > 100000000 || last_offset < 0) {
+          WARN("col " << c << " STRING CORRUPT: last_offset=" << last_offset);
+          any_corrupt = true;
+        }
+      }
+    }
+  }
+
+  if (any_corrupt) {
+    FAIL("cudf::unpack produced corrupt STRING offsets from dumped production data — BUG REPRODUCED!");
+  } else {
+    INFO("All STRING offsets valid — cudf::unpack works correctly on this data");
+  }
+
+  // If not corrupt, try concatenation too
+  if (!any_corrupt) {
+    cudaGetLastError();
+    std::vector<cudf::table_view> views = {view};
+    auto result = cudf::concatenate(views, stream, &cuda_mr);
+    CHECK(result->num_columns() == view.num_columns());
+    CHECK(result->num_rows() == view.num_rows());
+  }
+
+  cudaFree(gpu_buf);
 }
 
 TEST_CASE("pack_unpack with STRING columns", "[exchange]") {

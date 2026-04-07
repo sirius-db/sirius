@@ -702,6 +702,57 @@ void GPUBufferManager::registerExternalTablePacked(
                     up_table_name, view.num_rows(), total_rows,
                     existing->second->pending_views.size());
 
+    // Validate the just-unpacked view and dump data if corrupt.
+    {
+      bool this_view_corrupt = false;
+      for (cudf::size_type ci = 0; ci < view.num_columns(); ci++) {
+        auto col = view.column(ci);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child = col.child(0);
+          int32_t last_off = 0;
+          if (child.size() > 0) {
+            cudaMemcpy(&last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+            if (last_off > 100000000 || last_off < 0) {
+              this_view_corrupt = true;
+              break;
+            }
+          }
+        }
+      }
+      // Also dump view 0 as a reference (known good).
+      if (existing->second->pending_views.size() == 2) {
+        auto dump_path = std::string("/tmp/good_exchange_view_0");
+        auto& first_md = existing->second->pending_metadata[0];
+        {
+          auto md_path = dump_path + ".metadata";
+          std::ofstream f(md_path, std::ios::binary);
+          f.write(first_md.data(), first_md.size());
+          SIRIUS_LOG_INFO("[registerExternalTablePacked] DUMPED good metadata to {}", md_path);
+        }
+      }
+      if (this_view_corrupt) {
+        // Dump metadata and GPU data to files for unit test reproduction.
+        auto dump_path = std::string("/tmp/corrupt_exchange_view_") +
+            std::to_string(existing->second->pending_views.size() - 1);
+        {
+          auto md_path = dump_path + ".metadata";
+          std::ofstream f(md_path, std::ios::binary);
+          f.write(stored_md.data(), stored_md.size());
+          SIRIUS_LOG_ERROR("[registerExternalTablePacked] DUMPED metadata ({} bytes) to {}",
+                          stored_md.size(), md_path);
+        }
+        {
+          auto gpu_path = dump_path + ".gpudata";
+          std::vector<uint8_t> host_buf(gpu_size);
+          cudaMemcpy(host_buf.data(), gpu_data, gpu_size, cudaMemcpyDeviceToHost);
+          std::ofstream f(gpu_path, std::ios::binary);
+          f.write(reinterpret_cast<const char*>(host_buf.data()), host_buf.size());
+          SIRIUS_LOG_ERROR("[registerExternalTablePacked] DUMPED gpu data ({} bytes) to {}",
+                          gpu_size, gpu_path);
+        }
+      }
+    }
+
     // Validate ALL views after append to detect if push_back corrupted earlier views.
     for (size_t vi = 0; vi < existing->second->pending_views.size(); vi++) {
       auto& pv = existing->second->pending_views[vi];
