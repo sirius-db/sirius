@@ -265,11 +265,20 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
             // Estimate total staging space needed: full table packed size as upper bound.
             // Reserve atomically to prevent concurrent sink() calls from overlapping.
-            auto total_estimate = cudf::chunked_pack::create(view, 1UL << 20, stream)->get_total_contiguous_size();
-            size_t aligned_estimate = (total_estimate + 255) & ~255UL;
-            // Add some padding for per-partition alignment overhead.
-            aligned_estimate += static_cast<size_t>(part_num) * 256;
+            // Compute exact per-partition packed sizes upfront to get accurate staging reservation.
+            // The full-table estimate is unreliable because per-partition alignment padding differs.
+            size_t exact_total = 0;
+            for (int i = 0; i < part_num; i++) {
+              auto start = offsets[i];
+              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_table->num_rows();
+              if (end <= start) continue;
+              auto pslice = cudf::slice(partitioned_table->view(), {start, end});
+              auto psz = cudf::chunked_pack::create(pslice[0], 1UL << 20, stream)->get_total_contiguous_size();
+              exact_total += (psz + 255) & ~255UL;  // 256-byte align per partition
+            }
+            size_t aligned_estimate = exact_total;
             size_t staging_offset = lgb.ReserveStagingRegion(aligned_estimate, staging_size);
+            size_t actual_total_packed = 0; // Track actual vs estimate
 
             for (int i = 0; i < part_num; i++) {
               auto start = offsets[i];
@@ -337,8 +346,16 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                 pp.metadata = std::move(md);
                 pp.num_rows = static_cast<int32_t>(num_rows);
                 packed_parts.push_back(std::move(pp));
+                actual_total_packed += (total + 255) & ~255UL;
                 staging_offset += (total + 255) & ~255UL;  // 256-byte align
               }
+            }
+            if (actual_total_packed > aligned_estimate) {
+              SIRIUS_LOG_ERROR("[result_collector] OVERFLOW: actual_total_packed={} > estimated={} (diff={})",
+                              actual_total_packed, aligned_estimate, actual_total_packed - aligned_estimate);
+            } else {
+              SIRIUS_LOG_INFO("[result_collector] staging estimate OK: actual={} estimated={} (slack={})",
+                              actual_total_packed, aligned_estimate, aligned_estimate - actual_total_packed);
             }
             lgb.AccumulatePackedPartitions(std::move(packed_parts));
             // Also set packed_gpu_addr so get_packed_gpu() returns non-None.

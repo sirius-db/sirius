@@ -82,6 +82,14 @@ impl ExchangeBuffer {
 
     /// Store packed GPU exchange data for an exchange key (accumulates from multiple senders).
     pub fn store_packed_gpu(&self, key: ExchangeKey, data: PackedGpuExchange) {
+        tracing::info!(
+            query_id = ?(key.query_id),
+            node_id = key.node_id,
+            gpu_addr = format_args!("0x{:x}", data.gpu_addr),
+            gpu_size = data.gpu_size,
+            has_lease = data._staging_lease.is_some(),
+            "store_packed_gpu"
+        );
         self.packed_gpu.entry(key).or_insert_with(Vec::new).push(data);
     }
 
