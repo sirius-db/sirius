@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-LOG_DIR="/tmp/sirius-cluster"
+LOG_DIR="$PROJECT_ROOT/log/cluster"
 FE_HTTP="127.0.0.1:8030"
 FE_MYSQL="127.0.0.1:9030"
 SIRIUS_BE="$PROJECT_ROOT/doris/target/release/sirius-doris-be"
