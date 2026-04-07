@@ -327,6 +327,10 @@ TEST_CASE("debug_schema on null-data batch logs warning without crashing", "[deb
   REQUIRE_NOTHROW(sirius::debug_schema(batch, cudf::get_default_stream()));
 }
 
+// ===========================================================================
+// debug_head tests (Phase 2, Plan 02)
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
 // Test case 9: debug_head on multi-type numeric batch (ALIGNED format)
 // ---------------------------------------------------------------------------
@@ -394,7 +398,7 @@ TEST_CASE("debug_head CSV format produces output without throwing", "[debug_util
 }
 
 // ---------------------------------------------------------------------------
-// Test case 11: debug_head clamps N when N > row count (D-12)
+// Test case 11: debug_head clamps N to row count (D-12)
 // ---------------------------------------------------------------------------
 
 TEST_CASE("debug_head clamps N to row count without throwing", "[debug_utils]")
@@ -494,6 +498,10 @@ TEST_CASE("debug_head on null-data batch logs warning without crashing", "[debug
   cucascade::data_batch batch(0, nullptr);
   REQUIRE_NOTHROW(sirius::debug_head(batch, 5, cudf::get_default_stream()));
 }
+
+// ===========================================================================
+// debug_stats tests (Phase 2, Plan 02)
+// ===========================================================================
 
 // ---------------------------------------------------------------------------
 // Test case 15: debug_stats on numeric columns
