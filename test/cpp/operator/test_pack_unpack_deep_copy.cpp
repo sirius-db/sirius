@@ -844,6 +844,264 @@ TEST_CASE("Q3 exchange: chunked_pack from GPU pipeline output", "[exchange][q3][
   cudaFree(staging);
 }
 
+TEST_CASE("nixl recv staging: contiguous packed buffers with STRING offset validation", "[exchange][nixl]") {
+  // Reproduces the EXACT RECV staging scenario:
+  // - Multiple packed buffers from different batches are stored contiguously
+  //   in a single staging buffer (simulating RECV staging bump allocator)
+  // - Each is unpacked from its offset within the staging buffer
+  // - Validates STRING column offsets are correct (not aliased to chars data)
+  // - Then concatenates all views
+  //
+  // This catches the Q3 bug where STRING offsets contain ASCII chars data
+  // instead of integer offsets after nixl transfer.
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  // Allocate a single 64MB "RECV staging" buffer
+  constexpr size_t STAGING_SIZE = 64UL << 20;
+  void* recv_staging = nullptr;
+  REQUIRE(cudaMalloc(&recv_staging, STAGING_SIZE) == cudaSuccess);
+
+  // Also allocate a "SEND staging" (source of the data, different address)
+  void* send_staging = nullptr;
+  REQUIRE(cudaMalloc(&send_staging, STAGING_SIZE) == cudaSuccess);
+
+  std::vector<cudf::table_view> all_views;
+  std::vector<std::unique_ptr<std::vector<uint8_t>>> all_metadatas;
+  size_t send_offset = 0;
+  size_t recv_offset = 0;
+
+  constexpr int NUM_BATCHES = 10;
+
+  for (int batch = 0; batch < NUM_BATCHES; batch++) {
+    // Create a table with STRING columns (similar to Q3 exchange data)
+    auto table = make_q3_exchange_table(800 + batch * 100);
+
+    // hash_partition and take partition 0
+    std::vector<cudf::size_type> key_cols = {0};
+    auto [partitioned, offsets] = cudf::hash_partition(
+        table->view(), key_cols, 2, cudf::hash_id::HASH_MURMUR3,
+        cudf::DEFAULT_HASH_SEED, stream);
+    auto start = offsets[0];
+    auto end = offsets[1];
+    if (end <= start) continue;
+    auto slice = cudf::slice(partitioned->view(), {start, end});
+
+    // Pack into SEND staging with chunked_pack
+    auto packer = cudf::chunked_pack::create(slice[0], STAGING_SIZE - send_offset, stream);
+    auto total = packer->get_total_contiguous_size();
+    REQUIRE(send_offset + total <= STAGING_SIZE);
+    cudf::device_span<uint8_t> send_dst(
+        static_cast<uint8_t*>(send_staging) + send_offset, STAGING_SIZE - send_offset);
+    while (packer->has_next()) { packer->next(send_dst); }
+    auto md = packer->build_metadata();
+
+    // Simulate nixl transfer: copy from SEND staging to RECV staging
+    // (just like cudaMemcpy D2D would do via RDMA)
+    REQUIRE(cudaMemcpy(
+        static_cast<uint8_t*>(recv_staging) + recv_offset,
+        static_cast<uint8_t*>(send_staging) + send_offset,
+        total, cudaMemcpyDeviceToDevice) == cudaSuccess);
+
+    // Unpack from RECV staging offset (this is what the receiver does)
+    auto unpacked = cudf::unpack(md->data(),
+        static_cast<const uint8_t*>(recv_staging) + recv_offset);
+
+    REQUIRE(unpacked.num_columns() == 8);
+    REQUIRE(unpacked.num_rows() == (end - start));
+
+    // VALIDATE STRING column offsets are sane (the Q3 bug check)
+    for (cudf::size_type c = 0; c < unpacked.num_columns(); c++) {
+      auto col = unpacked.column(c);
+      if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+        auto child = col.child(0); // offsets column
+        int32_t last_offset = 0;
+        if (child.size() > 0) {
+          REQUIRE(cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1,
+                            sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess);
+          INFO("batch " << batch << " col " << c << " STRING rows=" << col.size()
+               << " last_offset=" << last_offset);
+          // last_offset should be < 1MB for ~1000 rows of TPC-H strings
+          CHECK(last_offset > 0);
+          CHECK(last_offset < 1024 * 1024);
+        }
+      }
+    }
+
+    all_views.push_back(unpacked);
+    all_metadatas.push_back(std::move(md));
+
+    send_offset += (total + 255) & ~255UL;
+    recv_offset += (total + 255) & ~255UL;
+  }
+
+  INFO("stored " << all_views.size() << " views in RECV staging, offset=" << recv_offset);
+  REQUIRE(all_views.size() == NUM_BATCHES);
+
+  // Concatenate all views (this is what finalize_pending_views does)
+  cudaGetLastError();
+  auto result = cudf::concatenate(all_views, stream, &cuda_mr);
+  CHECK(result->num_columns() == 8);
+  CHECK(result->num_rows() > 0);
+  INFO("concatenated: " << result->num_rows() << " rows");
+
+  cudaFree(recv_staging);
+  cudaFree(send_staging);
+}
+
+TEST_CASE("nixl recv staging: unpack from misaligned offset", "[exchange][nixl]") {
+  // Test that cudf::unpack works when the packed buffer is at a non-power-of-2
+  // offset within a larger staging buffer. The RECV staging bump allocator uses
+  // 256-byte alignment, but cudaMalloc provides much higher alignment.
+  // If cudf::unpack metadata assumes higher alignment, STRING column offsets
+  // would be miscomputed.
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  constexpr size_t STAGING_SIZE = 64UL << 20;
+  void* staging = nullptr;
+  REQUIRE(cudaMalloc(&staging, STAGING_SIZE) == cudaSuccess);
+
+  // Create a table with STRING columns
+  auto table = make_q3_exchange_table(1000);
+  std::vector<cudf::size_type> key_cols = {0};
+  auto [partitioned, offsets] = cudf::hash_partition(
+      table->view(), key_cols, 2, cudf::hash_id::HASH_MURMUR3,
+      cudf::DEFAULT_HASH_SEED, stream);
+  auto start = offsets[0];
+  auto end = offsets[1];
+  REQUIRE(end > start);
+  auto slice = cudf::slice(partitioned->view(), {start, end});
+
+  // Pack into a separate buffer first to get the size and metadata
+  auto packer = cudf::chunked_pack::create(slice[0], STAGING_SIZE, stream);
+  auto total = packer->get_total_contiguous_size();
+
+  // Test different alignment offsets within the staging buffer
+  std::vector<size_t> test_offsets = {0, 256, 512, 1024, 4096, 65536, 170240};
+
+  for (auto test_offset : test_offsets) {
+    SECTION("offset " + std::to_string(test_offset)) {
+      REQUIRE(test_offset + total <= STAGING_SIZE);
+
+      // Pack into staging at this offset
+      auto packer2 = cudf::chunked_pack::create(slice[0], STAGING_SIZE - test_offset, stream);
+      cudf::device_span<uint8_t> dst(
+          static_cast<uint8_t*>(staging) + test_offset, STAGING_SIZE - test_offset);
+      while (packer2->has_next()) { packer2->next(dst); }
+      auto md = packer2->build_metadata();
+
+      // Unpack from this offset
+      auto unpacked = cudf::unpack(md->data(),
+          static_cast<const uint8_t*>(staging) + test_offset);
+      REQUIRE(unpacked.num_columns() == 8);
+      REQUIRE(unpacked.num_rows() == (end - start));
+
+      // Validate STRING column offsets
+      for (cudf::size_type c = 0; c < unpacked.num_columns(); c++) {
+        auto col = unpacked.column(c);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child = col.child(0);
+          int32_t last_offset = 0;
+          if (child.size() > 0) {
+            REQUIRE(cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1,
+                              sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess);
+            INFO("offset=" << test_offset << " col " << c
+                 << " STRING last_offset=" << last_offset << " rows=" << col.size());
+            CHECK(last_offset > 0);
+            CHECK(last_offset < 1024 * 1024);
+          }
+        }
+      }
+
+      // Concatenate should work
+      cudaGetLastError();
+      std::vector<cudf::table_view> views = {unpacked};
+      auto result = cudf::concatenate(views, stream, &cuda_mr);
+      CHECK(result->num_rows() == (end - start));
+    }
+  }
+
+  cudaFree(staging);
+}
+
+TEST_CASE("nixl recv staging: concurrent writes to adjacent regions", "[exchange][nixl]") {
+  // Test that writing to ADJACENT regions in the staging buffer doesn't corrupt
+  // existing data. Simulates concurrent nixl transfers writing to different offsets.
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  constexpr size_t STAGING_SIZE = 64UL << 20;
+  void* staging = nullptr;
+  REQUIRE(cudaMalloc(&staging, STAGING_SIZE) == cudaSuccess);
+
+  // Pack 5 tables into separate regions
+  struct PackedEntry {
+    size_t offset;
+    size_t size;
+    std::unique_ptr<std::vector<uint8_t>> metadata;
+    cudf::size_type expected_rows;
+  };
+  std::vector<PackedEntry> entries;
+  size_t offset = 0;
+
+  for (int i = 0; i < 5; i++) {
+    auto table = make_q3_exchange_table(500 + i * 200);
+    std::vector<cudf::size_type> key_cols = {0};
+    auto [partitioned, offsets] = cudf::hash_partition(
+        table->view(), key_cols, 2, cudf::hash_id::HASH_MURMUR3,
+        cudf::DEFAULT_HASH_SEED, stream);
+    auto start = offsets[0];
+    auto end = offsets[1];
+    if (end <= start) continue;
+    auto slice = cudf::slice(partitioned->view(), {start, end});
+
+    auto packer = cudf::chunked_pack::create(slice[0], STAGING_SIZE - offset, stream);
+    auto total = packer->get_total_contiguous_size();
+    cudf::device_span<uint8_t> dst(static_cast<uint8_t*>(staging) + offset, STAGING_SIZE - offset);
+    while (packer->has_next()) { packer->next(dst); }
+    auto md = packer->build_metadata();
+
+    entries.push_back({offset, total, std::move(md), end - start});
+    offset += (total + 255) & ~255UL;
+  }
+
+  // Now unpack ALL entries and validate STRING offsets
+  // This checks that packing entry N didn't corrupt entry N-1's data
+  std::vector<cudf::table_view> views;
+  for (auto& e : entries) {
+    auto unpacked = cudf::unpack(e.metadata->data(),
+        static_cast<const uint8_t*>(staging) + e.offset);
+    REQUIRE(unpacked.num_rows() == e.expected_rows);
+
+    // Validate STRING offsets
+    for (cudf::size_type c = 0; c < unpacked.num_columns(); c++) {
+      auto col = unpacked.column(c);
+      if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+        auto child = col.child(0);
+        int32_t last_offset = 0;
+        if (child.size() > 0) {
+          REQUIRE(cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1,
+                            sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess);
+          CHECK(last_offset > 0);
+          CHECK(last_offset < 1024 * 1024);
+        }
+      }
+    }
+    views.push_back(unpacked);
+  }
+
+  cudaGetLastError();
+  auto result = cudf::concatenate(views, stream, &cuda_mr);
+  CHECK(result->num_columns() == 8);
+  CHECK(result->num_rows() > 0);
+
+  cudaFree(staging);
+}
+
 TEST_CASE("pack_unpack with STRING columns", "[exchange]") {
   // Reproduces Q3/Q14 exchange table issue: tables with STRING columns
   // packed into staging → unpacked → deep copy fails, concatenate works.

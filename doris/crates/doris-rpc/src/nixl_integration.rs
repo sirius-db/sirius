@@ -1062,22 +1062,17 @@ pub async fn send_nixl_to_peer(
         "nixl transfer: flattened buffer pairs"
     );
 
-    // SENDER-SIDE integrity check: log first/last bytes of each src buffer.
+    // SENDER-SIDE integrity check: compute checksum of each src buffer.
     for (i, (addr, len)) in all_src_ptrs.iter().enumerate() {
-        if *len >= 32 {
-            if let (Ok(first), Ok(last)) = (
-                crate::cuda_driver::gpu_to_host(*addr, 16),
-                crate::cuda_driver::gpu_to_host(*addr + *len - 16, 16),
-            ) {
-                info!(
-                    buf_idx = i,
-                    src_addr = format_args!("0x{addr:x}"),
-                    src_len = len,
-                    first = format_args!("{:02x}{:02x}{:02x}{:02x}", first[0], first[1], first[2], first[3]),
-                    last = format_args!("{:02x}{:02x}{:02x}{:02x}", last[0], last[1], last[2], last[3]),
-                    "nixl transfer: SENDER data integrity check"
-                );
-            }
+        if let Ok(buf) = crate::cuda_driver::gpu_to_host(*addr, *len) {
+            let checksum: u64 = buf.iter().map(|&b| b as u64).sum();
+            info!(
+                buf_idx = i,
+                src_addr = format_args!("0x{addr:x}"),
+                src_len = len,
+                checksum,
+                "nixl transfer: SENDER buffer checksum"
+            );
         }
     }
 
@@ -1088,9 +1083,16 @@ pub async fn send_nixl_to_peer(
 
         tokio::task::spawn_blocking(move || {
             // Ensure the tokio worker thread has an active CUDA primary context.
-            // Without this, UCX internally calls cuDevicePrimaryCtxRetain which
-            // fails with "failed to get primary context id" → Fatal crash.
             crate::cuda_driver::ensure_cuda_context()?;
+
+            // Synchronize the CUDA device before the nixl transfer. The sender's
+            // cudf::chunked_pack writes to SEND staging using the cudf default stream.
+            // The nixl RDMA transfer reads from the same buffer using UCX's internal
+            // stream. Without this barrier, the transfer can read stale/partial data
+            // from SEND staging (the pack hasn't completed on the default stream yet).
+            unsafe { cudarc::driver::result::ctx::synchronize() }
+                .map_err(|e| format!("cuCtxSynchronize before nixl transfer: {e}"))?;
+
             let src_descs = agent.create_gpu_descs(&all_src_ptrs, device_id)?;
             let dst_descs = agent.create_gpu_descs(&all_dst_ptrs, device_id)?;
             agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, &remote)

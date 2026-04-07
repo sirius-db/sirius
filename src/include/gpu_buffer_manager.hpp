@@ -159,7 +159,18 @@ class GPUBufferManager {
   /// The caller must ensure the backing memory outlives the table entry.
   void registerExternalTable(const string& table_name,
                              const cudf::table_view& view,
-                             const vector<string>& column_names);
+                             const vector<string>& column_names,
+                             std::string metadata = {});
+
+  /// Register a packed cudf buffer. Stores metadata first (stable pointer),
+  /// then unpacks from the stored copy. This ensures cudf::unpack's table_view
+  /// references metadata that stays alive in pending_metadata.
+  void registerExternalTablePacked(const string& table_name,
+                                   uint8_t* gpu_data,
+                                   size_t gpu_size,
+                                   std::string metadata,
+                                   int& out_num_cols,
+                                   int& out_num_rows);
 
   /// Finalize all exchange tables that have pending views.
   /// Runs cudf::concatenate to materialize views into owned cudf::tables.

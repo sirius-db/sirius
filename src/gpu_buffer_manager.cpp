@@ -16,6 +16,7 @@
 
 #include "gpu_buffer_manager.hpp"
 #include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
 
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -534,7 +535,8 @@ void GPUBufferManager::createColumn(string up_table_name,
 void GPUBufferManager::registerExternalTable(
     const string& table_name,
     const cudf::table_view& view,
-    const vector<string>& column_names) {
+    const vector<string>& column_names,
+    std::string metadata) {
 
   auto num_cols = view.num_columns();
   auto num_rows = static_cast<size_t>(view.num_rows());
@@ -616,6 +618,9 @@ void GPUBufferManager::registerExternalTable(
   auto existing = tables.find(up_table_name);
   if (existing != tables.end()) {
     // Accumulate the view for later concatenation.
+    // Keep the metadata alive — cudf::unpack table_views may reference the metadata
+    // buffer internally for STRING child column pointers.
+    existing->second->pending_metadata.push_back(std::move(metadata));
     existing->second->pending_views.push_back(view);
     auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
     existing->second->pending_total_rows = total_rows;
@@ -632,6 +637,7 @@ void GPUBufferManager::registerExternalTable(
   // packed_cudf_table is set to nullptr — duckdb_scan_task will
   // use the finalized table after finalize_pending_views().
   rel->packed_cudf_table = nullptr;
+  rel->pending_metadata.push_back(std::move(metadata));
   rel->pending_views.push_back(view);
   rel->pending_total_rows = num_rows;
   tables[up_table_name] = rel;
@@ -663,6 +669,117 @@ void GPUBufferManager::finalizeExchangeTable(const string& table_name) {
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("[finalizeExchangeTable] failed for '{}': {}", up, e.what());
   }
+}
+
+void GPUBufferManager::registerExternalTablePacked(
+    const string& table_name,
+    uint8_t* gpu_data,
+    size_t gpu_size,
+    std::string metadata,
+    int& out_num_cols,
+    int& out_num_rows) {
+
+  string up_table_name = table_name;
+  transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+
+  // Store metadata FIRST so it has a stable address.
+  auto existing = tables.find(up_table_name);
+  if (existing != tables.end()) {
+    existing->second->pending_metadata.push_back(std::move(metadata));
+    // Unpack from the STORED metadata (stable pointer).
+    auto& stored_md = existing->second->pending_metadata.back();
+    auto* md_ptr = reinterpret_cast<const uint8_t*>(stored_md.data());
+    cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
+    existing->second->pending_views.push_back(view);
+    auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
+    existing->second->pending_total_rows = total_rows;
+    for (auto& col : existing->second->columns) {
+      if (col) col->column_length = total_rows;
+    }
+    out_num_cols = view.num_columns();
+    out_num_rows = static_cast<int>(total_rows);
+    SIRIUS_LOG_INFO("[registerExternalTablePacked] appended '{}': {} rows, {} total ({} views)",
+                    up_table_name, view.num_rows(), total_rows,
+                    existing->second->pending_views.size());
+    return;
+  }
+
+  // First registration: create the relation, store metadata, then unpack.
+  auto num_cols_est = 0; // Will be set after unpack.
+  auto rel = make_shared_ptr<GPUIntermediateRelation>(0);
+  rel->names = up_table_name;
+  rel->packed_cudf_table = nullptr;
+  rel->pending_metadata.push_back(std::move(metadata));
+
+  // Unpack from the STORED metadata (stable pointer).
+  auto& stored_md = rel->pending_metadata.back();
+  auto* md_ptr = reinterpret_cast<const uint8_t*>(stored_md.data());
+  cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
+
+  auto num_cols = view.num_columns();
+  auto num_rows = static_cast<size_t>(view.num_rows());
+
+  // Populate columns (same as registerExternalTable).
+  rel->column_count = static_cast<size_t>(num_cols);
+  rel->column_names.resize(num_cols);
+  rel->columns.resize(num_cols);
+  for (cudf::size_type c = 0; c < num_cols; c++) {
+    auto col = view.column(c);
+    auto col_name = "col_" + std::to_string(c);
+    transform(col_name.begin(), col_name.end(), col_name.begin(), ::toupper);
+    rel->column_names[c] = col_name;
+
+    GPUColumnType gpu_type;
+    switch (col.type().id()) {
+      case cudf::type_id::INT8:
+      case cudf::type_id::INT16:   gpu_type = GPUColumnType(GPUColumnTypeId::INT16); break;
+      case cudf::type_id::INT32:   gpu_type = GPUColumnType(GPUColumnTypeId::INT32); break;
+      case cudf::type_id::INT64:   gpu_type = GPUColumnType(GPUColumnTypeId::INT64); break;
+      case cudf::type_id::FLOAT32: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT32); break;
+      case cudf::type_id::FLOAT64: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT64); break;
+      case cudf::type_id::BOOL8:   gpu_type = GPUColumnType(GPUColumnTypeId::BOOLEAN); break;
+      case cudf::type_id::STRING:  gpu_type = GPUColumnType(GPUColumnTypeId::VARCHAR); break;
+      case cudf::type_id::TIMESTAMP_DAYS: gpu_type = GPUColumnType(GPUColumnTypeId::DATE); break;
+      case cudf::type_id::TIMESTAMP_SECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC); break;
+      case cudf::type_id::TIMESTAMP_MILLISECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS); break;
+      case cudf::type_id::TIMESTAMP_MICROSECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_US); break;
+      case cudf::type_id::TIMESTAMP_NANOSECONDS: gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS); break;
+      case cudf::type_id::DECIMAL32:
+      case cudf::type_id::DECIMAL64:
+      case cudf::type_id::DECIMAL128: {
+        gpu_type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        uint8_t width = (col.type().id() == cudf::type_id::DECIMAL32) ? 9 :
+                        (col.type().id() == cudf::type_id::DECIMAL64) ? 18 : 38;
+        gpu_type.SetDecimalTypeInfo(width, static_cast<uint8_t>(-col.type().scale()));
+        break;
+      }
+      default:
+        continue;
+    }
+    auto* data_ptr = const_cast<uint8_t*>(col.data<uint8_t>());
+    auto* validity_ptr = const_cast<cudf::bitmask_type*>(col.null_mask());
+    if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+      auto offsets_col = col.child(0);
+      auto* offsets_ptr = const_cast<uint64_t*>(
+        reinterpret_cast<const uint64_t*>(offsets_col.data<int32_t>()));
+      size_t num_bytes = 0;
+      auto gpu_col = make_shared_ptr<GPUColumn>(
+        num_rows, gpu_type, data_ptr, offsets_ptr, num_bytes, true, validity_ptr);
+      rel->columns[c] = gpu_col;
+    } else {
+      auto gpu_col = make_shared_ptr<GPUColumn>(
+        num_rows, gpu_type, data_ptr, validity_ptr);
+      rel->columns[c] = gpu_col;
+    }
+  }
+
+  rel->pending_views.push_back(view);
+  rel->pending_total_rows = num_rows;
+  tables[up_table_name] = rel;
+  out_num_cols = num_cols;
+  out_num_rows = static_cast<int>(num_rows);
+  SIRIUS_LOG_INFO("[registerExternalTablePacked] registered '{}': {} cols, {} rows",
+                  up_table_name, num_cols, num_rows);
 }
 
 }  // namespace duckdb

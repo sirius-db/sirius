@@ -1619,38 +1619,33 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
       auto gpu_addr = static_cast<uintptr_t>(input.inputs[1].GetValue<int64_t>());
       auto gpu_size = static_cast<size_t>(input.inputs[2].GetValue<int64_t>());
       auto md_blob = input.inputs[3].GetValueUnsafe<string>();
-      auto* md_ptr = reinterpret_cast<const uint8_t*>(md_blob.data());
       auto* gpu_ptr = reinterpret_cast<uint8_t*>(gpu_addr);
 
       SIRIUS_LOG_INFO("[register_packed_table] table={} gpu=0x{:x} size={} md_size={}",
                       table_name, gpu_addr, gpu_size, md_blob.size());
 
-      // cudf::unpack: reconstruct table_view pointing into the contiguous GPU buffer.
-      cudf::table_view view = cudf::unpack(md_ptr, gpu_ptr);
-      auto num_cols = view.num_columns();
-      auto num_rows = view.num_rows();
-
-      SIRIUS_LOG_INFO("[register_packed_table] unpacked: {} cols, {} rows", num_cols, num_rows);
-
-      // Log column data pointers for debugging address validity.
-      for (cudf::size_type c = 0; c < num_cols && c < 3; c++) {
-        auto col = view.column(c);
-        auto data_addr = reinterpret_cast<uintptr_t>(col.data<uint8_t>());
-        SIRIUS_LOG_INFO("[register_packed_table] col {} type={} data=0x{:x} size={} null_count={}",
-                        c, static_cast<int>(col.type().id()), data_addr,
-                        col.size(), col.null_count());
-      }
-
-      // Register the unpacked table_view directly in GPUBufferManager::tables.
-      // Column pointers reference the packed buffer (zero-copy).
-      // GPU scan operators will read directly from these pointers.
+      // Register via GPUBufferManager. The metadata is stored first (stable pointer),
+      // then cudf::unpack runs from the stored copy. This ensures the table_view's
+      // internal references to the metadata buffer remain valid.
+      int num_cols = 0, num_rows_out = 0;
       if (buffer_is_initialized) {
         auto& mgr = GPUBufferManager::GetInstance();
-        vector<string> col_names;
-        for (int c = 0; c < num_cols; c++) {
-          col_names.push_back("col_" + std::to_string(c));
+        mgr.registerExternalTablePacked(table_name, gpu_ptr, gpu_size, std::move(md_blob),
+                                        num_cols, num_rows_out);
+      }
+
+      // Re-unpack locally for column type inspection (CREATE TABLE SQL).
+      // Use the original md_blob — wait, it was moved. Use stored copy from manager.
+      cudf::table_view view;
+      if (buffer_is_initialized) {
+        auto& mgr = GPUBufferManager::GetInstance();
+        string up = table_name;
+        transform(up.begin(), up.end(), up.begin(), ::toupper);
+        auto it = mgr.tables.find(up);
+        if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
+          view = it->second->pending_views.back();
+          num_cols = view.num_columns();
         }
-        mgr.registerExternalTable(table_name, view, col_names);
       }
 
       // Build CREATE TABLE SQL for the Rust caller to execute.
@@ -1687,7 +1682,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
         col_defs += "\"col_" + std::to_string(c) + "\" " + dtype;
       }
       result->create_table_sql = "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
-      result->num_rows = static_cast<int64_t>(num_rows);
+      result->num_rows = static_cast<int64_t>(num_rows_out);
 
       return std::move(result);
     };

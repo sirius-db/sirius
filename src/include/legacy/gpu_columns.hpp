@@ -266,7 +266,12 @@ class GPUIntermediateRelation {
   /// Each view points into a packed/staging buffer that stays alive until
   /// release_gpu_buffers(). Call finalize_pending_views() to concatenate
   /// them into a single cudf::table for duckdb_scan_task.
+  ///
+  /// IMPORTANT: cudf::unpack creates table_views that may reference the host
+  /// metadata buffer internally (for STRING child column pointers). We must
+  /// keep the metadata alive alongside the views.
   std::vector<cudf::table_view> pending_views;
+  std::vector<std::string> pending_metadata; // Keeps metadata buffers alive
   size_t pending_total_rows = 0;
 
   /// Concatenate all pending views into a single owned cudf::table.
@@ -349,6 +354,7 @@ class GPUIntermediateRelation {
     auto merged = cudf::concatenate(pending_views, cudf::get_default_stream(), &cuda_mr);
     packed_cudf_table = merged.release();
     pending_views.clear();
+    pending_metadata.clear(); // Metadata no longer needed after concatenation.
     if (packed_cudf_table) {
       pending_total_rows = static_cast<size_t>(packed_cudf_table->num_rows());
     }
