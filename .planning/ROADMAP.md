@@ -31,8 +31,8 @@ Decimal phases appear between their surrounding integers in numeric order.
   5. A debug function that encounters an internal exception logs the error and returns without propagating the exception to the caller
 **Plans:** 2 plans
 Plans:
-- [ ] 01-01-PLAN.md — Create debug_utils header, implementation with all infrastructure invariants, and CMake integration
-- [ ] 01-02-PLAN.md — Comprehensive Catch2 unit tests for debug_schema, debug_nulls, and copy_null_mask_to_host
+- [x] 01-01-PLAN.md — Create debug_utils header, implementation with all infrastructure invariants, and CMake integration
+- [x] 01-02-PLAN.md — Comprehensive Catch2 unit tests for debug_schema, debug_nulls, and copy_null_mask_to_host
 
 ### Phase 2: Numeric Row Preview and Column Statistics
 **Goal**: Developers can call `debug_head(batch, N, stream)` and see the first N rows in aligned-column and CSV format for all numeric types, and call `debug_stats(batch, stream)` to see GPU-computed min, max, and sum per numeric column — all output routed through `[SIRIUS_DIAG]`
