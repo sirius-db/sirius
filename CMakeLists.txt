@@ -275,6 +275,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
+    test/cpp/debug/test_debug_utils.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
