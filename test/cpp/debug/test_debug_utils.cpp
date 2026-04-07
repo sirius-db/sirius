@@ -14,14 +14,11 @@
  * limitations under the License.
  */
 
-#include "debug_utils.hpp"
-
 #include "data/data_batch_utils.hpp"
+#include "debug_utils.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "operator/operator_type_traits.hpp"
 #include "utils/data_utils.hpp"
-
-#include <catch.hpp>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
@@ -30,18 +27,19 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <vector>
 
-using namespace sirius::test::operator_utils;
+namespace test_utils = sirius::test::operator_utils;
 
 // ---------------------------------------------------------------------------
 // Test case 1: debug_schema produces output without throwing
@@ -49,20 +47,22 @@ using namespace sirius::test::operator_utils;
 
 TEST_CASE("debug_schema produces output without throwing", "[debug_utils]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
+  auto mr     = test_utils::get_resource_ref(*space);
 
   // Create INT32 column (5 rows)
   std::vector<int32_t> vals_a{10, 20, 30, 40, 50};
-  auto col_a = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(vals_a, stream, mr);
+  auto col_a =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(vals_a, stream, mr);
 
   // Create INT64 column (5 rows)
   std::vector<int64_t> vals_b{100, 200, 300, 400, 500};
-  auto col_b = sirius::test::vector_to_cudf_column<gpu_type_traits<int64_t>>(vals_b, stream, mr);
+  auto col_b =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(vals_b, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col_a));
@@ -81,18 +81,20 @@ TEST_CASE("debug_schema produces output without throwing", "[debug_utils]")
 
 TEST_CASE("debug_schema with no column names uses defaults", "[debug_utils]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
+  auto mr     = test_utils::get_resource_ref(*space);
 
   std::vector<int32_t> vals_a{1, 2, 3, 4, 5};
-  auto col_a = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(vals_a, stream, mr);
+  auto col_a =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(vals_a, stream, mr);
 
   std::vector<int64_t> vals_b{10, 20, 30, 40, 50};
-  auto col_b = sirius::test::vector_to_cudf_column<gpu_type_traits<int64_t>>(vals_b, stream, mr);
+  auto col_b =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(vals_b, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col_a));
@@ -112,18 +114,20 @@ TEST_CASE("debug_schema with no column names uses defaults", "[debug_utils]")
 
 TEST_CASE("debug_nulls produces output without throwing", "[debug_utils]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
+  auto mr     = test_utils::get_resource_ref(*space);
 
   std::vector<int32_t> vals_a{10, 20, 30, 40, 50};
-  auto col_a = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(vals_a, stream, mr);
+  auto col_a =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(vals_a, stream, mr);
 
   std::vector<int64_t> vals_b{100, 200, 300, 400, 500};
-  auto col_b = sirius::test::vector_to_cudf_column<gpu_type_traits<int64_t>>(vals_b, stream, mr);
+  auto col_b =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(vals_b, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col_a));
@@ -142,12 +146,12 @@ TEST_CASE("debug_nulls produces output without throwing", "[debug_utils]")
 
 TEST_CASE("debug_schema handles empty batch (0 rows)", "[debug_utils]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
+  auto mr     = test_utils::get_resource_ref(*space);
 
   // Create two columns with 0 rows
   auto col_a = cudf::make_numeric_column(
@@ -172,12 +176,12 @@ TEST_CASE("debug_schema handles empty batch (0 rows)", "[debug_utils]")
 
 TEST_CASE("debug_nulls reports correct null counts for columns with nulls", "[debug_utils]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
+  auto mr     = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 5;
 
@@ -187,7 +191,8 @@ TEST_CASE("debug_nulls reports correct null counts for columns with nulls", "[de
 
   // Write some data to the column
   std::vector<int32_t> host_data{10, 20, 30, 40, 50};
-  cudaMemcpyAsync(col->mutable_view().data<int32_t>(),
+  auto mv = col->mutable_view();
+  cudaMemcpyAsync(mv.data<int32_t>(),
                   host_data.data(),
                   sizeof(int32_t) * num_rows,
                   cudaMemcpyHostToDevice,
@@ -202,7 +207,8 @@ TEST_CASE("debug_nulls reports correct null counts for columns with nulls", "[de
   host_mask[0] = 0b00010101;  // bits 0,2,4 set; bits 1,3 clear
 
   rmm::device_buffer dev_mask(mask_size, stream, mr);
-  cudaMemcpyAsync(dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.value());
+  cudaMemcpyAsync(
+    dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.value());
   stream.synchronize();
 
   col->set_null_mask(std::move(dev_mask), 2);  // null_count = 2
@@ -224,12 +230,12 @@ TEST_CASE("debug_nulls reports correct null counts for columns with nulls", "[de
 
 TEST_CASE("copy_null_mask_to_host returns correct null positions", "[debug_utils]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
+  auto mr     = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 8;
 
@@ -239,7 +245,8 @@ TEST_CASE("copy_null_mask_to_host returns correct null positions", "[debug_utils
 
   // Write data
   std::vector<int32_t> host_data{1, 2, 3, 4, 5, 6, 7, 8};
-  cudaMemcpyAsync(col->mutable_view().data<int32_t>(),
+  auto mv = col->mutable_view();
+  cudaMemcpyAsync(mv.data<int32_t>(),
                   host_data.data(),
                   sizeof(int32_t) * num_rows,
                   cudaMemcpyHostToDevice,
@@ -252,7 +259,8 @@ TEST_CASE("copy_null_mask_to_host returns correct null positions", "[debug_utils
   host_mask[0] = 0x55;  // 0b01010101: bits 0,2,4,6 set (valid), bits 1,3,5,7 clear (null)
 
   rmm::device_buffer dev_mask(mask_size, stream, mr);
-  cudaMemcpyAsync(dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.value());
+  cudaMemcpyAsync(
+    dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.value());
   stream.synchronize();
 
   col->set_null_mask(std::move(dev_mask), 4);  // null_count = 4
@@ -277,19 +285,20 @@ TEST_CASE("copy_null_mask_to_host returns correct null positions", "[debug_utils
 
 TEST_CASE("copy_null_mask_to_host returns has_nulls=false for non-null column", "[debug_utils]")
 {
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
+  auto mr     = test_utils::get_resource_ref(*space);
 
   // Create a column with no nulls (UNALLOCATED mask)
   auto col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 5, cudf::mask_state::UNALLOCATED, stream, mr);
 
   std::vector<int32_t> host_data{1, 2, 3, 4, 5};
-  cudaMemcpyAsync(col->mutable_view().data<int32_t>(),
+  auto mv = col->mutable_view();
+  cudaMemcpyAsync(mv.data<int32_t>(),
                   host_data.data(),
                   sizeof(int32_t) * 5,
                   cudaMemcpyHostToDevice,
