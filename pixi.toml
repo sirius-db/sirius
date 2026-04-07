@@ -55,6 +55,16 @@ cuda-version = "12.*"
 # GPU architectures: Turing through Hopper (75, 80, 86, 90a)
 CUDAARCHS = "75-real;80-real;86-real;90a-real"
 
+[feature.duckdb-python.dependencies]
+pip = "*"
+python = ">=3.12"
+pybind11 = ">=2.6.0"
+scikit-build-core = ">=0.11.4"
+setuptools-scm = ">=8.0"
+
+[feature.duckdb-python.tasks]
+build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
+
 # Lightweight env for running nightly cudf builds (no build deps needed)
 [feature.nightly-runner.dependencies]
 pixi = "*"
@@ -66,4 +76,5 @@ nightly-run = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME p
 [environments]
 default = ["cuda13"]
 cuda12 = ["cuda12"]
+duckdb-python = ["duckdb-python"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }

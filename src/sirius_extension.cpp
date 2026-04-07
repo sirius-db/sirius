@@ -30,6 +30,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
@@ -44,6 +45,7 @@ extern "C" int cudaProfilerStop();
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
+#include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -90,6 +92,11 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -177,6 +184,11 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -1013,12 +1025,20 @@ static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
 
-  auto& db     = loader.GetDatabaseInstance();
-  auto& config = DBConfig::GetConfig(db);
-  config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
+  auto& db           = loader.GetDatabaseInstance();
+  auto& config       = DBConfig::GetConfig(db);
+  auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr = callback.get();
+  config.GetCallbackManager().Register(std::move(callback));
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register SiriusContext on connections that were opened before the extension
+  // was loaded (e.g. when loaded via LOAD in Python or the CLI).
+  for (auto& ctx : ConnectionManager::Get(db).GetConnectionList()) {
+    callback_ptr->OnConnectionOpened(*ctx);
+  }
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }

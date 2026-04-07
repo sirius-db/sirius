@@ -267,7 +267,7 @@ TEST_CASE("host_parquet_representation construction", "[host_parquet_representat
 
   SECTION("has correct uncompressed size")
   {
-    REQUIRE(repr->get_uncompressed_size_in_bytes() == fixture.uncompressed_size_in_bytes);
+    REQUIRE(repr->get_uncompressed_data_size_in_bytes() == fixture.uncompressed_size_in_bytes);
   }
 
   SECTION("has row group indices")
@@ -329,7 +329,8 @@ TEST_CASE("host_parquet_representation clone creates independent copy",
 
   SECTION("cloned representation has same uncompressed size")
   {
-    REQUIRE(cloned->get_uncompressed_size_in_bytes() == repr->get_uncompressed_size_in_bytes());
+    REQUIRE(cloned->get_uncompressed_data_size_in_bytes() ==
+            repr->get_uncompressed_data_size_in_bytes());
   }
 
   SECTION("cloned representation has same row group indices")
