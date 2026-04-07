@@ -24,6 +24,7 @@
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // cudf
@@ -120,8 +121,16 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
       "Target HOST memory_space does not have a fixed_size_host_memory_resource");
   }
 
+  // Reserve memory before allocating to ensure proper memory tracking
+  auto reservation = const_cast<cucascade::memory::memory_space*>(target_memory_space)
+                       ->make_reservation_or_null(data_size);
+  if (!reservation) {
+    throw std::runtime_error(
+      "Cannot corss-NUMA copy host_parquet_representation: failed to reserve host memory");
+  }
+
   auto const& src_allocation  = host_src.get_column_chunks();
-  auto dst_allocation         = mr->allocate_multiple_blocks(data_size);
+  auto dst_allocation         = mr->allocate_multiple_blocks(data_size, reservation.get());
   size_t src_block_index      = 0;
   size_t src_block_offset     = 0;
   size_t dst_block_index      = 0;
@@ -158,8 +167,8 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     std::move(dst_allocation),
     std::move(cloned_reader),
     host_src.get_reader_options(),
-    std::move(host_src.get_row_group_indices()),
-    std::move(host_src.get_column_chunk_byte_ranges()),
+    host_src.get_row_group_indices(),
+    host_src.get_column_chunk_byte_ranges(),
     data_size,
     host_src.get_uncompressed_data_size_in_bytes(),
     host_src.get_file_size(),

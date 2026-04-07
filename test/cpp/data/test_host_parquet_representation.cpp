@@ -380,6 +380,63 @@ TEST_CASE("host_parquet_representation clone creates independent copy",
   }
 }
 
+TEST_CASE("host_parquet_representation clone uses reservation",
+          "[host_parquet_representation][clone][reservation]")
+{
+  sirius_memory_reservation_manager mgr(create_test_configs());
+  auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
+  REQUIRE(host_space != nullptr);
+
+  parquet_test_fixture fixture;
+  fixture.setup(500, "clone_reservation");
+
+  auto repr = fixture.build_representation(host_space);
+  REQUIRE(repr != nullptr);
+
+  // Record reservation state before clone
+  auto reserved_before = host_space->get_total_reserved_memory();
+  auto count_before    = host_space->get_active_reservation_count();
+
+  // Clone creates and releases a reservation internally
+  auto cloned_base = repr->clone(rmm::cuda_stream_default);
+  REQUIRE(cloned_base != nullptr);
+
+  // After clone completes, the internal reservation should be released
+  auto reserved_after = host_space->get_total_reserved_memory();
+  auto count_after    = host_space->get_active_reservation_count();
+  REQUIRE(count_after == count_before);
+  REQUIRE(reserved_after == reserved_before);
+}
+
+TEST_CASE("host_parquet_representation clone fails when reservation unavailable",
+          "[host_parquet_representation][clone][reservation]")
+{
+  // Create a memory manager with very limited host capacity
+  reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2048ull * 1024 * 1024)
+    .set_gpu_memory_resource_factory(
+      [](int, size_t) { return std::make_unique<rmm::mr::cuda_memory_resource>(); })
+    .use_host_per_gpu()
+    .set_per_host_capacity(1ull * 1024 * 1024);  // Only 1 MB
+  sirius_memory_reservation_manager mgr(builder.build());
+  auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
+  REQUIRE(host_space != nullptr);
+
+  parquet_test_fixture fixture;
+  fixture.setup(500, "clone_fail");
+
+  auto repr = fixture.build_representation(host_space);
+  REQUIRE(repr != nullptr);
+
+  // Exhaust remaining capacity by reserving nearly all available memory
+  auto available      = host_space->get_available_memory();
+  auto blocker        = host_space->make_reservation_or_null(available);
+
+  // Clone should throw because reservation cannot be satisfied
+  REQUIRE_THROWS_AS(repr->clone(rmm::cuda_stream_default), std::runtime_error);
+}
+
 TEST_CASE("host_parquet_representation clone with small data",
           "[host_parquet_representation][clone]")
 {
@@ -673,6 +730,54 @@ TEST_CASE("host_parquet_representation clone then convert to GPU",
 //===----------------------------------------------------------------------===//
 // host_parquet_representation Cross-Host Copy Converter Tests
 //===----------------------------------------------------------------------===//
+
+TEST_CASE("host_parquet_representation cross-host copy uses reservation",
+          "[host_parquet_representation][converters][cross_host][reservation]")
+{
+  reservation_manager_configurator builder;
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(2048ull * 1024 * 1024)
+    .set_gpu_memory_resource_factory(
+      [](int, size_t) { return std::make_unique<rmm::mr::cuda_memory_resource>(); })
+    .use_host_per_gpu()
+    .set_per_host_capacity(4096ull * 1024 * 1024);
+
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+    SUCCEED("Fewer than 2 GPUs available; skipping cross-host reservation test");
+    return;
+  }
+
+  sirius_memory_reservation_manager mgr(builder.build());
+  cucascade::representation_converter_registry registry;
+  cucascade::register_builtin_converters(registry);
+  register_parquet_converters(registry);
+
+  auto* host_space_0 = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
+  auto* host_space_1 = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 1));
+  REQUIRE(host_space_0 != nullptr);
+  REQUIRE(host_space_1 != nullptr);
+
+  parquet_test_fixture fixture;
+  fixture.setup(200, "cross_host_reservation");
+
+  auto repr = fixture.build_representation(host_space_0);
+  REQUIRE(repr != nullptr);
+
+  // Record reservation state on target space before conversion
+  auto reserved_before = host_space_1->get_total_reserved_memory();
+  auto count_before    = host_space_1->get_active_reservation_count();
+
+  rmm::cuda_stream stream;
+  auto result = registry.convert<host_parquet_representation>(*repr, host_space_1, stream);
+  REQUIRE(result != nullptr);
+
+  // The converter's internal reservation should be released after conversion
+  auto reserved_after = host_space_1->get_total_reserved_memory();
+  auto count_after    = host_space_1->get_active_reservation_count();
+  REQUIRE(count_after == count_before);
+  REQUIRE(reserved_after == reserved_before);
+}
 
 TEST_CASE("host_parquet_representation cross-host copy converter",
           "[host_parquet_representation][converters][cross_host]")

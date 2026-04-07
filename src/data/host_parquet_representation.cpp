@@ -17,6 +17,9 @@
 // sirius
 #include <data/host_parquet_representation.hpp>
 
+// cucascade
+#include <cucascade/memory/memory_reservation.hpp>
+
 namespace sirius {
 
 std::unique_ptr<cucascade::idata_representation> host_parquet_representation::clone(
@@ -28,8 +31,15 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
     throw std::runtime_error("Cannot clone host_parquet_representation: no host memory resource");
   }
 
-  // Allocate new blocks for the copy
-  auto allocation_copy = host_mr->allocate_multiple_blocks(_size_in_bytes);
+  // Reserve memory before allocating to ensure proper memory tracking
+  auto reservation = get_memory_space().make_reservation_or_null(_size_in_bytes);
+  if (!reservation) {
+    throw std::runtime_error(
+      "Cannot clone host_parquet_representation: failed to reserve host memory");
+  }
+
+  // Allocate new blocks for the copy, tracked against the reservation
+  auto allocation_copy = host_mr->allocate_multiple_blocks(_size_in_bytes, reservation.get());
 
   // Copy data block by block
   const auto& src_blocks = _column_chunks->get_blocks();
