@@ -43,7 +43,10 @@ Plans:
   2. `debug_head(batch, 5, stream, format=csv)` prints the same five rows in CSV format
   3. `debug_stats(batch, stream)` prints per-column min, max, and sum for numeric columns; non-numeric columns appear as `(non-numeric, skipped)` in the output
   4. `debug_stats` uses `cudf::reduce` — no full column is copied to host for statistics computation
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 02-01-PLAN.md — Implement debug_head and debug_stats functions in debug_utils module
+- [ ] 02-02-PLAN.md — Comprehensive Catch2 unit tests for debug_head and debug_stats
 
 ### Phase 3: Full Type Coverage and Checksums
 **Goal**: `debug_head` handles all Sirius-supported data types including STRING, DECIMAL (with correct scale), TIMESTAMP, and DATE (as human-readable calendar format), and `debug_checksum` produces a stable per-column xxhash_64 fingerprint that can be compared across two log files to detect data divergence
@@ -75,7 +78,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Infrastructure and Metadata Inspection | 0/2 | Planning complete | - |
-| 2. Numeric Row Preview and Column Statistics | 0/TBD | Not started | - |
+| 1. Infrastructure and Metadata Inspection | 2/2 | Complete | 2026-04-07 |
+| 2. Numeric Row Preview and Column Statistics | 0/2 | Planning complete | - |
 | 3. Full Type Coverage and Checksums | 0/TBD | Not started | - |
 | 4. Diff, Sampling, and Skill Integration | 0/TBD | Not started | - |
