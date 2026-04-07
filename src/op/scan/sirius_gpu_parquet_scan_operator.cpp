@@ -14,38 +14,44 @@
  * limitations under the License.
  */
 
-#include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
+// sirius
+#include <data/data_batch_utils.hpp>
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <log/logging.hpp>
+#include <op/scan/parquet_scan_operator_data.hpp>
+#include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 
-#include "log/logging.hpp"
-#include "op/scan/parquet_scan_operator_data.hpp"
-
+// cudf
 #include <cudf/io/datasource.hpp>
-#include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 
+// cucascade
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
+// standard library
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace sirius::op::scan {
 
-// ---------------------------------------------------------------------------
+//===----------------------------------------------------------------------===//
 // Constructor
-// ---------------------------------------------------------------------------
+//===----------------------------------------------------------------------===//
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::idx_t estimated_cardinality,
-  size_t batch_data_size)
+  cucascade::memory::memory_space& gpu_memory_space)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
-    _batch_data_size(batch_data_size)
+    _gpu_memory_space(gpu_memory_space)
 {
 }
 
-// ---------------------------------------------------------------------------
+//===----------------------------------------------------------------------===//
 // Sink interface (pipeline 1)
-// ---------------------------------------------------------------------------
+//===----------------------------------------------------------------------===//
 void sirius_gpu_parquet_scan_operator::sink(const operator_data& input_data,
                                             rmm::cuda_stream_view /*stream*/)
 {
@@ -68,76 +74,37 @@ void sirius_gpu_parquet_scan_operator::sink(const operator_data& input_data,
     metadata->row_group_partitions.size());
 }
 
-// ---------------------------------------------------------------------------
-// Pipeline 1 completion signal
-// ---------------------------------------------------------------------------
-void sirius_gpu_parquet_scan_operator::mark_pipeline1_finished()
+//===----------------------------------------------------------------------===//
+// Pipeline 1 → Pipeline 2 transition
+//===----------------------------------------------------------------------===//
+void sirius_gpu_parquet_scan_operator::finalize_metadata()
 {
-  _pipeline1_finished.store(true, std::memory_order_release);
-}
-
-// ---------------------------------------------------------------------------
-// Partition list construction
-//
-// Uses double-checked locking with std::atomic<bool> (_partitions_built) and
-// acquire/release semantics to ensure that:
-//   1. _pre_built_batches is fully written before _partitions_built is set to true.
-//   2. Any thread that observes _partitions_built == true (via acquire load) sees
-//      the complete _pre_built_batches vector.
-//   3. The partition list is only built after pipeline 1 has finished (all sink()
-//      calls completed), preventing premature freezing on a partial metadata set.
-// ---------------------------------------------------------------------------
-void sirius_gpu_parquet_scan_operator::build_partition_list()
-{
-  // Do not build until pipeline 1 signals it is done.
-  if (!_pipeline1_finished.load(std::memory_order_acquire)) { return; }
-  // Fast path: already built.
-  if (_partitions_built.load(std::memory_order_acquire)) { return; }
-
   std::lock_guard<std::mutex> lock(_metadata_mutex);
-  // Re-check under lock (double-checked locking).
-  if (_partitions_built.load(std::memory_order_relaxed)) { return; }
 
-  _pre_built_batches.clear();
-
+  _partition_index.clear();
   for (auto const& meta : _accumulated_metadata) {
-    size_t batch_uncompressed = 0;
-    std::vector<row_group_range> batch_ranges;
-
-    for (auto const& rg : meta.row_group_partitions) {
-      // Start a new batch when adding this range would exceed the target size
-      // (but always include at least one range per batch so we make progress).
-      if (!batch_ranges.empty() &&
-          batch_uncompressed + rg.reserved_uncompressed_bytes > _batch_data_size) {
-        _pre_built_batches.push_back(pre_built_batch{&meta, std::move(batch_ranges)});
-        batch_ranges.clear();
-        batch_uncompressed = 0;
-      }
-      batch_ranges.push_back(rg);
-      batch_uncompressed += rg.reserved_uncompressed_bytes;
-    }
-    if (!batch_ranges.empty()) {
-      _pre_built_batches.push_back(pre_built_batch{&meta, std::move(batch_ranges)});
+    for (std::size_t i = 0; i < meta.row_group_partitions.size(); ++i) {
+      _partition_index.push_back(partition_entry{&meta, i});
     }
   }
 
-  // Release store: all writes to _pre_built_batches happen-before this store.
-  _partitions_built.store(true, std::memory_order_release);
+  // Release store: all writes to _partition_index happen-before this store.
+  _finalized.store(true, std::memory_order_release);
 
   SIRIUS_LOG_DEBUG(
-    "[sirius_gpu_parquet_scan_operator] Built {} pre-built scan batches from {} metadata objects",
-    _pre_built_batches.size(),
+    "[sirius_gpu_parquet_scan_operator] Finalized {} partitions from {} metadata objects",
+    _partition_index.size(),
     _accumulated_metadata.size());
 }
 
-// ---------------------------------------------------------------------------
+//===----------------------------------------------------------------------===//
 // Source interface (pipeline 2)
-// ---------------------------------------------------------------------------
-size_t sirius_gpu_parquet_scan_operator::get_total_partitions() const
+//===----------------------------------------------------------------------===//
+std::size_t sirius_gpu_parquet_scan_operator::get_total_partitions() const
 {
-  if (_partitions_built.load(std::memory_order_acquire)) { return _pre_built_batches.size(); }
+  if (_finalized.load(std::memory_order_acquire)) { return _partition_index.size(); }
   std::lock_guard<std::mutex> lock(_metadata_mutex);
-  size_t total = 0;
+  std::size_t total = 0;
   for (auto const& meta : _accumulated_metadata) {
     total += meta.row_group_partitions.size();
   }
@@ -146,9 +113,8 @@ size_t sirius_gpu_parquet_scan_operator::get_total_partitions() const
 
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
-  build_partition_list();
-  if (!_partitions_built.load(std::memory_order_acquire)) { return std::nullopt; }
-  if (_next_batch_idx.load(std::memory_order_relaxed) < _pre_built_batches.size()) {
+  if (!_finalized.load(std::memory_order_acquire)) { return std::nullopt; }
+  if (_next_partition_idx.load(std::memory_order_relaxed) < _partition_index.size()) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
   return std::nullopt;
@@ -156,75 +122,102 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
 
 bool sirius_gpu_parquet_scan_operator::all_ports_empty()
 {
-  build_partition_list();
-  if (!_partitions_built.load(std::memory_order_acquire)) { return false; }
-  return _next_batch_idx.load(std::memory_order_relaxed) >= _pre_built_batches.size();
+  if (!_finalized.load(std::memory_order_acquire)) { return false; }
+  return _next_partition_idx.load(std::memory_order_relaxed) >= _partition_index.size();
 }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
-  build_partition_list();
-  if (!_partitions_built.load(std::memory_order_acquire)) { return nullptr; }
+  if (!_finalized.load(std::memory_order_acquire)) { return nullptr; }
 
-  auto idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _pre_built_batches.size()) { return nullptr; }
+  auto const idx = _next_partition_idx.fetch_add(1, std::memory_order_relaxed);
+  if (idx >= _partition_index.size()) { return nullptr; }
 
-  auto const& batch = _pre_built_batches[idx];
+  auto const& entry    = _partition_index[idx];
+  auto const* meta     = entry.metadata;
+  auto const& rg_range = meta->row_group_partitions[entry.partition_idx];
 
   SIRIUS_LOG_DEBUG(
-    "[sirius_gpu_parquet_scan_operator] Creating parquet_scan_data batch {} with {} row-group "
-    "ranges",
+    "[sirius_gpu_parquet_scan_operator] Creating parquet_scan_data for partition {} "
+    "(file_idx={}, {} row groups)",
     idx,
-    batch.scan_ranges.size());
+    rg_range.file_idx,
+    rg_range.row_group_indices.size());
 
-  return std::make_unique<parquet_scan_data>(*batch.metadata, batch.scan_ranges);
+  return std::make_unique<parquet_scan_data>(meta->file_paths[rg_range.file_idx],
+                                             rg_range,
+                                             meta->reader_options,
+                                             meta->filter_expression,
+                                             meta->post_filter_projection_ids);
 }
 
-// ---------------------------------------------------------------------------
-// execute() — byte-range preloading
-//
-// This method contains the execution logic that was previously spread across
-// parquet_scan_task::compute_task() and parquet_scan_task_local_state.
-//
-// NOTE: The method currently throws std::runtime_error because byte-range
-// preloading requires a cucascade host-memory reservation which is only
-// available inside a dedicated task type (parquet_scan_task or a new
-// parquet_gpu_scan_task). Full integration will be added in a follow-up.
-// ---------------------------------------------------------------------------
+//===----------------------------------------------------------------------===//
+// execute()
+//===----------------------------------------------------------------------===//
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
-  const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  auto const* scan = dynamic_cast<const parquet_scan_data*>(&input_data);
-  if (!scan) {
-    SIRIUS_LOG_ERROR(
-      "[sirius_gpu_parquet_scan_operator] execute() called with unexpected operator_data type "
-      "(typeid: {}); expected parquet_scan_data.",
-      typeid(input_data).name());
+  auto const* scan_data = dynamic_cast<const parquet_scan_data*>(&input_data);
+  if (!scan_data) {
     throw std::runtime_error(
       "[sirius_gpu_parquet_scan_operator] execute() called with unexpected operator_data type; "
       "expected parquet_scan_data.");
   }
 
-  // TODO: Implement full byte-range preloading here.
-  //
-  // The required logic (currently in parquet_scan_task::compute_task()) is:
-  //  1. Create a cudf::io::datasource for the file.
-  //  2. Build a hybrid_scan_reader from the cached FileMetaData + reader_options.
-  //  3. Allocate a cucascade multiple_blocks_allocation for compressed bytes.
-  //  4. Read all byte ranges (PAR1 header, column chunks, footer+trailer) into
-  //     the allocation asynchronously.
-  //  5. Construct a host_parquet_representation and wrap it in a data_batch.
-  //
-  // This requires a host-memory reservation provided by the enclosing task
-  // (analogous to parquet_scan_task_local_state::make_allocation()).  A new
-  // task type (parquet_gpu_scan_task) will supply that context.
+  // If datasource has not been set by prefetcher, create it now.  The datasource
+  // field on parquet_scan_data is a mutable transport slot that may be filled by the
+  // prefetcher before execution; if it's still null, we create one from the file path.
+  auto datasource = std::move(scan_data->datasource);
+  if (!datasource) { datasource = cudf::io::datasource::create(scan_data->file_path); }
 
-  SIRIUS_LOG_ERROR(
-    "[sirius_gpu_parquet_scan_operator] execute() is not yet fully integrated. "
-    "A dedicated parquet_gpu_scan_task type must provide the host-memory reservation context.");
-  throw std::runtime_error(
-    "[sirius_gpu_parquet_scan_operator] execute() is not yet fully integrated. "
-    "A dedicated parquet_gpu_scan_task type must provide the host-memory reservation context.");
+  // Build reader options for this partition's row groups.
+  auto opts = *scan_data->reader_options;
+  opts.set_source(cudf::io::source_info{datasource.get()});
+  opts.set_row_groups({scan_data->rg_range.row_group_indices});
+
+  // Read the parquet data onto the GPU.
+  auto [table, metadata] = cudf::io::read_parquet(opts, stream);
+
+  SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Read {} — {} rows, {} columns",
+                   scan_data->file_path,
+                   table->num_rows(),
+                   table->num_columns());
+
+  // Apply the filter if it was not pushed down into the parquet scan.
+  if (std::holds_alternative<std::shared_ptr<duckdb::Expression>>(scan_data->filter_expression)) {
+    auto& duckdb_expr = std::get<std::shared_ptr<duckdb::Expression>>(scan_data->filter_expression);
+    if (duckdb_expr) {
+      duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*duckdb_expr);
+      auto input_batch  = sirius::make_data_batch(std::move(table), _gpu_memory_space);
+      auto output_batch = gpu_expression_executor.select(input_batch, stream);
+      if (!output_batch) { return std::make_unique<operator_data>(); }
+      table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
+      SIRIUS_LOG_DEBUG(
+        "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
+    }
+  }
+
+  // Prune pure filter columns if necessary.
+  auto const& post_filter_projection_ids = scan_data->post_filter_projection_ids;
+  if (!post_filter_projection_ids.empty()) {
+    auto columns = table->release();
+    std::vector<std::unique_ptr<cudf::column>> projected_columns;
+    projected_columns.reserve(post_filter_projection_ids.size());
+    for (auto const col_idx : post_filter_projection_ids) {
+      projected_columns.push_back(std::move(columns[col_idx]));
+    }
+    table = std::make_unique<cudf::table>(std::move(projected_columns));
+    SIRIUS_LOG_DEBUG(
+      "[sirius_gpu_parquet_scan_operator] Pruned pure filter columns; post-filter projection has "
+      "{} columns",
+      table->num_columns());
+  }
+
+  // Wrap the GPU table in operator_data for the downstream pipeline.
+  auto batch = sirius::make_data_batch(std::move(table), _gpu_memory_space);
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  batches.push_back(std::move(batch));
+  return std::make_unique<operator_data>(batches);
 }
 
 }  // namespace sirius::op::scan

@@ -417,28 +417,26 @@ void parquet_scan_task_global_state::partition_row_groups()
 
     size_t partition_uncompressed_bytes = 0;
     size_t partition_compressed_bytes   = 0;
-    size_t rg_start                     = 0;
-    size_t rg_count                     = 0;
+    std::vector<cudf::size_type> partition_rg_indices;
     for (size_t rg_idx = 0; rg_idx < meta.row_groups.size(); ++rg_idx) {
       partition_uncompressed_bytes +=
         static_cast<size_t>(_row_group_uncompressed_bytes[file_idx][rg_idx]);
       partition_compressed_bytes +=
         static_cast<size_t>(_row_group_compressed_bytes[file_idx][rg_idx]);
-      ++rg_count;
+      partition_rg_indices.push_back(static_cast<cudf::size_type>(rg_idx));
 
       if (partition_uncompressed_bytes >= _approximate_batch_size) {
-        _row_group_partitions.emplace_back(
-          file_idx, rg_start, rg_count, partition_uncompressed_bytes, partition_compressed_bytes);
+        _row_group_partitions.emplace_back(file_idx, std::move(partition_rg_indices),
+                                           partition_uncompressed_bytes, partition_compressed_bytes);
         partition_uncompressed_bytes = 0;
         partition_compressed_bytes   = 0;
-        rg_start                     = rg_idx + 1;
-        rg_count                     = 0;
+        partition_rg_indices.clear();
       }
     }
     // We may have a final partition that doesn't amount to the target batch size
-    if (rg_count > 0) {
-      _row_group_partitions.emplace_back(
-        file_idx, rg_start, rg_count, partition_uncompressed_bytes, partition_compressed_bytes);
+    if (!partition_rg_indices.empty()) {
+      _row_group_partitions.emplace_back(file_idx, std::move(partition_rg_indices),
+                                         partition_uncompressed_bytes, partition_compressed_bytes);
     }
   }
 }
@@ -451,9 +449,8 @@ parquet_scan_task_local_state::parquet_scan_task_local_state(
 {
   auto const& partition = g_state.get_row_group_partition(partition_idx);
 
-  _file_idx = partition.file_idx;
-  _rg_indices.resize(partition.row_group_count);
-  std::iota(_rg_indices.begin(), _rg_indices.end(), partition.start_row_group);
+  _file_idx   = partition.file_idx;
+  _rg_indices = partition.row_group_indices;
   _reserved_uncompressed_bytes = partition.reserved_uncompressed_bytes;
   _reserved_compressed_bytes =
     partition.reserved_compressed_bytes + g_state.get_metadata_byte_size(_file_idx);

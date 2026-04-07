@@ -61,7 +61,7 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
 
   auto cancel_task_if_needed = []() {
     SIRIUS_LOG_ERROR(
-      "gpu_pipeline_task: failed to lock batch for processing and cannot prepare batch for "
+      "[gpu_pipeline_task] Failed to lock batch for processing and cannot prepare batch for "
       "processing. This likely means the batch is in transit and there is a bug in "
       "the in-transit locking logic. Cancelling task to avoid deadlock.");
   };

@@ -16,10 +16,16 @@
 
 #pragma once
 
-#include "op/sirius_physical_operator.hpp"
+// sirius
+#include <expression_executor/gpu_expression_translator.hpp>
+#include <op/sirius_physical_operator.hpp>
 
+// cudf
+#include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 
+// standard library
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,34 +33,33 @@
 
 namespace sirius::op::scan {
 
+using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
+
 //===----------------------------------------------------------------------===//
 // row_group_range
 //===----------------------------------------------------------------------===//
 /**
- * @brief Represents a range of consecutive row groups within a single parquet file.
+ * @brief Represents a set of row groups within a single parquet file.
  *
  * Used as the unit of work for both the metadata scan (partitioning) and the
  * GPU scan (byte-range preloading).
  */
 struct row_group_range {
-  row_group_range(size_t file_idx,
-                  size_t start_row_group,
-                  size_t row_group_count,
-                  size_t reserved_uncompressed_bytes,
-                  size_t reserved_compressed_bytes)
+  row_group_range(std::size_t file_idx,
+                  std::vector<cudf::size_type> row_group_indices,
+                  std::size_t reserved_uncompressed_bytes,
+                  std::size_t reserved_compressed_bytes)
     : file_idx(file_idx),
-      start_row_group(start_row_group),
-      row_group_count(row_group_count),
+      row_group_indices(std::move(row_group_indices)),
       reserved_uncompressed_bytes(reserved_uncompressed_bytes),
       reserved_compressed_bytes(reserved_compressed_bytes)
   {
   }
 
-  size_t file_idx;
-  size_t start_row_group;
-  size_t row_group_count;
-  size_t reserved_uncompressed_bytes;
-  size_t reserved_compressed_bytes;
+  std::size_t file_idx;
+  std::vector<cudf::size_type> row_group_indices;
+  std::size_t reserved_uncompressed_bytes;
+  std::size_t reserved_compressed_bytes;
 };
 
 //===----------------------------------------------------------------------===//
@@ -71,7 +76,7 @@ struct row_group_range {
  */
 class parquet_metadata_input : public op::operator_data {
  public:
-  parquet_metadata_input(std::vector<std::string> file_paths, size_t approximate_batch_size)
+  parquet_metadata_input(std::vector<std::string> file_paths, std::size_t approximate_batch_size)
     : file_paths(std::move(file_paths)), approximate_batch_size(approximate_batch_size)
   {
   }
@@ -84,7 +89,7 @@ class parquet_metadata_input : public op::operator_data {
   }
 
   std::vector<std::string> file_paths;
-  size_t approximate_batch_size;
+  std::size_t approximate_batch_size;
 };
 
 //===----------------------------------------------------------------------===//
@@ -101,6 +106,8 @@ class parquet_metadata_input : public op::operator_data {
  */
 class partitioned_parquet_metadata : public op::operator_data {
  public:
+  using translated_expression = gpu_expression_translator::translated_expression;
+
   partitioned_parquet_metadata() = default;
 
   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
@@ -110,26 +117,17 @@ class partitioned_parquet_metadata : public op::operator_data {
     return std::vector<::cucascade::data_batch_processing_handle>{};
   }
 
-  /**
-   * @brief Compute total uncompressed bytes across all row-group partitions.
-   */
-  [[nodiscard]] size_t compute_total_uncompressed_bytes() const
-  {
-    size_t total = 0;
-    for (auto const& rg : row_group_partitions) {
-      total += rg.reserved_uncompressed_bytes;
-    }
-    return total;
-  }
-
   std::vector<std::string> file_paths;
-  std::vector<cudf::io::parquet::FileMetaData> file_metadatas;
-  cudf::io::parquet_reader_options reader_options;
   std::vector<row_group_range> row_group_partitions;
-  std::vector<size_t> file_sizes;
-  std::vector<size_t> footer_offsets;
-  std::vector<size_t> metadata_byte_sizes;
-  std::vector<size_t> selected_column_indices;
+
+  std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+  /// Either a) the translated filter expression for row-group pruning and filter pushdown, or
+  ///        b) the coalesced duckdb expression if filter translation failed.
+  /// Shared ownership of the translated filter expression is used so that
+  /// the cuDF AST nodes referenced by reader_options remain alive.
+  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
+    filter_expression;
+  std::vector<std::size_t> post_filter_projection_ids;
 };
 
 //===----------------------------------------------------------------------===//
@@ -138,18 +136,27 @@ class partitioned_parquet_metadata : public op::operator_data {
 /**
  * @brief Input to a GPU parquet scan task.
  *
- * References the shared partitioned_parquet_metadata and carries the subset of
- * row_group_range objects that this particular task must read.  The scan ranges
- * are batched by sirius_gpu_parquet_scan_operator::get_next_task_input_data()
- * to meet the configured batch_data_size.
+ * Contains all per-partition data needed to read a single row_group_range from
+ * a parquet file.  Fields are extracted from partitioned_parquet_metadata by
+ * get_next_task_input_data() so that each task is self-contained.
  *
  * prepare_for_processing returns an empty handle vector because this type
  * holds no cucascade data_batch objects.
  */
 class parquet_scan_data : public op::operator_data {
  public:
-  parquet_scan_data(partitioned_parquet_metadata meta, std::vector<row_group_range> scan_ranges)
-    : metadata(std::move(meta)), scan_ranges(std::move(scan_ranges))
+  using translated_expression = gpu_expression_translator::translated_expression;
+  parquet_scan_data(std::string file_path,
+                    row_group_range rg_range,
+                    std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
+                    std::variant<std::shared_ptr<translated_expression>,
+                                 std::shared_ptr<duckdb::Expression>> filter_expression,
+                    std::vector<std::size_t> post_filter_projection_ids)
+    : file_path(std::move(file_path)),
+      rg_range(std::move(rg_range)),
+      reader_options(std::move(reader_options)),
+      filter_expression(std::move(filter_expression)),
+      post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
   }
 
@@ -160,8 +167,20 @@ class parquet_scan_data : public op::operator_data {
     return std::vector<::cucascade::data_batch_processing_handle>{};
   }
 
-  partitioned_parquet_metadata metadata;
-  std::vector<row_group_range> scan_ranges;
+  std::string file_path;
+  row_group_range rg_range;
+  std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+  /// Either a) the translated filter expression for row-group pruning and filter pushdown, or
+  ///        b) the coalesced duckdb expression if filter translation failed.
+  /// Shared ownership of the translated filter expression is used so that
+  /// the cuDF AST nodes referenced by reader_options remain alive.
+  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
+    filter_expression;
+  std::vector<std::size_t> post_filter_projection_ids;
+  /// Datasource for the parquet file.  Marked mutable so that execute() can
+  /// move it out through a const reference — the datasource is a transport slot
+  /// that may be filled by the prefetcher before execution.
+  mutable std::unique_ptr<cudf::io::datasource> datasource = nullptr;
 };
 
 }  // namespace sirius::op::scan

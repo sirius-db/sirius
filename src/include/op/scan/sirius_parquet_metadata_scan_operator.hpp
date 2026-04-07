@@ -16,18 +16,22 @@
 
 #pragma once
 
-#include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_operator_type.hpp"
+// sirius
+#include <expression_executor/gpu_expression_translator.hpp>
+#include <op/sirius_physical_operator.hpp>
+#include <op/sirius_physical_operator_type.hpp>
 
 // duckdb
-#include "duckdb/common/column_index.hpp"
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/vector.hpp"
+#include <duckdb/common/column_index.hpp>
+#include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
 
+// standard library
 #include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -60,6 +64,9 @@ namespace sirius::op::scan {
  */
 class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
  public:
+  using translated_expression = gpu_expression_translator::translated_expression;
+
+  /// The physical operator type for this operator.
   static constexpr SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN;
 
@@ -71,26 +78,34 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    * @brief Construct the metadata scan operator from the individual fields extracted from the
    *        physical parquet scan node (or equivalent source).
    *
-   * @param types                Output column types.
-   * @param estimated_cardinality  Estimated output row count.
-   * @param file_paths           All parquet file paths to scan.
-   * @param column_ids           Column ids exposed by the table function (used for column
-   *                             selection; see detail::make_selected_column_indices).
-   * @param projection_ids       Indices into column_ids that the planner has projected out
-   *                             (empty = no projection, read all columns).
-   * @param names                All column names in schema order (used to build column-name
-   *                             projections passed to the parquet reader).
+   * @param types                   Output column types.
+   * @param estimated_cardinality   Estimated output row count.
+   * @param file_paths              The list of parquet files to scan.
+   * @param column_ids              Column ids exposed by the table function (used for column
+   *                                selection; see detail::make_selected_column_indices).
+   * @param projection_ids          Indices into column_ids that the planner has projected out
+   *                                (empty = no projection, read all columns).
+   * @param names                   All column names in schema order (used to build column-name
+   *                                projections passed to the parquet reader).
    * @param approximate_batch_size  Target uncompressed bytes per row-group partition.
-   * @param max_file_processed   Maximum number of files handled by one metadata task.
+   * @param table_filter_set        The table filter set for row-group pruning and filter pushdown
+   *                                (optional; may be nullptr if no filters or filter translation
+   * fails).
+   * @param max_file_processed      Maximum number of files handled by one metadata task.
+   *
+   * @throws if projection_ids is nonempty or filter_expression is non-nullptr but names is empty
+   *         (column names are required for both projection and filter pushdown).
    */
-  sirius_parquet_metadata_scan_operator(duckdb::vector<duckdb::LogicalType> types,
-                                        duckdb::idx_t estimated_cardinality,
-                                        std::vector<std::string> file_paths,
-                                        duckdb::vector<duckdb::ColumnIndex> const& column_ids,
-                                        duckdb::vector<duckdb::idx_t> const& projection_ids,
-                                        duckdb::vector<std::string> const& names,
-                                        size_t approximate_batch_size,
-                                        size_t max_file_processed = DEFAULT_MAX_FILE_PROCESSED);
+  sirius_parquet_metadata_scan_operator(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::idx_t estimated_cardinality,
+    std::vector<std::string> const& file_paths,
+    duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+    duckdb::vector<duckdb::idx_t> const& projection_ids,
+    duckdb::vector<std::string> const& names,
+    std::size_t approximate_batch_size,
+    duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set = nullptr,
+    std::size_t max_file_processed                              = DEFAULT_MAX_FILE_PROCESSED);
 
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
@@ -134,26 +149,39 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
   //===----------Accessors----------===//
-  [[nodiscard]] size_t get_total_files() const { return _total_files; }
-  [[nodiscard]] size_t get_max_file_processed() const { return _max_file_processed; }
-  [[nodiscard]] size_t get_approximate_batch_size() const { return _approximate_batch_size; }
+  [[nodiscard]] std::size_t get_total_files() const { return _total_files; }
+  [[nodiscard]] std::size_t get_max_file_processed() const { return _max_file_processed; }
+  [[nodiscard]] std::size_t get_approximate_batch_size() const { return _approximate_batch_size; }
 
  private:
-  /// All parquet file paths for this scan.
+  /// The list of parquet files to scan.
   std::vector<std::string> _file_paths;
   /// Column indices to read (after projection), indices into parquet schema.
-  std::vector<size_t> _selected_column_indices;
+  std::vector<std::size_t> _selected_column_indices;
   /// Whether projection is applied.
   bool _is_projected;
-  /// Column names used when setting column-name projection on reader options.
+  /// Column names for the projected columns, in column_ids order.
   std::vector<std::string> _projected_column_names;
+  /// Whether there are AST filters to push down.
+  bool _has_ast_filter;
+  /// Whether there are duckdb filters to execute in the table scan operator that could not be
+  /// translated to AST filters.
+  bool _has_duckdb_filter;
+  /// Either a) the translated filter expression for row-group pruning and filter pushdown, or
+  ///        b) the coalesced duckdb expression if filter translation failed.
+  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
+    _filter_expression;
+  /// The projection ids corresponding to columns that remain after pruning pure filter columns.
+  std::vector<std::size_t> _post_filter_projection_ids;
+  /// The set of column indices corresponding to columns that will be pruned after filtering.
+  std::unordered_set<std::size_t> _pure_filter_column_indices;
 
-  size_t _approximate_batch_size;
-  size_t _max_file_processed;
-  size_t _total_files;
+  std::size_t _approximate_batch_size;
+  std::size_t _max_file_processed;
+  std::size_t _total_files;
 
   /// Atomic file-batch counter; incremented by get_next_task_input_data().
-  std::atomic<size_t> _next_file_idx{0};
+  std::atomic<std::size_t> _next_file_idx{0};
 };
 
 }  // namespace sirius::op::scan
