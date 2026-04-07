@@ -124,11 +124,10 @@ std::vector<size_t> make_selected_column_indices(
 
   if (projection_ids.empty()) {
     //===----------No Projection: Select All Columns----------===//
-    std::for_each(column_ids.begin(),
-                  column_ids.end(),
-                  [&push_unique](duckdb::ColumnIndex const& column_id) {
-                    push_unique(column_id.GetPrimaryIndex());
-                  });
+    std::for_each(
+      column_ids.begin(), column_ids.end(), [&push_unique](duckdb::ColumnIndex const& column_id) {
+        push_unique(column_id.GetPrimaryIndex());
+      });
     return selected_column_indices;
   }
 
@@ -158,8 +157,8 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     _scan_op(scan_op),
     _approximate_batch_size(approximate_batch_size),
     _is_projected(!scan_op->projection_ids.empty()),
-    _selected_column_indices(detail::make_selected_column_indices(scan_op->column_ids,
-                                                                    scan_op->projection_ids))
+    _selected_column_indices(
+      detail::make_selected_column_indices(scan_op->column_ids, scan_op->projection_ids))
 {
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
@@ -426,8 +425,10 @@ void parquet_scan_task_global_state::partition_row_groups()
       partition_rg_indices.push_back(static_cast<cudf::size_type>(rg_idx));
 
       if (partition_uncompressed_bytes >= _approximate_batch_size) {
-        _row_group_partitions.emplace_back(file_idx, std::move(partition_rg_indices),
-                                           partition_uncompressed_bytes, partition_compressed_bytes);
+        _row_group_partitions.emplace_back(file_idx,
+                                           std::move(partition_rg_indices),
+                                           partition_uncompressed_bytes,
+                                           partition_compressed_bytes);
         partition_uncompressed_bytes = 0;
         partition_compressed_bytes   = 0;
         partition_rg_indices.clear();
@@ -435,8 +436,10 @@ void parquet_scan_task_global_state::partition_row_groups()
     }
     // We may have a final partition that doesn't amount to the target batch size
     if (!partition_rg_indices.empty()) {
-      _row_group_partitions.emplace_back(file_idx, std::move(partition_rg_indices),
-                                         partition_uncompressed_bytes, partition_compressed_bytes);
+      _row_group_partitions.emplace_back(file_idx,
+                                         std::move(partition_rg_indices),
+                                         partition_uncompressed_bytes,
+                                         partition_compressed_bytes);
     }
   }
 }
@@ -449,8 +452,8 @@ parquet_scan_task_local_state::parquet_scan_task_local_state(
 {
   auto const& partition = g_state.get_row_group_partition(partition_idx);
 
-  _file_idx   = partition.file_idx;
-  _rg_indices = partition.row_group_indices;
+  _file_idx                    = partition.file_idx;
+  _rg_indices                  = partition.row_group_indices;
   _reserved_uncompressed_bytes = partition.reserved_uncompressed_bytes;
   _reserved_compressed_bytes =
     partition.reserved_compressed_bytes + g_state.get_metadata_byte_size(_file_idx);

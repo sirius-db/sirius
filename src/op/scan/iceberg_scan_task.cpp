@@ -159,7 +159,8 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
     file_paths.push_back(f.path);
   }
 
-  auto selected = detail::make_selected_column_indices(scan_op->column_ids, scan_op->projection_ids);
+  auto selected =
+    detail::make_selected_column_indices(scan_op->column_ids, scan_op->projection_ids);
 
   return {std::move(file_paths), std::move(selected)};
 }

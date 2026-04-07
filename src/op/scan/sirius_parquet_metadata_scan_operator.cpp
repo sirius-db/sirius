@@ -98,10 +98,9 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
       auto const primary_idx = column_ids[ref_index].GetPrimaryIndex();
       return names[primary_idx];
     };
-    auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
-    auto duckdb_expression =
-      convert_table_filters_to_expression(
-        *table_filter_set, column_ids, this->types, batch_column_map);
+    auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
+    auto duckdb_expression = convert_table_filters_to_expression(
+      *table_filter_set, column_ids, this->types, batch_column_map);
     if (duckdb_expression) {
       gpu_expression_translator translator(rmm::cuda_stream_default,
                                            cudf::get_current_device_resource_ref());
@@ -199,10 +198,10 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   }
   auto const& input = *input_ptr;
 
-  auto result                          = std::make_unique<partitioned_parquet_metadata>();
-  result->file_paths                   = input.file_paths;
-  result->filter_expression = _filter_expression;
-  result->post_filter_projection_ids   = _post_filter_projection_ids;
+  auto result                        = std::make_unique<partitioned_parquet_metadata>();
+  result->file_paths                 = input.file_paths;
+  result->filter_expression          = _filter_expression;
+  result->post_filter_projection_ids = _post_filter_projection_ids;
 
   //===----------Build reader options----------===//
   result->reader_options = std::make_shared<cudf::io::parquet_reader_options>(

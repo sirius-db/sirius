@@ -63,8 +63,8 @@ std::filesystem::path write_parquet(duckdb::Connection& con,
   std::string sql;
   if (row_group_size != 0) {
     sql = "COPY " + table_name + " TO '" + path.string() +
-          "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
-          std::to_string(row_group_size) + ")";
+          "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " + std::to_string(row_group_size) +
+          ")";
   } else {
     sql = "COPY " + table_name + " TO '" + path.string() + "' (FORMAT PARQUET, COMPRESSION zstd)";
   }
@@ -139,8 +139,10 @@ schema_info synthetic_table_schema()
   info.column_ids = {
     duckdb::ColumnIndex(0), duckdb::ColumnIndex(1), duckdb::ColumnIndex(2), duckdb::ColumnIndex(3)};
   info.names = {"id", "value", "price", "name"};
-  info.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT,
-                duckdb::LogicalType::DOUBLE, duckdb::LogicalType::VARCHAR};
+  info.types = {duckdb::LogicalType::INTEGER,
+                duckdb::LogicalType::BIGINT,
+                duckdb::LogicalType::DOUBLE,
+                duckdb::LogicalType::VARCHAR};
   return info;
 }
 
@@ -149,11 +151,16 @@ schema_info synthetic_table_schema()
 schema_info diverse_table_schema()
 {
   schema_info info;
-  info.column_ids = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1), duckdb::ColumnIndex(2),
-                     duckdb::ColumnIndex(3), duckdb::ColumnIndex(4)};
+  info.column_ids = {duckdb::ColumnIndex(0),
+                     duckdb::ColumnIndex(1),
+                     duckdb::ColumnIndex(2),
+                     duckdb::ColumnIndex(3),
+                     duckdb::ColumnIndex(4)};
   info.names      = {"id", "value", "price", "label", "created"};
-  info.types      = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT,
-                     duckdb::LogicalType::DECIMAL(12, 2), duckdb::LogicalType::VARCHAR,
+  info.types      = {duckdb::LogicalType::INTEGER,
+                     duckdb::LogicalType::BIGINT,
+                     duckdb::LogicalType::DECIMAL(12, 2),
+                     duckdb::LogicalType::VARCHAR,
                      duckdb::LogicalType::DATE};
   return info;
 }
@@ -172,15 +179,14 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   rmm::cuda_stream_view stream                             = cudf::get_default_stream())
 {
   // --- Pipeline 1: metadata scan ---
-  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
-    output_types,
-    0,
-    file_paths,
-    column_ids,
-    projection_ids,
-    names,
-    approximate_batch_size,
-    std::move(table_filters));
+  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(output_types,
+                                                                      0,
+                                                                      file_paths,
+                                                                      column_ids,
+                                                                      projection_ids,
+                                                                      names,
+                                                                      approximate_batch_size,
+                                                                      std::move(table_filters));
 
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(output_types, 0, gpu_space);
 
@@ -217,8 +223,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
 std::vector<int32_t> copy_int32_column(cudf::column_view const& col)
 {
   std::vector<int32_t> host(col.size());
-  cudaMemcpy(host.data(), col.data<int32_t>(), sizeof(int32_t) * col.size(),
-             cudaMemcpyDeviceToHost);
+  cudaMemcpy(
+    host.data(), col.data<int32_t>(), sizeof(int32_t) * col.size(), cudaMemcpyDeviceToHost);
   return host;
 }
 
@@ -226,8 +232,8 @@ std::vector<int32_t> copy_int32_column(cudf::column_view const& col)
 std::vector<int64_t> copy_int64_column(cudf::column_view const& col)
 {
   std::vector<int64_t> host(col.size());
-  cudaMemcpy(host.data(), col.data<int64_t>(), sizeof(int64_t) * col.size(),
-             cudaMemcpyDeviceToHost);
+  cudaMemcpy(
+    host.data(), col.data<int64_t>(), sizeof(int64_t) * col.size(), cudaMemcpyDeviceToHost);
   return host;
 }
 
@@ -239,7 +245,9 @@ std::vector<std::string> copy_string_column(cudf::column_view const& col)
   std::vector<char> chars;
   if (!offsets.empty() && offsets.back() > 0) {
     chars.resize(static_cast<std::size_t>(offsets.back()));
-    cudaMemcpy(chars.data(), str_col.chars_begin(cudf::get_default_stream()), chars.size(),
+    cudaMemcpy(chars.data(),
+               str_col.chars_begin(cudf::get_default_stream()),
+               chars.size(),
                cudaMemcpyDeviceToHost);
   }
   std::vector<std::string> result;
@@ -266,7 +274,7 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
   auto path = write_parquet(con, "src_test", 200);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -298,7 +306,7 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   auto path = write_parquet(con, "meta_exec_test", 500);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -318,20 +326,19 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   REQUIRE(meta->reader_options != nullptr);
 }
 
-TEST_CASE("two-pipeline scan - basic scan with all columns",
-          "[two_pipeline_scan][shared_context]")
+TEST_CASE("two-pipeline scan - basic scan with all columns", "[two_pipeline_scan][shared_context]")
 {
   auto memory_manager = initialize_memory_manager();
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 2000;
   create_synthetic_table(con, "basic_scan", NUM_ROWS);
   auto path = write_parquet(con, "basic_scan", 500);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -358,13 +365,13 @@ TEST_CASE("two-pipeline scan - projection selects subset of columns",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 1000;
   create_synthetic_table(con, "proj_scan", NUM_ROWS);
   auto path = write_parquet(con, "proj_scan", 500);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
 
   // Project: id (col 0) and price (col 2)
@@ -399,13 +406,13 @@ TEST_CASE("two-pipeline scan - diverse types (VARCHAR, DECIMAL, DATE)",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 500;
   create_diverse_table(con, "diverse_scan", NUM_ROWS);
   auto path = write_parquet(con, "diverse_scan", 200);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = diverse_table_schema();
+  auto schema                    = diverse_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -438,13 +445,13 @@ TEST_CASE("two-pipeline scan - filter pushdown with integer filter",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 2000;
   create_synthetic_table(con, "filter_scan", NUM_ROWS);
   auto path = write_parquet(con, "filter_scan", 500);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -455,8 +462,13 @@ TEST_CASE("two-pipeline scan - filter pushdown with integer filter",
     duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
                                               duckdb::Value::INTEGER(1000)));
 
-  auto batches = run_two_pipeline_scan(files, schema.types, schema.column_ids, no_projection,
-                                       schema.names, 1024 * 1024, *gpu_space,
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space,
                                        std::move(table_filters));
 
   std::size_t total_rows = 0;
@@ -478,13 +490,13 @@ TEST_CASE("two-pipeline scan - filter on BIGINT column",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 1000;
   create_synthetic_table(con, "bigint_filter", NUM_ROWS);
   auto path = write_parquet(con, "bigint_filter", 200);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -495,8 +507,13 @@ TEST_CASE("two-pipeline scan - filter on BIGINT column",
     duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
                                               duckdb::Value::BIGINT(50000)));
 
-  auto batches = run_two_pipeline_scan(files, schema.types, schema.column_ids, no_projection,
-                                       schema.names, 1024 * 1024, *gpu_space,
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space,
                                        std::move(table_filters));
 
   std::size_t total_rows = 0;
@@ -518,13 +535,13 @@ TEST_CASE("two-pipeline scan - projection with filter",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 1000;
   create_synthetic_table(con, "proj_filter", NUM_ROWS);
   auto path = write_parquet(con, "proj_filter", 500);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
 
   // Project: id (0), price (2)
@@ -540,9 +557,14 @@ TEST_CASE("two-pipeline scan - projection with filter",
     duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
                                               duckdb::Value::INTEGER(500)));
 
-  auto batches =
-    run_two_pipeline_scan(files, output_types, schema.column_ids, projection_ids, schema.names,
-                          1024 * 1024, *gpu_space, std::move(table_filters));
+  auto batches = run_two_pipeline_scan(files,
+                                       output_types,
+                                       schema.column_ids,
+                                       projection_ids,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space,
+                                       std::move(table_filters));
 
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
@@ -557,8 +579,7 @@ TEST_CASE("two-pipeline scan - projection with filter",
   REQUIRE(total_rows == 500);
 }
 
-TEST_CASE("two-pipeline scan - multiple files",
-          "[two_pipeline_scan][multi_file][shared_context]")
+TEST_CASE("two-pipeline scan - multiple files", "[two_pipeline_scan][multi_file][shared_context]")
 {
   auto memory_manager = initialize_memory_manager();
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
@@ -574,7 +595,7 @@ TEST_CASE("two-pipeline scan - multiple files",
   parquet_file_cleanup cleanup{{path_a, path_b}};
 
   // Both files have the same schema.
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path_a.string(), path_b.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -595,19 +616,22 @@ TEST_CASE("two-pipeline scan - small batch size creates multiple partitions",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 5000;
   create_synthetic_table(con, "small_batch", NUM_ROWS);
   // Small row groups → many row groups
   auto path = write_parquet(con, "small_batch", 500);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
   // Very small batch size to force multiple partitions
-  auto batches = run_two_pipeline_scan(files, schema.types, schema.column_ids, no_projection,
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
                                        schema.names,
                                        1024,  // tiny batch target
                                        *gpu_space);
@@ -622,8 +646,7 @@ TEST_CASE("two-pipeline scan - small batch size creates multiple partitions",
   REQUIRE(total_rows == NUM_ROWS);
 }
 
-TEST_CASE("gpu_scan_operator - sink and finalize lifecycle",
-          "[gpu_scan_operator][shared_context]")
+TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator][shared_context]")
 {
   auto memory_manager = initialize_memory_manager();
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
@@ -654,13 +677,13 @@ TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 500;
   create_diverse_table(con, "diverse_filter", NUM_ROWS);
   auto path = write_parquet(con, "diverse_filter", 100);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = diverse_table_schema();
+  auto schema                    = diverse_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -671,8 +694,13 @@ TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",
     duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
                                               duckdb::Value::INTEGER(100)));
 
-  auto batches = run_two_pipeline_scan(files, schema.types, schema.column_ids, no_projection,
-                                       schema.names, 1024 * 1024, *gpu_space,
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space,
                                        std::move(table_filters));
 
   std::size_t total_rows = 0;
@@ -700,13 +728,13 @@ TEST_CASE("two-pipeline scan - projection on diverse types",
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
   constexpr std::size_t NUM_ROWS = 300;
   create_diverse_table(con, "diverse_proj", NUM_ROWS);
   auto path = write_parquet(con, "diverse_proj", 100);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = diverse_table_schema();
+  auto schema                    = diverse_table_schema();
   std::vector<std::string> files = {path.string()};
 
   // Project: label (3) and created (4) — VARCHAR and DATE columns
@@ -715,8 +743,8 @@ TEST_CASE("two-pipeline scan - projection on diverse types",
   output_types.push_back(schema.types[3]);
   output_types.push_back(schema.types[4]);
 
-  auto batches = run_two_pipeline_scan(files, output_types, schema.column_ids, projection_ids,
-                                       schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(
+    files, output_types, schema.column_ids, projection_ids, schema.names, 1024 * 1024, *gpu_space);
 
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
@@ -741,7 +769,7 @@ TEST_CASE("two-pipeline scan - empty result from filter",
   auto path = write_parquet(con, "empty_filter", 500);
   parquet_file_cleanup cleanup{{path}};
 
-  auto schema = synthetic_table_schema();
+  auto schema                    = synthetic_table_schema();
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
@@ -752,8 +780,13 @@ TEST_CASE("two-pipeline scan - empty result from filter",
     duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_GREATERTHAN,
                                               duckdb::Value::INTEGER(99999)));
 
-  auto batches = run_two_pipeline_scan(files, schema.types, schema.column_ids, no_projection,
-                                       schema.names, 1024 * 1024, *gpu_space,
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space,
                                        std::move(table_filters));
 
   std::size_t total_rows = 0;
