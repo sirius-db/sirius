@@ -21,6 +21,7 @@ NUM_BES=1
 DATA_DIR="/data/tpch/sf1/p16/snappy"
 FE_HOST="127.0.0.1"
 FE_HTTP_PORT=8030
+FE_MYSQL_PORT=9030
 QUERY_FILTER=""  # empty = all
 
 # Parse args
@@ -36,6 +37,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 FE_HTTP="${FE_HOST}:${FE_HTTP_PORT}"
+# mysql is in the doris-fe pixi env, not the doris env
+MYSQL_BIN="${PROJECT_ROOT}/.pixi/envs/doris-fe/bin/mysql"
+if ! [[ -x "$MYSQL_BIN" ]]; then
+    MYSQL_BIN="$(command -v mysql 2>/dev/null || true)"
+fi
+if [[ -z "$MYSQL_BIN" ]]; then
+    echo "ERROR: mysql client not found. Build FE env: pixi run -e doris-fe doris-fe-build"
+    exit 1
+fi
+MYSQL_CMD="${MYSQL_BIN} -h ${FE_HOST} -P ${FE_MYSQL_PORT} -u root --batch --raw"
 
 # Ensure python3 is available (pixi env or system)
 if ! command -v python3 &>/dev/null; then
@@ -51,14 +62,10 @@ fi
 # shared_storage=true even for 1 BE — FE requires backend_id when false
 SHARED_STORAGE="true"
 
-# Run a SQL statement via FE HTTP API, return JSON response
+# Run a SQL statement via mysql client, return tab-separated output
 fe_query() {
     local sql="$1"
-    local escaped
-    escaped=$(echo "$sql" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    curl -sf "http://${FE_HTTP}/api/query/default_cluster/information_schema" \
-        -u root: -H "Content-Type: application/json" \
-        -d "{\"stmt\":\"$escaped\"}" 2>/dev/null
+    $MYSQL_CMD -N -e "$sql" 2>/dev/null
 }
 
 # ── Table name → local() TVF rewrite (Python) ──────────────────────────────
@@ -129,6 +136,13 @@ if [[ "$SKIP_BUILD" == false ]]; then
     pixi run -e doris doris-build
 fi
 
+count_alive_bes() {
+    local alive
+    alive=$($MYSQL_CMD -N -e "SHOW BACKENDS" 2>/dev/null \
+        | awk -F'\t' '{if ($10 == "true") count++} END {print count+0}')
+    echo "$alive" | tr -d '[:space:]'
+}
+
 # ── Verify cluster ──────────────────────────────────────────────────────────
 echo "==> Checking FE health..."
 for i in $(seq 1 30); do
@@ -146,9 +160,7 @@ done
 
 echo "==> Checking for ${NUM_BES} alive BE(s)..."
 for i in $(seq 1 30); do
-    ALIVE_COUNT=$(fe_query "SHOW BACKENDS" 2>/dev/null \
-        | tr -d '\n' | grep -o '"true"' | wc -l || echo 0)
-    ALIVE_COUNT=$(echo "$ALIVE_COUNT" | tr -d '[:space:]')
+    ALIVE_COUNT=$(count_alive_bes)
     if [[ "$ALIVE_COUNT" -ge "$NUM_BES" ]]; then
         echo "    $ALIVE_COUNT BE(s) alive"
         break
@@ -177,54 +189,58 @@ run_tpch_query() {
 
     printf "\n── Q%-2d ──────────────────────────────────────────────────────────\n" "$qnum"
 
-    # Escape for JSON (double quotes → \", backslashes → \\)
-    local escaped
-    escaped=$(echo "$rewritten" | sed 's/\\/\\\\/g; s/"/\\"/g')
-
     local start_ts
     start_ts=$(date +%s%3N)
 
+    # Write query to temp file (avoids shell escaping issues with mysql -e)
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "SET query_timeout = ${timeout};" > "$tmpfile"
+    echo "$rewritten" >> "$tmpfile"
+
     local result
-    result=$(timeout "$timeout" curl -sf \
-        "http://${FE_HTTP}/api/query/default_cluster/information_schema" \
-        -u root: -H "Content-Type: application/json" \
-        -d "{\"stmt\":\"$escaped\"}" 2>/dev/null) || {
-        local exit_code=$?
-        local end_ts
-        end_ts=$(date +%s%3N)
-        local elapsed=$(( end_ts - start_ts ))
-        if [[ $exit_code -eq 124 ]]; then
-            printf "  TIMEOUT (%ds limit, %d.%03ds elapsed)\n" "$timeout" $((elapsed/1000)) $((elapsed%1000))
-            TIMEOUT_COUNT=$((TIMEOUT_COUNT + 1))
-        else
-            printf "  ERROR   (exit=%d, %d.%03ds)\n" "$exit_code" $((elapsed/1000)) $((elapsed%1000))
-            FAIL_COUNT=$((FAIL_COUNT + 1))
-        fi
-        wait_for_be
-        return
-    }
+    local exit_code=0
+    result=$(timeout "$timeout" $MYSQL_CMD < "$tmpfile" 2>&1) || exit_code=$?
+    rm -f "$tmpfile"
 
     local end_ts
     end_ts=$(date +%s%3N)
     local elapsed=$(( end_ts - start_ts ))
 
-    # Parse response with python
+    if [[ $exit_code -eq 124 ]]; then
+        printf "  TIMEOUT (%ds limit, %d.%03ds elapsed)\n" "$timeout" $((elapsed/1000)) $((elapsed%1000))
+        TIMEOUT_COUNT=$((TIMEOUT_COUNT + 1))
+        wait_for_be
+        return
+    fi
+
+    if echo "$result" | grep -q "^ERROR"; then
+        local err_msg
+        err_msg=$(echo "$result" | head -1 | cut -c1-200)
+        printf "  FAIL    %s  (%d.%03ds)\n" "$err_msg" $((elapsed/1000)) $((elapsed%1000))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        wait_for_be
+        return
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        printf "  ERROR   (exit=%d, %d.%03ds)\n" "$exit_code" $((elapsed/1000)) $((elapsed%1000))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        wait_for_be
+        return
+    fi
+
+    # Parse tab-separated mysql output (first line = headers, rest = data)
     local status
     status=$(echo "$result" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    if d.get('msg') == 'success' and 'data' in d and isinstance(d['data'], dict) and 'data' in d['data']:
-        rows = d['data']['data']
-        print(f'OK:{len(rows)} rows')
-    elif d.get('msg') == 'success':
-        print('OK:0 rows')
-    else:
-        msg = d.get('msg', 'unknown')
-        detail = str(d.get('data', ''))[:200]
-        print(f'ERR:{msg}: {detail}')
-except Exception as e:
-    print(f'ERR:parse error: {e}')
+import sys
+lines = sys.stdin.read().strip().split('\n')
+if not lines or not lines[0]:
+    print('OK:0 rows')
+else:
+    header = lines[0]
+    rows = lines[1:]
+    print(f'OK:{len(rows)} rows')
 " 2>/dev/null)
 
     if [[ "$status" == OK:* ]]; then
@@ -233,11 +249,12 @@ except Exception as e:
 
         # Print first few rows for verification
         echo "$result" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-rows = d.get('data',{}).get('data',[])
-meta = d.get('data',{}).get('meta',[])
-cols = [m['name'] for m in meta] if meta else []
+import sys
+lines = sys.stdin.read().strip().split('\n')
+if not lines:
+    sys.exit()
+cols = lines[0].split('\t')
+rows = [l.split('\t') for l in lines[1:]]
 if cols:
     print('  Columns:', ', '.join(cols[:8]), '...' if len(cols) > 8 else '')
 for i, r in enumerate(rows[:3]):
@@ -248,18 +265,10 @@ if len(rows) > 3:
 " 2>/dev/null
         PASS_COUNT=$((PASS_COUNT + 1))
     else
-        local err_info="${status#ERR:}"
-        printf "  FAIL    %s  (%d.%03ds)\n" "$err_info" $((elapsed/1000)) $((elapsed%1000))
+        printf "  FAIL    unexpected output  (%d.%03ds)\n" $((elapsed/1000)) $((elapsed%1000))
         FAIL_COUNT=$((FAIL_COUNT + 1))
         wait_for_be
     fi
-}
-
-count_alive_bes() {
-    local alive
-    alive=$(fe_query "SHOW BACKENDS" 2>/dev/null \
-        | tr -d '\n' | grep -o '"true"' | wc -l || echo 0)
-    echo "$alive" | tr -d '[:space:]'
 }
 
 wait_for_be_alive() {
@@ -309,7 +318,7 @@ get_query_list() {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 # Increase query timeout for complex queries
-fe_query "SET GLOBAL query_timeout = 30" >/dev/null 2>&1 || true
+$MYSQL_CMD -e "SET GLOBAL query_timeout = 30" >/dev/null 2>&1 || true
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
