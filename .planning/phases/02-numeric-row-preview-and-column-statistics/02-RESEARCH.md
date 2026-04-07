@@ -98,6 +98,7 @@ struct value_to_string_functor {
                          rmm::cuda_stream_view stream)
   {
     T val;
+    // col.data<T>() is offset-adjusted in cuDF 26.02 (VERIFIED from header)
     cudaMemcpyAsync(&val, col.data<T>() + row, sizeof(T),
                     cudaMemcpyDeviceToHost, stream.value());
     stream.synchronize();
@@ -123,7 +124,7 @@ struct value_to_string_functor {
 auto sliced_views = cudf::slice(tv, {0, keep_rows}, stream);
 auto sliced_tv = sliced_views.front();  // table_view of first N rows
 ```
-**Critical detail:** The returned `column_view` from a sliced table has a non-zero `offset()`. When copying data with `cudaMemcpyAsync`, start from `col.data<T>() + col.offset()`, NOT `col.data<T>()`. Similarly, when checking null bits, use `col.offset() + row_index`. [VERIFIED: cudf::column_view documentation and cudf::slice semantics]
+**Critical detail:** The returned `column_view` from a sliced table has a non-zero `offset()`. In cuDF 26.02, `col.data<T>()` already returns an offset-adjusted pointer (i.e., `head<T>() + _offset`), so use `col.data<T>()` directly for `cudaMemcpyAsync` -- do NOT add `col.offset()` again or you will double-count and read wrong data. However, the null bitmask pointer from `null_mask()` is NOT offset-adjusted, so when checking individual null bits, use `col.offset() + row_index`. [VERIFIED: inspected cudf::column_view::data() in cuDF 26.02 header at `.pixi/envs/default/include/cudf/column/column_view.hpp` -- confirmed `return head<T>() + _offset`]
 
 ### Pattern 3: cudf::reduce for GPU-Side Statistics
 **What:** `cudf::reduce(col, agg, output_type, stream)` computes a single scalar value on GPU without copying the full column to host.
@@ -170,7 +171,7 @@ void debug_head(cucascade::data_batch const& batch,
 ### Anti-Patterns to Avoid
 - **Per-element cudaMemcpy:** Copying one value at a time from GPU to host is disastrously slow (O(N*cols) kernel launches). Always batch-copy the entire sliced column.
 - **Using `cudf::is_numeric()` for stats classification:** In cuDF, `is_numeric(BOOL8)` returns `true` because `bool` is arithmetic. But STATS-02 explicitly says BOOL should be skipped. Use an explicit type_id check instead.
-- **Forgetting column offset after slice:** `cudf::slice` returns a view with `col.offset() > 0`. The `data<T>()` pointer already accounts for offset in newer cuDF versions, but the null bitmask offset must be handled explicitly. Use `col.offset() + row` for null bit checking.
+- **Double-counting column offset:** In cuDF 26.02, `col.data<T>()` already returns an offset-adjusted pointer. Do NOT write `col.data<T>() + col.offset()` -- that double-counts the offset and reads wrong data. Use `col.data<T>()` directly for data access. However, the null bitmask from `null_mask()` is NOT offset-adjusted, so use `col.offset() + row` when checking null bits.
 - **Using `cudaDeviceSynchronize()`:** Per INFRA-01, always use `stream.synchronize()`.
 
 ## Don't Hand-Roll
@@ -187,11 +188,11 @@ void debug_head(cucascade::data_batch const& batch,
 
 ## Common Pitfalls
 
-### Pitfall 1: Column Offset After cudf::slice
-**What goes wrong:** Copied data appears shifted or contains garbage values.
-**Why it happens:** `cudf::slice` returns a `column_view` with a non-zero `offset()`. The `data<T>()` method returns a pointer to the beginning of the underlying buffer, NOT offset-adjusted in older cuDF versions.
-**How to avoid:** Always use `col.data<T>() + col.offset()` as the source for `cudaMemcpyAsync`. Copy exactly `col.size()` elements, not the original column's size. For null bitmask, use `col.offset() + row_idx` when calling `bit_is_set`. The existing `copy_null_mask_to_host` in Phase 1 copies from `col.null_mask()` which is the raw pointer -- when working with sliced columns, the offset must be applied when checking individual bits.
-**Warning signs:** First few values correct but later values wrong; off-by-N errors in output.
+### Pitfall 1: Column Offset After cudf::slice -- Data Pointer vs Null Bitmask
+**What goes wrong:** Copied data appears shifted or contains garbage values, OR null checks are off by the offset.
+**Why it happens:** `cudf::slice` returns a `column_view` with a non-zero `offset()`. The `data<T>()` and `null_mask()` methods handle offset differently.
+**How to avoid:** In cuDF 26.02, `col.data<T>()` returns `head<T>() + _offset`, meaning it is **already offset-adjusted**. Use `col.data<T>()` directly as the source for `cudaMemcpyAsync` -- do NOT add `col.offset()` or you will double-count and read past the end of valid data. However, `col.null_mask()` returns the **raw** bitmask pointer (NOT offset-adjusted). When checking individual null bits, use `col.offset() + row_idx` as the bit index. The existing `copy_null_mask_to_host` in Phase 1 copies from `col.null_mask()` which is the raw pointer -- when working with sliced columns, the offset must be applied when checking individual bits via `nulls.is_null(col.offset() + r)`. [VERIFIED: inspected `cudf::column_view::data()` in cuDF 26.02 header -- confirmed `return head<T>() + _offset`]
+**Warning signs:** Data values are wrong or segfault when reading a sliced column with `col.data<T>() + col.offset()` (double-counting). Null positions appear shifted when not applying offset to bitmask checks.
 
 ### Pitfall 2: cudf::reduce Returns Invalid Scalar for All-NULL Columns
 **What goes wrong:** Attempting to call `value()` on an invalid scalar causes undefined behavior or crash.
@@ -246,8 +247,10 @@ for (cudf::size_type c = 0; c < sliced_tv.num_columns(); ++c) {
 
   // Example for INT32 (generalize via type_dispatcher)
   std::vector<int32_t> host_vals(col.size());
+  // NOTE: col.data<T>() is already offset-adjusted in cuDF 26.02.
+  // Do NOT add col.offset() -- that would double-count.
   cudaMemcpyAsync(host_vals.data(),
-                  col.data<int32_t>() + col.offset(),
+                  col.data<int32_t>(),
                   sizeof(int32_t) * col.size(),
                   cudaMemcpyDeviceToHost,
                   stream.value());
@@ -255,6 +258,7 @@ for (cudf::size_type c = 0; c < sliced_tv.num_columns(); ++c) {
 
   // Format each value
   for (cudf::size_type r = 0; r < col.size(); ++r) {
+    // NOTE: null_mask() is NOT offset-adjusted, so apply col.offset() here
     if (nulls.is_null(col.offset() + r)) {
       // output "NULL" per D-06
     } else {
@@ -342,22 +346,26 @@ bool is_stats_numeric(cudf::type_id id) {
 
 ## Assumptions Log
 
-| # | Claim | Section | Risk if Wrong |
-|---|-------|---------|---------------|
-| A1 | `col.data<T>()` returns offset-adjusted pointer in cuDF 26.02 (i.e., `data<T>()` already accounts for `offset()`) | Architecture Patterns, Pitfall 1 | If not offset-adjusted, data reads will be shifted by offset elements. LOW risk -- verify by checking cudf::column_view::data() implementation, or simply always add offset defensively |
-| A2 | `cudf::minmax` returns the same scalar type as `cudf::reduce` with MIN/MAX aggregation | Code Example 2 | If scalar types differ, extraction code needs adjustment. LOW risk -- both return `std::unique_ptr<cudf::scalar>` |
+| # | Claim | Section | Status |
+|---|-------|---------|--------|
+| A1 | `col.data<T>()` returns offset-adjusted pointer in cuDF 26.02 (i.e., `data<T>()` already accounts for `offset()`) | Architecture Patterns, Pitfall 1 | **CONFIRMED** -- inspected `cudf::column_view::data()` in cuDF 26.02 header: `return head<T>() + _offset` |
+| A2 | `cudf::minmax` returns the same scalar type as `cudf::reduce` with MIN/MAX aggregation | Code Example 2 | LOW risk -- both return `std::unique_ptr<cudf::scalar>` |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Does `col.data<T>()` account for column offset in cuDF 26.02?**
-   - What we know: In some cuDF versions, `data<T>()` returns a pointer offset by `offset() * sizeof(T)`, making explicit offset addition redundant and incorrect (double-counting).
-   - What's unclear: Whether cuDF 26.02 auto-adjusts or not.
-   - Recommendation: Check the cudf::column_view::data() implementation. If it auto-adjusts, use `col.data<T>()` directly. If not, use `col.data<T>() + col.offset()`. The safest approach is to inspect the actual header during implementation. Since we use `cudf::slice` which is zero-copy, a quick unit test with a sliced column will verify the behavior definitively.
+   - **RESOLVED:** YES. Inspected the cuDF 26.02 header at `.pixi/envs/default/include/cudf/column/column_view.hpp` and confirmed:
+     ```cpp
+     template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
+     T const* data() const noexcept
+     {
+       return head<T>() + _offset;
+     }
+     ```
+     `col.data<T>()` returns an offset-adjusted pointer. Use it directly -- do NOT add `col.offset()` to the data pointer (that would double-count). However, `null_mask()` returns the raw bitmask pointer (not offset-adjusted), so null bit checking still requires `col.offset() + row_idx`.
 
 2. **Should `debug_head` for BOOL8 columns also compute stats in `debug_stats`?**
-   - What we know: STATS-02 explicitly lists BOOL as non-numeric for stats. HEAD-01 says "all numeric types" -- the success criteria mentions BOOL columns in debug_head output.
-   - What's unclear: Whether BOOL8 rows should display in debug_head (yes, per success criteria) but be skipped in debug_stats (yes, per STATS-02).
-   - Recommendation: BOOL8 is displayed in debug_head (rows show `true`/`false`) but skipped with `(non-numeric, skipped)` in debug_stats. These are independent functions with different type scopes.
+   - **RESOLVED:** No. BOOL8 is displayed in debug_head (rows show `true`/`false`) but skipped with `(non-numeric, skipped)` in debug_stats. These are independent functions with different type scopes. STATS-02 explicitly lists BOOL as non-numeric for stats.
 
 ## Project Constraints (from CLAUDE.md)
 
@@ -382,6 +390,7 @@ bool is_stats_numeric(cudf::type_id id) {
 - `/home/bwyogatama/sirius/.pixi/envs/default/include/cudf/copying.hpp` -- cudf::slice API signature
 - `/home/bwyogatama/sirius/.pixi/envs/default/include/cudf/scalar/scalar.hpp` -- numeric_scalar::value() API
 - `/home/bwyogatama/sirius/.pixi/envs/default/include/cudf/utilities/traits.hpp` -- is_numeric, is_floating_point type checks
+- `/home/bwyogatama/sirius/.pixi/envs/default/include/cudf/column/column_view.hpp` -- cudf::column_view::data() offset behavior (VERIFIED)
 - `test/cpp/debug/test_debug_utils.cpp` -- Existing Catch2 test patterns for debug utilities
 - `test/cpp/operator/operator_type_traits.hpp` -- gpu_type_traits for test column creation
 - `test/cpp/utils/data_utils.hpp` -- vector_to_cudf_column helper for tests
@@ -395,7 +404,7 @@ bool is_stats_numeric(cudf::type_id id) {
 **Confidence breakdown:**
 - Standard stack: HIGH -- all libraries already in use, verified against actual source code
 - Architecture: HIGH -- all patterns verified against existing Sirius codebase usage
-- Pitfalls: HIGH -- identified from actual cuDF API documentation and existing code patterns, plus cudf::slice offset semantics verified from header
+- Pitfalls: HIGH -- identified from actual cuDF API documentation and existing code patterns, plus cudf::slice offset semantics verified from cuDF 26.02 header inspection
 
 **Research date:** 2026-04-06
 **Valid until:** 2026-05-06 (stable -- cuDF 26.02 is the installed version, unlikely to change)
