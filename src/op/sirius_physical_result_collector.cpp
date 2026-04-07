@@ -149,8 +149,9 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       // Convert to host representation.
       // Release the reservation before converting so the converter's internal allocation
       // can use the freed capacity (the converter cannot accept a reservation parameter).
-      auto& registry  = sirius::converter_registry::get();
-      auto* mem_space = const_cast<cucascade::memory::memory_space*>(&reservation->get_memory_space());
+      auto& registry = sirius::converter_registry::get();
+      auto* mem_space =
+        const_cast<cucascade::memory::memory_space*>(&reservation->get_memory_space());
       reservation.reset();
 
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();

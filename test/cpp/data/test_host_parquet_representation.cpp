@@ -430,8 +430,8 @@ TEST_CASE("host_parquet_representation clone fails when reservation unavailable"
   REQUIRE(repr != nullptr);
 
   // Exhaust remaining capacity by reserving nearly all available memory
-  auto available      = host_space->get_available_memory();
-  auto blocker        = host_space->make_reservation_or_null(available);
+  auto available = host_space->get_available_memory();
+  auto blocker   = host_space->make_reservation_or_null(available);
 
   // Clone should throw because reservation cannot be satisfied
   REQUIRE_THROWS_AS(repr->clone(rmm::cuda_stream_default), std::runtime_error);
