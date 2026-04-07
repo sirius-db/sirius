@@ -95,6 +95,7 @@ add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 set(EXTENSION_SOURCES
     src/config.cpp
     src/cpu_cache.cpp
+    src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
