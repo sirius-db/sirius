@@ -495,6 +495,7 @@ TEST_CASE("debug_head on null-data batch logs warning without crashing", "[debug
   REQUIRE_NOTHROW(sirius::debug_head(batch, 5, cudf::get_default_stream()));
 }
 
+
 // ---------------------------------------------------------------------------
 // Test case 15: debug_stats on numeric columns
 // ---------------------------------------------------------------------------
