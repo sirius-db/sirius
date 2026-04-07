@@ -701,6 +701,27 @@ void GPUBufferManager::registerExternalTablePacked(
     SIRIUS_LOG_INFO("[registerExternalTablePacked] appended '{}': {} rows, {} total ({} views)",
                     up_table_name, view.num_rows(), total_rows,
                     existing->second->pending_views.size());
+
+    // Validate ALL views after append to detect if push_back corrupted earlier views.
+    for (size_t vi = 0; vi < existing->second->pending_views.size(); vi++) {
+      auto& pv = existing->second->pending_views[vi];
+      for (cudf::size_type ci = 0; ci < pv.num_columns(); ci++) {
+        auto col = pv.column(ci);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child = col.child(0);
+          int32_t last_off = 0;
+          if (child.size() > 0) {
+            cudaMemcpy(&last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+            if (last_off > 100000000 || last_off < 0) {
+              SIRIUS_LOG_ERROR("[registerExternalTablePacked] VIEW {} col {} CORRUPT after appending view {}: "
+                              "last_offset={} for {} rows",
+                              vi, ci, existing->second->pending_views.size() - 1, last_off, col.size());
+            }
+          }
+        }
+      }
+    }
+
     return;
   }
 

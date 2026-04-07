@@ -1027,6 +1027,160 @@ TEST_CASE("nixl recv staging: unpack from misaligned offset", "[exchange][nixl]"
   cudaFree(staging);
 }
 
+TEST_CASE("nixl recv staging: metadata lifetime with many views", "[exchange][nixl]") {
+  // Test that unpacking 15+ views into a vector doesn't invalidate earlier views.
+  // Simulates the exact registerExternalTablePacked pattern:
+  // - Store metadata in a vector<string>
+  // - Unpack from stored metadata
+  // - Store table_view in vector<table_view>
+  // - Validate all views remain valid after all pushes
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  constexpr size_t STAGING_SIZE = 64UL << 20;
+  void* staging = nullptr;
+  REQUIRE(cudaMalloc(&staging, STAGING_SIZE) == cudaSuccess);
+
+  // Vectors matching the GPUIntermediateRelation layout
+  std::vector<std::string> pending_metadata;
+  std::vector<cudf::table_view> pending_views;
+
+  size_t offset = 0;
+  constexpr int NUM_ENTRIES = 15;
+
+  for (int i = 0; i < NUM_ENTRIES; i++) {
+    auto table = make_q3_exchange_table(400 + i * 100);
+    std::vector<cudf::size_type> key_cols = {0};
+    auto [partitioned, offsets] = cudf::hash_partition(
+        table->view(), key_cols, 2, cudf::hash_id::HASH_MURMUR3,
+        cudf::DEFAULT_HASH_SEED, stream);
+    auto start = offsets[0];
+    auto end = offsets[1];
+    if (end <= start) continue;
+    auto slice = cudf::slice(partitioned->view(), {start, end});
+
+    // Pack into staging
+    auto packer = cudf::chunked_pack::create(slice[0], STAGING_SIZE - offset, stream);
+    auto total = packer->get_total_contiguous_size();
+    REQUIRE(offset + total <= STAGING_SIZE);
+    cudf::device_span<uint8_t> dst(static_cast<uint8_t*>(staging) + offset, STAGING_SIZE - offset);
+    while (packer->has_next()) { packer->next(dst); }
+    auto md = packer->build_metadata();
+
+    // Store metadata FIRST (like registerExternalTablePacked)
+    pending_metadata.push_back(std::string(reinterpret_cast<const char*>(md->data()), md->size()));
+
+    // Unpack from the STORED metadata (stable pointer)
+    auto& stored = pending_metadata.back();
+    auto unpacked = cudf::unpack(
+        reinterpret_cast<const uint8_t*>(stored.data()),
+        static_cast<const uint8_t*>(staging) + offset);
+
+    pending_views.push_back(unpacked);
+    offset += (total + 255) & ~255UL;
+  }
+
+  INFO(NUM_ENTRIES << " views stored");
+  REQUIRE(pending_views.size() == NUM_ENTRIES);
+
+  // Validate ALL views (especially the early ones that might be invalidated by
+  // vector reallocation or metadata pointer changes)
+  for (size_t v = 0; v < pending_views.size(); v++) {
+    auto& pv = pending_views[v];
+    for (cudf::size_type c = 0; c < pv.num_columns(); c++) {
+      auto col = pv.column(c);
+      if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+        auto child = col.child(0);
+        int32_t last_offset = 0;
+        if (child.size() > 0) {
+          REQUIRE(cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1,
+                            sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess);
+          INFO("view " << v << " col " << c << " last_offset=" << last_offset
+               << " rows=" << col.size());
+          CHECK(last_offset > 0);
+          CHECK(last_offset < 1024 * 1024);
+        }
+      }
+    }
+  }
+
+  // Concatenate all
+  cudaGetLastError();
+  auto result = cudf::concatenate(pending_views, stream, &cuda_mr);
+  CHECK(result->num_columns() == 8);
+  CHECK(result->num_rows() > 0);
+  INFO("concatenated: " << result->num_rows() << " rows from " << pending_views.size() << " views");
+
+  cudaFree(staging);
+}
+
+TEST_CASE("nixl recv staging: metadata stored in vector with reallocation", "[exchange][nixl]") {
+  // Specifically test that pending_metadata vector reallocation doesn't
+  // invalidate pointers used by cudf::unpack table_views.
+  // Force reallocation by not reserving the vector.
+  auto stream = cudf::get_default_stream();
+  auto* mr    = rmm::mr::get_current_device_resource();
+  static rmm::mr::cuda_memory_resource cuda_mr;
+
+  constexpr size_t BUF_SIZE = 4UL << 20;
+  void* buf = nullptr;
+  REQUIRE(cudaMalloc(&buf, BUF_SIZE) == cudaSuccess);
+
+  // Don't reserve — force reallocation
+  std::vector<std::string> metadatas;
+  std::vector<cudf::table_view> views;
+
+  auto table = make_q3_exchange_table(500);
+  std::vector<cudf::size_type> key_cols = {0};
+  auto [partitioned, offsets] = cudf::hash_partition(
+      table->view(), key_cols, 2, cudf::hash_id::HASH_MURMUR3,
+      cudf::DEFAULT_HASH_SEED, stream);
+  auto start = offsets[0];
+  auto end = offsets[1];
+  REQUIRE(end > start);
+  auto slice = cudf::slice(partitioned->view(), {start, end});
+
+  // Pack once
+  auto packer = cudf::chunked_pack::create(slice[0], BUF_SIZE, stream);
+  auto total = packer->get_total_contiguous_size();
+  cudf::device_span<uint8_t> dst(static_cast<uint8_t*>(buf), BUF_SIZE);
+  while (packer->has_next()) { packer->next(dst); }
+  auto md = packer->build_metadata();
+  std::string md_str(reinterpret_cast<const char*>(md->data()), md->size());
+
+  // Push the SAME metadata 20 times to force vector reallocation
+  for (int i = 0; i < 20; i++) {
+    metadatas.push_back(md_str);
+    auto& stored = metadatas.back();
+    auto unpacked = cudf::unpack(
+        reinterpret_cast<const uint8_t*>(stored.data()),
+        static_cast<const uint8_t*>(buf));
+    views.push_back(unpacked);
+  }
+
+  // Check that ALL views are still valid (metadata pointers might have moved)
+  for (size_t v = 0; v < views.size(); v++) {
+    auto& pv = views[v];
+    for (cudf::size_type c = 0; c < pv.num_columns(); c++) {
+      auto col = pv.column(c);
+      if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+        auto child = col.child(0);
+        int32_t last_offset = 0;
+        if (child.size() > 0) {
+          REQUIRE(cudaMemcpy(&last_offset, child.data<int32_t>() + child.size() - 1,
+                            sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess);
+          INFO("view " << v << " col " << c << " last_offset=" << last_offset);
+          CHECK(last_offset > 0);
+          CHECK(last_offset < 1024 * 1024);
+        }
+      }
+    }
+  }
+
+  cudaFree(buf);
+}
+
 TEST_CASE("nixl recv staging: concurrent writes to adjacent regions", "[exchange][nixl]") {
   // Test that writing to ADJACENT regions in the staging buffer doesn't corrupt
   // existing data. Simulates concurrent nixl transfers writing to different offsets.

@@ -328,7 +328,7 @@ class GPUIntermediateRelation {
           int32_t last_off = 0;
           if (child.size() > 0) {
             cudaMemcpy(&last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
-            if (last_off > 1000000) {
+            if (last_off > 100000000 || last_off < 0) {
               SIRIUS_LOG_ERROR("[PRE-FINALIZE] view {} col {} STRING last_offset={} CORRUPT (> 1MB for {} rows)",
                               v, c, last_off, col.size());
             }
