@@ -30,6 +30,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
@@ -40,8 +41,11 @@ extern "C" int cudaProfilerStop();
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
 #include "gpu_buffer_manager.hpp"
+#ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#endif
+#include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -55,13 +59,12 @@ namespace duckdb {
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
-struct GPUTableFunctionData : public TableFunctionData {
-  GPUTableFunctionData() = default;
-  shared_ptr<Relation> plan;
-  shared_ptr<GPUPreparedStatementData> gpu_prepared;
+struct SiriusTableFunctionData : public TableFunctionData {
+  SiriusTableFunctionData() = default;
+  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<GPUContext> gpu_context;
+  unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -89,6 +92,11 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -141,12 +149,14 @@ struct GPUTableFunctionData : public TableFunctionData {
   }
 };
 
-struct SiriusTableFunctionData : public TableFunctionData {
-  SiriusTableFunctionData() = default;
-  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
+#ifdef SIRIUS_ENABLE_LEGACY
+struct GPUTableFunctionData : public TableFunctionData {
+  GPUTableFunctionData() = default;
+  shared_ptr<Relation> plan;
+  shared_ptr<GPUPreparedStatementData> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<::sirius::sirius_interface> sirius_iface;
+  unique_ptr<GPUContext> gpu_context;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -174,6 +184,11 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -342,6 +357,18 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
   output.Reference(*result_chunk);
   return;
 }
+
+static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog& catalog)
+{
+  TableFunction gpu_processing("gpu_processing",
+                               {LogicalType::VARCHAR},
+                               SiriusExtension::GPUProcessingFunction,
+                               SiriusExtension::GPUProcessingBind);
+  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
+  catalog.CreateTableFunction(transaction, gpu_processing_info);
+}
+#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
   ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
@@ -645,11 +672,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
   catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-  TableFunction gpu_processing(
-    "gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
-  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
-  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(transaction, gpu_processing_info);
+#ifdef SIRIUS_ENABLE_LEGACY
+  RegisterLegacyGPUFunctions(transaction, catalog);
+#endif
 
   TableFunction gpu_execution("gpu_execution",
                               {LogicalType::VARCHAR},
@@ -815,7 +840,6 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
-  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
@@ -845,7 +869,6 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
   auto* params = get_operator_params(context);
   if (!params) { return; }
   params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
-  params->validate_and_fix();
   SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
                    params->max_build_hash_table_bytes);
 }
@@ -1002,12 +1025,20 @@ static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
 
-  auto& db     = loader.GetDatabaseInstance();
-  auto& config = DBConfig::GetConfig(db);
-  config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
+  auto& db           = loader.GetDatabaseInstance();
+  auto& config       = DBConfig::GetConfig(db);
+  auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr = callback.get();
+  config.GetCallbackManager().Register(std::move(callback));
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register SiriusContext on connections that were opened before the extension
+  // was loaded (e.g. when loaded via LOAD in Python or the CLI).
+  for (auto& ctx : ConnectionManager::Get(db).GetConnectionList()) {
+    callback_ptr->OnConnectionOpened(*ctx);
+  }
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }

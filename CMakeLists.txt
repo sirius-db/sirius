@@ -27,7 +27,6 @@ endif()
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
-
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
@@ -76,14 +75,6 @@ set(EXTENSION_SOURCES
     src/extension_lock.cpp
     src/fallback.cpp
     src/gpu_buffer_manager.cpp
-    src/gpu_columns.cpp
-    src/gpu_context.cpp
-    src/gpu_executor.cpp
-    src/gpu_meta_pipeline.cpp
-    src/gpu_physical_operator.cpp
-    src/gpu_physical_plan_generator.cpp
-    src/gpu_pipeline.cpp
-    src/gpu_query_result.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -95,6 +86,12 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/duckdb_scan_task.cpp
+    src/op/scan/equality_delete_filter.cpp
+    src/op/scan/iceberg_avro_reader.cpp
+    src/op/scan/iceberg_delete_pipeline.cpp
+    src/op/scan/iceberg_metadata_reader.cpp
+    src/op/scan/iceberg_scan_task.cpp
+    src/op/scan/positional_delete_filter.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp
     src/op/sirius_physical_column_data_scan.cpp
@@ -114,6 +111,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator.cpp
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
+    src/op/sirius_physical_iceberg_scan.cpp
     src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
@@ -124,27 +122,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_table_scan.cpp
     src/op/sirius_physical_top_n.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
-    src/operator/gpu_materialize.cpp
-    src/operator/gpu_physical_column_data_scan.cpp
-    src/operator/gpu_physical_concat.cpp
-    src/operator/gpu_physical_cte.cpp
-    src/operator/gpu_physical_delim_join.cpp
-    src/operator/gpu_physical_dummy_scan.cpp
-    src/operator/gpu_physical_empty_result.cpp
-    src/operator/gpu_physical_filter.cpp
-    src/operator/gpu_physical_grouped_aggregate.cpp
-    src/operator/gpu_physical_hash_join.cpp
-    src/operator/gpu_physical_limit.cpp
-    src/operator/gpu_physical_nested_loop_join.cpp
-    src/operator/gpu_physical_order.cpp
-    src/operator/gpu_physical_partition.cpp
-    src/operator/gpu_physical_projection.cpp
-    src/operator/gpu_physical_result_collector.cpp
-    src/operator/gpu_physical_strings_matching.cpp
-    src/operator/gpu_physical_substring.cpp
-    src/operator/gpu_physical_table_scan.cpp
-    src/operator/gpu_physical_top_n.cpp
-    src/operator/gpu_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_queue.cpp
@@ -153,23 +130,8 @@ set(EXTENSION_SOURCES
     src/pipeline/pipeline_queue.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
+    src/pipeline/sirius_pipeline_converter.cpp
     src/pipeline/task_request.cpp
-    src/plan/gpu_plan_aggregate.cpp
-    src/plan/gpu_plan_column_data_get.cpp
-    src/plan/gpu_plan_comparison_join.cpp
-    src/plan/gpu_plan_cte.cpp
-    src/plan/gpu_plan_delim_get.cpp
-    src/plan/gpu_plan_delim_join.cpp
-    src/plan/gpu_plan_dummy_scan.cpp
-    src/plan/gpu_plan_empty_result.cpp
-    src/plan/gpu_plan_expression_get.cpp
-    src/plan/gpu_plan_filter.cpp
-    src/plan/gpu_plan_get.cpp
-    src/plan/gpu_plan_limit.cpp
-    src/plan/gpu_plan_order.cpp
-    src/plan/gpu_plan_projection.cpp
-    src/plan/gpu_plan_recursive_cte.cpp
-    src/plan/gpu_plan_top_n.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
@@ -196,9 +158,18 @@ set(EXTENSION_SOURCES
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
 
+# Legacy Sirius — all config lives in src/legacy/CMakeLists.txt.
+# Deleting src/legacy/ cleanly removes legacy build support.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
+  add_subdirectory(src/legacy)
+  list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
+       ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
+endif()
+
 set(CUDA_SOURCES
     src/cuda/allocator.cu
     src/cuda/communication.cu
+    src/cuda/iceberg/equality_delete_mask.cu
     src/cuda/cudf/cudf_aggregate.cu
     src/cuda/cudf/cudf_duplicate_elimination.cu
     src/cuda/cudf/cudf_groupby.cu
@@ -239,7 +210,15 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_include_directories(
     ${_target}
-    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+    PRIVATE
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+      $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
+  )
+
+  if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
+    target_compile_definitions(${_target}
+                               PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
+  endif()
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade)
@@ -297,10 +276,11 @@ set(TEST_SOURCES
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
+    test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
-    test/cpp/exec/test_kiosk.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
@@ -326,6 +306,8 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_pipeline_memory_history.cpp
+    test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
@@ -342,9 +324,16 @@ target_include_directories(
   PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+    $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
+)
 
-target_link_libraries(sirius_unittest sirius_extension)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static)
+link_extension_libraries(sirius_unittest "")
+# DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
+# that conflict with inline definitions from headers included in test files.
+target_link_options(sirius_unittest PRIVATE
+                    "LINKER:--allow-multiple-definition")
 
 # Precompile Catch2 header (18K lines) once instead of in every test file
 target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
