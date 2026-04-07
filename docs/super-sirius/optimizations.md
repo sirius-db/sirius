@@ -120,7 +120,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:** cuCascade `cucascade/src/memory/small_pinned_host_memory_resource.cpp`, integrated in `src/include/sirius_context.hpp`
 
-**Config:** `pinned_memory_size` parameter in `gpu_buffer_init()`
+**Config:** Memory manager settings in `sirius.cfg` (cuCascade)
 
 ## Scan Optimizations
 
