@@ -51,6 +51,7 @@ struct downgrade_request {
   std::function<bool()> predicate;
   std::promise<size_t> result;
   std::atomic<size_t> bytes_freed{0};
+  std::atomic<size_t> batches_downgraded{0};
   std::atomic<bool> satisfied{false};
 };
 

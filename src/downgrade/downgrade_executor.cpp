@@ -21,6 +21,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <thread>
 
@@ -110,7 +111,8 @@ void downgrade_executor::processing_loop()
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
-    auto& req = request;  // unique_ptr<downgrade_request>
+    auto& req    = request;  // unique_ptr<downgrade_request>
+    auto t_start = std::chrono::steady_clock::now();
 
     // 1. Collect repos
     std::vector<downgrade_repository_info> repos;
@@ -142,6 +144,7 @@ void downgrade_executor::processing_loop()
                         try {
                           task.execute(stream);
                           req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
+                          req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                           if (req_ptr->predicate && req_ptr->predicate()) {
                             req_ptr->satisfied.store(true, std::memory_order_release);
                           }
@@ -154,8 +157,20 @@ void downgrade_executor::processing_loop()
     // 4. Let in-flight batches finish
     _pool->wait_all();
 
+    auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);
+    auto total_batches = req->batches_downgraded.load(std::memory_order_relaxed);
+    auto duration_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+    double throughput_mbs =
+      (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
+    SIRIUS_LOG_DEBUG("[downgrade] request done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s)",
+                     total_batches,
+                     total_bytes,
+                     duration_ms,
+                     throughput_mbs);
+
     // 5. Fulfill the promise with total bytes freed
-    req->result.set_value(req->bytes_freed.load(std::memory_order_relaxed));
+    req->result.set_value(total_bytes);
   }
 }
 
