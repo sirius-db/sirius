@@ -27,7 +27,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. `cargo build` for the Sirius BE (including nixl-test and nixl Rust bindings) completes on aarch64 without link errors
   4. The `sirius-be` pixi task launches the Sirius BE process on aarch64 with correct LD_LIBRARY_PATH (process starts, does not crash on missing libraries)
   5. All changes preserve existing x86_64 build and runtime behavior (no regressions on x86_64)
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 01-01-PLAN.md -- Fix pixi.toml: platform-conditional sysroot, arch-aware nixl-build CUDA paths, arch-aware sirius-be LD_LIBRARY_PATH
+- [ ] 01-02-PLAN.md -- Fix Rust build scripts: nixl-test CUDA stubs path, nixl-sys local patch with arch-aware lib path
 
 ### Phase 2: Documentation
 **Goal**: A developer on aarch64 can follow the existing build guide to build and deploy Sirius without consulting anyone
@@ -45,5 +49,5 @@ Phases execute in numeric order: 1 -> 2
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Build and Runtime | 0/0 | Not started | - |
+| 1. Build and Runtime | 0/2 | Planning complete | - |
 | 2. Documentation | 0/0 | Not started | - |
