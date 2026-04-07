@@ -22,6 +22,7 @@
 #include "log/logging.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 
@@ -272,6 +273,7 @@ class GPUIntermediateRelation {
   /// keep the metadata alive alongside the views.
   std::vector<cudf::table_view> pending_views;
   std::vector<std::string> pending_metadata; // Keeps metadata buffers alive
+  std::vector<uint8_t*> pending_gpu_ptrs;    // GPU data pointers for re-unpack
   size_t pending_total_rows = 0;
 
   /// Concatenate all pending views into a single owned cudf::table.
@@ -312,6 +314,21 @@ class GPUIntermediateRelation {
     static rmm::mr::cuda_memory_resource cuda_mr;
     cudaDeviceSynchronize();
     cudaGetLastError();
+
+    // Re-unpack from stored metadata + gpu_ptrs to get fresh table_views.
+    // The stored pending_views may have corrupted column_view pointers if
+    // the vector reallocated or if cudf::unpack has state issues.
+    if (pending_gpu_ptrs.size() == pending_views.size() &&
+        pending_metadata.size() == pending_views.size()) {
+      SIRIUS_LOG_INFO("[finalize_pending_views] re-unpacking {} views from stored metadata",
+                      pending_views.size());
+      pending_views.clear();
+      for (size_t i = 0; i < pending_metadata.size(); i++) {
+        auto* md_ptr = reinterpret_cast<const uint8_t*>(pending_metadata[i].data());
+        auto view = cudf::unpack(md_ptr, pending_gpu_ptrs[i]);
+        pending_views.push_back(view);
+      }
+    }
 
     // Pre-finalize integrity check: verify the first/last 4 bytes of each view's buffer.
     for (size_t v = 0; v < pending_views.size(); v++) {

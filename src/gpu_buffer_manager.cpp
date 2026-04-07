@@ -704,6 +704,7 @@ void GPUBufferManager::registerExternalTablePacked(
     auto* md_ptr = reinterpret_cast<const uint8_t*>(stored_md.data());
     cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
     existing->second->pending_views.push_back(view);
+    existing->second->pending_gpu_ptrs.push_back(gpu_data);
     auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
     existing->second->pending_total_rows = total_rows;
     for (auto& col : existing->second->columns) {
@@ -859,6 +860,7 @@ void GPUBufferManager::registerExternalTablePacked(
   }
 
   rel->pending_views.push_back(view);
+  rel->pending_gpu_ptrs.push_back(gpu_data);
   rel->pending_total_rows = num_rows;
   tables[up_table_name] = rel;
   out_num_cols = num_cols;
