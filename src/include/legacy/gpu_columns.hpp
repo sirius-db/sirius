@@ -308,6 +308,30 @@ class GPUIntermediateRelation {
     cudaDeviceSynchronize();
     cudaGetLastError();
 
+    // Pre-finalize integrity check: verify the first/last 4 bytes of each view's buffer.
+    for (size_t v = 0; v < pending_views.size(); v++) {
+      auto& pv = pending_views[v];
+      auto head_addr = reinterpret_cast<uintptr_t>(pv.column(0).head<uint8_t>());
+      // Read first 4 bytes via cudaMemcpy
+      uint32_t first4 = 0;
+      cudaMemcpy(&first4, reinterpret_cast<const void*>(head_addr), 4, cudaMemcpyDeviceToHost);
+      // For STRING columns, check the offsets child's last value
+      for (cudf::size_type c = 0; c < pv.num_columns(); c++) {
+        auto col = pv.column(c);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child = col.child(0);
+          int32_t last_off = 0;
+          if (child.size() > 0) {
+            cudaMemcpy(&last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+            if (last_off > 1000000) {
+              SIRIUS_LOG_ERROR("[PRE-FINALIZE] view {} col {} STRING last_offset={} CORRUPT (> 1MB for {} rows)",
+                              v, c, last_off, col.size());
+            }
+          }
+        }
+      }
+    }
+
     // Try concatenating incrementally to identify which view causes the failure.
     if (pending_views.size() > 1) {
       for (size_t i = 0; i < pending_views.size(); i++) {

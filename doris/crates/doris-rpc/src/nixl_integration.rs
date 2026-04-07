@@ -1062,6 +1062,25 @@ pub async fn send_nixl_to_peer(
         "nixl transfer: flattened buffer pairs"
     );
 
+    // SENDER-SIDE integrity check: log first/last bytes of each src buffer.
+    for (i, (addr, len)) in all_src_ptrs.iter().enumerate() {
+        if *len >= 32 {
+            if let (Ok(first), Ok(last)) = (
+                crate::cuda_driver::gpu_to_host(*addr, 16),
+                crate::cuda_driver::gpu_to_host(*addr + *len - 16, 16),
+            ) {
+                info!(
+                    buf_idx = i,
+                    src_addr = format_args!("0x{addr:x}"),
+                    src_len = len,
+                    first = format_args!("{:02x}{:02x}{:02x}{:02x}", first[0], first[1], first[2], first[3]),
+                    last = format_args!("{:02x}{:02x}{:02x}{:02x}", last[0], last[1], last[2], last[3]),
+                    "nixl transfer: SENDER data integrity check"
+                );
+            }
+        }
+    }
+
     // Execute transfer on blocking thread (nixl uses polling).
     {
         let agent = agent.clone();

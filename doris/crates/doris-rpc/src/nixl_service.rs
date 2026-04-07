@@ -22,7 +22,10 @@ pub struct NixlMetadataServiceHandler {
     /// Pending GPU buffers awaiting transfer_complete. RAII cleanup on removal:
     /// - Registered: deregisters from nixl + frees GPU memory
     /// - Staged: releases leases (staging buffer reclaims space when all drop)
-    pending_buffers: Mutex<HashMap<(i64, i64, i32), PendingDstBuffers>>,
+    /// Pending GPU buffers awaiting transfer_complete. Multiple entries per key
+    /// because multiple exchange_metadata calls for the same (query_id, node_id)
+    /// each allocate separate RECV staging regions.
+    pending_buffers: Mutex<HashMap<(i64, i64, i32), Vec<PendingDstBuffers>>>,
 }
 
 /// Holds destination GPU buffers until transfer_complete.
@@ -276,13 +279,18 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         self.pending_buffers
             .lock()
             .unwrap()
-            .insert(pending_key, pending);
+            .entry(pending_key)
+            .or_insert_with(Vec::new)
+            .push(pending);
 
         // Step 3: Load sender's metadata (force-load since sender registered new buffers).
         let remote_name = match agent.force_load_remote_metadata(&peer, &req.nixl_metadata) {
             Ok(name) => name,
             Err(e) => {
-                self.pending_buffers.lock().unwrap().remove(&pending_key);
+                // Pop the last entry we just pushed (don't remove all).
+                if let Some(vec) = self.pending_buffers.lock().unwrap().get_mut(&pending_key) {
+                    vec.pop();
+                }
                 warn!(error = %e, "failed to load remote nixl metadata");
                 return Ok(Response::new(PExchangeNixlMetadataResponse {
                     dst_buffers: vec![],
@@ -302,7 +310,9 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         let receiver_metadata = match if used_staging { agent.get_metadata() } else { agent.get_fresh_metadata() } {
             Ok(md) => md,
             Err(e) => {
-                self.pending_buffers.lock().unwrap().remove(&pending_key);
+                if let Some(vec) = self.pending_buffers.lock().unwrap().get_mut(&pending_key) {
+                    vec.pop();
+                }
                 warn!(error = %e, "failed to get fresh receiver metadata");
                 return Ok(Response::new(PExchangeNixlMetadataResponse {
                     dst_buffers: vec![],
@@ -392,10 +402,36 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 "transfer_complete: packed cudf buffer received, storing for GPU-direct registration"
             );
 
-            // Move the staging lease from pending_buffers into the PackedGpuExchange.
-            // This keeps the RECV staging region alive until the exchange fragment
-            // consumes and finalizes the data (cudf::concatenate reads from staging).
-            let staging_lease = self.pending_buffers.lock().unwrap().remove(&pending_key)
+            // Data integrity check: verify transferred data isn't all zeros or garbage.
+            if dst_buf.len >= 32 {
+                let addr = dst_buf.addr as usize;
+                let len = dst_buf.len as usize;
+                if let (Ok(first16), Ok(last16)) = (
+                    crate::cuda_driver::gpu_to_host(addr, 16),
+                    crate::cuda_driver::gpu_to_host(addr + len - 16, 16),
+                ) {
+                    let all_zero_first = first16.iter().all(|&b| b == 0);
+                    let all_zero_last = last16.iter().all(|&b| b == 0);
+                    if all_zero_first && all_zero_last {
+                        warn!(
+                            gpu_addr = format_args!("0x{addr:x}"), gpu_size = len,
+                            "transfer_complete: SUSPECT — both first and last 16 bytes are all zeros"
+                        );
+                    } else {
+                        info!(
+                            first = format_args!("{:02x}{:02x}{:02x}{:02x}", first16[0], first16[1], first16[2], first16[3]),
+                            last = format_args!("{:02x}{:02x}{:02x}{:02x}", last16[0], last16[1], last16[2], last16[3]),
+                            "transfer_complete: data integrity spot check OK"
+                        );
+                    }
+                }
+            }
+
+            // Move ONE staging lease from pending_buffers into the PackedGpuExchange.
+            // Pop from the Vec (not remove!) to keep other entries' leases alive.
+            let staging_lease = self.pending_buffers.lock().unwrap()
+                .get_mut(&pending_key)
+                .and_then(|vec| vec.pop())
                 .and_then(|pb| match pb {
                     PendingDstBuffers::Staged(mut leases) => leases.pop(),
                     _ => None,
@@ -430,9 +466,10 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
              All nixl transfers must use cudf::pack format."
         );
 
-        // Free any pending destination GPU buffers.
-        let removed = self.pending_buffers.lock().unwrap().remove(&pending_key);
-        drop(removed);
+        // Free pending destination GPU buffers for this entry.
+        if let Some(vec) = self.pending_buffers.lock().unwrap().get_mut(&pending_key) {
+            vec.pop();
+        }
 
         Ok(Response::new(PNixlTransferCompleteResponse {
             status_code: 1,
