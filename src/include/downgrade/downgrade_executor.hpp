@@ -45,6 +45,8 @@ namespace parallel {
  * Enqueued into the executor's request queue by the monitor loop or by
  * external callers. The processing loop dequeues one request at a time
  * and dispatches batch downgrades to the thread pool.
+ * WARNING: The predicate function may be called by multiple threads concurrently.
+ * Thread safety of the predicate function is the responsibility of the caller.
  */
 struct downgrade_request {
   size_t target_bytes{0};
@@ -145,6 +147,7 @@ class downgrade_executor {
  private:
   void processing_loop();
   void monitor_loop();
+  void cancel_pending_requests();
 
   std::vector<std::weak_ptr<cucascade::data_batch>> collect_all_candidates(
     const std::vector<downgrade_repository_info>& repositories, size_t amount_to_downgrade);

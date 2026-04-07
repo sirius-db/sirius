@@ -317,7 +317,9 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
-  // Launch 4 threads, each requesting memory reclamation concurrently
+  // Launch 4 threads, each requesting memory reclamation concurrently.
+  // During drain, pending requests are cancelled with an exception, so
+  // threads must tolerate both success and cancellation.
   std::atomic<int> completed{0};
   std::vector<std::thread> threads;
   for (int i = 0; i < 4; ++i) {
@@ -327,13 +329,17 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
       repo->add_data_batch(batch);
       repo_mgr.add_new_repository(100 + i, "out", std::move(repo));
 
-      executor.request_free_memory_and_wait(1ull << 30);
+      try {
+        executor.request_free_memory_and_wait(1ull << 30);
 
-      // Wait for the batch to be downgraded
-      auto deadline = std::chrono::steady_clock::now() + 10s;
-      while (std::chrono::steady_clock::now() < deadline) {
-        if (batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
-        std::this_thread::sleep_for(50ms);
+        // Wait for the batch to be downgraded
+        auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < deadline) {
+          if (batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
+          std::this_thread::sleep_for(50ms);
+        }
+      } catch (const std::exception&) {
+        // Request was cancelled by drain -- expected
       }
       completed.fetch_add(1);
     });
@@ -366,6 +372,69 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
     std::this_thread::sleep_for(50ms);
   }
   REQUIRE(final_batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+TEST_CASE("stop_cancels_pending_requests", "[downgrade_lifecycle]")
+{
+  auto mem_mgr = make_test_memory_manager();
+  cucascade::shared_data_repository_manager repo_mgr;
+
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  executor.start();
+
+  // Enqueue several requests then immediately stop.
+  // The processing loop handles requests sequentially, so some will still
+  // be queued when stop() interrupts the queue.
+  std::vector<std::future<size_t>> futures;
+  for (int i = 0; i < 10; ++i) {
+    futures.push_back(executor.request_free_memory(1024));
+  }
+
+  executor.stop();
+
+  // Every future must resolve — either with a value (0, processed before
+  // shutdown) or an exception (cancelled by stop).  No future should block
+  // indefinitely.
+  for (auto& f : futures) {
+    REQUIRE(f.valid());
+    try {
+      f.get();  // may return 0 or throw
+    } catch (const std::exception&) {
+      // cancelled — expected for requests still queued at shutdown
+    }
+  }
+}
+
+TEST_CASE("drain_cancels_pending_requests_with_exception", "[downgrade_lifecycle]")
+{
+  auto mem_mgr = make_test_memory_manager();
+  cucascade::shared_data_repository_manager repo_mgr;
+
+  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  executor.start();
+
+  std::vector<std::future<size_t>> futures;
+  for (int i = 0; i < 10; ++i) {
+    futures.push_back(executor.request_free_memory(1024));
+  }
+
+  executor.drain();
+
+  // All futures must be resolved after drain
+  for (auto& f : futures) {
+    REQUIRE(f.valid());
+    try {
+      f.get();
+    } catch (const std::exception&) {
+      // cancelled — expected
+    }
+  }
+
+  // Executor should still be operational after drain
+  auto f = executor.request_free_memory(1024);
+  REQUIRE(f.get() == 0);  // no repos, 0 freed
 
   executor.stop();
 }

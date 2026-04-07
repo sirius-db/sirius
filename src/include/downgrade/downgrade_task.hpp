@@ -44,8 +44,9 @@ struct downgrade_task {
    * for HOST memory allocation.
    *
    * @param stream CUDA stream used for device memory operations
+   * @return true if the batch was successfully downgraded, false if skipped
    */
-  void execute(rmm::cuda_stream_view stream);
+  bool execute(rmm::cuda_stream_view stream);
 };
 
 }  // namespace parallel

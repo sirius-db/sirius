@@ -26,12 +26,12 @@
 namespace sirius {
 namespace parallel {
 
-void downgrade_task::execute(rmm::cuda_stream_view stream)
+bool downgrade_task::execute(rmm::cuda_stream_view stream)
 {
   // Check if already on host tier - nothing to do
   auto memory_space = batch->get_memory_space();
   if (memory_space == nullptr || memory_space->get_tier() != cucascade::memory::Tier::GPU) {
-    return;
+    return false;
   }
 
   // Save the batch state so we can restore it after the in-transit conversion.
@@ -43,7 +43,7 @@ void downgrade_task::execute(rmm::cuda_stream_view stream)
   if (!batch->try_to_lock_for_in_transit()) {
     // Batch is currently being processed or moving, skip downgrade for now
     // The scheduler can retry later
-    return;
+    return false;
   }
 
   try {
@@ -51,12 +51,16 @@ void downgrade_task::execute(rmm::cuda_stream_view stream)
     auto reservation = res_mgr.request_reservation(
       cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
     if (!reservation) {
-      throw rmm::out_of_memory("Failed to allocate host memory for downgrade task.");
+      batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+      return false;
     }
 
     // Reservation identifies a memory_space (tier + device). Fetch its default allocator.
     auto mem_space = res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
-    if (!mem_space) { throw std::runtime_error("Invalid reservation memory_space for HOST tier"); }
+    if (!mem_space) {
+      batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+      return false;
+    }
 
     // Use the centralized converter registry to convert GPU representation to HOST
     auto& converter_registry = sirius::converter_registry::get();
@@ -64,7 +68,7 @@ void downgrade_task::execute(rmm::cuda_stream_view stream)
 
     // Release the in-transit lock, restoring the batch to its previous state
     batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-    return;
+    return true;
   } catch (...) {
     batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
     throw;

@@ -83,6 +83,7 @@ void downgrade_executor::stop()
   if (_processing_thread.joinable()) { _processing_thread.join(); }
 
   _pool->wait_all();
+  cancel_pending_requests();
   _pool->stop();
   _pool.reset();
 
@@ -100,7 +101,7 @@ void downgrade_executor::drain()
   if (_processing_thread.joinable()) { _processing_thread.join(); }
 
   _pool->wait_all();
-  _request_queue.drain();
+  cancel_pending_requests();
   _pool->resume();
   _request_queue.reactivate();
 
@@ -144,11 +145,12 @@ void downgrade_executor::processing_loop()
                        batch_size]() {
                         downgrade_task task{batch, res_mgr};
                         try {
-                          task.execute(stream);
-                          req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
-                          req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
-                          if (req_ptr->predicate && req_ptr->predicate()) {
-                            req_ptr->satisfied.store(true, std::memory_order_release);
+                          if (task.execute(stream)) {
+                            req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
+                            req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                            if (req_ptr->predicate && req_ptr->predicate()) {
+                              req_ptr->satisfied.store(true, std::memory_order_release);
+                            }
                           }
                         } catch (const std::exception& e) {
                           SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
@@ -195,6 +197,18 @@ void downgrade_executor::monitor_loop()
     }
     // Brief sleep to avoid busy-spinning; the monitor re-checks after each interval
     std::this_thread::sleep_for(std::chrono::milliseconds(_config.monitor_period_ms));
+  }
+}
+
+void downgrade_executor::cancel_pending_requests()
+{
+  while (auto req = _request_queue.try_pop()) {
+    try {
+      req->result.set_exception(
+        std::make_exception_ptr(std::runtime_error("downgrade executor shutting down")));
+    } catch (...) {
+      // Promise may already be fulfilled — safe to ignore
+    }
   }
 }
 
