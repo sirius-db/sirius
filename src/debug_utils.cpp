@@ -82,6 +82,92 @@ bool is_gpu_tier(cucascade::data_batch const& batch, const char* func_name)
   return true;
 }
 
+// STATS-02: Classify types eligible for statistics computation.
+// BOOL8 is explicitly excluded even though cudf::is_numeric(BOOL8) returns true.
+bool is_stats_numeric(cudf::type_id id)
+{
+  switch (id) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64:
+    case cudf::type_id::UINT8:
+    case cudf::type_id::UINT16:
+    case cudf::type_id::UINT32:
+    case cudf::type_id::UINT64:
+    case cudf::type_id::FLOAT32:
+    case cudf::type_id::FLOAT64: return true;
+    default: return false;
+  }
+}
+
+// Determine widened output type for SUM to prevent overflow (Pitfall 3, Pitfall 6).
+cudf::data_type sum_output_type(cudf::type_id id)
+{
+  switch (id) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32: return cudf::data_type{cudf::type_id::INT64};
+    case cudf::type_id::UINT8:
+    case cudf::type_id::UINT16:
+    case cudf::type_id::UINT32: return cudf::data_type{cudf::type_id::UINT64};
+    case cudf::type_id::FLOAT32: return cudf::data_type{cudf::type_id::FLOAT64};
+    default: return cudf::data_type{id};  // INT64, UINT64, FLOAT64 stay as-is
+  }
+}
+
+// Extract a cudf scalar value as a formatted string, dispatching on the data type.
+std::string scalar_to_string(cudf::scalar const& s,
+                             cudf::data_type dt,
+                             rmm::cuda_stream_view stream)
+{
+  if (!s.is_valid(stream)) { return "NULL"; }  // D-10
+
+  switch (dt.id()) {
+    case cudf::type_id::INT8: {
+      auto val = static_cast<cudf::numeric_scalar<int8_t> const&>(s).value(stream);
+      return fmt::format("{}", static_cast<int>(val));
+    }
+    case cudf::type_id::INT16: {
+      auto val = static_cast<cudf::numeric_scalar<int16_t> const&>(s).value(stream);
+      return fmt::format("{}", val);
+    }
+    case cudf::type_id::INT32: {
+      auto val = static_cast<cudf::numeric_scalar<int32_t> const&>(s).value(stream);
+      return fmt::format("{}", val);
+    }
+    case cudf::type_id::INT64: {
+      auto val = static_cast<cudf::numeric_scalar<int64_t> const&>(s).value(stream);
+      return fmt::format("{}", val);
+    }
+    case cudf::type_id::UINT8: {
+      auto val = static_cast<cudf::numeric_scalar<uint8_t> const&>(s).value(stream);
+      return fmt::format("{}", val);
+    }
+    case cudf::type_id::UINT16: {
+      auto val = static_cast<cudf::numeric_scalar<uint16_t> const&>(s).value(stream);
+      return fmt::format("{}", val);
+    }
+    case cudf::type_id::UINT32: {
+      auto val = static_cast<cudf::numeric_scalar<uint32_t> const&>(s).value(stream);
+      return fmt::format("{}", val);
+    }
+    case cudf::type_id::UINT64: {
+      auto val = static_cast<cudf::numeric_scalar<uint64_t> const&>(s).value(stream);
+      return fmt::format("{}", val);
+    }
+    case cudf::type_id::FLOAT32: {
+      auto val = static_cast<cudf::numeric_scalar<float> const&>(s).value(stream);
+      return fmt::format("{:g}", val);  // D-04
+    }
+    case cudf::type_id::FLOAT64: {
+      auto val = static_cast<cudf::numeric_scalar<double> const&>(s).value(stream);
+      return fmt::format("{:g}", val);  // D-04
+    }
+    default: return "?";
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -374,6 +460,84 @@ void debug_head(cucascade::data_batch const& batch,
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_head failed: {}", e.what());
   } catch (...) {
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_head failed: unknown error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// debug_stats
+// ---------------------------------------------------------------------------
+
+void debug_stats(cucascade::data_batch const& batch,
+                 rmm::cuda_stream_view stream,
+                 std::vector<std::string> const& col_names)
+{
+  try {
+    if (!is_gpu_tier(batch, "debug_stats")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
+    stream.synchronize();
+
+    auto num_cols = tv.num_columns();
+
+    std::string output;
+    output += fmt::format("[SIRIUS_DIAG] stats: batch_id={} rows={} cols={}\n",
+                          batch.get_batch_id(), tv.num_rows(), num_cols);
+
+    // D-13: Empty batch
+    if (tv.num_rows() == 0) {
+      output += "[SIRIUS_DIAG]   (empty batch)\n";
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    // D-07: Summary table format consistent with debug_schema
+    output += fmt::format(
+      "[SIRIUS_DIAG]   {:<6s} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
+      "idx", "name", "type", "min", "max", "sum");
+    output += fmt::format(
+      "[SIRIUS_DIAG]   {:-<6s} {:-<20s} {:-<15s} {:->15s} {:->15s} {:->15s}\n",
+      "", "", "", "", "", "");
+
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      auto const& col = tv.column(c);
+      std::string name =
+        (static_cast<std::size_t>(c) < col_names.size())
+          ? col_names[static_cast<std::size_t>(c)]
+          : fmt::format("col[{}]", c);
+      auto type_name = cudf::type_to_name(col.type());
+
+      if (!is_stats_numeric(col.type().id())) {
+        // D-08: Non-numeric columns skipped
+        output += fmt::format(
+          "[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
+          static_cast<int>(c), name, type_name,
+          "(non-numeric, skipped)", "", "");
+        continue;
+      }
+
+      // STATS-03: Use cudf::minmax for combined min+max (1 kernel launch)
+      auto [min_scalar, max_scalar] = cudf::minmax(col, stream);
+
+      // Use cudf::reduce for SUM with widened output type (Pitfall 3)
+      auto sum_agg  = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+      auto sum_type = sum_output_type(col.type().id());
+      auto sum_scalar = cudf::reduce(col, *sum_agg, sum_type, stream);
+
+      // D-10: All-NULL columns show NULL
+      std::string min_str = scalar_to_string(*min_scalar, col.type(), stream);
+      std::string max_str = scalar_to_string(*max_scalar, col.type(), stream);
+      std::string sum_str = scalar_to_string(*sum_scalar, sum_type, stream);
+
+      output += fmt::format(
+        "[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
+        static_cast<int>(c), name, type_name, min_str, max_str, sum_str);
+    }
+
+    SIRIUS_LOG_DEBUG("{}", output);
+
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_stats failed: {}", e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_stats failed: unknown error");
   }
 }
 
