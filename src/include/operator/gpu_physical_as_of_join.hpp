@@ -29,37 +29,6 @@
 
 namespace duckdb {
 
-template <typename T>
-void asOfJoinNestedLoop(int64_t* left_data_timestamp,
-                        int64_t* right_data_timestamp,
-                        T* left_data_value,
-                        T* right_data_value,
-                        uint64_t*& row_ids_left,
-                        uint64_t*& row_ids_right,
-                        uint64_t*& count,
-                        uint64_t left_size,
-                        uint64_t right_size,
-                        int* condition_mode,
-                        int num_keys);
-
-template <typename T>
-void asOfJoinBuildHashTable(uint8_t** keys,
-                    unsigned long long* ht,
-                    uint64_t ht_len,
-                    uint64_t N,
-                    int* condition_mode,
-                    int num_keys,
-                    bool is_right);
-
-template <typename T>
-void asOfJoinProbeHashTable(uint8_t** keys,
-                    unsigned long long* ht,
-                    uint64_t ht_len,
-                    uint64_t N,
-                    int* condition_mode,
-                    int num_keys,
-                    bool is_right);
-
 //! PhysicalAsOfJoin represents an as of join between two tables
 class GPUPhysicalAsOfJoin : public GPUPhysicalOperator {
  public:

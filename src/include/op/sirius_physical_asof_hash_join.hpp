@@ -32,6 +32,37 @@
 #include <cstddef>
 #include <cstdint>
 
+template <typename T>
+void asOfJoinNestedLoop(int64_t* left_data_timestamp,
+                        int64_t* right_data_timestamp,
+                        T* left_data_value,
+                        T* right_data_value,
+                        uint64_t*& row_ids_left,
+                        uint64_t*& row_ids_right,
+                        uint64_t*& count,
+                        uint64_t left_size,
+                        uint64_t right_size,
+                        int* condition_mode,
+                        int num_keys);
+
+template <typename T>
+void asOfJoinBuildHashTable(uint8_t** keys,
+                            unsigned long long* ht,
+                            uint64_t ht_len,
+                            uint64_t N,
+                            int* condition_mode,
+                            int num_keys,
+                            bool is_right);
+
+template <typename T>
+void asOfJoinProbeHashTable(uint8_t** keys,
+                            unsigned long long* ht,
+                            uint64_t ht_len,
+                            uint64_t N,
+                            int* condition_mode,
+                            int num_keys,
+                            bool is_right);
+
 namespace sirius {
 
 namespace pipeline {
@@ -45,12 +76,13 @@ namespace op {
 // BUILD_PROBE builds the hash table in one step and then probes it in a separate step, which allows
 // for better pipelining with other operators, and allows reusing the hash table. MIXED_JOIN uses
 // cudf's mixed_join API for joins with both equality and inequality conditions.
-enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
+enum class HASH_JOIN_MODE { BUILD_PROBE };
 enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
 
 class sirius_physical_asof_hash_join : public sirius_physical_partition_consumer_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ASOF_HASH_JOIN;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::ASOF_HASH_JOIN;
 
   struct join_projection_columns {
     std::vector<cudf::size_type> col_idxs;
@@ -159,7 +191,7 @@ class sirius_physical_asof_hash_join : public sirius_physical_partition_consumer
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::STANDARD;
+  HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::BUILD_PROBE;
   BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
   uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode

@@ -371,18 +371,17 @@ template void asOfJoinNestedLoop<double>(int64_t* left_data_timestamp,
                                          int* condition_mode,
                                          int num_keys);
 
-
 template <int B, int I, typename T>
 __global__ void probe_multikey_count_asof(T** keys,
-                                     unsigned long long* ht,
-                                     uint64_t ht_len,
-                                     uint64_t* offset_each_thread,
-                                     unsigned long long* total_count,
-                                     uint64_t N,
-                                     int* condition_mode,
-                                     int num_keys,
-                                     int equal_keys,
-                                     bool is_right)
+                                          unsigned long long* ht,
+                                          uint64_t ht_len,
+                                          uint64_t* offset_each_thread,
+                                          unsigned long long* total_count,
+                                          uint64_t N,
+                                          int* condition_mode,
+                                          int num_keys,
+                                          int equal_keys,
+                                          bool is_right)
 {
   typedef cub::BlockScan<int, B> BlockScanInt;
 
@@ -475,17 +474,17 @@ __global__ void probe_multikey_count_asof(T** keys,
 
 template <int B, int I, typename T>
 __global__ void probe_multikey_asof(T** keys,
-                               int64_t* timestamps,
-                               unsigned long long* ht,
-                               uint64_t ht_len,
-                               uint64_t* offset_each_thread,
-                               uint64_t* row_ids_left,
-                               uint64_t* row_ids_right,
-                               uint64_t N,
-                               int* condition_mode,
-                               int num_keys,
-                               int equal_keys,
-                               bool is_right)
+                                    int64_t* timestamps,
+                                    unsigned long long* ht,
+                                    uint64_t ht_len,
+                                    uint64_t* offset_each_thread,
+                                    uint64_t* row_ids_left,
+                                    uint64_t* row_ids_right,
+                                    uint64_t N,
+                                    int* condition_mode,
+                                    int num_keys,
+                                    int equal_keys,
+                                    bool is_right)
 {
   uint64_t tile_size   = B * I;
   uint64_t tile_offset = blockIdx.x * tile_size;
@@ -511,7 +510,7 @@ __global__ void probe_multikey_asof(T** keys,
     // Initialize max_timestamp to the smallest possible value
     int64_t max_timestamp = 0x8000000000000000;
     bool foundMatchingRow = false;
-    
+
     if (threadIdx.x + (ITEM * B) < num_tile_items) {
       uint64_t slot;
       // if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
@@ -550,22 +549,20 @@ __global__ void probe_multikey_asof(T** keys,
         slot = (slot + 65599) % ht_len;
       }
     }
-    if(foundMatchingRow){
-      output_offset++;
-    }
+    if (foundMatchingRow) { output_offset++; }
   }
 }
 
 // The last 64 bits of each entry in ht is the timestamp
 template <int B, int I, typename T>
 __global__ void build_multikey_asof(T** keys,
-                               int64_t* timestamp,
-                               unsigned long long* ht,
-                               uint64_t ht_len,
-                               uint64_t N,
-                               int num_keys,
-                               int equal_keys,
-                               bool is_right)
+                                    int64_t* timestamp,
+                                    unsigned long long* ht,
+                                    uint64_t ht_len,
+                                    uint64_t N,
+                                    int num_keys,
+                                    int equal_keys,
+                                    bool is_right)
 {
   uint64_t tile_size   = B * I;
   uint64_t tile_offset = blockIdx.x * tile_size;
@@ -613,13 +610,13 @@ __global__ void build_multikey_asof(T** keys,
 
 template <typename T>
 void asOfJoinBuildHashTable(uint8_t** keys,
-  int64_t* timestamps,
-                    unsigned long long* ht,
-                    uint64_t ht_len,
-                    uint64_t N,
-                    int* condition_mode,
-                    int num_keys,
-                    bool is_right)
+                            int64_t* timestamps,
+                            unsigned long long* ht,
+                            uint64_t ht_len,
+                            uint64_t N,
+                            int* condition_mode,
+                            int num_keys,
+                            bool is_right)
 {
   CHECK_ERROR();
   if (N == 0 || ht_len == 0) {
@@ -641,10 +638,8 @@ void asOfJoinBuildHashTable(uint8_t** keys,
   T** keys_dev = gpuBufferManager->customCudaMalloc<T*>(num_keys, 0, 0);
   cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(T*), cudaMemcpyHostToDevice);
 
-
   int64_t* timestamps_dev = gpuBufferManager->customCudaMalloc<int64_t>(N, 0, 0);
   cudaMemcpy(timestamps_dev, timestamps, N * sizeof(int64_t), cudaMemcpyHostToDevice);
-
 
   int equal_keys = 0;
   for (int idx = 0; idx < num_keys; idx++) {
@@ -659,7 +654,7 @@ void asOfJoinBuildHashTable(uint8_t** keys,
 
   build_multikey_asof<BLOCK_THREADS, ITEMS_PER_THREAD, T>
     <<<(N + tile_items - 1) / tile_items, BLOCK_THREADS>>>(
-      keys_dev, timestamps,ht, ht_len, N, num_keys, equal_keys, is_right);
+      keys_dev, timestamps, ht, ht_len, N, num_keys, equal_keys, is_right);
   CHECK_ERROR();
   cudaDeviceSynchronize();
   STOP_TIMER();
@@ -670,16 +665,16 @@ void asOfJoinBuildHashTable(uint8_t** keys,
 
 template <typename T>
 void asOfJoinProbeHashTable(uint8_t** keys,
-                    int64_t* timestamps,
-                    unsigned long long* ht,
-                    uint64_t ht_len,
-                    uint64_t*& row_ids_left,
-                    uint64_t*& row_ids_right,
-                    uint64_t*& count,
-                    uint64_t N,
-                    int* condition_mode,
-                    int num_keys,
-                    bool is_right)
+                            int64_t* timestamps,
+                            unsigned long long* ht,
+                            uint64_t ht_len,
+                            uint64_t*& row_ids_left,
+                            uint64_t*& row_ids_right,
+                            uint64_t*& count,
+                            uint64_t N,
+                            int* condition_mode,
+                            int num_keys,
+                            bool is_right)
 {
   CHECK_ERROR();
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -742,7 +737,6 @@ void asOfJoinProbeHashTable(uint8_t** keys,
   assert(h_count[0] > 0);
   SIRIUS_LOG_DEBUG("Probe Hash Table Result Count: {}", h_count[0]);
 
-
   int64_t* timestamps_dev = gpuBufferManager->customCudaMalloc<int64_t>(N, 0, 0);
   cudaMemcpy(timestamps_dev, timestamps, N * sizeof(int64_t), cudaMemcpyHostToDevice);
 
@@ -784,45 +778,45 @@ void asOfJoinProbeHashTable(uint8_t** keys,
 }
 
 template void asOfJoinBuildHashTable<int32_t>(uint8_t** keys,
-                                      int64_t* timestamps,
-                                      unsigned long long* ht,
-                                      uint64_t ht_len,
-                                      uint64_t N,
-                                      int* condition_mode,
-                                      int num_keys,
-                                      bool is_right);
+                                              int64_t* timestamps,
+                                              unsigned long long* ht,
+                                              uint64_t ht_len,
+                                              uint64_t N,
+                                              int* condition_mode,
+                                              int num_keys,
+                                              bool is_right);
 
 template void asOfJoinBuildHashTable<int64_t>(uint8_t** keys,
-                                      int64_t* timestamps,
-                                      unsigned long long* ht,
-                                      uint64_t ht_len,
-                                      uint64_t N,
-                                      int* condition_mode,
-                                      int num_keys,
-                                      bool is_right);
+                                              int64_t* timestamps,
+                                              unsigned long long* ht,
+                                              uint64_t ht_len,
+                                              uint64_t N,
+                                              int* condition_mode,
+                                              int num_keys,
+                                              bool is_right);
 
 template void asOfJoinProbeHashTable<int32_t>(uint8_t** keys,
-                                      int64_t* timestamps,
-                                      unsigned long long* ht,
-                                      uint64_t ht_len,
-                                      uint64_t*& row_ids_left,
-                                      uint64_t*& row_ids_right,
-                                      uint64_t*& count,
-                                      uint64_t N,
-                                      int* condition_mode,
-                                      int num_keys,
-                                      bool is_right);
+                                              int64_t* timestamps,
+                                              unsigned long long* ht,
+                                              uint64_t ht_len,
+                                              uint64_t*& row_ids_left,
+                                              uint64_t*& row_ids_right,
+                                              uint64_t*& count,
+                                              uint64_t N,
+                                              int* condition_mode,
+                                              int num_keys,
+                                              bool is_right);
 
 template void asOfJoinProbeHashTable<int64_t>(uint8_t** keys,
-                                      int64_t* timestamps,
-                                      unsigned long long* ht,
-                                      uint64_t ht_len,
-                                      uint64_t*& row_ids_left,
-                                      uint64_t*& row_ids_right,
-                                      uint64_t*& count,
-                                      uint64_t N,
-                                      int* condition_mode,
-                                      int num_keys,
-                                      bool is_right);
+                                              int64_t* timestamps,
+                                              unsigned long long* ht,
+                                              uint64_t ht_len,
+                                              uint64_t*& row_ids_left,
+                                              uint64_t*& row_ids_right,
+                                              uint64_t*& count,
+                                              uint64_t N,
+                                              int* condition_mode,
+                                              int num_keys,
+                                              bool is_right);
 
 }  // namespace duckdb

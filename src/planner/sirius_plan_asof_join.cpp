@@ -18,7 +18,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_asof_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
@@ -43,25 +43,23 @@ sirius_physical_plan_generator::plan_asof_join(duckdb::LogicalComparisonJoin& op
     // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
   }
 
-  //Check to make sure that the conditions include a time condition and another condition
-  bool has_time_condition = false;
+  // Check to make sure that the conditions include a time condition and another condition
+  bool has_time_condition  = false;
   bool has_other_condition = false;
   for (auto& cond : op.conditions) {
     if (cond.comparison == duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO &&
-        (cond.left->return_type.InternalType() == duckdb::PhysicalType::TIMESTAMP ||
-         cond.left->return_type.InternalType() == duckdb::PhysicalType::TIMESTAMP_TZ ||
-         cond.left->return_type.InternalType() == duckdb::PhysicalType::TIMESTAMP_NS)) {
+        (cond.left->return_type.InternalType() == duckdb::PhysicalType::INT64)) {
       has_time_condition = true;
     } else {
       has_other_condition = true;
     }
   }
 
-  if(!has_time_condition){
+  if (!has_time_condition) {
     throw duckdb::NotImplementedException("ASOF join requires a time condition");
   }
 
-  if(!has_other_condition){
+  if (!has_other_condition) {
     throw duckdb::NotImplementedException("ASOF join requires at least one non-time condition");
   }
 
@@ -84,10 +82,9 @@ sirius_physical_plan_generator::plan_asof_join(duckdb::LogicalComparisonJoin& op
   bool prefer_range_joins = duckdb::Settings::Get<duckdb::PreferRangeJoinsSetting>(context);
   prefer_range_joins      = prefer_range_joins && can_iejoin;
 
-
   //  TODO: for meJ replace with physical asof hash join operator
   bool is_supported_by_hash_join =
-    sirius::op::sirius_physical_hash_join::are_conditions_supported(op.conditions);
+    sirius::op::sirius_physical_asof_hash_join::are_conditions_supported(op.conditions);
   if (is_supported_by_hash_join && !prefer_range_joins) {
     // Equality join with small number of keys : possible perfect join optimization
     // auto &join = Make<PhysicalHashJoin>(op, left, right, std::move(op.conditions), op.join_type,
@@ -99,7 +96,7 @@ sirius_physical_plan_generator::plan_asof_join(duckdb::LogicalComparisonJoin& op
     const auto& op_params = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_config()
                               .get_operator_params();
-    auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    auto join = duckdb::make_uniq<sirius::op::sirius_physical_asof_hash_join>(
       op,
       std::move(left),
       std::move(right),
@@ -111,7 +108,7 @@ sirius_physical_plan_generator::plan_asof_join(duckdb::LogicalComparisonJoin& op
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
       op_params.max_build_hash_table_bytes);
-    join->Cast<sirius::op::sirius_physical_hash_join>().join_stats = std::move(op.join_stats);
+    join->Cast<sirius::op::sirius_physical_asof_hash_join>().join_stats = std::move(op.join_stats);
     return join;
   }
 

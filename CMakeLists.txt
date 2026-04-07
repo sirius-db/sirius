@@ -94,6 +94,7 @@ set(EXTENSION_SOURCES
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/sirius_physical_asof_hash_join.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -132,6 +133,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/task_request.cpp
     src/planner/query.cpp
+    src/planner/sirius_plan_asof_join.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
