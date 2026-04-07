@@ -12,16 +12,16 @@ Enable fast, accurate identification of faulty operators by providing consistent
 
 ### Validated
 
-(None yet — ship to validate)
+- ✓ `debug_schema(batch)` prints column names, data types, null counts, and total row count via SIRIUS_LOG — Phase 1
+- ✓ `debug_nulls(batch)` logs per-column null count and null percentage — Phase 1
+- ✓ Infrastructure: stream-scoped sync, null-aware copy, [SIRIUS_DIAG] log routing, output buffering, try/catch wrapping — Phase 1
 
 ### Active
 
 - [ ] `debug_head(batch, N)` prints first N rows of a data batch in aligned-column format (pandas-style) and CSV format via SIRIUS_LOG
 - [ ] `debug_stats(batch)` prints per-column min, max, sum statistics via SIRIUS_LOG
-- [ ] `debug_schema(batch)` prints column names, data types, null counts, and total row count via SIRIUS_LOG
 - [ ] `debug_checksum(batch)` computes and logs per-column hash/fingerprint for cross-pipeline comparison
 - [ ] `debug_diff(batch_a, batch_b)` compares two data batches and logs which rows and columns differ
-- [ ] `debug_nulls(batch)` logs per-column null count and null percentage
 - [ ] All utilities support the full set of Sirius-supported data types (INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR, DATE, TIMESTAMP, DECIMAL)
 - [ ] Output is pretty-formatted and human-readable in log files
 - [ ] `/validate` skill references these utilities for data validation instrumentation
@@ -78,4 +78,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-06 after initialization*
+*Last updated: 2026-04-07 after Phase 1 completion*
