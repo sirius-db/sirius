@@ -94,45 +94,45 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INFRA-01 | TBD | Pending |
-| INFRA-02 | TBD | Pending |
-| INFRA-03 | TBD | Pending |
-| INFRA-04 | TBD | Pending |
-| INFRA-05 | TBD | Pending |
-| INFRA-06 | TBD | Pending |
-| SCHEMA-01 | TBD | Pending |
-| SCHEMA-02 | TBD | Pending |
-| NULL-01 | TBD | Pending |
-| NULL-02 | TBD | Pending |
-| HEAD-01 | TBD | Pending |
-| HEAD-02 | TBD | Pending |
-| HEAD-03 | TBD | Pending |
-| HEAD-04 | TBD | Pending |
-| HEAD-05 | TBD | Pending |
-| HEAD-06 | TBD | Pending |
-| STATS-01 | TBD | Pending |
-| STATS-02 | TBD | Pending |
-| STATS-03 | TBD | Pending |
-| CHKSUM-01 | TBD | Pending |
-| CHKSUM-02 | TBD | Pending |
-| CHKSUM-03 | TBD | Pending |
-| DIFF-01 | TBD | Pending |
-| DIFF-02 | TBD | Pending |
-| DIFF-03 | TBD | Pending |
-| DIFF-04 | TBD | Pending |
-| DIFF-05 | TBD | Pending |
-| SAMPLE-01 | TBD | Pending |
-| SAMPLE-02 | TBD | Pending |
-| SAMPLE-03 | TBD | Pending |
-| SKILL-01 | TBD | Pending |
-| SKILL-02 | TBD | Pending |
-| SKILL-03 | TBD | Pending |
+| INFRA-01 | Phase 1 | Pending |
+| INFRA-02 | Phase 1 | Pending |
+| INFRA-03 | Phase 1 | Pending |
+| INFRA-04 | Phase 1 | Pending |
+| INFRA-05 | Phase 1 | Pending |
+| INFRA-06 | Phase 1 | Pending |
+| SCHEMA-01 | Phase 1 | Pending |
+| SCHEMA-02 | Phase 1 | Pending |
+| NULL-01 | Phase 1 | Pending |
+| NULL-02 | Phase 1 | Pending |
+| HEAD-01 | Phase 2 | Pending |
+| HEAD-02 | Phase 2 | Pending |
+| HEAD-03 | Phase 2 | Pending |
+| HEAD-04 | Phase 3 | Pending |
+| HEAD-05 | Phase 3 | Pending |
+| HEAD-06 | Phase 3 | Pending |
+| STATS-01 | Phase 2 | Pending |
+| STATS-02 | Phase 2 | Pending |
+| STATS-03 | Phase 2 | Pending |
+| CHKSUM-01 | Phase 3 | Pending |
+| CHKSUM-02 | Phase 3 | Pending |
+| CHKSUM-03 | Phase 3 | Pending |
+| DIFF-01 | Phase 4 | Pending |
+| DIFF-02 | Phase 4 | Pending |
+| DIFF-03 | Phase 4 | Pending |
+| DIFF-04 | Phase 4 | Pending |
+| DIFF-05 | Phase 4 | Pending |
+| SAMPLE-01 | Phase 4 | Pending |
+| SAMPLE-02 | Phase 4 | Pending |
+| SAMPLE-03 | Phase 4 | Pending |
+| SKILL-01 | Phase 4 | Pending |
+| SKILL-02 | Phase 4 | Pending |
+| SKILL-03 | Phase 4 | Pending |
 
 **Coverage:**
 - v1 requirements: 33 total
-- Mapped to phases: 0
-- Unmapped: 33
+- Mapped to phases: 33
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-06*
-*Last updated: 2026-04-06 after initial definition*
+*Last updated: 2026-04-06 — traceability populated after roadmap creation*
