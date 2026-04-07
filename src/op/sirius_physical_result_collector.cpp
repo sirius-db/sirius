@@ -305,11 +305,16 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                 pp.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
                 packed_parts.push_back(std::move(pp));
               } else {
-                auto packer = cudf::chunked_pack::create(slice[0], staging_size - staging_offset, stream);
-                cudf::device_span<uint8_t> dst(
-                  reinterpret_cast<uint8_t*>(staging_addr + staging_offset), staging_size - staging_offset);
-                while (packer->has_next()) { packer->next(dst); }
-                auto md = packer->build_metadata();
+                // Use cudf::pack (not chunked_pack) — chunked_pack has a bug where
+                // STRING chars data overwrites fixed-width column positions for specific
+                // hash_partition + slice outputs. cudf::pack produces correct output.
+                auto packed = cudf::pack(slice[0], stream);
+                auto total = packed.gpu_data->size();
+                // Copy to staging (sync to ensure data is visible before validation/nixl read)
+                cudaMemcpy(reinterpret_cast<void*>(staging_addr + staging_offset),
+                           packed.gpu_data->data(), total,
+                           cudaMemcpyDeviceToDevice);
+                auto md = std::move(packed.metadata);
                 SIRIUS_LOG_INFO("[result_collector] partition {}: {} rows, {} bytes at staging+{}",
                                 i, num_rows, total, staging_offset);
                 // Validate: read first 4 bytes of packed buffer — should be INT32 if col 0 is INT32
@@ -322,7 +327,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                   SIRIUS_LOG_INFO("[result_collector] partition {} packed first4={} (0x{:08x}) col0_type={} ascii={}",
                                   i, packed_first4, static_cast<uint32_t>(packed_first4),
                                   static_cast<int>(first_col_type), looks_ascii);
-                  if (looks_ascii && first_col_type == cudf::type_id::INT32) {
+                  if (looks_ascii && cudf::is_fixed_width(cudf::data_type{first_col_type})) {
                     // SENDER-SIDE CORRUPTION DETECTED! Also pack with cudf::pack for comparison.
                     SIRIUS_LOG_ERROR("[result_collector] SENDER CORRUPTION: partition {} has ASCII at INT32 offset 0!", i);
                     auto ref_packed = cudf::pack(slice[0]);
@@ -366,17 +371,19 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             // Broadcast path: accumulate each batch as a separate entry.
             // Reserve a staging region atomically BEFORE packing, to prevent
             // concurrent sink() calls from overlapping in the staging buffer.
-            auto total_size = cudf::chunked_pack::create(view, 1UL << 20, stream)->get_total_contiguous_size();
+            // Use cudf::pack (not chunked_pack) to get correct packed output,
+            // then D2D copy to staging. chunked_pack has a bug with STRING columns.
+            auto packed_probe = cudf::pack(view, stream);
+            auto total_size = packed_probe.gpu_data->size();
             size_t aligned_size = (total_size + 255) & ~255UL;
             size_t staging_offset = lgb.ReserveStagingRegion(aligned_size, staging_size);
 
             if (staging_offset + total_size <= staging_size) {
-              // Fits in staging buffer — pack into reserved region.
-              auto packer = cudf::chunked_pack::create(view, staging_size - staging_offset, stream);
-              cudf::device_span<uint8_t> dst_span(
-                reinterpret_cast<uint8_t*>(staging_addr + staging_offset), staging_size - staging_offset);
-              while (packer->has_next()) { packer->next(dst_span); }
-              auto metadata = packer->build_metadata();
+              // Fits in staging buffer — copy packed data to staging (sync).
+              cudaMemcpy(reinterpret_cast<void*>(staging_addr + staging_offset),
+                        packed_probe.gpu_data->data(), total_size,
+                        cudaMemcpyDeviceToDevice);
+              auto metadata = std::move(packed_probe.metadata);
               SIRIUS_LOG_INFO("[result_collector] broadcast batch: {} rows, {} bytes at staging+{}",
                               view.num_rows(), total_size, staging_offset);
               duckdb::PackedBroadcastEntry entry;
