@@ -494,3 +494,124 @@ TEST_CASE("debug_head on null-data batch logs warning without crashing", "[debug
   cucascade::data_batch batch(0, nullptr);
   REQUIRE_NOTHROW(sirius::debug_head(batch, 5, cudf::get_default_stream()));
 }
+
+// ---------------------------------------------------------------------------
+// Test case 15: debug_stats on numeric columns
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_stats on numeric columns produces output without throwing", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {10, 20, 30}, stream, mr);
+  auto col_i64 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
+    {100, 200, 300}, stream, mr);
+  auto col_f32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<float>>(
+    {1.5f, 2.5f, 3.5f}, stream, mr);
+  auto col_f64 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<double>>(
+    {1.11, 2.22, 3.33}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col_i32));
+  columns.push_back(std::move(col_i64));
+  columns.push_back(std::move(col_f32));
+  columns.push_back(std::move(col_f64));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(
+    sirius::debug_stats(*batch, stream, {"i32", "i64", "f32", "f64"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 16: debug_stats skips BOOL column with non-numeric note (D-08, STATS-02)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_stats skips BOOL column as non-numeric", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col_i32  = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {10, 20, 30}, stream, mr);
+  auto col_bool = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<bool>>(
+    {true, false, true}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col_i32));
+  columns.push_back(std::move(col_bool));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_stats(*batch, stream, {"nums", "flags"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 17: debug_stats on all-NULL numeric column (D-10)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_stats on all-NULL numeric column shows NULL", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  constexpr cudf::size_type num_rows = 5;
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_NULL, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // All 5 rows are null -- min, max, sum should all display as "NULL" (D-10)
+  REQUIRE_NOTHROW(sirius::debug_stats(*batch, stream, {"all_null_col"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 18: debug_stats on empty batch (D-13)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_stats on empty batch prints note without throwing", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_stats(*batch, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 19: debug_stats on null-data batch (tier guard)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_stats on null-data batch logs warning without crashing", "[debug_utils]")
+{
+  cucascade::data_batch batch(0, nullptr);
+  REQUIRE_NOTHROW(sirius::debug_stats(batch, cudf::get_default_stream()));
+}
