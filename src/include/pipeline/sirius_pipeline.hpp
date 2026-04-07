@@ -78,6 +78,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   friend class ::sirius::sirius_engine;
   friend class sirius_pipeline_build_state;
   friend class sirius_meta_pipeline;
+  friend class sirius_pipeline_converter;
 
  public:
   explicit sirius_pipeline(sirius_engine& engine);
