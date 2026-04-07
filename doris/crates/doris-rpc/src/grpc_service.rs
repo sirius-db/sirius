@@ -435,13 +435,23 @@ fn merge_fragment_plans(
         let node_types: Vec<_> = plan
             .map(|p| p.nodes.iter().map(|n| (n.node_id, n.node_type, n.num_children)).collect())
             .unwrap_or_default();
-        let dest_node_id = params
-            .fragment
-            .as_ref()
-            .and_then(|f| f.output_sink.as_ref())
-            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
-            .and_then(|s| s.stream_sink.as_ref())
-            .map(|ss| ss.dest_node_id);
+        let dest_node_ids: Vec<i32> = {
+            let sink = params.fragment.as_ref().and_then(|f| f.output_sink.as_ref());
+            match sink.map(|s| s.type_) {
+                Some(TDataSinkType::DATA_STREAM_SINK) => {
+                    sink.and_then(|s| s.stream_sink.as_ref())
+                        .map(|ss| vec![ss.dest_node_id])
+                        .unwrap_or_default()
+                }
+                Some(TDataSinkType::MULTI_CAST_DATA_STREAM_SINK) => {
+                    sink.and_then(|s| s.multi_cast_stream_sink.as_ref())
+                        .and_then(|mc| mc.sinks.as_ref())
+                        .map(|sinks| sinks.iter().map(|s| s.dest_node_id).collect())
+                        .unwrap_or_default()
+                }
+                _ => vec![],
+            }
+        };
         let sink_type = params
             .fragment
             .as_ref()
@@ -451,7 +461,7 @@ fn merge_fragment_plans(
             fragment_idx = i,
             fragment_id = ?params.fragment_id,
             ?node_types,
-            ?dest_node_id,
+            ?dest_node_ids,
             ?sink_type,
             per_exch = ?params.per_exch_num_senders,
             "merge_fragment_plans: fragment detail"
@@ -478,19 +488,29 @@ fn merge_fragment_plans(
     // it feeds. We include leaves AND intermediates because intermediate-to-intermediate
     // connections are also local (e.g. subquery fragment → main join fragment).
     // EXCHANGE nodes not in this set depend on remote BEs.
-    let extract_dest_id = |p: &TPipelineFragmentParams| {
-        p.fragment
-            .as_ref()
-            .and_then(|f| f.output_sink.as_ref())
-            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
-            .and_then(|s| s.stream_sink.as_ref())
-            .map(|ss| ss.dest_node_id)
+    let extract_dest_ids = |p: &TPipelineFragmentParams| -> Vec<i32> {
+        let sink = match p.fragment.as_ref().and_then(|f| f.output_sink.as_ref()) {
+            Some(s) => s,
+            None => return vec![],
+        };
+        match sink.type_ {
+            TDataSinkType::DATA_STREAM_SINK => {
+                sink.stream_sink.as_ref().map(|ss| vec![ss.dest_node_id]).unwrap_or_default()
+            }
+            TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => {
+                sink.multi_cast_stream_sink.as_ref()
+                    .and_then(|mc| mc.sinks.as_ref())
+                    .map(|sinks| sinks.iter().map(|s| s.dest_node_id).collect())
+                    .unwrap_or_default()
+            }
+            _ => vec![],
+        }
     };
     let leaf_dest_ids: std::collections::HashSet<i32> = leaf_fragments
         .iter()
-        .filter_map(|p| extract_dest_id(p))
-        .chain(intermediate_fragments.iter().filter_map(|p| extract_dest_id(p)))
-        .chain(exchange_root_fragments.iter().filter_map(|p| extract_dest_id(p)))
+        .flat_map(|p| extract_dest_ids(p))
+        .chain(intermediate_fragments.iter().flat_map(|p| extract_dest_ids(p)))
+        .chain(exchange_root_fragments.iter().flat_map(|p| extract_dest_ids(p)))
         .collect();
 
     // Check if any fragment has EXCHANGE nodes that can't be satisfied by local
@@ -575,14 +595,8 @@ fn merge_fragment_plans(
     let mut leaf_by_dest: std::collections::HashMap<i32, &TPipelineFragmentParams> =
         std::collections::HashMap::new();
     for leaf in &leaf_fragments {
-        if let Some(dest_node_id) = leaf
-            .fragment
-            .as_ref()
-            .and_then(|f| f.output_sink.as_ref())
-            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
-            .and_then(|s| s.stream_sink.as_ref())
-            .map(|ss| ss.dest_node_id)
-        {
+        let dest_ids = extract_dest_ids(leaf);
+        for dest_node_id in dest_ids {
             leaf_by_dest.insert(dest_node_id, leaf);
         }
     }
@@ -631,21 +645,15 @@ fn merge_fragment_plans(
 
     // Seed resolved sources from leaves.
     for leaf in &leaf_fragments {
-        if let Some(dest_node_id) = leaf
+        let dest_ids = extract_dest_ids(leaf);
+        if let Some(nodes) = leaf
             .fragment
             .as_ref()
-            .and_then(|f| f.output_sink.as_ref())
-            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
-            .and_then(|s| s.stream_sink.as_ref())
-            .map(|ss| ss.dest_node_id)
+            .and_then(|f| f.plan.as_ref())
+            .map(|p| p.nodes.clone())
         {
-            if let Some(nodes) = leaf
-                .fragment
-                .as_ref()
-                .and_then(|f| f.plan.as_ref())
-                .map(|p| p.nodes.clone())
-            {
-                resolved_sources.insert(dest_node_id, nodes);
+            for dest_node_id in dest_ids {
+                resolved_sources.insert(dest_node_id, nodes.clone());
             }
         }
     }
@@ -717,21 +725,17 @@ fn merge_fragment_plans(
                 }
 
                 // Register this fragment's merged output as a resolved source.
-                if let Some(dest_node_id) = params
-                    .fragment
-                    .as_ref()
-                    .and_then(|f| f.output_sink.as_ref())
-                    .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
-                    .and_then(|s| s.stream_sink.as_ref())
-                    .map(|ss| ss.dest_node_id)
                 {
+                    let dest_ids = extract_dest_ids(&params);
                     if let Some(nodes) = params
                         .fragment
                         .as_ref()
                         .and_then(|f| f.plan.as_ref())
                         .map(|p| p.nodes.clone())
                     {
-                        resolved_sources.insert(dest_node_id, nodes);
+                        for dest_node_id in dest_ids {
+                            resolved_sources.insert(dest_node_id, nodes.clone());
+                        }
                     }
                 }
 
@@ -785,7 +789,8 @@ fn merge_fragment_plans(
     if exchange_root_fragments.is_empty() && intermediate_fragments.len() == 1 {
         if let Some(fragment) = intermediate_fragments[0].fragment.as_mut() {
             if fragment.output_sink.as_ref()
-                .map(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+                .map(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK
+                      || s.type_ == TDataSinkType::MULTI_CAST_DATA_STREAM_SINK)
                 .unwrap_or(false)
             {
                 fragment.output_sink = None;
@@ -3464,7 +3469,7 @@ pub async fn start_grpc_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use doris_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink};
+    use doris_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink, TMultiCastDataStreamSink};
     use doris_thrift::partitions::{TDataPartition, TPartitionType};
     use doris_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType};
     use doris_thrift::types::{TNetworkAddress, TUniqueId};
@@ -4002,5 +4007,133 @@ mod tests {
     fn test_exchange_table_name_format() {
         let name = exchange_table_name(0x00FF00FF, 42);
         assert_eq!(name, "__EXCH_00ff00ff_42");
+    }
+
+    fn make_multi_cast_data_stream_sink(dest_node_ids: &[i32]) -> TDataSink {
+        let sinks: Vec<TDataStreamSink> = dest_node_ids.iter().map(|&id| {
+            TDataStreamSink {
+                dest_node_id: id,
+                output_partition: TDataPartition {
+                    type_: TPartitionType::UNPARTITIONED,
+                    partition_exprs: None,
+                    partition_infos: None,
+                },
+                ignore_not_found: None,
+                output_exprs: None,
+                output_tuple_id: None,
+                conjuncts: None,
+                runtime_filters: None,
+                tablet_sink_schema: None,
+                tablet_sink_partition: None,
+                tablet_sink_location: None,
+                tablet_sink_txn_id: None,
+                tablet_sink_tuple_id: None,
+                tablet_sink_exprs: None,
+                is_merge: None,
+            }
+        }).collect();
+        TDataSink {
+            type_: TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
+            stream_sink: None,
+            result_sink: None,
+            mysql_table_sink: None,
+            export_sink: None,
+            olap_table_sink: None,
+            memory_scratch_sink: None,
+            odbc_table_sink: None,
+            result_file_sink: None,
+            jdbc_table_sink: None,
+            multi_cast_stream_sink: Some(TMultiCastDataStreamSink {
+                sinks: Some(sinks),
+                destinations: None,
+            }),
+            hive_table_sink: None,
+            iceberg_table_sink: None,
+            dictionary_sink: None,
+            blackhole_sink: None,
+        }
+    }
+
+    /// Q15-like CTE plan with MULTI_CAST_DATA_STREAM_SINK:
+    ///
+    /// Fragment 0 (frag_id=6): TOP_N(10,1) -> HASH_JOIN(8,2) -> HASH_JOIN(11,2) ->
+    ///     AGG(12,1) -> EXCHANGE(9,0) + EXCHANGE(6,0) + EXCHANGE(5,0), RESULT_SINK
+    /// Fragment 1 (frag_id=5): AGG(3,1) -> EXCHANGE(7,0), STREAM_SINK dest=9
+    /// Fragment 2 (frag_id=2): FILE_SCAN(4,0), STREAM_SINK dest=5
+    /// Fragment 3 (frag_id=1): AGG(1,1) -> EXCHANGE(2,0),
+    ///     MULTI_CAST_DATA_STREAM_SINK sinks=[{dest=6}, {dest=7}]
+    /// Fragment 4 (frag_id=0): AGG(13,1) -> FILE_SCAN(0,0), STREAM_SINK dest=2
+    ///
+    /// After merge, all exchanges are local => should produce 1 merged fragment.
+    #[test]
+    fn test_merge_cte_multicast_five_fragments() {
+        // Fragment 0: result collector with 3 exchange nodes
+        let mut frag0 = make_params(vec![
+            make_node(10, TPlanNodeType::SORT_NODE, 1),
+            make_node(8, TPlanNodeType::HASH_JOIN_NODE, 2),
+            // Left child of hash join 8: exchange 6
+            make_node(6, TPlanNodeType::EXCHANGE_NODE, 0),
+            // Right child of hash join 8: hash join 11
+            make_node(11, TPlanNodeType::HASH_JOIN_NODE, 2),
+            // Left child of hash join 11: AGG -> exchange 9
+            make_node(12, TPlanNodeType::AGGREGATION_NODE, 1),
+            make_node(9, TPlanNodeType::EXCHANGE_NODE, 0),
+            // Right child of hash join 11: exchange 5
+            make_node(5, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        frag0.fragment_id = Some(6);
+
+        // Fragment 1: AGG -> EXCHANGE(7), sends to exchange node 9
+        let mut frag1 = make_params(vec![
+            make_node(3, TPlanNodeType::AGGREGATION_NODE, 1),
+            make_node(7, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        frag1.fragment_id = Some(5);
+        frag1.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(9));
+
+        // Fragment 2: FILE_SCAN, sends to exchange node 5
+        let mut frag2 = make_params(vec![
+            make_node(4, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        frag2.fragment_id = Some(2);
+        frag2.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(5));
+
+        // Fragment 3: AGG -> EXCHANGE(2), MULTI_CAST sends to dest=6 AND dest=7
+        let mut frag3 = make_params(vec![
+            make_node(1, TPlanNodeType::AGGREGATION_NODE, 1),
+            make_node(2, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        frag3.fragment_id = Some(1);
+        frag3.fragment.as_mut().unwrap().output_sink =
+            Some(make_multi_cast_data_stream_sink(&[6, 7]));
+
+        // Fragment 4: AGG -> FILE_SCAN, sends to exchange node 2
+        let mut frag4 = make_params(vec![
+            make_node(13, TPlanNodeType::AGGREGATION_NODE, 1),
+            make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        frag4.fragment_id = Some(0);
+        frag4.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(2));
+
+        let merged = merge_fragment_plans(&[frag0, frag1, frag2, frag3, frag4]);
+
+        // All exchanges are local (multicast covers dest 6 and 7).
+        // Should produce 1 merged fragment.
+        assert_eq!(
+            merged.len(), 1,
+            "CTE multicast plan should merge into 1 fragment, got {}",
+            merged.len()
+        );
+
+        // Verify no EXCHANGE_NODE remains in merged plan.
+        let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
+        let exchange_count = plan.nodes.iter()
+            .filter(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0)
+            .count();
+        assert_eq!(
+            exchange_count, 0,
+            "merged plan should have no unresolved EXCHANGE_NODEs, got {}",
+            exchange_count
+        );
     }
 }
