@@ -59,9 +59,9 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_mem
   sirius::converter_registry::reset_for_testing();
 
   cucascade::memory::reservation_manager_configurator builder;
-  const size_t gpu_capacity  = 2ull << 30;
-  const double limit_ratio   = 0.75;
-  const size_t host_capacity = 4ull << 30;
+  const size_t gpu_capacity  = 2ull << 30;  // 2GB
+  const double limit_ratio   = 0.75;        // 75% of GPU capacity
+  const size_t host_capacity = 4ull << 30;  // 4GB
 
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
@@ -121,11 +121,12 @@ downgrade_executor make_test_executor(cucascade::shared_data_repository_manager&
 
 TEST_CASE("start_stop_cycle", "[downgrade_lifecycle]")
 {
-  auto mem_mgr = make_test_memory_manager();
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
   cucascade::shared_data_repository_manager repo_mgr;
 
   // nullptr memory_space -- monitor loop won't trigger
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
 
   // First start/stop cycle
   REQUIRE_NOTHROW(executor.start());
@@ -378,10 +379,11 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
 
 TEST_CASE("stop_cancels_pending_requests", "[downgrade_lifecycle]")
 {
-  auto mem_mgr = make_test_memory_manager();
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
   cucascade::shared_data_repository_manager repo_mgr;
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   // Enqueue several requests then immediately stop.
@@ -409,10 +411,11 @@ TEST_CASE("stop_cancels_pending_requests", "[downgrade_lifecycle]")
 
 TEST_CASE("drain_cancels_pending_requests_with_exception", "[downgrade_lifecycle]")
 {
-  auto mem_mgr = make_test_memory_manager();
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
   cucascade::shared_data_repository_manager repo_mgr;
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   std::vector<std::future<size_t>> futures;

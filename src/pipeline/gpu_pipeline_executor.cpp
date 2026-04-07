@@ -32,7 +32,7 @@
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
-
+#include <mutex>
 namespace sirius {
 namespace pipeline {
 
@@ -113,7 +113,7 @@ void gpu_pipeline_executor::manager_loop()
     } else if (reservation->size() < bytes_needs && _downgrade_executor) {
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
-      size_t target_bytes = std::max(static_cast<size_t>(shortfall * 1.25), bytes_needs / 4);
+      size_t target_bytes = std::max(shortfall + shortfall / 4, bytes_needs / 4);
 
       SIRIUS_LOG_DEBUG(
         "GPU Pipeline Executor: requested reservation size {} but only got {} bytes, reservation "

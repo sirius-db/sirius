@@ -49,7 +49,13 @@ void downgrade_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
 
-  cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+  if (_memory_space) {
+    auto device_id = _memory_space->get_device_id();
+    cudaSetDevice(device_id);
+    cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+  } else {
+    cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+  }
 
   _request_queue.reactivate();
 

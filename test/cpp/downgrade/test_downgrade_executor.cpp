@@ -120,11 +120,12 @@ downgrade_executor make_test_executor(cucascade::shared_data_repository_manager&
 
 TEST_CASE("Downgrade executor starts and stops cleanly", "[downgrade_executor]")
 {
-  auto mem_mgr = make_test_memory_manager();
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
   cucascade::shared_data_repository_manager repo_mgr;
 
   // nullptr memory_space — monitor loop won't trigger, just tests lifecycle
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -132,10 +133,11 @@ TEST_CASE("Downgrade executor starts and stops cleanly", "[downgrade_executor]")
 
 TEST_CASE("request_free_memory_and_wait with no repositories returns 0", "[downgrade_executor]")
 {
-  auto mem_mgr = make_test_memory_manager();
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
   cucascade::shared_data_repository_manager repo_mgr;
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1024);
@@ -181,7 +183,7 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
   REQUIRE(batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
@@ -213,7 +215,7 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
   size_t one_batch_size = batches[0]->get_data()->get_size_in_bytes();
   REQUIRE(one_batch_size > 0);
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(one_batch_size);
@@ -256,7 +258,7 @@ TEST_CASE("request_free_memory prioritizes partitioned repos over non-partitione
 
   size_t one_batch_size = batch_p0->get_data()->get_size_in_bytes();
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(one_batch_size);
@@ -289,7 +291,7 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
 
   size_t two_batches = batch_p0->get_data()->get_size_in_bytes() * 2;
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(two_batches);
@@ -323,7 +325,7 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
 
   size_t three_batches = batch_p0->get_data()->get_size_in_bytes() * 3;
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(three_batches);
@@ -366,7 +368,7 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
 
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
@@ -390,7 +392,7 @@ TEST_CASE("request_free_memory returns future that resolves to bytes freed", "[d
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   auto future  = executor.request_free_memory(1ull << 30);
@@ -419,7 +421,7 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
 
   std::atomic<size_t> call_count{0};
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   // Predicate returns true on first call — should stop after ~1 batch
@@ -456,7 +458,7 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_mgr, nullptr, *mem_mgr);
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
 
   // Request far more than available
