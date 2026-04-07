@@ -1,6 +1,6 @@
 # Phase 2: Numeric Row Preview and Column Statistics - Context
 
-**Gathered:** 2026-04-06
+**Gathered:** 2026-04-06 (updated 2026-04-06)
 **Status:** Ready for planning
 
 <domain>
@@ -28,6 +28,9 @@ Implement `debug_head(batch, N, stream)` for numeric types with aligned-column a
 - **D-08:** Non-numeric columns show `(non-numeric, skipped)` in the stats table
 - **D-09:** Min/max/sum only — no count or mean (count is in the header, mean is derivable). Keeps output compact and GPU reduce calls minimal
 - **D-10:** All-NULL numeric columns show `NULL` for min, max, and sum — follows SQL standard semantics (`SUM/MIN/MAX` of all NULLs = NULL)
+
+### GPU-to-Host Data Transfer
+- **D-14:** Bulk copy per column: one `cudaMemcpyAsync` per column after `cudf::slice`, issue all async copies first, then a single `stream.synchronize()` at the end — avoids per-column sync overhead
 
 ### Error Edge Cases
 - **D-11:** No cap on N — trust the caller. Try/catch wrapping handles OOM gracefully
