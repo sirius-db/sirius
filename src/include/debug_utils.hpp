@@ -75,4 +75,46 @@ void debug_nulls(cucascade::data_batch const& batch,
                  rmm::cuda_stream_view stream,
                  std::vector<std::string> const& col_names = {});
 
+/**
+ * @brief Output format for debug_head row display.
+ */
+enum class DebugFormat { ALIGNED, CSV };
+
+/**
+ * @brief Log the first N rows of a data batch as [SIRIUS_DIAG] output.
+ *
+ * Copies only the first N rows from GPU to host (via cudf::slice zero-copy
+ * view) and formats them in either fixed-width aligned columns or CSV.
+ * Supports all numeric types (INT8-64, UINT8-64, FLOAT32/64) and BOOL8.
+ * Unsupported types (STRING, DECIMAL, TIMESTAMP, DATE) display as
+ * "(unsupported)" -- full type support is added in Phase 3.
+ *
+ * @param batch     The data batch to inspect (must be in GPU tier)
+ * @param n         Number of rows to display (clamped to actual row count)
+ * @param stream    CUDA stream for device-to-host copies
+ * @param format    Output format: ALIGNED (default) or CSV
+ * @param col_names Optional column names (falls back to col[N])
+ */
+void debug_head(cucascade::data_batch const& batch,
+                cudf::size_type n,
+                rmm::cuda_stream_view stream,
+                DebugFormat format = DebugFormat::ALIGNED,
+                std::vector<std::string> const& col_names = {});
+
+/**
+ * @brief Log per-column min, max, sum statistics as [SIRIUS_DIAG] output.
+ *
+ * Computes statistics entirely on GPU using cudf::minmax and cudf::reduce.
+ * No full column data is copied to host. Numeric columns (INT8-64, UINT8-64,
+ * FLOAT32/64) show min, max, and sum. Non-numeric columns (BOOL, STRING,
+ * DECIMAL, TIMESTAMP, DATE) display as "(non-numeric, skipped)".
+ *
+ * @param batch     The data batch to inspect (must be in GPU tier)
+ * @param stream    CUDA stream for GPU reduction operations
+ * @param col_names Optional column names (falls back to col[N])
+ */
+void debug_stats(cucascade::data_batch const& batch,
+                 rmm::cuda_stream_view stream,
+                 std::vector<std::string> const& col_names = {});
+
 }  // namespace sirius
