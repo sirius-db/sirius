@@ -445,8 +445,22 @@ pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
             .unwrap_or(0),
         Some(rel::RelType::Join(join)) => {
             let left = join.left.as_deref().map(count_rel_columns).unwrap_or(0);
-            let right = join.right.as_deref().map(count_rel_columns).unwrap_or(0);
-            left + right
+            // SEMI/ANTI joins output only the left side's columns.
+            let is_semi_anti = matches!(
+                join_rel::JoinType::try_from(join.r#type).ok(),
+                Some(
+                    join_rel::JoinType::LeftSemi
+                        | join_rel::JoinType::RightSemi
+                        | join_rel::JoinType::LeftAnti
+                        | join_rel::JoinType::RightAnti
+                )
+            );
+            if is_semi_anti {
+                left
+            } else {
+                let right = join.right.as_deref().map(count_rel_columns).unwrap_or(0);
+                left + right
+            }
         }
         Some(rel::RelType::Cross(cross)) => {
             let left = cross.left.as_deref().map(count_rel_columns).unwrap_or(0);
@@ -464,6 +478,21 @@ pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
                 .map(|g| g.grouping_expressions.len())
                 .unwrap_or(0);
             groups + agg.measures.len()
+        }
+        Some(rel::RelType::Project(proj)) => {
+            let input_cols = proj
+                .input
+                .as_deref()
+                .map(count_rel_columns)
+                .unwrap_or(0);
+            // Check for Emit mapping which selects a subset of columns.
+            if let Some(common) = &proj.common {
+                if let Some(rel_common::EmitKind::Emit(emit)) = &common.emit_kind {
+                    return emit.output_mapping.len();
+                }
+            }
+            // Without Emit: output = input columns + expression columns.
+            input_cols + proj.expressions.len()
         }
         Some(rel::RelType::Set(set)) => {
             // UNION ALL: output columns = first input's columns.
@@ -506,12 +535,24 @@ pub(crate) fn collect_rel_column_names(rel: &Rel) -> Vec<String> {
                 .as_deref()
                 .map(collect_rel_column_names)
                 .unwrap_or_default();
-            names.extend(
-                join.right
-                    .as_deref()
-                    .map(collect_rel_column_names)
-                    .unwrap_or_default(),
+            // SEMI/ANTI joins output only the left side's columns.
+            let is_semi_anti = matches!(
+                join_rel::JoinType::try_from(join.r#type).ok(),
+                Some(
+                    join_rel::JoinType::LeftSemi
+                        | join_rel::JoinType::RightSemi
+                        | join_rel::JoinType::LeftAnti
+                        | join_rel::JoinType::RightAnti
+                )
             );
+            if !is_semi_anti {
+                names.extend(
+                    join.right
+                        .as_deref()
+                        .map(collect_rel_column_names)
+                        .unwrap_or_default(),
+                );
+            }
             names
         }
         Some(rel::RelType::Cross(cross)) => {
@@ -656,8 +697,19 @@ fn translate_hash_join_node(
         .context("HASH_JOIN_NODE missing hash_join_node data")?;
 
     let mut iter = children.into_iter();
-    let left = iter.next().unwrap();
-    let right = iter.next().unwrap();
+    let orig_left = iter.next().unwrap();
+    let orig_right = iter.next().unwrap();
+
+    // Rewrite RIGHT_SEMI/RIGHT_ANTI → LEFT_SEMI/LEFT_ANTI by swapping children.
+    // DuckDB's Substrait consumer handles LEFT_SEMI natively; RIGHT variants need
+    // the swap so that the probe side (right in Doris) becomes the left in Substrait.
+    let is_right_semi_or_anti = hash_join.join_op == TJoinOp::RIGHT_SEMI_JOIN
+        || hash_join.join_op == TJoinOp::RIGHT_ANTI_JOIN;
+    let (left, right) = if is_right_semi_or_anti {
+        (orig_right, orig_left) // swap children
+    } else {
+        (orig_left, orig_right)
+    };
 
     // Count left-side output columns for right-side field reference offsetting.
     // In a Substrait JoinRel, the combined schema is [left_cols | right_cols].
@@ -674,17 +726,25 @@ fn translate_hash_join_node(
     let mut conditions: Vec<Expression> = Vec::new();
 
     for eq_cond in &hash_join.eq_join_conjuncts {
+        // For RIGHT_SEMI/ANTI, Doris's eq_cond.left/right are relative to the
+        // ORIGINAL (pre-swap) children. After swapping, Doris's "left" is now our
+        // "right" and vice versa.
+        let (doris_left_expr, doris_right_expr) = if is_right_semi_or_anti {
+            (&eq_cond.right, &eq_cond.left) // swap eq sides too
+        } else {
+            (&eq_cond.left, &eq_cond.right)
+        };
         // Left side: resolve using the left Rel's column names.
         if !left_col_names.is_empty() {
             desc.set_child_rel_column_names(left_col_names.clone());
         }
-        let left_expr = expr_translator::translate_expr(&eq_cond.left, desc, registry)?;
+        let left_expr = expr_translator::translate_expr(doris_left_expr, desc, registry)?;
         desc.clear_child_rel_column_names();
         // Right side: resolve using the right Rel's column names, then offset.
         if !right_col_names.is_empty() {
             desc.set_child_rel_column_names(right_col_names.clone());
         }
-        let mut right_expr = expr_translator::translate_expr(&eq_cond.right, desc, registry)?;
+        let mut right_expr = expr_translator::translate_expr(doris_right_expr, desc, registry)?;
         desc.clear_child_rel_column_names();
         expr_translator::offset_field_refs(&mut right_expr, left_col_count);
         conditions.push(expr_translator::make_scalar_fn(
@@ -694,9 +754,18 @@ fn translate_hash_join_node(
         ));
     }
 
-    // Add vother_join_conjunct if present.
-    let post_join_filter = if let Some(other) = &hash_join.vother_join_conjunct {
-        // Set combined column names for cross-table expressions.
+    // Translate vother_join_conjunct if present.
+    // For SEMI/ANTI joins: merge into the main expression (no post_join_filter).
+    // For other joins: keep as post_join_filter for correct OUTER join semantics.
+    let is_semi_or_anti = matches!(
+        hash_join.join_op,
+        TJoinOp::LEFT_SEMI_JOIN
+            | TJoinOp::RIGHT_SEMI_JOIN
+            | TJoinOp::LEFT_ANTI_JOIN
+            | TJoinOp::RIGHT_ANTI_JOIN
+    );
+    let mut post_join_filter = None;
+    if let Some(other) = &hash_join.vother_join_conjunct {
         let mut combined = left_col_names;
         combined.extend(right_col_names);
         if !combined.is_empty() {
@@ -704,12 +773,26 @@ fn translate_hash_join_node(
         }
         let expr = expr_translator::translate_expr(other, desc, registry)?;
         desc.clear_child_rel_column_names();
-        Some(expr)
-    } else {
-        None
-    };
+        if is_semi_or_anti {
+            // Merge into join condition — semantically correct for SEMI/ANTI.
+            conditions.push(expr);
+        } else {
+            post_join_filter = Some(expr);
+        }
+    }
 
     let expression = and_expressions(conditions, registry);
+
+    // Map join type, converting RIGHT variants to LEFT after the swap.
+    let join_type = if is_right_semi_or_anti {
+        if hash_join.join_op == TJoinOp::RIGHT_SEMI_JOIN {
+            join_rel::JoinType::LeftSemi as i32
+        } else {
+            join_rel::JoinType::LeftAnti as i32
+        }
+    } else {
+        map_join_type(&hash_join.join_op)
+    };
 
     let join_rel = Rel {
         rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
@@ -717,7 +800,7 @@ fn translate_hash_join_node(
             right: Some(Box::new(right)),
             expression: expression.map(Box::new),
             post_join_filter: post_join_filter.map(Box::new),
-            r#type: map_join_type(&hash_join.join_op),
+            r#type: join_type,
             ..Default::default()
         }))),
     };
