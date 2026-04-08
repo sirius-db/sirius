@@ -738,8 +738,20 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionSubstraitBind(ClientContex
   result->substrait_blob = serialized;
   result->query = "-- substrait plan (no SQL fallback available)";
 
-  for (auto& column : planner.names) {
-    names.emplace_back(column);
+  // Deduplicate column names: DuckDB table functions reject duplicate names.
+  // Multi-table joins can produce duplicates (e.g., self-joins or AGG plans
+  // where the planner derives non-unique names from intermediate nodes).
+  {
+    std::unordered_map<std::string, int> name_counts;
+    for (auto& column : planner.names) {
+      auto& count = name_counts[column];
+      if (count == 0) {
+        names.emplace_back(column);
+      } else {
+        names.emplace_back(column + "_" + std::to_string(count));
+      }
+      count++;
+    }
   }
   for (auto& type : planner.types) {
     return_types.emplace_back(type);
