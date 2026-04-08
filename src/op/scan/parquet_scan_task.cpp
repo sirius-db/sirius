@@ -38,11 +38,6 @@
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 
 // cudf
-#include "cucascade/data/cpu_data_representation.hpp"
-#include "cucascade/data/gpu_data_representation.hpp"
-#include "cudf/cudf_utils.hpp"
-#include "data/cached_data_representation.hpp"
-
 #include <cudf/ast/expressions.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/io/datasource.hpp>
@@ -230,7 +225,6 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _scan_op(scan_op),
     _approximate_batch_size(approximate_batch_size),
-    _is_projected(!selected_column_indices.empty()),
     _file_paths(std::move(file_paths))
 {
   if (_file_paths.empty()) {

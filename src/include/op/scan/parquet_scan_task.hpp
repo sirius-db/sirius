@@ -189,17 +189,6 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   }
 
   /**
-   * @brief Get the row group range metadata associated with the given partition.
-   *
-   * @param[in] idx The row group partition index.
-   * @return The row group range metadata associated with the given partition.
-   */
-  [[nodiscard]] row_group_range const& get_row_group_partition(std::size_t idx) const
-  {
-    return _row_group_partitions[idx];
-  }
-
-  /**
    * @brief Make a hybrid scan Parquet reader with the underlying reader options.
    *
    * Each task/data batch will need its own reader for concurrency reasons.
@@ -338,7 +327,6 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   //===----------Fields----------===//
   std::size_t _approximate_batch_size;     ///< Target approximate batch size for scan tasks
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
-  bool _is_projected;                      ///< Whether projection is applied
 
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata

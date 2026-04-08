@@ -107,11 +107,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   // For parquet scan pipelines, filter and projection are already applied in
   // parquet_scan_task and the host_parquet_representation converters.
-  if (passthrough) {
-    std::vector<std::shared_ptr<cucascade::data_batch>> output_batches(raw_input_batches.begin(),
-                                                                       raw_input_batches.end());
-    return std::make_unique<operator_data>(output_batches);
-  }
+  // Also, only parquet file tails are small due to the partitioning logic, so batch concatenation
+  // is not needed.
+  if (passthrough) { return std::make_unique<operator_data>(raw_input_batches); }
 
   // Build the column_ids index → batch position mapping once.
   // Both filter expression construction and post-filter projection use this.
