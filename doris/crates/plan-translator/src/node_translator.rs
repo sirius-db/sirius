@@ -954,24 +954,138 @@ fn translate_hash_join_node(
     );
     if is_semi_or_anti_op {
         if let Some(other_conjuncts) = &hash_join.other_join_conjuncts {
-            // Use node's row_tuples for resolution — they span both sides and
-            // slot_global_index uses parent_tuple_id to distinguish left from right
-            // (critical for self-joins where column names are duplicated).
-            let row_tuples = &node.row_tuples;
-            let mut combined = left_col_names.clone();
-            combined.extend(right_col_names.clone());
-            if !combined.is_empty() {
-                desc.set_child_rel_column_names(combined);
+            if needs_swap {
+                // For swapped RIGHT→LEFT joins, resolve each SLOT_REF separately
+                // to handle self-joins (duplicate column names).
+                //
+                // After swap: our left = Doris's right, our right = Doris's left.
+                // Determine which Doris side each SLOT_REF belongs to via eq_join_conjuncts.
+                let doris_left_tuples: std::collections::HashSet<i32> = hash_join
+                    .eq_join_conjuncts
+                    .iter()
+                    .filter_map(|eq| {
+                        eq.left.nodes.first().and_then(|n| {
+                            n.slot_ref.as_ref().and_then(|sr| {
+                                desc.get_slot(sr.slot_id).ok().map(|s| s.parent_tuple_id)
+                            })
+                        })
+                    })
+                    .collect();
+
+                for conj in other_conjuncts {
+                    // Resolve each SLOT_REF individually based on which side it belongs to.
+                    // Doris's left tuples → our right (needs offset by left_col_count).
+                    // Doris's right tuples → our left (no offset needed).
+                    let mut conditions_for_conj = Vec::new();
+                    for node in &conj.nodes {
+                        if node.node_type == TExprNodeType::SLOT_REF {
+                            if let Some(sr) = &node.slot_ref {
+                                if let Ok(slot) = desc.get_slot(sr.slot_id) {
+                                    let is_doris_left =
+                                        doris_left_tuples.contains(&slot.parent_tuple_id);
+                                    if is_doris_left {
+                                        // Doris left → our right after swap.
+                                        // Resolve against right_col_names + offset.
+                                        if !right_col_names.is_empty() {
+                                            desc.set_child_rel_column_names(
+                                                right_col_names.clone(),
+                                            );
+                                        }
+                                    } else {
+                                        // Doris right → our left after swap.
+                                        if !left_col_names.is_empty() {
+                                            desc.set_child_rel_column_names(
+                                                left_col_names.clone(),
+                                            );
+                                        }
+                                    }
+                                    let single_expr = TExpr {
+                                        nodes: vec![node.clone()],
+                                    };
+                                    let mut resolved = expr_translator::translate_expr(
+                                        &single_expr,
+                                        desc,
+                                        registry,
+                                    )?;
+                                    desc.clear_child_rel_column_names();
+                                    if is_doris_left {
+                                        expr_translator::offset_field_refs(
+                                            &mut resolved,
+                                            left_col_count,
+                                        );
+                                    }
+                                    conditions_for_conj.push(resolved);
+                                }
+                            }
+                        }
+                    }
+                    // Log the resolved refs.
+                    fn get_refs(e: &Expression) -> Vec<i32> {
+                        let mut r = Vec::new();
+                        if let Some(expression::RexType::Selection(s)) = e.rex_type.as_ref() {
+                            if let Some(field_reference::ReferenceType::DirectReference(seg)) = s.reference_type.as_ref() {
+                                if let Some(reference_segment::ReferenceType::StructField(sf)) = seg.reference_type.as_ref() {
+                                    r.push(sf.field);
+                                }
+                            }
+                        }
+                        r
+                    }
+                    let resolved_refs: Vec<i32> = conditions_for_conj.iter().flat_map(get_refs).collect();
+                    tracing::warn!(
+                        doris_left_tuples = ?doris_left_tuples,
+                        resolved_refs = ?resolved_refs,
+                        left_col_count,
+                        "other_join_conjunct resolved refs for swapped SEMI/ANTI"
+                    );
+
+                    // Build the expression from the resolved SLOT_REFs.
+                    // For a simple binary expression like `ne(a, b)`, wrap in the function.
+                    if conditions_for_conj.len() == 2 {
+                        // Find the function name from the root node.
+                        if let Some(first) = conj.nodes.first() {
+                            if first.node_type == TExprNodeType::FUNCTION_CALL
+                                || first.node_type == TExprNodeType::BINARY_PRED
+                            {
+                                if let Some(fn_) = &first.fn_ {
+                                    // Map Doris function names to Substrait names.
+                                    let (uri, substrait_name) = match fn_.name.function_name.as_str() {
+                                        "ne" => (crate::URI_COMPARISON, "not_equal"),
+                                        "eq" => (crate::URI_COMPARISON, "equal"),
+                                        "lt" => (crate::URI_COMPARISON, "lt"),
+                                        "le" => (crate::URI_COMPARISON, "lte"),
+                                        "gt" => (crate::URI_COMPARISON, "gt"),
+                                        "ge" => (crate::URI_COMPARISON, "gte"),
+                                        other => (crate::URI_COMPARISON, other),
+                                    };
+                                    let anchor = registry.register_function(
+                                        uri,
+                                        substrait_name,
+                                    );
+                                    let expr = expr_translator::make_scalar_fn(
+                                        anchor,
+                                        conditions_for_conj,
+                                        expr_translator::bool_type(),
+                                    );
+                                    conditions.push(expr);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No swap: resolve normally using combined names.
+                let mut combined = left_col_names.clone();
+                combined.extend(right_col_names.clone());
+                if !combined.is_empty() {
+                    desc.set_child_rel_column_names(combined);
+                }
+                for conj in other_conjuncts {
+                    let expr = expr_translator::translate_expr(conj, desc, registry)?;
+                    conditions.push(expr);
+                }
+                desc.clear_child_rel_column_names();
             }
-            for conj in other_conjuncts {
-                let expr = if !row_tuples.is_empty() {
-                    expr_translator::translate_expr_in_context(conj, desc, registry, row_tuples)?
-                } else {
-                    expr_translator::translate_expr(conj, desc, registry)?
-                };
-                conditions.push(expr);
-            }
-            desc.clear_child_rel_column_names();
         }
     }
 

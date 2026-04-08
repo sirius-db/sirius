@@ -650,6 +650,71 @@ pub fn offset_field_refs(expr: &mut Expression, offset: usize) {
     }
 }
 
+/// Remap field references after swapping join children.
+///
+/// Original schema: [orig_left(orig_left_count) | orig_right(orig_right_count)]
+/// Swapped schema:  [orig_right(orig_right_count) | orig_left(orig_left_count)]
+///
+/// A field ref i in original maps to:
+///   if i < orig_left_count:  i + orig_right_count  (was left, now right side)
+///   else:                    i - orig_left_count    (was right, now left side)
+pub fn remap_field_refs(expr: &mut Expression, orig_left_count: usize, orig_right_count: usize) {
+    match &mut expr.rex_type {
+        Some(expression::RexType::Selection(ref mut field_ref)) => {
+            if let Some(field_reference::ReferenceType::DirectReference(ref mut seg)) =
+                field_ref.reference_type
+            {
+                if let Some(reference_segment::ReferenceType::StructField(ref mut sf)) =
+                    seg.reference_type
+                {
+                    let idx = sf.field as usize;
+                    sf.field = if idx < orig_left_count {
+                        (idx + orig_right_count) as i32
+                    } else {
+                        (idx - orig_left_count) as i32
+                    };
+                }
+            }
+        }
+        Some(expression::RexType::ScalarFunction(ref mut func)) => {
+            for arg in &mut func.arguments {
+                if let Some(substrait::proto::function_argument::ArgType::Value(ref mut e)) =
+                    arg.arg_type
+                {
+                    remap_field_refs(e, orig_left_count, orig_right_count);
+                }
+            }
+        }
+        Some(expression::RexType::Cast(ref mut cast)) => {
+            if let Some(ref mut input) = cast.input {
+                remap_field_refs(input, orig_left_count, orig_right_count);
+            }
+        }
+        Some(expression::RexType::SingularOrList(ref mut list)) => {
+            if let Some(ref mut value) = list.value {
+                remap_field_refs(value, orig_left_count, orig_right_count);
+            }
+            for opt in &mut list.options {
+                remap_field_refs(opt, orig_left_count, orig_right_count);
+            }
+        }
+        Some(expression::RexType::IfThen(ref mut if_then)) => {
+            for clause in &mut if_then.ifs {
+                if let Some(ref mut cond) = clause.r#if {
+                    remap_field_refs(cond, orig_left_count, orig_right_count);
+                }
+                if let Some(ref mut then) = clause.then {
+                    remap_field_refs(then, orig_left_count, orig_right_count);
+                }
+            }
+            if let Some(ref mut else_expr) = if_then.r#else {
+                remap_field_refs(else_expr, orig_left_count, orig_right_count);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
