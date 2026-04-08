@@ -874,11 +874,10 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
                    params->max_build_hash_table_bytes);
 }
 
-static void SetEnableTransparentExecution(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::ENABLE_TRANSPARENT_EXECUTION = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_TRANSPARENT_EXECUTION to {}",
-                   Config::ENABLE_TRANSPARENT_EXECUTION);
+  Config::ENABLE_GPU_EXECUTION = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_GPU_EXECUTION to {}", Config::ENABLE_GPU_EXECUTION);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -1029,11 +1028,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             SetMaxBuildHashTableBytes);
 
   config.AddExtensionOption(
-    "sirius_transparent_execution",
+    "gpu_execution",
     "Whether to transparently intercept SQL queries and execute them on GPU",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_TRANSPARENT_EXECUTION),
-    SetEnableTransparentExecution);
+    Value::BOOLEAN(Config::ENABLE_GPU_EXECUTION),
+    SetEnableGpuExecution);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

@@ -115,7 +115,7 @@ class GPUExecutionFixtureBase {
                           std::optional<float> float_tolerance = std::nullopt)
   {
     // Enable transparent GPU execution
-    con->Query("SET sirius_transparent_execution = true;");
+    con->Query("SET gpu_execution = true;");
 
     // Run on GPU (transparent — plain SQL goes through Sirius optimizer hook)
     auto gpu_result = con->Query(query);
@@ -126,9 +126,9 @@ class GPUExecutionFixtureBase {
     REQUIRE_FALSE(gpu_result->HasError());
 
     // Run on CPU (disable transparent execution)
-    con->Query("SET sirius_transparent_execution = false;");
+    con->Query("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
-    con->Query("SET sirius_transparent_execution = true;");
+    con->Query("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 

@@ -150,7 +150,7 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_transparent_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
+| `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
 
 ### Debug
 

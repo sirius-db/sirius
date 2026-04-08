@@ -85,9 +85,9 @@ def execute_query(con, query_num, use_gpu=False, warmup=False, verify_mode=False
 
     # Toggle transparent GPU execution
     if use_gpu:
-        con.execute("SET sirius_transparent_execution = true;")
+        con.execute("SET gpu_execution = true;")
     else:
-        con.execute("SET sirius_transparent_execution = false;")
+        con.execute("SET gpu_execution = false;")
 
     result = con.execute(sql)
 

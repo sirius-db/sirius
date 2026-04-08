@@ -73,7 +73,7 @@ struct Config {
   static int LOG_FLUSH_SECONDS;
 
   // Whether to transparently intercept SQL and execute on GPU
-  static bool ENABLE_TRANSPARENT_EXECUTION;
+  static bool ENABLE_GPU_EXECUTION;
 };
 
 }  // namespace duckdb

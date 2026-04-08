@@ -28,7 +28,7 @@ namespace sirius::transparent {
 void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
-  if (!duckdb::Config::ENABLE_TRANSPARENT_EXECUTION) { return; }
+  if (!duckdb::Config::ENABLE_GPU_EXECUTION) { return; }
 
   auto& context = input.context;
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -44,7 +44,7 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
-  if (!duckdb::Config::ENABLE_TRANSPARENT_EXECUTION) { return; }
+  if (!duckdb::Config::ENABLE_GPU_EXECUTION) { return; }
 
   auto& context = input.context;
 

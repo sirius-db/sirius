@@ -48,7 +48,7 @@ class TransparentExecutionFixture {
     }
 
     // Enable transparent execution.
-    con->Query("SET sirius_transparent_execution = true;");
+    con->Query("SET gpu_execution = true;");
   }
 
   /// Run a query via plain SQL (transparent GPU path) and via CPU, compare results.
@@ -63,9 +63,9 @@ class TransparentExecutionFixture {
     REQUIRE_FALSE(gpu_result->HasError());
 
     // Disable transparent execution and run on CPU.
-    con->Query("SET sirius_transparent_execution = false;");
+    con->Query("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
-    con->Query("SET sirius_transparent_execution = true;");
+    con->Query("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
@@ -147,11 +147,11 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
                  "[transparent][integration]")
 {
   // When disabled, queries should still work (CPU path).
-  con->Query("SET sirius_transparent_execution = false;");
+  con->Query("SET gpu_execution = false;");
   con->Query("CREATE TABLE test_off AS SELECT i AS id FROM range(10) t(i);");
   auto result = con->Query("SELECT * FROM test_off ORDER BY id;");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 10);
-  con->Query("SET sirius_transparent_execution = true;");
+  con->Query("SET gpu_execution = true;");
 }
