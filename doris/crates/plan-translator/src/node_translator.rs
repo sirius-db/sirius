@@ -869,8 +869,34 @@ fn translate_hash_join_node(
         .context("HASH_JOIN_NODE missing hash_join_node data")?;
 
     let mut iter = children.into_iter();
-    let left = iter.next().unwrap();
-    let right = iter.next().unwrap();
+    let orig_left = iter.next().unwrap();
+    let orig_right = iter.next().unwrap();
+
+    // Rewrite RIGHT_SEMI/RIGHT_ANTI → LEFT_SEMI/LEFT_ANTI by swapping children.
+    // DuckDB doesn't support RIGHT_SEMI/ANTI with non-equality conditions, and
+    // some query patterns also fail with pure equality RIGHT_SEMI/ANTI.
+    let needs_swap = matches!(
+        hash_join.join_op,
+        TJoinOp::RIGHT_SEMI_JOIN | TJoinOp::RIGHT_ANTI_JOIN
+    );
+    let (left, right) = if needs_swap {
+        (orig_right, orig_left)
+    } else {
+        (orig_left, orig_right)
+    };
+
+    // Debug: dump hash join fields.
+    tracing::warn!(
+        join_op = ?hash_join.join_op,
+        num_eq = hash_join.eq_join_conjuncts.len(),
+        has_other = hash_join.other_join_conjuncts.is_some(),
+        num_other = hash_join.other_join_conjuncts.as_ref().map(|v| v.len()).unwrap_or(0),
+        has_vother = hash_join.vother_join_conjunct.is_some(),
+        num_conjuncts = node.conjuncts.as_ref().map(|c| c.len()).unwrap_or(0),
+        is_mark = hash_join.is_mark,
+        num_mark_conjuncts = hash_join.mark_join_conjuncts.as_ref().map(|v| v.len()).unwrap_or(0),
+        "HASH_JOIN fields"
+    );
 
     // Count left-side output columns for right-side field reference offsetting.
     // In a Substrait JoinRel, the combined schema is [left_cols | right_cols].
@@ -888,17 +914,23 @@ fn translate_hash_join_node(
     let mut conditions: Vec<Expression> = Vec::new();
 
     for eq_cond in &hash_join.eq_join_conjuncts {
+        // When children are swapped, Doris's "left" is our "right" and vice versa.
+        let (doris_left, doris_right) = if needs_swap {
+            (&eq_cond.right, &eq_cond.left)
+        } else {
+            (&eq_cond.left, &eq_cond.right)
+        };
         // Left side: resolve using the left Rel's column names.
         if !left_col_names.is_empty() {
             desc.set_child_rel_column_names(left_col_names.clone());
         }
-        let left_expr = expr_translator::translate_expr(&eq_cond.left, desc, registry)?;
+        let left_expr = expr_translator::translate_expr(doris_left, desc, registry)?;
         desc.clear_child_rel_column_names();
         // Right side: resolve using the right Rel's column names, then offset.
         if !right_col_names.is_empty() {
             desc.set_child_rel_column_names(right_col_names.clone());
         }
-        let mut right_expr = expr_translator::translate_expr(&eq_cond.right, desc, registry)?;
+        let mut right_expr = expr_translator::translate_expr(doris_right, desc, registry)?;
         desc.clear_child_rel_column_names();
         expr_translator::offset_field_refs(&mut right_expr, left_col_count);
         conditions.push(expr_translator::make_scalar_fn(
@@ -910,18 +942,37 @@ fn translate_hash_join_node(
 
     // Translate other_join_conjuncts (list) if present. These are non-equality
     // conditions like `l1.l_suppkey <> l2.l_suppkey` for EXISTS/NOT EXISTS.
-    // Always merge into the join expression (they reference both sides).
-    if let Some(other_conjuncts) = &hash_join.other_join_conjuncts {
-        let mut combined = left_col_names.clone();
-        combined.extend(right_col_names.clone());
-        if !combined.is_empty() {
-            desc.set_child_rel_column_names(combined);
+    // Only merge into the join expression for SEMI/ANTI joins (where they
+    // reference both sides and can't be in a FilterRel).
+    // For other joins, the vother_join_conjunct path handles cross-table filters.
+    let is_semi_or_anti_op = matches!(
+        hash_join.join_op,
+        TJoinOp::LEFT_SEMI_JOIN
+            | TJoinOp::RIGHT_SEMI_JOIN
+            | TJoinOp::LEFT_ANTI_JOIN
+            | TJoinOp::RIGHT_ANTI_JOIN
+    );
+    if is_semi_or_anti_op {
+        if let Some(other_conjuncts) = &hash_join.other_join_conjuncts {
+            // Use node's row_tuples for resolution — they span both sides and
+            // slot_global_index uses parent_tuple_id to distinguish left from right
+            // (critical for self-joins where column names are duplicated).
+            let row_tuples = &node.row_tuples;
+            let mut combined = left_col_names.clone();
+            combined.extend(right_col_names.clone());
+            if !combined.is_empty() {
+                desc.set_child_rel_column_names(combined);
+            }
+            for conj in other_conjuncts {
+                let expr = if !row_tuples.is_empty() {
+                    expr_translator::translate_expr_in_context(conj, desc, registry, row_tuples)?
+                } else {
+                    expr_translator::translate_expr(conj, desc, registry)?
+                };
+                conditions.push(expr);
+            }
+            desc.clear_child_rel_column_names();
         }
-        for conj in other_conjuncts {
-            let expr = expr_translator::translate_expr(conj, desc, registry)?;
-            conditions.push(expr);
-        }
-        desc.clear_child_rel_column_names();
     }
 
     // Translate vother_join_conjunct if present.
@@ -964,7 +1015,16 @@ fn translate_hash_join_node(
             right: Some(Box::new(right)),
             expression: expression.map(Box::new),
             post_join_filter: post_join_filter.map(Box::new),
-            r#type: map_join_type(&hash_join.join_op),
+            r#type: if needs_swap {
+                // Swapped RIGHT→LEFT
+                if hash_join.join_op == TJoinOp::RIGHT_SEMI_JOIN {
+                    join_rel::JoinType::LeftSemi as i32
+                } else {
+                    join_rel::JoinType::LeftAnti as i32
+                }
+            } else {
+                map_join_type(&hash_join.join_op)
+            },
             ..Default::default()
         }))),
     };
