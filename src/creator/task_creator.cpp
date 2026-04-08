@@ -71,6 +71,10 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
+    // Give each pipeline a pointer to this task_creator so that when a pipeline
+    // finishes (including via downstream notification), it can schedule output consumers.
+    pipeline->set_task_creator(this);
+
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) { continue; }
 
