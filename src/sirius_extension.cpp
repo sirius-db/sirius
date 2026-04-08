@@ -1053,7 +1053,7 @@ static void LoadInternal(ExtensionLoader& loader)
   OptimizerExtension opt_ext;
   opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
   opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
-  config.optimizer_extensions.push_back(std::move(opt_ext));
+  OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
   // was loaded (e.g. when loaded via LOAD in Python or the CLI).

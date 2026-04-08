@@ -47,9 +47,9 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     duckdb::ClientContext& context) const override;
   duckdb::unique_ptr<duckdb::LocalSourceState> GetLocalSourceState(
     duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const override;
-  duckdb::SourceResultType GetData(duckdb::ExecutionContext& context,
-                                   duckdb::DataChunk& chunk,
-                                   duckdb::OperatorSourceInput& input) const override;
+  duckdb::SourceResultType GetDataInternal(duckdb::ExecutionContext& context,
+                                           duckdb::DataChunk& chunk,
+                                           duckdb::OperatorSourceInput& input) const override;
 
   std::string GetName() const override { return "SIRIUS_GPU_EXECUTION"; }
 
