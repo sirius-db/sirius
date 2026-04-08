@@ -27,10 +27,13 @@
 #include "duckdb/parallel/pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
-
 namespace sirius {
 
 class sirius_engine;
+
+namespace creator {
+class task_creator;
+}  // namespace creator
 
 namespace op {
 class sirius_physical_operator;
@@ -130,6 +133,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   std::vector<op::sirius_physical_operator*> get_output_consumers() const;
 
+  //! Notifies downstream pipelines to re-evaluate their status after this pipeline finishes
+  void notify_downstream_pipelines();
+
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;
 
@@ -150,6 +156,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   void mark_task_created();
   void mark_task_completed();
+
+  //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
+  void set_task_creator(sirius::creator::task_creator* tc);
 
  private:
   //! Whether or not the pipeline has been readied
@@ -182,6 +191,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   bool launch_scan_tasks(duckdb::shared_ptr<duckdb::Event>& event, duckdb::idx_t max_threads);
 
   bool schedule_parallel(duckdb::shared_ptr<duckdb::Event>& event);
+
+  //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
+  sirius::creator::task_creator* _task_creator{nullptr};
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;
