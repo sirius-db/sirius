@@ -16,6 +16,9 @@
 
 #pragma once
 
+// sirius
+#include <expression_executor/gpu_expression_translator.hpp>
+
 // cucascade
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -68,7 +71,8 @@ using post_convert_fn_t =
  * The APIs for this reader are still marked experimental and are likely volatile.
  */
 class host_parquet_representation : public cucascade::idata_representation {
-  using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
+  using hybrid_scan_reader    = cudf::io::parquet::experimental::hybrid_scan_reader;
+  using translated_expression = gpu_expression_translator::translated_expression;
 
  public:
   /**
@@ -87,6 +91,9 @@ class host_parquet_representation : public cucascade::idata_representation {
    * @param[in] size_in_bytes The size of the representation in bytes (compressed).
    * @param[in] uncompressed_size_in_bytes The uncompressed size of the data represented by this
    * representation.
+   * @param[in] file_size The original parquet file size in bytes.
+   * @param[in] fallback_datasource An optional fallback datasource for uncached byte ranges.
+   * @param[in]
    */
   host_parquet_representation(cucascade::memory::memory_space* memory_space,
                               cucascade::memory::fixed_multiple_blocks_allocation column_chunks,
@@ -97,7 +104,9 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::size_t size_in_bytes,
                               std::size_t uncompressed_size_in_bytes,
                               std::size_t file_size,
-                              std::shared_ptr<cudf::io::datasource> fallback_datasource)
+                              std::shared_ptr<cudf::io::datasource> fallback_datasource,
+                              std::shared_ptr<translated_expression> filter_expression = nullptr,
+                              std::vector<std::size_t> post_filter_projection_ids      = {})
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),
@@ -107,7 +116,9 @@ class host_parquet_representation : public cucascade::idata_representation {
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
       _file_size(file_size),
-      _fallback_datasource(fallback_datasource)
+      _fallback_datasource(fallback_datasource),
+      _filter_expression(filter_expression),
+      _post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
   }
 
@@ -260,6 +271,26 @@ class host_parquet_representation : public cucascade::idata_representation {
     _fallback_datasource = std::move(ds);
   }
 
+  /**
+   * @brief Gets the optional filter expression for filter pushdown.
+   *
+   * @return A shared_ptr to the translated filter expression, or nullptr if not set.
+   */
+  [[nodiscard]] std::shared_ptr<translated_expression> const& get_filter_expression() const
+  {
+    return _filter_expression;
+  }
+
+  /**
+   * @brief Gets the vector of projection IDs of columns that remain after filter pushdown.
+   *
+   * @return A const reference to the vector of post-filter projection IDs.
+   */
+  [[nodiscard]] std::vector<std::size_t> const& get_post_filter_projection_ids() const
+  {
+    return _post_filter_projection_ids;
+  }
+
   // -------------------------------------------------------------------------
   // Post-convert hook (used by the iceberg scan path for delete application)
   // -------------------------------------------------------------------------
@@ -328,7 +359,9 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::size_t size_in_bytes,
                               std::size_t uncompressed_size_in_bytes,
                               std::size_t file_size,
-                              std::shared_ptr<cudf::io::datasource> fallback_datasource)
+                              std::shared_ptr<cudf::io::datasource> fallback_datasource,
+                              std::shared_ptr<translated_expression> filter_expression,
+                              std::vector<std::size_t> post_filter_projection_ids)
     : idata_representation(*memory_space),
       _parquet_reader(std::move(parquet_reader)),
       _reader_options(std::move(reader_options)),
@@ -337,7 +370,9 @@ class host_parquet_representation : public cucascade::idata_representation {
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
       _file_size(file_size),
-      _fallback_datasource(fallback_datasource)
+      _fallback_datasource(fallback_datasource),
+      _filter_expression(filter_expression),
+      _post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
   }
 
@@ -351,6 +386,8 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_size_in_bytes;
   std::size_t _file_size{0};
   std::shared_ptr<cudf::io::datasource> _fallback_datasource;
+  std::shared_ptr<translated_expression> _filter_expression;
+  std::vector<std::size_t> _post_filter_projection_ids;
   /// Optional post-convert hook (null for plain parquet, set for iceberg V2 deletes).
   post_convert_fn_t _post_convert_fn;
   /// Path of the Iceberg data file this batch was read from (empty for plain parquet).

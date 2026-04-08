@@ -820,6 +820,30 @@ TEST_CASE("translator: unsupported function returns nullopt", "[expression_trans
 //===----------------------------------------------------------------------===//
 // Test: Conjunction (AND / OR)
 //===----------------------------------------------------------------------===//
+TEST_CASE("translator: conjunction with unsupported first child returns nullopt",
+          "[expression_translator]")
+{
+  auto unsupported = duckdb::make_uniq<BoundFunctionExpression>(
+    LogicalType{LogicalTypeId::INTEGER},
+    ScalarFunction("abs", {LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
+    duckdb::vector<duckdb::unique_ptr<Expression>>{},
+    nullptr);
+  unsupported->children.push_back(
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+
+  auto supported = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_GREATERTHAN,
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
+    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+
+  auto conjunction = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+  conjunction->children.push_back(std::move(unsupported));
+  conjunction->children.push_back(std::move(supported));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*conjunction);
+  REQUIRE_FALSE(ast_tree.has_value());
+}
 
 TEST_CASE("translator: conjunction AND", "[expression_translator]")
 {
@@ -1707,4 +1731,33 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
   // col0[i] + col1[i] == i + (100-i) == 100 for all rows
   std::vector<uint8_t> expected(100, 1);
   REQUIRE(host_vals == expected);
+}
+
+//===----------------------------------------------------------------------===//
+// Test: Decimal constants are disabled
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("translator: decimal constants return nullopt", "[expression_translator]")
+{
+  // DECIMAL32 (small precision)
+  {
+    auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(42, 5, 2));
+    auto translator = make_translator();
+    auto ast_tree   = translator.translate_expression(*expr);
+    REQUIRE_FALSE(ast_tree.has_value());
+  }
+  // DECIMAL64 (medium precision)
+  {
+    auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(12345, 12, 4));
+    auto translator = make_translator();
+    auto ast_tree   = translator.translate_expression(*expr);
+    REQUIRE_FALSE(ast_tree.has_value());
+  }
+  // DECIMAL128 (large precision)
+  {
+    auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(99999, 30, 6));
+    auto translator = make_translator();
+    auto ast_tree   = translator.translate_expression(*expr);
+    REQUIRE_FALSE(ast_tree.has_value());
+  }
 }

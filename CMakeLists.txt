@@ -94,6 +94,7 @@ set(EXTENSION_SOURCES
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/scan/scan_utils.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp

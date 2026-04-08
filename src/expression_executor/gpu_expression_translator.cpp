@@ -18,9 +18,195 @@
 #include <expression_executor/gpu_expression_translator.hpp>
 #include <log/logging.hpp>
 
+// cudf
+#include <cudf/utilities/type_dispatcher.hpp>
+#include <cudf/wrappers/timestamps.hpp>
+
 namespace sirius {
 
 using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
+
+namespace {
+
+/// @brief Convert a cudf::ast::ast_operator to a human-readable string.
+std::string ast_operator_to_string(cudf::ast::ast_operator op)
+{
+  switch (op) {
+    case cudf::ast::ast_operator::ADD: return "+";
+    case cudf::ast::ast_operator::SUB: return "-";
+    case cudf::ast::ast_operator::MUL: return "*";
+    case cudf::ast::ast_operator::DIV: return "/";
+    case cudf::ast::ast_operator::TRUE_DIV: return "true_div";
+    case cudf::ast::ast_operator::FLOOR_DIV: return "floor_div";
+    case cudf::ast::ast_operator::MOD: return "%";
+    case cudf::ast::ast_operator::PYMOD: return "pymod";
+    case cudf::ast::ast_operator::POW: return "**";
+    case cudf::ast::ast_operator::EQUAL: return "==";
+    case cudf::ast::ast_operator::NULL_EQUAL: return "null_eq";
+    case cudf::ast::ast_operator::NOT_EQUAL: return "!=";
+    case cudf::ast::ast_operator::LESS: return "<";
+    case cudf::ast::ast_operator::GREATER: return ">";
+    case cudf::ast::ast_operator::LESS_EQUAL: return "<=";
+    case cudf::ast::ast_operator::GREATER_EQUAL: return ">=";
+    case cudf::ast::ast_operator::BITWISE_AND: return "&";
+    case cudf::ast::ast_operator::BITWISE_OR: return "|";
+    case cudf::ast::ast_operator::BITWISE_XOR: return "^";
+    case cudf::ast::ast_operator::LOGICAL_AND: return "AND";
+    case cudf::ast::ast_operator::NULL_LOGICAL_AND: return "null_and";
+    case cudf::ast::ast_operator::LOGICAL_OR: return "OR";
+    case cudf::ast::ast_operator::NULL_LOGICAL_OR: return "null_or";
+    case cudf::ast::ast_operator::IDENTITY: return "identity";
+    case cudf::ast::ast_operator::IS_NULL: return "IS_NULL";
+    case cudf::ast::ast_operator::SIN: return "sin";
+    case cudf::ast::ast_operator::COS: return "cos";
+    case cudf::ast::ast_operator::TAN: return "tan";
+    case cudf::ast::ast_operator::ARCSIN: return "arcsin";
+    case cudf::ast::ast_operator::ARCCOS: return "arccos";
+    case cudf::ast::ast_operator::ARCTAN: return "arctan";
+    case cudf::ast::ast_operator::SINH: return "sinh";
+    case cudf::ast::ast_operator::COSH: return "cosh";
+    case cudf::ast::ast_operator::TANH: return "tanh";
+    case cudf::ast::ast_operator::ARCSINH: return "arcsinh";
+    case cudf::ast::ast_operator::ARCCOSH: return "arccosh";
+    case cudf::ast::ast_operator::ARCTANH: return "arctanh";
+    case cudf::ast::ast_operator::EXP: return "exp";
+    case cudf::ast::ast_operator::LOG: return "log";
+    case cudf::ast::ast_operator::SQRT: return "sqrt";
+    case cudf::ast::ast_operator::CBRT: return "cbrt";
+    case cudf::ast::ast_operator::CEIL: return "ceil";
+    case cudf::ast::ast_operator::FLOOR: return "floor";
+    case cudf::ast::ast_operator::ABS: return "abs";
+    case cudf::ast::ast_operator::RINT: return "rint";
+    case cudf::ast::ast_operator::BIT_INVERT: return "~";
+    case cudf::ast::ast_operator::NOT: return "NOT";
+    case cudf::ast::ast_operator::CAST_TO_INT64: return "cast_to_int64";
+    case cudf::ast::ast_operator::CAST_TO_UINT64: return "cast_to_uint64";
+    case cudf::ast::ast_operator::CAST_TO_FLOAT64: return "cast_to_float64";
+    default: return "unknown_op";
+  }
+}
+
+/// @brief Recursively produce a human-readable string for a cuDF AST expression.
+std::string expression_to_string(cudf::ast::expression const& expr)
+{
+  if (auto const* op = dynamic_cast<cudf::ast::operation const*>(&expr)) {
+    auto const& operands = op->get_operands();
+    auto op_str          = ast_operator_to_string(op->get_operator());
+    if (operands.size() == 1) {
+      return op_str + "(" + expression_to_string(operands[0].get()) + ")";
+    } else if (operands.size() == 2) {
+      return "(" + expression_to_string(operands[0].get()) + " " + op_str + " " +
+             expression_to_string(operands[1].get()) + ")";
+    }
+    return op_str + "(?)";
+  }
+  if (auto const* col_ref = dynamic_cast<cudf::ast::column_reference const*>(&expr)) {
+    std::string table_str =
+      (col_ref->get_table_source() == cudf::ast::table_reference::LEFT) ? "L" : "R";
+    return table_str + "[" + std::to_string(col_ref->get_column_index()) + "]";
+  }
+  if (auto const* col_name_ref = dynamic_cast<cudf::ast::column_name_reference const*>(&expr)) {
+    return col_name_ref->get_column_name();
+  }
+  if (auto const* lit = dynamic_cast<cudf::ast::literal const*>(&expr)) {
+    auto const& s   = lit->get_scalar();
+    auto const dt   = s.type();
+    auto const name = cudf::type_to_name(dt);
+
+    // Try to read the scalar value for supported types.
+    auto val_str = std::string("?");
+    switch (dt.id()) {
+      case cudf::type_id::INT8:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<int8_t> const&>(s).value());
+        break;
+      case cudf::type_id::INT16:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<int16_t> const&>(s).value());
+        break;
+      case cudf::type_id::INT32:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<int32_t> const&>(s).value());
+        break;
+      case cudf::type_id::INT64:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<int64_t> const&>(s).value());
+        break;
+      case cudf::type_id::UINT8:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<uint8_t> const&>(s).value());
+        break;
+      case cudf::type_id::UINT16:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<uint16_t> const&>(s).value());
+        break;
+      case cudf::type_id::UINT32:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<uint32_t> const&>(s).value());
+        break;
+      case cudf::type_id::UINT64:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<uint64_t> const&>(s).value());
+        break;
+      case cudf::type_id::FLOAT32:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<float> const&>(s).value());
+        break;
+      case cudf::type_id::FLOAT64:
+        val_str = std::to_string(static_cast<cudf::numeric_scalar<double> const&>(s).value());
+        break;
+      case cudf::type_id::BOOL8:
+        val_str = static_cast<cudf::numeric_scalar<bool> const&>(s).value() ? "true" : "false";
+        break;
+      case cudf::type_id::TIMESTAMP_DAYS:
+        val_str = std::to_string(static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(s)
+                                   .value()
+                                   .time_since_epoch()
+                                   .count());
+        break;
+      case cudf::type_id::TIMESTAMP_SECONDS:
+        val_str = std::to_string(static_cast<cudf::timestamp_scalar<cudf::timestamp_s> const&>(s)
+                                   .value()
+                                   .time_since_epoch()
+                                   .count());
+        break;
+      case cudf::type_id::TIMESTAMP_MILLISECONDS:
+        val_str = std::to_string(static_cast<cudf::timestamp_scalar<cudf::timestamp_ms> const&>(s)
+                                   .value()
+                                   .time_since_epoch()
+                                   .count());
+        break;
+      case cudf::type_id::TIMESTAMP_MICROSECONDS:
+        val_str = std::to_string(static_cast<cudf::timestamp_scalar<cudf::timestamp_us> const&>(s)
+                                   .value()
+                                   .time_since_epoch()
+                                   .count());
+        break;
+      case cudf::type_id::TIMESTAMP_NANOSECONDS:
+        val_str = std::to_string(static_cast<cudf::timestamp_scalar<cudf::timestamp_ns> const&>(s)
+                                   .value()
+                                   .time_since_epoch()
+                                   .count());
+        break;
+      case cudf::type_id::DECIMAL32: {
+        auto const& fps = static_cast<cudf::fixed_point_scalar<numeric::decimal32> const&>(s);
+        val_str = "rep=" + std::to_string(fps.value()) + ",scale=" + std::to_string(dt.scale());
+        break;
+      }
+      case cudf::type_id::DECIMAL64: {
+        auto const& fps = static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(s);
+        val_str = "rep=" + std::to_string(fps.value()) + ",scale=" + std::to_string(dt.scale());
+        break;
+      }
+      case cudf::type_id::STRING: {
+        val_str = "\"" + static_cast<cudf::string_scalar const&>(s).to_string() + "\"";
+        break;
+      }
+      default: break;
+    }
+    return "literal(" + name + ":" + val_str + ")";
+  }
+  return "<unknown>";
+}
+
+}  // anonymous namespace
+
+std::string gpu_expression_translator::translated_expression::to_string() const
+{
+  if (tree.size() == 0) { return "<empty>"; }
+  return expression_to_string(tree.back());
+}
 
 std::optional<gpu_expression_translator::translated_expression>
 gpu_expression_translator::translate_expression(duckdb::Expression const& expr,
@@ -28,6 +214,21 @@ gpu_expression_translator::translate_expression(duckdb::Expression const& expr,
 {
   reset_tree();
   auto expr_ref = add_expression(expr, table_src);
+  if (!expr_ref) { return std::nullopt; }
+  translated_expression result;
+  result.tree           = std::move(_ast_tree);
+  result.owned_literals = std::move(_literal_scalars);
+  return result;
+}
+
+std::optional<gpu_expression_translator::translated_expression>
+gpu_expression_translator::translate_expression_with_names(
+  duckdb::Expression const& expr, column_name_resolver_fxn column_name_resolver)
+{
+  reset_tree();
+  _column_name_resolver = std::move(column_name_resolver);
+  auto expr_ref         = add_expression(expr, cudf::ast::table_reference::LEFT);
+  _column_name_resolver = nullptr;
   if (!expr_ref) { return std::nullopt; }
   translated_expression result;
   result.tree           = std::move(_ast_tree);
@@ -120,8 +321,12 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   switch (expr.GetExpressionClass()) {
     case duckdb::ExpressionClass::BOUND_BETWEEN:
       return add_expression(expr.Cast<duckdb::BoundBetweenExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_CASE:
-      return std::nullopt;  // CASE expressions cannot be translated to cuDF ASTs
+    case duckdb::ExpressionClass::BOUND_CASE: {
+      SIRIUS_LOG_DEBUG(
+        "[expression_translator] CASE expressions cannot be translated to cuDF ASTs: {}",
+        expr.ToString());
+      return std::nullopt;
+    }
     case duckdb::ExpressionClass::BOUND_CAST:
       return add_expression(expr.Cast<duckdb::BoundCastExpression>(), table_src);
     case duckdb::ExpressionClass::BOUND_COMPARISON:
@@ -252,6 +457,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 
   // Add the children and combine with AND/OR operations as we go
   auto result = add_expression(*expr.children[0], table_src);
+  if (!result) { return std::nullopt; }
+
   for (size_t i = 1; i < expr.children.size(); ++i) {
     // Add child expression
     auto child_expr = add_expression(*expr.children[i], table_src);
@@ -281,6 +488,10 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   auto const cudf_type = GetCudfType(expr.return_type);
   // TODO: Expand type support as needed. See gpu_execute_constant.cpp.
   switch (cudf_type.id()) {
+    case cudf::type_id::INT8: {
+      return add_literal_expression<cudf::numeric_scalar<int8_t>>(
+        expr.value.GetValue<int8_t>(), true, _stream, _resource_ref);
+    }
     case cudf::type_id::INT16: {
       return add_literal_expression<cudf::numeric_scalar<int16_t>>(
         expr.value.GetValue<int16_t>(), true, _stream, _resource_ref);
@@ -292,6 +503,22 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     case cudf::type_id::INT64: {
       return add_literal_expression<cudf::numeric_scalar<int64_t>>(
         expr.value.GetValue<int64_t>(), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT8: {
+      return add_literal_expression<cudf::numeric_scalar<uint8_t>>(
+        expr.value.GetValue<uint8_t>(), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT16: {
+      return add_literal_expression<cudf::numeric_scalar<uint16_t>>(
+        expr.value.GetValue<uint16_t>(), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT32: {
+      return add_literal_expression<cudf::numeric_scalar<uint32_t>>(
+        expr.value.GetValue<uint32_t>(), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT64: {
+      return add_literal_expression<cudf::numeric_scalar<uint64_t>>(
+        expr.value.GetValue<uint64_t>(), true, _stream, _resource_ref);
     }
     case cudf::type_id::FLOAT32: {
       return add_literal_expression<cudf::numeric_scalar<float_t>>(
@@ -309,22 +536,73 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
       return add_literal_expression<cudf::string_scalar>(
         expr.value.GetValue<std::string>(), true, _stream, _resource_ref);
     }
-    // cudf decimal type uses negative scale
-    case cudf::type_id::DECIMAL32: {
-      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal32>>(
-        expr.value.GetValueUnsafe<typename numeric::decimal32::rep>(),
-        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+    case cudf::type_id::TIMESTAMP_DAYS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_D>>(
+        cudf::duration_D{expr.value.GetValue<duckdb::date_t>().days}, true, _stream, _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_SECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_s>>(
+        cudf::duration_s{expr.value.GetValue<duckdb::timestamp_sec_t>().value},
         true,
         _stream,
         _resource_ref);
     }
-    case cudf::type_id::DECIMAL64: {
-      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal64>>(
-        expr.value.GetValueUnsafe<typename numeric::decimal64::rep>(),
-        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_ms>>(
+        cudf::duration_ms{expr.value.GetValue<duckdb::timestamp_ms_t>().value},
         true,
         _stream,
         _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_us>>(
+        cudf::duration_us{expr.value.GetValue<duckdb::timestamp_tz_t>().value},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_ns>>(
+        cudf::duration_ns{expr.value.GetValue<duckdb::timestamp_tz_t>().value},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    // cudf decimal type uses negative scale
+    /// TODO: Uncomment the decimal code once the following bug fix is released in cuDF and we
+    /// update to that version:
+    /// https://github.com/rapidsai/cudf/pull/21447
+    /// For now, fallthrough to default case to return nullopt and effectively disallow decimal
+    /// types.
+    case cudf::type_id::DECIMAL32: {
+      // return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal32>>(
+      //   expr.value.GetValueUnsafe<typename numeric::decimal32::rep>(),
+      //   numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+      //   true,
+      //   _stream,
+      //   _resource_ref);
+    }
+    case cudf::type_id::DECIMAL64: {
+      // return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal64>>(
+      //   expr.value.GetValueUnsafe<typename numeric::decimal64::rep>(),
+      //   numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+      //   true,
+      //   _stream,
+      //   _resource_ref);
+    }
+    case cudf::type_id::DECIMAL128: {
+      // duckdb::hugeint_t const value = expr.value.GetValueUnsafe<duckdb::hugeint_t>();
+      // __int128_t rep                = (static_cast<__int128_t>(value.upper) << 64) | value.lower;
+      // return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal128>>(
+      //   rep,
+      //   numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+      //   true,
+      //   _stream,
+      //   _resource_ref);
+      SIRIUS_LOG_DEBUG(
+        "[expression_translator] DECIMAL types are not supported in expression translator due to "
+        "cuDF bug");
+      return std::nullopt;
     }
     default: {
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}",
@@ -432,6 +710,19 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   duckdb::BoundReferenceExpression const& expr, cudf::ast::table_reference const table_src)
 {
+  // We need to disable DECIMAL types in the expression translator for now because of cuDF bug.
+  auto const cudf_type = GetCudfType(expr.return_type);
+  if (cudf_type.id() == cudf::type_id::DECIMAL32 || cudf_type.id() == cudf::type_id::DECIMAL64 ||
+      cudf_type.id() == cudf::type_id::DECIMAL128) {
+    SIRIUS_LOG_DEBUG(
+      "[expression_translator] DECIMAL types are not supported in expression translator due to "
+      "cuDF bug");
+    return std::nullopt;
+  }
+
+  if (_column_name_resolver) {
+    return _ast_tree.emplace<cudf::ast::column_name_reference>(_column_name_resolver(expr.index));
+  }
   return _ast_tree.emplace<cudf::ast::column_reference>(expr.index, table_src);
 }
 

@@ -118,6 +118,13 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Only used in optimized table scan
   bool exhausted = false;
 
+  //! When true, execute() is a no-op passthrough. Set for parquet scan
+  //! pipelines where filter and projection are handled in parquet_scan_task.
+  bool passthrough = false;
+
+  //! The composite filter expression from the table filter set, if any
+  duckdb::unique_ptr<duckdb::Expression> filter_expr = nullptr;
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
