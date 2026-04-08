@@ -379,6 +379,13 @@ fn apply_conjuncts(
     // actual Substrait Rel output (not table-relative indices which may be wrong
     // after SEMI/ANTI joins remove columns from the output schema).
     let rel_names = collect_rel_column_names(&input);
+    let rel_count = count_rel_columns(&input);
+    tracing::warn!(
+        num_conjuncts = conjuncts.len(),
+        rel_count,
+        rel_names = ?rel_names,
+        "apply_conjuncts: translating conjuncts"
+    );
     if !rel_names.is_empty() {
         desc.set_child_rel_column_names(rel_names);
     }
@@ -612,6 +619,174 @@ pub(crate) fn collect_rel_column_names(rel: &Rel) -> Vec<String> {
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// Validate all field references in a Rel tree are within bounds.
+/// Returns a list of (path, field_index, available_columns) for any violations.
+pub fn validate_field_refs(rel: &Rel, path: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let col_count = count_rel_columns(rel);
+
+    match rel.rel_type.as_ref() {
+        Some(rel::RelType::Filter(filter)) => {
+            let input_cols = filter
+                .input
+                .as_deref()
+                .map(count_rel_columns)
+                .unwrap_or(0);
+            if let Some(cond) = &filter.condition {
+                check_expr_refs(cond, input_cols, path, "filter.condition", &mut errors);
+            }
+            if let Some(input) = &filter.input {
+                errors.extend(validate_field_refs(input, &format!("{path}/filter")));
+            }
+        }
+        Some(rel::RelType::Join(join)) => {
+            let left_cols = join.left.as_deref().map(count_rel_columns).unwrap_or(0);
+            let right_cols = join.right.as_deref().map(count_rel_columns).unwrap_or(0);
+            let combined = left_cols + right_cols;
+            let join_type = join_rel::JoinType::try_from(join.r#type)
+                .map(|t| format!("{t:?}"))
+                .unwrap_or_else(|_| format!("unknown({})", join.r#type));
+            if let Some(expr) = &join.expression {
+                check_expr_refs(
+                    expr,
+                    combined,
+                    path,
+                    &format!("join({join_type}).expression [left={left_cols} right={right_cols}]"),
+                    &mut errors,
+                );
+            }
+            if let Some(pjf) = &join.post_join_filter {
+                check_expr_refs(
+                    pjf,
+                    combined,
+                    path,
+                    &format!("join({join_type}).post_join_filter [left={left_cols} right={right_cols}]"),
+                    &mut errors,
+                );
+            }
+            if let Some(left) = &join.left {
+                errors.extend(validate_field_refs(left, &format!("{path}/join.left")));
+            }
+            if let Some(right) = &join.right {
+                errors.extend(validate_field_refs(right, &format!("{path}/join.right")));
+            }
+        }
+        Some(rel::RelType::Aggregate(agg)) => {
+            let input_cols = agg.input.as_deref().map(count_rel_columns).unwrap_or(0);
+            if let Some(g) = agg.groupings.first() {
+                #[allow(deprecated)]
+                for (i, expr) in g.grouping_expressions.iter().enumerate() {
+                    check_expr_refs(expr, input_cols, path, &format!("agg.group[{i}]"), &mut errors);
+                }
+            }
+            for (i, m) in agg.measures.iter().enumerate() {
+                if let Some(f) = &m.measure {
+                    for (j, arg) in f.arguments.iter().enumerate() {
+                        if let Some(substrait::proto::function_argument::ArgType::Value(v)) = &arg.arg_type {
+                            check_expr_refs(v, input_cols, path, &format!("agg.measure[{i}].arg[{j}]"), &mut errors);
+                        }
+                    }
+                }
+            }
+            if let Some(input) = &agg.input {
+                errors.extend(validate_field_refs(input, &format!("{path}/agg")));
+            }
+        }
+        Some(rel::RelType::Sort(sort)) => {
+            let input_cols = sort.input.as_deref().map(count_rel_columns).unwrap_or(0);
+            for (i, sf) in sort.sorts.iter().enumerate() {
+                if let Some(expr) = &sf.expr {
+                    check_expr_refs(expr, input_cols, path, &format!("sort.field[{i}]"), &mut errors);
+                }
+            }
+            if let Some(input) = &sort.input {
+                errors.extend(validate_field_refs(input, &format!("{path}/sort")));
+            }
+        }
+        Some(rel::RelType::Fetch(fetch)) => {
+            if let Some(input) = &fetch.input {
+                errors.extend(validate_field_refs(input, &format!("{path}/fetch")));
+            }
+        }
+        Some(rel::RelType::Project(proj)) => {
+            let input_cols = proj.input.as_deref().map(count_rel_columns).unwrap_or(0);
+            for (i, expr) in proj.expressions.iter().enumerate() {
+                check_expr_refs(expr, input_cols, path, &format!("project.expr[{i}]"), &mut errors);
+            }
+            if let Some(input) = &proj.input {
+                errors.extend(validate_field_refs(input, &format!("{path}/project")));
+            }
+        }
+        _ => {}
+    }
+    let _ = col_count; // suppress unused warning
+    errors
+}
+
+/// Check all field references in an expression are within bounds.
+fn check_expr_refs(
+    expr: &Expression,
+    available: usize,
+    path: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    match expr.rex_type.as_ref() {
+        Some(expression::RexType::Selection(sel)) => {
+            if let Some(field_reference::ReferenceType::DirectReference(seg)) =
+                sel.reference_type.as_ref()
+            {
+                if let Some(reference_segment::ReferenceType::StructField(sf)) =
+                    seg.reference_type.as_ref()
+                {
+                    if sf.field as usize >= available {
+                        errors.push(format!(
+                            "{path}: {context}: field_ref({}) >= available({available})",
+                            sf.field
+                        ));
+                    }
+                }
+            }
+        }
+        Some(expression::RexType::ScalarFunction(f)) => {
+            for arg in &f.arguments {
+                if let Some(substrait::proto::function_argument::ArgType::Value(v)) =
+                    &arg.arg_type
+                {
+                    check_expr_refs(v, available, path, context, errors);
+                }
+            }
+        }
+        Some(expression::RexType::IfThen(ift)) => {
+            for clause in &ift.ifs {
+                if let Some(cond) = &clause.r#if {
+                    check_expr_refs(cond, available, path, context, errors);
+                }
+                if let Some(then) = &clause.then {
+                    check_expr_refs(then, available, path, context, errors);
+                }
+            }
+            if let Some(e) = &ift.r#else {
+                check_expr_refs(e, available, path, context, errors);
+            }
+        }
+        Some(expression::RexType::Cast(cast)) => {
+            if let Some(input) = &cast.input {
+                check_expr_refs(input, available, path, context, errors);
+            }
+        }
+        Some(expression::RexType::SingularOrList(sol)) => {
+            if let Some(v) = &sol.value {
+                check_expr_refs(v, available, path, context, errors);
+            }
+            for opt in &sol.options {
+                check_expr_refs(opt, available, path, context, errors);
+            }
+        }
+        _ => {}
     }
 }
 

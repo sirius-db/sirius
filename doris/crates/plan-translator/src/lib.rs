@@ -15,7 +15,7 @@ use doris_thrift::plan_nodes::{TPlan, TPlanNodeType};
 use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUri};
-use substrait::proto::{rel, rel_common, Plan, PlanRel, ProjectRel, Rel, RelCommon, RelRoot, Version};
+use substrait::proto::{join_rel, rel, rel_common, Plan, PlanRel, ProjectRel, Rel, RelCommon, RelRoot, Version};
 
 pub mod descriptor_table;
 pub mod expr_translator;
@@ -151,18 +151,28 @@ fn rel_output_names(rel: &Rel) -> Vec<String> {
             .map(|r| rel_output_names(r))
             .unwrap_or_default(),
         Some(rel::RelType::Join(j)) => {
-            let mut names = j
+            let left_names = j
                 .left
                 .as_deref()
                 .map(|r| rel_output_names(r))
                 .unwrap_or_default();
-            names.extend(
-                j.right
-                    .as_deref()
-                    .map(|r| rel_output_names(r))
-                    .unwrap_or_default(),
-            );
-            names
+            let right_names = j
+                .right
+                .as_deref()
+                .map(|r| rel_output_names(r))
+                .unwrap_or_default();
+            // SEMI/ANTI joins output only one side's columns.
+            match join_rel::JoinType::try_from(j.r#type).ok() {
+                Some(join_rel::JoinType::LeftSemi | join_rel::JoinType::LeftAnti) => left_names,
+                Some(join_rel::JoinType::RightSemi | join_rel::JoinType::RightAnti) => {
+                    right_names
+                }
+                _ => {
+                    let mut names = left_names;
+                    names.extend(right_names);
+                    names
+                }
+            }
         }
         Some(rel::RelType::Cross(c)) => {
             let mut names = c
@@ -537,6 +547,57 @@ pub fn translate_fragment(
         }
     }
 
+    // Validate field references before proceeding.
+    let validation_errors = node_translator::validate_field_refs(&rel, "root");
+    if !validation_errors.is_empty() {
+        tracing::warn!(
+            num_errors = validation_errors.len(),
+            errors = ?validation_errors,
+            "Substrait plan validation: out-of-range field references"
+        );
+    } else {
+        tracing::warn!(
+            rel_cols = node_translator::count_rel_columns(&rel),
+            rel_type = ?rel.rel_type.as_ref().map(|t| std::mem::discriminant(t)),
+            "Substrait plan validation: all field references OK"
+        );
+    }
+    // Dump tree structure as single-line for logging.
+    fn dump_rel_flat(rel: &Rel) -> String {
+        let cols = node_translator::count_rel_columns(rel);
+        match rel.rel_type.as_ref() {
+            Some(rel::RelType::Filter(f)) => {
+                let child = f.input.as_deref().map(dump_rel_flat).unwrap_or_default();
+                format!("Filter({cols})[{child}]")
+            }
+            Some(rel::RelType::Join(j)) => {
+                let jt = join_rel::JoinType::try_from(j.r#type).map(|t| format!("{t:?}")).unwrap_or_default();
+                let l = j.left.as_deref().map(dump_rel_flat).unwrap_or_default();
+                let r = j.right.as_deref().map(dump_rel_flat).unwrap_or_default();
+                format!("{jt}({cols})[{l}, {r}]")
+            }
+            Some(rel::RelType::Read(_)) => format!("Read({cols})"),
+            Some(rel::RelType::Aggregate(a)) => {
+                let child = a.input.as_deref().map(dump_rel_flat).unwrap_or_default();
+                format!("Agg({cols})[{child}]")
+            }
+            Some(rel::RelType::Sort(s)) => {
+                let child = s.input.as_deref().map(dump_rel_flat).unwrap_or_default();
+                format!("Sort({cols})[{child}]")
+            }
+            Some(rel::RelType::Fetch(f)) => {
+                let child = f.input.as_deref().map(dump_rel_flat).unwrap_or_default();
+                format!("Fetch({cols})[{child}]")
+            }
+            Some(rel::RelType::Project(p)) => {
+                let child = p.input.as_deref().map(dump_rel_flat).unwrap_or_default();
+                format!("Project({cols})[{child}]")
+            }
+            _ => format!("Other({cols})"),
+        }
+    }
+    // Moved after root_names computation below
+
     // Extract sort/limit specification from the Doris plan's root SORT_NODE.
     // Returns structured sort info (column names + directions) for Rust-side sorting,
     // plus a LIMIT-only SQL string for the from_substrait wrapper.
@@ -652,6 +713,15 @@ pub fn translate_fragment(
         dedup_column_names(output_names.clone())
     };
     let result_output_names = output_names;
+
+    tracing::warn!(
+        rel_cols = node_translator::count_rel_columns(&rel),
+        root_names_count = root_names.len(),
+        output_names_count = result_output_names.len(),
+        rel_names_count = rel_names.len(),
+        root_names = ?root_names,
+        "Substrait plan summary"
+    );
 
     let (extension_uris, extensions) = registry.into_extensions();
 
