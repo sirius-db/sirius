@@ -29,7 +29,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
-#include <algorithm>
 #include <format>
 
 namespace sirius {
@@ -105,6 +104,12 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
   const auto& raw_input_batches = input_data.get_data_batches();
+
+  // For parquet scan pipelines, filter and projection are already applied in
+  // parquet_scan_task and the host_parquet_representation converters.
+  // Also, only parquet file tails are small due to the partitioning logic, so batch concatenation
+  // is not needed.
+  if (passthrough) { return std::make_unique<operator_data>(raw_input_batches); }
 
   // Build the column_ids index → batch position mapping once.
   // Both filter expression construction and post-filter projection use this.

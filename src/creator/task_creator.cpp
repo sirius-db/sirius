@@ -71,6 +71,10 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
+    // Give each pipeline a pointer to this task_creator so that when a pipeline
+    // finishes (including via downstream notification), it can schedule output consumers.
+    pipeline->set_task_creator(this);
+
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) { continue; }
 
@@ -324,8 +328,8 @@ void task_creator::manager_loop()
                                  : &node->Cast<op::sirius_physical_parquet_scan>();
           while (true) {
             pipeline->mark_task_created();
-            auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
-            if (!partition_idx.has_value()) {
+            auto partition = parquet_task_global_state->claim_next_rg_partition();
+            if (!partition.has_value()) {
               pipeline->mark_task_completed();
               if (pipeline->is_pipeline_finished()) {
                 auto output_consumers = pipeline->get_output_consumers();
@@ -341,7 +345,7 @@ void task_creator::manager_loop()
 
             auto parquet_task_local_state =
               std::make_unique<op::scan::parquet_scan_task_local_state>(*parquet_task_global_state,
-                                                                        *partition_idx);
+                                                                        *partition);
 
             if (destination_data_repositories.empty()) {
               throw std::runtime_error(

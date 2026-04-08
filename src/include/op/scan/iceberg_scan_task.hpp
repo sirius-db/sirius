@@ -94,8 +94,20 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
   void build_delete_pipeline(sirius_physical_iceberg_scan* scan_op);
 
   // -------------------------------------------------------------------------
+  // Accessors
+  // -------------------------------------------------------------------------
+
+  [[nodiscard]] std::vector<size_t> const& get_selected_column_indices() const
+  {
+    return _selected_column_indices;
+  }
+
+  // -------------------------------------------------------------------------
   // Fields
   // -------------------------------------------------------------------------
+
+  /// Column indices selected for reading (needed for equality-delete key mapping).
+  std::vector<size_t> _selected_column_indices;
 
   /// The composable delete pipeline (empty for V1 tables).
   iceberg_delete_pipeline _delete_pipeline;
