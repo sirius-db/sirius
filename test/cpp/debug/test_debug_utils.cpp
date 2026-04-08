@@ -616,3 +616,228 @@ TEST_CASE("debug_stats on null-data batch logs warning without crashing", "[debu
   cucascade::data_batch batch(0, nullptr);
   REQUIRE_NOTHROW(sirius::debug_stats(batch, cudf::get_default_stream()));
 }
+
+// ===========================================================================
+// debug_head Phase 3 tests: STRING, DECIMAL, TIMESTAMP, DATE type coverage
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test case 20: debug_head on STRING column shows string values
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_head on STRING column shows string values", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::string_tag>>(
+    {"hello", "world", "test"}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(
+    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"str_col"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 21: debug_head on STRING column truncates with max_string_len
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_head on STRING column truncates with max_string_len", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::string_tag>>(
+    {"short", "this_is_a_very_long_string_value"}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // max_string_len=10 will truncate the long string
+  REQUIRE_NOTHROW(
+    sirius::debug_head(*batch, 2, stream, sirius::DebugFormat::ALIGNED, {"str"}, 10));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 22: debug_head on DECIMAL64 column shows scaled values
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_head on DECIMAL64 column shows scaled values", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // decimal64_tag: scale=-2, values {12345, -100, 5} represent 123.45, -1.00, 0.05
+  auto col = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
+    {12345, -100, 5}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(
+    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"price"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 23: debug_head on TIMESTAMP_MICROSECONDS column shows calendar format
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_head on TIMESTAMP_MICROSECONDS column shows calendar format", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // 1705305000000000 us = 2024-01-15 08:30:00 UTC
+  // 0 = 1970-01-01 00:00:00
+  // 1705305000123456 us = 2024-01-15 08:30:00.123456 (fractional seconds)
+  auto col = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::timestamp_us_tag>>(
+    {1705305000000000LL, 0LL, 1705305000123456LL}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(
+    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"ts"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 24: debug_head on DATE column shows date format
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_head on DATE column shows date format", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // 19738 days since epoch = 2024-01-15
+  // 0 = 1970-01-01
+  // -1 = 1969-12-31 (pre-epoch)
+  auto col = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::date32_tag>>(
+    {19738, 0, -1}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(
+    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"dt"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 25: debug_head on mixed batch with all supported types
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_head on mixed batch with all supported types", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col_int = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {10, 20, 30}, stream, mr);
+  auto col_str = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::string_tag>>(
+    {"hello", "world", "test"}, stream, mr);
+  auto col_dec = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
+    {12345, -100, 5}, stream, mr);
+  auto col_ts = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::timestamp_us_tag>>(
+    {1705305000000000LL, 0LL, 1705305000123456LL}, stream, mr);
+  auto col_dt = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::date32_tag>>(
+    {19738, 0, -1}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col_int));
+  columns.push_back(std::move(col_str));
+  columns.push_back(std::move(col_dec));
+  columns.push_back(std::move(col_ts));
+  columns.push_back(std::move(col_dt));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(
+    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED,
+                       {"int", "str", "dec", "ts", "dt"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 26: debug_head on STRING column with nulls shows NULL
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_head on STRING column with nulls shows NULL", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create string column with 3 rows
+  auto col = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::string_tag>>(
+    {"hello", "world", "test"}, stream, mr);
+
+  // Set null mask: middle row (row 1) is null
+  // Bitmask byte: bit 0 set, bit 1 clear, bit 2 set => 0b00000101 = 0x05
+  constexpr cudf::size_type num_rows = 3;
+  auto mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
+  std::vector<uint8_t> host_mask(mask_size, 0xFF);
+  host_mask[0] = 0b00000101;  // bits 0,2 set (valid); bit 1 clear (null)
+
+  rmm::device_buffer dev_mask(mask_size, stream, mr);
+  cudaMemcpyAsync(
+    dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.value());
+  stream.synchronize();
+
+  col->set_null_mask(std::move(dev_mask), 1);  // null_count = 1
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(
+    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"str_with_null"}));
+}
