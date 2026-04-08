@@ -70,6 +70,7 @@ class pipeline_executor {
    * @param scan_executor_config Configuration for the scan executor thread pool
    * @param mem_mgr Reference to the memory reservation manager
    * @param sys_topology Optional system topology info for CPU affinity
+   * @param downgrade_executors Optional vector of downgrade executors
    */
   explicit pipeline_executor(
     const exec::thread_pool_config& gpu_executor_config,

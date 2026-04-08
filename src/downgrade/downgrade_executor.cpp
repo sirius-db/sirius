@@ -352,7 +352,12 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
     return freed.load(std::memory_order_relaxed) >= bytes;
   };
   auto future = req->result.get_future();
-  _request_queue.push(std::move(req));
+  if (!_request_queue.push(std::move(req))) {
+    SIRIUS_LOG_WARN(
+      "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);
+    req->result.set_value(0);
+    return future;
+  }
   return future;
 }
 
@@ -368,7 +373,12 @@ std::future<size_t> downgrade_executor::request_downgrade(size_t target_bytes,
   req->target_bytes = target_bytes;
   req->predicate    = std::move(predicate);
   auto future       = req->result.get_future();
-  _request_queue.push(std::move(req));
+  if (!_request_queue.push(std::move(req))) {
+    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request for {} bytes",
+                    target_bytes);
+    req->result.set_value(0);
+    return future;
+  }
   return future;
 }
 

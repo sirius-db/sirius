@@ -59,6 +59,9 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    * @param mem_space Pointer to the memory space for GPU allocations
    * @param task_request_publisher Publisher to submit task requests
+   * @param downgrade_executor Pointer to the downgrade executor. This is used so that the
+   * gpu_pipeline_executor can request memory downgrade if it cannot obtain a reservation from the
+   * memory space.
    */
   explicit gpu_pipeline_executor(
     exec::thread_pool_config config,
