@@ -486,18 +486,23 @@ impl DescriptorTable {
     pub fn slot_table_index(&self, slot_id: i32) -> Result<usize> {
         let slot = self.get_slot(slot_id)?;
         let parent = self.get_tuple(slot.parent_tuple_id)?;
+
+        // When child_rel_column_names is set, prioritize it for resolution.
+        // This is critical for conjuncts on JOIN nodes where the FilterRel
+        // operates on the combined [left|right] schema — table-relative indices
+        // from the table_id path would be wrong (they don't account for offsets
+        // from other joined tables in the combined schema).
+        if let Some(ref col_names) = *self.child_rel_column_names.borrow() {
+            if !slot.col_name.is_empty() {
+                if let Some(idx) = col_names.iter().position(|n| n == &slot.col_name) {
+                    return Ok(idx);
+                }
+            }
+        }
+
         let table_id = match parent.table_id {
             Some(id) => id,
             None => {
-                // If child_rel_column_names is set (e.g., for nested JOIN condition
-                // resolution), use it for accurate name-based resolution.
-                if let Some(ref col_names) = *self.child_rel_column_names.borrow() {
-                    if !slot.col_name.is_empty() {
-                        if let Some(idx) = col_names.iter().position(|n| n == &slot.col_name) {
-                            return Ok(idx);
-                        }
-                    }
-                }
                 // Try override columns (handles TVF scans).
                 for (_, columns) in &self.table_column_overrides {
                     if let Some(pos) = columns.iter().position(|c| c == &slot.col_name) {

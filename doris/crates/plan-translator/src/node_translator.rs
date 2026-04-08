@@ -375,11 +375,21 @@ fn apply_conjuncts(
         _ => return Ok(input),
     };
 
+    // Set child_rel_column_names so conjunct SLOT_REFs resolve against the
+    // actual Substrait Rel output (not table-relative indices which may be wrong
+    // after SEMI/ANTI joins remove columns from the output schema).
+    let rel_names = collect_rel_column_names(&input);
+    if !rel_names.is_empty() {
+        desc.set_child_rel_column_names(rel_names);
+    }
+
     // Translate each conjunct expression.
     let conditions: Vec<Expression> = conjuncts
         .iter()
         .map(|expr| expr_translator::translate_expr(expr, desc, registry))
         .collect::<Result<_>>()?;
+
+    desc.clear_child_rel_column_names();
 
     // Combine multiple conjuncts with AND.
     let condition = if conditions.len() == 1 {
@@ -696,6 +706,7 @@ fn translate_hash_join_node(
     // name-based resolution (slot_table_index fails for intermediate tuple slots).
     let left_col_names = collect_rel_column_names(&left);
     let right_col_names = collect_rel_column_names(&right);
+
 
     // Build equality conditions from eq_join_conjuncts.
     let eq_anchor = registry.register_function(crate::URI_COMPARISON, "equal");
