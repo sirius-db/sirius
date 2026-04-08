@@ -60,7 +60,8 @@ sirius_physical_iceberg_scan::sirius_physical_iceberg_scan(
                                  estimated_cardinality,
                                  std::move(extra_info),
                                  std::move(parameters_p),
-                                 std::move(virtual_columns_p))
+                                 std::move(virtual_columns_p),
+                                 nullptr)
 {
   // Override the type set by the parquet scan base constructor
   type = SiriusPhysicalOperatorType::ICEBERG_SCAN;
