@@ -74,9 +74,9 @@ Plans:
   5. The `/validate` and `/runtime-errors` skill files instruct Claude to call `debug_checksum`, `debug_stats`, `debug_head`, `debug_schema`, `debug_nulls`, and `debug_diff` by name, with function signatures and usage examples documented
 **Plans:** 3 plans
 Plans:
-- [ ] 04-01-PLAN.md — Implement debug_diff and debug_sample functions with shared formatting helper extraction
-- [ ] 04-02-PLAN.md — Comprehensive Catch2 unit tests for debug_diff and debug_sample
-- [ ] 04-03-PLAN.md — Update /validate and /runtime-errors skill files with Debug Utilities documentation
+- [x] 04-01-PLAN.md — Implement debug_diff and debug_sample functions with shared formatting helper extraction
+- [x] 04-02-PLAN.md — Comprehensive Catch2 unit tests for debug_diff and debug_sample
+- [x] 04-03-PLAN.md — Update /validate and /runtime-errors skill files with Debug Utilities documentation
 
 ## Progress
 
