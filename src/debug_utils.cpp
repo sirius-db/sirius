@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <random>
 #include <type_traits>
 
 namespace sirius {
@@ -360,6 +361,330 @@ std::string format_date_days(int32_t raw_days)
   return fmt::format("{:04d}-{:02d}-{:02d}", y, m, d);
 }
 
+// ---------------------------------------------------------------------------
+// Shared formatting helper: extract cell values and format into output string.
+// Called by debug_head (after cudf::slice) and debug_sample (after cudf::gather).
+// ---------------------------------------------------------------------------
+void format_rows_to_output(
+    std::string& output,
+    cudf::table_view const& sliced_tv,
+    rmm::cuda_stream_view stream,
+    DebugFormat format,
+    std::vector<std::string> const& names,
+    cudf::size_type max_string_len)
+{
+  auto num_cols = sliced_tv.num_columns();
+  auto num_rows = sliced_tv.num_rows();
+
+  // Extract string representations for each cell: cells[col][row]
+  std::vector<std::vector<std::string>> cells(num_cols);
+  for (cudf::size_type c = 0; c < num_cols; ++c) {
+    auto const& col = sliced_tv.column(c);
+    auto nulls      = copy_null_mask_to_host(col, stream);
+    cells[c].resize(num_rows);
+
+    auto tid = col.type().id();
+
+    // Helper lambda: copy typed data from GPU, format each value.
+    auto extract_numeric = [&]<typename T>() {
+      std::vector<T> host_vals(num_rows);
+      cudaMemcpyAsync(host_vals.data(),
+                      col.data<T>(),
+                      sizeof(T) * num_rows,
+                      cudaMemcpyDeviceToHost,
+                      stream.value());
+      stream.synchronize();
+      for (cudf::size_type r = 0; r < num_rows; ++r) {
+        if (nulls.is_null(col.offset() + r)) {
+          cells[c][r] = "NULL";
+        } else {
+          if constexpr (std::is_floating_point_v<T>) {
+            cells[c][r] = fmt::format("{:g}", host_vals[r]);
+          } else if constexpr (std::is_same_v<T, int8_t>) {
+            cells[c][r] = fmt::format("{}", static_cast<int>(host_vals[r]));
+          } else {
+            cells[c][r] = fmt::format("{}", host_vals[r]);
+          }
+        }
+      }
+    };
+
+    // BOOL8 special handling (stored as int8_t, display as true/false)
+    auto extract_bool = [&]() {
+      std::vector<int8_t> host_vals(num_rows);
+      cudaMemcpyAsync(host_vals.data(),
+                      col.data<int8_t>(),
+                      sizeof(int8_t) * num_rows,
+                      cudaMemcpyDeviceToHost,
+                      stream.value());
+      stream.synchronize();
+      for (cudf::size_type r = 0; r < num_rows; ++r) {
+        if (nulls.is_null(col.offset() + r)) {
+          cells[c][r] = "NULL";
+        } else {
+          cells[c][r] = host_vals[r] ? "true" : "false";
+        }
+      }
+    };
+
+    switch (tid) {
+      case cudf::type_id::INT8: extract_numeric.template operator()<int8_t>(); break;
+      case cudf::type_id::INT16: extract_numeric.template operator()<int16_t>(); break;
+      case cudf::type_id::INT32: extract_numeric.template operator()<int32_t>(); break;
+      case cudf::type_id::INT64: extract_numeric.template operator()<int64_t>(); break;
+      case cudf::type_id::UINT8: extract_numeric.template operator()<uint8_t>(); break;
+      case cudf::type_id::UINT16: extract_numeric.template operator()<uint16_t>(); break;
+      case cudf::type_id::UINT32: extract_numeric.template operator()<uint32_t>(); break;
+      case cudf::type_id::UINT64: extract_numeric.template operator()<uint64_t>(); break;
+      case cudf::type_id::FLOAT32: extract_numeric.template operator()<float>(); break;
+      case cudf::type_id::FLOAT64: extract_numeric.template operator()<double>(); break;
+      case cudf::type_id::BOOL8: extract_bool(); break;
+
+      case cudf::type_id::STRING: {
+        cudf::strings_column_view scv(col);
+        auto const num_offsets = num_rows + 1;
+        std::vector<int32_t> host_offsets(num_offsets);
+        cudaMemcpyAsync(host_offsets.data(),
+                        scv.offsets().data<int32_t>() + col.offset(),
+                        num_offsets * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        auto const chars_start = host_offsets[0];
+        auto const chars_end   = host_offsets[num_rows];
+        auto const chars_bytes = chars_end - chars_start;
+        std::vector<char> host_chars(chars_bytes);
+        if (chars_bytes > 0) {
+          cudaMemcpyAsync(host_chars.data(),
+                          scv.chars_begin(stream) + chars_start,
+                          chars_bytes,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+        }
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            auto const start = host_offsets[r] - chars_start;
+            auto const end   = host_offsets[r + 1] - chars_start;
+            std::string val(host_chars.data() + start, end - start);
+            if (max_string_len > 0 &&
+                val.size() > static_cast<std::size_t>(max_string_len)) {
+              val.resize(max_string_len);
+              val += "...";
+            }
+            cells[c][r] = std::move(val);
+          }
+        }
+        break;
+      }
+
+      case cudf::type_id::DECIMAL32: {
+        int32_t scale     = col.type().scale();
+        int abs_scale     = std::abs(scale);
+        std::vector<int32_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int32_t>(),
+                        sizeof(int32_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_decimal_value(host_vals[r], abs_scale);
+          }
+        }
+        break;
+      }
+      case cudf::type_id::DECIMAL64: {
+        int32_t scale     = col.type().scale();
+        int abs_scale     = std::abs(scale);
+        std::vector<int64_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int64_t>(),
+                        sizeof(int64_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_decimal_value(host_vals[r], abs_scale);
+          }
+        }
+        break;
+      }
+      case cudf::type_id::DECIMAL128: {
+        int32_t scale     = col.type().scale();
+        int abs_scale     = std::abs(scale);
+        std::vector<__int128_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<__int128_t>(),
+                        sizeof(__int128_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_decimal128_value(host_vals[r], abs_scale);
+          }
+        }
+        break;
+      }
+
+      case cudf::type_id::TIMESTAMP_SECONDS: {
+        std::vector<int64_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int64_t>(),
+                        sizeof(int64_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_timestamp_s(host_vals[r]);
+          }
+        }
+        break;
+      }
+      case cudf::type_id::TIMESTAMP_MILLISECONDS: {
+        std::vector<int64_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int64_t>(),
+                        sizeof(int64_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_timestamp_ms(host_vals[r]);
+          }
+        }
+        break;
+      }
+      case cudf::type_id::TIMESTAMP_MICROSECONDS: {
+        std::vector<int64_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int64_t>(),
+                        sizeof(int64_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_timestamp_us(host_vals[r]);
+          }
+        }
+        break;
+      }
+      case cudf::type_id::TIMESTAMP_NANOSECONDS: {
+        std::vector<int64_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int64_t>(),
+                        sizeof(int64_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_timestamp_ns(host_vals[r]);
+          }
+        }
+        break;
+      }
+
+      case cudf::type_id::TIMESTAMP_DAYS: {
+        std::vector<int32_t> host_vals(num_rows);
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int32_t>(),
+                        sizeof(int32_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          if (nulls.is_null(col.offset() + r)) {
+            cells[c][r] = "NULL";
+          } else {
+            cells[c][r] = format_date_days(host_vals[r]);
+          }
+        }
+        break;
+      }
+
+      default:
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          cells[c][r] = "(unsupported)";
+        }
+        break;
+    }
+  }
+
+  // Format output
+  if (format == DebugFormat::CSV) {
+    output += "[SIRIUS_DIAG]   ";
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      if (c > 0) { output += ","; }
+      output += names[c];
+    }
+    output += "\n";
+    for (cudf::size_type r = 0; r < num_rows; ++r) {
+      output += "[SIRIUS_DIAG]   ";
+      for (cudf::size_type c = 0; c < num_cols; ++c) {
+        if (c > 0) { output += ","; }
+        output += cells[c][r];
+      }
+      output += "\n";
+    }
+  } else {
+    // ALIGNED format: dynamic column widths
+    std::vector<std::size_t> widths(num_cols);
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      widths[c] = names[c].size();
+      for (cudf::size_type r = 0; r < num_rows; ++r) {
+        widths[c] = std::max(widths[c], cells[c][r].size());
+      }
+      widths[c] += 2;  // padding
+    }
+
+    // Header row
+    output += "[SIRIUS_DIAG]   ";
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      output += fmt::format("{:<{}s}", names[c], widths[c]);
+    }
+    output += "\n";
+
+    // Separator row
+    output += "[SIRIUS_DIAG]   ";
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      output += std::string(widths[c], '-');
+    }
+    output += "\n";
+
+    // Data rows
+    for (cudf::size_type r = 0; r < num_rows; ++r) {
+      output += "[SIRIUS_DIAG]   ";
+      for (cudf::size_type c = 0; c < num_cols; ++c) {
+        output += fmt::format("{:<{}s}", cells[c][r], widths[c]);
+      }
+      output += "\n";
+    }
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -507,8 +832,6 @@ void debug_head(cucascade::data_batch const& batch,
       sliced_tv   = slices.front();
     }
 
-    auto num_rows = sliced_tv.num_rows();
-
     // Build column names
     std::vector<std::string> names(num_cols);
     for (cudf::size_type c = 0; c < num_cols; ++c) {
@@ -517,327 +840,12 @@ void debug_head(cucascade::data_batch const& batch,
                    : fmt::format("col[{}]", c);
     }
 
-    // Extract string representations for each cell: cells[col][row]
-    std::vector<std::vector<std::string>> cells(num_cols);
-    for (cudf::size_type c = 0; c < num_cols; ++c) {
-      auto const& col = sliced_tv.column(c);
-      auto nulls      = copy_null_mask_to_host(col, stream);
-      cells[c].resize(num_rows);
-
-      auto tid = col.type().id();
-
-      // Helper lambda: copy typed data from GPU, format each value.
-      // col.data<T>() is offset-adjusted in cuDF 26.02 -- do NOT add col.offset().
-      // But null_mask() is NOT offset-adjusted, so use col.offset() + r for null checks.
-      auto extract_numeric = [&]<typename T>() {
-        std::vector<T> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<T>(),
-                        sizeof(T) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
-        for (cudf::size_type r = 0; r < num_rows; ++r) {
-          if (nulls.is_null(col.offset() + r)) {
-            cells[c][r] = "NULL";  // D-06
-          } else {
-            if constexpr (std::is_floating_point_v<T>) {
-              cells[c][r] = fmt::format("{:g}", host_vals[r]);  // D-04
-            } else if constexpr (std::is_same_v<T, int8_t>) {
-              cells[c][r] = fmt::format("{}", static_cast<int>(host_vals[r]));
-            } else {
-              cells[c][r] = fmt::format("{}", host_vals[r]);
-            }
-          }
-        }
-      };
-
-      // BOOL8 special handling (stored as int8_t, display as true/false per D-05)
-      auto extract_bool = [&]() {
-        std::vector<int8_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int8_t>(),
-                        sizeof(int8_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
-        for (cudf::size_type r = 0; r < num_rows; ++r) {
-          if (nulls.is_null(col.offset() + r)) {
-            cells[c][r] = "NULL";
-          } else {
-            cells[c][r] = host_vals[r] ? "true" : "false";  // D-05
-          }
-        }
-      };
-
-      switch (tid) {
-        case cudf::type_id::INT8: extract_numeric.template operator()<int8_t>(); break;
-        case cudf::type_id::INT16: extract_numeric.template operator()<int16_t>(); break;
-        case cudf::type_id::INT32: extract_numeric.template operator()<int32_t>(); break;
-        case cudf::type_id::INT64: extract_numeric.template operator()<int64_t>(); break;
-        case cudf::type_id::UINT8: extract_numeric.template operator()<uint8_t>(); break;
-        case cudf::type_id::UINT16: extract_numeric.template operator()<uint16_t>(); break;
-        case cudf::type_id::UINT32: extract_numeric.template operator()<uint32_t>(); break;
-        case cudf::type_id::UINT64: extract_numeric.template operator()<uint64_t>(); break;
-        case cudf::type_id::FLOAT32: extract_numeric.template operator()<float>(); break;
-        case cudf::type_id::FLOAT64: extract_numeric.template operator()<double>(); break;
-        case cudf::type_id::BOOL8: extract_bool(); break;
-
-        // ----- STRING (D-01, D-02, T-03-01) -----
-        case cudf::type_id::STRING: {
-          cudf::strings_column_view scv(col);
-          // Copy offsets for the sliced range (col.offset() adjusts for sliced views)
-          auto const num_offsets = num_rows + 1;
-          std::vector<int32_t> host_offsets(num_offsets);
-          cudaMemcpyAsync(host_offsets.data(),
-                          scv.offsets().data<int32_t>() + col.offset(),
-                          num_offsets * sizeof(int32_t),
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          // Copy only the chars bytes we need (offset[0] to offset[N])
-          auto const chars_start = host_offsets[0];
-          auto const chars_end   = host_offsets[num_rows];
-          auto const chars_bytes = chars_end - chars_start;
-          std::vector<char> host_chars(chars_bytes);
-          if (chars_bytes > 0) {
-            cudaMemcpyAsync(host_chars.data(),
-                            scv.chars_begin(stream) + chars_start,
-                            chars_bytes,
-                            cudaMemcpyDeviceToHost,
-                            stream.value());
-            stream.synchronize();
-          }
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              auto const start = host_offsets[r] - chars_start;
-              auto const end   = host_offsets[r + 1] - chars_start;
-              std::string val(host_chars.data() + start, end - start);
-              if (max_string_len > 0 &&
-                  val.size() > static_cast<std::size_t>(max_string_len)) {
-                val.resize(max_string_len);
-                val += "...";
-              }
-              cells[c][r] = std::move(val);
-            }
-          }
-          break;
-        }
-
-        // ----- DECIMAL32/64/128 (D-04, D-05) -----
-        case cudf::type_id::DECIMAL32: {
-          int32_t scale     = col.type().scale();
-          int abs_scale     = std::abs(scale);
-          std::vector<int32_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<int32_t>(),
-                          sizeof(int32_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_decimal_value(host_vals[r], abs_scale);
-            }
-          }
-          break;
-        }
-        case cudf::type_id::DECIMAL64: {
-          int32_t scale     = col.type().scale();
-          int abs_scale     = std::abs(scale);
-          std::vector<int64_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<int64_t>(),
-                          sizeof(int64_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_decimal_value(host_vals[r], abs_scale);
-            }
-          }
-          break;
-        }
-        case cudf::type_id::DECIMAL128: {
-          int32_t scale     = col.type().scale();
-          int abs_scale     = std::abs(scale);
-          std::vector<__int128_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<__int128_t>(),
-                          sizeof(__int128_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_decimal128_value(host_vals[r], abs_scale);
-            }
-          }
-          break;
-        }
-
-        // ----- TIMESTAMP types (D-06, D-08, D-09) -----
-        case cudf::type_id::TIMESTAMP_SECONDS: {
-          std::vector<int64_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<int64_t>(),
-                          sizeof(int64_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_timestamp_s(host_vals[r]);
-            }
-          }
-          break;
-        }
-        case cudf::type_id::TIMESTAMP_MILLISECONDS: {
-          std::vector<int64_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<int64_t>(),
-                          sizeof(int64_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_timestamp_ms(host_vals[r]);
-            }
-          }
-          break;
-        }
-        case cudf::type_id::TIMESTAMP_MICROSECONDS: {
-          std::vector<int64_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<int64_t>(),
-                          sizeof(int64_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_timestamp_us(host_vals[r]);
-            }
-          }
-          break;
-        }
-        case cudf::type_id::TIMESTAMP_NANOSECONDS: {
-          std::vector<int64_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<int64_t>(),
-                          sizeof(int64_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_timestamp_ns(host_vals[r]);
-            }
-          }
-          break;
-        }
-
-        // ----- DATE (TIMESTAMP_DAYS) (D-07) -----
-        case cudf::type_id::TIMESTAMP_DAYS: {
-          std::vector<int32_t> host_vals(num_rows);
-          cudaMemcpyAsync(host_vals.data(),
-                          col.data<int32_t>(),
-                          sizeof(int32_t) * num_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            if (nulls.is_null(col.offset() + r)) {
-              cells[c][r] = "NULL";
-            } else {
-              cells[c][r] = format_date_days(host_vals[r]);
-            }
-          }
-          break;
-        }
-
-        default:
-          // Truly unknown types
-          for (cudf::size_type r = 0; r < num_rows; ++r) {
-            cells[c][r] = "(unsupported)";
-          }
-          break;
-      }
-    }
-
-    // Build output string
+    // Build output via shared formatting helper
     std::string output;
     output += fmt::format("[SIRIUS_DIAG] head: batch_id={} rows={} cols={} showing={}\n",
-                          batch.get_batch_id(), tv.num_rows(), num_cols, num_rows);
-
-    if (format == DebugFormat::CSV) {
-      // CSV format (HEAD-02)
-      output += "[SIRIUS_DIAG]   ";
-      for (cudf::size_type c = 0; c < num_cols; ++c) {
-        if (c > 0) { output += ","; }
-        output += names[c];
-      }
-      output += "\n";
-      for (cudf::size_type r = 0; r < num_rows; ++r) {
-        output += "[SIRIUS_DIAG]   ";
-        for (cudf::size_type c = 0; c < num_cols; ++c) {
-          if (c > 0) { output += ","; }
-          output += cells[c][r];
-        }
-        output += "\n";
-      }
-    } else {
-      // ALIGNED format (HEAD-01, D-03: dynamic column widths)
-      std::vector<std::size_t> widths(num_cols);
-      for (cudf::size_type c = 0; c < num_cols; ++c) {
-        widths[c] = names[c].size();
-        for (cudf::size_type r = 0; r < num_rows; ++r) {
-          widths[c] = std::max(widths[c], cells[c][r].size());
-        }
-        widths[c] += 2;  // padding
-      }
-
-      // Header row
-      output += "[SIRIUS_DIAG]   ";
-      for (cudf::size_type c = 0; c < num_cols; ++c) {
-        output += fmt::format("{:<{}s}", names[c], widths[c]);
-      }
-      output += "\n";
-
-      // Separator row
-      output += "[SIRIUS_DIAG]   ";
-      for (cudf::size_type c = 0; c < num_cols; ++c) {
-        output += std::string(widths[c], '-');
-      }
-      output += "\n";
-
-      // Data rows
-      for (cudf::size_type r = 0; r < num_rows; ++r) {
-        output += "[SIRIUS_DIAG]   ";
-        for (cudf::size_type c = 0; c < num_cols; ++c) {
-          output += fmt::format("{:<{}s}", cells[c][r], widths[c]);
-        }
-        output += "\n";
-      }
-    }
+                          batch.get_batch_id(), tv.num_rows(), num_cols,
+                          sliced_tv.num_rows());
+    format_rows_to_output(output, sliced_tv, stream, format, names, max_string_len);
 
     SIRIUS_LOG_DEBUG("{}", output);
 
@@ -1000,6 +1008,347 @@ void debug_checksum(cucascade::data_batch const& batch,
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_checksum failed: {}", e.what());
   } catch (...) {
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_checksum failed: unknown error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// debug_diff
+// ---------------------------------------------------------------------------
+
+void debug_diff(cucascade::data_batch const& batch_a,
+                cucascade::data_batch const& batch_b,
+                rmm::cuda_stream_view stream,
+                cudf::size_type max_diff_rows,
+                cudf::size_type max_rows,
+                std::vector<std::string> const& col_names)
+{
+  try {
+    if (!is_gpu_tier(batch_a, "debug_diff")) { return; }
+    if (!is_gpu_tier(batch_b, "debug_diff")) { return; }
+
+    cudf::table_view tv_a = get_cudf_table_view(batch_a);
+    cudf::table_view tv_b = get_cudf_table_view(batch_b);
+    stream.synchronize();
+
+    std::string output;
+    output += fmt::format(
+      "[SIRIUS_DIAG] diff: batch_a_id={} batch_b_id={} cols_a={} cols_b={} rows_a={} rows_b={}\n",
+      batch_a.get_batch_id(), batch_b.get_batch_id(),
+      tv_a.num_columns(), tv_b.num_columns(),
+      tv_a.num_rows(), tv_b.num_rows());
+
+    // D-06 / DIFF-02: Schema mismatch check — column count
+    if (tv_a.num_columns() != tv_b.num_columns()) {
+      output += fmt::format(
+        "[SIRIUS_DIAG]   schema mismatch: batch_a has {} cols, batch_b has {} cols\n",
+        tv_a.num_columns(), tv_b.num_columns());
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    auto num_cols = tv_a.num_columns();
+
+    // D-06 / DIFF-02: Schema mismatch check — column types
+    bool type_mismatch = false;
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      if (tv_a.column(c).type() != tv_b.column(c).type()) {
+        std::string name =
+          (static_cast<std::size_t>(c) < col_names.size())
+            ? col_names[static_cast<std::size_t>(c)]
+            : fmt::format("col[{}]", c);
+        output += fmt::format(
+          "[SIRIUS_DIAG]   schema mismatch: {} type {} vs {}\n",
+          name,
+          cudf::type_to_name(tv_a.column(c).type()),
+          cudf::type_to_name(tv_b.column(c).type()));
+        type_mismatch = true;
+      }
+    }
+    if (type_mismatch) {
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    // D-06 / DIFF-03: Row count mismatch
+    if (tv_a.num_rows() != tv_b.num_rows()) {
+      output += fmt::format(
+        "[SIRIUS_DIAG]   row count mismatch: batch_a has {} rows, batch_b has {} rows\n",
+        tv_a.num_rows(), tv_b.num_rows());
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    auto num_rows = tv_a.num_rows();
+
+    // D-03 / DIFF-05 / T-04-01: Row limit guard to prevent OOM
+    if (num_rows > max_rows) {
+      output += fmt::format(
+        "[SIRIUS_DIAG]   row count {} exceeds limit {}, skipping value comparison\n",
+        num_rows, max_rows);
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    // D-04 / DIFF-01 / DIFF-04: Per-column host-side value comparison
+    bool all_identical = true;
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      auto const& col_a = tv_a.column(c);
+      auto const& col_b = tv_b.column(c);
+      auto nulls_a      = copy_null_mask_to_host(col_a, stream);
+      auto nulls_b      = copy_null_mask_to_host(col_b, stream);
+
+      std::string name =
+        (static_cast<std::size_t>(c) < col_names.size())
+          ? col_names[static_cast<std::size_t>(c)]
+          : fmt::format("col[{}]", c);
+
+      cudf::size_type diff_count = 0;
+      std::vector<cudf::size_type> diff_indices;
+
+      auto tid = col_a.type().id();
+
+      // Generic comparison lambda for numeric/timestamp types copied as type T
+      auto compare_numeric = [&]<typename T>() {
+        std::vector<T> host_a(num_rows);
+        std::vector<T> host_b(num_rows);
+        cudaMemcpyAsync(host_a.data(), col_a.data<T>(),
+                        sizeof(T) * num_rows, cudaMemcpyDeviceToHost, stream.value());
+        cudaMemcpyAsync(host_b.data(), col_b.data<T>(),
+                        sizeof(T) * num_rows, cudaMemcpyDeviceToHost, stream.value());
+        stream.synchronize();
+        for (cudf::size_type r = 0; r < num_rows; ++r) {
+          bool null_a = nulls_a.is_null(col_a.offset() + r);
+          bool null_b = nulls_b.is_null(col_b.offset() + r);
+          bool differ = false;
+          if (null_a != null_b) {
+            differ = true;
+          } else if (!null_a && host_a[r] != host_b[r]) {
+            differ = true;
+          }
+          if (differ) {
+            ++diff_count;
+            if (static_cast<cudf::size_type>(diff_indices.size()) < max_diff_rows) {
+              diff_indices.push_back(r);
+            }
+          }
+        }
+      };
+
+      switch (tid) {
+        case cudf::type_id::INT8: compare_numeric.template operator()<int8_t>(); break;
+        case cudf::type_id::INT16: compare_numeric.template operator()<int16_t>(); break;
+        case cudf::type_id::INT32: compare_numeric.template operator()<int32_t>(); break;
+        case cudf::type_id::INT64: compare_numeric.template operator()<int64_t>(); break;
+        case cudf::type_id::UINT8: compare_numeric.template operator()<uint8_t>(); break;
+        case cudf::type_id::UINT16: compare_numeric.template operator()<uint16_t>(); break;
+        case cudf::type_id::UINT32: compare_numeric.template operator()<uint32_t>(); break;
+        case cudf::type_id::UINT64: compare_numeric.template operator()<uint64_t>(); break;
+        case cudf::type_id::FLOAT32: compare_numeric.template operator()<float>(); break;
+        case cudf::type_id::FLOAT64: compare_numeric.template operator()<double>(); break;
+        case cudf::type_id::BOOL8: compare_numeric.template operator()<int8_t>(); break;
+
+        case cudf::type_id::STRING: {
+          // Copy string data to host for both columns and compare
+          cudf::strings_column_view scv_a(col_a);
+          cudf::strings_column_view scv_b(col_b);
+
+          // Helper to extract host strings from a string column
+          auto extract_strings = [&](cudf::strings_column_view const& scv,
+                                     cudf::column_view const& col,
+                                     host_column_nulls const& nulls)
+            -> std::vector<std::string> {
+            std::vector<std::string> result(num_rows);
+            auto const num_offsets = num_rows + 1;
+            std::vector<int32_t> host_offsets(num_offsets);
+            cudaMemcpyAsync(host_offsets.data(),
+                            scv.offsets().data<int32_t>() + col.offset(),
+                            num_offsets * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost,
+                            stream.value());
+            stream.synchronize();
+            auto const chars_start = host_offsets[0];
+            auto const chars_end   = host_offsets[num_rows];
+            auto const chars_bytes = chars_end - chars_start;
+            std::vector<char> host_chars(chars_bytes);
+            if (chars_bytes > 0) {
+              cudaMemcpyAsync(host_chars.data(),
+                              scv.chars_begin(stream) + chars_start,
+                              chars_bytes,
+                              cudaMemcpyDeviceToHost,
+                              stream.value());
+              stream.synchronize();
+            }
+            for (cudf::size_type r = 0; r < num_rows; ++r) {
+              if (nulls.is_null(col.offset() + r)) {
+                // Leave empty — null handled separately
+              } else {
+                auto const start = host_offsets[r] - chars_start;
+                auto const end   = host_offsets[r + 1] - chars_start;
+                result[r] = std::string(host_chars.data() + start, end - start);
+              }
+            }
+            return result;
+          };
+
+          auto strings_a = extract_strings(scv_a, col_a, nulls_a);
+          auto strings_b = extract_strings(scv_b, col_b, nulls_b);
+
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            bool null_a = nulls_a.is_null(col_a.offset() + r);
+            bool null_b = nulls_b.is_null(col_b.offset() + r);
+            bool differ = false;
+            if (null_a != null_b) {
+              differ = true;
+            } else if (!null_a && strings_a[r] != strings_b[r]) {
+              differ = true;
+            }
+            if (differ) {
+              ++diff_count;
+              if (static_cast<cudf::size_type>(diff_indices.size()) < max_diff_rows) {
+                diff_indices.push_back(r);
+              }
+            }
+          }
+          break;
+        }
+
+        // DECIMAL types: compare raw integer representation
+        case cudf::type_id::DECIMAL32: compare_numeric.template operator()<int32_t>(); break;
+        case cudf::type_id::DECIMAL64: compare_numeric.template operator()<int64_t>(); break;
+        case cudf::type_id::DECIMAL128: compare_numeric.template operator()<__int128_t>(); break;
+
+        // TIMESTAMP types: compare raw integer representation
+        case cudf::type_id::TIMESTAMP_SECONDS:
+        case cudf::type_id::TIMESTAMP_MILLISECONDS:
+        case cudf::type_id::TIMESTAMP_MICROSECONDS:
+        case cudf::type_id::TIMESTAMP_NANOSECONDS:
+          compare_numeric.template operator()<int64_t>(); break;
+
+        case cudf::type_id::TIMESTAMP_DAYS:
+          compare_numeric.template operator()<int32_t>(); break;
+
+        default:
+          // Unsupported type — skip comparison for this column
+          output += fmt::format(
+            "[SIRIUS_DIAG]   {} (unsupported type, skipped)\n", name);
+          continue;
+      }
+
+      // D-01: Report per-column diffs (only if any found)
+      if (diff_count > 0) {
+        all_identical = false;
+        std::string idx_list;
+        for (std::size_t i = 0; i < diff_indices.size(); ++i) {
+          if (i > 0) { idx_list += ", "; }
+          idx_list += fmt::format("{}", diff_indices[i]);
+        }
+        output += fmt::format(
+          "[SIRIUS_DIAG]   {} diffs: {}/{} rows [idx: {}]\n",
+          name, diff_count, num_rows, idx_list);
+      }
+    }
+
+    if (all_identical) {
+      output += "[SIRIUS_DIAG]   batches are identical\n";
+    }
+
+    SIRIUS_LOG_DEBUG("{}", output);
+
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_diff failed: {}", e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_diff failed: unknown error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// debug_sample
+// ---------------------------------------------------------------------------
+
+void debug_sample(cucascade::data_batch const& batch,
+                  cudf::size_type n,
+                  rmm::cuda_stream_view stream,
+                  DebugFormat format,
+                  std::vector<std::string> const& col_names,
+                  cudf::size_type max_string_len,
+                  std::optional<uint64_t> seed)
+{
+  try {
+    if (!is_gpu_tier(batch, "debug_sample")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
+    stream.synchronize();
+
+    auto num_cols = tv.num_columns();
+
+    // Empty batch handling
+    if (tv.num_rows() == 0) {
+      std::string output;
+      output += fmt::format("[SIRIUS_DIAG] sample: batch_id={} rows=0 cols={}\n",
+                            batch.get_batch_id(), num_cols);
+      output += "[SIRIUS_DIAG]   (empty batch)\n";
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    // T-04-02: Clamp N to batch size
+    auto keep = std::min(n, tv.num_rows());
+    if (keep <= 0) { return; }
+
+    // Build column names
+    std::vector<std::string> names(num_cols);
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      names[c] = (static_cast<std::size_t>(c) < col_names.size())
+                   ? col_names[static_cast<std::size_t>(c)]
+                   : fmt::format("col[{}]", c);
+    }
+
+    std::string output;
+    output += fmt::format(
+      "[SIRIUS_DIAG] sample: batch_id={} rows={} cols={} sampled={}\n",
+      batch.get_batch_id(), tv.num_rows(), num_cols, keep);
+
+    // If sampling all rows, skip gather and format directly
+    if (keep >= tv.num_rows()) {
+      format_rows_to_output(output, tv, stream, format, names, max_string_len);
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    // D-07, D-08: Generate random indices on host via std::mt19937
+    std::mt19937 gen(seed.has_value()
+                       ? static_cast<std::mt19937::result_type>(*seed)
+                       : std::random_device{}());
+    std::uniform_int_distribution<cudf::size_type> dist(0, tv.num_rows() - 1);
+    std::vector<cudf::size_type> indices(keep);
+    for (auto& idx : indices) { idx = dist(gen); }
+    std::sort(indices.begin(), indices.end());  // sorted for memory locality
+
+    // Copy indices to GPU and call cudf::gather
+    rmm::device_buffer dev_indices(
+      indices.data(),
+      static_cast<std::size_t>(keep) * sizeof(cudf::size_type),
+      stream,
+      cudf::get_current_device_resource_ref());
+    stream.synchronize();
+
+    cudf::column_view indices_col(
+      cudf::data_type{cudf::type_id::INT32},
+      keep,
+      dev_indices.data(),
+      nullptr,
+      0);
+
+    auto gathered = cudf::gather(tv, indices_col,
+                                 cudf::out_of_bounds_policy::DONT_CHECK, stream);
+
+    format_rows_to_output(output, gathered->view(), stream, format, names, max_string_len);
+
+    SIRIUS_LOG_DEBUG("{}", output);
+
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_sample failed: {}", e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_sample failed: unknown error");
   }
 }
 
