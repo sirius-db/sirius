@@ -72,9 +72,19 @@ std::unique_ptr<cudf::table> compute_top_n_table(
 
     auto order =
       ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING : cudf::order::DESCENDING;
-    auto indices = cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
-    kept         = cudf::gather(
+    auto null_ord = ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
+                      ? cudf::null_order::BEFORE
+                      : cudf::null_order::AFTER;
+    auto indices  = cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
+    auto gathered = cudf::gather(
       input, indices->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
+    // top_k_order does not guarantee sorted output — sort the gathered rows
+    kept = cudf::sort_by_key(gathered->view(),
+                             cudf::table_view({gathered->view().column(idx)}),
+                             {order},
+                             {null_ord},
+                             stream,
+                             memory_resource);
   } else {
     // Multi-key: fall back to full sort_by_key
     std::vector<cudf::column_view> key_views;
