@@ -9,6 +9,7 @@
 
 #include <cudf/types.hpp>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -138,5 +139,50 @@ void debug_stats(cucascade::data_batch const& batch,
 void debug_checksum(cucascade::data_batch const& batch,
                     rmm::cuda_stream_view stream,
                     std::vector<std::string> const& col_names = {});
+
+/**
+ * @brief Compare two data batches and log schema/value differences.
+ *
+ * Checks schema (column count, types) first, then row count, then
+ * per-column value comparison on host. Reports per-column diff count
+ * and first max_diff_rows differing row indices. Skips value comparison
+ * if either batch exceeds max_rows to prevent OOM.
+ *
+ * @param batch_a       First batch (must be in GPU tier)
+ * @param batch_b       Second batch (must be in GPU tier)
+ * @param stream        CUDA stream for device-to-host copies
+ * @param max_diff_rows Max differing row indices shown per column (default 10)
+ * @param max_rows      Skip value comparison if either batch exceeds this (default 10M)
+ * @param col_names     Optional column names
+ */
+void debug_diff(cucascade::data_batch const& batch_a,
+                cucascade::data_batch const& batch_b,
+                rmm::cuda_stream_view stream,
+                cudf::size_type max_diff_rows = 10,
+                cudf::size_type max_rows = 10'000'000,
+                std::vector<std::string> const& col_names = {});
+
+/**
+ * @brief Log N randomly selected rows from a data batch.
+ *
+ * Generates random row indices on host via std::mt19937, uses cudf::gather
+ * to extract those rows from GPU, then formats output using the same
+ * pipeline as debug_head (aligned columns or CSV).
+ *
+ * @param batch          The data batch to sample (must be in GPU tier)
+ * @param n              Number of rows to sample (clamped to batch size)
+ * @param stream         CUDA stream for device-to-host copies
+ * @param format         Output format: ALIGNED (default) or CSV
+ * @param col_names      Optional column names
+ * @param max_string_len Maximum display length for STRING values (0 = no limit)
+ * @param seed           Optional RNG seed for reproducible sampling
+ */
+void debug_sample(cucascade::data_batch const& batch,
+                  cudf::size_type n,
+                  rmm::cuda_stream_view stream,
+                  DebugFormat format = DebugFormat::ALIGNED,
+                  std::vector<std::string> const& col_names = {},
+                  cudf::size_type max_string_len = 50,
+                  std::optional<uint64_t> seed = std::nullopt);
 
 }  // namespace sirius
