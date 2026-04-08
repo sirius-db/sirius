@@ -493,6 +493,12 @@ pub fn translate_fragment(
     // CAST_EXPR, etc.), wrap the Rel in a ProjectRel to compute them. Without this,
     // queries like Q8 (mkt_share = SUM(x)/SUM(y)) return raw aggregation columns
     // without the final division.
+    if let Some(output_exprs) = fragment.output_exprs.as_ref() {
+        let types: Vec<_> = output_exprs.iter().map(|e| {
+            e.nodes.first().map(|n| format!("{:?}", n.node_type)).unwrap_or_default()
+        }).collect();
+        tracing::warn!(num_exprs = output_exprs.len(), types = ?types, "output_exprs types");
+    }
     let has_computed_output_exprs = fragment.output_exprs.as_ref().map_or(false, |exprs| {
         exprs.iter().any(|e| {
             e.nodes
@@ -669,7 +675,11 @@ pub fn translate_fragment(
     // output column position. For file scans where the Rel outputs more columns,
     // we use name-based matching against the Rel output. For AGG/other where
     // output_exprs might reorder columns, we use slot position in row_tuples.
-    let rel_names = rel_output_names(&rel);
+    // Use collect_rel_column_names (already computed above) instead of
+    // rel_output_names. The latter returns empty for Aggregate/ProjectRel,
+    // causing root_names to fall back to output_names (FE order), which
+    // mismatches DuckDB's actual output order (grouping keys first, then measures).
+    let rel_names = rel_column_names.clone();
 
     // If the Rel produces fewer columns than the FE expects, truncate output_names
     // to only those available in the Rel, preserving the FE's SELECT list order.
