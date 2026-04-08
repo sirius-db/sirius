@@ -130,6 +130,7 @@ set(EXTENSION_SOURCES
     src/pipeline/pipeline_queue.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
+    src/pipeline/sirius_pipeline_converter.cpp
     src/pipeline/task_request.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
@@ -308,6 +309,8 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_pipeline_memory_history.cpp
+    test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
@@ -328,7 +331,12 @@ target_include_directories(
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
-target_link_libraries(sirius_unittest sirius_extension)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static)
+link_extension_libraries(sirius_unittest "")
+# DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
+# that conflict with inline definitions from headers included in test files.
+target_link_options(sirius_unittest PRIVATE
+                    "LINKER:--allow-multiple-definition")
 
 # Precompile Catch2 header (18K lines) once instead of in every test file
 target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
