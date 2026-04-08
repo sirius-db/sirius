@@ -71,7 +71,9 @@ duckdb::unique_ptr<duckdb::LocalSourceState> PhysicalSiriusExecution::GetLocalSo
 }
 
 duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
-  duckdb::ExecutionContext& context, duckdb::DataChunk& chunk, duckdb::OperatorSourceInput& input) const
+  duckdb::ExecutionContext& context,
+  duckdb::DataChunk& chunk,
+  duckdb::OperatorSourceInput& input) const
 {
   auto& state = input.global_state.Cast<SiriusGlobalSourceState>();
   if (state.finished) { return duckdb::SourceResultType::FINISHED; }
