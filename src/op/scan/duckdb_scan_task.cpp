@@ -32,10 +32,47 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
+#include <duckdb/common/enums/vector_type.hpp>
 #include <duckdb/common/types.hpp>
+#include <duckdb/common/types/vector.hpp>
 #include <duckdb/function/table_function.hpp>
 
+#include <chrono>
+
 namespace sirius::op::scan {
+
+//===----------------------------------------------------------------------===//
+// Scan instrumentation helpers
+//===----------------------------------------------------------------------===//
+namespace {
+
+/// @brief Returns the name of a DuckDB VectorType as a string.
+const char* vector_type_name(duckdb::VectorType vt)
+{
+  switch (vt) {
+    case duckdb::VectorType::FLAT_VECTOR: return "FLAT";
+    case duckdb::VectorType::CONSTANT_VECTOR: return "CONSTANT";
+    case duckdb::VectorType::DICTIONARY_VECTOR: return "DICTIONARY";
+    case duckdb::VectorType::FSST_VECTOR: return "FSST";
+    case duckdb::VectorType::SEQUENCE_VECTOR: return "SEQUENCE";
+    default: return "UNKNOWN";
+  }
+}
+
+/// @brief Simple RAII timer that logs elapsed time in microseconds on destruction.
+struct scoped_timer {
+  using clock = std::chrono::steady_clock;
+  clock::time_point start;
+  double& target_us;
+  scoped_timer(double& t) : start(clock::now()), target_us(t) {}
+  ~scoped_timer()
+  {
+    target_us +=
+      std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - start).count();
+  }
+};
+
+}  // namespace
 
 //===----------------------------------------------------------------------===//
 // duckdb_scan_task_global_state
@@ -400,6 +437,16 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
 
   // Ensure at least 1 vector can fit, otherwise the task will be a no-op
   _estimated_rows_per_batch = std::max<size_t>(_estimated_rows_per_batch, STANDARD_VECTOR_SIZE);
+
+  SIRIUS_LOG_INFO(
+    "[duckdb_scan] estimation: {} cols ({} varchar), estimated_row_bytes={}, "
+    "estimated_rows_per_batch={}, batch_size={}, default_varchar_size={}",
+    _num_columns,
+    _varchar_indices.size(),
+    estimated_row_bytes,
+    _estimated_rows_per_batch,
+    _approximate_batch_size,
+    _default_varchar_size);
 }
 
 void duckdb_scan_task_local_state::initialize_builders()
@@ -556,28 +603,111 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
+  // === Scan instrumentation counters ===
+  double us_get_next_chunk = 0;
+  double us_chunk_fits     = 0;
+  double us_process        = 0;
+  size_t num_chunks        = 0;
+  // Per-VectorType counters: [FLAT, FSST, CONSTANT, DICTIONARY, SEQUENCE]
+  std::array<size_t, 5> vtype_counts = {};
+  // Track how many dict vectors we flatten (cost indicator)
+  size_t dict_vectors_flattened = 0;
+  size_t dict_varchar_vectors_flattened = 0;
+
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
                             g_state._op.scanned_types);
 
   // Enter the scan loop to accumulate a data batch
-  while (get_next_chunk(l_state, g_state)) {
+  bool chunk_available = false;
+  {
+    scoped_timer t(us_get_next_chunk);
+    chunk_available = get_next_chunk(l_state, g_state);
+  }
+  while (chunk_available) {
+    ++num_chunks;
+
+    // Record VectorType distribution before Flatten
+    for (size_t i = 0; i < l_state._num_columns; ++i) {
+      auto const vt = l_state._chunk.data[i].GetVectorType();
+      auto const vt_idx = static_cast<size_t>(vt);
+      if (vt_idx < vtype_counts.size()) { vtype_counts[vt_idx]++; }
+      if (vt == duckdb::VectorType::DICTIONARY_VECTOR) {
+        dict_vectors_flattened++;
+        if (l_state._column_builders[i].type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+          dict_varchar_vectors_flattened++;
+        }
+      }
+    }
+
     // We know a priori that the fixed-width columns and masks will fit in the allocated buffers.
     // For variable-length columns, we need to check that we have enough space.
     // If there isn't enough space, we just throw an exception for now.
     /// FUTURE WORK: push the current data batch into a new scan task.
-    if (!chunk_fits(l_state)) {
+    bool fits = false;
+    {
+      scoped_timer t(us_chunk_fits);
+      fits = chunk_fits(l_state);
+    }
+    if (!fits) {
       std::string err_msg =
         "[duckdb_scan_task]: current chunk does not fit in the allocated buffers.";
       throw std::runtime_error(err_msg);
     }
 
     // Process the chunk into the column builders
-    process_chunk(l_state);
+    {
+      scoped_timer t(us_process);
+      process_chunk(l_state);
+    }
 
     // Termination condition
     if (STANDARD_VECTOR_SIZE + l_state._row_offset >= l_state._estimated_rows_per_batch) { break; }
+
+    // Fetch next chunk
+    {
+      scoped_timer t(us_get_next_chunk);
+      chunk_available = get_next_chunk(l_state, g_state);
+    }
+  }
+
+  // === Log scan instrumentation summary ===
+  {
+    size_t actual_bytes = l_state._row_offset > 0 ? l_state.get_tail_byte_offset() : 0;
+    size_t alloc_bytes  = l_state._allocation ? l_state._allocation->size_bytes() : 0;
+
+    // Compute per-column varchar usage
+    std::string varchar_detail;
+    for (auto idx : l_state._varchar_indices) {
+      auto const& cb = l_state._column_builders[idx];
+      varchar_detail += fmt::format(" col{}={}/{} bytes", idx, cb.total_data_bytes,
+                                    cb.total_data_bytes_allocated);
+    }
+
+    SIRIUS_LOG_INFO(
+      "[duckdb_scan] task={} rows={}/{} est, chunks={}, alloc={}/{} bytes ({}% used), "
+      "vtype=[FLAT={} FSST={} CONST={} DICT={} SEQ={}], "
+      "dict_flatten=[total={} varchar={}], "
+      "time_us=[get_chunk={:.0f} chunk_fits={:.0f} process={:.0f}]{}",
+      _task_id,
+      l_state._row_offset,
+      l_state._estimated_rows_per_batch,
+      num_chunks,
+      actual_bytes,
+      alloc_bytes,
+      alloc_bytes > 0 ? (actual_bytes * 100 / alloc_bytes) : 0,
+      vtype_counts[0],
+      vtype_counts[1],
+      vtype_counts[2],
+      vtype_counts[3],
+      vtype_counts[4],
+      dict_vectors_flattened,
+      dict_varchar_vectors_flattened,
+      us_get_next_chunk,
+      us_chunk_fits,
+      us_process,
+      varchar_detail);
   }
 
   // Add tasks back to the queue if the local scan state is not finished
