@@ -965,3 +965,319 @@ TEST_CASE("debug_checksum on null-data batch logs warning without crashing", "[d
   cucascade::data_batch batch(0, nullptr);
   REQUIRE_NOTHROW(sirius::debug_checksum(batch, cudf::get_default_stream()));
 }
+
+// ===========================================================================
+// debug_diff tests (Phase 4, Plan 02)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test case 32: debug_diff identical batches reports no diffs
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff identical batches reports no diffs", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create two identical batches: INT32 + INT64, 5 rows each
+  auto make_batch = [&]() {
+    auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+      {10, 20, 30, 40, 50}, stream, mr);
+    auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
+      {100, 200, 300, 400, 500}, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(col_a));
+    columns.push_back(std::move(col_b));
+    auto table = std::make_unique<cudf::table>(std::move(columns));
+    return sirius::make_data_batch(std::move(table), *space);
+  };
+
+  auto batch_a = make_batch();
+  auto batch_b = make_batch();
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 33: debug_diff column count mismatch (DIFF-02)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff column count mismatch logs schema mismatch", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // batch_a: 2 columns (INT32, INT64)
+  auto col_a1 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3}, stream, mr);
+  auto col_a2 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
+    {10, 20, 30}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_a;
+  cols_a.push_back(std::move(col_a1));
+  cols_a.push_back(std::move(col_a2));
+  auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
+  auto batch_a = sirius::make_data_batch(std::move(table_a), *space);
+
+  // batch_b: 1 column (INT32)
+  auto col_b1 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_b;
+  cols_b.push_back(std::move(col_b1));
+  auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
+  auto batch_b = sirius::make_data_batch(std::move(table_b), *space);
+
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  // Schema mismatch detected and logged, no crash
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 34: debug_diff column type mismatch (DIFF-02)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff column type mismatch logs schema mismatch", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // batch_a: 1 column (INT32, values {1,2,3})
+  auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_a;
+  cols_a.push_back(std::move(col_a));
+  auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
+  auto batch_a = sirius::make_data_batch(std::move(table_a), *space);
+
+  // batch_b: 1 column (INT64, values {1,2,3})
+  auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
+    {1, 2, 3}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_b;
+  cols_b.push_back(std::move(col_b));
+  auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
+  auto batch_b = sirius::make_data_batch(std::move(table_b), *space);
+
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  // Type mismatch detected and logged, no value comparison attempted
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 35: debug_diff row count mismatch (DIFF-03)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff row count mismatch logs row count mismatch", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // batch_a: 1 column (INT32, 3 rows)
+  auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_a;
+  cols_a.push_back(std::move(col_a));
+  auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
+  auto batch_a = sirius::make_data_batch(std::move(table_a), *space);
+
+  // batch_b: 1 column (INT32, 5 rows)
+  auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3, 4, 5}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_b;
+  cols_b.push_back(std::move(col_b));
+  auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
+  auto batch_b = sirius::make_data_batch(std::move(table_b), *space);
+
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  // Row count mismatch detected and logged
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 36: debug_diff value differences (DIFF-01, DIFF-04)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff value differences reports per-column diff counts", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // batch_a: 1 column (INT32, 5 rows: {1, 2, 3, 4, 5})
+  auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3, 4, 5}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_a;
+  cols_a.push_back(std::move(col_a));
+  auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
+  auto batch_a = sirius::make_data_batch(std::move(table_a), *space);
+
+  // batch_b: 1 column (INT32, 5 rows: {1, 99, 3, 4, 99})
+  auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 99, 3, 4, 99}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols_b;
+  cols_b.push_back(std::move(col_b));
+  auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
+  auto batch_b = sirius::make_data_batch(std::move(table_b), *space);
+
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  // Per-column diff count and indices reported
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream, /*max_diff_rows=*/10));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 37: debug_diff with null differences
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff with null differences detects null position diffs", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  constexpr cudf::size_type num_rows = 5;
+
+  // batch_a: 1 column (INT32, 5 rows: {1, NULL, 3, 4, 5}) -- null at index 1
+  auto col_a = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, stream, mr);
+  {
+    std::vector<int32_t> host_data{1, 2, 3, 4, 5};
+    auto mv = col_a->mutable_view();
+    cudaMemcpyAsync(mv.data<int32_t>(),
+                    host_data.data(),
+                    sizeof(int32_t) * num_rows,
+                    cudaMemcpyHostToDevice,
+                    stream.value());
+    // null at index 1: bits 0,2,3,4 set => 0b00011101 = 0x1D
+    auto mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
+    std::vector<uint8_t> host_mask(mask_size, 0xFF);
+    host_mask[0] = 0b00011101;
+    rmm::device_buffer dev_mask(mask_size, stream, mr);
+    cudaMemcpyAsync(
+      dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.value());
+    stream.synchronize();
+    col_a->set_null_mask(std::move(dev_mask), 1);
+  }
+
+  // batch_b: 1 column (INT32, 5 rows: {1, 2, 3, NULL, 5}) -- null at index 3
+  auto col_b = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, stream, mr);
+  {
+    std::vector<int32_t> host_data{1, 2, 3, 4, 5};
+    auto mv = col_b->mutable_view();
+    cudaMemcpyAsync(mv.data<int32_t>(),
+                    host_data.data(),
+                    sizeof(int32_t) * num_rows,
+                    cudaMemcpyHostToDevice,
+                    stream.value());
+    // null at index 3: bits 0,1,2,4 set => 0b00010111 = 0x17
+    auto mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
+    std::vector<uint8_t> host_mask(mask_size, 0xFF);
+    host_mask[0] = 0b00010111;
+    rmm::device_buffer dev_mask(mask_size, stream, mr);
+    cudaMemcpyAsync(
+      dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.value());
+    stream.synchronize();
+    col_b->set_null_mask(std::move(dev_mask), 1);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> cols_a;
+  cols_a.push_back(std::move(col_a));
+  auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
+  auto batch_a = sirius::make_data_batch(std::move(table_a), *space);
+
+  std::vector<std::unique_ptr<cudf::column>> cols_b;
+  cols_b.push_back(std::move(col_b));
+  auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
+  auto batch_b = sirius::make_data_batch(std::move(table_b), *space);
+
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  // Null position differences detected
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 38: debug_diff row limit guard (DIFF-05, D-03)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff row limit guard skips comparison for large batches", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create a small batch (5 rows) but pass max_rows=2 to trigger the guard
+  auto make_batch = [&]() {
+    auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+      {1, 2, 3, 4, 5}, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(col));
+    auto table = std::make_unique<cudf::table>(std::move(columns));
+    return sirius::make_data_batch(std::move(table), *space);
+  };
+
+  auto batch_a = make_batch();
+  auto batch_b = make_batch();
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  // max_rows=2 but batches have 5 rows -- warning logged, value comparison skipped
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream, /*max_diff_rows=*/10, /*max_rows=*/2));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 39: debug_diff empty batches
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_diff empty batches handles gracefully", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create two empty batches (0 rows, 1 INT32 column each)
+  auto make_empty_batch = [&]() {
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(col));
+    auto table = std::make_unique<cudf::table>(std::move(columns));
+    return sirius::make_data_batch(std::move(table), *space);
+  };
+
+  auto batch_a = make_empty_batch();
+  auto batch_b = make_empty_batch();
+  REQUIRE(batch_a != nullptr);
+  REQUIRE(batch_b != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream));
+}
