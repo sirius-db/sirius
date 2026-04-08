@@ -45,8 +45,8 @@ Plans:
   4. `debug_stats` uses `cudf::reduce` — no full column is copied to host for statistics computation
 **Plans:** 2 plans
 Plans:
-- [ ] 02-01-PLAN.md — Implement debug_head and debug_stats functions in debug_utils module
-- [ ] 02-02-PLAN.md — Comprehensive Catch2 unit tests for debug_head and debug_stats
+- [x] 02-01-PLAN.md — Implement debug_head and debug_stats functions in debug_utils module
+- [x] 02-02-PLAN.md — Comprehensive Catch2 unit tests for debug_head and debug_stats
 
 ### Phase 3: Full Type Coverage and Checksums
 **Goal**: `debug_head` handles all Sirius-supported data types including STRING, DECIMAL (with correct scale), TIMESTAMP, and DATE (as human-readable calendar format), and `debug_checksum` produces a stable per-column xxhash_64 fingerprint that can be compared across two log files to detect data divergence
