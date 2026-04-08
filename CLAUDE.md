@@ -52,9 +52,18 @@ Build outputs:
 ### Building Python API
 
 ```bash
-cd duckdb-python
-pip install .
-cd ..
+pixi run -e duckdb-python build-duckdb-python
+```
+
+This uses a dedicated pixi environment (`duckdb-python`) with pip, pybind11, and scikit-build-core. The task automatically points `DUCKDB_SOURCE_PATH` at the repo-level `duckdb/` submodule so the Python package links against the same DuckDB version as the C++ extension.
+
+**Usage from Python:**
+```python
+import duckdb
+
+con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
+result = con.execute("CALL gpu_execution('SELECT ...')").fetchall()
 ```
 
 ## Testing
@@ -170,9 +179,12 @@ CLI:
 ```sql
 LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
 CALL gpu_execution('SELECT ...');
+-- Legacy mode (requires gpu_buffer_init first):
+CALL gpu_buffer_init('1 GB', '2 GB');
+CALL gpu_processing('SELECT ...');
 ```
 
-Python:
+Python (requires `pixi run -e duckdb-python build-duckdb-python` first):
 ```python
 con = duckdb.connect('db.duckdb', config={"allow_unsigned_extensions": "true"})
 con.execute("LOAD '/path/to/sirius.duckdb_extension'")
