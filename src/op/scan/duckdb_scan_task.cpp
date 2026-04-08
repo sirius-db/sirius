@@ -108,12 +108,10 @@ size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
       auto max_len      = duckdb::StringStats::MaxStringLength(*stats);
       auto distinct_est = stats->GetDistinctCount();
 
-      // For low-cardinality columns (distinct << total), avg ≈ max
-      // For high-cardinality, use max/2 as conservative midpoint
+      // Use max_string_length as the allocation estimate.
+      // This is a safe upper bound — actual average will be ≤ max.
+      // Still much better than the blind 256-byte default for most columns.
       size_t estimated_avg = max_len;
-      if (distinct_est > 0 && distinct_est > total_rows / 2) {
-        estimated_avg = std::max<size_t>(max_len / 2, 1);
-      }
 
       SIRIUS_LOG_INFO(
         "[duckdb_scan] metadata col {}: max_string_length={}, distinct_est={}, total_rows={}, "
@@ -473,11 +471,13 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
     if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       _varchar_indices.push_back(i);
 
-      // Log metadata-based estimate for comparison (no behavior change yet)
-      estimate_varchar_bytes_from_metadata(op.bind_data.get(), i, _exec_ctx.client);
+      // Use metadata-based max_string_length instead of blind default when available
+      size_t varchar_size = estimate_varchar_bytes_from_metadata(
+        op.bind_data.get(), i, _exec_ctx.client);
+      if (varchar_size == 0) { varchar_size = _default_varchar_size; }
 
-      _column_builders.emplace_back(col_type, _default_varchar_size);
-      estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data
+      _column_builders.emplace_back(col_type, varchar_size);
+      estimated_row_bytes += (sizeof(int32_t) + varchar_size);  // offset + data
     } else {
       _column_builders.emplace_back(col_type, _default_varchar_size);
       estimated_row_bytes += duckdb::GetTypeIdSize(col_type.InternalType());  // data
@@ -520,8 +520,9 @@ void duckdb_scan_task_local_state::initialize_builders()
     // Update byte_offset for next column
     if (_column_builders[i].type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       // VARCHAR column (offsets + data + mask)
+      // Use per-column type_size from metadata (or default if unavailable)
       byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int32_t) +
-                     _estimated_rows_per_batch * _default_varchar_size +
+                     _estimated_rows_per_batch * _column_builders[i].type_size +
                      utils::ceil_div_8(_estimated_rows_per_batch);
     } else {
       // Fixed-width column (data + mask)
