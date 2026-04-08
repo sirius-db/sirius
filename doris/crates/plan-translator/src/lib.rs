@@ -715,10 +715,10 @@ pub fn translate_fragment(
     let result_output_names = output_names;
 
     tracing::warn!(
+        tree = %dump_rel_flat(&rel),
         rel_cols = node_translator::count_rel_columns(&rel),
         root_names_count = root_names.len(),
         output_names_count = result_output_names.len(),
-        rel_names_count = rel_names.len(),
         root_names = ?root_names,
         "Substrait plan summary"
     );

@@ -908,6 +908,22 @@ fn translate_hash_join_node(
         ));
     }
 
+    // Translate other_join_conjuncts (list) if present. These are non-equality
+    // conditions like `l1.l_suppkey <> l2.l_suppkey` for EXISTS/NOT EXISTS.
+    // Always merge into the join expression (they reference both sides).
+    if let Some(other_conjuncts) = &hash_join.other_join_conjuncts {
+        let mut combined = left_col_names.clone();
+        combined.extend(right_col_names.clone());
+        if !combined.is_empty() {
+            desc.set_child_rel_column_names(combined);
+        }
+        for conj in other_conjuncts {
+            let expr = expr_translator::translate_expr(conj, desc, registry)?;
+            conditions.push(expr);
+        }
+        desc.clear_child_rel_column_names();
+    }
+
     // Translate vother_join_conjunct if present.
     // For SEMI/ANTI joins: merge into the main expression (no post_join_filter).
     // For other joins: keep as post_join_filter for correct OUTER join semantics.
@@ -929,6 +945,11 @@ fn translate_hash_join_node(
         desc.clear_child_rel_column_names();
         if is_semi_or_anti {
             // Merge into join condition — semantically correct for SEMI/ANTI.
+            tracing::warn!(
+                join_op = ?hash_join.join_op,
+                left_col_count,
+                "merging vother_join_conjunct into SEMI/ANTI join expression"
+            );
             conditions.push(expr);
         } else {
             post_join_filter = Some(expr);
@@ -947,6 +968,62 @@ fn translate_hash_join_node(
             ..Default::default()
         }))),
     };
+
+    // For SEMI/ANTI joins, conjuncts may reference columns from both sides
+    // (e.g., l1.l_suppkey <> l2.l_suppkey for EXISTS/NOT EXISTS). These can't
+    // be in a FilterRel (which only sees the output side). Merge them into the
+    // join expression instead.
+    if is_semi_or_anti {
+        if let Some(conjuncts) = &node.conjuncts {
+            if !conjuncts.is_empty() {
+                // Re-create combined column names for resolving both-side references.
+                // Use left/right from the JoinRel we just built.
+                let join_box = match join_rel.rel_type.as_ref() {
+                    Some(rel::RelType::Join(j)) => j,
+                    _ => unreachable!(),
+                };
+                let left_names_j = join_box.left.as_deref().map(collect_rel_column_names).unwrap_or_default();
+                let right_names_j = join_box.right.as_deref().map(collect_rel_column_names).unwrap_or_default();
+                let mut combined = left_names_j;
+                combined.extend(right_names_j);
+                if !combined.is_empty() {
+                    desc.set_child_rel_column_names(combined);
+                }
+                let mut extra_conditions = Vec::new();
+                for conj in conjuncts {
+                    let expr = expr_translator::translate_expr(conj, desc, registry)?;
+                    extra_conditions.push(expr);
+                }
+                desc.clear_child_rel_column_names();
+
+                // Merge extra conditions into the join expression.
+                if !extra_conditions.is_empty() {
+                    tracing::warn!(
+                        num_conjuncts = extra_conditions.len(),
+                        join_op = ?hash_join.join_op,
+                        "merging SEMI/ANTI conjuncts into join expression"
+                    );
+                    let join_box2 = match join_rel.rel_type {
+                        Some(rel::RelType::Join(j)) => j,
+                        _ => unreachable!(),
+                    };
+                    let mut all_conditions: Vec<Expression> = Vec::new();
+                    if let Some(existing) = join_box2.expression.map(|b| *b) {
+                        all_conditions.push(existing);
+                    }
+                    all_conditions.extend(extra_conditions);
+                    let merged = and_expressions(all_conditions, registry);
+                    return Ok(Rel {
+                        rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
+                            expression: merged.map(Box::new),
+                            ..*join_box2
+                        }))),
+                    });
+                }
+            }
+        }
+        return Ok(join_rel);
+    }
 
     // Apply conjuncts as filter if present.
     apply_conjuncts(join_rel, node, desc, registry)
