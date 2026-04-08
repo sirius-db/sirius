@@ -350,17 +350,17 @@ sirius::debug_sample(batch, N, stream, format, col_names, max_string_len, seed);
 | A3 | Shared formatting helper extracted from `debug_head` internals | Architecture Patterns | Low -- internal decomposition at Claude's discretion; duplication also works |
 | A4 | Skill documentation placed as a new section within existing SKILL.md | Code Examples | Low -- section placement is at Claude's discretion per CONTEXT.md |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **debug_diff on cudf::gather'd / sliced table views**
    - What we know: `debug_diff` receives `data_batch` objects which contain full `cudf::table` references. The function extracts `cudf::table_view` via `get_cudf_table_view()`.
    - What's unclear: Whether callers will ever pass batches that contain sliced views (with non-zero `col.offset()`). The existing null mask handling already accounts for offset, but value comparison needs to be offset-aware too.
-   - Recommendation: Follow existing `debug_head` pattern: `col.data<T>()` is offset-adjusted in cuDF 26.02, null mask uses `col.offset() + r`. This handles both full and sliced views correctly.
+   - RESOLVED: Follow existing `debug_head` pattern: `col.data<T>()` is offset-adjusted in cuDF 26.02, null mask uses `col.offset() + r`. This handles both full and sliced views correctly.
 
 2. **debug_sample memory resource for cudf::gather**
    - What we know: `cudf::gather` accepts an optional `rmm::device_async_resource_ref` parameter. Most codebase usages pass an explicit allocator from `memory_space.get_default_allocator()`.
    - What's unclear: Whether `debug_sample` should use the default device resource (`cudf::get_current_device_resource_ref()`) or require a memory resource parameter.
-   - Recommendation: Use `cudf::get_current_device_resource_ref()` (same as `debug_checksum` does on line 942) to keep the API simple. Debug utilities are diagnostic-only and don't need explicit memory management.
+   - RESOLVED: Use `cudf::get_current_device_resource_ref()` (same as `debug_checksum` does on line 942) to keep the API simple. Debug utilities are diagnostic-only and don't need explicit memory management.
 
 ## Environment Availability
 
