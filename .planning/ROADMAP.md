@@ -57,7 +57,10 @@ Plans:
   2. `debug_head` on a DECIMAL column shows values with the correct decimal point position derived from `col.type().scale()`, not raw integer values
   3. `debug_head` on TIMESTAMP and DATE columns shows human-readable calendar format (e.g., `2024-01-15 08:30:00`), not raw epoch integers
   4. `debug_checksum(batch, stream)` produces a `col[N] checksum: 0xXXXXXXXX` line per column, and running the same query twice yields identical checksum values for identical data
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 03-01-PLAN.md — Extend debug_head with STRING, DECIMAL, TIMESTAMP, DATE type support and unit tests
+- [ ] 03-02-PLAN.md — Implement debug_checksum with xxhash_64 + XOR reduce and unit tests
 
 ### Phase 4: Diff, Sampling, and Skill Integration
 **Goal**: `debug_diff` compares two batches and reports schema mismatches and per-column row differences; `debug_sample` prints N randomly selected rows using the same formatting as `debug_head`; both Claude Code skills document the complete utility API so Claude uses named functions instead of ad-hoc `SIRIUS_LOG_TRACE` patterns
@@ -79,6 +82,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Infrastructure and Metadata Inspection | 2/2 | Complete | 2026-04-07 |
-| 2. Numeric Row Preview and Column Statistics | 0/2 | Planning complete | - |
-| 3. Full Type Coverage and Checksums | 0/TBD | Not started | - |
+| 2. Numeric Row Preview and Column Statistics | 2/2 | Complete | 2026-04-07 |
+| 3. Full Type Coverage and Checksums | 0/2 | Planning complete | - |
 | 4. Diff, Sampling, and Skill Integration | 0/TBD | Not started | - |
