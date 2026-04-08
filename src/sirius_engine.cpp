@@ -43,6 +43,7 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
+#include "pipeline/sirius_plan_printer.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
@@ -351,6 +352,10 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // Collect all pipelines for progress tracking
   root_pipeline->get_pipelines(sirius_pipelines, true);
   SIRIUS_LOG_DEBUG("total_pipelines = {}", sirius_pipelines.size());
+
+  // Auto-log the enriched query plan (D-08)
+  pipeline::sirius_plan_printer plan_printer(new_scheduled);
+  SIRIUS_LOG_INFO("Query Plan:\n{}", plan_printer.render());
 }
 
 }  // namespace sirius
