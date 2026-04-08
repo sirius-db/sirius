@@ -841,3 +841,120 @@ TEST_CASE("debug_head on STRING column with nulls shows NULL", "[debug_utils]")
   REQUIRE_NOTHROW(
     sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"str_with_null"}));
 }
+
+// ---------------------------------------------------------------------------
+// Test case 27: debug_checksum on numeric column produces output without throwing
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_checksum on numeric column produces output without throwing", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {10, 20, 30}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream, {"nums"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 28: debug_checksum on multi-type batch produces per-column output
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_checksum on multi-type batch produces per-column output", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {10, 20, 30}, stream, mr);
+  auto col_str = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::string_tag>>(
+    {"alpha", "beta", "gamma"}, stream, mr);
+  auto col_dec = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
+    {100, 250, 350}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col_i32));
+  columns.push_back(std::move(col_str));
+  columns.push_back(std::move(col_dec));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream, {"i32", "str", "dec"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 29: debug_checksum on empty batch prints note without throwing
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_checksum on empty batch prints note without throwing", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create empty INT32 column (0 rows)
+  auto col = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 30: debug_checksum on all-NULL column produces zero checksum
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_checksum on all-NULL column produces zero checksum", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create INT32 column with 5 rows, all NULL
+  constexpr cudf::size_type num_rows = 5;
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows,
+    cudf::mask_state::ALL_NULL, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream, {"all_null"}));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 31: debug_checksum on null-data batch logs warning without crashing
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_checksum on null-data batch logs warning without crashing", "[debug_utils]")
+{
+  cucascade::data_batch batch(0, nullptr);
+  REQUIRE_NOTHROW(sirius::debug_checksum(batch, cudf::get_default_stream()));
+}
