@@ -59,8 +59,8 @@ Plans:
   4. `debug_checksum(batch, stream)` produces a `col[N] checksum: 0xXXXXXXXX` line per column, and running the same query twice yields identical checksum values for identical data
 **Plans:** 2 plans
 Plans:
-- [ ] 03-01-PLAN.md — Extend debug_head with STRING, DECIMAL, TIMESTAMP, DATE type support and unit tests
-- [ ] 03-02-PLAN.md — Implement debug_checksum with xxhash_64 + XOR reduce and unit tests
+- [x] 03-01-PLAN.md — Extend debug_head with STRING, DECIMAL, TIMESTAMP, DATE type support and unit tests
+- [x] 03-02-PLAN.md — Implement debug_checksum with xxhash_64 + XOR reduce and unit tests
 
 ### Phase 4: Diff, Sampling, and Skill Integration
 **Goal**: `debug_diff` compares two batches and reports schema mismatches and per-column row differences; `debug_sample` prints N randomly selected rows using the same formatting as `debug_head`; both Claude Code skills document the complete utility API so Claude uses named functions instead of ad-hoc `SIRIUS_LOG_TRACE` patterns
@@ -72,7 +72,11 @@ Plans:
   3. `debug_diff` on a batch exceeding the configurable row limit logs a warning and skips value comparison rather than attempting an OOM copy
   4. `debug_sample(batch, N, stream)` prints N randomly selected rows in the same aligned-column format as `debug_head`, with different rows visible on repeated calls
   5. The `/validate` and `/runtime-errors` skill files instruct Claude to call `debug_checksum`, `debug_stats`, `debug_head`, `debug_schema`, `debug_nulls`, and `debug_diff` by name, with function signatures and usage examples documented
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+- [ ] 04-01-PLAN.md — Implement debug_diff and debug_sample functions with shared formatting helper extraction
+- [ ] 04-02-PLAN.md — Comprehensive Catch2 unit tests for debug_diff and debug_sample
+- [ ] 04-03-PLAN.md — Update /validate and /runtime-errors skill files with Debug Utilities documentation
 
 ## Progress
 
@@ -84,4 +88,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Infrastructure and Metadata Inspection | 2/2 | Complete | 2026-04-07 |
 | 2. Numeric Row Preview and Column Statistics | 2/2 | Complete | 2026-04-07 |
 | 3. Full Type Coverage and Checksums | 0/2 | Planning complete | - |
-| 4. Diff, Sampling, and Skill Integration | 0/TBD | Not started | - |
+| 4. Diff, Sampling, and Skill Integration | 0/3 | Planning complete | - |
