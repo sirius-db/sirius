@@ -10,6 +10,7 @@
 
 #include <cudf/copying.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/hashing.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -922,6 +923,83 @@ void debug_stats(cucascade::data_batch const& batch,
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_stats failed: {}", e.what());
   } catch (...) {
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_stats failed: unknown error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// debug_checksum
+// ---------------------------------------------------------------------------
+
+void debug_checksum(cucascade::data_batch const& batch,
+                    rmm::cuda_stream_view stream,
+                    std::vector<std::string> const& col_names)
+{
+  try {
+    if (!is_gpu_tier(batch, "debug_checksum")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
+    stream.synchronize();
+
+    auto mr       = cudf::get_current_device_resource_ref();
+    auto num_cols = tv.num_columns();
+
+    std::string output;
+    output += fmt::format(
+      "[SIRIUS_DIAG] checksum: batch_id={} rows={} cols={}\n",
+      batch.get_batch_id(), tv.num_rows(), num_cols);
+
+    // Empty batch handling
+    if (tv.num_rows() == 0) {
+      output += "[SIRIUS_DIAG]   (empty batch)\n";
+      SIRIUS_LOG_DEBUG("{}", output);
+      return;
+    }
+
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      auto const& col = tv.column(c);
+      std::string name =
+        (static_cast<std::size_t>(c) < col_names.size())
+          ? col_names[static_cast<std::size_t>(c)]
+          : fmt::format("col[{}]", c);
+
+      auto nc = col.null_count();
+      if (nc < 0) { nc = 0; }
+
+      // Pitfall 6 / T-03-05: Empty or all-NULL column
+      if (col.size() == 0 || nc == col.size()) {
+        output += fmt::format(
+          "[SIRIUS_DIAG]   {} checksum: 0x{:016X} nulls={}\n",
+          name, uint64_t{0}, static_cast<int>(nc));
+        continue;
+      }
+
+      // Step 1: Hash the single column (per D-10)
+      cudf::table_view single_col_tv({col});
+      auto hash_col = cudf::hashing::xxhash_64(single_col_tv, 0, stream, mr);
+
+      // Step 2: XOR reduce to single value (per D-10)
+      auto xor_agg = cudf::make_bitwise_aggregation<cudf::reduce_aggregation>(
+        cudf::bitwise_op::XOR);
+      auto result = cudf::reduce(
+        hash_col->view(), *xor_agg,
+        cudf::data_type{cudf::type_id::UINT64}, stream, mr);
+
+      auto& scalar =
+        static_cast<cudf::numeric_scalar<uint64_t> const&>(*result);
+      uint64_t checksum =
+        scalar.is_valid(stream) ? scalar.value(stream) : 0;
+
+      // D-11: Output format with null count
+      output += fmt::format(
+        "[SIRIUS_DIAG]   {} checksum: 0x{:016X} nulls={}\n",
+        name, checksum, static_cast<int>(nc));
+    }
+
+    SIRIUS_LOG_DEBUG("{}", output);
+
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_checksum failed: {}", e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN("[SIRIUS_DIAG] debug_checksum failed: unknown error");
   }
 }
 
