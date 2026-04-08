@@ -1049,28 +1049,62 @@ fn project_ipc_columns(
             );
             explicit.to_vec()
         } else {
-            // Names don't match at explicit positions — fall back to name-based.
+            // Names don't match at explicit positions — fall back to name-based
+            // with two-pass matching (exact name first, positional for unmatched).
             tracing::warn!(
                 explicit_indices = ?explicit,
                 output_names = ?output_names,
                 duckdb_schema = ?schema_names,
                 "explicit indices don't match schema names, falling back to name-based projection"
             );
-            let mut name_indices = Vec::new();
+            let mut name_indices: Vec<Option<usize>> = Vec::new();
+            let mut used_indices = std::collections::HashSet::new();
+
+            // Pass 1: match by exact name
             for name in output_names {
-                match schema.index_of(name) {
-                    Ok(idx) => name_indices.push(idx),
-                    Err(_) => {
-                        tracing::warn!(
-                            column = %name,
-                            duckdb_schema = ?schema_names,
-                            "projection column not found in result, skipping projection"
-                        );
-                        return Ok(ipc_bytes.to_vec());
+                if name.is_empty() || name.starts_with("expr_") {
+                    name_indices.push(None);
+                } else {
+                    match schema.index_of(name) {
+                        Ok(idx) if !used_indices.contains(&idx) => {
+                            name_indices.push(Some(idx));
+                            used_indices.insert(idx);
+                        }
+                        _ => name_indices.push(None),
                     }
                 }
             }
-            name_indices
+
+            // Pass 2: assign remaining IPC columns to unmatched positions by elimination
+            let mut remaining: Vec<usize> = (0..schema.fields().len())
+                .filter(|i| !used_indices.contains(i))
+                .collect();
+            let mut remaining_iter = remaining.drain(..);
+            for entry in &mut name_indices {
+                if entry.is_none() {
+                    *entry = remaining_iter.next();
+                }
+            }
+
+            let resolved: Vec<usize> = name_indices.iter().filter_map(|x| *x).collect();
+            if resolved.len() == output_names.len() {
+                tracing::info!(
+                    indices = ?resolved,
+                    duckdb_schema = ?schema_names,
+                    output_names = ?output_names,
+                    "projected IPC using name+positional fallback (explicit indices path)"
+                );
+                resolved
+            } else {
+                tracing::warn!(
+                    resolved = resolved.len(),
+                    expected = output_names.len(),
+                    duckdb_schema = ?schema_names,
+                    output_names = ?output_names,
+                    "could not resolve all output columns, skipping projection"
+                );
+                return Ok(ipc_bytes.to_vec());
+            }
         }
     } else if schema.fields().len() == output_names.len()
         && schema_names
@@ -1087,23 +1121,58 @@ fn project_ipc_columns(
         );
         return Ok(ipc_bytes.to_vec());
     } else {
-        // Find column indices by name.
-        let mut name_indices = Vec::new();
+        // Two-pass matching: exact name match first, positional fallback for unmatched.
+        // Computed columns (aggregations, CASE, etc.) get placeholder names like
+        // "expr_N" or "" that won't match DuckDB's output names. Instead of giving
+        // up, we match what we can by name and assign remaining columns by elimination.
+        let mut name_indices: Vec<Option<usize>> = Vec::new();
+        let mut used_indices = std::collections::HashSet::new();
+
+        // Pass 1: match by exact name
         for name in output_names {
-            match schema.index_of(name) {
-                Ok(idx) => name_indices.push(idx),
-                Err(_) => {
-                    tracing::warn!(
-                        column = %name,
-                        duckdb_schema = ?schema_names,
-                        output_names = ?output_names,
-                        "projection column not found in result, skipping projection (caller: check project_ipc_columns call sites)"
-                    );
-                    return Ok(ipc_bytes.to_vec());
+            if name.is_empty() || name.starts_with("expr_") {
+                name_indices.push(None);
+            } else {
+                match schema.index_of(name) {
+                    Ok(idx) if !used_indices.contains(&idx) => {
+                        name_indices.push(Some(idx));
+                        used_indices.insert(idx);
+                    }
+                    _ => name_indices.push(None),
                 }
             }
         }
-        name_indices
+
+        // Pass 2: assign remaining IPC columns to unmatched positions by elimination
+        let mut remaining: Vec<usize> = (0..schema.fields().len())
+            .filter(|i| !used_indices.contains(i))
+            .collect();
+        let mut remaining_iter = remaining.drain(..);
+        for entry in &mut name_indices {
+            if entry.is_none() {
+                *entry = remaining_iter.next();
+            }
+        }
+
+        let resolved: Vec<usize> = name_indices.iter().filter_map(|x| *x).collect();
+        if resolved.len() == output_names.len() {
+            tracing::info!(
+                indices = ?resolved,
+                duckdb_schema = ?schema_names,
+                output_names = ?output_names,
+                "projected IPC using name+positional fallback"
+            );
+            resolved
+        } else {
+            tracing::warn!(
+                resolved = resolved.len(),
+                expected = output_names.len(),
+                duckdb_schema = ?schema_names,
+                output_names = ?output_names,
+                "could not resolve all output columns, skipping projection"
+            );
+            return Ok(ipc_bytes.to_vec());
+        }
     };
 
     let projected_schema = Arc::new(
