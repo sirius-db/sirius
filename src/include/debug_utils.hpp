@@ -121,4 +121,22 @@ void debug_stats(cucascade::data_batch const& batch,
                  rmm::cuda_stream_view stream,
                  std::vector<std::string> const& col_names = {});
 
+/**
+ * @brief Log per-column xxhash_64 fingerprints as [SIRIUS_DIAG] output.
+ *
+ * Computes a deterministic 64-bit checksum per column using cudf::hashing::xxhash_64
+ * to hash all rows, then cudf::reduce with bitwise XOR to collapse to a single value.
+ * Computation stays entirely on GPU -- no column data is copied to host.
+ * Same data in same order produces same checksum across runs (per D-12).
+ *
+ * Output format per column: "col[N] checksum: 0xABCD1234EF567890 nulls=2" (per D-11).
+ *
+ * @param batch     The data batch to checksum (must be in GPU tier)
+ * @param stream    CUDA stream for GPU operations
+ * @param col_names Optional column names (falls back to col[N])
+ */
+void debug_checksum(cucascade::data_batch const& batch,
+                    rmm::cuda_stream_view stream,
+                    std::vector<std::string> const& col_names = {});
+
 }  // namespace sirius
