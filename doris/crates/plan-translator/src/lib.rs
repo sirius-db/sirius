@@ -15,7 +15,7 @@ use doris_thrift::plan_nodes::{TPlan, TPlanNodeType};
 use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUri};
-use substrait::proto::{rel, Plan, PlanRel, Rel, RelRoot, Version};
+use substrait::proto::{rel, rel_common, Plan, PlanRel, ProjectRel, Rel, RelCommon, RelRoot, Version};
 
 pub mod descriptor_table;
 pub mod expr_translator;
@@ -479,6 +479,64 @@ pub fn translate_fragment(
     // Translate the plan tree into a Substrait Rel tree.
     let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, &table_schemas, file_scan_map)?;
 
+    // If output_exprs contain computed expressions (ARITHMETIC_EXPR, FUNCTION_CALL,
+    // CAST_EXPR, etc.), wrap the Rel in a ProjectRel to compute them. Without this,
+    // queries like Q8 (mkt_share = SUM(x)/SUM(y)) return raw aggregation columns
+    // without the final division.
+    let has_computed_output_exprs = fragment.output_exprs.as_ref().map_or(false, |exprs| {
+        exprs.iter().any(|e| {
+            e.nodes
+                .first()
+                .map_or(true, |n| n.node_type != TExprNodeType::SLOT_REF)
+        })
+    });
+
+    if has_computed_output_exprs {
+        if let Some(output_exprs) = fragment.output_exprs.as_ref() {
+            // Use root node's row_tuples for resolving SLOT_REFs in output_exprs
+            // against the plan's output schema.
+            let root_row_tuples = &plan.nodes[0].row_tuples;
+
+            let mut projections = Vec::new();
+            for expr in output_exprs {
+                let translated = expr_translator::translate_expr_in_context(
+                    expr,
+                    &desc,
+                    &mut registry,
+                    root_row_tuples,
+                )?;
+                projections.push(translated);
+            }
+
+            let num_input = node_translator::count_rel_columns(&rel);
+            // Emit selects only the projected expressions (skip pass-through input columns).
+            let output_mapping: Vec<i32> = (num_input as i32
+                ..num_input as i32 + projections.len() as i32)
+                .collect();
+
+            debug!(
+                num_input,
+                num_projections = projections.len(),
+                output_mapping = ?output_mapping,
+                "wrapping Rel in ProjectRel for computed output_exprs"
+            );
+
+            rel = Rel {
+                rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+                    common: Some(RelCommon {
+                        emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
+                            output_mapping,
+                        })),
+                        ..Default::default()
+                    }),
+                    input: Some(Box::new(rel)),
+                    expressions: projections,
+                    ..Default::default()
+                }))),
+            };
+        }
+    }
+
     // Extract sort/limit specification from the Doris plan's root SORT_NODE.
     // Returns structured sort info (column names + directions) for Rust-side sorting,
     // plus a LIMIT-only SQL string for the from_substrait wrapper.
@@ -584,8 +642,9 @@ pub fn translate_fragment(
     // DuckDB's from_substrait returns the Relation's natural column names
     // (potentially in optimizer-reordered order). The Rust-side project_ipc_columns
     // function handles name-based reordering to match FE's output_names.
-    // We don't wrap in a ProjectRel because DuckDB's TransformProjectOp uses
-    // mock aliases ("expr_0", "expr_1"...) that break name-based matching.
+    // NOTE: When computed output_exprs are present, we DO wrap in a ProjectRel
+    // (added above). DuckDB's TransformRootOp applies root_names as aliases, so
+    // the output columns get proper names for project_ipc_columns matching.
     let output_column_indices: Option<Vec<usize>> = None;
     let root_names = if !rel_names.is_empty() {
         dedup_column_names(rel_names.clone())

@@ -900,6 +900,7 @@ fn translate_aggregation_node(
                     func.phase = 3; // INITIAL_TO_RESULT
                 }
             }
+            let num_measures_collapsed = merged.measures.len();
             let agg_rel = Rel {
                 rel_type: Some(rel::RelType::Aggregate(Box::new(merged))),
             };
@@ -1097,8 +1098,30 @@ fn apply_node_projections(
         }
     }
 
+    // Validate: all permutation indices must be within [0, total).
+    if permutation.iter().any(|&idx| idx >= total) {
+        tracing::warn!(
+            permutation = ?permutation,
+            total,
+            "apply_node_projections: permutation index out of range, skipping"
+        );
+        return rel;
+    }
+
     // Check if reordering is needed.
     if permutation.iter().enumerate().all(|(i, &v)| i == v) {
+        return rel;
+    }
+
+    // Verify the input Rel actually has enough columns.
+    let actual_cols = count_rel_columns(&rel);
+    if actual_cols < total {
+        tracing::warn!(
+            actual_cols,
+            expected = total,
+            permutation = ?permutation,
+            "apply_node_projections: input Rel has fewer columns than expected, skipping"
+        );
         return rel;
     }
 
