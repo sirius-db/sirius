@@ -9,9 +9,11 @@
 #include "log/logging.hpp"
 
 #include <cudf/copying.hpp>
+#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -24,6 +26,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <type_traits>
 
 namespace sirius {
 
@@ -168,6 +172,193 @@ std::string scalar_to_string(cudf::scalar const& s,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Decimal formatting helpers (D-04, D-05)
+// ---------------------------------------------------------------------------
+
+// Format DECIMAL32/DECIMAL64 raw integer with fixed-point decimal placement.
+// Uses unsigned magnitude to handle INT_MIN / INT64_MIN correctly (T-03-03).
+template <typename T>
+std::string format_decimal_value(T raw, int abs_scale)
+{
+  if (abs_scale == 0) { return fmt::format("{}", raw); }
+  bool negative = raw < 0;
+  // Cast to unsigned BEFORE negation to avoid UB on MIN values (T-03-03)
+  using U     = std::make_unsigned_t<T>;
+  U magnitude = negative ? static_cast<U>(0) - static_cast<U>(raw) : static_cast<U>(raw);
+  std::string digits = fmt::format("{}", magnitude);
+  // Pad with leading zeros if digit count <= abs_scale (Pitfall 4: 5 with scale=2 -> "0.05")
+  while (digits.size() <= static_cast<std::size_t>(abs_scale)) {
+    digits.insert(digits.begin(), '0');
+  }
+  auto decimal_pos = digits.size() - static_cast<std::size_t>(abs_scale);
+  digits.insert(decimal_pos, ".");
+  return (negative ? "-" : "") + digits;
+}
+
+// Format DECIMAL128 (__int128_t) raw integer with fixed-point decimal placement.
+// Manual int128-to-string because fmt has no __int128_t formatter (Pitfall 2).
+std::string format_decimal128_value(__int128_t raw, int abs_scale)
+{
+  bool negative = raw < 0;
+  // Use unsigned __int128 for magnitude to handle MIN correctly
+  using U128  = unsigned __int128;
+  U128 magnitude = negative ? static_cast<U128>(0) - static_cast<U128>(raw) : static_cast<U128>(raw);
+
+  // Build digits in reverse by repeated division by 10
+  std::string digits;
+  if (magnitude == 0) {
+    digits = "0";
+  } else {
+    while (magnitude > 0) {
+      digits.push_back(static_cast<char>('0' + static_cast<int>(magnitude % 10)));
+      magnitude /= 10;
+    }
+    std::reverse(digits.begin(), digits.end());
+  }
+
+  if (abs_scale == 0) { return (negative ? "-" : "") + digits; }
+
+  // Pad with leading zeros if digit count <= abs_scale
+  while (digits.size() <= static_cast<std::size_t>(abs_scale)) {
+    digits.insert(digits.begin(), '0');
+  }
+  auto decimal_pos = digits.size() - static_cast<std::size_t>(abs_scale);
+  digits.insert(decimal_pos, ".");
+  return (negative ? "-" : "") + digits;
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp/Date formatting helpers (D-06, D-07, D-08, D-09)
+// ---------------------------------------------------------------------------
+
+// Howard Hinnant's civil_from_days algorithm (public domain).
+// Converts days since Unix epoch (1970-01-01) to calendar date.
+// Handles negative days (pre-1970) correctly via floor division (Pitfall 5).
+struct civil_date {
+  int year;
+  unsigned month;
+  unsigned day;
+};
+
+civil_date civil_from_days(int32_t days_since_epoch)
+{
+  // Shift epoch from 1970-01-01 to 0000-03-01 for simpler leap year math
+  int z   = days_since_epoch + 719468;
+  int era = (z >= 0 ? z : z - 146096) / 146097;
+  auto doe = static_cast<unsigned>(z - era * 146097);                   // day of era [0, 146096]
+  auto yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;    // year of era [0, 399]
+  int y    = static_cast<int>(yoe) + era * 400;
+  auto doy = doe - (365 * yoe + yoe / 4 - yoe / 100);                  // day of year [0, 365]
+  auto mp  = (5 * doy + 2) / 153;                                      // month [0, 11]
+  auto d   = doy - (153 * mp + 2) / 5 + 1;                             // day [1, 31]
+  auto m   = mp + (mp < 10 ? 3 : static_cast<unsigned>(-9));            // month [1, 12]
+  y += (m <= 2);
+  return {y, m, d};
+}
+
+// Format TIMESTAMP_SECONDS (int64_t seconds since epoch)
+std::string format_timestamp_s(int64_t raw_s)
+{
+  // Floor division for days (Pitfall 5: negative timestamps)
+  int32_t days =
+    static_cast<int32_t>((raw_s >= 0) ? raw_s / 86400 : (raw_s - 86399) / 86400);
+  int seconds_in_day = static_cast<int>(raw_s - static_cast<int64_t>(days) * 86400);
+  auto [y, m, d]     = civil_from_days(days);
+  int hh             = seconds_in_day / 3600;
+  int mm             = (seconds_in_day % 3600) / 60;
+  int ss             = seconds_in_day % 60;
+  return fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
+}
+
+// Format TIMESTAMP_MILLISECONDS (int64_t milliseconds since epoch)
+std::string format_timestamp_ms(int64_t raw_ms)
+{
+  int64_t total_seconds =
+    (raw_ms >= 0) ? raw_ms / 1'000 : (raw_ms - 999) / 1'000;
+  int frac_ms = static_cast<int>(raw_ms - total_seconds * 1'000);
+
+  int32_t days =
+    static_cast<int32_t>((total_seconds >= 0) ? total_seconds / 86400
+                                              : (total_seconds - 86399) / 86400);
+  int seconds_in_day = static_cast<int>(total_seconds - static_cast<int64_t>(days) * 86400);
+  auto [y, m, d]     = civil_from_days(days);
+  int hh             = seconds_in_day / 3600;
+  int mm_t           = (seconds_in_day % 3600) / 60;
+  int ss             = seconds_in_day % 60;
+
+  std::string result =
+    fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm_t, ss);
+  if (frac_ms != 0) {
+    std::string frac = fmt::format(".{:03d}", frac_ms);
+    // Trim trailing zeros from fractional part (D-08)
+    while (frac.back() == '0') { frac.pop_back(); }
+    result += frac;
+  }
+  return result;
+}
+
+// Format TIMESTAMP_MICROSECONDS (int64_t microseconds since epoch)
+std::string format_timestamp_us(int64_t raw_us)
+{
+  int64_t total_seconds =
+    (raw_us >= 0) ? raw_us / 1'000'000 : (raw_us - 999'999) / 1'000'000;
+  int frac_us = static_cast<int>(raw_us - total_seconds * 1'000'000);
+
+  int32_t days =
+    static_cast<int32_t>((total_seconds >= 0) ? total_seconds / 86400
+                                              : (total_seconds - 86399) / 86400);
+  int seconds_in_day = static_cast<int>(total_seconds - static_cast<int64_t>(days) * 86400);
+  auto [y, m, d]     = civil_from_days(days);
+  int hh             = seconds_in_day / 3600;
+  int mm             = (seconds_in_day % 3600) / 60;
+  int ss             = seconds_in_day % 60;
+
+  std::string result =
+    fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
+  if (frac_us != 0) {
+    std::string frac = fmt::format(".{:06d}", frac_us);
+    // Trim trailing zeros from fractional part (D-08)
+    while (frac.back() == '0') { frac.pop_back(); }
+    result += frac;
+  }
+  return result;
+}
+
+// Format TIMESTAMP_NANOSECONDS (int64_t nanoseconds since epoch)
+std::string format_timestamp_ns(int64_t raw_ns)
+{
+  int64_t total_seconds =
+    (raw_ns >= 0) ? raw_ns / 1'000'000'000 : (raw_ns - 999'999'999) / 1'000'000'000;
+  int frac_ns = static_cast<int>(raw_ns - total_seconds * 1'000'000'000);
+
+  int32_t days =
+    static_cast<int32_t>((total_seconds >= 0) ? total_seconds / 86400
+                                              : (total_seconds - 86399) / 86400);
+  int seconds_in_day = static_cast<int>(total_seconds - static_cast<int64_t>(days) * 86400);
+  auto [y, m, d]     = civil_from_days(days);
+  int hh             = seconds_in_day / 3600;
+  int mm             = (seconds_in_day % 3600) / 60;
+  int ss             = seconds_in_day % 60;
+
+  std::string result =
+    fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
+  if (frac_ns != 0) {
+    std::string frac = fmt::format(".{:09d}", frac_ns);
+    // Trim trailing zeros from fractional part (D-08)
+    while (frac.back() == '0') { frac.pop_back(); }
+    result += frac;
+  }
+  return result;
+}
+
+// Format TIMESTAMP_DAYS (int32_t days since epoch) as YYYY-MM-DD only (D-07)
+std::string format_date_days(int32_t raw_days)
+{
+  auto [y, m, d] = civil_from_days(raw_days);
+  return fmt::format("{:04d}-{:02d}-{:02d}", y, m, d);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -285,7 +476,8 @@ void debug_head(cucascade::data_batch const& batch,
                 cudf::size_type n,
                 rmm::cuda_stream_view stream,
                 DebugFormat format,
-                std::vector<std::string> const& col_names)
+                std::vector<std::string> const& col_names,
+                cudf::size_type max_string_len)
 {
   try {
     if (!is_gpu_tier(batch, "debug_head")) { return; }
@@ -389,8 +581,200 @@ void debug_head(cucascade::data_batch const& batch,
         case cudf::type_id::FLOAT32: extract_numeric.template operator()<float>(); break;
         case cudf::type_id::FLOAT64: extract_numeric.template operator()<double>(); break;
         case cudf::type_id::BOOL8: extract_bool(); break;
+
+        // ----- STRING (D-01, D-02, T-03-01) -----
+        case cudf::type_id::STRING: {
+          cudf::strings_column_view scv(col);
+          // Copy offsets for the sliced range (col.offset() adjusts for sliced views)
+          auto const num_offsets = num_rows + 1;
+          std::vector<int32_t> host_offsets(num_offsets);
+          cudaMemcpyAsync(host_offsets.data(),
+                          scv.offsets().data<int32_t>() + col.offset(),
+                          num_offsets * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          // Copy only the chars bytes we need (offset[0] to offset[N])
+          auto const chars_start = host_offsets[0];
+          auto const chars_end   = host_offsets[num_rows];
+          auto const chars_bytes = chars_end - chars_start;
+          std::vector<char> host_chars(chars_bytes);
+          if (chars_bytes > 0) {
+            cudaMemcpyAsync(host_chars.data(),
+                            scv.chars_begin(stream) + chars_start,
+                            chars_bytes,
+                            cudaMemcpyDeviceToHost,
+                            stream.value());
+            stream.synchronize();
+          }
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              auto const start = host_offsets[r] - chars_start;
+              auto const end   = host_offsets[r + 1] - chars_start;
+              std::string val(host_chars.data() + start, end - start);
+              if (max_string_len > 0 &&
+                  val.size() > static_cast<std::size_t>(max_string_len)) {
+                val.resize(max_string_len);
+                val += "...";
+              }
+              cells[c][r] = std::move(val);
+            }
+          }
+          break;
+        }
+
+        // ----- DECIMAL32/64/128 (D-04, D-05) -----
+        case cudf::type_id::DECIMAL32: {
+          int32_t scale     = col.type().scale();
+          int abs_scale     = std::abs(scale);
+          std::vector<int32_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int32_t>(),
+                          sizeof(int32_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_decimal_value(host_vals[r], abs_scale);
+            }
+          }
+          break;
+        }
+        case cudf::type_id::DECIMAL64: {
+          int32_t scale     = col.type().scale();
+          int abs_scale     = std::abs(scale);
+          std::vector<int64_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_decimal_value(host_vals[r], abs_scale);
+            }
+          }
+          break;
+        }
+        case cudf::type_id::DECIMAL128: {
+          int32_t scale     = col.type().scale();
+          int abs_scale     = std::abs(scale);
+          std::vector<__int128_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<__int128_t>(),
+                          sizeof(__int128_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_decimal128_value(host_vals[r], abs_scale);
+            }
+          }
+          break;
+        }
+
+        // ----- TIMESTAMP types (D-06, D-08, D-09) -----
+        case cudf::type_id::TIMESTAMP_SECONDS: {
+          std::vector<int64_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_timestamp_s(host_vals[r]);
+            }
+          }
+          break;
+        }
+        case cudf::type_id::TIMESTAMP_MILLISECONDS: {
+          std::vector<int64_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_timestamp_ms(host_vals[r]);
+            }
+          }
+          break;
+        }
+        case cudf::type_id::TIMESTAMP_MICROSECONDS: {
+          std::vector<int64_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_timestamp_us(host_vals[r]);
+            }
+          }
+          break;
+        }
+        case cudf::type_id::TIMESTAMP_NANOSECONDS: {
+          std::vector<int64_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_timestamp_ns(host_vals[r]);
+            }
+          }
+          break;
+        }
+
+        // ----- DATE (TIMESTAMP_DAYS) (D-07) -----
+        case cudf::type_id::TIMESTAMP_DAYS: {
+          std::vector<int32_t> host_vals(num_rows);
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int32_t>(),
+                          sizeof(int32_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          stream.synchronize();
+          for (cudf::size_type r = 0; r < num_rows; ++r) {
+            if (nulls.is_null(col.offset() + r)) {
+              cells[c][r] = "NULL";
+            } else {
+              cells[c][r] = format_date_days(host_vals[r]);
+            }
+          }
+          break;
+        }
+
         default:
-          // Unsupported types (STRING, DECIMAL, TIMESTAMP, DATE) -- Phase 3
+          // Truly unknown types
           for (cudf::size_type r = 0; r < num_rows; ++r) {
             cells[c][r] = "(unsupported)";
           }

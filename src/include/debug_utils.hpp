@@ -85,21 +85,25 @@ enum class DebugFormat { ALIGNED, CSV };
  *
  * Copies only the first N rows from GPU to host (via cudf::slice zero-copy
  * view) and formats them in either fixed-width aligned columns or CSV.
- * Supports all numeric types (INT8-64, UINT8-64, FLOAT32/64) and BOOL8.
- * Unsupported types (STRING, DECIMAL, TIMESTAMP, DATE) display as
- * "(unsupported)" -- full type support is added in Phase 3.
+ * Supports all numeric types (INT8-64, UINT8-64, FLOAT32/64), BOOL8,
+ * STRING (with truncation), DECIMAL32/64/128 (fixed-point format),
+ * TIMESTAMP (all resolutions), and DATE (TIMESTAMP_DAYS).
  *
- * @param batch     The data batch to inspect (must be in GPU tier)
- * @param n         Number of rows to display (clamped to actual row count)
- * @param stream    CUDA stream for device-to-host copies
- * @param format    Output format: ALIGNED (default) or CSV
- * @param col_names Optional column names (falls back to col[N])
+ * @param batch          The data batch to inspect (must be in GPU tier)
+ * @param n              Number of rows to display (clamped to actual row count)
+ * @param stream         CUDA stream for device-to-host copies
+ * @param format         Output format: ALIGNED (default) or CSV
+ * @param col_names      Optional column names (falls back to col[N])
+ * @param max_string_len Maximum display length for STRING values. Longer
+ *                       strings truncated with '...' suffix. Pass 0 for no
+ *                       truncation (per D-02).
  */
 void debug_head(cucascade::data_batch const& batch,
                 cudf::size_type n,
                 rmm::cuda_stream_view stream,
                 DebugFormat format = DebugFormat::ALIGNED,
-                std::vector<std::string> const& col_names = {});
+                std::vector<std::string> const& col_names = {},
+                cudf::size_type max_string_len = 50);
 
 /**
  * @brief Log per-column min, max, sum statistics as [SIRIUS_DIAG] output.
