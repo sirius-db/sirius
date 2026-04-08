@@ -32,10 +32,17 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/enums/vector_type.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/types/vector.hpp>
+#include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/function/table_function.hpp>
+#include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/statistics/string_stats.hpp>
+#include <duckdb/storage/table/column_data.hpp>
+#include <duckdb/storage/table/row_group.hpp>
+#include <duckdb/storage/table/row_group_collection.hpp>
 
 #include <chrono>
 
@@ -72,7 +79,56 @@ struct scoped_timer {
   }
 };
 
-}  // namespace
+/// @brief Try to estimate average varchar bytes per row for a column using DuckDB storage metadata.
+/// Returns 0 if metadata is unavailable (caller should fall back to default).
+size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
+                                            size_t column_index,
+                                            duckdb::ClientContext& context)
+{
+  if (!bind_data_ptr) { return 0; }
+
+  // Cast to TableScanBindData to access the underlying table
+  duckdb::TableScanBindData* tsbd = nullptr;
+  try {
+    tsbd = &bind_data_ptr->Cast<duckdb::TableScanBindData>();
+  } catch (...) {
+    return 0;  // Not a seq_scan table function
+  }
+
+  try {
+    auto& table   = tsbd->table.Cast<duckdb::DuckTableEntry>();
+    auto& storage = table.GetStorage();
+    auto total_rows = storage.GetTotalRows();
+    if (total_rows == 0) { return 0; }
+
+    // Read StringStats for this column
+    auto col_idx = duckdb::StorageIndex(column_index);
+    auto stats   = storage.GetStatistics(context, col_idx);
+    if (stats && duckdb::StringStats::HasMaxStringLength(*stats)) {
+      auto max_len      = duckdb::StringStats::MaxStringLength(*stats);
+      auto distinct_est = stats->GetDistinctCount();
+
+      // For low-cardinality columns (distinct << total), avg ≈ max
+      // For high-cardinality, use max/2 as conservative midpoint
+      size_t estimated_avg = max_len;
+      if (distinct_est > 0 && distinct_est > total_rows / 2) {
+        estimated_avg = std::max<size_t>(max_len / 2, 1);
+      }
+
+      SIRIUS_LOG_INFO(
+        "[duckdb_scan] metadata col {}: max_string_length={}, distinct_est={}, total_rows={}, "
+        "estimated_avg={}",
+        column_index, max_len, distinct_est, total_rows, estimated_avg);
+
+      return estimated_avg;
+    }
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("[duckdb_scan] metadata access failed for col {}: {}", column_index, e.what());
+  }
+  return 0;
+}
+
+}  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
 // duckdb_scan_task_global_state
@@ -414,12 +470,17 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   _column_builders.reserve(_num_columns);
   for (size_t i = 0; i < _num_columns; ++i) {
     auto const col_type = op.scanned_types[i];
-    _column_builders.emplace_back(col_type, _default_varchar_size);
     if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       _varchar_indices.push_back(i);
-      estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data + mask
+
+      // Log metadata-based estimate for comparison (no behavior change yet)
+      estimate_varchar_bytes_from_metadata(op.bind_data.get(), i, _exec_ctx.client);
+
+      _column_builders.emplace_back(col_type, _default_varchar_size);
+      estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data
     } else {
-      estimated_row_bytes += duckdb::GetTypeIdSize(col_type.InternalType());  // data + mask
+      _column_builders.emplace_back(col_type, _default_varchar_size);
+      estimated_row_bytes += duckdb::GetTypeIdSize(col_type.InternalType());  // data
     }
   }
 
@@ -440,13 +501,12 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
 
   SIRIUS_LOG_INFO(
     "[duckdb_scan] estimation: {} cols ({} varchar), estimated_row_bytes={}, "
-    "estimated_rows_per_batch={}, batch_size={}, default_varchar_size={}",
+    "estimated_rows_per_batch={}, batch_size={}",
     _num_columns,
     _varchar_indices.size(),
     estimated_row_bytes,
     _estimated_rows_per_batch,
-    _approximate_batch_size,
-    _default_varchar_size);
+    _approximate_batch_size);
 }
 
 void duckdb_scan_task_local_state::initialize_builders()
