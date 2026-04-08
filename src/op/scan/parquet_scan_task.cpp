@@ -297,7 +297,8 @@ void parquet_scan_task_global_state::initialize_from_files()
   }
 
   //===----------Projections----------===//
-  auto projected_column_indices = detail::make_selected_column_indices(*_scan_op);
+  auto projected_column_indices =
+    detail::make_selected_column_indices(_scan_op->column_ids, _scan_op->projection_ids);
   std::unordered_set<std::size_t> pure_filter_column_indices;
   if (is_projected) {
     std::vector<std::string> projected_column_names;
