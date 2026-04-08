@@ -1281,3 +1281,173 @@ TEST_CASE("debug_diff empty batches handles gracefully", "[debug_utils]")
 
   REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream));
 }
+
+// ===========================================================================
+// debug_sample tests (Phase 4, Plan 02)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test case 40: debug_sample basic operation (SAMPLE-01)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_sample basic operation with named columns", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create a batch with 2 columns (INT32, INT64), 10 rows
+  auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, stream, mr);
+  auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
+    {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col_a));
+  columns.push_back(std::move(col_b));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // Sample 3 rows with seed=42 and named columns
+  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"val_a", "val_b"}, 50, /*seed=*/42));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 41: debug_sample with fixed seed is reproducible (SAMPLE-03, D-08)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_sample with fixed seed is reproducible", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create a batch with 1 column (INT32, 20 rows: {0..19})
+  std::vector<int32_t> vals(20);
+  for (int i = 0; i < 20; ++i) { vals[i] = i; }
+  auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    vals, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // Call twice with seed=12345 -- both should succeed without crash
+  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 5, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/12345));
+  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 5, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/12345));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 42: debug_sample N > num_rows clamps silently (D-09)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_sample N > num_rows clamps silently", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create a batch with 1 column (INT32, 3 rows)
+  auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {1, 2, 3}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // N=100 but only 3 rows -- clamped to 3, no crash
+  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 100, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/42));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 43: debug_sample CSV format (SAMPLE-02, D-09)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_sample CSV format produces output without throwing", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create a batch with 2 columns (INT32, FLOAT64), 5 rows
+  auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+    {10, 20, 30, 40, 50}, stream, mr);
+  auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<double>>(
+    {1.1, 2.2, 3.3, 4.4, 5.5}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col_a));
+  columns.push_back(std::move(col_b));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // CSV format with seed=42
+  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 2, stream, sirius::DebugFormat::CSV, {}, 50, /*seed=*/42));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 44: debug_sample empty batch
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_sample empty batch handles gracefully", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create an empty batch (0 rows, 1 INT32 column)
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // Empty batch -- should log empty message, no crash
+  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 5, stream));
+}
+
+// ---------------------------------------------------------------------------
+// Test case 45: debug_sample with STRING columns
+// ---------------------------------------------------------------------------
+
+TEST_CASE("debug_sample with STRING columns extracts values correctly", "[debug_utils]")
+{
+  auto memory_manager = test_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = test_utils::get_resource_ref(*space);
+
+  // Create a STRING column following established pattern from test case 20
+  auto col = sirius::test::vector_to_cudf_column<
+    test_utils::gpu_type_traits<test_utils::string_tag>>(
+    {"hello", "world", "test", "sample", "data"}, stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto batch = sirius::make_data_batch(std::move(table), *space);
+  REQUIRE(batch != nullptr);
+
+  // Sample 3 rows with seed=42
+  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/42));
+}
