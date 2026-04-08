@@ -16,6 +16,7 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
+#include "creator/task_creator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -277,6 +278,23 @@ bool sirius_pipeline::is_pipeline_finished() const
   return pipeline_finished.load();
 }
 
+void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
+
+void sirius_pipeline::notify_downstream_pipelines()
+{
+  // Schedule output consumers via the task_creator so downstream pipelines
+  // whose FULL-barrier ports are now unblocked will get tasks created.
+  if (_task_creator) {
+    for (auto* consumer : get_output_consumers()) {
+      _task_creator->schedule(consumer);
+    }
+  }
+
+  for (auto* parent : get_parents()) {
+    parent->update_pipeline_status();
+  }
+}
+
 void sirius_pipeline::update_pipeline_status()
 {
   auto end_nvtx_range_if_finished = [this]() {
@@ -285,19 +303,26 @@ void sirius_pipeline::update_pipeline_status()
     }
   };
 
+  // Skip if already finished — avoids redundant re-evaluation and re-notification.
+  if (pipeline_finished.load()) { return; }
+
   if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
     if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
                                  // get_next_task_hint() to check if the source is ready?
       pipeline_finished.store(true);
       end_nvtx_range_if_finished();
+      notify_downstream_pipelines();
       return;
     }
   } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
     auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
     if (!parquet_scan.has_more_partitions) {
-      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
-      end_nvtx_range_if_finished();
+      if (tasks_created.load() == tasks_completed.load()) {
+        pipeline_finished = true;
+        end_nvtx_range_if_finished();
+        notify_downstream_pipelines();
+      }
       return;
     }
   } else {
@@ -323,9 +348,11 @@ void sirius_pipeline::update_pipeline_status()
         for (auto& op : get_operators()) {
           op.get().finalize_operator();
         }
+        end_nvtx_range_if_finished();
+        notify_downstream_pipelines();
       }
     }
-    end_nvtx_range_if_finished();
+    if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
   }
 }
 
