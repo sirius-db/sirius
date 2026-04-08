@@ -29,6 +29,8 @@ cufile.log
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+# Generated nightly environment
+envs/
 compile_commands.json
 
 # Zed editor settings

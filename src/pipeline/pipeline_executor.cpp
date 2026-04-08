@@ -131,8 +131,6 @@ void pipeline_executor::set_scan_caching_config(sirius::op::scan::cache_level le
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
-  _current_query = query;
-
   // Drain leftover tasks from previous query
   _scan_executor->drain_leftover_tasks();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
@@ -140,10 +138,6 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
   }
 
   auto scans = query->get_scan_operators();
-  SIRIUS_LOG_INFO("[prepare_for_query] found {} scan operators", scans.size());
-  for (size_t i = 0; i < scans.size(); ++i) {
-    SIRIUS_LOG_INFO("[prepare_for_query] scan[{}]: type={}", i, static_cast<int>(scans[i]->type));
-  }
   _scan_executor->prepare_cache_for_scan_operators(scans);
 
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
@@ -167,49 +161,13 @@ std::future<void> pipeline_executor::start_query()
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  // Set on_finished callbacks on ALL pipelines.  When a pipeline finishes,
-  // its downstream consumers (waiting on FULL barriers) must be notified so
-  // the task creator can re-check their readiness.  Without this, consumers
-  // are scheduled once during the scan but if they return WAITING (barrier
-  // not yet met), they are dropped and never re-checked.
-  auto* ch = _completion_handler.get();
-  if (_current_query) {
-    for (auto& pipeline : _current_query->get_pipelines()) {
-      auto sink   = pipeline->get_sink();
-      auto source = pipeline->get_source();
-      bool is_scan =
-        source && (source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                   source->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN);
-      bool is_result_collector =
-        sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
-
-      pipeline->on_finished = [this, ch, is_scan, is_result_collector,
-                               pipeline_ptr = pipeline.get()]() {
-        // 1. Scan pipelines: schedule the next scan from the priority queue.
-        if (is_scan) {
-          SIRIUS_LOG_INFO("scan pipeline #{} finished, scheduling next scan + consumers",
-                          pipeline_ptr->get_pipeline_id());
-          schedule_next_scan_tasks();
-        }
-
-        // 2. ALL pipelines: notify downstream consumers that a barrier is met.
-        auto consumers = pipeline_ptr->get_output_consumers();
-        for (auto* consumer : consumers) {
-          _task_creator->schedule(consumer);
-        }
-
-        // 3. Result-collector pipelines: signal query completion for 0-row scans.
-        if (is_result_collector) {
-          if (ch && !ch->is_completed()) {
-            SIRIUS_LOG_INFO("pipeline on_finished: signaling completion (0-row scan)");
-            ch->mark_completed();
-          }
-        }
-      };
-    }
+  constexpr int k_initial_scans = 2;
+  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+  for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
+    auto* scan_op = _priority_scans.front();
+    _task_creator->schedule(scan_op);
+    _priority_scans.pop();
   }
-
-  schedule_next_scan_tasks();
 
   return future;
 }
@@ -264,23 +222,6 @@ void pipeline_executor::management_eventloop()
     }
   }
 }
-
-void pipeline_executor::schedule_next_scan_tasks()
-{
-  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-  SIRIUS_LOG_INFO("[schedule_next_scan_tasks] priority_scans queue size={}", _priority_scans.size());
-  if (!_priority_scans.empty()) {
-    auto* scan_op = _priority_scans.front();
-    auto num_threads = _scan_executor->get_num_threads();
-    SIRIUS_LOG_INFO("[schedule_next_scan_tasks] scheduling scan type={} on {} threads",
-                    static_cast<int>(scan_op->type), num_threads);
-    for (auto i = 0; i != num_threads; ++i) {
-      _task_creator->schedule(scan_op);
-    }
-    _priority_scans.pop();
-  }
-}
-
 
 }  // namespace pipeline
 }  // namespace sirius

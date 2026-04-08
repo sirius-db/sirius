@@ -27,11 +27,13 @@
 #include "duckdb/parallel/pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
-#include <functional>
-
 namespace sirius {
 
 class sirius_engine;
+
+namespace creator {
+class task_creator;
+}  // namespace creator
 
 namespace op {
 class sirius_physical_operator;
@@ -79,6 +81,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   friend class ::sirius::sirius_engine;
   friend class sirius_pipeline_build_state;
   friend class sirius_meta_pipeline;
+  friend class sirius_pipeline_converter;
 
  public:
   explicit sirius_pipeline(sirius_engine& engine);
@@ -130,6 +133,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   std::vector<op::sirius_physical_operator*> get_output_consumers() const;
 
+  //! Notifies downstream pipelines to re-evaluate their status after this pipeline finishes
+  void notify_downstream_pipelines();
+
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;
 
@@ -151,24 +157,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void mark_task_created();
   void mark_task_completed();
 
-  //! Check if any tasks have been created for this pipeline.
-  bool has_created_tasks() const { return tasks_created.load() > 0; }
-
-  //! Mark the pipeline as finished (for zero-data finalization path).
-  void mark_as_finished() { pipeline_finished.store(true); }
-
-  //! Optional callback invoked when the pipeline finishes.
-  //! Used to signal the completion_handler when a 0-row scan completes
-  //! and no GPU tasks are created.
-  std::function<void()> on_finished;
-
-  //! Exactly-once guard for on_finished callback (prevents double-fire
-  //! from concurrent GPU executor threads or task_creator paths).
-  mutable std::atomic<bool> on_finished_fired{false};
-
-  //! Exactly-once guard for the zero-data finalization path (prevents
-  //! concurrent task_creator threads from both finalizing the same pipeline).
-  mutable std::atomic<bool> finalized{false};
+  //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
+  void set_task_creator(sirius::creator::task_creator* tc);
 
  private:
   //! Whether or not the pipeline has been readied
@@ -201,6 +191,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   bool launch_scan_tasks(duckdb::shared_ptr<duckdb::Event>& event, duckdb::idx_t max_threads);
 
   bool schedule_parallel(duckdb::shared_ptr<duckdb::Event>& event);
+
+  //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
+  sirius::creator::task_creator* _task_creator{nullptr};
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;

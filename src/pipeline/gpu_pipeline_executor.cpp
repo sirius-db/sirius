@@ -252,47 +252,8 @@ void gpu_pipeline_executor::manager_loop()
           }
         }
 
-        // Synchronize the exclusive stream to ensure all GPU operations (including
-        // the result_collector's hash_partition + chunked_pack into staging) complete
-        // before we signal task completion. Without this, the Rust exchange code can
-        // access staging buffer addresses while GPU kernels are still writing to them.
-        exc_stream->synchronize();
-
-        task.reset();
-
-        // Path A: Fire on_finished for generic (non-scan, non-result-collector)
-        // pipelines. Scan pipelines fire on_finished from update_pipeline_status().
-        // Result-collector uses the query_complete path below (avoids teardown race).
-        // CAS on on_finished_fired ensures exactly-once semantics.
-        bool notified_via_on_finished = false;
-        if (pipeline) {
-          bool finished = pipeline->is_pipeline_finished();
-          SIRIUS_LOG_DEBUG("[gpu_exec] pipeline #{} task done, finished={}",
-                          pipeline->get_pipeline_id(), finished);
-          if (finished) {
-            auto src  = pipeline->get_source();
-            auto sink = pipeline->get_sink();
-            bool is_scan = src && (src->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                                   src->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN);
-            bool is_rc   = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
-            if (!is_scan && !is_rc) {
-              bool expected = false;
-              if (pipeline->on_finished_fired.compare_exchange_strong(expected, true)) {
-                SIRIUS_LOG_INFO("[gpu_exec] pipeline #{} on_finished firing (generic)",
-                                pipeline->get_pipeline_id());
-                if (pipeline->on_finished) { pipeline->on_finished(); }
-                notified_via_on_finished = true;
-              }
-            } else if (is_rc) {
-              SIRIUS_LOG_INFO("[gpu_exec] pipeline #{} finished (RESULT_COLLECTOR)",
-                              pipeline->get_pipeline_id());
-            }
-          }
-        }
-
-        // Skip consumer scheduling when on_finished already handled it
-        // (on_finished schedules the same consumers — avoids duplicates).
-        if (!notified_via_on_finished && !query_complete && _task_creator) {
+        if (!query_complete && _task_creator) {
+          bool pipeline_done = pipeline && pipeline->is_pipeline_finished();
           for (auto* consumer : consumers) {
             if (consumer) { _task_creator->schedule(consumer); }
           }

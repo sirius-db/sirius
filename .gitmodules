@@ -7,6 +7,10 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "substrait"]
+	path = substrait
+	url = https://github.com/sirius-db/duckdb-substrait-extension.git
+	branch = main
 [submodule "cucascade"]
 	path = cucascade
 	url = https://github.com/NVIDIA/cuCascade.git
@@ -17,11 +21,11 @@
 [submodule "doris/thirdparty/apache-doris"]
 	path = doris/thirdparty/apache-doris
 	url = https://github.com/apache/doris.git
-[submodule "substrait"]
-	path = substrait
-	url = https://github.com/sirius-db/duckdb-substrait-extension.git
-	branch = duckdb-1.4.4
 [submodule "doris/thirdparty/nixl"]
 	path = doris/thirdparty/nixl
 	url = https://github.com/ai-dynamo/nixl.git
 	ignore = dirty
+[submodule ".claude/claude-tools"]
+	path = .claude/claude-tools
+	url = https://github.com/sirius-db/claude-tools.git
+	branch = main

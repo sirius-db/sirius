@@ -71,6 +71,10 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
+    // Give each pipeline a pointer to this task_creator so that when a pipeline
+    // finishes (including via downstream notification), it can schedule output consumers.
+    pipeline->set_task_creator(this);
+
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) { continue; }
 
@@ -223,15 +227,6 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   _task_creation_queue.push(std::move(request));
 }
 
-void task_creator::schedule(op::sirius_physical_operator* node,
-                            duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
-{
-  auto request      = std::make_unique<task_creation_request>();
-  request->node     = node;
-  request->pipeline = std::move(pipeline);
-  _task_creation_queue.push(std::move(request));
-}
-
 void task_creator::manager_loop()
 {
   while (_running.load()) {
@@ -247,56 +242,18 @@ void task_creator::manager_loop()
       break;
     }
 
-    auto* original_node    = request->node;
-    auto explicit_pipeline = std::move(request->pipeline);
-    if (original_node == nullptr) { continue; }
+    auto node = request->node;
+    if (node == nullptr) { continue; }
 
-    auto* node = get_operator_for_next_task(original_node);
+    node = get_operator_for_next_task(node);
 
-    if (node == nullptr) {
-      // Path B: Zero-data pipeline detection.
-      auto zd_pipeline = explicit_pipeline
-        ? explicit_pipeline
-        : (original_node ? original_node->get_pipeline() : nullptr);
-      if (zd_pipeline && !zd_pipeline->is_pipeline_finished()) {
-        auto first = zd_pipeline->get_source();
-        auto sink  = zd_pipeline->get_sink();
-        bool is_rc = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
-        bool src_done = first && first->is_source_pipeline_finished();
-        bool ports_empty = first && first->all_ports_empty();
-        bool no_tasks = !zd_pipeline->has_created_tasks();
-        SIRIUS_LOG_DEBUG("[task_creator] pipeline #{} nullptr: src_done={} ports_empty={} no_tasks={} is_rc={}",
-                        zd_pipeline->get_pipeline_id(), src_done, ports_empty, no_tasks, is_rc);
-        if (!is_rc && src_done && ports_empty && no_tasks) {
-          // Atomically finalize — prevents B/B race from concurrent threads.
-          bool exp_fin = false;
-          if (zd_pipeline->finalized.compare_exchange_strong(exp_fin, true)) {
-            zd_pipeline->mark_as_finished();
-            for (auto& op : zd_pipeline->get_operators()) {
-              op.get().finalize_operator();
-            }
-            bool exp_cb = false;
-            if (zd_pipeline->on_finished_fired.compare_exchange_strong(exp_cb, true)) {
-              if (zd_pipeline->on_finished) { zd_pipeline->on_finished(); }
-            }
-          }
-        }
-      }
-      continue;
-    }
-
-    // Only use the explicit pipeline if the node wasn't redirected by hint chain.
-    // When get_operator_for_next_task follows WAITING hints to a different producer,
-    // the explicit_pipeline (intended for the original node) is wrong for the new node.
-    if (node != original_node) { explicit_pipeline.reset(); }
+    if (node == nullptr) { continue; }
 
     // Dispatch the task creation work to the pool
-    _bounded_pool->dispatch(std::move(slot),
-      [this, node, explicit_pipeline = std::move(explicit_pipeline)]() mutable {
+    _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
       try {
-        // Use the explicit pipeline if provided (for shared operators like TABLE_SCAN),
-        // otherwise fall back to the operator's own pipeline.
-        auto pipeline = explicit_pipeline ? std::move(explicit_pipeline) : node->get_pipeline();
+        // Get what we need to create the task
+        auto pipeline = node->get_pipeline();
         std::vector<cucascade::shared_data_repository*> destination_data_repositories;
         // special handling for delim joins
         if (pipeline->get_sink()->type ==
@@ -371,8 +328,8 @@ void task_creator::manager_loop()
                                  : &node->Cast<op::sirius_physical_parquet_scan>();
           while (true) {
             pipeline->mark_task_created();
-            auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
-            if (!partition_idx.has_value()) {
+            auto partition = parquet_task_global_state->claim_next_rg_partition();
+            if (!partition.has_value()) {
               pipeline->mark_task_completed();
               if (pipeline->is_pipeline_finished()) {
                 auto output_consumers = pipeline->get_output_consumers();
@@ -388,7 +345,7 @@ void task_creator::manager_loop()
 
             auto parquet_task_local_state =
               std::make_unique<op::scan::parquet_scan_task_local_state>(*parquet_task_global_state,
-                                                                        *partition_idx);
+                                                                        *partition);
 
             if (destination_data_repositories.empty()) {
               throw std::runtime_error(
