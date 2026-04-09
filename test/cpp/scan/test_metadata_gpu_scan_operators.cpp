@@ -211,7 +211,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     if (!input) { break; }
     auto output = gpu_op.execute(*input, stream);
     REQUIRE(output);
-    for (auto& batch : output->get_data_batches()) {
+    auto* pipelineable = dynamic_cast<sirius::op::pipelineable_operator_data*>(output.get());
+    REQUIRE(pipelineable);
+    for (auto& batch : pipelineable->get_data_batches()) {
       all_batches.push_back(batch);
     }
   }

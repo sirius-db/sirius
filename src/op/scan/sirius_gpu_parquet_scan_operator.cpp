@@ -213,7 +213,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   auto batch = sirius::make_data_batch(std::move(table), _gpu_memory_space);
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
-  return std::make_unique<operator_data>(batches);
+  return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 
 }  // namespace sirius::op::scan

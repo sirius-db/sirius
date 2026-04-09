@@ -28,7 +28,6 @@
 // standard library
 #include <cstddef>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,22 +70,12 @@ struct row_group_range {
  *
  * Carries a batch of file paths (up to max_file_processed) along with the
  * target approximate batch size used when partitioning row groups.
- *
- * prepare_for_processing returns an empty handle vector because this type
- * holds no cucascade data_batch objects — it is pure metadata.
  */
 class parquet_metadata_input : public op::operator_data {
  public:
   parquet_metadata_input(std::vector<std::string> file_paths, std::size_t approximate_batch_size)
     : file_paths(std::move(file_paths)), approximate_batch_size(approximate_batch_size)
   {
-  }
-
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* /*requested_memory_space*/,
-    rmm::cuda_stream_view /*stream*/) override
-  {
-    return std::vector<::cucascade::data_batch_processing_handle>{};
   }
 
   std::vector<std::string> file_paths;
@@ -101,22 +90,12 @@ class parquet_metadata_input : public op::operator_data {
  *
  * Contains the parsed parquet file metadata and the row-group partitions
  * computed from it, ready for consumption by sirius_gpu_parquet_scan_operator.
- *
- * prepare_for_processing returns an empty handle vector because this type
- * holds no cucascade data_batch objects — it is pure metadata.
  */
 class partitioned_parquet_metadata : public op::operator_data {
  public:
   using translated_expression = gpu_expression_translator::translated_expression;
 
   partitioned_parquet_metadata() = default;
-
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* /*requested_memory_space*/,
-    rmm::cuda_stream_view /*stream*/) override
-  {
-    return std::vector<::cucascade::data_batch_processing_handle>{};
-  }
 
   std::vector<std::string> file_paths;
   std::vector<std::shared_ptr<cudf::io::datasource>> datasources;  ///< Parallel to file_paths.
@@ -141,9 +120,6 @@ class partitioned_parquet_metadata : public op::operator_data {
  * Contains all per-partition data needed to read a single row_group_range from
  * a parquet file.  Fields are extracted from partitioned_parquet_metadata by
  * get_next_task_input_data() so that each task is self-contained.
- *
- * prepare_for_processing returns an empty handle vector because this type
- * holds no cucascade data_batch objects.
  */
 class parquet_scan_data : public op::operator_data {
  public:
@@ -162,13 +138,6 @@ class parquet_scan_data : public op::operator_data {
       post_filter_projection_ids(std::move(post_filter_projection_ids)),
       datasource(std::move(datasource))
   {
-  }
-
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* /*requested_memory_space*/,
-    rmm::cuda_stream_view /*stream*/) override
-  {
-    return std::vector<::cucascade::data_batch_processing_handle>{};
   }
 
   std::string file_path;
