@@ -21,6 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "expression_executor/gpu_expression_translator.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
@@ -50,7 +51,8 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
                                std::size_t estimated_cardinality,
                                duckdb::ExtraOperatorInfo extra_info,
                                duckdb::vector<duckdb::Value> parameters,
-                               duckdb::virtual_column_map_t virtual_columns);
+                               duckdb::virtual_column_map_t virtual_columns,
+                               sirius_physical_table_scan* physical_table_scan);
 
   std::optional<task_creation_hint> get_next_task_hint() override
   {
@@ -105,6 +107,11 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
   std::atomic<bool> exhausted{false};
 
   std::atomic<bool> has_more_partitions{true};
+
+  //! The translated filter expression, if translation from duckdb expression to cuDF AST was
+  //! successful. We need to maintain this here so that translation failures can be detected during
+  //! the execution of the table scan operator, in which case the filter can be applied there.
+  std::optional<gpu_expression_translator::translated_expression> translated_filter;
 
  public:
   bool is_source() const override { return true; }

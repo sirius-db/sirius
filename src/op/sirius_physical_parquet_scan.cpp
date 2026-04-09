@@ -16,6 +16,10 @@
 
 #include "op/sirius_physical_parquet_scan.hpp"
 
+#include "expression_executor/gpu_expression_translator.hpp"
+#include "op/scan/scan_utils.hpp"
+#include "op/sirius_physical_table_scan.hpp"
+
 namespace sirius {
 namespace op {
 
@@ -43,7 +47,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table
       table_scan->estimated_cardinality,
       copy_extra_info_parquet_scan(table_scan->extra_info),
       table_scan->parameters,
-      table_scan->virtual_columns)
+      table_scan->virtual_columns,
+      table_scan)  // Pass pointer to the table scan for filter pushdown
 {
 }
 
@@ -59,7 +64,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
   std::size_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
-  duckdb::virtual_column_map_t virtual_columns_p)
+  duckdb::virtual_column_map_t virtual_columns_p,
+  sirius_physical_table_scan* table_scan)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARQUET_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
@@ -73,6 +79,33 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
     parameters(std::move(parameters_p)),
     virtual_columns(std::move(virtual_columns_p))
 {
+  if (table_filters && !table_filters->filters.empty()) {
+    auto name_resolver = [&](duckdb::idx_t ref_index) -> std::string {
+      auto const primary_idx = column_ids[ref_index].GetPrimaryIndex();
+      return names[primary_idx];
+    };
+    auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
+    auto duckdb_expression = convert_table_filters_to_expression(
+      *table_filters, column_ids, returned_types, batch_column_map);
+    if (duckdb_expression) {
+      gpu_expression_translator translator(rmm::cuda_stream_default,
+                                           cudf::get_current_device_resource_ref());
+      translated_filter =
+        translator.translate_expression_with_names(*duckdb_expression, name_resolver);
+      if (!translated_filter) {
+        SIRIUS_LOG_INFO(
+          "[sirius_physical_parquet_scan] Failed to translate filter expression for pushdown. "
+          "Filter will be applied in the table scan operator.");
+      } else {
+        // Instruct the sirius_physical_table_scan operator to bypass execute()
+        if (table_scan) { table_scan->passthrough = true; }
+      }
+      // Move the duckdb_expression into the table scan
+      if (table_scan) { table_scan->filter_expr = std::move(duckdb_expression); }
+    }
+  } else {
+    translated_filter = std::nullopt;
+  }
 }
 
 }  // namespace op
