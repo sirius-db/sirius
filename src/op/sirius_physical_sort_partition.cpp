@@ -40,8 +40,8 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(sirius_physical_o
 sirius_physical_sort_partition::sirius_physical_sort_partition(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
-  duckdb::vector<duckdb::idx_t> projections_p,
-  duckdb::idx_t estimated_cardinality)
+  duckdb::vector<std::size_t> projections_p,
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_PARTITION, std::move(types), estimated_cardinality),
     orders(std::move(orders)),

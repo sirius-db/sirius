@@ -168,14 +168,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
-  pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    config_.get_gpu_pipeline_executor_config(),
-    config_.get_duckdb_scan_executor_config(),
-    *memory_manager_,
-    &config_.get_hw_topology());
-
-  // Create one downgrade executor per GPU memory space.
-  // HOST→DISK downgrade is not yet implemented, so we skip HOST tier for now.
+  // Create one downgrade executor per GPU memory space BEFORE pipeline_executor,
+  // so pointers are available for injection into gpu_pipeline_executors.
+  // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
     auto spaces        = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& dg_cfg = config_.get_downgrade_executor_config();
@@ -186,16 +181,29 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         space->get_id(),
         const_cast<cucascade::memory::memory_space*>(space),
         *memory_manager_);
-      executor->start();
+      // NOTE: do not call executor->start() here -- deferred until after
+      // pipeline_executor_ and task_creator_ are constructed.
       downgrade_executors_.push_back(std::move(executor));
     }
   };
   create_executors_for_tier(cucascade::memory::Tier::GPU);
 
+  pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
+    config_.get_gpu_pipeline_executor_config(),
+    config_.get_duckdb_scan_executor_config(),
+    *memory_manager_,
+    &config_.get_hw_topology(),
+    &downgrade_executors_);
+
   task_creator_ = std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_config(),
                                                                   *memory_manager_);
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
+
+  // Start everything -- downgrade executors deferred until now
+  for (auto& executor : downgrade_executors_) {
+    executor->start();
+  }
   task_creator_->start_thread_pool();
   pipeline_executor_->start();
 

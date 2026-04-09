@@ -42,7 +42,7 @@ namespace op {
 
 /// Recursively collect all BoundReferenceExpression indices from an expression tree.
 static void collect_bound_ref_indices(duckdb::Expression& expr,
-                                      std::unordered_set<duckdb::idx_t>& indices)
+                                      std::unordered_set<std::size_t>& indices)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
     indices.insert(expr.Cast<duckdb::BoundReferenceExpression>().index);
@@ -78,7 +78,7 @@ bool sirius_physical_hash_join::are_conditions_supported(
   if (!has_inequality) { return true; }
 
   // Mixed join: collect the column indices used on each side of the equality conditions.
-  std::unordered_set<duckdb::idx_t> equality_left_cols, equality_right_cols;
+  std::unordered_set<std::size_t> equality_left_cols, equality_right_cols;
   for (auto const& cond : conditions) {
     if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
         cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
@@ -96,7 +96,7 @@ bool sirius_physical_hash_join::are_conditions_supported(
         cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
       continue;
     }
-    std::unordered_set<duckdb::idx_t> ineq_left_cols, ineq_right_cols;
+    std::unordered_set<std::size_t> ineq_left_cols, ineq_right_cols;
     collect_bound_ref_indices(*cond.left, ineq_left_cols);
     collect_bound_ref_indices(*cond.right, ineq_right_cols);
     for (auto const idx : ineq_left_cols) {
@@ -151,10 +151,10 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> right,
   duckdb::vector<duckdb::JoinCondition> cond,
   duckdb::JoinType join_type,
-  const duckdb::vector<duckdb::idx_t>& left_projection_map,
-  const duckdb::vector<duckdb::idx_t>& right_projection_map,
+  const duckdb::vector<std::size_t>& left_projection_map,
+  const duckdb::vector<std::size_t>& right_projection_map,
   duckdb::vector<duckdb::LogicalType> delim_types,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
   uint64_t max_build_hash_table_bytes)
   : sirius_physical_partition_consumer_operator(
@@ -175,7 +175,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   if (left_projection_map.empty()) {
     lhs_output_columns.col_idxs.reserve(lhs_input_types.size());
-    for (duckdb::idx_t i = 0; i < lhs_input_types.size(); i++) {
+    for (std::size_t i = 0; i < lhs_input_types.size(); i++) {
       lhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
     }
   } else {
@@ -198,7 +198,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   if (right_projection_map.empty()) {
     rhs_output_columns.col_idxs.reserve(rhs_input_types.size());
-    for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
+    for (std::size_t i = 0; i < rhs_input_types.size(); i++) {
       rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
     }
   } else {
@@ -217,7 +217,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     rhs_output_columns.col_types.push_back(rhs_col_type);
   }
 
-  for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+  for (std::size_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition = conditions[cond_idx];
     const bool is_equality =
       (condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
@@ -290,7 +290,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> right,
   duckdb::vector<duckdb::JoinCondition> cond,
   duckdb::JoinType join_type,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   uint64_t max_build_hash_table_bytes)
   : sirius_physical_hash_join(op,
                               std::move(left),
