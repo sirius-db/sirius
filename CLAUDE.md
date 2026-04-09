@@ -203,27 +203,6 @@ The fallback mechanism is implemented in `src/fallback.cpp` and integrates with 
 - GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
 - Links against: cudf::cudf, rmm::rmm, libnuma, libconfig++, absl::any_invocable, spdlog, cuCascade
 
-## Common Issues
-
-**Build Issues:**
-
-If you see undefined reference errors related to GLIBCXX or CXXABI:
-```bash
-export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
-pixi run clean && pixi run build
-```
-
-**Memory Issues:**
-
-If build consumes too much RAM, reduce parallel jobs:
-```bash
-CMAKE_BUILD_PARALLEL_LEVEL=4 pixi run build
-```
-
-**Test Datasets:**
-
-TPC-H and ClickBench datasets must be generated before running tests. See `test_datasets/` and run `setup_test_datasets.sh` (automatically run in pixi activation).
-
 ## Extension Development
 
 This is a DuckDB extension project using the extension template. The build system integrates with DuckDB's extension infrastructure via `extension-ci-tools`.
