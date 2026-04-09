@@ -170,7 +170,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
@@ -182,7 +183,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               *input_batch->get_memory_space());
     results.push_back(std::move(result));
   }
-  return std::make_unique<operator_data>(results);
+  return std::make_unique<pipelineable_operator_data>(results);
 }
 }  // namespace op
 }  // namespace sirius

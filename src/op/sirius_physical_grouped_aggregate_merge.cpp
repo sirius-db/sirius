@@ -184,7 +184,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    return std::make_unique<operator_data>(input_batch);
+    return std::make_unique<pipelineable_operator_data>(input_batch);
   } else {
     return nullptr;
   }
@@ -194,7 +194,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
@@ -202,7 +203,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<operator_data>(input_data);
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one
@@ -219,7 +220,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // If no post-processing needed, return merged result directly
   if (!has_avg && !has_count_distinct) {
-    return std::make_unique<operator_data>(
+    return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
 
@@ -287,7 +288,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
   auto result       = sirius::make_data_batch(std::move(output_table), *space);
-  return std::make_unique<operator_data>(
+  return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }
 }  // namespace op
