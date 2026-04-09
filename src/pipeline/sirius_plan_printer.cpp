@@ -26,6 +26,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -53,6 +54,9 @@ struct render_tree {
   size_t height;  // number of rows
   // grid[y][x] = optional node at that position
   std::vector<std::vector<std::optional<render_node>>> grid;
+  // Map: (y, x) -> list of child x positions in row y+1
+  // Used to draw horizontal branch connectors for multi-child parents
+  std::map<std::pair<size_t, size_t>, std::vector<size_t>> children_map;
 };
 
 /// Get the width (columns) and height (rows) of the subtree rooted at a pipeline.
@@ -164,17 +168,20 @@ void place_node(render_tree& tree,
 
   tree.grid[y][x] = std::move(node);
 
-  // Recurse into dependencies
+  // Recurse into dependencies and record child column positions
   if (depth_limit > 0) {
     size_t child_x = x;
+    std::vector<size_t> child_cols;
     for (auto& dep : pipeline.dependencies) {
       size_t child_w                = 0;
       size_t child_h                = 0;
       std::set<size_t> size_visited = visited;
       get_tree_width_height(*dep, child_w, child_h, depth_limit - 1, size_visited);
+      child_cols.push_back(child_x);
       place_node(tree, *dep, &pipeline, child_x, y + 1, depth_limit - 1, visited);
       child_x += child_w;
     }
+    if (!child_cols.empty()) { tree.children_map[{y, x}] = std::move(child_cols); }
   }
 }
 
@@ -486,7 +493,6 @@ std::string sirius_plan_printer::render_dag() const
 
     // --- Connection layer (between rows) ---
     if (y + 1 < tree.height) {
-      // Check if any node in next row has a connection label or any connection at all
       bool has_connections = false;
       for (size_t x = 0; x < tree.width; x++) {
         if (tree.grid[y + 1][x].has_value()) {
@@ -496,63 +502,144 @@ std::string sirius_plan_printer::render_dag() const
       }
 
       if (has_connections) {
-        // Render connection label line
-        bool has_labels = false;
-        for (size_t x = 0; x < tree.width; x++) {
-          if (tree.grid[y + 1][x].has_value() && !tree.grid[y + 1][x]->connection_label.empty()) {
-            has_labels = true;
-            break;
-          }
-        }
-
-        // Render vertical connector with optional label
-        for (size_t x = 0; x < tree.width; x++) {
-          if (tree.grid[y + 1][x].has_value()) {
-            // Center a vertical bar in the column
-            size_t center = node_render_width / 2;
-            std::string connector_line(node_render_width, ' ');
-            // Place vertical bar at center (handle UTF-8: the vertical char is 3 bytes)
-            std::string left_pad(center, ' ');
-            std::string right_pad_str;
-            if (center + 1 < node_render_width) {
-              right_pad_str = std::string(node_render_width - center - 1, ' ');
+        // Build a set of columns that are children of multi-child parents,
+        // and the range of columns each parent spans.
+        // branch_cols[col] = true means a horizontal branch line passes through this column
+        std::set<size_t> branch_cols;           // columns covered by a branch line
+        std::set<size_t> branch_junction_cols;  // columns where a child connects (┬ junction)
+        for (size_t px = 0; px < tree.width; px++) {
+          auto it = tree.children_map.find({y, px});
+          if (it != tree.children_map.end() && it->second.size() > 1) {
+            size_t min_col = *std::min_element(it->second.begin(), it->second.end());
+            size_t max_col = *std::max_element(it->second.begin(), it->second.end());
+            for (size_t c = min_col; c <= max_col; c++) {
+              branch_cols.insert(c);
             }
-            ss << left_pad << config_.VERTICAL << right_pad_str;
-          } else {
-            ss << std::string(node_render_width, ' ');
+            for (auto& child_col : it->second) {
+              branch_junction_cols.insert(child_col);
+            }
           }
         }
-        ss << "\n";
 
-        // Render connection label line (if any labels exist)
-        if (has_labels) {
+        // Render branch line (horizontal connectors for multi-child parents)
+        if (!branch_cols.empty()) {
+          // Build the line character by character across all columns
+          size_t total_chars = tree.width * node_render_width;
+          std::string branch_line(total_chars, ' ');
+
+          // For single-child parents, draw │ at center
           for (size_t x = 0; x < tree.width; x++) {
-            if (tree.grid[y + 1][x].has_value() && !tree.grid[y + 1][x]->connection_label.empty()) {
-              auto& label   = tree.grid[y + 1][x]->connection_label;
-              size_t center = node_render_width / 2;
-              // Place label centered on the connector
-              if (label.size() + 2 < node_render_width) {
-                size_t label_start = center - label.size() / 2;
-                std::string label_line(node_render_width, ' ');
-                label_line.replace(label_start, label.size(), label);
-                ss << label_line;
-              } else {
-                // Label too long, just print truncated
-                ss << label.substr(0, node_render_width);
+            if (tree.grid[y + 1][x].has_value() && branch_cols.find(x) == branch_cols.end()) {
+              // Single-child: just a vertical bar
+              // (handled below with UTF-8 since we can't place multi-byte in a char string)
+            }
+          }
+
+          // Render using ostringstream for proper UTF-8
+          for (size_t x = 0; x < tree.width; x++) {
+            size_t center = node_render_width / 2;
+            if (branch_cols.count(x)) {
+              // This column is part of a branch line
+              std::string col_str(node_render_width, ' ');
+              // Fill horizontal line at the center row
+              // We render: spaces up to center, then junction/horizontal, then spaces
+              std::string left_pad(center, ' ');
+              std::string right_pad_str;
+              if (center + 1 < node_render_width) {
+                right_pad_str = std::string(node_render_width - center - 1, ' ');
               }
-            } else {
-              if (tree.grid[y + 1][x].has_value()) {
-                // Has node but no label -- render vertical bar
-                size_t center = node_render_width / 2;
-                std::string left_pad(center, ' ');
-                std::string right_pad_str;
-                if (center + 1 < node_render_width) {
-                  right_pad_str = std::string(node_render_width - center - 1, ' ');
+
+              // Determine what character at center
+              bool is_junction = branch_junction_cols.count(x) > 0;
+              bool is_leftmost = branch_cols.count(x) && (!x || !branch_cols.count(x - 1));
+              bool is_rightmost =
+                branch_cols.count(x) && (x + 1 >= tree.width || !branch_cols.count(x + 1));
+
+              // For the horizontal portions between center of this column and neighbors,
+              // we need to fill with ─. Use a per-character approach.
+              // Left half of column: if previous column is also in branch, fill with ─
+              std::string left_half;
+              if (!is_leftmost && branch_cols.count(x)) {
+                // Fill left half with horizontal lines
+                for (size_t i = 0; i < center; i++) {
+                  left_half += config_.HORIZONTAL;
                 }
-                ss << left_pad << config_.VERTICAL << right_pad_str;
               } else {
-                ss << std::string(node_render_width, ' ');
+                left_half = left_pad;
               }
+
+              // Center character
+              std::string center_char;
+              if (is_junction) {
+                if (is_leftmost && is_rightmost) {
+                  center_char = config_.VERTICAL;  // single child, shouldn't happen here
+                } else if (is_leftmost) {
+                  center_char = config_.LTCORNER;  // ┌
+                } else if (is_rightmost) {
+                  center_char = config_.RTCORNER;  // ┐
+                } else {
+                  center_char = config_.TMIDDLE;  // ┬
+                }
+              } else {
+                // Not a junction — just horizontal line passing through
+                center_char = config_.HORIZONTAL;
+              }
+
+              // Right half of column: if next column is also in branch, fill with ─
+              std::string right_half;
+              if (!is_rightmost && branch_cols.count(x)) {
+                size_t right_len =
+                  (center + 1 < node_render_width) ? node_render_width - center - 1 : 0;
+                for (size_t i = 0; i < right_len; i++) {
+                  right_half += config_.HORIZONTAL;
+                }
+              } else {
+                right_half = right_pad_str;
+              }
+
+              ss << left_half << center_char << right_half;
+            } else if (tree.grid[y + 1][x].has_value()) {
+              // Single-child column not part of a branch — just │
+              std::string left_pad(center, ' ');
+              std::string right_pad_str;
+              if (center + 1 < node_render_width) {
+                right_pad_str = std::string(node_render_width - center - 1, ' ');
+              }
+              ss << left_pad << config_.VERTICAL << right_pad_str;
+            } else {
+              ss << std::string(node_render_width, ' ');
+            }
+          }
+          ss << "\n";
+
+          // Render vertical drops from each junction to child boxes
+          for (size_t x = 0; x < tree.width; x++) {
+            if (tree.grid[y + 1][x].has_value()) {
+              size_t center = node_render_width / 2;
+              std::string left_pad(center, ' ');
+              std::string right_pad_str;
+              if (center + 1 < node_render_width) {
+                right_pad_str = std::string(node_render_width - center - 1, ' ');
+              }
+              ss << left_pad << config_.VERTICAL << right_pad_str;
+            } else {
+              ss << std::string(node_render_width, ' ');
+            }
+          }
+          ss << "\n";
+        } else {
+          // No multi-child parents — simple vertical connectors
+          for (size_t x = 0; x < tree.width; x++) {
+            if (tree.grid[y + 1][x].has_value()) {
+              size_t center = node_render_width / 2;
+              std::string left_pad(center, ' ');
+              std::string right_pad_str;
+              if (center + 1 < node_render_width) {
+                right_pad_str = std::string(node_render_width - center - 1, ' ');
+              }
+              ss << left_pad << config_.VERTICAL << right_pad_str;
+            } else {
+              ss << std::string(node_render_width, ' ');
             }
           }
           ss << "\n";
