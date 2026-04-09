@@ -211,14 +211,22 @@ std::unique_ptr<op::operator_data> run_one_operator(
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-  auto peak_bytes        = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
-  std::string extra_info = fmt::format(
-    "execution time: {:.2f} ms, "
-    "peak allocated: {} bytes ({:.2f} MB)",
-    duration.count() / 1000.0,
-    peak_bytes,
+  auto peak_bytes = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
+
+  // Log per-operator timing at INFO level for cost breakdown
+  size_t out_rows = 0;
+  for (auto& batch : operator_output_data->get_data_batches()) {
+    auto view = get_cudf_table_view(*batch);
+    out_rows += view.num_rows();
+  }
+  SIRIUS_LOG_INFO(
+    "[gpu_op] pipeline={} op={} (id={}) time_us={} rows_out={} peak_mb={:.1f}",
+    pipeline->get_pipeline_id(),
+    op.get_name(),
+    op.get_operator_id(),
+    duration.count(),
+    out_rows,
     static_cast<double>(peak_bytes) / (1024.0 * 1024.0));
-  log_operator_data(op, *operator_output_data, pipeline, "produced", extra_info);
 
   validate_operator_output_types(operator_output_data.get(), op);
   return operator_output_data;
@@ -448,51 +456,72 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   }
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
-  auto const prepare_duration =
-    std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
-  SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) prepare execution time: {:.2f} ms",
-                   pipeline->get_pipeline_id(),
-                   first_op.get_name(),
-                   first_op.get_operator_id(),
-                   prepare_duration.count() / 1000.0);
+  auto const prepare_duration_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start).count();
 
   // At this point, all input batches are locked for processing.
   // They will remain locked until the processing_handles go out of scope.
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
-  _allocator                                     = allocator;
-  auto input_basis                               = local_state.get_task_consumption_basis();
+  _allocator       = allocator;
+  auto input_basis = local_state.get_task_consumption_basis();
+
+  auto const compute_start                       = std::chrono::high_resolution_clock::now();
   std::unique_ptr<op::operator_data> output_data = compute_task(stream);
+  auto const compute_end                         = std::chrono::high_resolution_clock::now();
+  auto const compute_duration_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(compute_end - compute_start).count();
+
+  auto const sink_start = std::chrono::high_resolution_clock::now();
 
   // Record memory metrics for future reservation estimates
+  std::size_t peak_bytes   = 0;
+  std::size_t output_bytes = 0;
   if (output_data) {
-    auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+    peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
     // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
     // operators. Clamp at zero to avoid size_t underflow when estimates exceed the observed peak.
-    if (peak_bytes > local_state._bytes_to_materialize_input) {
-      peak_bytes -= local_state._bytes_to_materialize_input;
+    auto peak_ops = peak_bytes;
+    if (peak_ops > local_state._bytes_to_materialize_input) {
+      peak_ops -= local_state._bytes_to_materialize_input;
     } else {
-      peak_bytes = 0;
+      peak_ops = 0;
     }
-    std::size_t output_bytes = 0;
     for (const auto& batch : output_data->get_data_batches()) {
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-    global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
-    SIRIUS_LOG_TRACE(
-      "Pipeline {}: memory history record - input_basis={}, output_bytes={}, reservation_bytes={}, "
-      "peak_bytes={}, peak_bytes_to_materialize_input={}",
-      pipeline->get_pipeline_id(),
-      input_basis,
-      output_bytes,
-      reservation_bytes,
-      peak_bytes,
-      local_state._bytes_to_materialize_input);
+    global.get_memory_history().record({input_basis, peak_ops, output_bytes});
   }
 
   if (output_data) { publish_output(*output_data, stream); }
+
+  auto const sink_end = std::chrono::high_resolution_clock::now();
+  auto const sink_duration_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(sink_end - sink_start).count();
+  auto const total_duration_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(sink_end - prepare_start).count();
+
+  // Log comprehensive per-task timing breakdown at INFO level
+  SIRIUS_LOG_INFO(
+    "[gpu_pipeline] pipeline={} task={} ops={} "
+    "time_us=[prepare={} compute={} sink={} total={}] "
+    "input_mb={:.1f} output_mb={:.1f} peak_mb={:.1f} reservation_mb={:.1f} "
+    "batches={} htod_mb={:.1f}",
+    pipeline->get_pipeline_id(),
+    _task_id,
+    op_chain,
+    prepare_duration_us,
+    compute_duration_us,
+    sink_duration_us,
+    total_duration_us,
+    input_basis / (1024.0 * 1024.0),
+    output_bytes / (1024.0 * 1024.0),
+    peak_bytes / (1024.0 * 1024.0),
+    reservation_bytes / (1024.0 * 1024.0),
+    processing_handles.size(),
+    local_state._bytes_to_materialize_input / (1024.0 * 1024.0));
 
   // Processing handles are automatically released here when they go out of scope
 }

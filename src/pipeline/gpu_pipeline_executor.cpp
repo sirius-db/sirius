@@ -28,6 +28,8 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <chrono>
+
 #include <util/stream_check_wrapper.hpp>
 
 namespace sirius {
@@ -84,18 +86,22 @@ void gpu_pipeline_executor::manager_loop()
       }
       break;
     }
-    auto bytes_needs = gpu_task->get_estimated_reservation_size();
-    SIRIUS_LOG_TRACE(
-      "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
-      "{}. Memory "
-      "available: {}, total reserved: {}, max: {}",
+    auto bytes_needs    = gpu_task->get_estimated_reservation_size();
+    auto const res_start = std::chrono::high_resolution_clock::now();
+    auto reservation     = _memory_space->make_reservation(bytes_needs);
+    auto const res_end   = std::chrono::high_resolution_clock::now();
+    auto const res_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(res_end - res_start).count();
+    SIRIUS_LOG_INFO(
+      "[gpu_executor] reservation: pipeline={} task={} requested_mb={:.1f} "
+      "available_mb={:.1f} reserved_mb={:.1f} max_mb={:.1f} time_us={}",
       gpu_task->get_pipeline_id(),
-      bytes_needs,
       gpu_task->get_task_id(),
-      _memory_space->get_available_memory(),
-      _memory_space->get_total_reserved_memory(),
-      _memory_space->get_max_memory());
-    auto reservation = _memory_space->make_reservation(bytes_needs);
+      bytes_needs / (1024.0 * 1024.0),
+      _memory_space->get_available_memory() / (1024.0 * 1024.0),
+      _memory_space->get_total_reserved_memory() / (1024.0 * 1024.0),
+      _memory_space->get_max_memory() / (1024.0 * 1024.0),
+      res_us);
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
