@@ -11,10 +11,10 @@ cd sirius
 ```
 
 By default, only the `gpu_execution` code path is compiled. To build `gpu_processing`, enable the `ENABLE_LEGACY_SIRIUS` CMake option:
-```
+```bash
 pixi shell
 cmake -S duckdb --preset release -DENABLE_LEGACY_SIRIUS=ON
-pixi run build
+cmake --build build/release
 ```
 
 ## Running

@@ -68,7 +68,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/nsys_profiles/sf${SF}}"
 
 if [ ! -f "$DUCKDB" ]; then
     echo "ERROR: DuckDB binary not found: $DUCKDB"
-    echo "  Build with: pixi run make -j12"
+    echo "  Build with: pixi run build"
     exit 1
 fi
 

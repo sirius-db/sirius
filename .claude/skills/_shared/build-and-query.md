@@ -38,13 +38,20 @@ DuckDB's CMake has `ENABLE_SANITIZER=TRUE` by default, which adds `-fsanitize=ad
 
 **To explicitly disable ASan in debug builds** (e.g., when using TSan instead):
 ```bash
-EXTRA_CMAKE_FLAGS="-DENABLE_SANITIZER=0" pixi run build clang-debug
+pixi shell
+cmake -S duckdb --preset clang-debug -DENABLE_SANITIZER=0
+cmake --build build/clang-debug
 ```
 
 **ASan vs TSan -- mutually exclusive:**
 ASan and TSan cannot be used simultaneously. DuckDB will warn and disable ASan if both are enabled. Use separate builds:
-- ASan build: `clang-debug` (default, no extra flags)
-- TSan build: `EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON -DENABLE_SANITIZER=0" pixi run build clang-debug`
+- ASan build: `pixi run build clang-debug` (default, no extra flags)
+- TSan build: requires manual configure with extra flags:
+  ```bash
+  pixi shell
+  cmake -S duckdb --preset clang-debug -DENABLE_TSAN=ON -DENABLE_SANITIZER=0
+  cmake --build build/clang-debug
+  ```
 
 **ASan runtime options:**
 ```bash

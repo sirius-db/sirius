@@ -37,7 +37,9 @@ Detect and diagnose race conditions using ThreadSanitizer (CPU threads) and NVID
    - Build with `clang-debug` + TSan flags (TSan requires `clang-debug` -- cannot use `relwithdebinfo`).
      **Important:** TSan and ASan cannot be used simultaneously. This skill uses TSan only -- explicitly disable ASan:
      ```bash
-     EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON -DENABLE_SANITIZER=0" pixi run build clang-debug
+     pixi shell
+     cmake -S duckdb --preset clang-debug -DENABLE_TSAN=ON -DENABLE_SANITIZER=0
+     cmake --build build/clang-debug
      ```
    - Run the reproduction case:
      ```bash
