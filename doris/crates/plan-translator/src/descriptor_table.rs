@@ -391,6 +391,53 @@ impl DescriptorTable {
         self.slot_expressions.get(&slot_id)
     }
 
+    /// Number of captured slot expressions.
+    pub fn slot_expression_count(&self) -> usize {
+        self.slot_expressions.len()
+    }
+
+    /// Add a single slot expression (for propagation to pass-through slots).
+    pub fn add_slot_expression(&mut self, slot_id: i32, expr: doris_thrift::exprs::TExpr) {
+        self.slot_expressions.insert(slot_id, expr);
+    }
+
+    /// Find a non-trivial (computed) slot expression at the given position in any
+    /// tuple with the given number of materialized slots. Non-trivial means the
+    /// expression has more than 1 node (not a simple SLOT_REF passthrough).
+    pub fn find_nontrivial_expression_by_position(
+        &self,
+        position: usize,
+        tuple_len: usize,
+    ) -> Option<doris_thrift::exprs::TExpr> {
+        for (&sid, expr) in &self.slot_expressions {
+            if expr.nodes.len() <= 1 {
+                continue;
+            }
+            if let Ok(slot) = self.get_slot(sid) {
+                if let Ok(tuple) = self.get_tuple(slot.parent_tuple_id) {
+                    let materialized: Vec<i32> = tuple
+                        .slot_ids
+                        .iter()
+                        .copied()
+                        .filter(|&s| {
+                            self.get_slot(s)
+                                .map(|sl| sl.is_materialized)
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    if materialized.len() == tuple_len {
+                        if let Some(pos) = materialized.iter().position(|&s| s == sid) {
+                            if pos == position {
+                                return Some(expr.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Set the flattened column names from the compiled child Rel.
     /// Uses interior mutability (RefCell) since translate_node takes &self.
     pub fn set_child_rel_column_names(&self, names: Vec<String>) {
