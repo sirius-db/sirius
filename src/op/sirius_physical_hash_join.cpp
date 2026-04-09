@@ -440,8 +440,8 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
     } else {
-      throw std::runtime_error(
-        "Invalid hash table build state in sirius_physical_hash_join::get_next_task_hint");
+      // If we are here, then this operator is actually complete.
+      return std::nullopt;
     }
   } else {
     return sirius_physical_operator::get_next_task_hint();
