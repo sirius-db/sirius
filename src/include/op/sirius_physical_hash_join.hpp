@@ -64,10 +64,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::unique_ptr<sirius_physical_operator> right,
     duckdb::vector<duckdb::JoinCondition> cond,
     duckdb::JoinType join_type,
-    const duckdb::vector<duckdb::idx_t>& left_projection_map,
-    const duckdb::vector<duckdb::idx_t>& right_projection_map,
+    const duckdb::vector<std::size_t>& left_projection_map,
+    const duckdb::vector<std::size_t>& right_projection_map,
     duckdb::vector<duckdb::LogicalType> delim_types,
-    duckdb::idx_t estimated_cardinality,
+    std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
   sirius_physical_hash_join(
@@ -76,7 +76,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::unique_ptr<sirius_physical_operator> right,
     duckdb::vector<duckdb::JoinCondition> cond,
     duckdb::JoinType join_type,
-    duckdb::idx_t estimated_cardinality,
+    std::size_t estimated_cardinality,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
