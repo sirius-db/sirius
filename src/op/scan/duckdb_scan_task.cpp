@@ -36,6 +36,7 @@
 #include <duckdb/common/enums/vector_type.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/types/vector.hpp>
+#include <duckdb/common/types/vector_buffer.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/storage/data_table.hpp>
@@ -321,7 +322,7 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   size_t row_offset,
   std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
-  // PRECONDITION: Vector must be flattened
+  // PRECONDITION: Vector must be flattened (for non-dictionary path)
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     size_t data_bytes    = 0;
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
@@ -351,6 +352,97 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   }
 
   process_mask_for_column(validity, num_rows, row_offset, allocation);
+}
+
+void duckdb_scan_task_local_state::column_builder::process_dictionary_varchar(
+  duckdb::Vector& vec,
+  size_t num_rows,
+  size_t row_offset,
+  std::unique_ptr<multiple_blocks_allocation>& allocation)
+{
+  // PRECONDITION: vec is DICTIONARY_VECTOR with VARCHAR child
+  auto& sel_vec    = duckdb::DictionaryVector::SelVector(vec);
+  auto& child      = duckdb::DictionaryVector::Child(vec);
+  auto& child_validity = duckdb::FlatVector::Validity(child);
+
+  // Step 1: Build dictionary lookup (small — fits in L1 cache)
+  // The child vector contains the unique string values
+  auto const* dict_data = duckdb::FlatVector::GetData<duckdb::string_t>(child);
+  auto dict_size_hint   = duckdb::DictionaryVector::DictionarySize(vec);
+  size_t dict_count     = dict_size_hint.IsValid() ? dict_size_hint.GetIndex() : 0;
+
+  // If we don't know the dictionary size, fall back to finding the max index
+  if (dict_count == 0) {
+    for (size_t row = 0; row < num_rows; ++row) {
+      auto idx = sel_vec.get_index(row);
+      if (idx >= dict_count) { dict_count = idx + 1; }
+    }
+  }
+
+  // Step 2: Pre-compute dictionary string pointers and lengths (small array, L1-friendly)
+  // Using stack allocation for small dictionaries, heap for larger ones
+  constexpr size_t STACK_DICT_LIMIT = 256;
+  struct dict_entry {
+    const char* data;
+    uint32_t len;
+  };
+  dict_entry stack_dict[STACK_DICT_LIMIT];
+  std::vector<dict_entry> heap_dict;
+  dict_entry* dict = stack_dict;
+  if (dict_count > STACK_DICT_LIMIT) {
+    heap_dict.resize(dict_count);
+    dict = heap_dict.data();
+  }
+
+  for (size_t k = 0; k < dict_count; ++k) {
+    if (child_validity.RowIsValid(k)) {
+      dict[k] = {dict_data[k].GetData(), static_cast<uint32_t>(dict_data[k].GetSize())};
+    } else {
+      dict[k] = {nullptr, 0};
+    }
+  }
+
+  // Step 3: Build offsets and copy string data using dictionary lookup
+  // The selection vector maps each row to a dictionary entry.
+  // The dictionary is small (fits L1), so lookups are fast.
+  // Validity for the output is determined by whether the selected dictionary entry is valid.
+  size_t data_bytes = 0;
+  for (size_t row = 0; row < num_rows; ++row) {
+    auto const prev_offset = offset_blocks_accessor.get_current(allocation);
+    offset_blocks_accessor.advance();
+
+    auto const dict_idx = sel_vec.get_index(row);
+    auto const& entry   = dict[dict_idx];
+
+    if (entry.data != nullptr) {
+      offset_blocks_accessor.set_current(prev_offset + entry.len, allocation);
+      data_blocks_accessor.memcpy_from(entry.data, entry.len, allocation);
+      data_bytes += entry.len;
+    } else {
+      offset_blocks_accessor.set_current(prev_offset, allocation);
+    }
+  }
+  total_data_bytes += data_bytes;
+
+  // For dictionary vectors, validity comes from the child (dictionary) mapped through selection.
+  // We need to build the output validity mask from the dictionary validity + selection vector.
+  // Construct a temporary validity mask for the output rows.
+  if (!child_validity.AllValid()) {
+    // Some dictionary entries are NULL — build per-row validity from selection
+    duckdb::ValidityMask output_validity(num_rows);
+    for (size_t row = 0; row < num_rows; ++row) {
+      auto const dict_idx = sel_vec.get_index(row);
+      if (!child_validity.RowIsValid(dict_idx)) {
+        output_validity.SetInvalid(row);
+        null_count++;
+      }
+    }
+    process_mask_for_column(output_validity, num_rows, row_offset, allocation);
+  } else {
+    // All dictionary entries are valid — all output rows are valid
+    duckdb::ValidityMask all_valid;  // nullptr = all valid
+    process_mask_for_column(all_valid, num_rows, row_offset, allocation);
+  }
 }
 
 cucascade::memory::column_metadata
@@ -647,21 +739,35 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 }
 
 /// Instrumented version of process_chunk that reports Flatten vs copy time separately.
+/// Uses dictionary-aware path for DICTIONARY_VECTOR VARCHAR columns.
 void duckdb_scan_task::process_chunk_timed(duckdb_scan_task_local_state& l_state,
                                            double& us_flatten,
                                            double& us_copy)
 {
   for (size_t i = 0; i < l_state._num_columns; ++i) {
-    auto& vec = l_state._chunk.data[i];
-    {
-      scoped_timer t(us_flatten);
-      vec.Flatten(l_state._chunk.size());
-    }
-    auto const& validity = duckdb::FlatVector::Validity(vec);
-    {
+    auto& vec    = l_state._chunk.data[i];
+    auto const vt = vec.GetVectorType();
+    bool const is_dict_varchar =
+      (vt == duckdb::VectorType::DICTIONARY_VECTOR &&
+       l_state._column_builders[i].type.InternalType() == duckdb::PhysicalType::VARCHAR);
+
+    if (is_dict_varchar) {
+      // Dictionary path: skip Flatten, process dictionary + indices directly
       scoped_timer t(us_copy);
-      l_state._column_builders[i].process_column(
-        vec, validity, l_state._chunk.size(), l_state._row_offset, l_state._allocation);
+      l_state._column_builders[i].process_dictionary_varchar(
+        vec, l_state._chunk.size(), l_state._row_offset, l_state._allocation);
+    } else {
+      // Standard path: Flatten then copy
+      {
+        scoped_timer t(us_flatten);
+        vec.Flatten(l_state._chunk.size());
+      }
+      auto const& validity = duckdb::FlatVector::Validity(vec);
+      {
+        scoped_timer t(us_copy);
+        l_state._column_builders[i].process_column(
+          vec, validity, l_state._chunk.size(), l_state._row_offset, l_state._allocation);
+      }
     }
   }
   l_state._row_offset += l_state._chunk.size();

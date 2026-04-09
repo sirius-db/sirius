@@ -280,6 +280,18 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
                         std::unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
+     * @brief Process a DICTIONARY_VECTOR VARCHAR column without flattening.
+     *
+     * Extracts the dictionary (small array of unique strings) and uses the selection
+     * vector to build cuDF STRING format (offsets + chars) directly. Avoids the cost
+     * of Flatten and improves cache locality for string copies.
+     */
+    void process_dictionary_varchar(duckdb::Vector& vec,
+                                    size_t num_rows,
+                                    size_t row_offset,
+                                    std::unique_ptr<multiple_blocks_allocation>& allocation);
+
+    /**
      * @brief Create a column_metadata for this column for building a host_table_allocation.
      *
      * @param[in] num_rows The number of rows in the column.
