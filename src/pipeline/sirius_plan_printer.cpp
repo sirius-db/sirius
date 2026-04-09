@@ -518,7 +518,9 @@ std::string sirius_plan_printer::render_dag() const
             has_any_branch = true;
             size_t min_col = *std::min_element(it->second.begin(), it->second.end());
             size_t max_col = *std::max_element(it->second.begin(), it->second.end());
-            for (size_t c = min_col; c <= max_col; c++) { col_to_parent[c] = px; }
+            for (size_t c = min_col; c <= max_col; c++) {
+              col_to_parent[c] = px;
+            }
           }
         }
 
@@ -533,8 +535,8 @@ std::string sirius_plan_printer::render_dag() const
               size_t max_col    = *std::max_element(children.begin(), children.end());
               std::set<size_t> child_set(children.begin(), children.end());
 
-              bool is_child    = child_set.count(x) > 0;
-              bool is_leftmost = (x == min_col);
+              bool is_child     = child_set.count(x) > 0;
+              bool is_leftmost  = (x == min_col);
               bool is_rightmost = (x == max_col);
 
               // Left half: horizontal if not leftmost, spaces if leftmost
@@ -565,11 +567,13 @@ std::string sirius_plan_printer::render_dag() const
 
               // Right half: horizontal if not rightmost, spaces if rightmost
               std::string right_half;
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               if (!is_rightmost) {
-                for (size_t i = 0; i < right_len; i++) { right_half += config_.HORIZONTAL; }
+                for (size_t i = 0; i < right_len; i++) {
+                  right_half += config_.HORIZONTAL;
+                }
               } else {
                 right_half = std::string(right_len, ' ');
               }
@@ -578,9 +582,9 @@ std::string sirius_plan_printer::render_dag() const
             } else if (tree.grid[y + 1][x].has_value()) {
               // Single-child — just │
               std::string left_pad(connector_center, ' ');
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               ss << left_pad << config_.VERTICAL << std::string(right_len, ' ');
             } else {
               ss << std::string(node_render_width, ' ');
@@ -592,9 +596,9 @@ std::string sirius_plan_printer::render_dag() const
           for (size_t x = 0; x < tree.width; x++) {
             if (tree.grid[y + 1][x].has_value()) {
               std::string left_pad(connector_center, ' ');
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               ss << left_pad << config_.VERTICAL << std::string(right_len, ' ');
             } else {
               ss << std::string(node_render_width, ' ');
@@ -606,9 +610,9 @@ std::string sirius_plan_printer::render_dag() const
           for (size_t x = 0; x < tree.width; x++) {
             if (tree.grid[y + 1][x].has_value()) {
               std::string left_pad(connector_center, ' ');
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               ss << left_pad << config_.VERTICAL << std::string(right_len, ' ');
             } else {
               ss << std::string(node_render_width, ' ');
