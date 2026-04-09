@@ -130,27 +130,29 @@ void place_node(render_tree& tree,
     return;
   }
 
-  // Build content lines with operator IDs and detail annotations (D-01, D-02, D-03, D-04)
+  // Build content lines bottom-to-top: sink first, then operators (reversed), then source.
+  // Query plans are read from the bottom, so source should be at the bottom of the box.
   auto source = pipeline.get_source();
   auto sink   = pipeline.get_sink();
-  if (source) {
-    node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*source));
-    for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*source)) {
+  if (sink && sink != source) {
+    node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*sink));
+    for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*sink)) {
       node.content_lines.push_back(detail);
     }
   }
   auto ops = pipeline.get_operators();
-  for (auto& op_ref : ops) {
-    if (source && &op_ref.get() == source.get()) { continue; }
-    if (sink && &op_ref.get() == sink.get()) { continue; }
-    node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(op_ref.get()));
-    for (auto& detail : sirius_plan_printer::get_operator_detail_lines(op_ref.get())) {
+  for (auto it = ops.rbegin(); it != ops.rend(); ++it) {
+    auto& op_ref = it->get();
+    if (source && &op_ref == source.get()) { continue; }
+    if (sink && &op_ref == sink.get()) { continue; }
+    node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(op_ref));
+    for (auto& detail : sirius_plan_printer::get_operator_detail_lines(op_ref)) {
       node.content_lines.push_back(detail);
     }
   }
-  if (sink && sink != source) {
-    node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*sink));
-    for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*sink)) {
+  if (source) {
+    node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*source));
+    for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*source)) {
       node.content_lines.push_back(detail);
     }
   }
