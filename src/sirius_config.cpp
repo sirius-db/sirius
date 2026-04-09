@@ -104,6 +104,19 @@ static void from_yaml(const YAML::Node& node, op::scan::scan_executor_config& op
 
 // ================ Internal config structs ================= //
 
+template <>
+struct sirius::config::custom_config_registrar<sirius::exec::downgrade_executor_config> {
+  static void config(sirius::config::configuration_setter& setter,
+                     sirius::exec::downgrade_executor_config& opt)
+  {
+    setter.add_config(
+      "num_threads", opt.thread_pool.num_threads, sirius::config::greater_than<size_t>{0});
+    setter.add_config("thread_name_prefix", opt.thread_pool.thread_name_prefix);
+    setter.add_config("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+    setter.add_config("monitor_period_ms", opt.monitor_period_ms);
+  }
+};
+
 namespace {
 
 struct topology {
@@ -384,7 +397,7 @@ const exec::thread_pool_config& sirius_config::get_gpu_pipeline_executor_config(
   return _gpu_pipeline_executor_config;
 }
 
-const exec::thread_pool_config& sirius_config::get_downgrade_executor_config() const noexcept
+const exec::downgrade_executor_config& sirius_config::get_downgrade_executor_config() const noexcept
 {
   return _downgrade_executor_config;
 }

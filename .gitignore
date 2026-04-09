@@ -31,6 +31,7 @@ cufile.log
 # Generated nightly environment
 envs/
 compile_commands.json
+.cache
 
 # Zed editor settings
 .zed

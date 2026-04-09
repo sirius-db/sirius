@@ -80,7 +80,8 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_downgrade_executor_config() const noexcept;
+  [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
+    const noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
 
@@ -113,8 +114,7 @@ struct sirius_config {
                                                 .thread_name_prefix = "task_creator"};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
-  exec::thread_pool_config _downgrade_executor_config{.num_threads        = 4,
-                                                      .thread_name_prefix = "downgrade"};
+  exec::downgrade_executor_config _downgrade_executor_config;
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
 };

@@ -56,7 +56,7 @@
 using namespace sirius;
 using namespace cucascade;
 using namespace cucascade::memory;
-using sirius::op::operator_data;
+using sirius::op::pipelineable_operator_data;
 
 namespace {
 
@@ -247,7 +247,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
-  collector.sink(operator_data({batch}), cudf::get_default_stream());
+  collector.sink(pipelineable_operator_data({batch}), cudf::get_default_stream());
   duckdb::GlobalSinkState sink_state;
   auto result = collector.get_result(sink_state);
   REQUIRE(result != nullptr);
@@ -313,7 +313,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
-  collector.sink(operator_data({batch}), stream);
+  collector.sink(pipelineable_operator_data({batch}), stream);
   duckdb::GlobalSinkState sink_state;
   auto result = collector.get_result(sink_state);
   REQUIRE(result != nullptr);
@@ -419,7 +419,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
         std::this_thread::yield();
       }
       try {
-        collector.sink(operator_data({batches[static_cast<size_t>(thread_idx)]}),
+        collector.sink(pipelineable_operator_data({batches[static_cast<size_t>(thread_idx)]}),
                        cudf::get_default_stream());
       } catch (...) {
         exceptions[static_cast<size_t>(thread_idx)] = std::current_exception();
