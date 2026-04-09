@@ -26,6 +26,7 @@
 #include "gpu_physical_operator.hpp"
 
 namespace duckdb {
+using sirius::AggregationType;
 
 uint64_t* createFixedSizeOffsets(size_t record_size, uint64_t num_rows);
 

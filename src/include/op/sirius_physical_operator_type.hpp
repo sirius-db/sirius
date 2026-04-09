@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "duckdb/common/constants.hpp"
+#include <cstdint>
+#include <string>
 
 namespace sirius::op {
 

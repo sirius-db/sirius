@@ -31,6 +31,8 @@
 #define NUM_GPUS 1
 
 namespace duckdb {
+using sirius::AggregationType;
+using sirius::OrderByType;
 
 template int16_t* GPUBufferManager::customCudaMalloc<int16_t>(size_t size, int gpu, bool caching);
 
