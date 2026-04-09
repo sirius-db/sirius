@@ -484,53 +484,6 @@ pub fn translate_fragment(
     // (e.g., `l_extendedprice * (1 - l_discount)`) by inlining the projection expressions.
     build_projection_slot_map(plan, &mut desc);
 
-    // Propagate computed expressions to output_exprs pass-through slots.
-    // After fragment merge, output_exprs may reference coordinator slots that are
-    // positional pass-throughs of intermediate AGG slots (different IDs, same data).
-    // Match non-trivial expressions (nodes.len()>1) by (tuple_len, position).
-    let propagated_slots = if let Some(output_exprs) = fragment.output_exprs.as_ref() {
-        let mut propagations = Vec::new();
-        for expr in output_exprs {
-            let sr = match expr.nodes.first().and_then(|n| n.slot_ref.as_ref()) {
-                Some(sr) if desc.get_slot_expression(sr.slot_id).is_none() => sr,
-                _ => continue,
-            };
-            tracing::warn!(slot_id = sr.slot_id, has_expr = desc.get_slot_expression(sr.slot_id).is_some(), "checking output_expr slot");
-        let slot = match desc.get_slot(sr.slot_id) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let tuple = match desc.get_tuple(slot.parent_tuple_id) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let mat: Vec<i32> = tuple.slot_ids.iter().copied()
-                .filter(|&s| desc.get_slot(s).map(|sl| sl.is_materialized).unwrap_or(false))
-                .collect();
-            let pos = match mat.iter().position(|&s| s == sr.slot_id) {
-                Some(p) => p,
-                None => continue,
-            };
-            if let Some((source_sid, found_expr)) =
-                desc.find_nontrivial_expression_by_position(pos, mat.len())
-            {
-                tracing::info!(
-                    target = sr.slot_id, source = source_sid, pos, tuple_len = mat.len(),
-                    "propagated computed expression to output_exprs slot"
-                );
-                propagations.push((sr.slot_id, found_expr));
-            }
-        }
-        let propagated_slots: std::collections::HashSet<i32> =
-            propagations.iter().map(|(sid, _)| *sid).collect();
-        for (sid, expr) in propagations {
-            desc.add_slot_expression(sid, expr);
-        }
-        propagated_slots
-    } else {
-        std::collections::HashSet::new()
-    };
-
     let mut registry = ExtensionRegistry::new();
 
     // Translate the plan tree into a Substrait Rel tree.
@@ -550,16 +503,7 @@ pub fn translate_fragment(
         exprs.iter().any(|e| {
             e.nodes
                 .first()
-                .map_or(true, |n| {
-                    if n.node_type != TExprNodeType::SLOT_REF {
-                        return true; // non-SLOT_REF = computed
-                    }
-                    // SLOT_REF: only trigger for PROPAGATED slots (not scan projections
-                    // which are already expanded inline during plan translation).
-                    n.slot_ref.as_ref().map_or(false, |sr| {
-                        propagated_slots.contains(&sr.slot_id)
-                    })
-                })
+                .map_or(true, |n| n.node_type != TExprNodeType::SLOT_REF)
         })
     });
 

@@ -396,7 +396,18 @@ fn extract_file_scan_info(params: &TPipelineFragmentParams) -> Vec<plan_translat
 fn merge_fragment_plans(
     all_params: &[TPipelineFragmentParams],
 ) -> Vec<TPipelineFragmentParams> {
+    // No merge: execute each fragment independently via local exchange.
+    // This preserves the FE's projection chain (division, CASE expressions,
+    // column ordering) which gets broken when EXCHANGE_NODEs are replaced
+    // with child plan nodes during merging (slot IDs disconnect across
+    // fragment boundaries). Local exchange uses in-process bRPC — the same
+    // path as multi-BE but with localhost as the target.
+    return all_params.to_vec();
+
+    // ---- Legacy merge code below (kept for reference) ----
+
     // Classify fragments.
+    #[allow(unreachable_code)]
     let mut leaf_fragments: Vec<&TPipelineFragmentParams> = Vec::new();
     let mut intermediate_fragments: Vec<TPipelineFragmentParams> = Vec::new();
     let mut exchange_root_fragments: Vec<TPipelineFragmentParams> = Vec::new();

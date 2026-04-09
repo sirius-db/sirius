@@ -391,43 +391,6 @@ impl DescriptorTable {
         self.slot_expressions.get(&slot_id)
     }
 
-    /// Get all captured slot expressions (for iteration during propagation).
-    pub fn get_all_slot_expressions(&self) -> &HashMap<i32, TExpr> {
-        &self.slot_expressions
-    }
-
-    /// Add a single slot expression (for propagation to pass-through slots).
-    pub fn add_slot_expression(&mut self, slot_id: i32, expr: TExpr) {
-        self.slot_expressions.insert(slot_id, expr);
-    }
-
-    /// Find a non-trivial (computed) expression at the given position in any tuple
-    /// with the given number of materialized slots. Returns (source_slot_id, expr).
-    pub fn find_nontrivial_expression_by_position(
-        &self,
-        position: usize,
-        tuple_len: usize,
-    ) -> Option<(i32, TExpr)> {
-        for (&sid, expr) in &self.slot_expressions {
-            if expr.nodes.len() <= 1 { continue; } // skip SLOT_REF passthrough
-            if let Ok(slot) = self.get_slot(sid) {
-                if let Ok(tuple) = self.get_tuple(slot.parent_tuple_id) {
-                    let mat: Vec<i32> = tuple.slot_ids.iter().copied()
-                        .filter(|&s| self.get_slot(s).map(|sl| sl.is_materialized).unwrap_or(false))
-                        .collect();
-                    if mat.len() == tuple_len {
-                        if let Some(pos) = mat.iter().position(|&s| s == sid) {
-                            if pos == position {
-                                return Some((sid, expr.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
     /// Set the flattened column names from the compiled child Rel.
     /// Uses interior mutability (RefCell) since translate_node takes &self.
     pub fn set_child_rel_column_names(&self, names: Vec<String>) {
