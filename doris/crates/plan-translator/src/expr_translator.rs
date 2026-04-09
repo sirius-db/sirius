@@ -165,13 +165,23 @@ fn translate_slot_ref(
     // Use None for row_tuples: scan projections resolve against their own table, not
     // the JOIN context. The expanded expression's SLOT_REFs use slot_table_index.
     if let Some(expr) = desc.get_slot_expression(slot_ref.slot_id) {
-        tracing::debug!(
-            slot_id = slot_ref.slot_id,
-            "SLOT_REF expanding via projection expression"
-        );
         let expr = expr.clone();
+        // Try expansion with None (scan projection context).
         let mut idx = 0;
-        return translate_expr_node(&expr.nodes, &mut idx, desc, registry, None);
+        match translate_expr_node(&expr.nodes, &mut idx, desc, registry, None) {
+            Ok(result) => return Ok(result),
+            Err(_) => {
+                // Scan context failed. For propagated AGG projections (division),
+                // the inner SLOT_REFs need the caller's row_tuples (AGG output scope).
+                if let Some(tuples) = row_tuples {
+                    let mut idx2 = 0;
+                    match translate_expr_node(&expr.nodes, &mut idx2, desc, registry, Some(tuples)) {
+                        Ok(result) => return Ok(result),
+                        Err(_) => {} // both failed; fall through to field ref
+                    }
+                }
+            }
+        }
     }
 
     let col_idx = if let Some(tuples) = row_tuples {

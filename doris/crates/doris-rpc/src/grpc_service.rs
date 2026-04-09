@@ -846,6 +846,37 @@ fn merge_fragment_plans(
                     merged_local.push(lp.clone());
                 }
             }
+            // Merge intermediate's desc_tbl into coordinator's so that slot/tuple
+            // descriptors from intermediate nodes (AGG projections, JOIN outputs)
+            // are accessible during plan translation.
+            if let Some(inter_desc) = &outermost.desc_tbl {
+                let coord_desc = params.desc_tbl.get_or_insert_with(|| {
+                    doris_thrift::descriptors::TDescriptorTable {
+                        slot_descriptors: None,
+                        tuple_descriptors: Vec::new(),
+                        table_descriptors: None,
+                    }
+                });
+                {
+                    let existing: std::collections::HashSet<i32> =
+                        coord_desc.tuple_descriptors.iter().map(|t| t.id).collect();
+                    for t in &inter_desc.tuple_descriptors {
+                        if !existing.contains(&t.id) {
+                            coord_desc.tuple_descriptors.push(t.clone());
+                        }
+                    }
+                }
+                if let Some(inter_slots) = &inter_desc.slot_descriptors {
+                    let coord_slots = coord_desc.slot_descriptors.get_or_insert_with(Vec::new);
+                    let existing: std::collections::HashSet<i32> =
+                        coord_slots.iter().map(|s| s.id).collect();
+                    for s in inter_slots {
+                        if !existing.contains(&s.id) {
+                            coord_slots.push(s.clone());
+                        }
+                    }
+                }
+            }
         }
 
         return exchange_root_fragments;
