@@ -36,9 +36,15 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 
   // Disable optimizers that produce DuckDB-internal functions Sirius can't handle.
   // The post-hook re-enables them so non-GPU queries aren't affected.
+  // Must match the set disabled by gpu_execution()'s PrepareConnection to ensure
+  // identical logical plans between the transparent and explicit GPU paths.
   auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
   disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
   disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+  // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+  // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+  // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources.
+  disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
 }
 
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
@@ -55,6 +61,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
   disabled.erase(duckdb::OptimizerType::IN_CLAUSE);
   disabled.erase(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+  disabled.erase(duckdb::OptimizerType::STATISTICS_PROPAGATION);
 
   // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this
   // copy — that's the single source of truth for GPU support. If the plan contains
