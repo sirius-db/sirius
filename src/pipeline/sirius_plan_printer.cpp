@@ -432,6 +432,10 @@ std::string sirius_plan_printer::render_dag() const
   // The inner width is node_render_width - 2 (minus the two vertical border chars)
   size_t inner_width = node_render_width - 2;
 
+  // The connector center must match the ┬ position in render_bottom_border:
+  //   └ (1 char) + left_side horizontal chars, where left_side = (inner_width - 1) / 2
+  size_t connector_center = 1 + (inner_width - 1) / 2;
+
   // Step 4: Render row by row
   std::ostringstream ss;
   ss << "=== Query Plan DAG ===\n";
@@ -537,7 +541,7 @@ std::string sirius_plan_printer::render_dag() const
 
           // Render using ostringstream for proper UTF-8
           for (size_t x = 0; x < tree.width; x++) {
-            size_t center = node_render_width / 2;
+            size_t center = connector_center;
             if (branch_cols.count(x)) {
               // This column is part of a branch line
               std::string col_str(node_render_width, ' ');
@@ -615,7 +619,7 @@ std::string sirius_plan_printer::render_dag() const
           // Render vertical drops from each junction to child boxes
           for (size_t x = 0; x < tree.width; x++) {
             if (tree.grid[y + 1][x].has_value()) {
-              size_t center = node_render_width / 2;
+              size_t center = connector_center;
               std::string left_pad(center, ' ');
               std::string right_pad_str;
               if (center + 1 < node_render_width) {
@@ -631,7 +635,7 @@ std::string sirius_plan_printer::render_dag() const
           // No multi-child parents — simple vertical connectors
           for (size_t x = 0; x < tree.width; x++) {
             if (tree.grid[y + 1][x].has_value()) {
-              size_t center = node_render_width / 2;
+              size_t center = connector_center;
               std::string left_pad(center, ' ');
               std::string right_pad_str;
               if (center + 1 < node_render_width) {
