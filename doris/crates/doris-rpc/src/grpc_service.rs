@@ -1568,12 +1568,20 @@ fn extract_exchange_destinations(
     let fragment = params.fragment.as_ref()?;
     let output_sink = fragment.output_sink.as_ref()?;
 
-    if output_sink.type_ != TDataSinkType::DATA_STREAM_SINK {
+    // Handle both DATA_STREAM_SINK and MULTI_CAST_DATA_STREAM_SINK.
+    // MULTI_CAST is used by CTE queries (Q15) to share a scan across multiple consumers.
+    let (stream_sink, dest_node_id) = if output_sink.type_ == TDataSinkType::DATA_STREAM_SINK {
+        let ss = output_sink.stream_sink.as_ref()?;
+        (ss, ss.dest_node_id)
+    } else if output_sink.type_ == TDataSinkType::MULTI_CAST_DATA_STREAM_SINK {
+        // Multicast: use the first sink's destination (all sinks share the same data).
+        let mc = output_sink.multi_cast_stream_sink.as_ref()?;
+        let sinks = mc.sinks.as_ref()?;
+        let first = sinks.first()?;
+        (first, first.dest_node_id)
+    } else {
         return None;
-    }
-
-    let stream_sink = output_sink.stream_sink.as_ref()?;
-    let dest_node_id = stream_sink.dest_node_id;
+    };
 
     let destinations = params.destinations.as_ref()?;
     if destinations.is_empty() {
@@ -1757,13 +1765,27 @@ impl PBackendService for PBackendServiceHandler {
 
         // Process each merged fragment.
         for params in &merged_params {
-            // Primary key: query_id (FE uses this with enableParallelResultSink=true).
-            let finst_id = FinstId {
-                hi: params.query_id.hi,
-                lo: params.query_id.lo,
+            // Primary key: fragment_instance_id from local_params[0].
+            // Each fragment has its own instance ID. The FE calls fetch_data
+            // with the result-sink fragment's instance ID.
+            let finst_id = params
+                .local_params
+                .as_ref()
+                .and_then(|lp| lp.first())
+                .map(|p| FinstId {
+                    hi: p.fragment_instance_id.hi,
+                    lo: p.fragment_instance_id.lo,
+                })
+                .unwrap_or(FinstId {
+                    hi: params.query_id.hi,
+                    lo: params.query_id.lo,
+                });
+            // Secondary key: query_id as alias (for backward compat).
+            let fragment_finst_id = if finst_id != query_id_key {
+                Some(query_id_key)
+            } else {
+                None
             };
-            // Secondary key: result-sink fragment's instance ID, captured before merge.
-            let fragment_finst_id = result_sink_finst_id;
 
             // Check for unresolved exchange nodes (receive data from other BEs).
             let exchange_node_ids = has_unresolved_exchanges(params);
@@ -2109,19 +2131,52 @@ impl PBackendService for PBackendServiceHandler {
                             })
                             .collect();
 
+                        // Build column names from the fragment's descriptor table
+                        // (proper names), falling back to PBlock metadata names
+                        // (sanitized if they contain special chars).
                         let column_names: Vec<String> = {
-                            let raw: Vec<String> = keep_indices.iter().enumerate().map(|(out_idx, &i)| {
-                                let name = &col_info[i].0;
-                                // Sanitize: column names with special chars (parens, quotes,
-                                // hash signs) break SQL CREATE TABLE and Substrait NamedTable.
-                                // Use positional alias for any non-identifier name.
-                                if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                                    format!("col_{}", out_idx)
+                            // Try descriptor table first: the exchange node's output
+                            // tuple has clean column names that match the FE's expectations.
+                            let desc_names: Option<Vec<String>> = params.desc_tbl.as_ref().and_then(|dt| {
+                                // Find the exchange node by matching the table name suffix.
+                                // Table name format: __EXCH_{hex}_{node_id}
+                                let node_id: Option<i32> = table_name.rsplit('_').next()
+                                    .and_then(|s| s.parse().ok());
+                                let exch_node = node_id.and_then(|nid| {
+                                    params.fragment.as_ref()?.plan.as_ref()?.nodes.iter()
+                                        .find(|n| n.node_id == nid)
+                                });
+                                if let Some(node) = exch_node {
+                                    let mut names = Vec::new();
+                                    for &tid in &node.row_tuples {
+                                        if let Some(slots) = dt.slot_descriptors.as_ref() {
+                                            for sd in slots {
+                                                if sd.parent == tid && sd.is_materialized {
+                                                    names.push(sd.col_name.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if names.len() == keep_indices.len() {
+                                        Some(names)
+                                    } else {
+                                        None // mismatch, fall back
+                                    }
                                 } else {
-                                    name.clone()
+                                    None
                                 }
-                            }).collect();
-                            // Deduplicate (self-joins produce duplicate column names).
+                            });
+
+                            let raw = desc_names.unwrap_or_else(|| {
+                                keep_indices.iter().enumerate().map(|(out_idx, &i)| {
+                                    let name = &col_info[i].0;
+                                    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                                        format!("col_{}", out_idx)
+                                    } else {
+                                        name.clone()
+                                    }
+                                }).collect()
+                            });
                             dedup_column_names(raw)
                         };
                         let column_types_sql: Vec<String> =
