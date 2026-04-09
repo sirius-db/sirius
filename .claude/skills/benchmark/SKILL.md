@@ -166,8 +166,6 @@ export SIRIUS_CONFIG_FILE=/path/to/config.cfg
 ./test/tpch_performance/run_tpch_parquet.sh --iterations 5 --parquet-dir /data/tpch sirius 100 $(seq 1 22)
 ```
 
-**SF>=1000 cache note:** At SF>=1000, queries 1, 7, 9, 10, 17, 18, 19, 21 automatically use `scan_cache_level = 'table_host'` (host memory caching). Override with `--cache-level`.
-
 ---
 
 # TPC-DS Benchmarks
@@ -287,7 +285,6 @@ To discover which TPC-DS queries are GPU-compatible:
 - **Ask the user** for any paths you don't know. Do NOT assume paths.
 - **Ask which benchmark** (TPC-H or TPC-DS) if not specified.
 - **For TPC-DS**, ask which query set: GPU-compatible only (queries that fully execute on GPU with correct results) or all 99 queries (some may fall back to CPU or error).
+- **Ask about data**: Does the dataset already exist? If yes, ask for the parquet directory path. If no, confirm the user wants to generate it before proceeding — data generation can take significant time and disk space at large scale factors. Do NOT auto-generate without asking.
 - Ensure the DuckDB binary is built: `pixi run -e clang make release`
 - For Super Sirius: ensure `SIRIUS_CONFIG_FILE` is set
-- For TPC-H: data is auto-generated if missing; query files are pre-existing in `tpch_queries/`
-- For TPC-DS: query files must exist in `test/tpcds_performance/queries/` — run `generate_tpcds_data.sh` first
