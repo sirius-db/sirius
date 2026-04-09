@@ -469,8 +469,9 @@ void parquet_scan_task::execute(rmm::cuda_stream_view stream)
   // Record memory metrics for future reservation estimates.
   // Parquet scan tasks don't have peak memory tracking, so use output size as proxy.
   if (auto output_data = compute_task(stream); output_data) {
-    std::size_t output_bytes = 0;
-    for (const auto& batch : output_data->get_data_batches()) {
+    auto& pipelineable_output_data = dynamic_cast<op::pipelineable_operator_data&>(*output_data);
+    std::size_t output_bytes       = 0;
+    for (const auto& batch : pipelineable_output_data.get_data_batches()) {
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
     }
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
@@ -593,7 +594,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                       std::move(parquet_representation));
     }
   }
-  auto result = std::make_unique<op::operator_data>(
+  auto result = std::make_unique<op::pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
 
   auto const task_end = std::chrono::high_resolution_clock::now();
@@ -614,7 +615,8 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
 void parquet_scan_task::publish_output(op::operator_data& output_data,
                                        rmm::cuda_stream_view /* stream */)
 {
-  for (auto& batch : output_data.get_data_batches()) {
+  auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
+  for (auto& batch : pipelineable_output.release_data_batches()) {
     _data_repo->add_data_batch(std::move(batch));
   }
 }
