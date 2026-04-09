@@ -108,6 +108,7 @@ void place_node(render_tree& tree,
 
   // Build content lines with operator IDs and detail annotations (D-01, D-02, D-03, D-04)
   auto source = pipeline.get_source();
+  auto sink = pipeline.get_sink();
   if (source) {
     node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*source));
     for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*source)) {
@@ -116,12 +117,13 @@ void place_node(render_tree& tree,
   }
   auto ops = pipeline.get_operators();
   for (auto& op_ref : ops) {
+    if (source && &op_ref.get() == source.get()) { continue; }
+    if (sink && &op_ref.get() == sink.get()) { continue; }
     node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(op_ref.get()));
     for (auto& detail : sirius_plan_printer::get_operator_detail_lines(op_ref.get())) {
       node.content_lines.push_back(detail);
     }
   }
-  auto sink = pipeline.get_sink();
   if (sink && sink != source) {
     node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*sink));
     for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*sink)) {
@@ -282,12 +284,14 @@ std::string sirius_plan_printer::build_operator_chain(const sirius_pipeline& pip
 {
   std::ostringstream ss;
   auto source = pipeline.get_source();
+  auto sink = pipeline.get_sink();
   if (source) { ss << format_operator_with_id(*source); }
   auto ops = pipeline.get_operators();
   for (auto& op_ref : ops) {
+    if (source && &op_ref.get() == source.get()) { continue; }
+    if (sink && &op_ref.get() == sink.get()) { continue; }
     ss << "\n" << format_operator_with_id(op_ref.get());
   }
-  auto sink = pipeline.get_sink();
   if (sink && sink != source) { ss << "\n" << format_operator_with_id(*sink); }
   return ss.str();
 }
@@ -318,12 +322,14 @@ std::string sirius_plan_printer::render_pipelines() const
 
     // Build arrow-separated operator chain with IDs (D-04, D-05)
     auto source = pipeline->get_source();
+    auto sink = pipeline->get_sink();
     if (source) { ss << format_operator_with_id(*source); }
     auto ops = pipeline->get_operators();
     for (auto& op_ref : ops) {
+      if (source && &op_ref.get() == source.get()) { continue; }
+      if (sink && &op_ref.get() == sink.get()) { continue; }
       ss << " -> " << format_operator_with_id(op_ref.get());
     }
-    auto sink = pipeline->get_sink();
     if (sink && sink != source) { ss << " -> " << format_operator_with_id(*sink); }
     ss << "\n";
 
