@@ -102,20 +102,15 @@ static void from_yaml(const YAML::Node& node, op::scan::scan_executor_config& op
   r.reject_unknown();
 }
 
-// ================ Internal config structs ================= //
-
-template <>
-struct sirius::config::custom_config_registrar<sirius::exec::downgrade_executor_config> {
-  static void config(sirius::config::configuration_setter& setter,
-                     sirius::exec::downgrade_executor_config& opt)
-  {
-    setter.add_config(
-      "num_threads", opt.thread_pool.num_threads, sirius::config::greater_than<size_t>{0});
-    setter.add_config("thread_name_prefix", opt.thread_pool.thread_name_prefix);
-    setter.add_config("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-    setter.add_config("monitor_period_ms", opt.monitor_period_ms);
-  }
-};
+static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& opt)
+{
+  yaml::reader r(node, "downgrade");
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
+  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("monitor_period_ms", opt.monitor_period_ms);
+  r.reject_unknown();
+}
 
 namespace {
 
