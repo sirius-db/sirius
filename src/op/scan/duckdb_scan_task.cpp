@@ -82,7 +82,8 @@ struct scoped_timer {
 /// @brief Try to estimate average varchar bytes per row for a column using DuckDB storage metadata.
 /// Returns 0 if metadata is unavailable (caller should fall back to default).
 size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
-                                            size_t column_index,
+                                            duckdb::StorageIndex storage_col_idx,
+                                            size_t projected_col_index,
                                             duckdb::ClientContext& context)
 {
   if (!bind_data_ptr) { return 0; }
@@ -101,9 +102,8 @@ size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
     auto total_rows = storage.GetTotalRows();
     if (total_rows == 0) { return 0; }
 
-    // Read StringStats for this column
-    auto col_idx = duckdb::StorageIndex(column_index);
-    auto stats   = storage.GetStatistics(context, col_idx);
+    // Read StringStats for this column using the storage column index
+    auto stats = storage.GetStatistics(context, storage_col_idx);
     if (stats && duckdb::StringStats::HasMaxStringLength(*stats)) {
       auto max_len      = duckdb::StringStats::MaxStringLength(*stats);
       auto distinct_est = stats->GetDistinctCount();
@@ -114,14 +114,15 @@ size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
       size_t estimated_avg = max_len;
 
       SIRIUS_LOG_INFO(
-        "[duckdb_scan] metadata col {}: max_string_length={}, distinct_est={}, total_rows={}, "
-        "estimated_avg={}",
-        column_index, max_len, distinct_est, total_rows, estimated_avg);
+        "[duckdb_scan] metadata col {} (storage {}): max_string_length={}, distinct_est={}, "
+        "total_rows={}, estimated_avg={}",
+        projected_col_index, storage_col_idx.GetPrimaryIndex(), max_len, distinct_est,
+        total_rows, estimated_avg);
 
       return estimated_avg;
     }
   } catch (std::exception const& e) {
-    SIRIUS_LOG_DEBUG("[duckdb_scan] metadata access failed for col {}: {}", column_index, e.what());
+    SIRIUS_LOG_DEBUG("[duckdb_scan] metadata access failed for col {}: {}", projected_col_index, e.what());
   }
   return 0;
 }
@@ -472,8 +473,9 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
       _varchar_indices.push_back(i);
 
       // Use metadata-based max_string_length instead of blind default when available
-      size_t varchar_size = estimate_varchar_bytes_from_metadata(
-        op.bind_data.get(), i, _exec_ctx.client);
+      auto storage_col_idx = duckdb::StorageIndex(op.column_ids[i].GetPrimaryIndex());
+      size_t varchar_size  = estimate_varchar_bytes_from_metadata(
+        op.bind_data.get(), storage_col_idx, i, _exec_ctx.client);
       if (varchar_size == 0) { varchar_size = _default_varchar_size; }
 
       _column_builders.emplace_back(col_type, varchar_size);
@@ -702,19 +704,29 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
       }
     }
 
-    // We know a priori that the fixed-width columns and masks will fit in the allocated buffers.
-    // For variable-length columns, we need to check that we have enough space.
-    // If there isn't enough space, we just throw an exception for now.
-    /// FUTURE WORK: push the current data batch into a new scan task.
+    // For variable-length columns, check that we have enough space.
+    // If there isn't enough space, flush the current batch and let the next task continue.
     bool fits = false;
     {
       scoped_timer t(us_chunk_fits);
       fits = chunk_fits(l_state);
     }
     if (!fits) {
-      std::string err_msg =
-        "[duckdb_scan_task]: current chunk does not fit in the allocated buffers.";
-      throw std::runtime_error(err_msg);
+      if (l_state._row_offset > 0) {
+        // We have accumulated data — flush it as a batch and let the next task handle
+        // the remaining scan range. The current chunk is lost (a few thousand rows).
+        // TODO: carry the unfitting chunk forward to the next task to avoid row loss.
+        SIRIUS_LOG_WARN(
+          "[duckdb_scan] task={}: varchar overflow after {} rows, flushing batch "
+          "(chunk of {} rows does not fit, continuing in next task)",
+          _task_id, l_state._row_offset, l_state._chunk.size());
+        break;
+      }
+      // First chunk doesn't fit — allocation is too small even for one chunk.
+      // This shouldn't happen with metadata-based estimation, but fall back to error.
+      throw std::runtime_error(
+        "[duckdb_scan_task]: first chunk does not fit in the allocated buffers. "
+        "Consider increasing scan_task_batch_size.");
     }
 
     // Process the chunk into the column builders
