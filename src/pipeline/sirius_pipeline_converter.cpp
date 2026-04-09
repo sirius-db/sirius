@@ -188,8 +188,8 @@ void sirius_pipeline_converter::split_table_scan_source(
 void sirius_pipeline_converter::split_intermediate_joins(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
-  duckdb::vector<duckdb::idx_t> join_positions;
-  for (duckdb::idx_t op_idx = 0; op_idx < current_pipeline->operators.size(); op_idx++) {
+  duckdb::vector<std::size_t> join_positions;
+  for (std::size_t op_idx = 0; op_idx < current_pipeline->operators.size(); op_idx++) {
     if (current_pipeline->operators[op_idx].get().type ==
           op::SiriusPhysicalOperatorType::HASH_JOIN ||
         current_pipeline->operators[op_idx].get().type ==
@@ -204,7 +204,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
   op::sirius_physical_concat* prev_concat_ptr           = nullptr;
 
   for (size_t hj_idx = 0; hj_idx < join_positions.size(); hj_idx++) {
-    duckdb::idx_t join_pos = join_positions[hj_idx];
+    std::size_t join_pos = join_positions[hj_idx];
     duckdb::unique_ptr<op::sirius_physical_concat> concat_op;
 
     // Create a PARTITION and CONCAT operator
@@ -247,7 +247,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
       if (hj_idx == 0) {
         // Move operators from current pipeline to new pipeline except for the last operator
         // before the join
-        for (duckdb::idx_t j = 0; j < join_pos - 1; j++) {
+        for (std::size_t j = 0; j < join_pos - 1; j++) {
           new_pipeline->operators.push_back(current_pipeline->operators[j]);
         }
         // set the sink to the operator before the join
@@ -256,7 +256,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
       } else {
         // Move operators from current pipeline to new pipeline except for the last operator
         // before the join
-        for (duckdb::idx_t j = join_positions[hj_idx - 1]; j < join_pos - 1; j++) {
+        for (std::size_t j = join_positions[hj_idx - 1]; j < join_pos - 1; j++) {
           new_pipeline->operators.push_back(current_pipeline->operators[j]);
         }
         // set the sink to the operator before the join
@@ -459,8 +459,8 @@ void sirius_pipeline_converter::split_order_by_sink(
     auto& child_types = current_pipeline->operators.size() > 0
                           ? current_pipeline->operators.back().get().types
                           : current_pipeline->source->types;
-    duckdb::vector<duckdb::idx_t> identity_proj;
-    for (duckdb::idx_t col_idx = 0; col_idx < child_types.size(); col_idx++) {
+    duckdb::vector<std::size_t> identity_proj;
+    for (std::size_t col_idx = 0; col_idx < child_types.size(); col_idx++) {
       identity_proj.push_back(col_idx);
     }
     order_ptr->projections = std::move(identity_proj);
@@ -504,7 +504,7 @@ void sirius_pipeline_converter::split_order_by_sink(
   {
     bool is_identity = (original_projections.size() == order_ptr->types.size());
     if (is_identity) {
-      for (duckdb::idx_t proj_idx = 0; proj_idx < original_projections.size(); proj_idx++) {
+      for (std::size_t proj_idx = 0; proj_idx < original_projections.size(); proj_idx++) {
         if (original_projections[proj_idx] != proj_idx) {
           is_identity = false;
           break;

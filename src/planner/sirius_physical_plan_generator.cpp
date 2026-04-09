@@ -40,7 +40,7 @@ duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation
 {
   if (op.is_source()) { return op.source_order(); }
 
-  duckdb::idx_t child_idx = 0;
+  std::size_t child_idx = 0;
   for (auto& child : op.children) {
     // Do not take the materialization phase of physical CTEs into account
     if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE && child_idx == 0) {

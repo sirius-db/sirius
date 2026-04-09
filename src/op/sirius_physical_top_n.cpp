@@ -44,8 +44,8 @@ namespace {
 std::unique_ptr<cudf::table> compute_top_n_table(
   cudf::table_view input,
   duckdb::vector<duckdb::BoundOrderByNode> const& orders,
-  duckdb::idx_t limit,
-  duckdb::idx_t offset,
+  std::size_t limit,
+  std::size_t offset,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref memory_resource)
 {
@@ -131,10 +131,10 @@ std::unique_ptr<cudf::table> compute_top_n_table(
 sirius_physical_top_n::sirius_physical_top_n(
   duckdb::vector<duckdb::LogicalType> types_p,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
-  duckdb::idx_t limit,
-  duckdb::idx_t offset,
+  std::size_t limit,
+  std::size_t offset,
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
@@ -205,10 +205,10 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(
   duckdb::vector<duckdb::LogicalType> types_p,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
-  duckdb::idx_t limit,
-  duckdb::idx_t offset,
+  std::size_t limit,
+  std::size_t offset,
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),

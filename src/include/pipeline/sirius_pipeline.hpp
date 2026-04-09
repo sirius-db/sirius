@@ -47,7 +47,7 @@ class sirius_meta_pipeline;
 class sirius_pipeline_build_state {
  public:
   //! How much to increment batch indexes when multiple pipelines share the same source
-  constexpr static duckdb::idx_t BATCH_INCREMENT = 10000000000000;
+  constexpr static std::size_t BATCH_INCREMENT = 10000000000000;
 
  public:
   //! Duplicate eliminated join scan dependencies
@@ -61,7 +61,7 @@ class sirius_pipeline_build_state {
   void set_pipeline_source(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
   void set_pipeline_sink(sirius_pipeline& pipeline,
                          duckdb::optional_ptr<op::sirius_physical_operator> op,
-                         duckdb::idx_t sink_pipeline_count);
+                         std::size_t sink_pipeline_count);
   void set_pipeline_operators(
     sirius_pipeline& pipeline,
     duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators);
@@ -104,7 +104,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   // void print_dependencies() const;
 
   //! Returns query progress
-  // bool get_progress(double &current_percentage, duckdb::idx_t &estimated_cardinality);
+  // bool get_progress(double &current_percentage, std::size_t &estimated_cardinality);
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
   // duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_all_operators();
@@ -140,10 +140,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   bool is_order_dependent() const;
 
   //! Registers a new batch index for a pipeline executor - returns the current minimum batch index
-  duckdb::idx_t register_new_batch_index();
+  std::size_t register_new_batch_index();
 
   //! Updates the batch index of a pipeline (and returns the new minimum batch index)
-  duckdb::idx_t update_batch_index(duckdb::idx_t old_index, duckdb::idx_t new_index);
+  std::size_t update_batch_index(std::size_t old_index, std::size_t new_index);
 
   //! The dependencies of this pipeline
   // duckdb::vector<std::weak_ptr<sirius_pipeline>> dependencies;
@@ -178,17 +178,17 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   duckdb::vector<duckdb::weak_ptr<sirius_pipeline>> parents;
 
   //! The base batch index of this pipeline
-  duckdb::idx_t base_batch_index = 0;
+  std::size_t base_batch_index = 0;
   //! Lock for accessing the set of batch indexes
   std::mutex batch_lock;
   //! The set of batch indexes that are currently being processed
   //! Despite batch indexes being unique - this is a multiset
   //! The reason is that when we start a new pipeline we insert the current minimum batch index as a
   //! placeholder Which leads to duplicate entries in the set of active batch indexes
-  std::multiset<duckdb::idx_t> batch_indexes;
+  std::multiset<std::size_t> batch_indexes;
 
   void schedule_sequential_task(duckdb::shared_ptr<duckdb::Event>& event);
-  bool launch_scan_tasks(duckdb::shared_ptr<duckdb::Event>& event, duckdb::idx_t max_threads);
+  bool launch_scan_tasks(duckdb::shared_ptr<duckdb::Event>& event, std::size_t max_threads);
 
   bool schedule_parallel(duckdb::shared_ptr<duckdb::Event>& event);
 

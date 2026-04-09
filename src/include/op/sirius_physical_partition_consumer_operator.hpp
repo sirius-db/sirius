@@ -27,7 +27,7 @@ class sirius_physical_partition_consumer_operator : public sirius_physical_opera
  public:
   sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType type,
                                               duckdb::vector<duckdb::LogicalType> types,
-                                              duckdb::idx_t estimated_cardinality)
+                                              std::size_t estimated_cardinality)
     : sirius_physical_operator(type, std::move(types), estimated_cardinality)
   {
   }
@@ -40,7 +40,7 @@ class sirius_physical_partition_consumer_operator : public sirius_physical_opera
   //! @param partition_idx The partition index
   virtual void push_data_batch_partitioned(std::string_view port_id,
                                            std::shared_ptr<::cucascade::data_batch> batch,
-                                           duckdb::idx_t partition_idx);
+                                           std::size_t partition_idx);
 };
 
 }  // namespace op

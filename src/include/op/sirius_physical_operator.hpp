@@ -172,7 +172,7 @@ class sirius_physical_operator {
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
                            duckdb::vector<duckdb::LogicalType> types,
-                           duckdb::idx_t estimated_cardinality)
+                           std::size_t estimated_cardinality)
     : type(type),
       types(std::move(types)),
       estimated_cardinality(estimated_cardinality),
@@ -189,7 +189,7 @@ class sirius_physical_operator {
   //! The types returned by this physical operator
   duckdb::vector<duckdb::LogicalType> types;
   //! The estimated cardinality of this physical operator
-  duckdb::idx_t estimated_cardinality;
+  std::size_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
   size_t operator_id;
 

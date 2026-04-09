@@ -35,7 +35,7 @@ struct pipeline_conversion_result {
   //! Ownership container for operators created during splitting (PARTITION, CONCAT, MERGE, etc.)
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> pipeline_breakers;
   //! Number of meta-pipelines (used for progress tracking)
-  duckdb::idx_t meta_pipeline_count;
+  std::size_t meta_pipeline_count;
 };
 
 //! Converts DuckDB-style meta-pipelines into Sirius execution-ready pipelines.
@@ -95,7 +95,7 @@ class sirius_pipeline_converter {
   // Internal state built during convert(), moved into result
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> pipeline_breakers_;
-  duckdb::idx_t meta_pipeline_count_ = 0;
+  std::size_t meta_pipeline_count_ = 0;
 };
 
 }  // namespace pipeline

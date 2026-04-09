@@ -33,7 +33,7 @@ namespace sirius::planner {
 
 static uint32_t required_bits_for_value(uint32_t n)
 {
-  duckdb::idx_t required_bits = 0;
+  std::size_t required_bits = 0;
   while (n > 0) {
     n >>= 1;
     required_bits++;
@@ -123,11 +123,11 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
 
 static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
                                            duckdb::LogicalAggregate& op,
-                                           duckdb::vector<duckdb::idx_t>& bits_per_group)
+                                           duckdb::vector<std::size_t>& bits_per_group)
 {
   if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) { return false; }
-  duckdb::idx_t perfect_hash_bits = 0;
-  for (duckdb::idx_t group_idx = 0; group_idx < op.groups.size(); group_idx++) {
+  std::size_t perfect_hash_bits = 0;
+  for (std::size_t group_idx = 0; group_idx < op.groups.size(); group_idx++) {
     auto& group = op.groups[group_idx];
     auto& stats = op.group_stats[group_idx];
 
@@ -198,8 +198,7 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
 
     range += 2;
     // figure out how many bits we need
-    duckdb::idx_t required_bits =
-      required_bits_for_value(duckdb::UnsafeNumericCast<uint32_t>(range));
+    std::size_t required_bits = required_bits_for_value(duckdb::UnsafeNumericCast<uint32_t>(range));
     bits_per_group.push_back(required_bits);
     perfect_hash_bits += required_bits;
     // check if we have exceeded the bits for the hash
@@ -286,7 +285,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   // groups! create a GROUP BY aggregator
   // use a partitioned or perfect hash aggregate if possible
   duckdb::vector<duckdb::column_t> partition_columns;
-  duckdb::vector<duckdb::idx_t> required_bits;
+  duckdb::vector<std::size_t> required_bits;
   if (can_use_simple_aggregation &&
       can_use_partitioned_aggregate(context, op, *plan, partition_columns)) {
     // auto &group_by =

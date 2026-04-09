@@ -26,8 +26,8 @@ namespace op {
 
 sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
                                              duckdb::vector<duckdb::BoundOrderByNode> orders,
-                                             duckdb::vector<duckdb::idx_t> projections_p,
-                                             duckdb::idx_t estimated_cardinality,
+                                             duckdb::vector<std::size_t> projections_p,
+                                             std::size_t estimated_cardinality,
                                              bool is_index_sort_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),

@@ -335,7 +335,7 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
     }
   }
 
-  chunk.SetCardinality(static_cast<duckdb::idx_t>(count));
+  chunk.SetCardinality(static_cast<std::size_t>(count));
   _row_offset += count;
 
   return true;

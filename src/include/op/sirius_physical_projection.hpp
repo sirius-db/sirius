@@ -29,7 +29,7 @@ class sirius_physical_projection : public sirius_physical_operator {
  public:
   sirius_physical_projection(duckdb::vector<duckdb::LogicalType> types,
                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-                             duckdb::idx_t estimated_cardinality);
+                             std::size_t estimated_cardinality);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;

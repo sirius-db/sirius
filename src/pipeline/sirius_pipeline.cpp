@@ -182,15 +182,15 @@ void sirius_pipeline::clear_source()
   batch_indexes.clear();
 }
 
-duckdb::idx_t sirius_pipeline::register_new_batch_index()
+std::size_t sirius_pipeline::register_new_batch_index()
 {
   std::lock_guard<std::mutex> l(batch_lock);
-  duckdb::idx_t minimum = batch_indexes.empty() ? base_batch_index : *batch_indexes.begin();
+  std::size_t minimum = batch_indexes.empty() ? base_batch_index : *batch_indexes.begin();
   batch_indexes.insert(minimum);
   return minimum;
 }
 
-duckdb::idx_t sirius_pipeline::update_batch_index(duckdb::idx_t old_index, duckdb::idx_t new_index)
+std::size_t sirius_pipeline::update_batch_index(std::size_t old_index, std::size_t new_index)
 {
   std::lock_guard<std::mutex> l(batch_lock);
   if (new_index < *batch_indexes.begin()) {
@@ -222,7 +222,7 @@ void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline,
 void sirius_pipeline_build_state::set_pipeline_sink(
   sirius_pipeline& pipeline,
   duckdb::optional_ptr<op::sirius_physical_operator> op,
-  duckdb::idx_t sink_pipeline_count)
+  std::size_t sink_pipeline_count)
 {
   pipeline.sink = op;
   if (pipeline.sink)

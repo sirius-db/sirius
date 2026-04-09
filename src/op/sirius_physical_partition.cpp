@@ -33,7 +33,7 @@ namespace op {
 
 namespace {
 
-std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& expr)
+std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& expr)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
     return expr.Cast<duckdb::BoundReferenceExpression>().index;
@@ -50,7 +50,7 @@ std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& e
 }  // namespace
 
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
-                                                     duckdb::idx_t estimated_cardinality,
+                                                     std::size_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build,
                                                      uint64_t hash_partition_bytes)
@@ -76,15 +76,15 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _hash_join_op      = op;  // set the hash join operator pointer for later use
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
-    for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
+    for (std::size_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
       auto& condition = hash_join_op.conditions[cond_idx];
       if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
           condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
         continue;
       }
-      std::optional<duckdb::idx_t> left_index =
+      std::optional<std::size_t> left_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
-      std::optional<duckdb::idx_t> right_index =
+      std::optional<std::size_t> right_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
       if (left_index.has_value() && right_index.has_value()) {
         // Determine if a type cast is needed for hash alignment.
@@ -116,7 +116,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _partition_keys            = grouped_aggregate_op.get_output_grouping_indices();
 
     // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate
-    // operator which may be what we want to use when we care about grouping sets for (duckdb::idx_t
+    // operator which may be what we want to use when we care about grouping sets for (std::size_t
     // i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
     //   auto& grouping = grouped_aggregate_op.groupings[i];
     //   for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {

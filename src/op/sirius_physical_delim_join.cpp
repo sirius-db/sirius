@@ -46,7 +46,7 @@ sirius_physical_delim_join::sirius_physical_delim_join(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::unique_ptr<sirius_physical_operator> original_join,
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::optional_idx delim_idx)
   : sirius_physical_operator(type, std::move(types), estimated_cardinality),
     join(std::move(original_join)),
@@ -60,7 +60,7 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::unique_ptr<sirius_physical_operator> original_join,
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::optional_idx delim_idx)
   : sirius_physical_delim_join(SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN,
                                std::move(types),
@@ -80,7 +80,7 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::unique_ptr<sirius_physical_operator> original_join,
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::optional_idx delim_idx)
   : sirius_physical_delim_join(SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
                                std::move(types),
