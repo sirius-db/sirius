@@ -69,7 +69,7 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
   while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
     try {
       auto& registry = sirius::converter_registry::get();
-      switch (requested_memory_space->get_tier()) {
+      switch (target_space->get_tier()) {
         case cucascade::memory::Tier::GPU: {
           auto prev_state = batch->get_state();
           if (!batch->try_to_lock_for_in_transit()) {
@@ -84,8 +84,7 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
             return std::nullopt;
           }
           try {
-            batch->convert_to<cucascade::gpu_table_representation>(
-              registry, requested_memory_space, stream);
+            batch->convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
           } catch (...) {
             batch->try_to_release_in_transit();
             throw;
@@ -100,8 +99,7 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
             return std::nullopt;
           }
           try {
-            batch->convert_to<cucascade::host_data_representation>(
-              registry, requested_memory_space, stream);
+            batch->convert_to<cucascade::host_data_representation>(registry, target_space, stream);
           } catch (...) {
             batch->try_to_release_in_transit();
             throw;
@@ -112,7 +110,7 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
         default: cancel_task_if_needed(); return std::nullopt;
       }
 
-      lock_result = batch->try_to_lock_for_processing(requested_memory_space->get_id());
+      lock_result = batch->try_to_lock_for_processing(target_space->get_id());
     } catch (...) {
       throw;
     }

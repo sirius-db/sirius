@@ -42,6 +42,10 @@ pipelineable_operator_data::prepare_for_processing(
   handles.reserve(_data_batches.size());
 
   for (const auto& batch : _data_batches) {
+    if (!batch) {
+      SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
+      return std::nullopt;
+    }
     std::optional<::cucascade::data_batch_processing_handle> handle;
     try {
       handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);

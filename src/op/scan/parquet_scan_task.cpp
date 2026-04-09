@@ -614,9 +614,10 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
 void parquet_scan_task::publish_output(op::operator_data& output_data,
                                        rmm::cuda_stream_view /* stream */)
 {
-  auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
-  for (auto& batch : pipelineable_output.get_data_batches()) {
-    _data_repo->add_data_batch(std::move(batch));
+  const auto& pipelineable_output =
+    dynamic_cast<const op::pipelineable_operator_data&>(output_data);
+  for (const auto& batch : pipelineable_output.get_data_batches()) {
+    _data_repo->add_data_batch(batch);
   }
 }
 
