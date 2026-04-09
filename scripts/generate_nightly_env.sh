@@ -10,14 +10,15 @@ TARGET_DIR="$REPO_ROOT/envs/nightly"
 mkdir -p "$TARGET_DIR"
 
 sed \
-  -e 's|channels = \["rapidsai", "conda-forge" \]|channels = ["rapidsai-nightly", "conda-forge"]|' \
+  -e 's|channels = \["rapidsai", "conda-forge"\]|channels = ["rapidsai-nightly", "conda-forge"]|' \
   -e 's|name = "sirius"|name = "sirius-nightly"|' \
   -e 's|libcudf = "[^"]*"|libcudf = "*"|' \
   -e 's|librmm = "[^"]*"|librmm = "*"|' \
   -e 's|"scripts/pixi_activate.sh"|"../../scripts/pixi_activate.sh"|' \
-  -e '/\[feature\.nightly-runner/d' \
-  -e '/^nightly-/d' \
+  -e 's|^cmd = .*|&\ncwd = "../.."|' \
   -e '/^# .*nightly cudf/d' \
+  -e '/\[feature\.nightly-runner/,/^$/d' \
+  -e '/^nightly-/d' \
   "$REPO_ROOT/pixi.toml" > "$TARGET_DIR/pixi.toml"
 
 echo "Generated $TARGET_DIR/pixi.toml"

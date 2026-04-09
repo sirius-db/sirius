@@ -1,7 +1,7 @@
-#!/usr/bin/env sh
-# Sourced by pixi during environment activation — must be POSIX-compatible.
+#!/usr/bin/env bash
+# Sourced by pixi during environment activation (requires bash for BASH_SOURCE).
 
-_root="${PIXI_PROJECT_ROOT:-.}"
+_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ -d "$_root/duckdb" ]; then
   # Remove stale symlink from dev branch (pointed to ../cmake/CMakePresets.json which
