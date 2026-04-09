@@ -122,10 +122,13 @@ TEMPLATE_TEST_CASE(
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs->get_data_batches().size() == 1);
-  auto output_table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                        .get_data_batches()[0]
+                        ->get_data()
+                        ->cast<gpu_table_representation>()
+                        .get_table();
   auto out_view    = output_table.view();
   auto host_vals   = copy_column_to_host<typename Traits::type>(out_view.column(1));
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
@@ -192,11 +195,14 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
-  REQUIRE(outputs->get_data_batches().size() == 1);
-  auto output_table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                        .get_data_batches()[0]
+                        ->get_data()
+                        ->cast<gpu_table_representation>()
+                        .get_table();
   auto out_view = output_table.view();
 
   // Verify all data passes through unchanged
@@ -264,11 +270,14 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
-  REQUIRE(outputs->get_data_batches().size() == 1);
-  auto output_table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                        .get_data_batches()[0]
+                        ->get_data()
+                        ->cast<gpu_table_representation>()
+                        .get_table();
   auto out_view = output_table.view();
 
   auto host_col0 = copy_column_to_host<int64_t>(out_view.column(0));
@@ -334,11 +343,14 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
-  REQUIRE(outputs->get_data_batches().size() == 1);
-  auto table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table();
   auto view = table.view();
   REQUIRE(view.num_columns() == 2);
   REQUIRE(view.num_rows() == 0);
@@ -404,11 +416,14 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
 
   // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
-  auto output_table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                        .get_data_batches()[0]
+                        ->get_data()
+                        ->cast<gpu_table_representation>()
+                        .get_table();
   auto out_view    = output_table.view();
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data   = copy_column_to_host<int32_t>(out_view.column(1));
@@ -508,11 +523,14 @@ TEST_CASE("parquet_scan with decimal filter does not set passthrough",
 
   // execute() should apply the filter (col0 > 3.00 keeps rows 5.00 and 7.00)
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
-  auto output_table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                        .get_data_batches()[0]
+                        ->get_data()
+                        ->cast<gpu_table_representation>()
+                        .get_table();
   auto out_view  = output_table.view();
   auto host_dec  = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data = copy_column_to_host<int32_t>(out_view.column(1));

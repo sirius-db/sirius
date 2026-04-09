@@ -153,7 +153,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator " +
                              std::to_string(this->get_operator_id()));
@@ -163,7 +164,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                              std::to_string(this->get_operator_id()));
   }
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
-    return std::make_unique<operator_data>(input_data);
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   auto input_batch = input_batches[0];
@@ -190,13 +191,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
-  return std::make_unique<operator_data>(partitioned_results);
+  return std::make_unique<pipelineable_operator_data>(partitioned_results);
 }
 
 void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::sink"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = pipelineable_input.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;
   for (auto& batch : input_batches) {

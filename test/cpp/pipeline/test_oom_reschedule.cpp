@@ -362,7 +362,7 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
       if (!request) { break; }
 
       auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
-        std::make_unique<sirius::op::operator_data>(
+        std::make_unique<sirius::op::pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{}));
       auto task = std::make_unique<oom_test_task>(
         static_cast<uint64_t>(dispatched.load(std::memory_order_relaxed)),
@@ -465,7 +465,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
 
       auto id          = static_cast<uint64_t>(dispatched.load(std::memory_order_relaxed));
       auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
-        std::make_unique<sirius::op::operator_data>(
+        std::make_unique<sirius::op::pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{}));
 
       std::unique_ptr<sirius::parallel::itask> task;

@@ -71,7 +71,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
                      all_batches.size(),
                      _current_partition_index - 1);
     if (all_batches.empty()) { return nullptr; }
-    return std::make_unique<operator_data>(all_batches);
+    return std::make_unique<pipelineable_operator_data>(all_batches);
   }
   return nullptr;
 }
@@ -80,7 +80,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   // Collect valid batches and find memory space
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
@@ -92,7 +93,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   }
 
   if (valid_batches.empty() || !space) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   // Helper lambda to apply final projection to a batch (removes sort-key-only columns)
@@ -114,7 +116,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   if (valid_batches.size() == 1) {
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
     outputs.push_back(apply_final_projection(valid_batches[0]));
-    return std::make_unique<operator_data>(outputs);
+    return std::make_unique<pipelineable_operator_data>(outputs);
   }
 
   // Build cudf order vectors from BoundOrderByNode
@@ -143,7 +145,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (merged_batch) { outputs.push_back(apply_final_projection(std::move(merged_batch))); }
-  return std::make_unique<operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
 }  // namespace op

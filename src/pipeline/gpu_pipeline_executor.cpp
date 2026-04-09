@@ -201,8 +201,10 @@ void gpu_pipeline_executor::manager_loop()
           // Operator outputs are in idle state; transition to task_created so
           // lock_or_prepare_batch() can lock them for the rescheduled task.
           auto intermediate_data = oom.release_intermediate_data();
-          if (intermediate_data) {
-            for (auto& batch : intermediate_data->get_data_batches()) {
+          auto* pipelineable_intermediate =
+            dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get());
+          if (pipelineable_intermediate) {
+            for (auto& batch : pipelineable_intermediate->get_data_batches()) {
               if (batch) { batch->try_to_create_task(); }
             }
           }

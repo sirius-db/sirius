@@ -86,16 +86,18 @@ TEST_CASE("sirius_physical_grouped_aggregate_merge grouped aggregates single dat
   auto input_table = std::make_unique<cudf::table>(expected_table->view());
   auto input_batch = sirius::make_data_batch(std::move(input_table), *space);
 
-  auto outputs =
-    grouped_aggregate_merger.execute(operator_data({std::move(input_batch)}), default_stream());
+  auto outputs = grouped_aggregate_merger.execute(
+    pipelineable_operator_data({std::move(input_batch)}), default_stream());
 
   // Verify we got one output batch
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
   // Compare output with expected using the validation utility
   // Dont Sort both tables before comparison since they should be identical
   bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
-    outputs->get_data_batches()[0], expected_table->view(), false);
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0],
+    expected_table->view(),
+    false);
   REQUIRE(tables_match);
 }
 
@@ -170,15 +172,19 @@ TEMPLATE_TEST_CASE(
     std::shared_ptr<data_batch> input_batch =
       sirius::make_data_batch(std::move(input_table), *space);
 
-    auto outputs = grouped_aggregator.execute(operator_data({input_batch}), default_stream());
+    auto outputs =
+      grouped_aggregator.execute(pipelineable_operator_data({input_batch}), default_stream());
 
     // Verify we got one output batch
-    REQUIRE(outputs->get_data_batches().size() == 1);
-    agg_outputs.push_back(outputs->get_data_batches()[0]);
+    REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() ==
+            1);
+    agg_outputs.push_back(
+      dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   }
 
-  auto outputs = grouped_aggregate_merger.execute(operator_data(agg_outputs), default_stream());
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto outputs =
+    grouped_aggregate_merger.execute(pipelineable_operator_data(agg_outputs), default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
   // need to cast the expected table column 4 (which is the count column) to int64_t since at the
   // merge stage, we end up doing a sum of int32_t which becomes an int64_t
@@ -200,7 +206,9 @@ TEMPLATE_TEST_CASE(
   // Compare output with expected using the validation utility
   // Sort both tables before comparison since aggregation order is not guaranteed
   bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
-    outputs->get_data_batches()[0], expected_table->view(), true);
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0],
+    expected_table->view(),
+    true);
   REQUIRE(tables_match);
 }
 
@@ -261,14 +269,18 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
   std::vector<std::shared_ptr<data_batch>> agg_outputs;
   for (auto& split_table : input_tables) {
     auto input_batch = sirius::make_data_batch(std::move(split_table), *space);
-    auto outputs     = grouped_aggregator.execute(operator_data({input_batch}), default_stream());
-    REQUIRE(outputs->get_data_batches().size() == 1);
-    agg_outputs.push_back(outputs->get_data_batches()[0]);
+    auto outputs =
+      grouped_aggregator.execute(pipelineable_operator_data({input_batch}), default_stream());
+    REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() ==
+            1);
+    agg_outputs.push_back(
+      dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   }
 
   // Run merge with AVG projection
-  auto outputs = grouped_aggregate_merger.execute(operator_data(agg_outputs), default_stream());
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto outputs =
+    grouped_aggregate_merger.execute(pipelineable_operator_data(agg_outputs), default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
   // Cast expected count column from int32 to int64 (merge sums int32 counts -> int64)
   auto expected_columns = expected_table->release();
@@ -279,6 +291,8 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
   expected_table = std::make_unique<cudf::table>(std::move(expected_columns));
 
   bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
-    outputs->get_data_batches()[0], expected_table->view(), true);
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0],
+    expected_table->view(),
+    true);
   REQUIRE(tables_match);
 }

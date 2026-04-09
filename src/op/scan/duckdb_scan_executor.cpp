@@ -191,10 +191,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
         throw std::runtime_error("Scan results for query not cached");
       }
       auto batches = entry->batches[entry->batch_index++];
-      return std::make_unique<op::operator_data>(clone_batches(std::move(batches), stream));
+      return std::make_unique<op::pipelineable_operator_data>(
+        clone_batches(std::move(batches), stream));
     } else {
-      auto scan_output = task->compute_task(stream);
-      entry->batches.push_back(clone_batches(scan_output->get_data_batches(), stream));
+      auto scan_output               = task->compute_task(stream);
+      auto& pipelineable_scan_output = dynamic_cast<op::pipelineable_operator_data&>(*scan_output);
+      entry->batches.push_back(clone_batches(pipelineable_scan_output.get_data_batches(), stream));
       return scan_output;
     }
   }

@@ -41,7 +41,8 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
                                                               rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -79,7 +80,7 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
     if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
   }
 
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 }  // namespace op

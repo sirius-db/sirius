@@ -371,7 +371,10 @@ void task_creator::manager_loop()
             pipeline->mark_task_created();
 
             auto input_data = node->get_next_task_input_data();
-            if (!input_data || input_data->get_data_batches().empty()) {
+            auto* pipelineable_input =
+              dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
+            if (!input_data ||
+                (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
               // No data was available (e.g., another thread already consumed it).
               // Balance the counter. mark_task_completed() calls update_pipeline_status()
               // which is correct: if all ports are truly empty and all real tasks have

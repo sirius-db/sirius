@@ -78,7 +78,8 @@ std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data&
                                                             rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_cte::execute"};
-  return std::make_unique<operator_data>(input_data);
+  return std::make_unique<pipelineable_operator_data>(
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 }  // namespace op

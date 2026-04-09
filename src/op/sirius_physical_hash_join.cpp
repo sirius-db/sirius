@@ -474,7 +474,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     input_batch.push_back(std::move(probe_batch));
     input_batch.push_back(std::move(build_batch));
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
-    return std::make_unique<operator_data>(input_batch);
+    return std::make_unique<pipelineable_operator_data>(input_batch);
 
   } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
     if (probe_port->repo->num_partitions() != 1) {
@@ -495,7 +495,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "batch from the default port but got none in operator " +
         std::to_string(this->get_operator_id()));
     }
-    return std::make_unique<operator_data>(input_batch);
+    return std::make_unique<pipelineable_operator_data>(input_batch);
   } else {
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
@@ -564,7 +564,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
             input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(
               right_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
-          return std::make_unique<operator_data>(input_batch);
+          return std::make_unique<pipelineable_operator_data>(input_batch);
         }
         right_counter++;
         counter++;
@@ -697,8 +697,9 @@ static std::unique_ptr<operator_data> gather_join_output(
   }
 
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-    make_data_batch(std::move(output_cudf_table), memory_space)});
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), memory_space)});
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
@@ -757,15 +758,17 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
 
   mark_out_cols.push_back(std::move(mark_column));
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
-  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-    make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   if (is_all_inequality_join) {
     throw std::runtime_error(
