@@ -21,7 +21,15 @@ Sirius searches for a config file in this order:
 2. **`./sirius.yaml`** — current working directory
 3. **`~/.sirius/sirius.yaml`** — user's home directory
 
-If no config file is found, Sirius initializes with built-in defaults. Set `SIRIUS_DISABLE=1` to prevent Sirius from initializing (e.g. for CPU-only benchmarks).
+If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 8 GB pinned host memory per NUMA node).
+
+### `SIRIUS_DISABLE`
+
+Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks.
+
+```bash
+export SIRIUS_DISABLE=1
+```
 
 ### Byte Suffixes
 

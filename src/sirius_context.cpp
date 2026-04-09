@@ -437,6 +437,10 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     spdlog::info(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
+    spdlog::warn(
+      "Super Sirius will allocate most GPU and pinned host memory on startup. "
+      "If you are using the legacy code path (gpu_buffer_init / gpu_processing), "
+      "set SIRIUS_DISABLE=1 to prevent this.");
     config_.apply_defaults();
   }
 
