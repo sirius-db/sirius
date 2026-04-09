@@ -441,6 +441,24 @@ std::string sirius_plan_printer::render_dag() const
   ss << "=== Query Plan DAG ===\n";
 
   for (size_t y = 0; y < tree.height; y++) {
+    // Compute the column span for each node: multi-child parents span their children's columns
+    // node_span[x] = number of columns this node visually spans (0 = consumed by prior span)
+    std::vector<size_t> node_span(tree.width, 0);
+    for (size_t x = 0; x < tree.width; x++) {
+      if (!tree.grid[y][x].has_value()) { continue; }
+      auto it = tree.children_map.find({y, x});
+      if (it != tree.children_map.end() && it->second.size() > 1) {
+        size_t max_col = *std::max_element(it->second.begin(), it->second.end());
+        node_span[x]   = max_col - x + 1;
+        // Mark consumed columns
+        for (size_t c = x + 1; c <= max_col && c < tree.width; c++) {
+          node_span[c] = 0;
+        }
+      } else {
+        if (node_span[x] == 0) { node_span[x] = 1; }  // not consumed by a prior span
+      }
+    }
+
     // Determine max content lines in this row
     size_t max_content_lines = 0;
     for (size_t x = 0; x < tree.width; x++) {
@@ -451,23 +469,32 @@ std::string sirius_plan_printer::render_dag() const
 
     // --- Top border layer ---
     for (size_t x = 0; x < tree.width; x++) {
-      if (tree.grid[y][x].has_value()) {
-        ss << render_top_border(config_, inner_width);
-      } else {
+      if (tree.grid[y][x].has_value() && node_span[x] >= 1) {
+        size_t span      = node_span[x];
+        size_t box_width = span * node_render_width;
+        size_t box_inner = box_width - 2;
+        ss << render_top_border(config_, box_inner);
+      } else if (!tree.grid[y][x].has_value() && node_span[x] == 0) {
+        // Empty cell not consumed by a spanning box
         ss << std::string(node_render_width, ' ');
       }
+      // else: consumed by spanning box, skip
     }
     ss << "\n";
 
     // --- Content layers ---
     for (size_t line_idx = 0; line_idx < max_content_lines; line_idx++) {
       for (size_t x = 0; x < tree.width; x++) {
-        if (tree.grid[y][x].has_value() && line_idx < tree.grid[y][x]->content_lines.size()) {
-          ss << render_content_line(config_, tree.grid[y][x]->content_lines[line_idx], inner_width);
-        } else if (tree.grid[y][x].has_value()) {
-          // Node exists but fewer content lines -- render empty content
-          ss << render_content_line(config_, "", inner_width);
-        } else {
+        if (tree.grid[y][x].has_value() && node_span[x] >= 1) {
+          size_t span      = node_span[x];
+          size_t box_width = span * node_render_width;
+          size_t box_inner = box_width - 2;
+          if (line_idx < tree.grid[y][x]->content_lines.size()) {
+            ss << render_content_line(config_, tree.grid[y][x]->content_lines[line_idx], box_inner);
+          } else {
+            ss << render_content_line(config_, "", box_inner);
+          }
+        } else if (!tree.grid[y][x].has_value() && node_span[x] == 0) {
           ss << std::string(node_render_width, ' ');
         }
       }
@@ -476,11 +503,12 @@ std::string sirius_plan_printer::render_dag() const
 
     // --- Bottom border layer ---
     for (size_t x = 0; x < tree.width; x++) {
-      if (tree.grid[y][x].has_value()) {
+      if (tree.grid[y][x].has_value() && node_span[x] >= 1) {
+        size_t span       = node_span[x];
+        size_t box_width  = span * node_render_width;
+        size_t box_inner  = box_width - 2;
         bool has_children = false;
-        // Check if this node has children (nodes in y+1 that it placed)
         if (y + 1 < tree.height) {
-          // Find the pipeline for this node
           for (auto& p : pipelines_) {
             if (p->get_pipeline_id() == tree.grid[y][x]->pipeline_id) {
               has_children = !p->dependencies.empty();
@@ -488,8 +516,8 @@ std::string sirius_plan_printer::render_dag() const
             }
           }
         }
-        ss << render_bottom_border(config_, inner_width, has_children);
-      } else {
+        ss << render_bottom_border(config_, box_inner, has_children);
+      } else if (!tree.grid[y][x].has_value() && node_span[x] == 0) {
         ss << std::string(node_render_width, ' ');
       }
     }
@@ -516,7 +544,9 @@ std::string sirius_plan_printer::render_dag() const
             has_any_branch = true;
             size_t min_col = *std::min_element(it->second.begin(), it->second.end());
             size_t max_col = *std::max_element(it->second.begin(), it->second.end());
-            for (size_t c = min_col; c <= max_col; c++) { col_to_parent[c] = px; }
+            for (size_t c = min_col; c <= max_col; c++) {
+              col_to_parent[c] = px;
+            }
           }
         }
 
@@ -531,8 +561,8 @@ std::string sirius_plan_printer::render_dag() const
               size_t max_col    = *std::max_element(children.begin(), children.end());
               std::set<size_t> child_set(children.begin(), children.end());
 
-              bool is_child    = child_set.count(x) > 0;
-              bool is_leftmost = (x == min_col);
+              bool is_child     = child_set.count(x) > 0;
+              bool is_leftmost  = (x == min_col);
               bool is_rightmost = (x == max_col);
 
               // Left half: horizontal if not leftmost, spaces if leftmost
@@ -563,11 +593,13 @@ std::string sirius_plan_printer::render_dag() const
 
               // Right half: horizontal if not rightmost, spaces if rightmost
               std::string right_half;
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               if (!is_rightmost) {
-                for (size_t i = 0; i < right_len; i++) { right_half += config_.HORIZONTAL; }
+                for (size_t i = 0; i < right_len; i++) {
+                  right_half += config_.HORIZONTAL;
+                }
               } else {
                 right_half = std::string(right_len, ' ');
               }
@@ -576,9 +608,9 @@ std::string sirius_plan_printer::render_dag() const
             } else if (tree.grid[y + 1][x].has_value()) {
               // Single-child — just │
               std::string left_pad(connector_center, ' ');
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               ss << left_pad << config_.VERTICAL << std::string(right_len, ' ');
             } else {
               ss << std::string(node_render_width, ' ');
@@ -590,9 +622,9 @@ std::string sirius_plan_printer::render_dag() const
           for (size_t x = 0; x < tree.width; x++) {
             if (tree.grid[y + 1][x].has_value()) {
               std::string left_pad(connector_center, ' ');
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               ss << left_pad << config_.VERTICAL << std::string(right_len, ' ');
             } else {
               ss << std::string(node_render_width, ' ');
@@ -604,9 +636,9 @@ std::string sirius_plan_printer::render_dag() const
           for (size_t x = 0; x < tree.width; x++) {
             if (tree.grid[y + 1][x].has_value()) {
               std::string left_pad(connector_center, ' ');
-              size_t right_len =
-                (connector_center + 1 < node_render_width) ?
-                  node_render_width - connector_center - 1 : 0;
+              size_t right_len = (connector_center + 1 < node_render_width)
+                                   ? node_render_width - connector_center - 1
+                                   : 0;
               ss << left_pad << config_.VERTICAL << std::string(right_len, ' ');
             } else {
               ss << std::string(node_render_width, ' ');
