@@ -42,7 +42,10 @@
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 
+#include <op/scan/direct_block_scan.hpp>
+
 #include <chrono>
+#include <cuda_runtime.h>
 
 namespace sirius::op::scan {
 
@@ -799,6 +802,74 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
+
+  // === Direct block scan benchmark (first task only) ===
+  if (_task_id == 0) {
+    try {
+      auto& bind_data = g_state._op.bind_data->Cast<duckdb::TableScanBindData>();
+      auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
+      auto& storage   = table.GetStorage();
+
+      auto bench_start = std::chrono::steady_clock::now();
+
+      // Pin all segments for all scanned columns
+      size_t total_pinned = 0;
+      size_t total_segments = 0;
+      for (size_t i = 0; i < l_state._num_columns; ++i) {
+        auto storage_col = duckdb::StorageIndex(g_state._op.column_ids[i].GetPrimaryIndex());
+        auto result = direct_block_scan_column(storage, storage_col, l_state._exec_ctx.client);
+        total_pinned += result.total_pinned_bytes;
+        total_segments += result.segments.size();
+      }
+
+      auto bench_end = std::chrono::steady_clock::now();
+      auto bench_us  = std::chrono::duration_cast<std::chrono::microseconds>(bench_end - bench_start).count();
+
+      // Also measure: cudaMemcpy ONE column's pinned blocks to GPU (raw, no decode)
+      // Use a small buffer (one block at a time) to avoid GPU OOM from the RMM pool.
+      double us_memcpy    = 0;
+      size_t bytes_copied = 0;
+      {
+        constexpr size_t BLOCK_SIZE = 262144;  // 256KB
+        void* gpu_buf               = nullptr;
+        auto cuda_err                = cudaMalloc(&gpu_buf, BLOCK_SIZE);
+        if (cuda_err == cudaSuccess && gpu_buf) {
+          // Copy first column's segments as benchmark
+          auto storage_col = duckdb::StorageIndex(g_state._op.column_ids[0].GetPrimaryIndex());
+          auto result2     = direct_block_scan_column(storage, storage_col, l_state._exec_ctx.client);
+
+          auto memcpy_start = std::chrono::steady_clock::now();
+          for (auto& seg : result2.segments) {
+            if (seg.data_ptr && seg.persistent && seg.segment_size > 0) {
+              auto copy_size = std::min(seg.segment_size, BLOCK_SIZE);
+              cudaMemcpy(gpu_buf, seg.data_ptr, copy_size, cudaMemcpyHostToDevice);
+              bytes_copied += copy_size;
+            }
+          }
+          cudaDeviceSynchronize();
+          auto memcpy_end = std::chrono::steady_clock::now();
+          us_memcpy       = std::chrono::duration_cast<std::chrono::microseconds>(
+                        memcpy_end - memcpy_start)
+                        .count();
+
+          cudaFree(gpu_buf);
+        }
+      }
+
+      SIRIUS_LOG_INFO(
+        "[direct_scan] BENCHMARK: pinned {} cols, {} segs, {:.1f}MB in {:.1f}ms. "
+        "cudaMemcpy col0 ({:.1f}MB) in {:.1f}ms = {:.1f} GB/s",
+        l_state._num_columns,
+        total_segments,
+        total_pinned / (1024.0 * 1024.0),
+        bench_us / 1000.0,
+        bytes_copied / (1024.0 * 1024.0),
+        us_memcpy / 1000.0,
+        us_memcpy > 0 ? (bytes_copied / (us_memcpy / 1e6)) / 1e9 : 0);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_DEBUG("[direct_scan] benchmark skipped: {}", e.what());
+    }
+  }
 
   // === Scan instrumentation counters ===
   double us_get_next_chunk = 0;
