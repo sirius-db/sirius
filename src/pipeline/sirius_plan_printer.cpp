@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <set>
 #include <sstream>
 
 namespace sirius::pipeline {
@@ -55,12 +56,17 @@ struct render_tree {
 };
 
 /// Get the width (columns) and height (rows) of the subtree rooted at a pipeline.
+/// Already-visited pipelines are treated as leaf nodes (reference-only).
 void get_tree_width_height(const sirius_pipeline& pipeline,
                            size_t& width,
                            size_t& height,
-                           size_t depth_limit)
+                           size_t depth_limit,
+                           std::set<size_t>& visited)
 {
-  if (depth_limit == 0 || pipeline.dependencies.empty()) {
+  bool is_duplicate = visited.count(pipeline.get_pipeline_id()) > 0;
+  visited.insert(pipeline.get_pipeline_id());
+
+  if (depth_limit == 0 || pipeline.dependencies.empty() || is_duplicate) {
     width  = 1;
     height = 1;
     return;
@@ -70,7 +76,7 @@ void get_tree_width_height(const sirius_pipeline& pipeline,
   for (auto& dep : pipeline.dependencies) {
     size_t child_w = 0;
     size_t child_h = 0;
-    get_tree_width_height(*dep, child_w, child_h, depth_limit - 1);
+    get_tree_width_height(*dep, child_w, child_h, depth_limit - 1, visited);
     width += child_w;
     height = std::max(height, child_h);
   }
@@ -78,13 +84,18 @@ void get_tree_width_height(const sirius_pipeline& pipeline,
 }
 
 /// Recursively place nodes into the 2D grid.
+/// Already-visited pipelines render as compact reference nodes instead of full subtrees.
 void place_node(render_tree& tree,
                 const sirius_pipeline& pipeline,
                 const sirius_pipeline* parent,
                 size_t x,
                 size_t y,
-                size_t depth_limit)
+                size_t depth_limit,
+                std::set<size_t>& visited)
 {
+  bool is_duplicate = visited.count(pipeline.get_pipeline_id()) > 0;
+  visited.insert(pipeline.get_pipeline_id());
+
   render_node node;
   node.pipeline_id = pipeline.get_pipeline_id();
 
@@ -106,9 +117,18 @@ void place_node(render_tree& tree,
     }
   }
 
+  if (is_duplicate) {
+    // Render a compact reference node instead of the full subtree
+    node.content_lines.push_back("(-> Pipeline #" + std::to_string(pipeline.get_pipeline_id()) +
+                                 ")");
+    node.width      = node.content_lines[0].size() + 4;
+    tree.grid[y][x] = std::move(node);
+    return;
+  }
+
   // Build content lines with operator IDs and detail annotations (D-01, D-02, D-03, D-04)
   auto source = pipeline.get_source();
-  auto sink = pipeline.get_sink();
+  auto sink   = pipeline.get_sink();
   if (source) {
     node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*source));
     for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*source)) {
@@ -144,14 +164,15 @@ void place_node(render_tree& tree,
 
   tree.grid[y][x] = std::move(node);
 
-  // Recurse into dependencies (D-07: shared deps duplicated in tree)
+  // Recurse into dependencies
   if (depth_limit > 0) {
     size_t child_x = x;
     for (auto& dep : pipeline.dependencies) {
-      size_t child_w = 0;
-      size_t child_h = 0;
-      get_tree_width_height(*dep, child_w, child_h, depth_limit - 1);
-      place_node(tree, *dep, &pipeline, child_x, y + 1, depth_limit - 1);
+      size_t child_w                = 0;
+      size_t child_h                = 0;
+      std::set<size_t> size_visited = visited;
+      get_tree_width_height(*dep, child_w, child_h, depth_limit - 1, size_visited);
+      place_node(tree, *dep, &pipeline, child_x, y + 1, depth_limit - 1, visited);
       child_x += child_w;
     }
   }
@@ -284,7 +305,7 @@ std::string sirius_plan_printer::build_operator_chain(const sirius_pipeline& pip
 {
   std::ostringstream ss;
   auto source = pipeline.get_source();
-  auto sink = pipeline.get_sink();
+  auto sink   = pipeline.get_sink();
   if (source) { ss << format_operator_with_id(*source); }
   auto ops = pipeline.get_operators();
   for (auto& op_ref : ops) {
@@ -322,7 +343,7 @@ std::string sirius_plan_printer::render_pipelines() const
 
     // Build arrow-separated operator chain with IDs (D-04, D-05)
     auto source = pipeline->get_source();
-    auto sink = pipeline->get_sink();
+    auto sink   = pipeline->get_sink();
     if (source) { ss << format_operator_with_id(*source); }
     auto ops = pipeline->get_operators();
     for (auto& op_ref : ops) {
@@ -371,17 +392,19 @@ std::string sirius_plan_printer::render_dag() const
   auto root = find_root_pipeline();
   if (!root) { return "=== Query Plan DAG ===\n(no root pipeline found)\n"; }
 
-  // Step 1: Compute tree dimensions
+  // Step 1: Compute tree dimensions (with visited set to avoid counting shared subtrees twice)
   size_t tree_width  = 0;
   size_t tree_height = 0;
-  get_tree_width_height(*root, tree_width, tree_height, MAX_TREE_DEPTH);
+  std::set<size_t> size_visited;
+  get_tree_width_height(*root, tree_width, tree_height, MAX_TREE_DEPTH, size_visited);
 
-  // Step 2: Create 2D grid and place nodes
+  // Step 2: Create 2D grid and place nodes (with visited set to deduplicate shared pipelines)
   render_tree tree;
   tree.width  = tree_width;
   tree.height = tree_height;
   tree.grid.resize(tree_height, std::vector<std::optional<render_node>>(tree_width));
-  place_node(tree, *root, nullptr, 0, 0, MAX_TREE_DEPTH);
+  std::set<size_t> place_visited;
+  place_node(tree, *root, nullptr, 0, 0, MAX_TREE_DEPTH, place_visited);
 
   // Step 3: Compute node_render_width (uniform width for all nodes)
   size_t node_render_width = config_.minimum_render_width;
