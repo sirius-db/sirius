@@ -482,6 +482,7 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
       if (varchar_size == 0) { varchar_size = _default_varchar_size; }
 
       _column_builders.emplace_back(col_type, varchar_size);
+      _column_builders.back().has_metadata_bound = (varchar_size != _default_varchar_size);
       estimated_row_bytes += (sizeof(int32_t) + varchar_size);  // offset + data
     } else {
       _column_builders.emplace_back(col_type, _default_varchar_size);
@@ -617,8 +618,11 @@ bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
 
 bool duckdb_scan_task::chunk_fits(duckdb_scan_task_local_state& l_state)
 {
-  // Loop over the VARCHAR columns and check if they fit in the allocated buffers
+  // Loop over the VARCHAR columns and check if they fit in the allocated buffers.
+  // Skip columns where allocation used max_string_length from metadata — those are
+  // guaranteed safe upper bounds, so Flatten + size check is redundant.
   for (auto varchar_idx : l_state._varchar_indices) {
+    if (l_state._column_builders[varchar_idx].has_metadata_bound) { continue; }
     auto& vec = l_state._chunk.data[varchar_idx];
     vec.Flatten(l_state._chunk.size());
     auto const& validity = duckdb::FlatVector::Validity(l_state._chunk.data[varchar_idx]);
@@ -638,6 +642,27 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
     auto const& validity = duckdb::FlatVector::Validity(vec);
     l_state._column_builders[i].process_column(
       vec, validity, l_state._chunk.size(), l_state._row_offset, l_state._allocation);
+  }
+  l_state._row_offset += l_state._chunk.size();
+}
+
+/// Instrumented version of process_chunk that reports Flatten vs copy time separately.
+void duckdb_scan_task::process_chunk_timed(duckdb_scan_task_local_state& l_state,
+                                           double& us_flatten,
+                                           double& us_copy)
+{
+  for (size_t i = 0; i < l_state._num_columns; ++i) {
+    auto& vec = l_state._chunk.data[i];
+    {
+      scoped_timer t(us_flatten);
+      vec.Flatten(l_state._chunk.size());
+    }
+    auto const& validity = duckdb::FlatVector::Validity(vec);
+    {
+      scoped_timer t(us_copy);
+      l_state._column_builders[i].process_column(
+        vec, validity, l_state._chunk.size(), l_state._row_offset, l_state._allocation);
+    }
   }
   l_state._row_offset += l_state._chunk.size();
 }
@@ -672,13 +697,15 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // === Scan instrumentation counters ===
   double us_get_next_chunk = 0;
   double us_chunk_fits     = 0;
-  double us_process        = 0;
+  double us_flatten        = 0;
+  double us_copy           = 0;
   size_t num_chunks        = 0;
   // Per-VectorType counters: [FLAT, FSST, CONSTANT, DICTIONARY, SEQUENCE]
   std::array<size_t, 5> vtype_counts = {};
   // Track how many dict vectors we flatten (cost indicator)
   size_t dict_vectors_flattened = 0;
   size_t dict_varchar_vectors_flattened = 0;
+  size_t chunk_fits_skipped = 0;
 
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.
@@ -708,9 +735,16 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
     }
 
     // For variable-length columns, check that we have enough space.
+    // If ALL varchar columns have metadata-based bounds, skip entirely (guaranteed safe).
     // If there isn't enough space, flush the current batch and let the next task continue.
-    bool fits = false;
-    {
+    bool all_have_bounds = true;
+    for (auto vi : l_state._varchar_indices) {
+      if (!l_state._column_builders[vi].has_metadata_bound) { all_have_bounds = false; break; }
+    }
+    bool fits = true;
+    if (all_have_bounds) {
+      chunk_fits_skipped++;
+    } else {
       scoped_timer t(us_chunk_fits);
       fits = chunk_fits(l_state);
     }
@@ -732,11 +766,8 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
         "Consider increasing scan_task_batch_size.");
     }
 
-    // Process the chunk into the column builders
-    {
-      scoped_timer t(us_process);
-      process_chunk(l_state);
-    }
+    // Process the chunk into the column builders (timed: Flatten vs copy)
+    process_chunk_timed(l_state, us_flatten, us_copy);
 
     // Termination condition
     if (STANDARD_VECTOR_SIZE + l_state._row_offset >= l_state._estimated_rows_per_batch) { break; }
@@ -764,8 +795,9 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
     SIRIUS_LOG_INFO(
       "[duckdb_scan] task={} rows={}/{} est, chunks={}, alloc={}/{} bytes ({}% used), "
       "vtype=[FLAT={} FSST={} CONST={} DICT={} SEQ={}], "
-      "dict_flatten=[total={} varchar={}], "
-      "time_us=[get_chunk={:.0f} chunk_fits={:.0f} process={:.0f}]{}",
+      "dict_flatten=[total={} varchar={}], fits_skipped={}, "
+      "time_us=[get_chunk={:.0f} chunk_fits={:.0f} flatten={:.0f} copy={:.0f} "
+      "total_scan={:.0f}]{}",
       _task_id,
       l_state._row_offset,
       l_state._estimated_rows_per_batch,
@@ -780,9 +812,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
       vtype_counts[4],
       dict_vectors_flattened,
       dict_varchar_vectors_flattened,
+      chunk_fits_skipped,
       us_get_next_chunk,
       us_chunk_fits,
-      us_process,
+      us_flatten,
+      us_copy,
+      us_get_next_chunk + us_chunk_fits + us_flatten + us_copy,
       varchar_detail);
   }
 
