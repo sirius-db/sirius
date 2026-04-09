@@ -416,11 +416,14 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
 
   // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
-  auto output_table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                        .get_data_batches()[0]
+                        ->get_data()
+                        ->cast<gpu_table_representation>()
+                        .get_table();
   auto out_view    = output_table.view();
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data   = copy_column_to_host<int32_t>(out_view.column(1));
@@ -520,11 +523,14 @@ TEST_CASE("parquet_scan with decimal filter does not set passthrough",
 
   // execute() should apply the filter (col0 > 3.00 keeps rows 5.00 and 7.00)
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
-  auto output_table =
-    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                        .get_data_batches()[0]
+                        ->get_data()
+                        ->cast<gpu_table_representation>()
+                        .get_table();
   auto out_view  = output_table.view();
   auto host_dec  = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data = copy_column_to_host<int32_t>(out_view.column(1));
