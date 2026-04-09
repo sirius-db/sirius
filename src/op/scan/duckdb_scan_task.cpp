@@ -108,10 +108,38 @@ size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
       auto max_len      = duckdb::StringStats::MaxStringLength(*stats);
       auto distinct_est = stats->GetDistinctCount();
 
-      // Use max_string_length as the allocation estimate.
-      // This is a safe upper bound — actual average will be ≤ max.
-      // Still much better than the blind 256-byte default for most columns.
+      // Strategy: use segment info to compute a tighter estimate than max_string_length.
+      // GetColumnSegmentInfo gives us per-segment row counts and compression types.
+      // For dictionary-compressed segments, distinct_count * max_len / distinct_count ≈ max_len
+      // but we can also estimate: total_allocation / total_rows as upper-bound avg.
       size_t estimated_avg = max_len;
+
+      // Try to get a tighter bound from segment-level data
+      try {
+        auto seg_infos = storage.GetColumnSegmentInfo(duckdb::QueryContext(context));
+        size_t col_segment_rows = 0;
+        for (auto const& seg : seg_infos) {
+          if (seg.column_id == storage_col_idx.GetPrimaryIndex()) {
+            col_segment_rows += seg.segment_count;
+          }
+        }
+
+        // For low-cardinality columns: distinct_est * max_len gives total unique bytes,
+        // and avg per row ≈ total_unique_bytes / distinct_est = max_len (no improvement).
+        // But for high-cardinality with known distinct: avg ≈ max * (some fraction).
+        // Use a conservative formula: for columns where distinct > 10% of rows,
+        // the max is likely much larger than avg, so use max * 0.75.
+        if (distinct_est > 0 && total_rows > 0) {
+          double distinct_ratio = static_cast<double>(distinct_est) / total_rows;
+          if (distinct_ratio > 0.1) {
+            // High cardinality: avg is typically well below max
+            estimated_avg = std::max<size_t>(max_len * 3 / 4, 1);
+          }
+          // Low cardinality: avg ≈ max (short categorical strings), keep max
+        }
+      } catch (...) {
+        // Segment info unavailable; fall back to max_string_length
+      }
 
       SIRIUS_LOG_INFO(
         "[duckdb_scan] metadata col {} (storage {}): max_string_length={}, distinct_est={}, "
