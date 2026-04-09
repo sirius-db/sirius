@@ -2267,11 +2267,16 @@ impl PBackendService for PBackendServiceHandler {
                             info!(sql = %union_sql, "exchange fragment using UNION SQL path");
                             (ExecPlan::SqlCpuOnly(union_sql), None)
                         } else if let Some(agg_sql) = generate_exchange_agg_merge_sql(&params, &table_schemas) {
-                            // 2. AGG merge: GPU engine can't do partial aggregate finalization
-                            //    (AVG decomposition produces extra columns that never merge back).
-                            //    Use CPU SQL path: count→SUM, avg→(SUM/COUNT), etc.
-                            info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path");
-                            (ExecPlan::SqlCpuOnly(agg_sql), None)
+                            // 2. AGG merge: count→SUM, avg→(SUM/COUNT), etc.
+                            //    Use GPU SQL if exchange tables are GPU-registered (packed GPU path),
+                            //    CPU SQL if tables are CPU-registered (PBlock decode path).
+                            if any_gpu_registration_failed {
+                                info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path (CPU)");
+                                (ExecPlan::SqlCpuOnly(agg_sql), None)
+                            } else {
+                                info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path (GPU)");
+                                (ExecPlan::Sql(agg_sql), None)
+                            }
                         } else if any_gpu_registration_failed {
                             // GPU table registration failed — some exchange tables are CPU-only.
                             // Must use CPU Substrait to avoid GPU engine hanging on invalid tables.
