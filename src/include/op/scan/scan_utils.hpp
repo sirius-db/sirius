@@ -18,24 +18,24 @@
 
 // duckdb
 #include <duckdb/common/types.hpp>
-#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/table_filter.hpp>
 
 namespace sirius::op {
 
-/// Build a mapping from column_ids index to batch column position.
-///
-/// The parquet scan (make_selected_column_indices) produces batch columns in
-/// column_ids order, but only for indices present in projection_ids.
-/// For example, if column_ids has 5 entries and projection_ids = {1, 3}:
-///   batch position 0 → column_ids[1]
-///   batch position 1 → column_ids[3]
-///
-/// Returns a vector of size column_ids_count where:
-///   result[i] = batch position of column_ids[i], or idx_t(-1) if not projected.
-///
-/// When projection_ids is empty, every column_ids entry maps to its own index.
+/**
+ * @brief Build a mapping from column_ids index to batch column position.
+ *
+ * The parquet scan (make_selected_column_indices) produces batch columns in
+ * column_ids order, but only for indices present in projection_ids.
+ * For example, if column_ids has 5 entries and projection_ids = {1, 3}:
+ *   batch position 0 → column_ids[1]
+ *   batch position 1 → column_ids[3]
+ *
+ * When projection_ids is empty, every column_ids entry maps to its own index.
+ *
+ * Returns a vector of size column_ids_count where:
+ *   result[i] = batch position of column_ids[i], or idx_t(-1) if not projected.
+ */
 std::vector<duckdb::idx_t> build_batch_column_map(
   const duckdb::vector<duckdb::idx_t>& projection_ids, duckdb::idx_t column_ids_count);
 

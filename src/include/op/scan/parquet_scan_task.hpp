@@ -44,6 +44,9 @@
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
+// sirius scan operator data
+#include <op/scan/parquet_scan_operator_data.hpp>
+
 // standard library
 #include <atomic>
 #include <memory>
@@ -57,13 +60,27 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 namespace detail {
 /**
- * @brief Compute the parquet column indices to read for the given scan operator.
+ * @brief Compute the parquet column indices to read given column and projection id vectors.
  *
  * Applies projection_ids / column_ids to select only the needed columns.
  * Virtual columns and duplicates are excluded/deduplicated.
  * Defined in parquet_scan_task.cpp.
+ *
+ * @param column_ids     All column ids exposed by the table function.
+ * @param projection_ids Subset of column_ids positions selected by the planner (empty = no
+ *                       projection).
  */
-std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op);
+std::vector<size_t> make_selected_column_indices(
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids);
+
+/**
+ * @brief Return true if all selected projected columns have a flat (depth-1) schema.
+ *
+ * Defined in parquet_scan_task.cpp.
+ */
+bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
+                                std::vector<size_t> const& selected_column_indices);
 }  // namespace detail
 
 //===----------------------------------------------------------------------===//
@@ -81,26 +98,8 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
  public:
-  /**
-   * @brief Struct representing a set of row groups assigned to a scan task.
-   */
-  struct row_group_range {
-    row_group_range(std::size_t file_idx,
-                    std::vector<cudf::size_type> rg_indices_p,
-                    std::size_t reserved_uncompressed_bytes_p,
-                    std::size_t reserved_compressed_bytes_p)
-      : file_idx(file_idx),
-        rg_indices(std::move(rg_indices_p)),
-        reserved_uncompressed_bytes(reserved_uncompressed_bytes_p),
-        reserved_compressed_bytes(reserved_compressed_bytes_p)
-    {
-    }
-
-    std::size_t file_idx;
-    std::vector<cudf::size_type> rg_indices;
-    std::size_t reserved_uncompressed_bytes;
-    std::size_t reserved_compressed_bytes;
-  };
+  /// Row-group range type shared with the new metadata/GPU scan operators.
+  using row_group_range = ::sirius::op::scan::row_group_range;
 
   //===----------Constructor----------===//
   /**
@@ -409,8 +408,8 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    */
   [[nodiscard]] cudf::host_span<cudf::size_type const> get_rg_span() const
   {
-    return cudf::host_span<cudf::size_type const>(_partition.rg_indices.data(),
-                                                  _partition.rg_indices.size());
+    return cudf::host_span<cudf::size_type const>(_partition.row_group_indices.data(),
+                                                  _partition.row_group_indices.size());
   };
 
   /**
@@ -441,13 +440,12 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
   /**
    * @brief Get the vector of row group indices assigned to this local state.
    *
-   * @return A (const) reference to the vector of row group indices.
+   * @return A reference to the vector of row group indices.
    */
-  [[nodiscard]] std::vector<cudf::size_type> const& get_rg_indices() const
+  [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices()
   {
-    return _partition.rg_indices;
+    return _partition.row_group_indices;
   }
-  [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices() { return _partition.rg_indices; }
 
  private:
   parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition

@@ -106,7 +106,9 @@ bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
     });
 }
 
-std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op)
+std::vector<size_t> make_selected_column_indices(
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids)
 {
   // Deduplication set
   std::unordered_set<size_t> seen;
@@ -121,13 +123,12 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
     }
   };
 
-  if (scan_op.projection_ids.empty()) {
+  if (projection_ids.empty()) {
     //===----------No Projection: Select All Columns----------===//
-    std::for_each(scan_op.column_ids.begin(),
-                  scan_op.column_ids.end(),
-                  [&push_unique](duckdb::ColumnIndex const& column_id) {
-                    push_unique(column_id.GetPrimaryIndex());
-                  });
+    std::for_each(
+      column_ids.begin(), column_ids.end(), [&push_unique](duckdb::ColumnIndex const& column_id) {
+        push_unique(column_id.GetPrimaryIndex());
+      });
     return selected_column_indices;
   }
 
@@ -137,10 +138,9 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
   // This ensures the parquet reader produces columns in the same order that
   // the TABLE_SCAN filter expects (column_ids order), since the filter's
   // BoundReferenceExpression indices are offsets into column_ids.
-  std::unordered_set<std::size_t> projected_set(scan_op.projection_ids.begin(),
-                                                scan_op.projection_ids.end());
-  for (std::size_t i = 0; i < scan_op.column_ids.size(); i++) {
-    if (projected_set.count(i)) { push_unique(scan_op.column_ids[i].GetPrimaryIndex()); }
+  std::unordered_set<std::size_t> projected_set(projection_ids.begin(), projection_ids.end());
+  for (std::size_t i = 0; i < column_ids.size(); i++) {
+    if (projected_set.count(i)) { push_unique(column_ids[i].GetPrimaryIndex()); }
   }
   return selected_column_indices;
 }
@@ -297,7 +297,8 @@ void parquet_scan_task_global_state::initialize_from_files()
   }
 
   //===----------Projections----------===//
-  auto projected_column_indices = detail::make_selected_column_indices(*_scan_op);
+  auto projected_column_indices =
+    detail::make_selected_column_indices(_scan_op->column_ids, _scan_op->projection_ids);
   std::unordered_set<std::size_t> pure_filter_column_indices;
   if (is_projected) {
     std::vector<std::string> projected_column_names;
