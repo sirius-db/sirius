@@ -18,8 +18,6 @@
 
 #include "log/logging.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
-
 #include <algorithm>
 #include <chrono>
 #include <optional>
@@ -49,12 +47,10 @@ void downgrade_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
 
-  if (_memory_space) {
-    auto device_id = _memory_space->get_device_id();
-    cudaSetDevice(device_id);
-    cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
-  } else {
-    cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+  {
+    auto device_id = _memory_space ? _memory_space->get_device_id() : 0;
+    _stream_pool   = std::make_unique<cucascade::memory::exclusive_stream_pool>(
+      rmm::cuda_device_id{device_id}, _config.thread_pool.num_threads);
   }
 
   _request_queue.reactivate();
@@ -92,11 +88,7 @@ void downgrade_executor::stop()
   cancel_pending_requests();
   _pool->stop();
   _pool.reset();
-
-  if (_stream) {
-    cudaStreamDestroy(_stream);
-    _stream = nullptr;
-  }
+  _stream_pool.reset();
 }
 
 void downgrade_executor::drain()
@@ -133,7 +125,7 @@ void downgrade_executor::processing_loop()
 
     // 3. Incremental dispatch with predicate checking
     for (auto& weak_batch : candidates) {
-      if (req->satisfied.load(std::memory_order_acquire)) break;
+      if (req->satisfied.load()) break;
 
       auto batch = weak_batch.lock();
       if (!batch) continue;  // batch was freed elsewhere — skip
@@ -143,19 +135,22 @@ void downgrade_executor::processing_loop()
 
       auto batch_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
 
+      auto exc_stream = _stream_pool->acquire_stream(
+        cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+
       _pool->dispatch(std::move(slot),
-                      [batch    = std::move(batch),
-                       req_ptr  = req.get(),
-                       &res_mgr = _reservation_manager,
-                       stream   = rmm::cuda_stream_view{_stream},
-                       batch_size]() {
+                      [batch      = std::move(batch),
+                       req_ptr    = req.get(),
+                       &res_mgr   = _reservation_manager,
+                       exc_stream = std::move(exc_stream),
+                       batch_size]() mutable {
                         downgrade_task task{batch, res_mgr};
                         try {
-                          if (task.execute(stream)) {
+                          if (task.execute(exc_stream)) {
                             req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
                             req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                             if (req_ptr->predicate && req_ptr->predicate()) {
-                              req_ptr->satisfied.store(true, std::memory_order_release);
+                              req_ptr->satisfied.store(true);
                             }
                           }
                         } catch (const std::exception& e) {
@@ -173,11 +168,16 @@ void downgrade_executor::processing_loop()
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     double throughput_mbs =
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
-    SIRIUS_LOG_DEBUG("[downgrade] request done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s)",
-                     total_batches,
-                     total_bytes,
-                     duration_ms,
-                     throughput_mbs);
+    std::string is_monitor_request = req->is_monitor_request ? "from monitor " : "";
+    SIRIUS_LOG_DEBUG(
+      "[downgrade] request {}done: {} target_bytes, {} batches, {} bytes in {:.2f} ms ({:.1f} "
+      "MB/s)",
+      is_monitor_request,
+      req->target_bytes,
+      total_batches,
+      total_bytes,
+      duration_ms,
+      throughput_mbs);
 
     // 5. Fulfill the promise with total bytes freed
     req->result.set_value(total_bytes);
@@ -192,9 +192,10 @@ void downgrade_executor::monitor_loop()
     if (_memory_space && _memory_space->should_downgrade_memory()) {
       size_t amount = _memory_space->get_amount_to_downgrade();
       if (amount > 0) {
-        auto req          = std::make_unique<downgrade_request>();
-        req->target_bytes = amount;
-        req->predicate    = [&freed = req->bytes_freed, amount]() {
+        auto req                = std::make_unique<downgrade_request>();
+        req->target_bytes       = amount;
+        req->is_monitor_request = true;
+        req->predicate          = [&freed = req->bytes_freed, amount]() {
           return freed.load(std::memory_order_relaxed) >= amount;
         };
         // Fire-and-forget: monitor does not wait for the result
@@ -355,8 +356,6 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN(
       "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);
-    req->result.set_value(0);
-    return future;
   }
   return future;
 }

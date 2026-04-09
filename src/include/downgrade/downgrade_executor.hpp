@@ -22,12 +22,11 @@
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
-#include <cuda_runtime_api.h>
-
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
 #include <functional>
@@ -55,6 +54,7 @@ struct downgrade_request {
   std::atomic<size_t> bytes_freed{0};
   std::atomic<size_t> batches_downgraded{0};
   std::atomic<bool> satisfied{false};
+  bool is_monitor_request{false};
 };
 
 /**
@@ -171,7 +171,7 @@ class downgrade_executor {
   std::thread _processing_thread;
   std::thread _monitor_thread;
   std::atomic<bool> _running{false};
-  cudaStream_t _stream{nullptr};
+  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
 
   cucascade::shared_data_repository_manager& _data_repo_mgr;
   cucascade::memory::memory_space_id _space_id;
