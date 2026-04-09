@@ -357,10 +357,20 @@ pub async fn send_exchange_with_nixl(
     }
 
     // Extract packed info from location (if available).
-    let (packed_metadata, buffers, packed_broadcast) = match &location {
-        ExecutionLocation::Gpu { packed_metadata, buffers, packed_broadcast, .. } =>
-            (packed_metadata.as_deref(), buffers.as_slice(), packed_broadcast.as_slice()),
-        _ => (None, &[][..], &[][..]),
+    // For self-transfer (local 1-BE), skip GPU packed paths and always use PBlock.
+    // GPU-registered exchange tables can't be read by CPU `from_substrait`, and the
+    // GPU engine hangs on Sort(Read) of packed GPU tables. PBlock decode creates
+    // proper CPU-accessible DuckDB tables that both CPU and GPU paths can handle.
+    let all_local = destinations.iter().all(|d| d.brpc_addr == local_brpc_addr);
+    let (packed_metadata, buffers, packed_broadcast) = if all_local {
+        // Force PBlock path for local exchange.
+        (None, &[][..], &[][..])
+    } else {
+        match &location {
+            ExecutionLocation::Gpu { packed_metadata, buffers, packed_broadcast, .. } =>
+                (packed_metadata.as_deref(), buffers.as_slice(), packed_broadcast.as_slice()),
+            _ => (None, &[][..], &[][..]),
+        }
     };
 
     // Broadcast / Random: send all rows to all destinations (existing behavior).

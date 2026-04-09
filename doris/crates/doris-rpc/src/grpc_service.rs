@@ -2270,13 +2270,10 @@ impl PBackendService for PBackendServiceHandler {
                             // 2. AGG merge: count→SUM, avg→(SUM/COUNT), etc.
                             //    Use GPU SQL if exchange tables are GPU-registered (packed GPU path),
                             //    CPU SQL if tables are CPU-registered (PBlock decode path).
-                            if any_gpu_registration_failed {
-                                info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path (CPU)");
-                                (ExecPlan::SqlCpuOnly(agg_sql), None)
-                            } else {
-                                info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path (GPU)");
-                                (ExecPlan::Sql(agg_sql), None)
-                            }
+                            // CPU SQL: exchange tables are CPU-registered (PBlock decode)
+                            // in 1-BE local exchange mode.
+                            info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path");
+                            (ExecPlan::SqlCpuOnly(agg_sql), None)
                         } else if any_gpu_registration_failed {
                             // GPU table registration failed — some exchange tables are CPU-only.
                             // Must use CPU Substrait to avoid GPU engine hanging on invalid tables.
@@ -2301,20 +2298,12 @@ impl PBackendService for PBackendServiceHandler {
                             // GPU hangs on CPU-registered exchange tables.
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    // Use GPU if the exchange tables are GPU-registered,
-                                    // CPU if they're CPU-registered (PBlock decode).
-                                    let exec = if !any_gpu_registration_failed && !plan.force_cpu_substrait {
-                                        info!("exchange fragment using GPU Substrait path");
-                                        ExecPlan::Substrait {
-                                            bytes: plan.substrait_bytes,
-                                            sort_limit_sql: plan.sort_limit_sql,
-                                        }
-                                    } else {
-                                        info!("exchange fragment using CPU Substrait path (no file scans)");
-                                        ExecPlan::SubstraitCpuOnly {
-                                            bytes: plan.substrait_bytes,
-                                            sort_limit_sql: plan.sort_limit_sql,
-                                        }
+                                    // Exchange fragments use CPU Substrait: exchange tables are
+                                    // CPU-registered (PBlock decode) in 1-BE local exchange mode.
+                                    info!("exchange fragment using CPU Substrait path");
+                                    let exec = ExecPlan::SubstraitCpuOnly {
+                                        bytes: plan.substrait_bytes,
+                                        sort_limit_sql: plan.sort_limit_sql,
                                     };
                                     (exec, Some(plan.output_names))
                                 }
