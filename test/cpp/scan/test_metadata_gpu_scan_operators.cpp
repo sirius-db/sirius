@@ -795,3 +795,125 @@ TEST_CASE("two-pipeline scan - empty result from filter",
   }
   REQUIRE(total_rows == 0);
 }
+
+TEST_CASE("two-pipeline scan - pure filter column pruning",
+          "[two_pipeline_scan][filter][projection][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 1000;
+  create_synthetic_table(con, "pure_filter_col", NUM_ROWS);
+  auto path = write_parquet(con, "pure_filter_col", 500);
+  parquet_file_cleanup cleanup{{path}};
+
+  // Schema: id(0) INTEGER, value(1) BIGINT, price(2) DOUBLE, name(3) VARCHAR
+  auto schema                    = synthetic_table_schema();
+  std::vector<std::string> files = {path.string()};
+
+  // Output only id(0) and price(2).  value(1) is a pure filter column: it appears
+  // in projection_ids but not in output_types, so it should be pruned after filtering.
+  //
+  // DuckDB convention: projection_ids are indices into column_ids.  The first
+  // output_types.size() entries are the real output columns; the rest are pure
+  // filter columns.  make_selected_column_indices collects the union of all
+  // referenced column_ids indices into a projected_set, then iterates column_ids
+  // in order, emitting only those in the set.  post_filter_projection_ids stores
+  // the raw projection_id values and uses them to index into the reader output.
+  //
+  // This only works when the projected_set forms a contiguous range {0..N-1},
+  // so that column_ids index == reader output position.  DuckDB's planner
+  // guarantees this: column_ids only contains referenced columns, and
+  // projection_ids (output + filter-only) covers all of them.
+  //
+  // With projection_ids = {0, 2, 1}, projected_set = {0, 1, 2} (contiguous),
+  // the reader produces 3 columns in column_ids order [id, value, price], and
+  // post_filter_projection_ids = {0, 2} selects columns[0]=id and columns[2]=price.
+  duckdb::vector<duckdb::LogicalType> output_types;
+  output_types.push_back(schema.types[0]);  // id    INTEGER
+  output_types.push_back(schema.types[2]);  // price DOUBLE
+
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 2, 1};  // id, price, value(filter-only)
+
+  // Filter: value < 50000  (value = id * 100, so id < 500 → 500 rows)
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->PushFilter(
+    duckdb::ColumnIndex(1),
+    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                              duckdb::Value::BIGINT(50000)));
+
+  auto batches = run_two_pipeline_scan(files,
+                                       output_types,
+                                       schema.column_ids,
+                                       projection_ids,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space,
+                                       std::move(table_filters));
+
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto table = sirius::get_cudf_table_view(*batch);
+    // Pure filter column (value) should have been pruned — only id and price remain.
+    REQUIRE(table.num_columns() == 2);
+    REQUIRE(table.column(0).type().id() == cudf::type_id::INT32);
+    REQUIRE(table.column(1).type().id() == cudf::type_id::FLOAT64);
+    auto ids = copy_int32_column(table.column(0));
+    for (auto id : ids) {
+      REQUIRE(id < 500);
+    }
+    total_rows += table.num_rows();
+  }
+  REQUIRE(total_rows == 500);
+}
+
+TEST_CASE("two-pipeline scan - DECIMAL filter falls back to DuckDB expression executor",
+          "[two_pipeline_scan][filter][fallback][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 500;
+  create_diverse_table(con, "decimal_fallback", NUM_ROWS);
+  auto path = write_parquet(con, "decimal_fallback", 200);
+  parquet_file_cleanup cleanup{{path}};
+
+  // Schema: id(0) INTEGER, value(1) BIGINT, price(2) DECIMAL(12,2), label(3) VARCHAR, created(4)
+  // DATE. A filter on the DECIMAL column will fail cudf AST translation (DECIMAL types are
+  // disabled due to a cudf bug), so the DuckDB expression executor fallback path is exercised.
+  auto schema                    = diverse_table_schema();
+  std::vector<std::string> files = {path.string()};
+  duckdb::vector<duckdb::idx_t> no_projection;
+
+  // Filter: price < 100.00  (price_cents = i*100+1, so price = i + 0.01; id < 100 → 100 rows)
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->PushFilter(
+    duckdb::ColumnIndex(2),
+    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                              duckdb::Value::DECIMAL(10000, 12, 2)));
+
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space,
+                                       std::move(table_filters));
+
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto table = sirius::get_cudf_table_view(*batch);
+    REQUIRE(table.num_columns() == 5);
+    auto ids = copy_int32_column(table.column(0));
+    for (auto id : ids) {
+      REQUIRE(id < 100);
+    }
+    total_rows += table.num_rows();
+  }
+  REQUIRE(total_rows == 100);
+}

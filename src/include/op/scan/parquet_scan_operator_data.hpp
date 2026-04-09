@@ -21,6 +21,7 @@
 #include <op/sirius_physical_operator.hpp>
 
 // cudf
+#include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 
@@ -118,6 +119,7 @@ class partitioned_parquet_metadata : public op::operator_data {
   }
 
   std::vector<std::string> file_paths;
+  std::vector<std::shared_ptr<cudf::io::datasource>> datasources;  ///< Parallel to file_paths.
   std::vector<row_group_range> row_group_partitions;
 
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
@@ -151,12 +153,14 @@ class parquet_scan_data : public op::operator_data {
                     std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                     std::variant<std::shared_ptr<translated_expression>,
                                  std::shared_ptr<duckdb::Expression>> filter_expression,
-                    std::vector<std::size_t> post_filter_projection_ids)
+                    std::vector<std::size_t> post_filter_projection_ids,
+                    std::shared_ptr<cudf::io::datasource> datasource)
     : file_path(std::move(file_path)),
       rg_range(std::move(rg_range)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
-      post_filter_projection_ids(std::move(post_filter_projection_ids))
+      post_filter_projection_ids(std::move(post_filter_projection_ids)),
+      datasource(std::move(datasource))
   {
   }
 
@@ -177,10 +181,8 @@ class parquet_scan_data : public op::operator_data {
   std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
     filter_expression;
   std::vector<std::size_t> post_filter_projection_ids;
-  /// Datasource for the parquet file.  Marked mutable so that execute() can
-  /// move it out through a const reference — the datasource is a transport slot
-  /// that may be filled by the prefetcher before execution.
-  mutable std::unique_ptr<cudf::io::datasource> datasource = nullptr;
+  /// Datasource for the parquet file, shared with other partitions of the same file.
+  std::shared_ptr<cudf::io::datasource> datasource;
 };
 
 }  // namespace sirius::op::scan

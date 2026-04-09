@@ -139,11 +139,16 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    * @brief Parse parquet metadata for the files in @p input_data and produce
    *        a partitioned_parquet_metadata.
    *
+   * If a filter expression was provided at construction, this method attempts to translate it
+   * into a cuDF AST for filter pushdown and row-group pruning. If column names were not provided
+   * to the constructor, or if AST translation fails, the original DuckDB expression is stored on
+   * the result for post-scan filtering in the GPU scan operator.
+   *
    * @param input_data  Must be a parquet_metadata_input instance.
-   * @param stream      CUDA stream (unused; metadata parsing is CPU-only).
-   * @return            A partitioned_metadata_operator_data wrapping a shared_ptr to the
-   *                    partitioned_parquet_metadata containing the parsed FileMetaData
+   * @param stream      CUDA stream used for AST filter translation and row-group pruning.
+   * @return            A partitioned_parquet_metadata containing the parsed FileMetaData
    *                    objects, reader options, and row-group partitions.
+   * @throws std::runtime_error if @p input_data is not a parquet_metadata_input.
    */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -162,15 +167,12 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   bool _is_projected;
   /// Column names for the projected columns, in column_ids order.
   std::vector<std::string> _projected_column_names;
-  /// Whether there are AST filters to push down.
-  bool _has_ast_filter;
-  /// Whether there are duckdb filters to execute in the table scan operator that could not be
-  /// translated to AST filters.
-  bool _has_duckdb_filter;
-  /// Either a) the translated filter expression for row-group pruning and filter pushdown, or
-  ///        b) the coalesced duckdb expression if filter translation failed.
-  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
-    _filter_expression;
+  /// Whether there is a filter expression (AST translation is deferred to execute()).
+  bool _has_filter;
+  /// The coalesced DuckDB filter expression (AST translation attempted in execute()).
+  std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+  /// Pre-computed column name lookup for AST translation (ref_index -> column name).
+  std::vector<std::string> _column_name_by_ref;
   /// The projection ids corresponding to columns that remain after pruning pure filter columns.
   std::vector<std::size_t> _post_filter_projection_ids;
   /// The set of column indices corresponding to columns that will be pruned after filtering.

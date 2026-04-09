@@ -90,42 +90,31 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
 {
   _selected_column_indices = detail::make_selected_column_indices(column_ids, projection_ids);
 
-  // Try to translate the table filter set into a GPU expression for filter pushdown.
-  _has_ast_filter    = false;
-  _has_duckdb_filter = false;
+  // Convert the table filter set into a DuckDB expression. AST translation is deferred to
+  // execute() so that a task-local CUDA stream can be used.
+  _has_filter = false;
   if (table_filter_set && !table_filter_set->filters.empty()) {
-    auto name_resolver = [&](duckdb::idx_t ref_index) -> std::string {
-      auto const primary_idx = column_ids[ref_index].GetPrimaryIndex();
-      return names[primary_idx];
-    };
     auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
     auto duckdb_expression = convert_table_filters_to_expression(
       *table_filter_set, column_ids, this->types, batch_column_map);
     if (duckdb_expression) {
-      gpu_expression_translator translator(rmm::cuda_stream_default,
-                                           cudf::get_current_device_resource_ref());
-      auto optional_filter =
-        translator.translate_expression_with_names(*duckdb_expression, name_resolver);
-      if (!optional_filter) {
-        SIRIUS_LOG_DEBUG(
-          "[sirius_physical_parquet_scan] Failed to translate filter expression for pushdown. "
-          "Filter will be applied in the table scan operator.");
-        _has_duckdb_filter = true;
-        _filter_expression = std::move(duckdb_expression);
-      } else {
-        _has_ast_filter    = true;
-        _filter_expression = std::make_shared<translated_expression>(std::move(*optional_filter));
-        SIRIUS_LOG_DEBUG(
-          "[sirius_physical_parquet_scan] Successfully translated filter expression for pushdown.");
+      _has_filter               = true;
+      _duckdb_filter_expression = std::move(duckdb_expression);
+      // Pre-compute the ref_index -> column_name mapping for AST translation in execute().
+      // If names are empty, AST translation will be skipped and the DuckDB filter used instead.
+      if (!names.empty()) {
+        _column_name_by_ref.resize(column_ids.size());
+        for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+          _column_name_by_ref[i] = names[column_ids[i].GetPrimaryIndex()];
+        }
       }
     }
   }
 
-  // For projections and/or filter pushdown, we need the column names.
-  if ((_is_projected || _has_ast_filter) && names.empty()) {
+  // Projections require column names to map indices to parquet column names.
+  if (_is_projected && names.empty()) {
     throw std::runtime_error(
-      "[sirius_parquet_metadata_scan_operator] Projection and filter pushdown require column names "
-      "to be provided.");
+      "[sirius_parquet_metadata_scan_operator] Projection requires column names to be provided.");
   }
 
   // Construct a) the post_filter_projection_ids list of projection ids corresponding to columns
@@ -136,7 +125,7 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
     for (auto idx : _selected_column_indices) {
       _projected_column_names.push_back(names[idx]);
     }
-    if (_has_duckdb_filter || _has_ast_filter) {
+    if (_has_filter) {
       std::vector<std::size_t> candidate_post_filter_ids;
       for (std::size_t i = 0; i < projection_ids.size(); i++) {
         auto const projection_id = projection_ids[i];
@@ -168,9 +157,7 @@ std::optional<task_creation_hint> sirius_parquet_metadata_scan_operator::get_nex
 }
 
 bool sirius_parquet_metadata_scan_operator::all_ports_empty()
-{
-  return _next_file_idx.load(std::memory_order_relaxed) >= _total_files;
-}
+{ return _next_file_idx.load(std::memory_order_relaxed) >= _total_files; }
 
 std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::get_next_task_input_data()
 {
@@ -188,7 +175,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::get_next_t
 // execute() — metadata parsing
 //===----------------------------------------------------------------------===//
 std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
-  const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   auto const* input_ptr = dynamic_cast<const parquet_metadata_input*>(&input_data);
   if (!input_ptr) {
@@ -198,10 +185,8 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   }
   auto const& input = *input_ptr;
 
-  auto result                        = std::make_unique<partitioned_parquet_metadata>();
-  result->file_paths                 = input.file_paths;
-  result->filter_expression          = _filter_expression;
-  result->post_filter_projection_ids = _post_filter_projection_ids;
+  auto result        = std::make_unique<partitioned_parquet_metadata>();
+  result->file_paths = input.file_paths;
 
   //===----------Build reader options----------===//
   result->reader_options = std::make_shared<cudf::io::parquet_reader_options>(
@@ -216,29 +201,58 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
 #endif
   }
 
-  // Filters
-  if (_has_ast_filter) {
-    result->reader_options->set_filter(
-      std::get<std::shared_ptr<translated_expression>>(_filter_expression)->back());
+  // Filter
+  std::shared_ptr<translated_expression> ast_filter;
+  if (_has_filter) {
+    if (!_column_name_by_ref.empty()) {
+      gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+      auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+        if (ref_index >= _column_name_by_ref.size()) {
+          throw std::runtime_error(
+            "[sirius_parquet_metadata_scan_operator] Filter expression contains reference to "
+            "column index " +
+            std::to_string(ref_index) +
+            " which is out of bounds for the provided column metadata.");
+        }
+        return _column_name_by_ref[ref_index];
+      };
+      auto optional_filter =
+        translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+      if (optional_filter) {
+        ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
+        result->reader_options->set_filter(ast_filter->back());
+        result->filter_expression = ast_filter;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for "
+          "pushdown.");
+      } else {
+        result->filter_expression = _duckdb_filter_expression;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
+          "pushdown. Filter will be applied in the GPU scan operator.");
+      }
+    } else {
+      // Column names were not provided; AST translation requires column name references.
+      result->filter_expression = _duckdb_filter_expression;
+      SIRIUS_LOG_DEBUG(
+        "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
+        "translation. Filter will be applied in the GPU scan operator.");
+    }
+    result->post_filter_projection_ids = _post_filter_projection_ids;
   }
 
-  std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
-  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> footer_buffers;
-  datasources.reserve(input.file_paths.size());
-  footer_buffers.reserve(input.file_paths.size());
-
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
+  result->datasources.reserve(input.file_paths.size());
   std::size_t file_idx = 0;
   for (auto const& file_path : input.file_paths) {
     //===----------Read metadata footers----------===//
-    auto datasource = cudf::io::datasource::create(file_path);
-    datasources.push_back(std::move(datasource));
+    result->datasources.push_back(cudf::io::datasource::create(file_path));
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
 #if CUDF_VERSION_NUM >= 2604
-    footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasources.back());
+    footer_buffer = cudf::io::parquet::fetch_footer_to_host(*result->datasources.back());
 #else
-    footer_buffer = fetch_footer_to_host_fallback(*datasources.back());
+    footer_buffer = fetch_footer_to_host_fallback(*result->datasources.back());
 #endif
 
     //===----------Parse metadata----------===//
@@ -256,21 +270,21 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     //===----------Row Group Partitioning----------===//
     auto row_group_indices = reader.all_row_groups(*result->reader_options);
     // Row group pruning with filter pushdown using metadata statistics.
-    if (_has_ast_filter) {
+    if (ast_filter) {
       auto const row_groups_before_pruning = row_group_indices.size();
       // clang-format off
-      SIRIUS_LOG_DEBUG("[parquet_scan_task_global_state] Row group pruning: file: {}\n" \
+      SIRIUS_LOG_DEBUG("[sirius_parquet_metadata_scan_operator] Row group pruning: file: {}\n" \
                        "                                                         before: {}",
                        file_path,
                        row_groups_before_pruning);
       // clang-format on
       // Prune row groups with filter pushdown using metadata statistics.
-      row_group_indices = reader.filter_row_groups_with_stats(
-        row_group_indices, *result->reader_options, rmm::cuda_stream_default);
+      row_group_indices =
+        reader.filter_row_groups_with_stats(row_group_indices, *result->reader_options, stream);
       auto const row_groups_after_pruning = row_group_indices.size();
       auto const pruned_row_groups        = row_groups_before_pruning - row_groups_after_pruning;
       // clang-format off
-      SIRIUS_LOG_DEBUG("[parquet_scan_task_global_state]                    after: {} (pruned {})",
+      SIRIUS_LOG_DEBUG("[sirius_parquet_metadata_scan_operator]                    after: {} (pruned {})",
                        row_groups_after_pruning,
                        pruned_row_groups);
       // clang-format on
@@ -281,13 +295,16 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     std::vector<cudf::size_type> partition_rg_indices;
     partition_rg_indices.reserve(row_group_indices.size());
 
-    auto flush_partition = [&]() {
+    auto flush_partition = [&result,
+                            &partition_rg_indices,
+                            &partition_uncompressed_bytes,
+                            &partition_compressed_bytes,
+                            &file_idx]() {
       if (partition_rg_indices.empty()) { return; }
       result->row_group_partitions.emplace_back(file_idx,
                                                 std::move(partition_rg_indices),
                                                 partition_uncompressed_bytes,
                                                 partition_compressed_bytes);
-      partition_rg_indices.clear();
       partition_uncompressed_bytes = 0;
       partition_compressed_bytes   = 0;
     };

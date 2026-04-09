@@ -22,7 +22,6 @@
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 
 // cudf
-#include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 
 // cucascade
@@ -66,7 +65,7 @@ void sirius_gpu_parquet_scan_operator::sink(const operator_data& input_data,
 
   {
     std::lock_guard<std::mutex> lock(_metadata_mutex);
-    _accumulated_metadata.push_back(*metadata);
+    _accumulated_metadata.push_back(*metadata);  // Copy unavoidable but relatively cheap
   }
 
   SIRIUS_LOG_DEBUG(
@@ -148,7 +147,8 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_i
                                              rg_range,
                                              meta->reader_options,
                                              meta->filter_expression,
-                                             meta->post_filter_projection_ids);
+                                             meta->post_filter_projection_ids,
+                                             meta->datasources[rg_range.file_idx]);
 }
 
 //===----------------------------------------------------------------------===//
@@ -164,11 +164,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       "expected parquet_scan_data.");
   }
 
-  // If datasource has not been set by prefetcher, create it now.  The datasource
-  // field on parquet_scan_data is a mutable transport slot that may be filled by the
-  // prefetcher before execution; if it's still null, we create one from the file path.
-  auto datasource = std::move(scan_data->datasource);
-  if (!datasource) { datasource = cudf::io::datasource::create(scan_data->file_path); }
+  auto datasource = scan_data->datasource;
 
   // Build reader options for this partition's row groups.
   auto opts = *scan_data->reader_options;
