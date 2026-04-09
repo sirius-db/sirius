@@ -38,7 +38,7 @@ Any integer config value that represents bytes supports human-readable suffixes:
 | `T`, `TB` | 1000⁴ | `1T` | 1,000,000,000,000 |
 | `Ti`, `TiB` | 1024⁴ | `1Ti` | 1,099,511,627,776 |
 
-Fractional values are supported (e.g. `1.5Gi`). Follows the Kubernetes/systemd convention.
+Fractional values are supported (e.g. `1.5Gi`). Follows the [Kubernetes resource units](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#meaning-of-memory) convention.
 
 ```yaml
 sirius:

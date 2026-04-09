@@ -20,15 +20,7 @@ Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PA
 
 ## Configuration
 
-`gpu_execution` requires a config file in YAML format. Sirius searches for it in this order:
-
-1. `SIRIUS_CONFIG_FILE` environment variable (explicit path)
-2. `./sirius.yaml` in the current working directory
-3. `~/.sirius/sirius.yaml` in the user's home directory
-
-If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 4 pipeline threads, etc.). Set `SIRIUS_DISABLE=1` to prevent Sirius from initializing. Byte values support human-readable suffixes like `8Gi`, `512Mi`, `1T` (see [Configuration docs](super-sirius/configuration.md#byte-suffixes)).
-
-An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml). See the [Configuration documentation](super-sirius/configuration.md) for a full reference of all options.
+`gpu_execution` requires a config file in YAML format. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [byte suffixes](super-sirius/configuration.md#byte-suffixes). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Running
 
