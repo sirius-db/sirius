@@ -457,8 +457,15 @@ pub async fn send_exchange_with_nixl(
         tracing::info!(
             dest = %dest.brpc_addr,
             sender_id,
+            ipc_len = ipc_bytes.len(),
             "self-transfer: feeding data directly into local ExchangeBuffer"
         );
+        if ipc_bytes.is_empty() {
+            // Empty IPC: send EOS without data (0-row exchange).
+            exchange_buffer.add_block(&key, sender_id, None, true);
+            tracing::info!(dest = %dest.brpc_addr, sender_id, "self-transfer: empty IPC, sent EOS only");
+            continue;
+        }
         let (pblock, _num_rows) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&ipc_bytes)
             .map_err(|e| format!("self-transfer arrow_ipc_to_pblock: {e}"))?;
         exchange_buffer.add_block(&key, sender_id, Some(pblock), false);

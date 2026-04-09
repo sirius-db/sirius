@@ -2291,13 +2291,25 @@ impl PBackendService for PBackendServiceHandler {
                                 }
                             }
                         } else {
-                            // 3. Everything else (SORT, JOIN, plain exchange): Substrait GPU path.
+                            // 3. Everything else (SORT, JOIN, plain exchange): Substrait path.
+                            // Use CPU for exchange-only fragments (no file scans) since
+                            // GPU hangs on CPU-registered exchange tables.
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    info!("exchange fragment using GPU Substrait path");
-                                    let exec = ExecPlan::Substrait {
-                                        bytes: plan.substrait_bytes,
-                                        sort_limit_sql: plan.sort_limit_sql,
+                                    let has_file_scans = params.file_scan_params
+                                        .as_ref().map_or(false, |m| !m.is_empty());
+                                    let exec = if has_file_scans && !plan.force_cpu_substrait {
+                                        info!("exchange fragment using GPU Substrait path");
+                                        ExecPlan::Substrait {
+                                            bytes: plan.substrait_bytes,
+                                            sort_limit_sql: plan.sort_limit_sql,
+                                        }
+                                    } else {
+                                        info!("exchange fragment using CPU Substrait path (no file scans)");
+                                        ExecPlan::SubstraitCpuOnly {
+                                            bytes: plan.substrait_bytes,
+                                            sort_limit_sql: plan.sort_limit_sql,
+                                        }
                                     };
                                     (exec, Some(plan.output_names))
                                 }
@@ -2617,7 +2629,11 @@ impl PBackendService for PBackendServiceHandler {
                 match plan_translator::translate_fragment(params, &table_schemas, &file_scan_map) {
                     Ok(plan) => {
                         info!(bytes = plan.substrait_bytes.len(), has_data_tables, force_cpu = plan.force_cpu_substrait, "translated to Substrait");
-                        let exec = if plan.force_cpu_substrait || !has_data_tables {
+                        // Force CPU for exchange-only fragments (no file scans,
+                        // only exchange tables). GPU hangs on CPU-registered
+                        // exchange tables.
+                        let has_file_scans = !file_scan_infos.is_empty();
+                        let exec = if plan.force_cpu_substrait || !has_data_tables || !has_file_scans {
                             ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
                         } else {
                             ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
