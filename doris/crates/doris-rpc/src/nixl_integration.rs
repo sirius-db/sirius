@@ -346,6 +346,18 @@ pub async fn send_exchange_with_nixl(
         ExecutionLocation::Gpu { ipc_bytes, .. } => ipc_bytes.clone(),
     };
 
+    // For local 1-BE exchange, force CPU PBlock path everywhere.
+    // GPU-registered exchange tables can't be read by CPU from_substrait,
+    // and GPU Sort on packed tables hangs. PBlock decode creates proper
+    // CPU-accessible DuckDB tables that work with both CPU and GPU paths.
+    let all_local = destinations.iter().all(|d| d.brpc_addr == local_brpc_addr);
+    let location = if all_local {
+        // Strip GPU packed data, keep only IPC bytes for PBlock conversion.
+        ExecutionLocation::Cpu(ipc_bytes.clone())
+    } else {
+        location
+    };
+
     // For hash-partitioned exchange, split the data per destination first,
     // then route each partition's data to its destination (local or remote).
     if let PartitionStrategy::Hash { ref partition_exprs, num_destinations, use_crc32c } = exch_info.partition {
@@ -356,12 +368,7 @@ pub async fn send_exchange_with_nixl(
         ).await;
     }
 
-    // Extract packed info from location (if available).
-    // For self-transfer (local 1-BE), skip GPU packed paths and always use PBlock.
-    // GPU-registered exchange tables can't be read by CPU `from_substrait`, and the
-    // GPU engine hangs on Sort(Read) of packed GPU tables. PBlock decode creates
-    // proper CPU-accessible DuckDB tables that both CPU and GPU paths can handle.
-    let all_local = destinations.iter().all(|d| d.brpc_addr == local_brpc_addr);
+    let all_local = true; // already computed above
     let (packed_metadata, buffers, packed_broadcast) = if all_local {
         // Force PBlock path for local exchange.
         (None, &[][..], &[][..])
