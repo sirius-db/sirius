@@ -2301,9 +2301,9 @@ impl PBackendService for PBackendServiceHandler {
                             // GPU hangs on CPU-registered exchange tables.
                             match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                 Ok(plan) => {
-                                    let has_file_scans = params.file_scan_params
-                                        .as_ref().map_or(false, |m| !m.is_empty());
-                                    let exec = if has_file_scans && !plan.force_cpu_substrait {
+                                    // Use GPU if the exchange tables are GPU-registered,
+                                    // CPU if they're CPU-registered (PBlock decode).
+                                    let exec = if !any_gpu_registration_failed && !plan.force_cpu_substrait {
                                         info!("exchange fragment using GPU Substrait path");
                                         ExecPlan::Substrait {
                                             bytes: plan.substrait_bytes,
