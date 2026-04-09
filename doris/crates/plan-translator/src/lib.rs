@@ -484,55 +484,6 @@ pub fn translate_fragment(
     // (e.g., `l_extendedprice * (1 - l_discount)`) by inlining the projection expressions.
     build_projection_slot_map(plan, &mut desc);
 
-    // Propagate captured computed expressions to output_exprs pass-through slots.
-    // After fragment merging, output_exprs reference coordinator tuple slots (e.g., 164)
-    // which are positional pass-throughs of intermediate tuple slots (e.g., 162 = division).
-    // Match by (tuple_len, position) but ONLY non-trivial expressions (>1 node = computed).
-    if let Some(output_exprs) = fragment.output_exprs.as_ref() {
-        for expr in output_exprs {
-            if let Some(sr) = expr.nodes.first().and_then(|n| n.slot_ref.as_ref()) {
-                if desc.get_slot_expression(sr.slot_id).is_some() {
-                    continue; // already has expression
-                }
-                if let Ok(slot) = desc.get_slot(sr.slot_id) {
-                    if let Ok(tuple) = desc.get_tuple(slot.parent_tuple_id) {
-                        let mat: Vec<i32> = tuple
-                            .slot_ids
-                            .iter()
-                            .copied()
-                            .filter(|&s| {
-                                desc.get_slot(s)
-                                    .map(|sl| sl.is_materialized)
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-                        if let Some(pos) = mat.iter().position(|&s| s == sr.slot_id) {
-                            if let Some(found) =
-                                desc.find_nontrivial_expression_by_position(pos, mat.len())
-                            {
-                                tracing::warn!(
-                                    slot = sr.slot_id,
-                                    pos,
-                                    tuple_len = mat.len(),
-                                    "propagated computed expression to output_exprs slot"
-                                );
-                                desc.add_slot_expression(sr.slot_id, found);
-                            } else {
-                                tracing::warn!(
-                                    slot = sr.slot_id,
-                                    pos,
-                                    tuple_len = mat.len(),
-                                    num_exprs = desc.slot_expression_count(),
-                                    "NO nontrivial match found at position"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     let mut registry = ExtensionRegistry::new();
 
     // Translate the plan tree into a Substrait Rel tree.
