@@ -105,6 +105,15 @@ class pipelineable_operator_data : public operator_data {
   }
 
   /**
+   * @brief Move the data batches out of this container, leaving it empty.
+   * @return Vector of data batch pointers (moved out).
+   */
+  std::vector<std::shared_ptr<::cucascade::data_batch>> release_data_batches()
+  {
+    return std::move(_data_batches);
+  }
+
+  /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
    * Iterates over all batches and locks (or converts then locks) each one into the
