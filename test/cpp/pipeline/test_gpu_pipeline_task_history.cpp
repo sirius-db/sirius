@@ -184,11 +184,13 @@ struct pipeline_context {
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  ctx.db       = std::make_unique<duckdb::DuckDB>(nullptr);
-  ctx.con      = std::make_unique<duckdb::Connection>(*ctx.db);
-  ctx.iface    = std::make_unique<sirius::sirius_interface>(*ctx.con->context);
-  ctx.engine   = std::make_unique<sirius::sirius_engine>(*ctx.con->context, *ctx.iface);
-  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(*ctx.engine);
+  ctx.db     = std::make_unique<duckdb::DuckDB>(nullptr);
+  ctx.con    = std::make_unique<duckdb::Connection>(*ctx.db);
+  ctx.iface  = std::make_unique<sirius::sirius_interface>(*ctx.con->context);
+  ctx.engine = std::make_unique<sirius::sirius_engine>(*ctx.con->context, *ctx.iface);
+  static sirius::pipeline::pipeline_build_context build_ctx{true};
+  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline->set_client_context(*ctx.con->context);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_op = std::make_unique<stub_operator>();
 
