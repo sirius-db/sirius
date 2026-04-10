@@ -126,12 +126,16 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-# Queries where scan results must be cached in host instead of GPU (too large to fit in GPU memory).
-# Only needed at SF1000+; at smaller scale factors everything fits in GPU memory.
-if [ "$SF" -ge 1000 ] 2>/dev/null; then
-    HOST_CACHE_QUERIES="1 7 9 10 17 18 19 21"
-else
-    HOST_CACHE_QUERIES=""
+# Load per-query scan cache level overrides from config file.
+# Format: <query_number> <cache_level> (one per line, # comments ignored).
+# Queries not listed use the default (table_gpu).
+CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.conf"
+declare -A QUERY_CACHE_LEVEL
+if [ "$SF" -ge 1000 ] 2>/dev/null && [ -f "$CACHE_CONFIG" ]; then
+    while IFS=' ' read -r qnum level; do
+        [[ -z "$qnum" || "$qnum" == \#* ]] && continue
+        QUERY_CACHE_LEVEL[$qnum]="$level"
+    done < "$CACHE_CONFIG"
 fi
 
 # Build list of valid queries (those with existing SQL files).
@@ -183,14 +187,8 @@ run_single_session() {
         # Set per-query scan cache level.  Bracket the SET with .timer off/on
         # so it doesn't produce a spurious "Run Time" line in the output.
         if [ "$ENGINE" = "sirius" ]; then
-            if [ -n "$SCAN_CACHE_LEVEL" ]; then
-                # Explicit --cache-level overrides all per-query defaults
-                printf ".timer off\nSET scan_cache_level = '%s';\n.timer on\n" "$SCAN_CACHE_LEVEL" >> "$TEMP_SQL"
-            elif echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
-                printf ".timer off\nSET scan_cache_level = 'table_host';\n.timer on\n" >> "$TEMP_SQL"
-            else
-                printf ".timer off\nSET scan_cache_level = 'table_gpu';\n.timer on\n" >> "$TEMP_SQL"
-            fi
+            local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
+            printf ".timer off\nSET scan_cache_level = '%s';\n.timer on\n" "$qlevel" >> "$TEMP_SQL"
         fi
         echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
         # N iterations back-to-back — nothing between them.
@@ -346,14 +344,8 @@ run_multi_session() {
         {
             printf '%s\n' "$VIEW_SQL"
             if [ "$ENGINE" = "sirius" ]; then
-                if [ -n "$SCAN_CACHE_LEVEL" ]; then
-                    # Explicit --cache-level overrides all per-query defaults
-                    printf "SET scan_cache_level = '%s';\n" "$SCAN_CACHE_LEVEL"
-                elif echo " $HOST_CACHE_QUERIES " | grep -q " $q "; then
-                    printf "SET scan_cache_level = 'table_host';\n"
-                else
-                    printf "SET scan_cache_level = 'table_gpu';\n"
-                fi
+                local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
+                printf "SET scan_cache_level = '%s';\n" "$qlevel"
             fi
             printf ".timer on\n"
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
