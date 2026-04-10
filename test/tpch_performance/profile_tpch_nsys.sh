@@ -7,7 +7,7 @@
 # share a single nsys capture.
 #
 # Usage:
-#   export SIRIUS_CONFIG_FILE=/path/to/config.cfg
+#   export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 #   ./test/tpch_performance/profile_tpch_nsys.sh <scale_factor> [query_numbers...]
 #
 # If no query numbers are given, queries 1-22 are attempted.

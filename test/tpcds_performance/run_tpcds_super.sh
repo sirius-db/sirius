@@ -72,7 +72,7 @@ mkdir -p "$OUTPUT_DIR"
 if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
     echo "ERROR: SIRIUS_CONFIG_FILE is not set."
     echo "Super Sirius (gpu_execution) requires a config file."
-    echo "Usage: export SIRIUS_CONFIG_FILE=/path/to/config.cfg"
+    echo "Usage: export SIRIUS_CONFIG_FILE=/path/to/config.yaml"
     exit 1
 fi
 

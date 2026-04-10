@@ -15,9 +15,9 @@
  */
 
 #include "catch.hpp"
-#include "config_option.hpp"
+#include "yaml_reader.hpp"
 
-#include <libconfig.h++>
+#include <yaml-cpp/yaml.h>
 
 #include <cstdlib>
 #include <exception>
@@ -25,296 +25,230 @@
 #include <stdexcept>
 #include <variant>
 
-TEST_CASE("use configuration basic setters", "[config_opt][basic]")
+using namespace sirius;
+
+TEST_CASE("yaml reader basic types", "[config_opt][basic]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
+  auto node = YAML::Load(R"(
+    int_value: 100
+    double_value: 6.28
+    string_value: "config setter test"
+  )");
+
   int int_value       = 0;
   double double_value = 0.0;
   std::string string_value;
-  setter.add_config("int_value", int_value);
-  setter.add_config("double_value", double_value);
-  setter.add_config("string_value", string_value);
 
-  // Create a libconfig config object
-  libconfig::Config libconfig;
-  libconfig.readString(R"(
-          int_value = 100;
-          double_value = 6.28;
-          string_value = "config setter test";
-    )");
-
-  try {
-    setter.apply(libconfig.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
-
-  REQUIRE(int_value == 100);
-  REQUIRE(double_value == Approx(6.28));
-  REQUIRE(string_value == "config setter test");
-
-  libconfig::Config root;
-  setter.write(root.getRoot());
-
-  // reset values and test write
-  int_value    = 0;
-  double_value = 0.0;
-  string_value = "";
-
-  try {
-    setter.apply(root.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
+  yaml::reader r(node);
+  r.optional("int_value", int_value);
+  r.optional("double_value", double_value);
+  r.optional("string_value", string_value);
+  r.reject_unknown();
 
   REQUIRE(int_value == 100);
   REQUIRE(double_value == Approx(6.28));
   REQUIRE(string_value == "config setter test");
 }
 
-TEST_CASE("use configuration basic optional setters", "[config_opt][optional]")
+TEST_CASE("yaml reader optional missing field uses default", "[config_opt][optional]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
-  std::optional<int> int_value = std::nullopt;
-  setter.add_optional_config("int_value", int_value);
+  auto node = YAML::Load("int_value: 100");
 
-  // Create a libconfig config object
-  libconfig::Config libconfig;
-  libconfig.readString(R"(
-          int_value = 100;
-          double_value = 6.28;
-          string_value = "config setter test";
-    )");
+  int int_value       = 0;
+  double double_value = 3.14;  // should remain unchanged
 
-  try {
-    setter.apply(libconfig.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
+  yaml::reader r(node);
+  r.optional("int_value", int_value);
+  r.optional("double_value", double_value);
+  r.reject_unknown();
 
-  REQUIRE(int_value.value() == 100);
-
-  int_value.reset();
-  libconfig::Config root;
-  setter.write(root.getRoot());
-
-  // reset values and test write
-
-  try {
-    setter.apply(root.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
-
-  REQUIRE_FALSE(int_value.has_value());
+  REQUIRE(int_value == 100);
+  REQUIRE(double_value == 3.14);
 }
 
-TEST_CASE("use configuration basic variant setters", "[config_opt][variant]")
+TEST_CASE("yaml reader required field throws if missing", "[config_opt][required]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
-  std::variant<std::monostate, int, double, std::string> one_of_options;
-  setter.add_variant_config<int>("int_value", one_of_options);
-  setter.add_variant_config<double>("double_value", one_of_options);
-  setter.add_variant_config<std::string>("string_value", one_of_options);
+  auto node = YAML::Load("int_value: 100");
 
-  {  // Create a libconfig config object
-    one_of_options = std::monostate{};
-    libconfig::Config libconfig;
-    libconfig.readString(R"(
-          int_value = 100;
-    )");
-
-    try {
-      setter.apply(libconfig.getRoot());
-    } catch (const std::exception& e) {
-      std::cerr << "Setting not found: " << e.what() << std::endl;
-    }
-
-    REQUIRE(std::get<int>(one_of_options) == 100);
-  }
-  {  // Create a libconfig config object
-    one_of_options = std::monostate{};
-    libconfig::Config libconfig;
-    libconfig.readString(R"(
-          double_value = 10.20;
-    )");
-
-    try {
-      setter.apply(libconfig.getRoot());
-    } catch (const std::exception& e) {
-      std::cerr << "Setting not found: " << e.what() << std::endl;
-    }
-
-    REQUIRE(std::get<double>(one_of_options) == 10.20);
-  }
-  {  // Create a libconfig config object
-    one_of_options = std::monostate{};
-    libconfig::Config libconfig;
-    libconfig.readString(R"(
-          string_value = "test string";
-    )");
-
-    try {
-      setter.apply(libconfig.getRoot());
-    } catch (const std::exception& e) {
-      std::cerr << "Setting not found: " << e.what() << std::endl;
-    }
-
-    REQUIRE(std::get<std::string>(one_of_options) == "test string");
-  }
-}
-
-TEST_CASE("use configuration basic setters with condition", "[config_opt][conditional]")
-{
-  using namespace sirius;
-  config::configuration_setter setter;
   int int_value = 0;
-  setter.add_config("int_value", int_value, sirius::config::greater_than<int>{150});
+  std::string name;
 
-  // Create a libconfig config object
-  libconfig::Config libconfig;
-  libconfig.readString(R"(
-          int_value = 100;
-          double_value = 6.28;
-          string_value = "config setter test";
-    )");
-
-  REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
-  REQUIRE(int_value == 0);  // value should not be changed due to validation failure
+  yaml::reader r(node);
+  r.optional("int_value", int_value);
+  REQUIRE_THROWS_AS(r.required("name", name), std::runtime_error);
 }
 
-TEST_CASE("use configuration array setters", "[config_opt][array]")
+TEST_CASE("yaml reader validation rejects out-of-range", "[config_opt][conditional]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
+  auto node = YAML::Load("value: 100");
+
+  int value = 0;
+  yaml::reader r(node);
+  REQUIRE_THROWS_AS(r.optional("value", value, yaml::greater_than<int>{150}), std::runtime_error);
+  REQUIRE(value == 0);  // value should not be changed due to validation failure
+}
+
+TEST_CASE("yaml reader validation with fraction", "[config_opt][conditional]")
+{
+  auto node = YAML::Load("f: 1.5");
+  double f  = 0.5;
+
+  yaml::reader r(node);
+  REQUIRE_THROWS_AS(r.optional("f", f, yaml::fraction<double>{}), std::runtime_error);
+  REQUIRE(f == 0.5);  // unchanged
+}
+
+TEST_CASE("yaml reader byte suffix parsing", "[config_opt][bytes]")
+{
+  SECTION("plain integers work with bytes()")
+  {
+    auto node          = YAML::Load("size: 1024");
+    std::uint64_t size = 0;
+    yaml::reader r(node);
+    r.optional("size", yaml::bytes(size));
+    REQUIRE(size == 1024);
+  }
+
+  SECTION("binary suffixes (Ki/KiB = 1024)")
+  {
+    auto node       = YAML::Load(R"(a: "4Ki"
+b: "4KiB"
+c: "1GiB"
+d: "2MiB")");
+    std::uint64_t a = 0, b = 0, c = 0, d = 0;
+    yaml::reader r(node);
+    r.optional("a", yaml::bytes(a));
+    r.optional("b", yaml::bytes(b));
+    r.optional("c", yaml::bytes(c));
+    r.optional("d", yaml::bytes(d));
+    REQUIRE(a == 4 * 1024ULL);
+    REQUIRE(b == 4 * 1024ULL);
+    REQUIRE(c == 1ULL * 1024 * 1024 * 1024);
+    REQUIRE(d == 2ULL * 1024 * 1024);
+  }
+
+  SECTION("decimal suffixes (K/KB/G/GB = 1000)")
+  {
+    auto node       = YAML::Load(R"(a: "4K"
+b: "4KB"
+c: "1G"
+d: "1T")");
+    std::uint64_t a = 0, b = 0, c = 0, d = 0;
+    yaml::reader r(node);
+    r.optional("a", yaml::bytes(a));
+    r.optional("b", yaml::bytes(b));
+    r.optional("c", yaml::bytes(c));
+    r.optional("d", yaml::bytes(d));
+    REQUIRE(a == 4000ULL);
+    REQUIRE(b == 4000ULL);
+    REQUIRE(c == 1000ULL * 1000 * 1000);
+    REQUIRE(d == 1000ULL * 1000 * 1000 * 1000);
+  }
+
+  SECTION("fractional values")
+  {
+    auto node        = YAML::Load(R"(si: "1.5G"
+bi: "1.5Gi")");
+    std::uint64_t si = 0, bi = 0;
+    yaml::reader r(node);
+    r.optional("si", yaml::bytes(si));
+    r.optional("bi", yaml::bytes(bi));
+    REQUIRE(si == static_cast<std::uint64_t>(1.5 * 1000 * 1000 * 1000));
+    REQUIRE(bi == static_cast<std::uint64_t>(1.5 * 1024 * 1024 * 1024));
+  }
+
+  SECTION("string suffix on plain integer field is rejected")
+  {
+    auto node = YAML::Load(R"(count: "4Ki")");
+    int count = 0;
+    yaml::reader r(node);
+    REQUIRE_THROWS(r.optional("count", count));
+  }
+
+  SECTION("invalid suffix throws")
+  {
+    auto node          = YAML::Load(R"(size: "8X")");
+    std::uint64_t size = 0;
+    yaml::reader r(node);
+    REQUIRE_THROWS_AS(r.optional("size", size), std::runtime_error);
+  }
+}
+
+TEST_CASE("yaml reader arrays", "[config_opt][array]")
+{
+  auto node = YAML::Load(R"(
+    int_value: [1, 2, 3, 4, 5]
+    double_value: [6.28, 3.14]
+    string_value: ["config setter test", "another string"]
+  )");
+
   std::vector<int> int_values;
   std::vector<double> double_values;
   std::vector<std::string> string_values;
-  setter.add_config("int_value", int_values);
-  setter.add_config("double_value", double_values);
-  setter.add_config("string_value", string_values);
-  // Create a libconfig config object
-  libconfig::Config libconfig;
-  libconfig.readString(R"(
-          int_value = [1, 2, 3, 4, 5];
-          double_value = [6.28, 3.14];
-          string_value = ["config setter test", "another string"];
-    )");
 
-  try {
-    setter.apply(libconfig.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
+  yaml::reader r(node);
+  r.optional("int_value", int_values);
+  r.optional("double_value", double_values);
+  r.optional("string_value", string_values);
+  r.reject_unknown();
 
   REQUIRE(int_values == std::vector<int>{1, 2, 3, 4, 5});
   REQUIRE(double_values == std::vector<double>{6.28, 3.14});
   REQUIRE(string_values == std::vector<std::string>{"config setter test", "another string"});
-
-  libconfig::Config root;
-  setter.write(root.getRoot());
-
-  int_values.clear();
-  double_values.clear();
-  string_values.clear();
-
-  try {
-    setter.apply(root.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
-
-  CHECK(int_values == std::vector<int>{1, 2, 3, 4, 5});
-  CHECK(double_values == std::vector<double>{6.28, 3.14});
-  CHECK(string_values == std::vector<std::string>{"config setter test", "another string"});
 }
+
+// ================ Struct with from_yaml ================= //
 
 struct complex_config {
   int int_value   = 0;
   bool bool_value = false;
   std::vector<std::string> string_values;
-};
 
-template <>
-struct sirius::config::custom_config_registrar<complex_config> {
-  static void config(sirius::config::configuration_setter& setter, complex_config& opt)
+  static void from_yaml(const YAML::Node& node, complex_config& opt)
   {
-    setter.add_config("int_value", opt.int_value);
-    setter.add_config("bool_value", opt.bool_value);
-    setter.add_config("string_values", opt.string_values);
+    yaml::reader r(node);
+    r.optional("int_value", opt.int_value);
+    r.optional("bool_value", opt.bool_value);
+    r.optional("string_values", opt.string_values);
+    r.reject_unknown();
   }
 };
 
-TEST_CASE("use configuration class setters with registered type", "[config_opt][complex]")
+TEST_CASE("yaml reader nested struct via from_yaml", "[config_opt][complex]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
+  auto node = YAML::Load(R"(
+    cfg:
+      int_value: 100
+      bool_value: true
+      string_values: ["config setter test", "another string"]
+  )");
+
   complex_config cfg;
-  setter.add_config("cfg", cfg);
-  // Create a libconfig config object
-  libconfig::Config libconfig;
-  libconfig.readString(R"(
-          cfg = {
-            int_value = 100;
-            bool_value = true;
-            string_values = ["config setter test", "another string"];
-          };
-    )");
-
-  try {
-    setter.apply(libconfig.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
-
-  REQUIRE(cfg.int_value == 100);
-  REQUIRE(cfg.bool_value == true);
-  REQUIRE(cfg.string_values == std::vector<std::string>{"config setter test", "another string"});
-
-  libconfig::Config root;
-  setter.write(root.getRoot());
-  cfg = complex_config{};
-  try {
-    setter.apply(root.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
+  yaml::reader r(node);
+  r.optional("cfg", cfg);
+  r.reject_unknown();
 
   REQUIRE(cfg.int_value == 100);
   REQUIRE(cfg.bool_value == true);
   REQUIRE(cfg.string_values == std::vector<std::string>{"config setter test", "another string"});
 }
 
-TEST_CASE("use configuration class setters array  with registered type", "[config_opt][complex]")
+TEST_CASE("yaml reader list of structs", "[config_opt][complex]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
+  auto node = YAML::Load(R"(
+    cfgs:
+      - int_value: 100
+        bool_value: true
+        string_values: ["config setter test", "another string"]
+      - int_value: 200
+        bool_value: false
+        string_values: ["second config", "more strings"]
+  )");
+
   std::vector<complex_config> cfgs;
-  setter.add_config("cfgs", cfgs);
-  // Create a libconfig config object
-  libconfig::Config libconfig;
-  try {
-    libconfig.readString(R"(
-        cfgs = (
-          {
-            int_value = 100;
-            bool_value = true;
-            string_values = ["config setter test", "another string"];
-          },
-          {
-            int_value = 200;
-            bool_value = false;
-            string_values = ["second config", "more strings"];
-          }
-        );
-    )");
-    setter.apply(libconfig.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
+  yaml::reader r(node);
+  r.optional("cfgs", cfgs);
+  r.reject_unknown();
 
   REQUIRE(cfgs.size() == 2);
   REQUIRE(cfgs[0].int_value == 100);
@@ -325,6 +259,9 @@ TEST_CASE("use configuration class setters array  with registered type", "[confi
   REQUIRE(cfgs[1].bool_value == false);
   REQUIRE(cfgs[1].string_values == std::vector<std::string>{"second config", "more strings"});
 }
+
+// ================ Enums ================= //
+
 namespace ee {
 
 enum class fruit { apple, banana, orange };
@@ -362,26 +299,20 @@ bool enum_to_string(color c, std::string& sv)
 }
 }  // namespace ee
 
-TEST_CASE("use configuration class setters custom array of enum", "[config_opt][enum]")
+TEST_CASE("yaml reader enum arrays", "[config_opt][enum]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
+  auto node = YAML::Load(R"(
+    colors: ["red", "green", "blue"]
+    fruits: [0, 1, 2]
+  )");
+
   std::vector<ee::color> colors;
   std::vector<ee::fruit> fruits;
 
-  setter.add_config("colors", colors);
-  setter.add_config("fruits", fruits);
-
-  libconfig::Config libconfig;
-  try {
-    libconfig.readString(R"(
-        colors = ["red", "green", "blue"];
-        fruits = [0, 1 ,2];
-    )");
-    setter.apply(libconfig.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
+  yaml::reader r(node);
+  r.optional("colors", colors);
+  r.optional("fruits", fruits);
+  r.reject_unknown();
 
   REQUIRE(colors.size() == 3);
   REQUIRE(colors[0] == ee::color::red);
@@ -394,456 +325,121 @@ TEST_CASE("use configuration class setters custom array of enum", "[config_opt][
   REQUIRE(fruits[2] == ee::fruit::orange);
 }
 
+// ================ Nested structs ================= //
+
 struct nested_config {
   int int_value = 0;
   complex_config cfg;
-};
 
-template <>
-struct sirius::config::custom_config_registrar<nested_config> {
-  static void config(sirius::config::configuration_setter& setter, nested_config& opt)
+  static void from_yaml(const YAML::Node& node, nested_config& opt)
   {
-    setter.add_config("int_value", opt.int_value);
-    setter.add_config("inner", opt.cfg);
+    yaml::reader r(node);
+    r.optional("int_value", opt.int_value);
+    r.optional("inner", opt.cfg);
+    r.reject_unknown();
   }
 };
 
-TEST_CASE("use configuration class setters nested  with registered type", "[config_opt][nested]")
+TEST_CASE("yaml reader deeply nested struct", "[config_opt][nested]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
+  auto node = YAML::Load(R"(
+    cfg:
+      int_value: 100
+      inner:
+        int_value: 200
+        bool_value: true
+        string_values: ["nested config test", "another nested string"]
+  )");
+
   nested_config cfg;
-  setter.add_config("cfg", cfg);
-  // Create a libconfig config object
-  libconfig::Config libconfig;
-  try {
-    libconfig.readString(R"(
-        cfg =
-          {
-            int_value = 100;
-            inner = {
-              int_value = 200;
-              bool_value = true;
-              string_values = ["nested config test", "another nested string"];
-    };
-          };
-    )");
-    setter.apply(libconfig.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
+  yaml::reader r(node);
+  r.optional("cfg", cfg);
+  r.reject_unknown();
 
   REQUIRE(cfg.int_value == 100);
   REQUIRE(cfg.cfg.int_value == 200);
   REQUIRE(cfg.cfg.bool_value == true);
   REQUIRE(cfg.cfg.string_values ==
           std::vector<std::string>{"nested config test", "another nested string"});
-
-  // Test writing back
-  libconfig::Config root;
-  setter.write(root.getRoot());
-  cfg = nested_config{};
-  try {
-    setter.apply(root.getRoot());
-  } catch (const std::exception& e) {
-    std::cerr << "Setting not found: " << e.what() << std::endl;
-  }
-  REQUIRE(cfg.int_value == 100);
-  REQUIRE(cfg.cfg.int_value == 200);
-  REQUIRE(cfg.cfg.bool_value == true);
-  REQUIRE(cfg.cfg.string_values ==
-          std::vector<std::string>{"nested config test", "another nested string"});
 }
 
-TEST_CASE("use env variable to set variables of a registered class", "[config_opt][required]")
+// ================ Unknown key detection ================= //
+
+TEST_CASE("yaml reader rejects unknown keys", "[config_opt][unregistered]")
 {
-  using namespace sirius;
-  config::configuration_setter setter;
-  ee::color favorite_color = ee::color::red;
-  int int_value            = 0;
-  setter.add_config("favorite_color", favorite_color, config::config_requirement::required);
-  setter.add_config("int_value", int_value);
-
-  libconfig::Config libconfig;
-  libconfig.readString(R"(
-        int_value = 100;
-    )");
-
-  REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::exception);
-}
-
-TEST_CASE("use nested naming with config", "[config_opt][nested_naming]")
-{
-  using namespace sirius;
-  config::configuration_setter setter;
-  ee::color favorite_color = ee::color::red;
-  int int_value            = 0;
-  setter.add_config("color.favorite", favorite_color, config::config_requirement::required);
-  setter.add_config("int.value", int_value);
-
-  libconfig::Config libconfig;
-  libconfig.readString(R"(
-        int = {
-          value = 100;
-        };
-        color = {
-          favorite = "green";
-        };
-    )");
-
-  setter.apply(libconfig.getRoot());
-
-  REQUIRE(int_value == 100);
-  REQUIRE(favorite_color == ee::color::green);
-}
-
-TEST_CASE("unregistered config key throws runtime_error", "[config_opt][unregistered]")
-{
-  using namespace sirius;
-
   SECTION("single unregistered key throws")
   {
-    config::configuration_setter setter;
-    int int_value = 0;
-    setter.add_config("int_value", int_value);
-
-    libconfig::Config libconfig;
-    libconfig.readString(R"(
-        int_value = 42;
-        unknown_key = "surprise";
+    auto node = YAML::Load(R"(
+      int_value: 42
+      unknown_key: "surprise"
     )");
 
-    REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
+    int int_value = 0;
+    yaml::reader r(node);
+    r.optional("int_value", int_value);
+    REQUIRE_THROWS_AS(r.reject_unknown(), std::runtime_error);
   }
 
   SECTION("all keys registered does not throw")
   {
-    config::configuration_setter setter;
+    auto node = YAML::Load(R"(
+      int_value: 42
+      double_value: 3.14
+    )");
+
     int int_value       = 0;
     double double_value = 0.0;
-    setter.add_config("int_value", int_value);
-    setter.add_config("double_value", double_value);
-
-    libconfig::Config libconfig;
-    libconfig.readString(R"(
-        int_value = 42;
-        double_value = 3.14;
-    )");
-
-    REQUIRE_NOTHROW(setter.apply(libconfig.getRoot()));
-  }
-
-  SECTION("unregistered key in dotted-path group throws")
-  {
-    config::configuration_setter setter;
-    int value = 0;
-    setter.add_config("group.value", value);
-
-    libconfig::Config libconfig;
-    libconfig.readString(R"(
-        group = { value = 10; };
-        rogue = 99;
-    )");
-
-    REQUIRE_THROWS_AS(setter.apply(libconfig.getRoot()), std::runtime_error);
+    yaml::reader r(node);
+    r.optional("int_value", int_value);
+    r.optional("double_value", double_value);
+    REQUIRE_NOTHROW(r.reject_unknown());
   }
 }
 
-// Test iterable config with element-level validation
-TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
+TEST_CASE("yaml reader nested struct rejects unknown keys", "[config_opt][unknown_key]")
 {
-  using namespace sirius;
-  SECTION("Valid elements pass validation")
-  {
-    // Create a simple config with a vector of positive integers
-    libconfig::Config cfg;
-    cfg.getRoot().add("numbers", libconfig::Setting::TypeArray);
-    auto& numbers_setting                            = cfg.getRoot()["numbers"];
-    numbers_setting.add(libconfig::Setting::TypeInt) = 1;
-    numbers_setting.add(libconfig::Setting::TypeInt) = 5;
-    numbers_setting.add(libconfig::Setting::TypeInt) = 10;
+  auto node = YAML::Load(R"(
+    cfg:
+      int_value: 100
+      typo_field: 999
+  )");
 
-    std::vector<int> numbers;
-    config::configuration_setter setter;
-
-    // Add config with predicate that requires positive numbers
-    setter.add_config("numbers", numbers, [](const int& val) { return val > 0; });
-
-    // This should succeed
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(numbers.size() == 3);
-    REQUIRE(numbers[0] == 1);
-    REQUIRE(numbers[1] == 5);
-    REQUIRE(numbers[2] == 10);
-  }
-
-  SECTION("Invalid element fails validation")
-  {
-    // Create a config with a vector containing a negative number
-    libconfig::Config cfg;
-    cfg.getRoot().add("numbers", libconfig::Setting::TypeArray);
-    auto& numbers_setting                            = cfg.getRoot()["numbers"];
-    numbers_setting.add(libconfig::Setting::TypeInt) = 1;
-    numbers_setting.add(libconfig::Setting::TypeInt) = -5;  // Invalid
-    numbers_setting.add(libconfig::Setting::TypeInt) = 10;
-
-    std::vector<int> numbers;
-    config::configuration_setter setter;
-
-    // Add config with predicate that requires positive numbers
-    setter.add_config("numbers", numbers, [](const int& val) { return val > 0; });
-
-    // This should throw because -5 fails validation
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
-  }
-
-  SECTION("Element validation with custom predicate")
-  {
-    // Test with greater_than validator
-    libconfig::Config cfg;
-    cfg.getRoot().add("scores", libconfig::Setting::TypeArray);
-    auto& scores_setting                            = cfg.getRoot()["scores"];
-    scores_setting.add(libconfig::Setting::TypeInt) = 50;
-    scores_setting.add(libconfig::Setting::TypeInt) = 75;
-    scores_setting.add(libconfig::Setting::TypeInt) = 100;
-
-    std::vector<int> scores;
-    config::configuration_setter setter;
-
-    // Use greater_than validator
-    setter.add_config("scores", scores, sirius::config::greater_than<int>{40});
-
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(scores.size() == 3);
-  }
-
-  SECTION("Element validation with fraction predicate on doubles")
-  {
-    // Test with fraction validator (0.0 to 1.0)
-    libconfig::Config cfg;
-    cfg.getRoot().add("fractions", libconfig::Setting::TypeArray);
-    auto& fractions_setting                              = cfg.getRoot()["fractions"];
-    fractions_setting.add(libconfig::Setting::TypeFloat) = 0.0;
-    fractions_setting.add(libconfig::Setting::TypeFloat) = 0.5;
-    fractions_setting.add(libconfig::Setting::TypeFloat) = 1.0;
-
-    std::vector<double> fractions;
-    config::configuration_setter setter;
-
-    setter.add_config("fractions", fractions, sirius::config::fraction<double>{});
-
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(fractions.size() == 3);
-    REQUIRE(fractions[0] == 0.0);
-    REQUIRE(fractions[1] == 0.5);
-    REQUIRE(fractions[2] == 1.0);
-  }
-
-  SECTION("Element validation fails for out-of-range fraction")
-  {
-    libconfig::Config cfg;
-    cfg.getRoot().add("fractions", libconfig::Setting::TypeArray);
-    auto& fractions_setting                              = cfg.getRoot()["fractions"];
-    fractions_setting.add(libconfig::Setting::TypeFloat) = 0.5;
-    fractions_setting.add(libconfig::Setting::TypeFloat) = 1.5;  // Invalid > 1.0
-
-    std::vector<double> fractions;
-    config::configuration_setter setter;
-
-    setter.add_config("fractions", fractions, sirius::config::fraction<double>{});
-
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
-  }
+  complex_config cfg;
+  yaml::reader r(node);
+  REQUIRE_THROWS_AS(r.optional("cfg", cfg), std::runtime_error);
 }
 
-// Test variant config with validation
-TEST_CASE("Variant config validates the value", "[config_opt][validation][variant]")
+// ================ optional_node ================= //
+
+TEST_CASE("yaml reader optional_node", "[config_opt][optional_node]")
 {
-  using namespace sirius;
-  SECTION("Valid variant value passes validation")
-  {
-    // Create a config with a port number (int)
-    libconfig::Config cfg;
-    cfg.getRoot().add("port", libconfig::Setting::TypeInt) = 8080;
+  auto node = YAML::Load(R"(
+    present: 42
+  )");
 
-    std::variant<int, std::string> port_or_name;
-    config::configuration_setter setter;
+  yaml::reader r(node);
+  auto present = r.optional_node("present");
+  auto missing = r.optional_node("missing");
+  r.reject_unknown();
 
-    // Add variant config with predicate that requires valid port range
-    setter.add_variant_config<int>(
-      "port", port_or_name, [](const int& val) { return val > 0 && val <= 65535; });
-
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(std::holds_alternative<int>(port_or_name));
-    REQUIRE(std::get<int>(port_or_name) == 8080);
-  }
-
-  SECTION("Invalid variant value fails validation")
-  {
-    // Create a config with an invalid port number
-    libconfig::Config cfg;
-    cfg.getRoot().add("port", libconfig::Setting::TypeInt) = 99999;  // Invalid port > 65535
-
-    std::variant<int, std::string> port_or_name;
-    config::configuration_setter setter;
-
-    // Add variant config with predicate that requires valid port range
-    setter.add_variant_config<int>(
-      "port", port_or_name, [](const int& val) { return val > 0 && val <= 65535; });
-
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
-  }
-
-  SECTION("Variant with string alternative and validation")
-  {
-    // Create a config with a string that must be non-empty
-    libconfig::Config cfg;
-    cfg.getRoot().add("name", libconfig::Setting::TypeString) = "localhost";
-
-    std::variant<int, std::string> port_or_name;
-    config::configuration_setter setter;
-
-    // Add variant config with predicate that requires non-empty string
-    setter.add_variant_config<std::string>(
-      "name", port_or_name, [](const std::string& val) { return !val.empty(); });
-
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(std::holds_alternative<std::string>(port_or_name));
-    REQUIRE(std::get<std::string>(port_or_name) == "localhost");
-  }
-
-  SECTION("Variant with empty string fails validation")
-  {
-    libconfig::Config cfg;
-    cfg.getRoot().add("name", libconfig::Setting::TypeString) = "";
-
-    std::variant<int, std::string> port_or_name;
-    config::configuration_setter setter;
-
-    setter.add_variant_config<std::string>(
-      "name", port_or_name, [](const std::string& val) { return !val.empty(); });
-
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
-  }
-
-  SECTION("Variant with between validator")
-  {
-    libconfig::Config cfg;
-    cfg.getRoot().add("percentage", libconfig::Setting::TypeInt) = 75;
-
-    std::variant<int, double, std::string> value;
-    config::configuration_setter setter;
-
-    // Use between validator for percentage (0-100)
-    setter.add_variant_config<int>("percentage", value, config::between<int>{0, 100});
-
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(std::holds_alternative<int>(value));
-    REQUIRE(std::get<int>(value) == 75);
-  }
-
-  SECTION("Variant with out-of-range value fails between validator")
-  {
-    libconfig::Config cfg;
-    cfg.getRoot().add("percentage", libconfig::Setting::TypeInt) = 150;  // Invalid > 100
-
-    std::variant<int, double, std::string> value;
-    config::configuration_setter setter;
-
-    setter.add_variant_config<int>("percentage", value, config::between<int>{0, 100});
-
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
-  }
+  REQUIRE(present.has_value());
+  REQUIRE(present->as<int>() == 42);
+  REQUIRE_FALSE(missing.has_value());
 }
 
-// Config type that only registers "name" — used to test dotted-path coexistence
-struct partial_name_config {
-  std::string name;
-};
+// ================ error context ================= //
 
-template <>
-struct sirius::config::custom_config_registrar<partial_name_config> {
-  static void config(sirius::config::configuration_setter& setter, partial_name_config& opt)
-  {
-    setter.add_config("name", opt.name);
-  }
-};
-
-TEST_CASE("Dotted-path and nested config coexist without false unknown-key error",
-          "[config_opt][dotted_path_and_nested]")
+TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
 {
-  using namespace sirius;
+  auto node = YAML::Load("value: not_a_number");
 
-  SECTION("Parent dotted-path key is exempt from nested config unknown-key check")
-  {
-    // The parent registers:
-    //   "block.extra" -> int (dotted path, handled by parent)
-    //   "block"       -> partial_name_config (nested, only knows "name")
-    // "block" in the config file has both "name" and "extra".
-    // Without the fix this would throw because the nested setter for partial_name_config
-    // doesn't know about "extra".
-
-    libconfig::Config cfg;
-    auto& block = cfg.getRoot().add("block", libconfig::Setting::TypeGroup);
-    block.add("name", libconfig::Setting::TypeString) = "hello";
-    block.add("extra", libconfig::Setting::TypeInt)   = 99;
-
-    partial_name_config named{};
-    int extra = 0;
-    config::configuration_setter setter;
-    setter.add_config("block.extra", extra);
-    setter.add_config("block", named);
-
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(named.name == "hello");
-    REQUIRE(extra == 99);
-  }
-
-  SECTION("Truly unknown key inside nested block still throws")
-  {
-    libconfig::Config cfg;
-    auto& block = cfg.getRoot().add("block", libconfig::Setting::TypeGroup);
-    block.add("name", libconfig::Setting::TypeString)     = "hello";
-    block.add("unknown_key", libconfig::Setting::TypeInt) = 7;
-
-    partial_name_config named{};
-    config::configuration_setter setter;
-    setter.add_config("block", named);
-
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
-  }
-}
-
-TEST_CASE("Unknown config keys throw runtime_error", "[config_opt][unknown_key]")
-{
-  using namespace sirius;
-
-  SECTION("Unregistered key in config throws")
-  {
-    libconfig::Config cfg;
-    cfg.getRoot().add("known_key", libconfig::Setting::TypeInt)   = 42;
-    cfg.getRoot().add("unknown_key", libconfig::Setting::TypeInt) = 99;
-
-    int known_val = 0;
-    config::configuration_setter setter;
-    setter.add_config("known_key", known_val);
-
-    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::runtime_error);
-  }
-
-  SECTION("All keys registered does not throw")
-  {
-    libconfig::Config cfg;
-    cfg.getRoot().add("key_a", libconfig::Setting::TypeInt) = 1;
-    cfg.getRoot().add("key_b", libconfig::Setting::TypeInt) = 2;
-
-    int a = 0, b = 0;
-    config::configuration_setter setter;
-    setter.add_config("key_a", a);
-    setter.add_config("key_b", b);
-
-    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
-    REQUIRE(a == 1);
-    REQUIRE(b == 2);
+  int value = 0;
+  yaml::reader r(node, "test.section");
+  try {
+    r.required("value", value);
+    FAIL("expected exception");
+  } catch (const std::runtime_error& e) {
+    std::string msg = e.what();
+    REQUIRE(msg.find("test.section.value") != std::string::npos);
   }
 }

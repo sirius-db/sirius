@@ -202,7 +202,7 @@ The fallback mechanism is implemented in `src/fallback.cpp` and integrates with 
 - Requires C++20 and CUDA standard 20
 - Separable compilation enabled for CUDA (`CMAKE_CUDA_SEPARABLE_COMPILATION ON`)
 - GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
-- Links against: cudf::cudf, rmm::rmm, libnuma, libconfig++, absl::any_invocable, spdlog, cuCascade
+- Links against: cudf::cudf, rmm::rmm, libnuma, yaml-cpp, absl::any_invocable, spdlog, cuCascade
 
 ## Extension Development
 

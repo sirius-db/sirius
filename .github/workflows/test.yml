@@ -88,7 +88,7 @@ jobs:
 
       - name: TPC-H performance snapshot
         env:
-          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.cfg
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
           PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
         run: |
           ./test/tpch_performance/benchmark_and_validate.sh 1

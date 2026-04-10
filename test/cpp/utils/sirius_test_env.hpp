@@ -29,12 +29,12 @@ namespace sirius::test {
  * @brief Shared test environment that holds a single DuckDB instance and SiriusContext.
  *
  * The constructor sets SIRIUS_CONFIG_FILE and creates a DuckDB instance, which triggers
- * the extension callback to create a SiriusContext and acquire the extension lock.
+ * the extension callback to create a SiriusContext.
  * All tests in the "shared" phase get connections to this DuckDB instance, avoiding
  * the overhead of repeated SiriusContext creation/destruction.
  *
  * For tests tagged [isolated_context] or [integration] that need their own SiriusContext,
- * the environment is temporarily paused (DuckDB destroyed, lock released) via a Catch2
+ * the environment is temporarily paused (DuckDB destroyed) via a Catch2
  * listener, then resumed after the isolated test completes.
  */
 class shared_test_env {
@@ -66,7 +66,7 @@ class shared_test_env {
   bool is_active() const { return db_ != nullptr; }
 
   /**
-   * @brief Temporarily destroy the DuckDB instance and release the extension lock.
+   * @brief Temporarily destroy the DuckDB instance.
    *
    * Called by the Catch2 listener before an isolated test runs, allowing
    * the test to create its own DuckDB with a different config.
@@ -74,7 +74,7 @@ class shared_test_env {
   void pause();
 
   /**
-   * @brief Recreate the DuckDB instance and reacquire the extension lock.
+   * @brief Recreate the DuckDB instance.
    *
    * Called by the Catch2 listener after an isolated test completes.
    */

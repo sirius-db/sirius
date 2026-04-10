@@ -320,8 +320,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx_ptr) {
     throw duckdb::InvalidInputException(
-      "Sirius context is not initialized. Ensure load_sirius() is called or ~/.sirius/sirius.cfg "
-      "exists.");
+      "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
+      "and review extension loading logs for errors.");
   }
   const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 

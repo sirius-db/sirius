@@ -20,9 +20,20 @@ By default, only the `gpu_execution` code path is compiled. To build `gpu_proces
 cd duckdb && cmake --preset release -DENABLE_LEGACY_SIRIUS=ON && cmake --build --preset release && cd ..
 ```
 
+## Important: Disable Super Sirius
+
+> **You MUST set `SIRIUS_DISABLE=1` when using `gpu_processing`.** Without this, the
+> Super Sirius engine (`gpu_execution`) automatically initializes on extension load and
+> claims most of the GPU memory and pinned host memory, leaving little for
+> `gpu_buffer_init`. This will cause allocation failures or severely degraded performance.
+
+```bash
+export SIRIUS_DISABLE=1
+./build/release/duckdb {DATABASE_NAME}.duckdb
+```
+
 ## Running
 
-Start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
 From the DuckDB shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```

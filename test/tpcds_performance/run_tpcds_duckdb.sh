@@ -24,8 +24,8 @@
 
 set -uo pipefail
 
-# Prevent Sirius config from interfering — this is a pure CPU baseline
-unset SIRIUS_CONFIG_FILE
+# Disable Sirius — this is a pure CPU baseline
+export SIRIUS_DISABLE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"

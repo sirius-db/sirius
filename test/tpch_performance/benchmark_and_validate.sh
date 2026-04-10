@@ -12,7 +12,7 @@
 #     run_info.txt    - git branch/revision, tree clean/dirty, build freshness,
 #                       hostname, memory, CPUs, load, GPUs/free memory, fs read benchmark
 #     run_info.patch  - when tree is dirty, full git diff and diff --cached
-#     sirius_config.cfg - copy of SIRIUS_CONFIG_FILE
+#     sirius_config.yaml - copy of SIRIUS_CONFIG_FILE
 #     sirius/run.log  sirius/q<N>/result.txt  sirius/q<N>/timings.csv
 #     duckdb/run.log  duckdb/q<N>/result.txt  duckdb/q<N>/timings.csv
 #     validation.csv
@@ -278,7 +278,7 @@ QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 if [ $# -ne 1 ]; then
     echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] <scale_factor>"
     echo "       $0 --report <run_dir>"
-    echo "Example: $0 --config ~/.sirius/sirius.cfg --engines sirius --iterations 3 --timeout 120 1000"
+    echo "Example: $0 --config ~/.sirius/sirius.yaml --engines sirius --iterations 3 --timeout 120 1000"
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
     exit 1
@@ -290,19 +290,19 @@ QUERIES=($(seq 1 22))
 RUN_DIR="$PROJECT_DIR/runs/$(date +%Y-%m-%d_%H-%M-%S)_sf${SF}_${NUM_ITERATIONS}iter"
 mkdir -p "$RUN_DIR"
 
-# Resolve config: explicit --config / env var / default ~/.sirius/sirius.cfg
+# Resolve config: explicit --config / env var / default ~/.sirius/sirius.yaml
 # Only required when running the sirius engine.
 ENGINES="${ENGINES:-sirius duckdb}"
 if [[ " $ENGINES " == *" sirius "* ]]; then
     if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
-        export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.cfg"
+        export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.yaml"
     fi
     if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
         echo "ERROR: config file not found: $SIRIUS_CONFIG_FILE"
         exit 1
     fi
     echo "Config file: $SIRIUS_CONFIG_FILE"
-    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
+    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.yaml"
 fi
 
 # ---------------------------------------------------------------------------
