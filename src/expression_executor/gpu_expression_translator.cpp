@@ -563,40 +563,31 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
         _resource_ref);
     }
     // cudf decimal type uses negative scale
-    /// TODO: Uncomment the decimal code once the following bug fix is released in cuDF and we
-    /// update to that version:
-    /// https://github.com/rapidsai/cudf/pull/21447
-    /// For now, fallthrough to default case to return nullopt and effectively disallow decimal
-    /// types.
     case cudf::type_id::DECIMAL32: {
-      // return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal32>>(
-      //   expr.value.GetValueUnsafe<typename numeric::decimal32::rep>(),
-      //   numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
-      //   true,
-      //   _stream,
-      //   _resource_ref);
+      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal32>>(
+        expr.value.GetValueUnsafe<typename numeric::decimal32::rep>(),
+        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+        true,
+        _stream,
+        _resource_ref);
     }
     case cudf::type_id::DECIMAL64: {
-      // return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal64>>(
-      //   expr.value.GetValueUnsafe<typename numeric::decimal64::rep>(),
-      //   numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
-      //   true,
-      //   _stream,
-      //   _resource_ref);
+      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal64>>(
+        expr.value.GetValueUnsafe<typename numeric::decimal64::rep>(),
+        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+        true,
+        _stream,
+        _resource_ref);
     }
     case cudf::type_id::DECIMAL128: {
-      // duckdb::hugeint_t const value = expr.value.GetValueUnsafe<duckdb::hugeint_t>();
-      // __int128_t rep                = (static_cast<__int128_t>(value.upper) << 64) | value.lower;
-      // return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal128>>(
-      //   rep,
-      //   numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
-      //   true,
-      //   _stream,
-      //   _resource_ref);
-      SIRIUS_LOG_DEBUG(
-        "[expression_translator] DECIMAL types are not supported in expression translator due to "
-        "cuDF bug");
-      return std::nullopt;
+      duckdb::hugeint_t const value = expr.value.GetValueUnsafe<duckdb::hugeint_t>();
+      __int128_t rep                = (static_cast<__int128_t>(value.upper) << 64) | value.lower;
+      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal128>>(
+        rep,
+        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
+        true,
+        _stream,
+        _resource_ref);
     }
     default: {
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}",
@@ -611,16 +602,36 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   duckdb::BoundFunctionExpression const& expr, cudf::ast::table_reference const table_src)
 {
   // cuDF AST only supports numeric binary functions
+  // We need to disable operations that propagate decimal types up the expression tree
+  // We are waiting on this bug fix: https://github.com/rapidsai/cudf/pull/21996
+  auto block_function_translation = [](duckdb::BoundFunctionExpression const& expr) -> bool {
+    for (auto const& child : expr.children) {
+      auto const child_type = child->return_type;
+      if (child_type.id() == duckdb::LogicalTypeId::DECIMAL) {
+        SIRIUS_LOG_DEBUG(
+          "[expression_translator] Blocking function '{}' because it propagates decimal types",
+          expr.function.name);
+        return true;
+      }
+    }
+    return false;
+  };
+
   auto const& func_str = expr.function.name;
   if (func_str == "+") {
+    if (block_function_translation(expr)) { return std::nullopt; }
     return add_function_expression<cudf::ast::ast_operator::ADD>(expr, table_src);
   } else if (func_str == "-") {
+    if (block_function_translation(expr)) { return std::nullopt; }
     return add_function_expression<cudf::ast::ast_operator::SUB>(expr, table_src);
   } else if (func_str == "*") {
+    if (block_function_translation(expr)) { return std::nullopt; }
     return add_function_expression<cudf::ast::ast_operator::MUL>(expr, table_src);
   } else if (func_str == "/" || func_str == "//") {
+    if (block_function_translation(expr)) { return std::nullopt; }
     return add_function_expression<cudf::ast::ast_operator::DIV>(expr, table_src);
   } else if (func_str == "%") {
+    if (block_function_translation(expr)) { return std::nullopt; }
     return add_function_expression<cudf::ast::ast_operator::MOD>(expr, table_src);
   }
   SIRIUS_LOG_DEBUG("[expression_translator] Unsupported function: {}", func_str);
@@ -704,16 +715,6 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   duckdb::BoundReferenceExpression const& expr, cudf::ast::table_reference const table_src)
 {
-  // We need to disable DECIMAL types in the expression translator for now because of cuDF bug.
-  auto const cudf_type = GetCudfType(expr.return_type);
-  if (cudf_type.id() == cudf::type_id::DECIMAL32 || cudf_type.id() == cudf::type_id::DECIMAL64 ||
-      cudf_type.id() == cudf::type_id::DECIMAL128) {
-    SIRIUS_LOG_DEBUG(
-      "[expression_translator] DECIMAL types are not supported in expression translator due to "
-      "cuDF bug");
-    return std::nullopt;
-  }
-
   if (_column_name_resolver) {
     return _ast_tree.emplace<cudf::ast::column_name_reference>(_column_name_resolver(expr.index));
   }

@@ -433,7 +433,7 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
   REQUIRE(host_data == data_vals);
 }
 
-TEST_CASE("parquet_scan with decimal filter does not set passthrough",
+TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
           "[physical_table_scan][passthrough]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
@@ -477,7 +477,7 @@ TEST_CASE("parquet_scan with decimal filter does not set passthrough",
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), *space);
   auto input_batch = std::make_shared<cucascade::data_batch>(0, std::move(gpu_repr));
 
-  // Filter: col0 > 3.00 (decimal — NOT translatable to cuDF AST)
+  // Filter: col0 > 3.00 (decimal column-vs-literal comparisons translate to cuDF AST)
   auto table_filters   = duckdb::make_uniq<duckdb::TableFilterSet>();
   auto constant_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
     duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::DECIMAL(300, 10, 2));
@@ -513,15 +513,15 @@ TEST_CASE("parquet_scan with decimal filter does not set passthrough",
                                         std::move(parameters),
                                         std::move(virtual_columns));
 
-  // Construct parquet_scan — decimal filter translation should fail
+  // Construct parquet_scan from table_scan — triggers filter translation
   sirius_physical_parquet_scan parquet_scan(&table_scan);
 
-  // Decimal translation fails — passthrough must be false
-  REQUIRE(table_scan.passthrough == false);
-  REQUIRE_FALSE(parquet_scan.translated_filter.has_value());
+  // DECIMAL64 > 3.00 should translate successfully
+  REQUIRE(table_scan.passthrough == true);
+  REQUIRE(parquet_scan.translated_filter.has_value());
   REQUIRE(table_scan.filter_expr != nullptr);
 
-  // execute() should apply the filter (col0 > 3.00 keeps rows 5.00 and 7.00)
+  // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
@@ -535,10 +535,7 @@ TEST_CASE("parquet_scan with decimal filter does not set passthrough",
   auto host_dec  = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data = copy_column_to_host<int32_t>(out_view.column(1));
 
-  // Only rows with dec > 300 (i.e., 5.00 and 7.00) survive
-  std::vector<int64_t> expected_dec{500, 700};
-  std::vector<int32_t> expected_data{50, 70};
-
-  REQUIRE(host_dec == expected_dec);
-  REQUIRE(host_data == expected_data);
+  // All rows pass through — no filtering applied
+  REQUIRE(host_dec == dec_raw);
+  REQUIRE(host_data == data_vals);
 }
