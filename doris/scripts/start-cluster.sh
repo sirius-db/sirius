@@ -105,8 +105,8 @@ for n in $(seq 1 "$NUM_BES"); do
     local_home="$LOG_DIR/be-$n"
     mkdir -p "$local_home/.sirius"
     # Copy sirius config if it exists
-    if [ -f "$HOME/.sirius/sirius.cfg" ]; then
-        cp "$HOME/.sirius/sirius.cfg" "$local_home/.sirius/sirius.cfg"
+    if [ -f "$HOME/.sirius/sirius.yaml" ]; then
+        cp "$HOME/.sirius/sirius.yaml" "$local_home/.sirius/sirius.yaml"
     fi
 done
 

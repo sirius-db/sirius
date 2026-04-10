@@ -521,14 +521,15 @@ SELECT * FROM local("file_path"="...", "format"="parquet", "backend_id"="<be2>")
 
 ### Configuration
 
-**GPU Memory** (`~/.sirius/sirius.cfg`):
-```
-gpu_memory : {
-    usage_limit_fraction = 0.2;
-    reservation_limit_fraction = 0.2;
-    downgrade_trigger_fraction = 0.15;
-    downgrade_stop_fraction = 0.1;
-};
+**GPU Memory** (`~/.sirius/sirius.yaml`):
+```yaml
+sirius:
+  memory:
+    gpu:
+      usage_limit_fraction: 0.2
+      reservation_limit_fraction: 0.2
+      downgrade_trigger_fraction: 0.15
+      downgrade_stop_fraction: 0.1
 ```
 
 **Doris FE** (`fe.conf`):

@@ -43,7 +43,7 @@ The script:
 - Drops stale backends from FE
 - Starts N BEs with separate HOME dirs (avoids sirius.lock conflicts)
 - Waits for all BEs to register and become alive
-- Config: `~/.sirius/sirius.cfg` is copied to each BE's HOME. For 2 BEs,
+- Config: `~/.sirius/sirius.yaml` is copied to each BE's HOME. For 2 BEs,
   set `usage_limit_fraction ≤ 0.3` to avoid GPU OOM.
 
 ### Manual startup (individual terminals)

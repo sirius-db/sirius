@@ -252,26 +252,23 @@ These queries have been verified to run on the GPU pipeline: **Q1, Q2, Q4, Q5, Q
 
 ## 6. Configuration Tuning
 
-### GPU Memory (`~/.sirius/sirius.cfg`)
+### GPU Memory (`~/.sirius/sirius.yaml`)
 
 Controls GPU memory allocation per BE. The default config allocates 20% of GPU VRAM per BE (designed for 2 BEs sharing 1 GPU):
 
-```libconfig
-sirius = {
-    topology = { num_gpus = 1; };
-    memory = {
-        gpu = {
-            usage_limit_fraction = 0.2;       // Max 20% of VRAM
-            reservation_limit_fraction = 0.2;
-        };
-        host = {
-            capacity_bytes = 4294967296;       // 4 GB host memory spill
-        };
-    };
-    executor = {
-        pipeline = { num_threads = 4; };
-    };
-};
+```yaml
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.2       # Max 20% of VRAM
+      reservation_limit_fraction: 0.2
+    host:
+      capacity_bytes: 4Gi             # 4 GB host memory spill
+  executor:
+    pipeline:
+      num_threads: 4
 ```
 
 **For a dedicated single-BE setup**, increase the GPU fraction:

@@ -11,7 +11,7 @@ struct BridgeContext;
 
 /// Create a headless DuckDB instance with the Sirius GPU extension loaded.
 ///
-/// @param config_path  Path to sirius.cfg (empty = defaults)
+/// @param config_path  Path to sirius.yaml (empty = defaults)
 /// @param gpu_ids      GPU device IDs to use
 /// @return             Opaque context handle
 std::unique_ptr<BridgeContext> create_context(

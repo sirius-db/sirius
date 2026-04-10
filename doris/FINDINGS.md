@@ -18,10 +18,10 @@ executing TPC-H queries via `local()` TVF over Parquet files.
 ## GPU Pipeline Status
 
 ### SiriusContext Initialization (FIXED)
-- **Problem**: Without a `sirius.cfg` file, `SiriusContext` was not created (NULL pointer).
+- **Problem**: Without a config file, `SiriusContext` was not created (NULL pointer).
 - **Root cause**: `read_config_file_if_exists()` returned early when no config file existed.
-- **Fix**: Added `ensure_default_memory_configs()` to `sirius_config` that builds default
-  memory space configs using `reservation_manager_configurator` with discovered topology.
+- **Fix**: Sirius now uses YAML configuration (`sirius.yaml`) and calls `apply_defaults()`
+  when no config file is found. Set `SIRIUS_DISABLE=1` to skip initialization entirely.
   Modified `read_config_file_if_exists()` to always create `SiriusContext` with defaults.
 
 ### QueryBegin / ClientContext (FIXED)
