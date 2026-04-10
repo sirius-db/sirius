@@ -44,6 +44,9 @@
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
+// sirius scan operator data
+#include <op/scan/parquet_scan_operator_data.hpp>
+
 // standard library
 #include <atomic>
 #include <memory>
@@ -57,13 +60,27 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 namespace detail {
 /**
- * @brief Compute the parquet column indices to read for the given scan operator.
+ * @brief Compute the parquet column indices to read given column and projection id vectors.
  *
  * Applies projection_ids / column_ids to select only the needed columns.
  * Virtual columns and duplicates are excluded/deduplicated.
  * Defined in parquet_scan_task.cpp.
+ *
+ * @param column_ids     All column ids exposed by the table function.
+ * @param projection_ids Subset of column_ids positions selected by the planner (empty = no
+ *                       projection).
  */
-std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op);
+std::vector<size_t> make_selected_column_indices(
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids);
+
+/**
+ * @brief Return true if all selected projected columns have a flat (depth-1) schema.
+ *
+ * Defined in parquet_scan_task.cpp.
+ */
+bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
+                                std::vector<size_t> const& selected_column_indices);
 }  // namespace detail
 
 //===----------------------------------------------------------------------===//
@@ -81,29 +98,8 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
  public:
-  /**
-   * @brief Struct representing a range of row groups assigned to a scan task.
-   */
-  struct row_group_range {
-    row_group_range(size_t file_idx,
-                    size_t start_row_group_p,
-                    size_t row_group_count_p,
-                    size_t reserved_uncompressed_bytes_p,
-                    size_t reserved_compressed_bytes_p)
-      : file_idx(file_idx),
-        start_row_group(start_row_group_p),
-        row_group_count(row_group_count_p),
-        reserved_uncompressed_bytes(reserved_uncompressed_bytes_p),
-        reserved_compressed_bytes(reserved_compressed_bytes_p)
-    {
-    }
-
-    size_t file_idx;
-    size_t start_row_group;
-    size_t row_group_count;
-    size_t reserved_uncompressed_bytes;
-    size_t reserved_compressed_bytes;
-  };
+  /// Row-group range type shared with the new metadata/GPU scan operators.
+  using row_group_range = ::sirius::op::scan::row_group_range;
 
   //===----------Constructor----------===//
   /**
@@ -116,7 +112,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
-    size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE);
+    std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE);
 
   //===----------Methods----------===//
   /**
@@ -132,7 +128,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param[in] file_idx The index of the file path to retrieve.
    * @return A const reference to the file path string.
    */
-  [[nodiscard]] std::string const& get_file_path(size_t file_idx) const
+  [[nodiscard]] std::string const& get_file_path(std::size_t file_idx) const
   {
     return _file_paths[file_idx];
   }
@@ -157,22 +153,26 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    *
    * @return The number of row group partitions.
    */
-  [[nodiscard]] size_t get_num_row_group_partitions() const { return _row_group_partitions.size(); }
+  [[nodiscard]] std::size_t get_num_row_group_partitions() const
+  {
+    return _row_group_partitions.size();
+  }
 
   /**
-   * @brief Atomically get the next row group partition index to be processed by a scan task.
+   * @brief Atomically claim and move out the next row group partition index to be processed by a
+   * scan task.
    *
-   * @return The next row group partition index.
+   * @return The next row group partition, moved out of global state; std::nullopt if exhausted.
    */
-  [[nodiscard]] std::optional<size_t> get_next_rg_partition_idx()
+  [[nodiscard]] std::optional<row_group_range> claim_next_rg_partition()
   {
-    auto const total = _row_group_partitions.size();
-    size_t current   = _next_rg_partition.load(std::memory_order_relaxed);
+    auto const total    = _row_group_partitions.size();
+    std::size_t current = _next_rg_partition.load(std::memory_order_relaxed);
     while (true) {
       if (current >= total) { return std::nullopt; }
       if (_next_rg_partition.compare_exchange_weak(
             current, current + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
-        return current;
+        return std::move(_row_group_partitions[current]);
       }
     }
   }
@@ -188,17 +188,6 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   }
 
   /**
-   * @brief Get the row group range metadata associated with the given partition.
-   *
-   * @param[in] idx The row group partition index.
-   * @return The row group range metadata associated with the given partition.
-   */
-  [[nodiscard]] row_group_range const& get_row_group_partition(size_t idx) const
-  {
-    return _row_group_partitions[idx];
-  }
-
-  /**
    * @brief Make a hybrid scan Parquet reader with the underlying reader options.
    *
    * Each task/data batch will need its own reader for concurrency reasons.
@@ -206,7 +195,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param[in] file_idx The file index of the parquet file to read.
    * @return A unique pointer to the hybrid scan Parquet reader.
    */
-  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader(size_t file_idx) const
+  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader(std::size_t file_idx) const
   {
     return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
   }
@@ -231,13 +220,16 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /**
    * @brief Get the file size for the given file index.
    */
-  [[nodiscard]] size_t get_file_size(size_t file_idx) const { return _file_sizes[file_idx]; }
+  [[nodiscard]] std::size_t get_file_size(std::size_t file_idx) const
+  {
+    return _file_sizes[file_idx];
+  }
 
   /**
    * @brief Get the total number of parquet metadata bytes (header + footer + trailer)
    * that must be cached alongside the column-chunk data for file @p file_idx.
    */
-  [[nodiscard]] size_t get_metadata_byte_size(size_t file_idx) const
+  [[nodiscard]] std::size_t get_metadata_byte_size(std::size_t file_idx) const
   {
     return _metadata_byte_sizes[file_idx];
   }
@@ -246,9 +238,31 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @brief Get the file offset where the parquet footer begins for file @p file_idx.
    * The footer range covers [footer_offset, file_size).
    */
-  [[nodiscard]] size_t get_footer_offset(size_t file_idx) const
+  [[nodiscard]] std::size_t get_footer_offset(std::size_t file_idx) const
   {
     return _footer_offsets[file_idx];
+  }
+
+  /** @brief Get a shared_ptr that pins the translated AST filter expression alive.
+   *
+   * This is passed to host_parquet_representation so the filter expression (which
+   * parquet_reader_options stores as a reference) survives until materialization.
+   *
+   * @return A shared_ptr to the translated filter expression (may be null if no filter). */
+  [[nodiscard]] std::shared_ptr<gpu_expression_translator::translated_expression>
+  get_filter_expression() const
+  {
+    return _translated_filter;
+  }
+
+  /**
+   * @brief Get projection ids of projected columns post-filter.
+   *
+   * @return A const reference to the vector of projection ids.
+   */
+  [[nodiscard]] std::vector<std::size_t> const& get_post_filter_projection_ids() const
+  {
+    return _post_filter_projection_ids;
   }
 
   // -------------------------------------------------------------------------
@@ -275,17 +289,6 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   [[nodiscard]] post_convert_fn_t get_post_convert_fn() const { return _post_convert_fn; }
 
-  /**
-   * @brief Return the selected column indices (indices into scan_op->names, in cudf table order).
-   *
-   * Used by iceberg_scan_task_global_state to compute data_key_indices that correctly map
-   * equality-delete key names to cudf table column positions.
-   */
-  [[nodiscard]] std::vector<size_t> const& get_selected_column_indices() const
-  {
-    return _selected_column_indices;
-  }
-
  protected:
   /**
    * @brief Protected constructor for subclasses that pre-process the file list.
@@ -309,48 +312,38 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   parquet_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
                                  sirius_physical_parquet_scan* scan_op,
                                  std::vector<std::string> file_paths,
-                                 std::vector<size_t> selected_column_indices,
+                                 std::vector<size_t> const& selected_column_indices,
                                  size_t approximate_batch_size);
 
  private:
   /**
-   * @brief Fill the vector of column indices for this scan after projection.
+   * @brief Shared initialization: read footers, apply projections/filters, parse
+   * metadata, and partition row groups. Called by both constructors after
+   * _file_paths has been populated.
    */
-  void make_selected_column_indices(sirius_physical_parquet_scan const& scan_op);
-
-  /**
-   * @brief Accumulate the compressed and uncompressed byte sizes for each row group in the file
-   * metadata, which are needed for partitioning the row groups into scan tasks.
-   */
-  void accumulate_row_group_byte_sizes();
-
-  /**
-   * @brief Partition the row groups into scan tasks based on the accumulated byte sizes and the
-   * target approximate batch size.
-   */
-  void partition_row_groups();
+  void initialize_from_files();
 
   //===----------Fields----------===//
-  size_t _approximate_batch_size;          ///< Target approximate batch size for scan tasks
+  std::size_t _approximate_batch_size;     ///< Target approximate batch size for scan tasks
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
-  bool _is_projected;                      ///< Whether projection is applied
 
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
   cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
 
-  std::vector<size_t> _file_sizes;           ///< Per-file total file size in bytes
-  std::vector<size_t> _metadata_byte_sizes;  ///< Per-file header+footer+trailer bytes
-  std::vector<size_t> _footer_offsets;       ///< Per-file offset where footer begins
+  std::vector<std::size_t> _file_sizes;           ///< Per-file total file size in bytes
+  std::vector<std::size_t> _metadata_byte_sizes;  ///< Per-file header+footer+trailer bytes
+  std::vector<std::size_t> _footer_offsets;       ///< Per-file offset where footer begins
 
-  std::vector<std::vector<size_t>>
-    _row_group_uncompressed_bytes;  ///< Per-(file,row-group) uncompressed bytes
-  std::vector<std::vector<size_t>>
-    _row_group_compressed_bytes;                       ///< Per-(file,row-group) compressed bytes
-  std::vector<row_group_range> _row_group_partitions;  ///< Row-group partitions for tasks
-  std::vector<size_t> _selected_column_indices;        ///< Column indices to read (projection)
+  std::shared_ptr<gpu_expression_translator::translated_expression>
+    _translated_filter;  ///< The translated filter expression, if any, to keep alive for
+                         ///< materialization
+  std::vector<std::size_t>
+    _post_filter_projection_ids;  ///< The indices of projected columns in the reader output
 
-  std::atomic<size_t> _next_rg_partition{0};  ///< Number of local states created
+  std::vector<row_group_range>
+    _row_group_partitions;  ///< The row group partitions for this scan (1 per task)
+  std::atomic<std::size_t> _next_rg_partition{0};  ///< Number of local states created
 
   /// Optional hook called after each batch is decompressed to a GPU table.
   /// Null for plain parquet scans; set by iceberg_scan_task_global_state.
@@ -375,9 +368,14 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    * @brief Construct the local state for the parquet scan task.
    *
    * @param[in] g_state The global state for the parquet scan task
-   * @param[in] partition_idx The assigned row group partition index
+   * @param[in] partition The assigned row group partition for this local state
    */
-  parquet_scan_task_local_state(parquet_scan_task_global_state& g_state, size_t partition_idx);
+  parquet_scan_task_local_state(parquet_scan_task_global_state const& g_state,
+                                parquet_scan_task_global_state::row_group_range partition)
+    : _partition(std::move(partition)),
+      _metadata_bytes(g_state.get_metadata_byte_size(_partition.file_idx))
+  {
+  }
 
   //===----------Methods----------===//
   /**
@@ -403,14 +401,15 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    *
    * @return The file index.
    */
-  [[nodiscard]] size_t get_file_idx() const { return _file_idx; }
+  [[nodiscard]] std::size_t get_file_idx() const { return _partition.file_idx; }
 
   /**
    * @brief Get the host span corresponding to the row group indices assigned to this local state.
    */
   [[nodiscard]] cudf::host_span<cudf::size_type const> get_rg_span() const
   {
-    return cudf::host_span<cudf::size_type const>(_rg_indices.data(), _rg_indices.size());
+    return cudf::host_span<cudf::size_type const>(_partition.row_group_indices.data(),
+                                                  _partition.row_group_indices.size());
   };
 
   /**
@@ -418,9 +417,9 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    *
    * @return The number of uncompressed bytes reserved.
    */
-  [[nodiscard]] size_t get_reserved_uncompressed_bytes() const
+  [[nodiscard]] std::size_t get_reserved_uncompressed_bytes() const
   {
-    return _reserved_uncompressed_bytes;
+    return _partition.reserved_uncompressed_bytes;
   }
 
   /**
@@ -428,7 +427,10 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    *
    * @return The number of compressed bytes reserved.
    */
-  [[nodiscard]] size_t get_reserved_compressed_bytes() const { return _reserved_compressed_bytes; }
+  [[nodiscard]] std::size_t get_reserved_compressed_bytes() const
+  {
+    return _partition.reserved_compressed_bytes + _metadata_bytes;
+  }
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
@@ -438,18 +440,16 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
   /**
    * @brief Get the vector of row group indices assigned to this local state.
    *
-   * @return A (const) reference to the vector of row group indices.
+   * @return A reference to the vector of row group indices.
    */
-  [[nodiscard]] std::vector<cudf::size_type> const& get_rg_indices() const { return _rg_indices; }
-  [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices() { return _rg_indices; }
+  [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices()
+  {
+    return _partition.row_group_indices;
+  }
 
  private:
-  size_t _file_idx;  ///< The file index of the parquet file to read
-  size_t _reserved_uncompressed_bytes =
-    0;  ///< Number of uncompressed bytes reserved by the row group range
-  size_t _reserved_compressed_bytes =
-    0;  ///< Number of compressed bytes reserved by the row group range
-  std::vector<cudf::size_type> _rg_indices;  ///< The row group indices assigned to this local state
+  parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition
+  std::size_t _metadata_bytes;                                 ///< The number of metadata bytes
 };
 
 //===----------------------------------------------------------------------===//
@@ -524,7 +524,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    *
    * @return The estimated reservation size in bytes.
    */
-  [[nodiscard]] size_t get_estimated_reservation_size() const override;
+  [[nodiscard]] std::size_t get_estimated_reservation_size() const override;
 
   /**
    * @brief Get the output consumers operators for this task.
@@ -569,8 +569,8 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @brief Read the given byte range from the parquet file into the memory allocation for this
    * task.
    */
-  void read_range_into_allocation(size_t file_offset,
-                                  size_t n_bytes,
+  void read_range_into_allocation(std::size_t file_offset,
+                                  std::size_t n_bytes,
                                   multiple_blocks_allocation_accessor& data_blocks_accessor,
                                   std::unique_ptr<multiple_blocks_allocation>& allocation,
                                   std::vector<std::future<std::size_t>>& read_futures);

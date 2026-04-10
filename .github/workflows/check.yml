@@ -52,6 +52,8 @@ jobs:
           - release
           - debug
         environment: [default]
+        cudf-channel:
+          - stable
         exclude:
           - compiler: gcc
             build-type: debug
@@ -62,12 +64,19 @@ jobs:
             compiler: gcc
             build-type: release
             environment: vcpkg
+            cudf-channel: stable
+          - arch: arm64
+            compiler: gcc
+            build-type: release
+            environment: default
+            cudf-channel: nightly
       fail-fast: false
     runs-on: >-
       ${{ matrix.environment == 'vcpkg'
         && fromJSON('["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"]')
         || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
     timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
+    continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -81,8 +90,10 @@ jobs:
         with:
           cache: false
           pixi-version: v0.65.0
-          activate-environment: true
-          environments: ${{ matrix.environment }}
+          activate-environment: ${{ matrix.environment != 'vcpkg' && matrix.cudf-channel != 'nightly' }}
+          environments: >-
+            ${{ matrix.cudf-channel == 'nightly' && 'nightly-runner'
+              || matrix.environment }}
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
@@ -93,7 +104,7 @@ jobs:
           key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
           restore-keys: vcpkg-${{ runner.os }}-${{ runner.arch }}-
 
-      - run: make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+      - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
         if: matrix.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"

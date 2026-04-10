@@ -42,7 +42,7 @@ namespace op {
 
 /// Recursively collect all BoundReferenceExpression indices from an expression tree.
 static void collect_bound_ref_indices(duckdb::Expression& expr,
-                                      std::unordered_set<duckdb::idx_t>& indices)
+                                      std::unordered_set<std::size_t>& indices)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
     indices.insert(expr.Cast<duckdb::BoundReferenceExpression>().index);
@@ -78,7 +78,7 @@ bool sirius_physical_hash_join::are_conditions_supported(
   if (!has_inequality) { return true; }
 
   // Mixed join: collect the column indices used on each side of the equality conditions.
-  std::unordered_set<duckdb::idx_t> equality_left_cols, equality_right_cols;
+  std::unordered_set<std::size_t> equality_left_cols, equality_right_cols;
   for (auto const& cond : conditions) {
     if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
         cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
@@ -96,7 +96,7 @@ bool sirius_physical_hash_join::are_conditions_supported(
         cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
       continue;
     }
-    std::unordered_set<duckdb::idx_t> ineq_left_cols, ineq_right_cols;
+    std::unordered_set<std::size_t> ineq_left_cols, ineq_right_cols;
     collect_bound_ref_indices(*cond.left, ineq_left_cols);
     collect_bound_ref_indices(*cond.right, ineq_right_cols);
     for (auto const idx : ineq_left_cols) {
@@ -151,10 +151,10 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> right,
   duckdb::vector<duckdb::JoinCondition> cond,
   duckdb::JoinType join_type,
-  const duckdb::vector<duckdb::idx_t>& left_projection_map,
-  const duckdb::vector<duckdb::idx_t>& right_projection_map,
+  const duckdb::vector<std::size_t>& left_projection_map,
+  const duckdb::vector<std::size_t>& right_projection_map,
   duckdb::vector<duckdb::LogicalType> delim_types,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
   uint64_t max_build_hash_table_bytes)
   : sirius_physical_partition_consumer_operator(
@@ -175,7 +175,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   if (left_projection_map.empty()) {
     lhs_output_columns.col_idxs.reserve(lhs_input_types.size());
-    for (duckdb::idx_t i = 0; i < lhs_input_types.size(); i++) {
+    for (std::size_t i = 0; i < lhs_input_types.size(); i++) {
       lhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
     }
   } else {
@@ -198,7 +198,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   if (right_projection_map.empty()) {
     rhs_output_columns.col_idxs.reserve(rhs_input_types.size());
-    for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
+    for (std::size_t i = 0; i < rhs_input_types.size(); i++) {
       rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
     }
   } else {
@@ -217,7 +217,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     rhs_output_columns.col_types.push_back(rhs_col_type);
   }
 
-  for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+  for (std::size_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition = conditions[cond_idx];
     const bool is_equality =
       (condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
@@ -290,7 +290,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> right,
   duckdb::vector<duckdb::JoinCondition> cond,
   duckdb::JoinType join_type,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   uint64_t max_build_hash_table_bytes)
   : sirius_physical_hash_join(op,
                               std::move(left),
@@ -440,8 +440,8 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
     } else {
-      throw std::runtime_error(
-        "Invalid hash table build state in sirius_physical_hash_join::get_next_task_hint");
+      // If we are here, then this operator is actually complete.
+      return std::nullopt;
     }
   } else {
     return sirius_physical_operator::get_next_task_hint();
@@ -474,7 +474,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     input_batch.push_back(std::move(probe_batch));
     input_batch.push_back(std::move(build_batch));
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
-    return std::make_unique<operator_data>(input_batch);
+    return std::make_unique<pipelineable_operator_data>(input_batch);
 
   } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
     if (probe_port->repo->num_partitions() != 1) {
@@ -495,7 +495,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "batch from the default port but got none in operator " +
         std::to_string(this->get_operator_id()));
     }
-    return std::make_unique<operator_data>(input_batch);
+    return std::make_unique<pipelineable_operator_data>(input_batch);
   } else {
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
@@ -564,7 +564,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
             input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(
               right_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
-          return std::make_unique<operator_data>(input_batch);
+          return std::make_unique<pipelineable_operator_data>(input_batch);
         }
         right_counter++;
         counter++;
@@ -697,8 +697,9 @@ static std::unique_ptr<operator_data> gather_join_output(
   }
 
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-    make_data_batch(std::move(output_cudf_table), memory_space)});
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), memory_space)});
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
@@ -757,15 +758,17 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
 
   mark_out_cols.push_back(std::move(mark_column));
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
-  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-    make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   if (is_all_inequality_join) {
     throw std::runtime_error(

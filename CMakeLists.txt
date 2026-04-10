@@ -60,6 +60,8 @@ endif()
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
+find_package(yaml-cpp REQUIRED CONFIG)
+find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 # libconfig++: vcpkg provides it as libconfig::config++ via CMake config;
 # conda-forge provides it only via pkg-config.
@@ -121,7 +123,6 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/extension_lock.cpp
     src/fallback.cpp
     src/gpu_buffer_manager.cpp
     src/memory/defragmenter_oom_policy.cpp
@@ -143,6 +144,9 @@ set(EXTENSION_SOURCES
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/scan/scan_utils.cpp
+    src/op/scan/sirius_parquet_metadata_scan_operator.cpp
+    src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -326,8 +330,8 @@ if(TARGET libconfig::config++)
 else()
   set(_LIBCONFIG_TARGET PkgConfig::LIBCONFIGPP)
 endif()
-target_link_libraries(sirius_extension PkgConfig::NUMA ${_LIBCONFIG_TARGET}
-                      absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
+                      ${_LIBCONFIG_TARGET} absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
@@ -354,6 +358,7 @@ set(TEST_SOURCES
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
+    test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
@@ -388,6 +393,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_metadata_gpu_scan_operators.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/unittest.cpp

@@ -159,7 +159,8 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
     file_paths.push_back(f.path);
   }
 
-  auto selected = detail::make_selected_column_indices(*scan_op);
+  auto selected =
+    detail::make_selected_column_indices(scan_op->column_ids, scan_op->projection_ids);
 
   return {std::move(file_paths), std::move(selected)};
 }
@@ -185,8 +186,9 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
                                    std::move(init.file_paths),
-                                   std::move(init.selected_column_indices),
-                                   approximate_batch_size)
+                                   init.selected_column_indices,
+                                   approximate_batch_size),
+    _selected_column_indices(std::move(init.selected_column_indices))
 {
   build_delete_pipeline(scan_op);
 }
