@@ -52,7 +52,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpressi
     for (idx_t i = 1; i < expr.children.size(); i++) {
       auto child = execute(*expr.children[i], execution_mode::AST);
 
-      auto output_expr = _ast_tree.emplace<cudf::ast::operation>(
+      auto const& output_expr = _ast_tree.emplace<cudf::ast::operation>(
         conjunction_type_switch_ast(expr), output.get_expr(), child.get_expr());
       output = execute_result(
         ast_result(output_expr,

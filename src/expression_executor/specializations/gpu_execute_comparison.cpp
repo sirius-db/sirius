@@ -64,9 +64,9 @@ execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpressio
       }
     };
 
-    auto left      = execute(*expr.left, mode);
-    auto right     = execute(*expr.right, mode);
-    auto comp_expr = _ast_tree.emplace<cudf::ast::operation>(
+    auto left             = execute(*expr.left, mode);
+    auto right            = execute(*expr.right, mode);
+    auto const& comp_expr = _ast_tree.emplace<cudf::ast::operation>(
       comparison_type_switch_ast(expr), left.get_expr(), right.get_expr());
 
     //===----------1: AST Mode----------===//

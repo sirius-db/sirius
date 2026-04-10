@@ -49,8 +49,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
       }
     };
 
-    auto child     = execute(*expr.child, execution_mode::AST);
-    auto cast_expr = _ast_tree.emplace<cudf::ast::operation>(
+    auto child            = execute(*expr.child, execution_mode::AST);
+    auto const& cast_expr = _ast_tree.emplace<cudf::ast::operation>(
       cast_type_switch(expr.return_type.id()), child.get_expr());
 
     if (mode == execution_mode::AST) {

@@ -54,11 +54,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression c
     auto lower                = execute(*expr.lower, execution_mode::AST);
     auto upper                = execute(*expr.upper, execution_mode::AST);
     auto [lower_op, upper_op] = comparison_type_switch_ast(expr);
-    auto lower_expr =
+    auto const& lower_expr =
       _ast_tree.emplace<cudf::ast::operation>(lower_op, input.get_expr(), lower.get_expr());
-    auto upper_expr =
+    auto const& upper_expr =
       _ast_tree.emplace<cudf::ast::operation>(upper_op, input.get_expr(), upper.get_expr());
-    auto between_expr = _ast_tree.emplace<cudf::ast::operation>(
+    auto const& between_expr = _ast_tree.emplace<cudf::ast::operation>(
       cudf::ast::ast_operator::LOGICAL_AND, lower_expr, upper_expr);
 
     //===----------1: AST Mode----------===//

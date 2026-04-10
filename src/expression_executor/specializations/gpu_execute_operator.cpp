@@ -140,9 +140,9 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
         case duckdb::ExpressionType::COMPARE_IN:  // Fallthrough
         case duckdb::ExpressionType::COMPARE_NOT_IN: {
           D_ASSERT(expr.children.size() > 1);
-          auto test            = execute(*expr.children[0], execution_mode::AST);
-          auto comparator      = execute(*expr.children[1], execution_mode::AST);
-          auto comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+          auto test                = execute(*expr.children[0], execution_mode::AST);
+          auto comparator          = execute(*expr.children[1], execution_mode::AST);
+          expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
             cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
           auto output = execute_result(
             ast_result(comparison_expr,
@@ -151,8 +151,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
 
           // Build an OR tree of comparisons
           for (std::size_t child_idx = 2; child_idx < expr.children.size(); ++child_idx) {
-            auto comparator           = execute(*expr.children[child_idx], execution_mode::AST);
-            auto next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+            auto comparator               = execute(*expr.children[child_idx], execution_mode::AST);
+            expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
               cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
             comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
               cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
@@ -163,7 +163,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
           }
 
           if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return output; }
-          auto not_expr =
+          auto const& not_expr =
             _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
           return execute_result(ast_result(
             not_expr, output.get_temp_scalar_indices(), output.get_temp_column_indices()));
@@ -179,7 +179,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
         case duckdb::ExpressionType::OPERATOR_NOT: {
           D_ASSERT(expr.children.size() == 1);
           auto child = execute(*expr.children[0], execution_mode::AST);
-          auto not_expr =
+          auto const& not_expr =
             _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, child.get_expr());
           return execute_result(
             ast_result(not_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
@@ -187,14 +187,14 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
         case duckdb::ExpressionType::OPERATOR_IS_NULL:  // Fallthrough
         case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL: {
           D_ASSERT(expr.children.size() == 1);
-          auto child        = execute(*expr.children[0], execution_mode::AST);
-          auto is_null_expr = _ast_tree.emplace<cudf::ast::operation>(
+          auto child               = execute(*expr.children[0], execution_mode::AST);
+          auto const& is_null_expr = _ast_tree.emplace<cudf::ast::operation>(
             cudf::ast::ast_operator::IS_NULL, child.get_expr());
           if (expr.type == duckdb::ExpressionType::OPERATOR_IS_NULL) {
             return execute_result(ast_result(
               is_null_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
           } else {
-            auto not_expr =
+            auto const& not_expr =
               _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, is_null_expr);
             return execute_result(ast_result(
               not_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));

@@ -29,7 +29,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression
                                                 execution_mode mode)
 {
   if (mode == execution_mode::AST) {
-    auto col_expr = _ast_tree.emplace<cudf::ast::column_reference>(expr.index);
+    auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(expr.index);
     return execute_result(ast_result(col_expr));
   }
   return execute_result(_input_table.column(expr.index));

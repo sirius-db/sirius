@@ -212,7 +212,7 @@ execute_result gpu_expression_executor::materialize_as_ast_column(
   auto const col_idx         = _input_table.num_columns() + _temp_columns.size();
   auto const temp_column_idx = _temp_columns.size();
   _temp_columns.push_back(std::move(column));
-  auto col_ref = _ast_tree.emplace<cudf::ast::column_reference>(col_idx);
+  auto const& col_ref = _ast_tree.emplace<cudf::ast::column_reference>(col_idx);
   return execute_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
 }
 
