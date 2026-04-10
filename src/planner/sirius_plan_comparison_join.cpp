@@ -153,6 +153,112 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       return {};
     }
 
+    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
+      if (op.children.size() != 2) { return {}; }
+      auto& join = op.Cast<duckdb::LogicalComparisonJoin>();
+
+      auto left_unique  = prove_unique_columns(*op.children[0]);
+      auto right_unique = prove_unique_columns(*op.children[1]);
+      if (left_unique.empty() && right_unique.empty()) { return {}; }
+
+      // Collect equality key columns on each side (only direct column refs).
+      std::unordered_set<duckdb::idx_t> left_eq_keys, right_eq_keys;
+      for (const auto& c : join.conditions) {
+        if (c.comparison != duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
+        if (c.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          left_eq_keys.insert(c.left->Cast<duckdb::BoundReferenceExpression>().index);
+        }
+        if (c.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          right_eq_keys.insert(c.right->Cast<duckdb::BoundReferenceExpression>().index);
+        }
+      }
+
+      // unique ⊆ keys → join keys include a unique key, so that side has no duplicates.
+      auto unique_subset_of_keys = [](const std::unordered_set<duckdb::idx_t>& unique,
+                                      const std::unordered_set<duckdb::idx_t>& keys) {
+        if (unique.empty()) { return false; }
+        for (auto col : unique) {
+          if (!keys.count(col)) { return false; }
+        }
+        return true;
+      };
+
+      bool right_keys_unique = unique_subset_of_keys(right_unique, right_eq_keys);
+      bool left_keys_unique  = unique_subset_of_keys(left_unique, left_eq_keys);
+
+      // Which side's row-level uniqueness survives the join?
+      bool left_preserved  = false;
+      bool right_preserved = false;
+      switch (join.join_type) {
+        case duckdb::JoinType::INNER:
+          // Each left row matches ≤1 right row iff right keys are unique (and vice versa).
+          left_preserved  = right_keys_unique;
+          right_preserved = left_keys_unique;
+          break;
+        case duckdb::JoinType::LEFT:
+          left_preserved = right_keys_unique;
+          break;
+        case duckdb::JoinType::RIGHT:
+          right_preserved = left_keys_unique;
+          break;
+        case duckdb::JoinType::SEMI:
+        case duckdb::JoinType::ANTI:
+          left_preserved = !left_unique.empty();  // output ⊆ left rows
+          break;
+        case duckdb::JoinType::RIGHT_SEMI:
+        case duckdb::JoinType::RIGHT_ANTI:
+          right_preserved = !right_unique.empty();
+          break;
+        case duckdb::JoinType::MARK:
+        case duckdb::JoinType::SINGLE:
+          left_preserved = !left_unique.empty();
+          break;
+        default: return {};  // FULL OUTER: NULL-padding can duplicate key values
+      }
+      if (!left_preserved && !right_preserved) { return {}; }
+
+      // Remap child unique indices through a projection map to output positions.
+      auto remap = [](const std::unordered_set<duckdb::idx_t>& child_unique,
+                      const duckdb::vector<duckdb::idx_t>& proj_map,
+                      duckdb::idx_t offset) -> std::unordered_set<duckdb::idx_t> {
+        std::unordered_set<duckdb::idx_t> mapped;
+        if (proj_map.empty()) {
+          for (auto col : child_unique) { mapped.insert(offset + col); }
+        } else {
+          for (duckdb::idx_t i = 0; i < proj_map.size(); i++) {
+            if (child_unique.count(proj_map[i])) { mapped.insert(offset + i); }
+          }
+          if (mapped.size() != child_unique.size()) { return {}; }
+        }
+        return mapped;
+      };
+
+      bool only_left =
+        join.join_type == duckdb::JoinType::SEMI || join.join_type == duckdb::JoinType::ANTI;
+      bool only_right = join.join_type == duckdb::JoinType::RIGHT_SEMI ||
+                        join.join_type == duckdb::JoinType::RIGHT_ANTI;
+
+      duckdb::idx_t left_output_count = join.left_projection_map.empty()
+                                          ? op.children[0]->types.size()
+                                          : join.left_projection_map.size();
+
+      std::unordered_set<duckdb::idx_t> best;
+      if (left_preserved && !only_right) {
+        auto mapped = remap(left_unique, join.left_projection_map, 0);
+        if (!mapped.empty() && (best.empty() || mapped.size() < best.size())) {
+          best = std::move(mapped);
+        }
+      }
+      if (right_preserved && !only_left) {
+        duckdb::idx_t right_offset = only_right ? 0 : left_output_count;
+        auto mapped                = remap(right_unique, join.right_projection_map, right_offset);
+        if (!mapped.empty() && (best.empty() || mapped.size() < best.size())) {
+          best = std::move(mapped);
+        }
+      }
+      return best;
+    }
+
     default: return {};
   }
 }

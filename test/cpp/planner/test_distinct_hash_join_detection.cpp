@@ -288,6 +288,56 @@ TEST_CASE_METHOD(distinct_hash_join_fixture,
 }
 
 // ---------------------------------------------------------------------------
+// Uniqueness propagation through joins
+// ---------------------------------------------------------------------------
+
+TEST_CASE_METHOD(
+  distinct_hash_join_fixture,
+  "distinct_hash_join - uniqueness propagates through INNER join with unique keys on other side",
+  "[distinct_hash_join][isolated_context]")
+{
+  // Inner join: (GROUP BY product_id) JOIN pk_orders ON product_id = o_orderkey
+  //   → pk_orders.o_orderkey is PK, so each agg row matches ≤1 pk_orders row
+  //   → agg's product_id uniqueness is preserved in the join output
+  // Outer join: products JOIN (result) ON id = product_id → unique_build_keys = true
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT * FROM products JOIN ("
+    "  SELECT agg.product_id, agg.total, o.o_custkey"
+    "  FROM (SELECT product_id, SUM(amount) AS total FROM sales GROUP BY product_id) agg"
+    "  JOIN pk_orders o ON agg.product_id = o.o_orderkey"
+    ") build ON products.id = build.product_id");
+  REQUIRE(plan);
+
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  CHECK(hj->unique_build_keys);
+}
+
+TEST_CASE_METHOD(
+  distinct_hash_join_fixture,
+  "distinct_hash_join - uniqueness does NOT propagate through INNER join when other side not unique",
+  "[distinct_hash_join][isolated_context]")
+{
+  // Inner join: (GROUP BY product_id) JOIN lineitem ON product_id = l_orderkey
+  //   → lineitem has no PK, so each agg row can match multiple lineitem rows
+  //   → agg's product_id uniqueness is NOT preserved
+  // Outer join: products JOIN (result) ON id = product_id → unique_build_keys = false
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT * FROM products JOIN ("
+    "  SELECT agg.product_id, agg.total, l.l_linenumber"
+    "  FROM (SELECT product_id, SUM(amount) AS total FROM sales GROUP BY product_id) agg"
+    "  JOIN lineitem l ON agg.product_id = l.l_orderkey"
+    ") build ON products.id = build.product_id");
+  REQUIRE(plan);
+
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  CHECK_FALSE(hj->unique_build_keys);
+}
+
+// ---------------------------------------------------------------------------
 // LEFT join support
 // ---------------------------------------------------------------------------
 
