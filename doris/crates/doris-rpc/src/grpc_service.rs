@@ -2321,14 +2321,12 @@ impl PBackendService for PBackendServiceHandler {
                             // 1. UNION_NODE: trivial SQL (DuckDB SetRel broken for Substrait)
                             info!(sql = %union_sql, "exchange fragment using UNION SQL path");
                             (ExecPlan::SqlCpuOnly(union_sql), None)
-                        } else if let Some(agg_sql) = generate_exchange_agg_merge_sql(&params, &table_schemas) {
-                            // 2. AGG merge: count→SUM, avg→(SUM/COUNT), etc.
-                            //    Use GPU SQL if exchange tables are GPU-registered (packed GPU path),
-                            //    CPU SQL if tables are CPU-registered (PBlock decode path).
-                            // CPU SQL: exchange tables are CPU-registered (PBlock decode)
-                            // in 1-BE local exchange mode.
-                            info!(sql = %agg_sql, "exchange fragment using AGG merge SQL path");
-                            (ExecPlan::SqlCpuOnly(agg_sql), None)
+                        } else if false {
+                            // AGG merge SQL shortcut disabled: it skips node projections
+                            // (division, CASE expressions) that are critical for correctness.
+                            // Using Substrait path instead, which handles projections via
+                            // build_projection_slot_map + slot expression expansion.
+                            unreachable!()
                         } else if any_gpu_registration_failed {
                             // GPU table registration failed — some exchange tables are CPU-only.
                             // Must use CPU Substrait to avoid GPU engine hanging on invalid tables.

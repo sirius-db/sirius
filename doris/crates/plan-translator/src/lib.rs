@@ -256,6 +256,21 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
     let mut slot_expressions: HashMap<i32, TExpr> = HashMap::new();
 
     for node in &plan.nodes {
+        // Log projection info for debugging.
+        let proj_count = node.projections.as_ref().map(|p| p.len()).unwrap_or(0);
+        if proj_count > 0 {
+            let types: Vec<String> = node.projections.as_ref().unwrap().iter().map(|e| {
+                e.nodes.first().map(|n| format!("{:?}(ch={})", n.node_type, n.num_children)).unwrap_or_default()
+            }).collect();
+            tracing::warn!(
+                node_id = node.node_id,
+                node_type = ?node.node_type,
+                proj_count,
+                types = ?types,
+                "plan node projections"
+            );
+        }
+
         // For FILE_SCAN_NODE: capture ALL projection expressions (named and unnamed).
         // For other nodes (JOIN, AGG): only capture EMPTY-NAME slots to avoid breaking
         // named slot resolution which uses different mechanisms (child_rel_column_names).
