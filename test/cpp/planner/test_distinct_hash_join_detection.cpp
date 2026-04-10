@@ -112,7 +112,7 @@ struct distinct_hash_join_fixture {
   distinct_hash_join_fixture()
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
-               "minimal.cfg";
+               "minimal.yaml";
     setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
     db  = std::make_unique<DuckDB>(nullptr);
     con = std::make_unique<Connection>(*db);
@@ -314,10 +314,10 @@ TEST_CASE_METHOD(
   CHECK(hj->unique_build_keys);
 }
 
-TEST_CASE_METHOD(
-  distinct_hash_join_fixture,
-  "distinct_hash_join - uniqueness does NOT propagate through INNER join when other side not unique",
-  "[distinct_hash_join][isolated_context]")
+TEST_CASE_METHOD(distinct_hash_join_fixture,
+                 "distinct_hash_join - uniqueness does NOT propagate through INNER join when other "
+                 "side not unique",
+                 "[distinct_hash_join][isolated_context]")
 {
   // Inner join: (GROUP BY product_id) JOIN lineitem ON product_id = l_orderkey
   //   → lineitem has no PK, so each agg row can match multiple lineitem rows

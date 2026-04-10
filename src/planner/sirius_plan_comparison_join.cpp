@@ -195,24 +195,16 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
           left_preserved  = right_keys_unique;
           right_preserved = left_keys_unique;
           break;
-        case duckdb::JoinType::LEFT:
-          left_preserved = right_keys_unique;
-          break;
-        case duckdb::JoinType::RIGHT:
-          right_preserved = left_keys_unique;
-          break;
+        case duckdb::JoinType::LEFT: left_preserved = right_keys_unique; break;
+        case duckdb::JoinType::RIGHT: right_preserved = left_keys_unique; break;
         case duckdb::JoinType::SEMI:
         case duckdb::JoinType::ANTI:
           left_preserved = !left_unique.empty();  // output ⊆ left rows
           break;
         case duckdb::JoinType::RIGHT_SEMI:
-        case duckdb::JoinType::RIGHT_ANTI:
-          right_preserved = !right_unique.empty();
-          break;
+        case duckdb::JoinType::RIGHT_ANTI: right_preserved = !right_unique.empty(); break;
         case duckdb::JoinType::MARK:
-        case duckdb::JoinType::SINGLE:
-          left_preserved = !left_unique.empty();
-          break;
+        case duckdb::JoinType::SINGLE: left_preserved = !left_unique.empty(); break;
         default: return {};  // FULL OUTER: NULL-padding can duplicate key values
       }
       if (!left_preserved && !right_preserved) { return {}; }
@@ -223,7 +215,9 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
                       duckdb::idx_t offset) -> std::unordered_set<duckdb::idx_t> {
         std::unordered_set<duckdb::idx_t> mapped;
         if (proj_map.empty()) {
-          for (auto col : child_unique) { mapped.insert(offset + col); }
+          for (auto col : child_unique) {
+            mapped.insert(offset + col);
+          }
         } else {
           for (duckdb::idx_t i = 0; i < proj_map.size(); i++) {
             if (child_unique.count(proj_map[i])) { mapped.insert(offset + i); }
@@ -268,11 +262,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 {
   // now visit the children
   D_ASSERT(op.children.size() == 2);
-  std::size_t lhs_cardinality  = op.children[0]->EstimateCardinality(context);
-  std::size_t rhs_cardinality  = op.children[1]->EstimateCardinality(context);
+  std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
+  std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
   // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
-  auto build_side_unique_cols = prove_unique_columns(*op.children[1]);
+  auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;

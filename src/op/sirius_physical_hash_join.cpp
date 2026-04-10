@@ -739,8 +739,9 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
   }
 
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-    make_data_batch(std::move(output_cudf_table), memory_space)});
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), memory_space)});
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
