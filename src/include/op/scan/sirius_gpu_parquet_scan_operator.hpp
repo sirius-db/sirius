@@ -69,11 +69,9 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   /**
    * @param types                  Output column types (forwarded from the parquet scan operator).
    * @param estimated_cardinality  Estimated row count.
-   * @param gpu_memory_space       GPU memory space for allocating output tables.
    */
   sirius_gpu_parquet_scan_operator(duckdb::vector<duckdb::LogicalType> types,
-                                   duckdb::idx_t estimated_cardinality,
-                                   cucascade::memory::memory_space& gpu_memory_space);
+                                   duckdb::idx_t estimated_cardinality);
 
   //===----------Sink interface (pipeline 1)----------===//
   bool is_sink() const override { return true; }
@@ -164,9 +162,6 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   };
   std::vector<partition_entry> _partition_index;
   std::atomic<std::size_t> _next_partition_idx{0};
-
-  // GPU memory space for allocating output tables produced by execute().
-  cucascade::memory::memory_space& _gpu_memory_space;
 };
 
 }  // namespace sirius::op::scan

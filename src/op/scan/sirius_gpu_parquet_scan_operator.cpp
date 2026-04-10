@@ -20,6 +20,7 @@
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
+#include <pipeline/sirius_meta_pipeline.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -39,12 +40,9 @@ namespace sirius::op::scan {
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::idx_t estimated_cardinality,
-  cucascade::memory::memory_space& gpu_memory_space)
+  duckdb::vector<duckdb::LogicalType> types, duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
-    _gpu_memory_space(gpu_memory_space)
+      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality)
 {
 }
 
@@ -163,8 +161,13 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       "[sirius_gpu_parquet_scan_operator] execute() called with unexpected operator_data type; "
       "expected parquet_scan_data.");
   }
-
+  if (!scan_data->gpu_memory_space) {
+    throw std::runtime_error(
+      "[sirius_gpu_parquet_scan_operator] execute() called with null gpu_memory_space in "
+      "input_data.");
+  }
   auto datasource = scan_data->datasource;
+  auto& mem_space = *scan_data->gpu_memory_space;
 
   // Build reader options for this partition's row groups.
   auto opts = *scan_data->reader_options;
@@ -184,7 +187,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     auto& duckdb_expr = std::get<std::shared_ptr<duckdb::Expression>>(scan_data->filter_expression);
     if (duckdb_expr) {
       duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*duckdb_expr);
-      auto input_batch  = sirius::make_data_batch(std::move(table), _gpu_memory_space);
+      auto input_batch  = sirius::make_data_batch(std::move(table), mem_space);
       auto output_batch = gpu_expression_executor.select(input_batch, stream);
       if (!output_batch) { return std::make_unique<operator_data>(); }
       table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
@@ -210,7 +213,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   }
 
   // Wrap the GPU table in operator_data for the downstream pipeline.
-  auto batch = sirius::make_data_batch(std::move(table), _gpu_memory_space);
+  auto batch = sirius::make_data_batch(std::move(table), mem_space);
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
   return std::make_unique<pipelineable_operator_data>(std::move(batches));

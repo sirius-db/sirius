@@ -31,7 +31,7 @@ namespace sirius {
 namespace op {
 
 //===--------------------------------------------------------------------===//
-// pipelineable_operator_data
+// operator_data
 //===--------------------------------------------------------------------===//
 
 std::optional<std::vector<::cucascade::data_batch_processing_handle>>

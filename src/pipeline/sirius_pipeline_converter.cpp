@@ -16,7 +16,10 @@
 
 #include "pipeline/sirius_pipeline_converter.hpp"
 
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "log/logging.hpp"
+#include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
+#include "op/scan/sirius_parquet_metadata_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -155,6 +158,67 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
   }
 
   return copied_scheduled;
+}
+
+//===----------------------------------------------------------------------===//
+// split_parquet_scan_source()
+//===----------------------------------------------------------------------===//
+void sirius_pipeline_converter::split_parquet_scan_source(
+  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
+{
+  assert(current_pipeline->source->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN);
+  auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_parquet_scan>();
+  assert(scan_op.function.name == "parquet_scan");
+
+  // TODO: extract file paths from the plan-time sirius_physical_table_scan, construct
+  // sirius_parquet_metadata_scan_operator + sirius_gpu_parquet_scan_operator, wire them
+  // into a sidecar metadata pipeline, and rewire current_pipeline to source from the GPU scan.
+  if (scan_op.function.in_out_function) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::split_parquet_scan_source] In-out table functions are not "
+      "supported in sirius parquet scans.");
+  }
+  if (scan_op.dynamic_filters) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::split_parquet_scan_source] Dynamic table filters are not "
+      "supported in sirius parquet scans.");
+  }
+  auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::split_parquet_scan_source] No input files to scan");
+  }
+  std::vector<std::string> file_paths;
+  auto const& files = bind_data.file_list->GetAllFiles();
+  for (const auto& file : files) {
+    file_paths.push_back(file.path);
+  }
+
+  auto metadata_scan_op = duckdb::make_uniq<op::scan::sirius_parquet_metadata_scan_operator>(
+    scan_op.types,
+    scan_op.estimated_cardinality,
+    file_paths,
+    scan_op.column_ids,
+    scan_op.projection_ids,
+    scan_op.names,
+    std::move(scan_op.table_filters));
+  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality);
+  gpu_scan_op->children.push_back(std::move(metadata_scan_op));
+  auto* metadata_scan_raw = gpu_scan_op->children[0].get();
+
+  /// Construct a sidecar metadata pipeline with a sirius_parquet_metadata_scan_operator source and
+  /// a sirius_gpu_parquet_scan_operator sink. The metadata scan reads parquet metadata and
+  /// partitions row groups; the GPU scan reads the actual data from the parquet files based on
+  /// the assigned row group partitions.
+  auto metadata_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
+  metadata_pipeline->source = metadata_scan_raw;
+  metadata_pipeline->sink   = gpu_scan_op.get();
+
+  current_pipeline->source = gpu_scan_op.get();
+
+  scheduled_.push_back(metadata_pipeline);
+  pipeline_breakers_.push_back(std::move(gpu_scan_op));
 }
 
 void sirius_pipeline_converter::split_table_scan_source(
@@ -726,8 +790,8 @@ void sirius_pipeline_converter::wire_data_repositories()
   std::unordered_map<const op::sirius_physical_operator*,
                      duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>>
     source_to_pipelines;
-  for (size_t i = 0; i < scheduled_.size(); i++) {
-    source_to_pipelines[scheduled_[i]->source.get()].push_back(scheduled_[i]);
+  for (const auto& pipeline : scheduled_) {
+    source_to_pipelines[pipeline->source.get()].push_back(pipeline);
   }
 
   // Assign pipeline IDs before adding ports so that add_port can sort _ports_list
@@ -745,14 +809,14 @@ void sirius_pipeline_converter::wire_data_repositories()
         scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE) {
       auto sink_op             = scheduled_[i]->get_sink().get();
       std::string_view port_id = "default";
-      for (auto dependent_pipeline : source_to_pipelines[sink_op]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         engine_.insert_repository(port_id, scheduled_[i], dependent_pipeline);
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::CTE) {
       auto& cte_op             = scheduled_[i]->get_sink()->Cast<op::sirius_physical_cte>();
       std::string_view port_id = "default";
       for (auto cte_scan : cte_op.cte_scans) {
-        for (auto dependent_pipeline : source_to_pipelines[&cte_scan.get()]) {
+        for (auto const& dependent_pipeline : source_to_pipelines[&cte_scan.get()]) {
           engine_.insert_repository(port_id, scheduled_[i], dependent_pipeline);
         }
       }
@@ -764,13 +828,13 @@ void sirius_pipeline_converter::wire_data_repositories()
 
       // Wire partition_join -> CONCAT (partition_join pushes via its own
       // sink/next_port_after_sink)
-      for (auto dependent_pipeline : source_to_pipelines[partition_join]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[partition_join]) {
         engine_.insert_repository("default", partition_join, scheduled_[i], dependent_pipeline);
       }
 
       // Wire distinct_op -> partition_distinct (distinct output pushed via distinct's
       // next_port_after_sink)
-      for (auto dependent_pipeline : source_to_pipelines[distinct_op]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[distinct_op]) {
         engine_.insert_repository("default", distinct_op, scheduled_[i], dependent_pipeline);
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
@@ -780,12 +844,12 @@ void sirius_pipeline_converter::wire_data_repositories()
       auto column_data_scan = left_delim.column_data_scan;
 
       // Wire column_data_scan -> downstream (column_data_scan pushes via its own sink)
-      for (auto dependent_pipeline : source_to_pipelines[column_data_scan]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[column_data_scan]) {
         engine_.insert_repository("default", column_data_scan, scheduled_[i], dependent_pipeline);
       }
 
       // Wire distinct_op -> partition_distinct
-      for (auto dependent_pipeline : source_to_pipelines[distinct_op]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[distinct_op]) {
         engine_.insert_repository("default", distinct_op, scheduled_[i], dependent_pipeline);
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::CONCAT) {
@@ -817,7 +881,8 @@ void sirius_pipeline_converter::wire_data_repositories()
         }
       } else {
         // Probe concats have dependent pipelines in source_to_pipelines
-        for (auto dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
+        for (auto const& dependent_pipeline :
+             source_to_pipelines[scheduled_[i]->get_sink().get()]) {
           engine_.insert_repository(port_id, scheduled_[i], dependent_pipeline);
         }
       }
@@ -826,7 +891,7 @@ void sirius_pipeline_converter::wire_data_repositories()
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
-      for (auto dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
         // if the source is CONCAT, then use partial barrier type
         if ((dependent_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
              dependent_pipeline->get_operators().size() == 0) ||
@@ -845,7 +910,7 @@ void sirius_pipeline_converter::wire_data_repositories()
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
       // Pipeline barrier — sort operators process batches as they arrive
       // (sort_sample overrides get_next_task_hint to wait for N batches)
-      for (auto dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
         auto next_op             = dependent_pipeline->get_operators().size() == 0
                                      ? dependent_pipeline->get_sink().get()
                                      : &dependent_pipeline->get_operators()[0].get();
@@ -863,8 +928,9 @@ void sirius_pipeline_converter::wire_data_repositories()
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
-      for (auto dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
+               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
+               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
+      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
         auto next_op             = dependent_pipeline->get_operators().size() == 0
                                      ? dependent_pipeline->get_sink().get()
                                      : &dependent_pipeline->get_operators()[0].get();
@@ -886,7 +952,7 @@ void sirius_pipeline_converter::wire_data_repositories()
       // Intermediate operators acting as pipeline sinks (e.g., filter, projection, join
       // placed as sink before a PARTITION pipeline). Use the base class sink() which
       // pushes data to next_port_after_sink via the data repo.
-      for (auto dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
+      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
         engine_.insert_repository("default", scheduled_[i], dependent_pipeline);
       }
     }

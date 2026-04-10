@@ -77,8 +77,8 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   duckdb::vector<duckdb::idx_t> const& projection_ids,
   duckdb::vector<std::string> const& names,
-  std::size_t approximate_batch_size,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+  std::size_t approximate_batch_size,
   std::size_t max_file_processed)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN, std::move(types), estimated_cardinality),
@@ -157,9 +157,7 @@ std::optional<task_creation_hint> sirius_parquet_metadata_scan_operator::get_nex
 }
 
 bool sirius_parquet_metadata_scan_operator::all_ports_empty()
-{
-  return _next_file_idx.load(std::memory_order_relaxed) >= _total_files;
-}
+{ return _next_file_idx.load(std::memory_order_relaxed) >= _total_files; }
 
 std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::get_next_task_input_data()
 {

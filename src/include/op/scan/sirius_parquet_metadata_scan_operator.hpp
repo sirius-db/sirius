@@ -17,6 +17,9 @@
 #pragma once
 
 // sirius
+#include "sirius_config.hpp"
+
+#include <config.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
@@ -87,10 +90,10 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    *                                (empty = no projection, read all columns).
    * @param names                   All column names in schema order (used to build column-name
    *                                projections passed to the parquet reader).
-   * @param approximate_batch_size  Target uncompressed bytes per row-group partition.
    * @param table_filter_set        The table filter set for row-group pruning and filter pushdown
    *                                (optional; may be nullptr if no filters or filter translation
-   * fails).
+   *                                fails).
+   * @param approximate_batch_size  Target uncompressed bytes per row-group partition.
    * @param max_file_processed      Maximum number of files handled by one metadata task.
    *
    * @throws if projection_ids is nonempty or filter_expression is non-nullptr but names is empty
@@ -103,9 +106,9 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
     duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     duckdb::vector<duckdb::idx_t> const& projection_ids,
     duckdb::vector<std::string> const& names,
-    std::size_t approximate_batch_size,
     duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set = nullptr,
-    std::size_t max_file_processed                              = DEFAULT_MAX_FILE_PROCESSED);
+    std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED);
 
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
@@ -174,8 +177,12 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   /// Pre-computed column name lookup for AST translation (ref_index -> column name).
   std::vector<std::string> _column_name_by_ref;
   /// The projection ids corresponding to columns that remain after pruning pure filter columns.
+  /// These are passed forward to the GPU scan operator to apply as a post-filter projection after
+  /// filter pushdown.
   std::vector<std::size_t> _post_filter_projection_ids;
   /// The set of column indices corresponding to columns that will be pruned after filtering.
+  /// For the metadata scan operator, this is used to prune bytes from the accumulated uncompressed
+  /// byte count for paritioning purposes.
   std::unordered_set<std::size_t> _pure_filter_column_indices;
 
   std::size_t _approximate_batch_size;
