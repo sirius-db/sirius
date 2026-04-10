@@ -119,9 +119,17 @@ pub fn resolve_partition_columns(
             .get(&slot_ref.slot_id)
             .ok_or_else(|| format!("slot_id {} not found in descriptor table", slot_ref.slot_id))?;
 
-        let col_idx = batch_schema
-            .index_of(col_name)
-            .map_err(|_| format!("column '{}' not found in batch schema", col_name))?;
+        // Look up by name, or fall back to positional index if name is empty
+        // (AGG measure slots have empty col_name in the descriptor).
+        let col_idx = if col_name.is_empty() {
+            // Positional fallback: use the partition expression index.
+            // The FE places partition columns first in the output schema.
+            col_indices.len()
+        } else {
+            batch_schema
+                .index_of(col_name)
+                .map_err(|_| format!("column '{}' not found in batch schema", col_name))?
+        };
 
         // Extract Doris primitive type from the expression's type descriptor.
         let doris_type = first_node
