@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "duckdb/common/types.hpp"
+
 #include <expression_executor/gpu_dispatcher.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_executor_state.hpp>
@@ -89,9 +91,14 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
                                                 execution_mode mode)
 {
   auto const& func_string = expr.function.name;
+  /// We disable AST if the output type is decimal, since cuDF ASTs choke on intermediate decimal
+  /// results currently.
+  /// TODO: Fix when the following bug fix is in:
+  /// https://github.com/rapidsai/cudf/pull/21996
   auto const ast_supported =
-    std::find(supported_ast_functions.begin(), supported_ast_functions.end(), func_string) !=
-    supported_ast_functions.end();
+    (expr.return_type.id() != duckdb::LogicalTypeId::DECIMAL) &&
+    (std::find(supported_ast_functions.begin(), supported_ast_functions.end(), func_string) !=
+     supported_ast_functions.end());
 
   if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
@@ -112,7 +119,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
         return cudf::ast::ast_operator::MOD;
       } else {
         throw duckdb::InternalException(
-          "[gpu_expression_executor:function] unrecognized function type {}", function_name);
+          "[gpu_expression_executor:function] unsupported AST function type {}", function_name);
       }
     };
 

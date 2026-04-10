@@ -207,6 +207,65 @@ std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
 
+std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
+                                                         int8_t scale,
+                                                         const std::vector<int64_t>& values_a,
+                                                         const std::vector<int64_t>& values_b)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+  auto size   = static_cast<cudf::size_type>(values_a.size());
+
+  auto make_col = [&](const std::vector<int64_t>& values) {
+    auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL64, -scale},
+                                             size,
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             mr);
+    cudaMemcpy(col->mutable_view().data<int64_t>(),
+               values.data(),
+               sizeof(int64_t) * values.size(),
+               cudaMemcpyHostToDevice);
+    return col;
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(make_col(values_a));
+  cols.push_back(make_col(values_b));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
+  auto batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+}
+
+std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
+                                                 int8_t scale,
+                                                 const std::vector<int32_t>& values)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+  auto size   = static_cast<cudf::size_type>(values.size());
+
+  auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL32, -scale},
+                                           size,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+  cudaMemcpy(col->mutable_view().data<int32_t>(),
+             values.data(),
+             sizeof(int32_t) * values.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
+  auto batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+}
+
 }  // namespace
 
 TEST_CASE("gpu_expression_executor execute(data_batch) projects references",
@@ -879,6 +938,199 @@ TEST_CASE("experimental execute arithmetic functions", "[expression_executor][ex
       REQUIRE(out0[i] == in0[i] % 3);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Decimal arithmetic (MATERIALIZE path — AST is disabled for decimal return
+// types pending cudf#21996, so all decimal function evaluation flows through
+// cudf::binary_operation on fixed_point columns/scalars).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("experimental execute decimal arithmetic (DECIMAL64)",
+          "[expression_executor][experimental][decimal]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  uint8_t const width = 18;
+  uint8_t const scale = 2;
+  auto const dec_type = LogicalType::DECIMAL(width, scale);
+
+  // Values: 0.00, 0.01, ... 0.09 (stored as 0, 1, ... 9 at scale 2)
+  std::vector<int64_t> raw_a = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  std::vector<int64_t> raw_b = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+  SECTION("col + literal (col + 1.25)")
+  {
+    auto input = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw_a);
+
+    // 1.25 at scale 2 → raw value 125
+    duckdb::vector<duckdb::unique_ptr<Expression>> children;
+    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{125}, width, scale)));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+    REQUIRE(ov.num_columns() == 1);
+    REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+    REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
+
+    auto out0 = copy_column_to_host<int64_t>(ov.column(0));
+    std::vector<int64_t> expected;
+    expected.reserve(raw_a.size());
+    for (auto v : raw_a) {
+      expected.push_back(v + 125);
+    }
+    REQUIRE(out0 == expected);
+  }
+
+  SECTION("col - col (two-column batch)")
+  {
+    auto input = make_decimal64_two_col_batch(*space, static_cast<int8_t>(scale), raw_b, raw_a);
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> children;
+    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
+    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 1));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(make_func_expr("-", dec_type, {dec_type, dec_type}, std::move(children)));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+    REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+    REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
+
+    auto out0 = copy_column_to_host<int64_t>(ov.column(0));
+    std::vector<int64_t> expected;
+    expected.reserve(raw_a.size());
+    for (size_t i = 0; i < raw_a.size(); ++i) {
+      expected.push_back(raw_b[i] - raw_a[i]);
+    }
+    REQUIRE(out0 == expected);
+  }
+
+  SECTION("col * integer literal (decimal with scale 0)")
+  {
+    auto input = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw_a);
+
+    // 2 as DECIMAL(18, 0) → same cudf type_id (DECIMAL64), scale 0.
+    // cudf MUL: output scale = lhs_scale + rhs_scale = -2 + 0 = -2.
+    auto const dec_int_type = LogicalType::DECIMAL(width, 0);
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> children;
+    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(
+      make_func_expr("*", dec_type, {dec_type, dec_int_type}, std::move(children)));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+    REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+    REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
+
+    auto out0 = copy_column_to_host<int64_t>(ov.column(0));
+    std::vector<int64_t> expected;
+    expected.reserve(raw_a.size());
+    for (auto v : raw_a) {
+      expected.push_back(v * 2);
+    }
+    REQUIRE(out0 == expected);
+  }
+}
+
+TEST_CASE("experimental execute decimal arithmetic (DECIMAL32)",
+          "[expression_executor][experimental][decimal]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // Width 8 → INT32 physical (DuckDB) → DECIMAL32 (cudf). Exercises the
+  // DECIMAL32 branches in gpu_execute_constant.cpp and GetCudfType.
+  uint8_t const width = 8;
+  uint8_t const scale = 2;
+  auto const dec_type = LogicalType::DECIMAL(width, scale);
+
+  // 1.00, 2.00, 3.00 ... 10.00 (raw: 100, 200, ... 1000 at scale 2)
+  std::vector<int32_t> raw = {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
+  auto input               = make_decimal32_batch(*space, static_cast<int8_t>(scale), raw);
+
+  // col0 + 0.50 → raw add 50
+  duckdb::vector<duckdb::unique_ptr<Expression>> children;
+  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
+  children.push_back(
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int32_t{50}, width, scale)));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL32);
+  REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
+
+  auto out0 = copy_column_to_host<int32_t>(ov.column(0));
+  std::vector<int32_t> expected;
+  expected.reserve(raw.size());
+  for (auto v : raw) {
+    expected.push_back(v + 50);
+  }
+  REQUIRE(out0 == expected);
+}
+
+TEST_CASE("experimental execute nested decimal arithmetic (col + 1.00) * 2",
+          "[expression_executor][experimental][decimal]")
+{
+  // Regression coverage: before disabling AST for decimal-returning functions,
+  // nested decimal arithmetic would feed intermediate fixed_point results into
+  // the cudf AST kernel and trip cudf#21996. With AST disabled for decimal
+  // return types, the inner `+` materializes via cudf::binary_operation and the
+  // outer `*` consumes the materialized column via another cudf::binary_operation.
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  uint8_t const width = 18;
+  uint8_t const scale = 2;
+  auto const dec_type = LogicalType::DECIMAL(width, scale);
+  auto const dec_int  = LogicalType::DECIMAL(width, 0);
+
+  // 0.00, 0.01 ... 0.09
+  std::vector<int64_t> raw = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  auto input               = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw);
+
+  // Inner: col + 1.00 (both scale 2) → result scale 2
+  duckdb::vector<duckdb::unique_ptr<Expression>> add_children;
+  add_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
+  add_children.push_back(
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{100}, width, scale)));
+  auto add_expr =
+    make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(add_children));
+
+  // Outer: (col + 1.00) * 2 where 2 is DECIMAL(18, 0) so MUL output scale = -2 + 0 = -2
+  duckdb::vector<duckdb::unique_ptr<Expression>> mul_children;
+  mul_children.push_back(std::move(add_expr));
+  mul_children.push_back(
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(
+    make_func_expr("*", dec_type, {dec_type, dec_int}, std::move(mul_children)));
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
+
+  auto out0 = copy_column_to_host<int64_t>(ov.column(0));
+  std::vector<int64_t> expected;
+  expected.reserve(raw.size());
+  for (auto v : raw) {
+    expected.push_back((v + 100) * 2);
+  }
+  REQUIRE(out0 == expected);
 }
 
 // ---------------------------------------------------------------------------

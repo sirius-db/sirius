@@ -174,9 +174,7 @@ gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expre
                                                  rmm::cuda_stream_view stream,
                                                  std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
-{
-  _expressions.push_back(expression);
-}
+{ _expressions.push_back(expression); }
 
 std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
 {
@@ -404,6 +402,15 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
     }
     case duckdb::ExpressionClass::BOUND_FUNCTION: {
       auto const& func_expr = expr.Cast<duckdb::BoundFunctionExpression>();
+
+      /// First we check if the output type is decimal, since cuDF ASTs choke on intermediate
+      /// decimal results currently.
+      /// TODO: Fix when the following bug fix is in:
+      /// https://github.com/rapidsai/cudf/pull/21996
+      if (func_expr.return_type.id() == duckdb::LogicalTypeId::DECIMAL) { return 0; }
+
+      // Check the set of supported AST functions. If the function is supported, count 1 for the
+      // function itself plus the ops in the children.
       if (std::find(supported_ast_functions.begin(),
                     supported_ast_functions.end(),
                     func_expr.function.name) != supported_ast_functions.end()) {
@@ -471,9 +478,7 @@ namespace sirius {
 GpuExpressionExecutor::GpuExpressionExecutor(const Expression& expr,
                                              rmm::device_async_resource_ref resource_ref)
   : resource_ref(resource_ref)
-{
-  AddExpression(expr);
-}
+{ AddExpression(expr); }
 
 GpuExpressionExecutor::GpuExpressionExecutor(const vector<unique_ptr<Expression>>& expressions,
                                              rmm::device_async_resource_ref resource_ref)
