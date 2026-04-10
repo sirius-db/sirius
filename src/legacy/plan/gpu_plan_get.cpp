@@ -297,6 +297,9 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet&
     unique_ptr<Expression> unsupported_filter;
     unordered_set<idx_t> to_remove;
     for (auto& entry : table_filters->filters) {
+      if (column_ids[entry.first].IsVirtualColumn()) {
+        continue;  // Skip virtual columns (ROW_ID, EMPTY)
+      }
       auto column_id = column_ids[entry.first].GetPrimaryIndex();
       auto& type     = op.returned_types[column_id];
       if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
@@ -325,6 +328,10 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet&
     if (!select_list.empty()) {
       vector<LogicalType> filter_types;
       for (auto& c : projection_ids) {
+        if (column_ids[c].IsVirtualColumn()) {
+          filter_types.push_back(LogicalType::BIGINT);
+          continue;
+        }
         auto column_id = column_ids[c].GetPrimaryIndex();
         filter_types.push_back(op.returned_types[column_id]);
       }

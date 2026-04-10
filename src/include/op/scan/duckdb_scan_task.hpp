@@ -102,10 +102,13 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   {
     _source_drained.store(true, std::memory_order_release);
     if (get_pipeline()) {
-      auto* scan_op =
-        dynamic_cast<sirius_physical_duckdb_scan*>(&get_pipeline()->get_operators().at(0).get());
+      auto source   = get_pipeline()->get_source();
+      auto* scan_op = source ? dynamic_cast<sirius_physical_duckdb_scan*>(source.get()) : nullptr;
 
-      if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
+      if (scan_op) {
+        scan_op->exhausted.store(true, std::memory_order_release);
+        get_pipeline()->update_pipeline_status();
+      }
     }
   }
 
@@ -137,6 +140,26 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
       output_consumers.push_back(next_port.next_operator);
     }
     return output_consumers;
+  }
+
+  /// @brief Get output consumers together with their destination pipelines.
+  /// Used by the scan executor to pass the correct pipeline when scheduling
+  /// downstream tasks for shared operators (e.g. TABLE_SCAN shared across
+  /// multiple pipelines).
+  struct consumer_with_pipeline {
+    sirius_physical_operator* op;
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline;
+  };
+
+  std::vector<consumer_with_pipeline> get_output_consumers_with_pipelines() const noexcept
+  {
+    std::vector<consumer_with_pipeline> result;
+    auto ports = _op.get_next_port_after_sink();
+    for (auto& [child, port_id] : ports) {
+      auto* p = child->get_port(port_id);
+      result.push_back({child, p ? p->dest_pipeline : nullptr});
+    }
+    return result;
   }
 
   std::size_t can_create_more_tasks() const noexcept
@@ -499,6 +522,14 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   std::vector<op::sirius_physical_operator*> get_output_consumers() override
   {
     return this->_global_state->cast<duckdb_scan_task_global_state>().get_output_consumers();
+  }
+
+  /// @brief Get output consumers with their destination pipelines.
+  std::vector<duckdb_scan_task_global_state::consumer_with_pipeline>
+  get_output_consumers_with_pipelines()
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>()
+      .get_output_consumers_with_pipelines();
   }
 
   [[nodiscard]] size_t get_pipeline_id() const

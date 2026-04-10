@@ -24,6 +24,7 @@
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_pipeline.hpp"
+#include "last_gpu_buffers.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "utils.hpp"
@@ -419,6 +420,47 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
                                    .count() /
                                  1000.0;
   SIRIUS_LOG_DEBUG("Result Collector CPU Materialize Time: {:.2f} ms", materialize_duration_ms);
+
+  // Capture GPU buffer metadata for nixl GPU-direct exchange.
+  // The materialized_relation has final GPU pointers that remain valid
+  // (GPUColumn destructor does not free GPU memory — managed by GPUBufferManager).
+  {
+    std::vector<GPUBufferInfo> gpu_buffers;
+    gpu_buffers.reserve(materialized_relation.columns.size());
+    for (size_t col = 0; col < materialized_relation.columns.size(); col++) {
+      auto& mc             = materialized_relation.columns[col];
+      size_t col_bytes     = mc->column_length * mc->data_wrapper.getColumnTypeSize();
+      std::string col_name = col < input_relation.column_names.size()
+                               ? input_relation.column_names[col]
+                               : "col_" + std::to_string(col);
+      gpu_buffers.push_back({
+        reinterpret_cast<uintptr_t>(mc->data_wrapper.data),
+        col_bytes,
+        0,  // device_id
+        std::move(col_name),
+        static_cast<int>(mc->data_wrapper.type.id()),
+        mc->column_length,
+      });
+    }
+    LastGPUBuffers::GetInstance().Store(std::move(gpu_buffers));
+
+    // If retain_next_ is set, move result GPU buffers to the retained table
+    // so they survive ResetBuffer() during DuckDB query cleanup.
+    if (LastGPUBuffers::GetInstance().ShouldRetain()) {
+      for (size_t c = 0; c < materialized_relation.columns.size(); c++) {
+        auto& mc = materialized_relation.columns[c];
+        if (mc->data_wrapper.data) { gpuBufferManager->RetainAllocation(mc->data_wrapper.data, 0); }
+        if (mc->data_wrapper.validity_mask) {
+          gpuBufferManager->RetainAllocation(
+            reinterpret_cast<void*>(mc->data_wrapper.validity_mask), 0);
+        }
+        if (mc->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR && mc->data_wrapper.offset) {
+          gpuBufferManager->RetainAllocation(mc->data_wrapper.offset, 0);
+        }
+      }
+      LastGPUBuffers::GetInstance().SetRetainNext(false);
+    }
+  }
 
   auto chunk_start_time = std::chrono::high_resolution_clock::now();
   size_t num_records    = materialized_relation.columns[0]->column_length;

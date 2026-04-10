@@ -19,6 +19,13 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/common/types.hpp"
 #include "helper/common.h"
+#include "log/logging.hpp"
+
+#include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
+#include <cudf/table/table.hpp>
+
+#include <rmm/mr/cuda_memory_resource.hpp>
 
 namespace duckdb {
 
@@ -251,6 +258,157 @@ class GPUIntermediateRelation {
   vector<string> column_names;
   vector<shared_ptr<GPUColumn>> columns;
   size_t column_count;
+
+  /// Pre-owned cudf::table from registerExternalTable (cudf::unpack'd data).
+  /// Raw pointer — ownership managed manually by the exchange lifecycle.
+  /// nullptr when not populated from packed nixl transfer.
+  cudf::table* packed_cudf_table = nullptr;
+
+  /// Pending table_views accumulated from multiple senders (zero-copy).
+  /// Each view points into a packed/staging buffer that stays alive until
+  /// release_gpu_buffers(). Call finalize_pending_views() to concatenate
+  /// them into a single cudf::table for duckdb_scan_task.
+  ///
+  /// IMPORTANT: cudf::unpack creates table_views that may reference the host
+  /// metadata buffer internally (for STRING child column pointers). We must
+  /// keep the metadata alive alongside the views.
+  std::vector<cudf::table_view> pending_views;
+  std::vector<std::string> pending_metadata;  // Keeps metadata buffers alive
+  std::vector<uint8_t*> pending_gpu_ptrs;     // GPU data pointers for re-unpack
+  size_t pending_total_rows = 0;
+
+  /// Concatenate all pending views into a single owned cudf::table.
+  /// Called just before GPU execution of the exchange fragment.
+  ///
+  /// Always uses cudf::concatenate (even for single view) because
+  /// cudf::table(column_view) deep copy fails for string columns from
+  /// cudf::unpack. cudf::concatenate handles all column types correctly.
+  void finalize_pending_views()
+  {
+    if (pending_views.empty()) return;
+    // Log details about each pending view for debugging.
+    for (size_t v = 0; v < pending_views.size(); v++) {
+      auto& pv = pending_views[v];
+      SIRIUS_LOG_INFO("[finalize_pending_views] view {}/{}: {} cols, {} rows",
+                      v,
+                      pending_views.size(),
+                      pv.num_columns(),
+                      pv.num_rows());
+      for (cudf::size_type c = 0; c < pv.num_columns(); c++) {
+        auto col       = pv.column(c);
+        auto data_addr = reinterpret_cast<uintptr_t>(col.head<uint8_t>());
+        // For STRING columns, also log child (offsets) info.
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child      = col.child(0);  // offsets column
+          auto child_addr = reinterpret_cast<uintptr_t>(child.head<uint8_t>());
+          // Read the last offset value (D2H) to check if it's absolute or relative.
+          int32_t last_offset = 0;
+          if (child.size() > 0) {
+            auto* offset_ptr = child.data<int32_t>() + child.size() - 1;
+            cudaMemcpy(&last_offset, offset_ptr, sizeof(int32_t), cudaMemcpyDeviceToHost);
+          }
+          SIRIUS_LOG_INFO(
+            "[finalize_pending_views]   col {} STRING data=0x{:x} rows={} child_addr=0x{:x} "
+            "child_rows={} last_offset={}",
+            c,
+            data_addr,
+            col.size(),
+            child_addr,
+            child.size(),
+            last_offset);
+        } else {
+          SIRIUS_LOG_INFO(
+            "[finalize_pending_views]   col {} type={} data=0x{:x} rows={} null_cnt={} children={} "
+            "offset={}",
+            c,
+            static_cast<int>(col.type().id()),
+            data_addr,
+            col.size(),
+            col.null_count(),
+            col.num_children(),
+            col.offset());
+        }
+      }
+    }
+    static rmm::mr::cuda_memory_resource cuda_mr;
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+
+    // Re-unpack from stored metadata + gpu_ptrs to get fresh table_views.
+    // The stored pending_views may have corrupted column_view pointers if
+    // the vector reallocated or if cudf::unpack has state issues.
+    if (pending_gpu_ptrs.size() == pending_views.size() &&
+        pending_metadata.size() == pending_views.size()) {
+      SIRIUS_LOG_INFO("[finalize_pending_views] re-unpacking {} views from stored metadata",
+                      pending_views.size());
+      pending_views.clear();
+      for (size_t i = 0; i < pending_metadata.size(); i++) {
+        auto* md_ptr = reinterpret_cast<const uint8_t*>(pending_metadata[i].data());
+        // Verify the GPU data is still valid before re-unpacking.
+        int32_t first4 = 0;
+        cudaMemcpy(&first4, pending_gpu_ptrs[i], 4, cudaMemcpyDeviceToHost);
+        SIRIUS_LOG_INFO(
+          "[finalize_pending_views] re-unpack view {}: gpu_ptr=0x{:x} first4=0x{:08x}",
+          i,
+          reinterpret_cast<uintptr_t>(pending_gpu_ptrs[i]),
+          static_cast<uint32_t>(first4));
+        auto view = cudf::unpack(md_ptr, pending_gpu_ptrs[i]);
+        pending_views.push_back(view);
+      }
+    }
+
+    // Pre-finalize integrity check: verify the first/last 4 bytes of each view's buffer.
+    for (size_t v = 0; v < pending_views.size(); v++) {
+      auto& pv       = pending_views[v];
+      auto head_addr = reinterpret_cast<uintptr_t>(pv.column(0).head<uint8_t>());
+      // Read first 4 bytes via cudaMemcpy
+      uint32_t first4 = 0;
+      cudaMemcpy(&first4, reinterpret_cast<const void*>(head_addr), 4, cudaMemcpyDeviceToHost);
+      // For STRING columns, check the offsets child's last value
+      for (cudf::size_type c = 0; c < pv.num_columns(); c++) {
+        auto col = pv.column(c);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child       = col.child(0);
+          int32_t last_off = 0;
+          if (child.size() > 0) {
+            cudaMemcpy(
+              &last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+            if (last_off > 100000000 || last_off < 0) {
+              SIRIUS_LOG_ERROR(
+                "[PRE-FINALIZE] view {} col {} STRING last_offset={} CORRUPT (> 1MB for {} rows)",
+                v,
+                c,
+                last_off,
+                col.size());
+            }
+          }
+        }
+      }
+    }
+
+    // Try concatenating incrementally to identify which view causes the failure.
+    if (pending_views.size() > 1) {
+      for (size_t i = 0; i < pending_views.size(); i++) {
+        try {
+          std::vector<cudf::table_view> single = {pending_views[i]};
+          auto test = cudf::concatenate(single, cudf::get_default_stream(), &cuda_mr);
+          SIRIUS_LOG_INFO(
+            "[finalize_pending_views] single view {} OK: {} rows", i, test->num_rows());
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("[finalize_pending_views] single view {} FAILED: {}", i, e.what());
+        }
+        cudaGetLastError();  // Clear error for next attempt
+      }
+    }
+
+    auto merged       = cudf::concatenate(pending_views, cudf::get_default_stream(), &cuda_mr);
+    packed_cudf_table = merged.release();
+    pending_views.clear();
+    pending_metadata.clear();  // Metadata no longer needed after concatenation.
+    if (packed_cudf_table) {
+      pending_total_rows = static_cast<size_t>(packed_cudf_table->num_rows());
+    }
+  }
 };
 
 }  // namespace duckdb

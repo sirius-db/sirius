@@ -264,6 +264,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/substrait/src/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/substrait/third_party/substrait>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/substrait/third_party>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
@@ -317,6 +320,13 @@ endif()
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
                       absl::any_invocable)
+# The loadable extension also needs substrait symbols (SubstraitToDuckDB,
+# substrait::Plan) which are in the substrait static library. Use whole-archive
+# to ensure all symbols are included since the linker can't resolve the
+# dependency order between the sirius .o files and the substrait archive.
+target_link_libraries(sirius_loadable_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
+                      absl::any_invocable
+                      -Wl,--whole-archive substrait_extension -Wl,--no-whole-archive)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
@@ -368,6 +378,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_pack_unpack_deep_copy.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp

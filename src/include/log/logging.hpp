@@ -33,6 +33,7 @@
 #endif
 
 #include <spdlog/sinks/daily_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 #include <string>
@@ -69,12 +70,19 @@ inline void InitGlobalLogger(const std::string& log_level_str,
   auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
   file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
+  // Stderr sink (for Docker logs visibility)
+  auto stderr_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+  stderr_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
+
   auto log_level = ParseLogLevel(log_level_str);
-  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
+  auto logger =
+    std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink, stderr_sink});
   logger->set_level(log_level);
   spdlog::set_default_logger(logger);
   spdlog::set_level(log_level);
   spdlog::flush_every(std::chrono::seconds(flush_seconds));
+  // Always flush immediately for info and above (needed for crash debugging)
+  spdlog::flush_on(spdlog::level::info);
 }
 
 inline void SetGlobalLogFlush(int flush_seconds)

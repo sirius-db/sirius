@@ -68,6 +68,10 @@ struct sirius_config {
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
 
+  /// \brief Build default memory space configs using reservation_manager_configurator
+  /// when no config file is available. No-op if configs already populated.
+  void ensure_default_memory_configs();
+
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
     return _hw_topology;

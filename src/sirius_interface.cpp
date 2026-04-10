@@ -147,21 +147,25 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
   const duckdb::PendingQueryParameters& parameters)
 {
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] start");
   D_ASSERT(sirius_active_query);
   auto& statement = *(statement_p->prepared);
 
   bind_prepared_statement_parameters(statement, parameters);
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] parameters bound");
 
   duckdb::unique_ptr<sirius_engine> temp = duckdb::make_uniq<sirius_engine>(context, *this);
   auto prop                              = temp->context.GetClientProperties();
   sirius_active_query->engine            = std::move(temp);
   auto& engine                           = get_sirius_engine();
   bool stream_result                     = false;
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] engine created");
 
   duckdb::unique_ptr<op::sirius_physical_result_collector> sirius_collector =
     duckdb::make_uniq_base<op::sirius_physical_result_collector,
                            op::sirius_physical_materialized_collector>(*statement_p,
                                                                        client_context);
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] result collector created");
   if (sirius_collector->type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     return sirius_error_result<duckdb::PendingQueryResult>(
       duckdb::ErrorData("Error in sirius_pending_statement_internal"));
@@ -169,14 +173,18 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
   D_ASSERT(sirius_collector->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
   auto types = sirius_collector->get_types();
   D_ASSERT(types == statement.types);
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] calling engine.initialize");
   engine.initialize(std::move(sirius_collector));
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] engine initialized");
 
   D_ASSERT(!sirius_active_query->has_open_result());
 
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] creating PendingQueryResult");
   auto pending_result = duckdb::make_uniq<duckdb::PendingQueryResult>(
     context.shared_from_this(), *(statement_p->prepared), std::move(types), stream_result);
   sirius_active_query->sirius_prepared = std::move(statement_p);
   sirius_active_query->set_open_result(*pending_result);
+  SIRIUS_LOG_INFO("[sirius_pending_statement_internal] done");
   return pending_result;
 };
 
@@ -184,13 +192,14 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
 duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_pending_query_result(
   duckdb::PendingQueryResult& pending)
 {
+  SIRIUS_LOG_INFO("[sirius_execute_pending] start");
   D_ASSERT(sirius_active_query->is_open_result(pending));
   check_executable_internal(pending);
   auto& engine = get_sirius_engine();
   try {
-    SIRIUS_LOG_DEBUG("Executing sirius_engine");
+    SIRIUS_LOG_INFO("[sirius_execute_pending] calling engine.execute()");
     engine.execute();
-    SIRIUS_LOG_DEBUG("Done executing sirius_engine");
+    SIRIUS_LOG_INFO("[sirius_execute_pending] engine.execute() done");
   } catch (std::exception& e) {
     duckdb::ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in sirius_execute_pending_query_result: {}", error.RawMessage());
@@ -200,7 +209,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_pending
     duckdb::ErrorData error = pending.GetErrorObject();
     return duckdb::make_uniq<duckdb::MaterializedQueryResult>(error);
   }
-  SIRIUS_LOG_DEBUG("Done sirius_execute_pending_query_result");
+  SIRIUS_LOG_INFO("[sirius_execute_pending] done, fetching result");
   auto result = fetch_result_internal(pending);
   return result;
 }

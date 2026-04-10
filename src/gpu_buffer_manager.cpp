@@ -25,6 +25,9 @@
 #include "operator/gpu_physical_table_scan.hpp"
 #include "utils.hpp"
 
+#include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
+
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
@@ -175,6 +178,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   cudf::set_current_device_resource(mr);
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
+  retained_allocation_table.resize(NUM_GPUS);
   SIRIUS_LOG_INFO("Allocated processing size {} in GPU 0", processing_size_per_gpu);
 
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
@@ -347,6 +351,38 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
   }
 }
 
+void GPUBufferManager::RetainAllocation(void* ptr, int gpu)
+{
+  // Move entry from allocation_table (or locked_allocation_table) to retained_allocation_table.
+  auto it = allocation_table[gpu].find(ptr);
+  if (it != allocation_table[gpu].end()) {
+    retained_allocation_table[gpu][ptr] = it->second;
+    allocation_table[gpu].erase(it);
+    return;
+  }
+  auto lit = locked_allocation_table[gpu].find(ptr);
+  if (lit != locked_allocation_table[gpu].end()) {
+    retained_allocation_table[gpu][ptr] = lit->second;
+    locked_allocation_table[gpu].erase(lit);
+  }
+}
+
+size_t GPUBufferManager::ReleaseRetainedBuffers()
+{
+  cudf::set_current_device_resource(mr);
+  size_t count = 0;
+  for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+    for (auto& [ptr, size] : retained_allocation_table[gpu]) {
+      if (ptr != nullptr) {
+        mr->deallocate(rmm::cuda_stream_view{}, ptr, size);
+        count++;
+      }
+    }
+    retained_allocation_table[gpu].clear();
+  }
+  return count;
+}
+
 void GPUBufferManager::lockAllocation(void* ptr, int gpu)
 {
   // move entries from the allocation table to the locked table
@@ -497,6 +533,407 @@ void GPUBufferManager::createColumn(string up_table_name,
     table->columns[column_id] = make_shared_ptr<GPUColumn>(0, column_type, nullptr, nullptr);
     table->columns[column_id]->is_unique = false;
   }
+}
+
+void GPUBufferManager::registerExternalTable(const string& table_name,
+                                             const cudf::table_view& view,
+                                             const vector<string>& column_names,
+                                             std::string metadata)
+{
+  auto num_cols = view.num_columns();
+  auto num_rows = static_cast<size_t>(view.num_rows());
+
+  // GPUBufferManager uses UPPERCASE table and column names for lookups.
+  string up_table_name = table_name;
+  transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+
+  auto rel   = make_shared_ptr<GPUIntermediateRelation>(static_cast<size_t>(num_cols));
+  rel->names = up_table_name;
+
+  for (cudf::size_type c = 0; c < num_cols; c++) {
+    auto col = view.column(c);
+    auto col_name =
+      (static_cast<size_t>(c) < column_names.size()) ? column_names[c] : "col_" + std::to_string(c);
+    transform(col_name.begin(), col_name.end(), col_name.begin(), ::toupper);
+    rel->column_names[c] = col_name;
+
+    // Map cudf type to GPUColumnType.
+    GPUColumnType gpu_type;
+    switch (col.type().id()) {
+      case cudf::type_id::INT8:
+      case cudf::type_id::INT16: gpu_type = GPUColumnType(GPUColumnTypeId::INT16); break;
+      case cudf::type_id::INT32: gpu_type = GPUColumnType(GPUColumnTypeId::INT32); break;
+      case cudf::type_id::INT64: gpu_type = GPUColumnType(GPUColumnTypeId::INT64); break;
+      case cudf::type_id::FLOAT32: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT32); break;
+      case cudf::type_id::FLOAT64: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT64); break;
+      case cudf::type_id::BOOL8: gpu_type = GPUColumnType(GPUColumnTypeId::BOOLEAN); break;
+      case cudf::type_id::STRING: gpu_type = GPUColumnType(GPUColumnTypeId::VARCHAR); break;
+      case cudf::type_id::TIMESTAMP_DAYS: gpu_type = GPUColumnType(GPUColumnTypeId::DATE); break;
+      case cudf::type_id::TIMESTAMP_SECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
+        break;
+      case cudf::type_id::TIMESTAMP_MILLISECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
+        break;
+      case cudf::type_id::TIMESTAMP_MICROSECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
+        break;
+      case cudf::type_id::TIMESTAMP_NANOSECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
+        break;
+      case cudf::type_id::DECIMAL32:
+      case cudf::type_id::DECIMAL64:
+      case cudf::type_id::DECIMAL128: {
+        gpu_type      = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        uint8_t width = (col.type().id() == cudf::type_id::DECIMAL32)   ? 9
+                        : (col.type().id() == cudf::type_id::DECIMAL64) ? 18
+                                                                        : 38;
+        gpu_type.SetDecimalTypeInfo(width, static_cast<uint8_t>(-col.type().scale()));
+        break;
+      }
+      default:
+        SIRIUS_LOG_WARN("[registerExternalTable] unsupported cudf type {} for column {}",
+                        static_cast<int>(col.type().id()),
+                        col_name);
+        continue;
+    }
+
+    // Create GPUColumn with pointers directly into the external GPU buffer.
+    // For fixed-width types: data pointer + size.
+    // For strings: data pointer (chars) + offsets from child(0).
+    auto* data_ptr     = const_cast<uint8_t*>(col.data<uint8_t>());
+    auto* validity_ptr = const_cast<cudf::bitmask_type*>(col.null_mask());
+
+    if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+      auto offsets_col = col.child(0);
+      // cudf strings: child(0) = offsets (INT32 or INT64), data = chars.
+      // Sirius uses uint64_t* offsets — need to handle INT32 case.
+      auto* offsets_ptr =
+        const_cast<uint64_t*>(reinterpret_cast<const uint64_t*>(offsets_col.data<int32_t>()));
+      // For INT32 offsets from cudf, we'd need to convert to INT64.
+      // For now, assume offsets_col type matches what Sirius expects.
+      size_t num_bytes = 0;  // Will be set by the scan operator if needed.
+      auto gpu_col     = make_shared_ptr<GPUColumn>(
+        num_rows, gpu_type, data_ptr, offsets_ptr, num_bytes, true, validity_ptr);
+      rel->columns[c] = gpu_col;
+    } else {
+      auto gpu_col    = make_shared_ptr<GPUColumn>(num_rows, gpu_type, data_ptr, validity_ptr);
+      rel->columns[c] = gpu_col;
+    }
+  }
+
+  // If the table already exists (multiple senders), we need to concatenate.
+  // Both views point into staging/packed buffers that stay alive until
+  // release_gpu_buffers(). We accumulate views and concatenate at the end.
+  auto existing = tables.find(up_table_name);
+  if (existing != tables.end()) {
+    // Accumulate the view for later concatenation.
+    // Keep the metadata alive — cudf::unpack table_views may reference the metadata
+    // buffer internally for STRING child column pointers.
+    existing->second->pending_metadata.push_back(std::move(metadata));
+    existing->second->pending_views.push_back(view);
+    auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
+    existing->second->pending_total_rows = total_rows;
+    for (auto& col : existing->second->columns) {
+      if (col) col->column_length = total_rows;
+    }
+    SIRIUS_LOG_INFO(
+      "[registerExternalTable] appended view to '{}', now {} total rows ({} views pending)",
+      up_table_name,
+      total_rows,
+      existing->second->pending_views.size());
+    return;
+  }
+
+  // First registration: store the view directly (zero-copy).
+  // The packed buffer stays alive until release_gpu_buffers().
+  // packed_cudf_table is set to nullptr — duckdb_scan_task will
+  // use the finalized table after finalize_pending_views().
+  rel->packed_cudf_table = nullptr;
+  rel->pending_metadata.push_back(std::move(metadata));
+  rel->pending_views.push_back(view);
+  rel->pending_total_rows = num_rows;
+  tables[up_table_name]   = rel;
+  SIRIUS_LOG_INFO(
+    "[registerExternalTable] registered '{}' with {} cols, {} rows (zero-copy, deferred deep copy)",
+    up_table_name,
+    num_cols,
+    num_rows);
+}
+
+void GPUBufferManager::finalizeExchangeTables()
+{
+  for (auto& [name, rel] : tables) {
+    if (name.find("__EXCH_") != std::string::npos && rel && !rel->pending_views.empty()) {
+      finalizeExchangeTable(name);
+    }
+  }
+}
+
+void GPUBufferManager::finalizeExchangeTable(const string& table_name)
+{
+  string up = table_name;
+  transform(up.begin(), up.end(), up.begin(), ::toupper);
+  auto it = tables.find(up);
+  if (it == tables.end() || !it->second || it->second->pending_views.empty()) return;
+
+  SIRIUS_LOG_INFO("[finalizeExchangeTable] finalizing '{}': {} pending views, {} total rows",
+                  up,
+                  it->second->pending_views.size(),
+                  it->second->pending_total_rows);
+  try {
+    it->second->finalize_pending_views();
+    SIRIUS_LOG_INFO("[finalizeExchangeTable] '{}' finalized: {} cols, {} rows",
+                    up,
+                    it->second->packed_cudf_table->num_columns(),
+                    it->second->packed_cudf_table->num_rows());
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_ERROR("[finalizeExchangeTable] failed for '{}': {}", up, e.what());
+  }
+}
+
+void GPUBufferManager::registerExternalTablePacked(const string& table_name,
+                                                   uint8_t* gpu_data,
+                                                   size_t gpu_size,
+                                                   std::string metadata,
+                                                   int& out_num_cols,
+                                                   int& out_num_rows)
+{
+  string up_table_name = table_name;
+  transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+
+  // Store metadata FIRST so it has a stable address.
+  auto existing = tables.find(up_table_name);
+  if (existing != tables.end()) {
+    existing->second->pending_metadata.push_back(std::move(metadata));
+    // Full checksum at registration time — compare with transfer_complete checksum.
+    cudaDeviceSynchronize();
+    {
+      std::vector<uint8_t> host_buf(gpu_size);
+      cudaMemcpy(host_buf.data(), gpu_data, gpu_size, cudaMemcpyDeviceToHost);
+      uint64_t reg_checksum = 0;
+      for (size_t i = 0; i < gpu_size; i++)
+        reg_checksum += host_buf[i];
+      int32_t first4        = *reinterpret_cast<int32_t*>(host_buf.data());
+      bool looks_like_ascii = (first4 > 0x20000000 && first4 < 0x7f7f7f7f);
+      SIRIUS_LOG_INFO(
+        "[registerExternalTablePacked] GPU data at 0x{:x} size={} checksum={} first4=0x{:08x} "
+        "ascii={}",
+        reinterpret_cast<uintptr_t>(gpu_data),
+        gpu_size,
+        reg_checksum,
+        static_cast<uint32_t>(first4),
+        looks_like_ascii);
+    }
+    // Unpack from the STORED metadata (stable pointer).
+    auto& stored_md       = existing->second->pending_metadata.back();
+    auto* md_ptr          = reinterpret_cast<const uint8_t*>(stored_md.data());
+    cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
+
+    // Check if cudf::unpack modified the GPU data.
+    {
+      int32_t post_unpack_first4 = 0;
+      cudaMemcpy(&post_unpack_first4, gpu_data, 4, cudaMemcpyDeviceToHost);
+      SIRIUS_LOG_INFO("[registerExternalTablePacked] after unpack: first4=0x{:08x}",
+                      static_cast<uint32_t>(post_unpack_first4));
+    }
+
+    // Also check a PREVIOUS view's data to see if it was corrupted by THIS unpack.
+    if (!existing->second->pending_gpu_ptrs.empty()) {
+      auto prev_ptr       = existing->second->pending_gpu_ptrs.back();
+      int32_t prev_first4 = 0;
+      cudaMemcpy(&prev_first4, prev_ptr, 4, cudaMemcpyDeviceToHost);
+      bool prev_ascii = (prev_first4 > 0x20000000 && prev_first4 < 0x7f7f7f7f);
+      SIRIUS_LOG_INFO(
+        "[registerExternalTablePacked] previous view gpu=0x{:x} first4=0x{:08x} ascii={}",
+        reinterpret_cast<uintptr_t>(prev_ptr),
+        static_cast<uint32_t>(prev_first4),
+        prev_ascii);
+    }
+
+    existing->second->pending_views.push_back(view);
+    existing->second->pending_gpu_ptrs.push_back(gpu_data);
+    auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
+    existing->second->pending_total_rows = total_rows;
+    for (auto& col : existing->second->columns) {
+      if (col) col->column_length = total_rows;
+    }
+    out_num_cols = view.num_columns();
+    out_num_rows = static_cast<int>(total_rows);
+    SIRIUS_LOG_INFO("[registerExternalTablePacked] appended '{}': {} rows, {} total ({} views)",
+                    up_table_name,
+                    view.num_rows(),
+                    total_rows,
+                    existing->second->pending_views.size());
+
+    // Validate the just-unpacked view and dump data if corrupt.
+    {
+      bool this_view_corrupt = false;
+      for (cudf::size_type ci = 0; ci < view.num_columns(); ci++) {
+        auto col = view.column(ci);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child       = col.child(0);
+          int32_t last_off = 0;
+          if (child.size() > 0) {
+            cudaMemcpy(
+              &last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+            if (last_off > 100000000 || last_off < 0) {
+              this_view_corrupt = true;
+              break;
+            }
+          }
+        }
+      }
+      // Also dump view 0 as a reference (known good).
+      if (existing->second->pending_views.size() == 2) {
+        auto dump_path = std::string("/tmp/good_exchange_view_0");
+        auto& first_md = existing->second->pending_metadata[0];
+        {
+          auto md_path = dump_path + ".metadata";
+          std::ofstream f(md_path, std::ios::binary);
+          f.write(first_md.data(), first_md.size());
+          SIRIUS_LOG_INFO("[registerExternalTablePacked] DUMPED good metadata to {}", md_path);
+        }
+      }
+      if (this_view_corrupt) {
+        // Dump metadata and GPU data to files for unit test reproduction.
+        auto dump_path = std::string("/tmp/corrupt_exchange_view_") +
+                         std::to_string(existing->second->pending_views.size() - 1);
+        {
+          auto md_path = dump_path + ".metadata";
+          std::ofstream f(md_path, std::ios::binary);
+          f.write(stored_md.data(), stored_md.size());
+          SIRIUS_LOG_ERROR("[registerExternalTablePacked] DUMPED metadata ({} bytes) to {}",
+                           stored_md.size(),
+                           md_path);
+        }
+        {
+          auto gpu_path = dump_path + ".gpudata";
+          std::vector<uint8_t> host_buf(gpu_size);
+          cudaMemcpy(host_buf.data(), gpu_data, gpu_size, cudaMemcpyDeviceToHost);
+          std::ofstream f(gpu_path, std::ios::binary);
+          f.write(reinterpret_cast<const char*>(host_buf.data()), host_buf.size());
+          SIRIUS_LOG_ERROR(
+            "[registerExternalTablePacked] DUMPED gpu data ({} bytes) to {}", gpu_size, gpu_path);
+        }
+      }
+    }
+
+    // Validate ALL views after append to detect if push_back corrupted earlier views.
+    for (size_t vi = 0; vi < existing->second->pending_views.size(); vi++) {
+      auto& pv = existing->second->pending_views[vi];
+      for (cudf::size_type ci = 0; ci < pv.num_columns(); ci++) {
+        auto col = pv.column(ci);
+        if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+          auto child       = col.child(0);
+          int32_t last_off = 0;
+          if (child.size() > 0) {
+            cudaMemcpy(
+              &last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+            if (last_off > 100000000 || last_off < 0) {
+              SIRIUS_LOG_ERROR(
+                "[registerExternalTablePacked] VIEW {} col {} CORRUPT after appending view {}: "
+                "last_offset={} for {} rows",
+                vi,
+                ci,
+                existing->second->pending_views.size() - 1,
+                last_off,
+                col.size());
+            }
+          }
+        }
+      }
+    }
+
+    return;
+  }
+
+  // First registration: create the relation, store metadata, then unpack.
+  auto num_cols_est      = 0;  // Will be set after unpack.
+  auto rel               = make_shared_ptr<GPUIntermediateRelation>(0);
+  rel->names             = up_table_name;
+  rel->packed_cudf_table = nullptr;
+  rel->pending_metadata.push_back(std::move(metadata));
+
+  // Unpack from the STORED metadata (stable pointer).
+  auto& stored_md       = rel->pending_metadata.back();
+  auto* md_ptr          = reinterpret_cast<const uint8_t*>(stored_md.data());
+  cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
+
+  auto num_cols = view.num_columns();
+  auto num_rows = static_cast<size_t>(view.num_rows());
+
+  // Populate columns (same as registerExternalTable).
+  rel->column_count = static_cast<size_t>(num_cols);
+  rel->column_names.resize(num_cols);
+  rel->columns.resize(num_cols);
+  for (cudf::size_type c = 0; c < num_cols; c++) {
+    auto col      = view.column(c);
+    auto col_name = "col_" + std::to_string(c);
+    transform(col_name.begin(), col_name.end(), col_name.begin(), ::toupper);
+    rel->column_names[c] = col_name;
+
+    GPUColumnType gpu_type;
+    switch (col.type().id()) {
+      case cudf::type_id::INT8:
+      case cudf::type_id::INT16: gpu_type = GPUColumnType(GPUColumnTypeId::INT16); break;
+      case cudf::type_id::INT32: gpu_type = GPUColumnType(GPUColumnTypeId::INT32); break;
+      case cudf::type_id::INT64: gpu_type = GPUColumnType(GPUColumnTypeId::INT64); break;
+      case cudf::type_id::FLOAT32: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT32); break;
+      case cudf::type_id::FLOAT64: gpu_type = GPUColumnType(GPUColumnTypeId::FLOAT64); break;
+      case cudf::type_id::BOOL8: gpu_type = GPUColumnType(GPUColumnTypeId::BOOLEAN); break;
+      case cudf::type_id::STRING: gpu_type = GPUColumnType(GPUColumnTypeId::VARCHAR); break;
+      case cudf::type_id::TIMESTAMP_DAYS: gpu_type = GPUColumnType(GPUColumnTypeId::DATE); break;
+      case cudf::type_id::TIMESTAMP_SECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
+        break;
+      case cudf::type_id::TIMESTAMP_MILLISECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
+        break;
+      case cudf::type_id::TIMESTAMP_MICROSECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
+        break;
+      case cudf::type_id::TIMESTAMP_NANOSECONDS:
+        gpu_type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
+        break;
+      case cudf::type_id::DECIMAL32:
+      case cudf::type_id::DECIMAL64:
+      case cudf::type_id::DECIMAL128: {
+        gpu_type      = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        uint8_t width = (col.type().id() == cudf::type_id::DECIMAL32)   ? 9
+                        : (col.type().id() == cudf::type_id::DECIMAL64) ? 18
+                                                                        : 38;
+        gpu_type.SetDecimalTypeInfo(width, static_cast<uint8_t>(-col.type().scale()));
+        break;
+      }
+      default: continue;
+    }
+    auto* data_ptr     = const_cast<uint8_t*>(col.data<uint8_t>());
+    auto* validity_ptr = const_cast<cudf::bitmask_type*>(col.null_mask());
+    if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
+      auto offsets_col = col.child(0);
+      auto* offsets_ptr =
+        const_cast<uint64_t*>(reinterpret_cast<const uint64_t*>(offsets_col.data<int32_t>()));
+      size_t num_bytes = 0;
+      auto gpu_col     = make_shared_ptr<GPUColumn>(
+        num_rows, gpu_type, data_ptr, offsets_ptr, num_bytes, true, validity_ptr);
+      rel->columns[c] = gpu_col;
+    } else {
+      auto gpu_col    = make_shared_ptr<GPUColumn>(num_rows, gpu_type, data_ptr, validity_ptr);
+      rel->columns[c] = gpu_col;
+    }
+  }
+
+  rel->pending_views.push_back(view);
+  rel->pending_gpu_ptrs.push_back(gpu_data);
+  rel->pending_total_rows = num_rows;
+  tables[up_table_name]   = rel;
+  out_num_cols            = num_cols;
+  out_num_rows            = static_cast<int>(num_rows);
+  SIRIUS_LOG_INFO("[registerExternalTablePacked] registered '{}': {} cols, {} rows",
+                  up_table_name,
+                  num_cols,
+                  num_rows);
 }
 
 }  // namespace duckdb

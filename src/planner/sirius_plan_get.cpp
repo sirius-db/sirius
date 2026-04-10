@@ -16,6 +16,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -49,6 +50,11 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
+  SIRIUS_LOG_INFO(
+    "[sirius_plan_get] create_plan for LogicalGet: function={}, bind_data={}, column_ids={}",
+    op.function.name,
+    (op.bind_data ? "present" : "NULL"),
+    op.GetColumnIds().size());
   auto column_ids = op.GetColumnIds();
 
   if (!op.children.empty()) {
@@ -65,7 +71,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     table_filters = create_table_filter_set(op.table_filters, column_ids);
   }
 
+  SIRIUS_LOG_INFO("[sirius_plan_get] dependency fn={}, bind_data={}",
+                  op.function.dependency ? "present" : "NULL",
+                  op.bind_data ? "present" : "NULL");
   if (op.function.dependency) { op.function.dependency(dependencies, op.bind_data.get()); }
+  SIRIUS_LOG_INFO("[sirius_plan_get] dependency resolved OK");
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> filter;
   auto& projection_ids = op.projection_ids;
@@ -103,6 +113,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
     duckdb::unordered_set<std::size_t> to_remove;
     for (auto& entry : table_filters->filters) {
+      if (column_ids[entry.first].IsVirtualColumn()) {
+        continue;  // Skip virtual columns (ROW_ID, EMPTY)
+      }
       auto column_id = column_ids[entry.first].GetPrimaryIndex();
       auto& type     = op.returned_types[column_id];
 
@@ -122,6 +135,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     if (!select_list.empty()) {
       duckdb::vector<duckdb::LogicalType> filter_types;
       for (auto& c : projection_ids) {
+        if (column_ids[c].IsVirtualColumn()) {
+          filter_types.push_back(duckdb::LogicalType::BIGINT);
+          continue;
+        }
         auto column_id = column_ids[c].GetPrimaryIndex();
         filter_types.push_back(op.returned_types[column_id]);
       }

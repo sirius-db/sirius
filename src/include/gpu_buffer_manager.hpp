@@ -147,6 +147,38 @@ class GPUBufferManager {
   vector<map<void*, uint64_t>> allocation_table;
   vector<map<void*, uint64_t>> locked_allocation_table;
 
+  // Allocations that survive ResetBuffer() — used for nixl GPU-direct exchange.
+  // Released explicitly via ReleaseRetainedBuffers().
+  vector<map<void*, uint64_t>> retained_allocation_table;
+
+  void RetainAllocation(void* ptr, int gpu);
+  size_t ReleaseRetainedBuffers();
+
+  /// Register an external GPU table from a cudf::table_view (zero-copy).
+  /// Column data pointers reference the caller's GPU memory (e.g. nixl staging buffer).
+  /// The caller must ensure the backing memory outlives the table entry.
+  void registerExternalTable(const string& table_name,
+                             const cudf::table_view& view,
+                             const vector<string>& column_names,
+                             std::string metadata = {});
+
+  /// Register a packed cudf buffer. Stores metadata first (stable pointer),
+  /// then unpacks from the stored copy. This ensures cudf::unpack's table_view
+  /// references metadata that stays alive in pending_metadata.
+  void registerExternalTablePacked(const string& table_name,
+                                   uint8_t* gpu_data,
+                                   size_t gpu_size,
+                                   std::string metadata,
+                                   int& out_num_cols,
+                                   int& out_num_rows);
+
+  /// Finalize all exchange tables that have pending views.
+  /// Runs cudf::concatenate to materialize views into owned cudf::tables.
+  /// Must be called BEFORE the staging buffer is reused (e.g. before
+  /// BeginSession() on a new fragment that packs into the same staging).
+  void finalizeExchangeTables();
+  void finalizeExchangeTable(const string& table_name);
+
  private:
   // Private constructor
   GPUBufferManager(size_t cache_size_per_gpu,

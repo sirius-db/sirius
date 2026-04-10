@@ -641,20 +641,23 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   const auto& func_str                  = expr.function.name;
 
   //----------Numeric Binary Functions----------//
-  if (func_str == ADD_FUNC_STR) {
+  // Match both DuckDB operator names (+, -, *, /) and Substrait function names
+  // (add, subtract, multiply, divide) — the latter appear when Substrait plans
+  // are converted back to DuckDB logical plans via from_substrait.
+  if (func_str == ADD_FUNC_STR || func_str == "add") {
     NumericBinaryFunctionDispatcher<cudf::binary_operator::ADD> binary_function(*this);
     return binary_function(expr, state);
-  } else if (func_str == SUB_FUNC_STR) {
+  } else if (func_str == SUB_FUNC_STR || func_str == "subtract") {
     NumericBinaryFunctionDispatcher<cudf::binary_operator::SUB> binary_function(*this);
     return binary_function(expr, state);
-  } else if (func_str == MUL_FUNC_STR) {
+  } else if (func_str == MUL_FUNC_STR || func_str == "multiply") {
     NumericBinaryFunctionDispatcher<cudf::binary_operator::MUL> binary_function(*this);
     return binary_function(expr, state);
-  } else if (func_str == DIV_FUNC_STR || func_str == INT_DIV_FUNC_STR) {
+  } else if (func_str == DIV_FUNC_STR || func_str == INT_DIV_FUNC_STR || func_str == "divide") {
     // For non-integer division on integer types, DuckDB inserts a CAST
     NumericBinaryFunctionDispatcher<cudf::binary_operator::DIV> binary_function(*this);
     return binary_function(expr, state);
-  } else if (func_str == MOD_FUNC_STR) {
+  } else if (func_str == MOD_FUNC_STR || func_str == "modulus") {
     NumericBinaryFunctionDispatcher<cudf::binary_operator::MOD> binary_function(*this);
     return binary_function(expr, state);
   } else if (func_str == ERROR_FUNC_STR) {

@@ -79,7 +79,7 @@ class cached_shared_representation : public cucascade::idata_representation {
   }
 
   /**
-   * @copydoc idata_representation::get_logical_data_size_in_bytes
+   * @brief Gets the uncompressed (logical) size of the data.
    */
   [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
   {

@@ -72,7 +72,7 @@ void GPUExecutor::Execute()
   // Execution starts here.
   int initial_idx = 0;
 
-  SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
+  SIRIUS_LOG_INFO("[GPUExecutor] Execute: {} meta pipelines", scheduled.size());
 
   for (const auto& pipeline : scheduled) {
     // TODO: This is temporary solution
@@ -129,16 +129,21 @@ void GPUExecutor::Execute()
     // *local_source_state, interrupt_state}; pipeline->source->GetData(exec_context,
     // source_relation, source_input);
     auto source_type = pipeline->source.get()->type;
-    SIRIUS_LOG_DEBUG("pipeline source type {}", PhysicalOperatorToString(source_type));
+    SIRIUS_LOG_INFO("[GPUExecutor] pipeline source type: {}",
+                    PhysicalOperatorToString(source_type));
     if (source_type == PhysicalOperatorType::TABLE_SCAN) {
       // initialize pipeline
+      SIRIUS_LOG_INFO("[GPUExecutor] calling GetDataDuckDB for TABLE_SCAN");
       Pipeline duckdb_pipeline(*executor);
       ThreadContext thread_context(context);
       ExecutionContext exec_context(context, thread_context, &duckdb_pipeline);
       auto& table_scan = pipeline->source->Cast<GPUPhysicalTableScan>();
       table_scan.GetDataDuckDB(exec_context);
+      SIRIUS_LOG_INFO("[GPUExecutor] GetDataDuckDB returned OK");
     }
+    SIRIUS_LOG_INFO("[GPUExecutor] calling pipeline->source->GetData");
     pipeline->source->GetData(*source_relation);
+    SIRIUS_LOG_INFO("[GPUExecutor] GetData returned OK");
     // SIRIUS_LOG_DEBUG("source relation size {}", source_relation->columns.size());
     // for (auto col : source_relation->columns) {
     // 	SIRIUS_LOG_DEBUG("source relation column size {} column name {}", col->column_length,

@@ -175,6 +175,7 @@ sirius_physical_operator::get_sources() const
 {
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
   if (is_sink()) {
+    D_ASSERT(children.size() == 1);
     result.push_back(*this);
     return result;
   } else {
@@ -281,8 +282,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   });
 
   if (unfinished_barrier != _ports_list.end()) {
-    auto* producer = &((*unfinished_barrier)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    auto source = (*unfinished_barrier)->src_pipeline->get_source();
+    if (!source) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, source.get()};
   }
 
   // if no unfinished barriers, then is this operator ready to create a task?
@@ -302,11 +304,24 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
     });
 
   if (unfinished_pipeline != _ports_list.end()) {
-    auto* producer = &((*unfinished_pipeline)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    auto source = (*unfinished_pipeline)->src_pipeline->get_source();
+    if (!source) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, source.get()};
   }
 
-  // nothing to do
+  // nothing to do — log port states for debugging pipeline hangs
+  {
+    std::string port_info;
+    for (auto& p : _ports_list) {
+      auto barrier = (p->type == MemoryBarrierType::FULL)      ? "FULL"
+                     : (p->type == MemoryBarrierType::PARTIAL) ? "PART"
+                                                               : "PIPE";
+      bool src_fin = p->src_pipeline ? p->src_pipeline->is_pipeline_finished() : true;
+      port_info += std::format("[{} repo={} src_fin={}] ", barrier, p->repo->total_size(), src_fin);
+    }
+    SIRIUS_LOG_DEBUG(
+      "[get_next_task_hint] op {} (id={}) → nullopt: {}", get_name(), get_operator_id(), port_info);
+  }
   return std::nullopt;
 }
 
