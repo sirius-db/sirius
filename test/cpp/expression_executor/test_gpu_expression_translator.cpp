@@ -155,12 +155,11 @@ std::unique_ptr<cudf::table> make_decimal32_table(std::vector<int32_t> const& re
                                                   int32_t cudf_scale)
 {
   auto const n = static_cast<cudf::size_type>(reps.size());
-  auto col     = cudf::make_fixed_width_column(
-    cudf::data_type{cudf::type_id::DECIMAL32, cudf_scale},
-    n,
-    cudf::mask_state::UNALLOCATED,
-    stream,
-    mr);
+  auto col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL32, cudf_scale},
+                                           n,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
   cudaMemcpy(
     col->mutable_view().data<int32_t>(), reps.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice);
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -173,12 +172,11 @@ std::unique_ptr<cudf::table> make_decimal64_table(std::vector<int64_t> const& re
                                                   int32_t cudf_scale)
 {
   auto const n = static_cast<cudf::size_type>(reps.size());
-  auto col     = cudf::make_fixed_width_column(
-    cudf::data_type{cudf::type_id::DECIMAL64, cudf_scale},
-    n,
-    cudf::mask_state::UNALLOCATED,
-    stream,
-    mr);
+  auto col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL64, cudf_scale},
+                                           n,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
   cudaMemcpy(
     col->mutable_view().data<int64_t>(), reps.data(), sizeof(int64_t) * n, cudaMemcpyHostToDevice);
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -1670,9 +1668,9 @@ TEST_CASE("translator: decimal32 column EQUAL decimal literal", "[expression_tra
   auto const dec52 = LogicalType::DECIMAL(5, 2);
 
   // col(0) == 2.50
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(dec52, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(
-    Value::DECIMAL(250, uint8_t{5}, uint8_t{2}));
+  auto left = duckdb::make_uniq<BoundReferenceExpression>(dec52, 0);
+  auto right =
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(250, uint8_t{5}, uint8_t{2}));
   auto expr = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
 
@@ -1755,20 +1753,20 @@ TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_
   auto const dec52 = LogicalType::DECIMAL(5, 2);
 
   // col(0) + col(0)
-  auto add = duckdb::make_uniq<BoundFunctionExpression>(
-    dec52,
-    ScalarFunction("+", {dec52, dec52}, dec52, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
+  auto add =
+    duckdb::make_uniq<BoundFunctionExpression>(dec52,
+                                               ScalarFunction("+", {dec52, dec52}, dec52, nullptr),
+                                               duckdb::vector<duckdb::unique_ptr<Expression>>{},
+                                               nullptr);
   add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
   add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
 
   // (col(0) + col(0)) * 2.00
-  auto mul = duckdb::make_uniq<BoundFunctionExpression>(
-    dec52,
-    ScalarFunction("*", {dec52, dec52}, dec52, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
+  auto mul =
+    duckdb::make_uniq<BoundFunctionExpression>(dec52,
+                                               ScalarFunction("*", {dec52, dec52}, dec52, nullptr),
+                                               duckdb::vector<duckdb::unique_ptr<Expression>>{},
+                                               nullptr);
   mul->children.push_back(std::move(add));
   mul->children.push_back(
     duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(200, uint8_t{5}, uint8_t{2})));
