@@ -324,9 +324,14 @@ target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
 # substrait::Plan) which are in the substrait static library. Use whole-archive
 # to ensure all symbols are included since the linker can't resolve the
 # dependency order between the sirius .o files and the substrait archive.
-target_link_libraries(sirius_loadable_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
-                      absl::any_invocable
-                      -Wl,--whole-archive substrait_extension -Wl,--no-whole-archive)
+target_link_libraries(
+  sirius_loadable_extension
+  PkgConfig::NUMA
+  yaml-cpp::yaml-cpp
+  absl::any_invocable
+  -Wl,--whole-archive
+  substrait_extension
+  -Wl,--no-whole-archive)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)

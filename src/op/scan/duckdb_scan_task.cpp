@@ -669,7 +669,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
           std::vector<std::shared_ptr<cucascade::data_batch>> batches;
           batches.push_back(batch);
           SIRIUS_LOG_INFO("[duckdb_scan_task] returning GPU batch via operator_data");
-          return std::make_unique<op::operator_data>(std::move(batches));
+          return std::make_unique<op::pipelineable_operator_data>(std::move(batches));
         }
       }
     }
