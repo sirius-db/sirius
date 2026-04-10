@@ -1,0 +1,47 @@
+# NOTICE - Actions permissions policy (Settings > Actions > General):
+#   - "Allow sirius-db, and select non-sirius-db, actions and reusable workflows"
+#     - Allow actions created by GitHub: YES (covers actions/*)
+#     - Allow actions by Marketplace verified creators: NO
+#     - Explicitly allowed third-party actions:
+#       prefix-dev/setup-pixi@*
+#       mozilla-actions/sccache-action@*
+#     - Require actions to be pinned to a full-length commit SHA: NO
+#
+# Adding a new action? You must:
+#   1. Pin it to a full-length commit SHA (e.g. uses: owner/repo@<40-char-sha> # vX.Y.Z)
+#   2. If it is not from sirius-db, GitHub, or the explicitly allowed third-party actions above, add it to the
+#      project-level allowlist above before merging
+name: Distribution
+
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  duckdb-stable-build:
+    name: Build extension binaries
+    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
+    with:
+      extension_name: sirius
+      duckdb_version: v1.5.1
+      ci_tools_version: sirius
+      exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      extra_toolchains: 'cuda'
+      vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
+      vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+      skip_tests: true
+      override_ci_tools_repository: 'sirius-db/extension-ci-tools'
+      build_type: ci-release
+      build_duckdb_shell: false
+      vcpkg_overlay_ports: 'vcpkg_ports'
+      vcpkg_overlay_triplets: 'vcpkg_triplets'
+      cuda_archs: '75;80;86;90a'
+      cuda_version: '13'
+      runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"]}'

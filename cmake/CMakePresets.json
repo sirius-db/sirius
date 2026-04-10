@@ -35,6 +35,10 @@
     {
       "configurePreset": "vcpkg-relwithdebinfo",
       "name": "vcpkg-relwithdebinfo"
+    },
+    {
+      "configurePreset": "ci-release",
+      "name": "ci-release"
     }
   ],
   "cmakeMinimumRequired": {
@@ -177,6 +181,20 @@
       "displayName": "vcpkg RelWithDebInfo",
       "inherits": "vcpkg-base",
       "name": "vcpkg-relwithdebinfo"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/ci-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_LINKER_TYPE": "",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_TOOLCHAIN_PATH}"
+      },
+      "displayName": "CI Release (Docker vcpkg + ccache)",
+      "inherits": "vcpkg-base",
+      "name": "ci-release"
     }
   ],
   "version": 6

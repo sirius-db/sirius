@@ -21,6 +21,7 @@ TEST_BUILD_TARGET ?= unittest
 
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	clang-release clang-debug clang-relwithdebinfo \
+	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug clean list-presets
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
@@ -68,6 +69,15 @@ clang-debug: build/clang-debug/build.ninja
 
 clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo
+
+ci-release: build/ci-release/build.ninja
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release
+
+configure_ci:
+	@echo "configure_ci step is skipped for this extension build..."
+
+set_duckdb_version:
+	@echo "DuckDB version is pinned by the submodule; skipping checkout of $(DUCKDB_GIT_VERSION)."
 
 test: test_release
 
