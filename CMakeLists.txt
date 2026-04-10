@@ -27,6 +27,36 @@ endif()
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
+
+# In the vcpkg build, vcpkg headers must take priority over: 1) conda's CCCL
+# 3.1.4 (injected via CXXFLAGS as -I.../include/cccl) 2) DuckDB's bundled fmt
+# 6.1.2 (uses duckdb_fmt namespace, incompatible with spdlog) Fix: strip conda
+# CCCL path; use NO_SYSTEM_FROM_IMPORTED + BEFORE include (applied per-target
+# below) to place vcpkg includes first.
+if(VCPKG_BUILD)
+  set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
+  string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CXX_FLAGS
+                       "${CMAKE_CXX_FLAGS}")
+  string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CUDA_FLAGS
+                       "${CMAKE_CUDA_FLAGS}")
+
+  # Strip conda-injected -Wl,-rpath flags from linker flags and disable CMake's
+  # RPATH mechanism so binaries don't carry a hardcoded path to the pixi/conda
+  # env. All deps are statically linked, so no RPATH is needed. FORCE is
+  # required because DuckDB's CMakeLists.txt sets this cache var first.
+  set(CMAKE_SKIP_RPATH
+      ON
+      CACHE BOOL "" FORCE)
+  foreach(_var CMAKE_SHARED_LINKER_FLAGS CMAKE_EXE_LINKER_FLAGS
+               CMAKE_MODULE_LINKER_FLAGS)
+    string(REGEX REPLACE "-Wl,-rpath-link[=,][^ ]*" "" ${_var} "${${_var}}")
+    string(REGEX REPLACE "-Wl,-rpath[=,][^ ]*" "" ${_var} "${${_var}}")
+    set(${_var}
+        "${${_var}}"
+        CACHE STRING "" FORCE)
+  endforeach()
+endif()
+
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
@@ -35,7 +65,18 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
-# cuCascade - GPU Memory Reservation Library (submodule)
+# cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
+# as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
+# in the vcpkg installed lib dir, which isn't on the default linker search path.
+# Create an imported target so CMake resolves the bare name to the full path
+# instead of emitting -lnuma.
+if(VCPKG_BUILD)
+  add_library(numa STATIC IMPORTED)
+  set_target_properties(
+    numa
+    PROPERTIES IMPORTED_LOCATION
+               "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libnuma.a")
+endif()
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
@@ -210,6 +251,15 @@ foreach(_target sirius_extension sirius_loadable_extension)
                CUDA_SEPARABLE_COMPILATION ON
                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+  # In the vcpkg build, vcpkg include dir must be searched before DuckDB's
+  # bundled fmt (which uses duckdb_fmt namespace, incompatible with spdlog).
+  # NO_SYSTEM_FROM_IMPORTED prevents -isystem/-I collapse by GCC; BEFORE ensures
+  # vcpkg includes precede DuckDB's in the search order.
+  if(VCPKG_BUILD)
+    set_target_properties(${_target} PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(${_target} BEFORE PRIVATE ${_VCPKG_INC})
+  endif()
+
   target_include_directories(
     ${_target}
     PRIVATE
@@ -248,6 +298,21 @@ target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
 # CMake PCH doesn't apply to nvcc — skip PCH for CUDA sources
 set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
                                                        ON)
+
+# The conda-forge GCC wrapper hard-codes -rpath <conda_prefix>/lib into every
+# link invocation. Strip it from the loadable extension so the binary only
+# depends on system libraries at runtime.
+if(VCPKG_BUILD)
+  find_program(_PATCHELF patchelf)
+  if(_PATCHELF)
+    add_custom_command(
+      TARGET sirius_loadable_extension
+      POST_BUILD
+      COMMAND ${_PATCHELF} --remove-rpath
+              $<TARGET_FILE:sirius_loadable_extension>
+      COMMENT "Stripping RPATH from sirius loadable extension")
+  endif()
+endif()
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
@@ -307,6 +372,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/parallel/test_task_executor.cpp
+    test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
@@ -322,6 +388,11 @@ set(TEST_SOURCES
 # cmake-format: on
 
 add_executable(sirius_unittest ${TEST_SOURCES})
+
+if(VCPKG_BUILD)
+  set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
+endif()
 
 target_include_directories(
   sirius_unittest
