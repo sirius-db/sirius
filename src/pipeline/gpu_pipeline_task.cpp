@@ -24,14 +24,11 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
-#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
-#include <data/sirius_converter_registry.hpp>
 
 #include <format>
 #include <optional>
@@ -41,94 +38,14 @@ namespace pipeline {
 
 namespace {
 
-std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
-  const std::shared_ptr<cucascade::data_batch>& batch,
-  const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream)
-{
-  using status = cucascade::lock_for_processing_status;
-  const auto* target_space =
-    requested_memory_space != nullptr ? requested_memory_space : batch->get_memory_space();
-  if (target_space == nullptr) { return std::nullopt; }
-
-  // NOTE: only works in single gpu setup
-  // wait for processing in case a shared batch is in transit in another thread.
-  auto lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
-
-  auto cancel_task_if_needed = []() {
-    SIRIUS_LOG_ERROR(
-      "gpu_pipeline_task: failed to lock batch for processing and cannot prepare batch for "
-      "processing. This likely means the batch is in transit and there is a bug in "
-      "the in-transit locking logic. Cancelling task to avoid deadlock.");
-  };
-
-  while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
-    try {
-      auto& registry = sirius::converter_registry::get();
-      switch (requested_memory_space->get_tier()) {
-        case cucascade::memory::Tier::GPU: {
-          auto prev_state = batch->get_state();
-          if (!batch->try_to_lock_for_in_transit()) {
-            auto current_state = batch->get_state();
-            if (current_state == cucascade::batch_state::in_transit) {
-              // If another thread has taken the in_transit lock, wait to acquire the processing
-              // lock.
-              lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
-              continue;
-            }
-            cancel_task_if_needed();
-            return std::nullopt;
-          }
-          try {
-            batch->convert_to<cucascade::gpu_table_representation>(
-              registry, requested_memory_space, stream);
-          } catch (...) {
-            batch->try_to_release_in_transit();
-            throw;
-          }
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-          break;
-        }
-        case cucascade::memory::Tier::HOST: {
-          auto prev_state = batch->get_state();
-          if (!batch->try_to_lock_for_in_transit()) {
-            cancel_task_if_needed();
-            return std::nullopt;
-          }
-          try {
-            batch->convert_to<cucascade::host_data_representation>(
-              registry, requested_memory_space, stream);
-          } catch (...) {
-            batch->try_to_release_in_transit();
-            throw;
-          }
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-          break;
-        }
-        default: cancel_task_if_needed(); return std::nullopt;
-      }
-
-      lock_result = batch->try_to_lock_for_processing(requested_memory_space->get_id());
-    } catch (...) {
-      cancel_task_if_needed();
-      throw;
-    }
-  }
-
-  if (!lock_result.success) {
-    cancel_task_if_needed();
-    return std::nullopt;
-  }
-
-  return std::move(lock_result.handle);
-}
-
 void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
 {
   if (data == nullptr) { return; }
+  auto* pipelineable_data = dynamic_cast<const op::pipelineable_operator_data*>(data);
+  if (pipelineable_data == nullptr) { return; }
   const auto& expected_types = op.get_types();
-  const auto& batches        = data->get_data_batches();
+  const auto& batches        = pipelineable_data->get_data_batches();
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
@@ -171,9 +88,10 @@ void log_operator_data(const op::sirius_physical_operator& op,
                        const char* label,
                        const std::string& extra_info = "")
 {
-  std::string batch_rows = "";
-  size_t total_bytes     = 0;
-  for (auto& batch : data.get_data_batches()) {
+  auto& pipelineable_data = dynamic_cast<const op::pipelineable_operator_data&>(data);
+  std::string batch_rows  = "";
+  size_t total_bytes      = 0;
+  for (auto& batch : pipelineable_data.get_data_batches()) {
     auto view = get_cudf_table_view(*batch);
     batch_rows += std::to_string(view.num_rows()) + "  ";
     total_bytes += batch->get_data()->get_size_in_bytes();
@@ -185,7 +103,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
     op.get_name(),
     op.get_operator_id(),
     label,
-    data.get_data_batches().size(),
+    pipelineable_data.get_data_batches().size(),
     batch_rows,
     total_bytes,
     static_cast<double>(total_bytes) / (1024.0 * 1024.0),
@@ -277,7 +195,15 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, i, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
-      auto peak_bytes        = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
+      // operators, clamping to zero to avoid unsigned underflow.
+      auto const bytes_to_materialize_input = local_state._bytes_to_materialize_input;
+      if (peak_bytes > bytes_to_materialize_input) {
+        peak_bytes -= bytes_to_materialize_input;
+      } else {
+        peak_bytes = 0;
+      }
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
       if (auto const* cc_oom =
@@ -285,10 +211,14 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         requested_bytes = cc_oom->requested_bytes;
         global_usage    = cc_oom->global_usage;
       }
+      size_t reservation_bytes =
+        _local_state->cast<gpu_pipeline_task_local_state>().get_reservation_bytes();
       SIRIUS_LOG_WARN(
         "Pipeline {}: OOM at operator {} (id={}, index {}/{}), "
         "requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
         "peak allocated {} bytes ({:.2f} MB), "
+        "bytes to materialize input {} bytes ({:.2f} MB), "
+        "reservation {} bytes ({:.2f} MB), "
         "rescheduling task {}",
         pipeline->get_pipeline_id(),
         op.get_name(),
@@ -301,7 +231,17 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         static_cast<double>(global_usage) / (1024.0 * 1024.0),
         peak_bytes,
         static_cast<double>(peak_bytes) / (1024.0 * 1024.0),
+        local_state._bytes_to_materialize_input,
+        static_cast<double>(local_state._bytes_to_materialize_input) / (1024.0 * 1024.0),
+        reservation_bytes,
+        static_cast<double>(reservation_bytes) / (1024.0 * 1024.0),
         _task_id);
+
+      auto input_basis =
+        _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
+      auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+      global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
         i,
@@ -360,6 +300,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto const prepare_start = std::chrono::high_resolution_clock::now();
   auto reservation         = local_state.release_reservation();
   if (!reservation) { throw std::runtime_error("GPU pipeline task requires a memory reservation"); }
+  auto reservation_bytes = reservation->size();
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
@@ -368,36 +309,44 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   absl::Cleanup source_closer = [allocator, stream]() {
     allocator->reset_stream_reservation(stream);
   };
-  std::vector<cucascade::data_batch_processing_handle> processing_handles;
+
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
-  processing_handles.reserve(local_state._input_data->get_data_batches().size());
-
-  for (const auto& batch : local_state._input_data->get_data_batches()) {
-    auto* resident_space = batch->get_memory_space();
-    if (requested_memory_space && resident_space &&
-        resident_space->get_id() != requested_memory_space->get_id()) {
-      SIRIUS_LOG_TRACE(
-        "Pipeline {}: fetching batch {} from tier {} to tier {} for operator {} (id={})",
-        pipeline->get_pipeline_id(),
-        batch->get_batch_id(),
-        static_cast<int>(resident_space->get_tier()),
-        static_cast<int>(requested_memory_space->get_tier()),
-        first_op.get_name(),
-        first_op.get_operator_id());
-    }
-    auto handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
-    if (!handle) {
-      // trick to retry the task
-      throw oom_reschedule_exception(std::move(local_state._input_data),
-                                     0,
-                                     "Failed to lock or prepare batch " +
-                                       std::to_string(batch->get_batch_id()) + " for processing");
-      return;
-    }
-    processing_handles.emplace_back(std::move(*handle));
+  auto* pipelineable_input =
+    dynamic_cast<op::pipelineable_operator_data*>(local_state._input_data.get());
+  if (!pipelineable_input) {
+    throw std::runtime_error(
+      "gpu_pipeline_task::execute: input_data is not pipelineable_operator_data");
   }
+
+  std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
+  try {
+    handles_opt = pipelineable_input->prepare_for_processing(requested_memory_space, stream);
+  } catch (const rmm::out_of_memory& oom) {
+    auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
+    auto input_basis = local_state.get_task_consumption_basis();
+    auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
+    global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+
+    SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
+                     pipeline->get_pipeline_id());
+    throw oom_reschedule_exception(
+      std::move(local_state._input_data),
+      0,
+      std::string("OOM while preparing batches for processing: ") + oom.what());
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
+                     pipeline->get_pipeline_id(),
+                     e.what());
+    throw;
+  }
+
+  if (!handles_opt) {
+    throw oom_reschedule_exception(
+      std::move(local_state._input_data), 0, "Failed to lock or prepare batches for processing");
+  }
+  std::vector<cucascade::data_batch_processing_handle> processing_handles = std::move(*handles_opt);
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
@@ -413,12 +362,42 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
-  _allocator       = allocator;
-  auto output_data = compute_task(stream);
+  _allocator                                     = allocator;
+  auto input_basis                               = local_state.get_task_consumption_basis();
+  std::unique_ptr<op::operator_data> output_data = compute_task(stream);
+
+  // Record memory metrics for future reservation estimates
+  if (output_data) {
+    auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+    // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
+    // operators. Clamp at zero to avoid size_t underflow when estimates exceed the observed peak.
+    if (peak_bytes > local_state._bytes_to_materialize_input) {
+      peak_bytes -= local_state._bytes_to_materialize_input;
+    } else {
+      peak_bytes = 0;
+    }
+    std::size_t output_bytes = 0;
+    auto* pipelineable_output =
+      dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
+    if (pipelineable_output) {
+      for (const auto& batch : pipelineable_output->get_data_batches()) {
+        if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+      }
+    }
+    auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+    global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
+    SIRIUS_LOG_TRACE(
+      "Pipeline {}: memory history record - input_basis={}, output_bytes={}, reservation_bytes={}, "
+      "peak_bytes={}, peak_bytes_to_materialize_input={}",
+      pipeline->get_pipeline_id(),
+      input_basis,
+      output_bytes,
+      reservation_bytes,
+      peak_bytes,
+      local_state._bytes_to_materialize_input);
+  }
 
   if (output_data) { publish_output(*output_data, stream); }
-  // 4. After each cudf operator, get peak total bytes to collect statistics
-  // 5. Push output batches to the data repository
 
   // Processing handles are automatically released here when they go out of scope
 }
@@ -428,7 +407,10 @@ std::size_t gpu_pipeline_task::get_input_size() const
   auto& local_state      = _local_state->cast<gpu_pipeline_task_local_state>();
   std::size_t input_size = 0;
   if (!local_state._input_data) { return 0; }
-  for (const auto& batch : local_state._input_data->get_data_batches()) {
+  auto* pipelineable_input =
+    dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
+  if (!pipelineable_input) { return 0; }
+  for (const auto& batch : pipelineable_input->get_data_batches()) {
     if (!batch || !batch->get_data()) { continue; }
     input_size += batch->get_data()->get_size_in_bytes();
   }
@@ -437,8 +419,16 @@ std::size_t gpu_pipeline_task::get_input_size() const
 
 std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 {
-  // WSM TODO: this is a placeholder for the actual reservation size
-  return get_input_size() * 1;
+  auto input_size =
+    _local_state->cast<gpu_pipeline_task_local_state>().get_task_consumption_basis();
+
+  auto bytes_to_materialize_input =
+    _local_state->cast<gpu_pipeline_task_local_state>()._bytes_to_materialize_input;
+  auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
+  auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
+  if (estimate) { return *estimate + bytes_to_materialize_input; }
+  // Fallback: no history yet (first batch in pipeline)
+  return input_size * 2 + bytes_to_materialize_input;
 }
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()

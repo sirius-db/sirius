@@ -145,7 +145,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! Other MetaPipelines that this sirius_meta_pipeline depends on
   duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> children;
   //! Next batch index
-  duckdb::idx_t next_batch_index;
+  std::size_t next_batch_index;
   //! Pipelines (other than the base pipeline) that need their own PipelineFinishEvent (e.g., for
   //! IEJoin)
   duckdb::reference_set_t<sirius_pipeline> finish_pipelines;

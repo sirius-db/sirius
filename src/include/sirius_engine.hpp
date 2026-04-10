@@ -43,6 +43,7 @@ class sirius_physical_table_scan;
 
 namespace sirius {
 
+struct operator_params;
 class sirius_interface;
 
 class sirius_engine {
@@ -64,14 +65,12 @@ class sirius_engine {
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_pipelines;
   //! The root pipelines of the query
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_root_pipelines;
-  //! The scheduled pipelines
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_scheduled;
   //! Storage for pipeline breaker created during pipeline splitting
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> new_pipeline_breakers;
   //! The current root pipeline index
-  duckdb::idx_t root_pipeline_idx;
+  std::size_t root_pipeline_idx;
   //! The total amount of pipelines in the query
-  duckdb::idx_t total_pipelines;
+  std::size_t total_pipelines;
   //! Insert the repository
   void insert_repository(std::string_view port_id,
                          duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,

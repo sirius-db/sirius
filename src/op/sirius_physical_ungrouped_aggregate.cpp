@@ -50,7 +50,7 @@ namespace op {
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
@@ -326,9 +326,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (aggregates.empty()) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto layout = build_aggregate_layout(aggregates);
@@ -443,7 +445,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
-  return std::make_unique<operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
 // Helper to deep copy Expression vector (same as in grouped_aggregate)
@@ -472,7 +474,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_AGGREGATE, std::move(types), estimated_cardinality),
@@ -489,9 +491,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (aggregates.empty()) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
@@ -500,12 +504,14 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     if (batch) { valid_batches.push_back(batch); }
   }
   if (valid_batches.empty()) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
   if (space == nullptr) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto layout = build_aggregate_layout(aggregates);
@@ -518,7 +524,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   }
 
   if (!layout.has_avg) {
-    return std::make_unique<operator_data>(
+    return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
 
@@ -547,7 +553,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto const batch_id = ::sirius::get_next_batch_id();
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
-  return std::make_unique<operator_data>(
+  return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
 }
 
@@ -568,7 +574,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
 }  // namespace op

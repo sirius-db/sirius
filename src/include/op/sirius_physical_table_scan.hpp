@@ -63,10 +63,10 @@ class sirius_physical_table_scan : public sirius_physical_operator {
                              duckdb::unique_ptr<duckdb::FunctionData> bind_data,
                              duckdb::vector<duckdb::LogicalType> returned_types,
                              duckdb::vector<duckdb::ColumnIndex> column_ids,
-                             duckdb::vector<duckdb::idx_t> projection_ids,
+                             duckdb::vector<std::size_t> projection_ids,
                              duckdb::vector<std::string> names,
                              duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
-                             duckdb::idx_t estimated_cardinality,
+                             std::size_t estimated_cardinality,
                              duckdb::ExtraOperatorInfo extra_info,
                              duckdb::vector<duckdb::Value> parameters,
                              duckdb::virtual_column_map_t virtual_columns);
@@ -80,7 +80,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! The column ids used within the table function
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   //! The projected-out column ids
-  duckdb::vector<duckdb::idx_t> projection_ids;
+  duckdb::vector<std::size_t> projection_ids;
   //! The names of the columns
   duckdb::vector<std::string> names;
   //! The table filters
@@ -108,7 +108,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
   duckdb::vector<duckdb::LogicalType> scanned_types;
 
-  duckdb::vector<duckdb::idx_t> scanned_ids;
+  duckdb::vector<std::size_t> scanned_ids;
 
   duckdb::unique_ptr<duckdb::TableFilterSet> fake_table_filters;
 
@@ -117,6 +117,13 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
   //! Only used in optimized table scan
   bool exhausted = false;
+
+  //! When true, execute() is a no-op passthrough. Set for parquet scan
+  //! pipelines where filter and projection are handled in parquet_scan_task.
+  bool passthrough = false;
+
+  //! The composite filter expression from the table filter set, if any
+  duckdb::unique_ptr<duckdb::Expression> filter_expr = nullptr;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

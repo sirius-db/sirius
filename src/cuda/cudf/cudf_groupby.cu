@@ -25,6 +25,7 @@
 #include <cstdlib>
 
 namespace duckdb {
+using sirius::AggregationType;
 
 template <typename T>
 void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b)

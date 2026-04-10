@@ -21,13 +21,13 @@ Sirius is a GPU-native SQL engine that integrates with DuckDB as an extension. I
 **Using Pixi (Recommended):**
 ```bash
 pixi shell                    # Activate environment with all dependencies
-source setup_sirius.sh        # Set SIRIUS_HOME_PATH and LDFLAGS
 ```
 
-**Manual Setup:**
+### Git Worktrees
+
+When creating a new worktree, submodules are not automatically initialized. After creating the worktree, run:
 ```bash
-source setup_sirius.sh
-export LIBCUDF_ENV_PREFIX=/path/to/miniconda3/envs/libcudf-env  # If using conda
+git submodule update --init --recursive
 ```
 
 ### Building
@@ -52,9 +52,18 @@ Build outputs:
 ### Building Python API
 
 ```bash
-cd duckdb-python
-pip install .
-cd ..
+pixi run -e duckdb-python build-duckdb-python
+```
+
+This uses a dedicated pixi environment (`duckdb-python`) with pip, pybind11, and scikit-build-core. The task automatically points `DUCKDB_SOURCE_PATH` at the repo-level `duckdb/` submodule so the Python package links against the same DuckDB version as the C++ extension.
+
+**Usage from Python:**
+```python
+import duckdb
+
+con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
+result = con.execute("CALL gpu_execution('SELECT ...')").fetchall()
 ```
 
 ## Testing
@@ -115,144 +124,46 @@ Configuration files:
 
 ## Architecture
 
-### Two Code Paths (Legacy vs New Sirius)
+### Super Sirius (`gpu_execution`)
 
-Sirius has two parallel execution modes, both coexisting in `src/`:
+The active execution engine. Uses `namespace sirius`, entry point: `CALL gpu_execution('SELECT ...')`.
 
-**Legacy Sirius** (`gpu_processing`):
-- Uses `namespace duckdb`
-- Entry point: `CALL gpu_processing('SELECT ...')`
-- Physical plan generator: `GPUPhysicalPlanGenerator` (`src/gpu_physical_plan_generator.cpp`)
-- Operators: `GPUPhysicalOperator` subclasses in `src/operator/` (e.g., `gpu_physical_hash_join.cpp`)
-- Plan builders: `src/plan/` (e.g., `gpu_plan_filter.cpp`, `gpu_plan_aggregate.cpp`)
-- Executor: `src/gpu_executor.cpp`
-- Memory: requires `gpu_buffer_init()` before use; uses `GPUBufferManager` and `GPUContext`
-
-**New Sirius / Super Sirius** (`gpu_execution`):
-- Uses `namespace sirius`
-- Entry point: `CALL gpu_execution('SELECT ...')`
 - Physical plan generator: `sirius_physical_plan_generator` (`src/planner/sirius_physical_plan_generator.cpp`)
 - Operators: `sirius_physical_operator` subclasses in `src/op/` (e.g., `sirius_physical_hash_join.cpp`)
 - Plan builders: `src/planner/` (e.g., `sirius_plan_filter.cpp`, `sirius_plan_aggregate.cpp`)
 - Engine: `src/sirius_engine.cpp`, pipelines in `src/pipeline/`
 - Interface: `src/sirius_interface.cpp` (uses `sirius_interface` class)
-- Includes task-based execution: `src/creator/`, `src/downgrade/`, `src/op/scan/`
+- Task-based execution: `src/creator/`, `src/downgrade/`, `src/op/scan/`
+- Extension entry point: `src/sirius_extension.cpp`
+- Expression evaluation: `src/expression_executor/`
+- Runtime configuration: `src/config.cpp` / `src/include/config.hpp`
+- CUDA kernels: `src/cuda/` (cuDF wrappers, expression dispatch)
 
-**Shared code** (used by both, in `namespace duckdb`):
-- `src/sirius_extension.cpp`: Extension entry point, registers both `gpu_processing` and `gpu_execution` table functions
-- `src/expression_executor/`: GPU expression evaluation
-- `src/config.cpp` / `src/include/config.hpp`: Runtime configuration
-- `src/cuda/`: CUDA kernels (cuDF wrappers, expression dispatch)
-
-New development should target the **new Sirius** (`namespace sirius` / `gpu_execution`) code path.
+> **Note:** A legacy code path (`gpu_processing`, `namespace duckdb`) still exists in `src/operator/`, `src/plan/`, `src/gpu_executor.cpp` etc. All new development targets Super Sirius.
 
 ### Super Sirius Documentation
 
-Comprehensive documentation for the new Sirius code path lives in `docs/super-sirius/`. **Read these docs before modifying Super Sirius code** — they cover the execution model, pipeline splitting rules, operator behavior, and configuration in detail.
-
-| Document | Covers |
-|----------|--------|
-| [README](docs/super-sirius/README.md) | Index and reading order |
-| [Architecture Overview](docs/super-sirius/architecture-overview.md) | Component diagram, ownership hierarchy, thread model |
-| [Execution Flow](docs/super-sirius/execution-flow.md) | End-to-end query trace from SQL to GPU results |
-| [Physical Plan Generation](docs/super-sirius/physical-plan-generation.md) | DuckDB→Sirius operator mapping, pipeline construction, **pipeline splitting rules with barrier types** |
-| [Operators](docs/super-sirius/operators.md) | All physical operators — scan, streaming, blocking, pipeline breakers |
-| [Pipeline Execution](docs/super-sirius/pipeline-execution.md) | Task execution, GPU executor, OOM handling, completion |
-| [Task Creator](docs/super-sirius/task-creator.md) | Hint chain, per-operator overrides, scan scheduling |
-| [Scan](docs/super-sirius/scan.md) | Scan subsystem — DuckDB scan, Parquet scan, caching modes |
-| [Memory Management](docs/super-sirius/memory-management.md) | GPU/host/disk tiers, cuCascade, reservations, downgrade |
-| [Data Management](docs/super-sirius/data-management.md) | Data batches, repositories, ports |
-| [Configuration](docs/super-sirius/configuration.md) | Config file format, operator params, thread pools |
-| [Optimizations](docs/super-sirius/optimizations.md) | Filter pushdown, projection elision, BUILD_PROBE mode |
-| [Expression Executor](docs/super-sirius/expression-executor.md) | GPU expression evaluation via cuDF |
-
-Key concepts from the docs:
-- **After pipeline finalization**, `operators` contains ALL operators (source to sink inclusive); `source` and `sink` are just aliases for `operators[0]` and `operators.back()`
-- **Pipeline splitting** in `initialize_internal()` inserts PARTITION, CONCAT, SORT_SAMPLE, MERGE_* operators with data repositories between pipelines
-- **Barrier types**: `FULL` (wait for all upstream), `PARTIAL` (only PARTITION→CONCAT), `PIPELINE` (streaming — scans, ORDER_BY→SORT_SAMPLE)
-- **Repositories** are always between pipelines, never in the middle of one
-
-### Execution Flow
-
-Sirius implements a custom execution engine that processes DuckDB's physical plans:
-
-1. **Thread Coordinator**: Main thread receives logical plan from DuckDB, populates Pipeline Metadata Hash Map
-2. **Task Creator**: Creates Scan Tasks and Pipeline Tasks based on data availability in Data Repository
-3. **Scan Executor**: Uses DuckDB to scan data from storage, converts to GPU format, stores in Data Repository
-4. **Pipeline Executor**: GPU thread pool executing operators via cuDF, stores results in Data Repository
-5. **Downgrade Executor**: Moves data from GPU to CPU when GPU memory is constrained
-
-### Key Components
-
-**Data Flow:**
-- `Data Batch`: Wrapper for pipeline input/output (cudf::table or spilling::allocation)
-- `Data Repository`: Container for Data Batches, manages movement across memory tiers (GPU/CPU/disk via cuCascade)
-- `Pipeline Task`: Operators chain + Data Batch to be executed on GPU
-- `Scan Task`: DuckDB-based data scan that produces Data Batches
-
-**Execution:**
-- `sirius_engine`: Top-level orchestrator, owns pipelines and physical plan
-- `sirius_pipeline`: Collection of operators that can be executed together
-- `sirius_meta_pipeline`: Manages pipeline dependencies and scheduling
-- `GPU Thread Pool`: Stream-per-thread model for parallel GPU execution
-- `Memory Reservation Manager`: Prevents GPU OOM by enforcing memory limits
-
-**Operators** (`src/include/operator/`):
-See [Supported Features](#supported-features) for the full list of implemented operators.
-
-### Directory Structure
-
-**Core source code:**
-- `src/include/`: Header files organized by module
-  - `operator/`: GPU physical operators (filter, join, aggregate, etc.)
-  - `pipeline/`: Pipeline execution framework (tasks, executors, queues)
-  - `memory/`: Memory management interfaces (integrates with cuCascade)
-  - `op/`: Sirius-specific physical operator wrappers
-  - `planner/`: Physical plan generation and optimization
-  - `data/`: Data structures (columns, batches)
-  - `cudf/`: cuDF integration utilities
-  - `expression_executor/`: Expression evaluation on GPU
-
-**Important files:**
-- `src/sirius_extension.cpp`: Extension entry point, registers functions with DuckDB
-- `src/sirius_interface.cpp`: API for `gpu_buffer_init` and `gpu_processing`
-- `src/gpu_executor.cpp`: Main GPU execution coordinator
-- `src/gpu_buffer_manager.cpp`: GPU memory allocation and caching
-
-**Third-party dependencies:**
-- `cucascade/`: GPU memory management library (built as subdirectory)
-- `duckdb/`: DuckDB core (git submodule)
-- `third_party/`: spdlog (logging), other dependencies via CMake
-
-**Build configuration:**
-- `CMakeLists.txt`: Main build configuration
-- `extension_config.cmake`: Extension-specific DuckDB config
-- `third_party/*.cmake`: External dependency fetching (spdlog, cucascade)
-- `pixi.toml`: Pixi environment specification (CUDA versions, dependencies)
-
-### Memory Management
-
-Sirius uses cuCascade for sophisticated GPU memory management:
-
-- **GPU Caching Region**: Stores raw input data on GPU
-- **GPU Processing Region**: Holds intermediate results (hash tables, join results)
-- **Pinned Host Memory**: Fast CPU-GPU transfers
-- **Memory Reservations**: Pre-allocation strategy to avoid OOM during execution
-
-Initialization via `gpu_buffer_init("1 GB", "2 GB", pinned_memory_size = "4 GB")`
+Comprehensive documentation lives in `docs/super-sirius/` — see [README](docs/super-sirius/README.md) for index and reading order. **Read these docs before modifying Super Sirius code.**
 
 ### Logging
-
-Sirius uses spdlog for structured logging:
 
 ```bash
 export SIRIUS_LOG_DIR=/path/to/logs      # Default: ${CMAKE_BINARY_DIR}/log
 export SIRIUS_LOG_LEVEL=debug            # Levels: trace, debug, info, warn, error
 ```
 
-Logs are essential for debugging GPU execution, memory allocation, and pipeline scheduling.
-
 ## Development Guidelines
+
+### Loading Library Context for Implementation Tasks
+
+**Before implementing new features, operators, or significant bug fixes**, always run `/module-context <task description>` first. This loads the relevant API documentation for cudf, rmm, duckdb, cucascade, and libkvikio modules so you have accurate function signatures, parameter types, and existing usage patterns. The module docs live in `.claude/skills/module-discover/docs/` and contain detailed API references extracted from the actual library headers.
+
+This is especially important for tasks involving:
+- GPU operators (joins, aggregations, sorting, filters, projections)
+- Memory management (reservations, pools, streams, spilling)
+- Data I/O (parquet scanning, datasources)
+- Expression evaluation (AST, unary/binary ops, type casting)
+- Pipeline execution (tasks, executors, data batches)
 
 ### Fallback Strategy
 
@@ -291,29 +202,7 @@ The fallback mechanism is implemented in `src/fallback.cpp` and integrates with 
 - Requires C++20 and CUDA standard 20
 - Separable compilation enabled for CUDA (`CMAKE_CUDA_SEPARABLE_COMPILATION ON`)
 - GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
-- Links against: cudf::cudf, rmm::rmm, libnuma, libconfig++, absl::any_invocable, spdlog, cuCascade
-
-## Common Issues
-
-**Build Issues:**
-
-If you see undefined reference errors related to GLIBCXX or CXXABI:
-```bash
-export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
-rm -rf build
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-```
-
-**Memory Issues:**
-
-If build consumes too much RAM, reduce parallel jobs:
-```bash
-CMAKE_BUILD_PARALLEL_LEVEL=4 make
-```
-
-**Test Datasets:**
-
-TPC-H and ClickBench datasets must be generated before running tests. See `test_datasets/` and run `setup_test_datasets.sh` (automatically run in pixi activation).
+- Links against: cudf::cudf, rmm::rmm, libnuma, yaml-cpp, absl::any_invocable, spdlog, cuCascade
 
 ## Extension Development
 
@@ -329,42 +218,18 @@ This is a DuckDB extension project using the extension template. The build syste
 CLI:
 ```sql
 LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
-CALL gpu_buffer_init('1 GB', '2 GB');
--- Legacy mode:
-CALL gpu_processing('SELECT ...');
--- New mode (preferred):
 CALL gpu_execution('SELECT ...');
+-- Legacy mode (requires gpu_buffer_init first):
+CALL gpu_buffer_init('1 GB', '2 GB');
+CALL gpu_processing('SELECT ...');
 ```
 
-Python:
+Python (requires `pixi run -e duckdb-python build-duckdb-python` first):
 ```python
 con = duckdb.connect('db.duckdb', config={"allow_unsigned_extensions": "true"})
 con.execute("LOAD '/path/to/sirius.duckdb_extension'")
-con.execute("CALL gpu_buffer_init('1 GB', '2 GB')")
-# Legacy mode:
-con.execute("CALL gpu_processing('SELECT ...')").fetchall()
-# New mode (preferred):
 con.execute("CALL gpu_execution('SELECT ...')").fetchall()
 ```
-
-## Performance Characteristics
-
-- **Cold runs are slow**: First query loads data from storage and converts DuckDB format to GPU format
-- **Warm runs benefit from GPU caching**: Subsequent queries use cached GPU data
-- **Best for**: Interactive analytics, financial workloads, ETL jobs, large aggregations/joins
-- **Benchmark**: ~8x speedup on TPC-H SF=100 vs CPU at equivalent hardware cost
-
-## Glossary Terms
-
-Key terminology used throughout the codebase (see `docs/glossary.md` for complete definitions):
-
-- **Pipeline**: Chain of operators executed together as a unit
-- **Data Batch**: Input/output wrapper for pipeline execution
-- **Data Repository**: Central storage for Data Batches with tier management
-- **GPU Scheduling Thread**: Stream-associated thread that pulls tasks from queue
-- **Memory Reservation**: Lease on memory to prevent oversubscription
-- **Task Creator**: Thread that polls completions and creates new tasks
-- **Thread Coordinator**: Main thread orchestrating Sirius execution
 
 ## Claude Code Skills
 
@@ -376,6 +241,8 @@ Sirius includes Claude Code skills for performance analysis and dataset manageme
 | Dataset Manager | `/dataset-manager` | Manages TPC-H parquet datasets — generate at any scale factor, consolidate files, inspect layout, optimize row groups. |
 | Optimization Advisor | `/optimization-advisor` | Maps GPU hotspots from nsys profiles to source functions, detects efficiency bottlenecks, sync overhead, and parallelism opportunities. |
 | TPC-DS Benchmark | `/tpcds-benchmark` | Runs TPC-DS benchmarks on Legacy Sirius, Super Sirius, or DuckDB CPU baseline — generate data, execute queries, and compare results. |
+| Module Context | `/module-context` | **Auto-loaded before implementation tasks.** Identifies which dependency modules are relevant to a task and loads their API docs (signatures, descriptions, usage examples). |
+| Module Discover | `/module-discover` | Analyzes a dependency library, divides it into modules, and generates LLM-consumable API documentation. Run once per library to populate docs. |
 
 **Useful debugging tools:**
 - `tools/parse_pipeline_log.py`: Parses Sirius pipeline logs to show per-operator row counts for debugging incorrect query results.

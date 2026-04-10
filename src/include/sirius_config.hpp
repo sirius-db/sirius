@@ -17,7 +17,6 @@
 #pragma once
 
 #include "config.hpp"
-#include "config_option.hpp"
 #include "exec/config.hpp"
 #include "op/scan/config.hpp"
 
@@ -29,7 +28,6 @@
 namespace sirius {
 
 namespace config {
-struct configuration_setter;
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
@@ -40,7 +38,7 @@ constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  /
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
-/// These can be set via the .cfg file under the [sirius.operator_params] section
+/// These can be set via the .yaml file under the sirius.operator_params section
 /// or overridden at runtime using DuckDB SET commands.
 struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
@@ -68,6 +66,7 @@ struct sirius_config {
   ~sirius_config() = default;
 
   void load_from_file(const std::filesystem::path& config_path);
+  void apply_defaults();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -81,7 +80,8 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_downgrade_executor_config() const noexcept;
+  [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
+    const noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
 
@@ -114,8 +114,7 @@ struct sirius_config {
                                                 .thread_name_prefix = "task_creator"};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
-  exec::thread_pool_config _downgrade_executor_config{.num_threads        = 4,
-                                                      .thread_name_prefix = "downgrade"};
+  exec::downgrade_executor_config _downgrade_executor_config;
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
 };
