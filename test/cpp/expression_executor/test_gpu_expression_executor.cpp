@@ -1052,8 +1052,7 @@ TEST_CASE("experimental execute decimal arithmetic (DECIMAL64)",
       duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
 
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      make_func_expr("*", dec_type, {dec_type, dec_int_type}, std::move(children)));
+    exprs.push_back(make_func_expr("*", dec_type, {dec_type, dec_int_type}, std::move(children)));
 
     auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
     REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
@@ -1133,8 +1132,7 @@ TEST_CASE("experimental execute nested decimal arithmetic (col + 1.00) * 2",
   add_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
   add_children.push_back(
     duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{100}, width, scale)));
-  auto add_expr =
-    make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(add_children));
+  auto add_expr = make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(add_children));
 
   // Outer: (col + 1.00) * 2 where 2 is DECIMAL(18, 0) so MUL output scale = -2 + 0 = -2
   duckdb::vector<duckdb::unique_ptr<Expression>> mul_children;
@@ -1143,8 +1141,7 @@ TEST_CASE("experimental execute nested decimal arithmetic (col + 1.00) * 2",
     duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
 
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(
-    make_func_expr("*", dec_type, {dec_type, dec_int}, std::move(mul_children)));
+  exprs.push_back(make_func_expr("*", dec_type, {dec_type, dec_int}, std::move(mul_children)));
 
   auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
   REQUIRE(ov.num_columns() == 1);
