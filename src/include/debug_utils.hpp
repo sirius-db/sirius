@@ -5,9 +5,9 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
-
 #include <cudf/types.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <optional>
 #include <string>
@@ -102,9 +102,9 @@ enum class DebugFormat { ALIGNED, CSV };
 void debug_head(cucascade::data_batch const& batch,
                 cudf::size_type n,
                 rmm::cuda_stream_view stream,
-                DebugFormat format = DebugFormat::ALIGNED,
+                DebugFormat format                        = DebugFormat::ALIGNED,
                 std::vector<std::string> const& col_names = {},
-                cudf::size_type max_string_len = 50);
+                cudf::size_type max_string_len            = 50);
 
 /**
  * @brief Log per-column min, max, sum statistics as [SIRIUS_DIAG] output.
@@ -158,8 +158,8 @@ void debug_checksum(cucascade::data_batch const& batch,
 void debug_diff(cucascade::data_batch const& batch_a,
                 cucascade::data_batch const& batch_b,
                 rmm::cuda_stream_view stream,
-                cudf::size_type max_diff_rows = 10,
-                cudf::size_type max_rows = 10'000'000,
+                cudf::size_type max_diff_rows             = 10,
+                cudf::size_type max_rows                  = 10'000'000,
                 std::vector<std::string> const& col_names = {});
 
 /**
@@ -180,9 +180,9 @@ void debug_diff(cucascade::data_batch const& batch_a,
 void debug_sample(cucascade::data_batch const& batch,
                   cudf::size_type n,
                   rmm::cuda_stream_view stream,
-                  DebugFormat format = DebugFormat::ALIGNED,
+                  DebugFormat format                        = DebugFormat::ALIGNED,
                   std::vector<std::string> const& col_names = {},
-                  cudf::size_type max_string_len = 50,
-                  std::optional<uint64_t> seed = std::nullopt);
+                  cudf::size_type max_string_len            = 50,
+                  std::optional<uint64_t> seed              = std::nullopt);
 
 }  // namespace sirius

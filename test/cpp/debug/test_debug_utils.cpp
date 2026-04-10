@@ -339,13 +339,13 @@ TEST_CASE("debug_head on multi-type numeric batch (ALIGNED)", "[debug_utils]")
   auto stream = cudf::get_default_stream();
   auto mr     = test_utils::get_resource_ref(*space);
 
-  auto col_i32  = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+  auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
-  auto col_i64  = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
+  auto col_i64 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
     {100, 200, 300}, stream, mr);
-  auto col_f32  = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<float>>(
+  auto col_f32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<float>>(
     {1.5f, 2.5f, 3.5f}, stream, mr);
-  auto col_f64  = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<double>>(
+  auto col_f64 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<double>>(
     {1.11, 2.22, 3.33}, stream, mr);
   auto col_bool = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<bool>>(
     {true, false, true}, stream, mr);
@@ -360,9 +360,8 @@ TEST_CASE("debug_head on multi-type numeric batch (ALIGNED)", "[debug_utils]")
   auto batch = sirius::make_data_batch(std::move(table), *space);
   REQUIRE(batch != nullptr);
 
-  REQUIRE_NOTHROW(
-    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED,
-                       {"i32", "i64", "f32", "f64", "flag"}));
+  REQUIRE_NOTHROW(sirius::debug_head(
+    *batch, 3, stream, sirius::DebugFormat::ALIGNED, {"i32", "i64", "f32", "f64", "flag"}));
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +454,7 @@ TEST_CASE("debug_head shows NULL for null positions", "[debug_utils]")
   auto mr     = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 5;
-  auto col = cudf::make_numeric_column(
+  auto col                           = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, stream, mr);
 
   std::vector<int32_t> host_data{10, 20, 30, 40, 50};
@@ -495,7 +494,6 @@ TEST_CASE("debug_head on null-data batch logs warning without crashing", "[debug
   REQUIRE_NOTHROW(sirius::debug_head(batch, 5, cudf::get_default_stream()));
 }
 
-
 // ---------------------------------------------------------------------------
 // Test case 15: debug_stats on numeric columns
 // ---------------------------------------------------------------------------
@@ -526,8 +524,7 @@ TEST_CASE("debug_stats on numeric columns produces output without throwing", "[d
   auto batch = sirius::make_data_batch(std::move(table), *space);
   REQUIRE(batch != nullptr);
 
-  REQUIRE_NOTHROW(
-    sirius::debug_stats(*batch, stream, {"i32", "i64", "f32", "f64"}));
+  REQUIRE_NOTHROW(sirius::debug_stats(*batch, stream, {"i32", "i64", "f32", "f64"}));
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +539,7 @@ TEST_CASE("debug_stats skips BOOL column as non-numeric", "[debug_utils]")
   auto stream = cudf::get_default_stream();
   auto mr     = test_utils::get_resource_ref(*space);
 
-  auto col_i32  = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+  auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
   auto col_bool = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<bool>>(
     {true, false, true}, stream, mr);
@@ -570,7 +567,7 @@ TEST_CASE("debug_stats on all-NULL numeric column shows NULL", "[debug_utils]")
   auto mr     = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 5;
-  auto col = cudf::make_numeric_column(
+  auto col                           = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_NULL, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -633,9 +630,9 @@ TEST_CASE("debug_head on STRING column shows string values", "[debug_utils]")
   auto stream = cudf::get_default_stream();
   auto mr     = test_utils::get_resource_ref(*space);
 
-  auto col = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::string_tag>>(
-    {"hello", "world", "test"}, stream, mr);
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
+      {"hello", "world", "test"}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -643,8 +640,7 @@ TEST_CASE("debug_head on STRING column shows string values", "[debug_utils]")
   auto batch = sirius::make_data_batch(std::move(table), *space);
   REQUIRE(batch != nullptr);
 
-  REQUIRE_NOTHROW(
-    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"str_col"}));
+  REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"str_col"}));
 }
 
 // ---------------------------------------------------------------------------
@@ -659,9 +655,9 @@ TEST_CASE("debug_head on STRING column truncates with max_string_len", "[debug_u
   auto stream = cudf::get_default_stream();
   auto mr     = test_utils::get_resource_ref(*space);
 
-  auto col = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::string_tag>>(
-    {"short", "this_is_a_very_long_string_value"}, stream, mr);
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
+      {"short", "this_is_a_very_long_string_value"}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -670,8 +666,7 @@ TEST_CASE("debug_head on STRING column truncates with max_string_len", "[debug_u
   REQUIRE(batch != nullptr);
 
   // max_string_len=10 will truncate the long string
-  REQUIRE_NOTHROW(
-    sirius::debug_head(*batch, 2, stream, sirius::DebugFormat::ALIGNED, {"str"}, 10));
+  REQUIRE_NOTHROW(sirius::debug_head(*batch, 2, stream, sirius::DebugFormat::ALIGNED, {"str"}, 10));
 }
 
 // ---------------------------------------------------------------------------
@@ -687,9 +682,9 @@ TEST_CASE("debug_head on DECIMAL64 column shows scaled values", "[debug_utils]")
   auto mr     = test_utils::get_resource_ref(*space);
 
   // decimal64_tag: scale=-2, values {12345, -100, 5} represent 123.45, -1.00, 0.05
-  auto col = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
-    {12345, -100, 5}, stream, mr);
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
+      {12345, -100, 5}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -697,8 +692,7 @@ TEST_CASE("debug_head on DECIMAL64 column shows scaled values", "[debug_utils]")
   auto batch = sirius::make_data_batch(std::move(table), *space);
   REQUIRE(batch != nullptr);
 
-  REQUIRE_NOTHROW(
-    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"price"}));
+  REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"price"}));
 }
 
 // ---------------------------------------------------------------------------
@@ -716,9 +710,9 @@ TEST_CASE("debug_head on TIMESTAMP_MICROSECONDS column shows calendar format", "
   // 1705305000000000 us = 2024-01-15 08:30:00 UTC
   // 0 = 1970-01-01 00:00:00
   // 1705305000123456 us = 2024-01-15 08:30:00.123456 (fractional seconds)
-  auto col = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::timestamp_us_tag>>(
-    {1705305000000000LL, 0LL, 1705305000123456LL}, stream, mr);
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::timestamp_us_tag>>(
+      {1705305000000000LL, 0LL, 1705305000123456LL}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -726,8 +720,7 @@ TEST_CASE("debug_head on TIMESTAMP_MICROSECONDS column shows calendar format", "
   auto batch = sirius::make_data_batch(std::move(table), *space);
   REQUIRE(batch != nullptr);
 
-  REQUIRE_NOTHROW(
-    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"ts"}));
+  REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"ts"}));
 }
 
 // ---------------------------------------------------------------------------
@@ -745,9 +738,9 @@ TEST_CASE("debug_head on DATE column shows date format", "[debug_utils]")
   // 19738 days since epoch = 2024-01-15
   // 0 = 1970-01-01
   // -1 = 1969-12-31 (pre-epoch)
-  auto col = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::date32_tag>>(
-    {19738, 0, -1}, stream, mr);
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::date32_tag>>(
+      {19738, 0, -1}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -755,8 +748,7 @@ TEST_CASE("debug_head on DATE column shows date format", "[debug_utils]")
   auto batch = sirius::make_data_batch(std::move(table), *space);
   REQUIRE(batch != nullptr);
 
-  REQUIRE_NOTHROW(
-    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"dt"}));
+  REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"dt"}));
 }
 
 // ---------------------------------------------------------------------------
@@ -773,18 +765,18 @@ TEST_CASE("debug_head on mixed batch with all supported types", "[debug_utils]")
 
   auto col_int = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
-  auto col_str = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::string_tag>>(
-    {"hello", "world", "test"}, stream, mr);
-  auto col_dec = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
-    {12345, -100, 5}, stream, mr);
-  auto col_ts = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::timestamp_us_tag>>(
-    {1705305000000000LL, 0LL, 1705305000123456LL}, stream, mr);
-  auto col_dt = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::date32_tag>>(
-    {19738, 0, -1}, stream, mr);
+  auto col_str =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
+      {"hello", "world", "test"}, stream, mr);
+  auto col_dec =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
+      {12345, -100, 5}, stream, mr);
+  auto col_ts =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::timestamp_us_tag>>(
+      {1705305000000000LL, 0LL, 1705305000123456LL}, stream, mr);
+  auto col_dt =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::date32_tag>>(
+      {19738, 0, -1}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col_int));
@@ -796,9 +788,8 @@ TEST_CASE("debug_head on mixed batch with all supported types", "[debug_utils]")
   auto batch = sirius::make_data_batch(std::move(table), *space);
   REQUIRE(batch != nullptr);
 
-  REQUIRE_NOTHROW(
-    sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED,
-                       {"int", "str", "dec", "ts", "dt"}));
+  REQUIRE_NOTHROW(sirius::debug_head(
+    *batch, 3, stream, sirius::DebugFormat::ALIGNED, {"int", "str", "dec", "ts", "dt"}));
 }
 
 // ---------------------------------------------------------------------------
@@ -814,14 +805,14 @@ TEST_CASE("debug_head on STRING column with nulls shows NULL", "[debug_utils]")
   auto mr     = test_utils::get_resource_ref(*space);
 
   // Create string column with 3 rows
-  auto col = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::string_tag>>(
-    {"hello", "world", "test"}, stream, mr);
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
+      {"hello", "world", "test"}, stream, mr);
 
   // Set null mask: middle row (row 1) is null
   // Bitmask byte: bit 0 set, bit 1 clear, bit 2 set => 0b00000101 = 0x05
   constexpr cudf::size_type num_rows = 3;
-  auto mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
+  auto mask_size                     = cudf::bitmask_allocation_size_bytes(num_rows);
   std::vector<uint8_t> host_mask(mask_size, 0xFF);
   host_mask[0] = 0b00000101;  // bits 0,2 set (valid); bit 1 clear (null)
 
@@ -880,12 +871,12 @@ TEST_CASE("debug_checksum on multi-type batch produces per-column output", "[deb
 
   auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
-  auto col_str = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::string_tag>>(
-    {"alpha", "beta", "gamma"}, stream, mr);
-  auto col_dec = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
-    {100, 250, 350}, stream, mr);
+  auto col_str =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
+      {"alpha", "beta", "gamma"}, stream, mr);
+  auto col_dec =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::decimal64_tag>>(
+      {100, 250, 350}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col_i32));
@@ -936,9 +927,8 @@ TEST_CASE("debug_checksum on all-NULL column produces zero checksum", "[debug_ut
 
   // Create INT32 column with 5 rows, all NULL
   constexpr cudf::size_type num_rows = 5;
-  auto col = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, num_rows,
-    cudf::mask_state::ALL_NULL, stream, mr);
+  auto col                           = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_NULL, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -1242,7 +1232,8 @@ TEST_CASE("debug_diff row limit guard skips comparison for large batches", "[deb
   REQUIRE(batch_b != nullptr);
 
   // max_rows=2 but batches have 5 rows -- warning logged, value comparison skipped
-  REQUIRE_NOTHROW(sirius::debug_diff(*batch_a, *batch_b, stream, /*max_diff_rows=*/10, /*max_rows=*/2));
+  REQUIRE_NOTHROW(
+    sirius::debug_diff(*batch_a, *batch_b, stream, /*max_diff_rows=*/10, /*max_rows=*/2));
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,7 +1296,8 @@ TEST_CASE("debug_sample basic operation with named columns", "[debug_utils]")
   REQUIRE(batch != nullptr);
 
   // Sample 3 rows with seed=42 and named columns
-  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"val_a", "val_b"}, 50, /*seed=*/42));
+  REQUIRE_NOTHROW(sirius::debug_sample(
+    *batch, 3, stream, sirius::DebugFormat::ALIGNED, {"val_a", "val_b"}, 50, /*seed=*/42));
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,9 +1314,11 @@ TEST_CASE("debug_sample with fixed seed is reproducible", "[debug_utils]")
 
   // Create a batch with 1 column (INT32, 20 rows: {0..19})
   std::vector<int32_t> vals(20);
-  for (int i = 0; i < 20; ++i) { vals[i] = i; }
-  auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
-    vals, stream, mr);
+  for (int i = 0; i < 20; ++i) {
+    vals[i] = i;
+  }
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(vals, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -1333,8 +1327,10 @@ TEST_CASE("debug_sample with fixed seed is reproducible", "[debug_utils]")
   REQUIRE(batch != nullptr);
 
   // Call twice with seed=12345 -- both should succeed without crash
-  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 5, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/12345));
-  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 5, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/12345));
+  REQUIRE_NOTHROW(
+    sirius::debug_sample(*batch, 5, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/12345));
+  REQUIRE_NOTHROW(
+    sirius::debug_sample(*batch, 5, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/12345));
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,7 +1356,8 @@ TEST_CASE("debug_sample N > num_rows clamps silently", "[debug_utils]")
   REQUIRE(batch != nullptr);
 
   // N=100 but only 3 rows -- clamped to 3, no crash
-  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 100, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/42));
+  REQUIRE_NOTHROW(
+    sirius::debug_sample(*batch, 100, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/42));
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,7 +1386,8 @@ TEST_CASE("debug_sample CSV format produces output without throwing", "[debug_ut
   REQUIRE(batch != nullptr);
 
   // CSV format with seed=42
-  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 2, stream, sirius::DebugFormat::CSV, {}, 50, /*seed=*/42));
+  REQUIRE_NOTHROW(
+    sirius::debug_sample(*batch, 2, stream, sirius::DebugFormat::CSV, {}, 50, /*seed=*/42));
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,9 +1429,9 @@ TEST_CASE("debug_sample with STRING columns extracts values correctly", "[debug_
   auto mr     = test_utils::get_resource_ref(*space);
 
   // Create a STRING column following established pattern from test case 20
-  auto col = sirius::test::vector_to_cudf_column<
-    test_utils::gpu_type_traits<test_utils::string_tag>>(
-    {"hello", "world", "test", "sample", "data"}, stream, mr);
+  auto col =
+    sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
+      {"hello", "world", "test", "sample", "data"}, stream, mr);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
@@ -1442,5 +1440,6 @@ TEST_CASE("debug_sample with STRING columns extracts values correctly", "[debug_
   REQUIRE(batch != nullptr);
 
   // Sample 3 rows with seed=42
-  REQUIRE_NOTHROW(sirius::debug_sample(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/42));
+  REQUIRE_NOTHROW(
+    sirius::debug_sample(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/42));
 }
