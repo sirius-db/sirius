@@ -266,6 +266,33 @@ std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
 
+std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
+                                                  int8_t scale,
+                                                  const std::vector<__int128_t>& values)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+  auto size   = static_cast<cudf::size_type>(values.size());
+
+  auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL128, -scale},
+                                           size,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+  cudaMemcpy(col->mutable_view().data<__int128_t>(),
+             values.data(),
+             sizeof(__int128_t) * values.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
+  auto batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+}
+
 }  // namespace
 
 TEST_CASE("gpu_expression_executor execute(data_batch) projects references",
@@ -1129,6 +1156,148 @@ TEST_CASE("experimental execute nested decimal arithmetic (col + 1.00) * 2",
   expected.reserve(raw.size());
   for (auto v : raw) {
     expected.push_back((v + 100) * 2);
+  }
+  REQUIRE(out0 == expected);
+}
+
+TEST_CASE("experimental execute decimal arithmetic (DECIMAL128)",
+          "[expression_executor][experimental][decimal]")
+{
+  // Width 38 → INT128 physical (DuckDB) → DECIMAL128 (cudf). Exercises the
+  // hugeint_t → __int128_t conversion branch in gpu_execute_constant.cpp for
+  // decimal constants, plus cudf::binary_operation on DECIMAL128 columns.
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  uint8_t const width = 38;
+  uint8_t const scale = 2;
+  auto const dec_type = LogicalType::DECIMAL(width, scale);
+
+  // 1.00, 2.00, 3.00 (raw: 100, 200, 300 at scale 2)
+  std::vector<__int128_t> raw = {100, 200, 300};
+  auto input                  = make_decimal128_batch(*space, static_cast<int8_t>(scale), raw);
+
+  // col + 1.25 → raw add 125
+  duckdb::vector<duckdb::unique_ptr<Expression>> children;
+  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
+  children.push_back(duckdb::make_uniq<BoundConstantExpression>(
+    Value::DECIMAL(duckdb::hugeint_t{125}, width, scale)));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL128);
+  REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
+
+  auto out0 = copy_column_to_host<__int128_t>(ov.column(0));
+  REQUIRE(out0.size() == raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) {
+    // __int128_t has no stream operator, so compare via int64 cast (values fit).
+    REQUIRE(static_cast<int64_t>(out0[i]) == static_cast<int64_t>(raw[i] + 125));
+  }
+}
+
+TEST_CASE("experimental execute decimal DIV (DECIMAL64)",
+          "[expression_executor][experimental][decimal]")
+{
+  // DIV has a distinct output-scale rule from ADD/SUB/MUL:
+  //   cudf fixed_point DIV output scale = lhs_scale - rhs_scale
+  // Here: col(scale -2) / literal(scale 0) → output scale -2.
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  uint8_t const width = 18;
+  uint8_t const scale = 2;
+  auto const dec_type = LogicalType::DECIMAL(width, scale);
+  auto const dec_int  = LogicalType::DECIMAL(width, 0);
+
+  // 4.00, 5.00, 6.00, 7.00 (raw 400, 500, 600, 700 at scale 2)
+  std::vector<int64_t> raw = {400, 500, 600, 700};
+  auto input               = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw);
+
+  // col / 2 (2 as DECIMAL(18, 0)) → fixed_point div truncates toward zero in
+  // the output scale; 500/2 = 250, 700/2 = 350.
+  duckdb::vector<duckdb::unique_ptr<Expression>> children;
+  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
+  children.push_back(
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(make_func_expr("/", dec_type, {dec_type, dec_int}, std::move(children)));
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
+
+  auto out0 = copy_column_to_host<int64_t>(ov.column(0));
+  std::vector<int64_t> expected;
+  expected.reserve(raw.size());
+  for (auto v : raw) {
+    expected.push_back(v / 2);
+  }
+  REQUIRE(out0 == expected);
+}
+
+TEST_CASE("experimental execute decimal TPC-H Q1 shape price * (1 - discount)",
+          "[expression_executor][experimental][decimal]")
+{
+  // Mirrors TPC-H Q1's `l_extendedprice * (1 - l_discount)`:
+  //   inner SUB has a scalar on the LEFT (1.00) and a column on the RIGHT
+  //   (discount), which hits the left-scalar branch of execute_numeric_binary_func;
+  //   outer MUL then consumes the materialized inner result as a column.
+  //   MUL output scale = lhs_scale + rhs_scale = -2 + -2 = -4, so the return
+  //   type is DECIMAL(18, 4).
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  uint8_t const width     = 18;
+  uint8_t const scale2    = 2;
+  uint8_t const scale4    = 4;
+  auto const price_type   = LogicalType::DECIMAL(width, scale2);  // DECIMAL(18,2)
+  auto const discount_t   = LogicalType::DECIMAL(width, scale2);  // DECIMAL(18,2)
+  auto const mul_ret_type = LogicalType::DECIMAL(width, scale4);  // DECIMAL(18,4)
+
+  // price: 1000.00, 2000.00, 3000.00
+  std::vector<int64_t> raw_price = {100000, 200000, 300000};
+  // discount: 0.05, 0.10, 0.15
+  std::vector<int64_t> raw_discount = {5, 10, 15};
+  auto input =
+    make_decimal64_two_col_batch(*space, static_cast<int8_t>(scale2), raw_price, raw_discount);
+
+  // Inner: 1.00 - discount (scalar on left, column on right)
+  duckdb::vector<duckdb::unique_ptr<Expression>> sub_children;
+  sub_children.push_back(
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{100}, width, scale2)));
+  sub_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(discount_t, 1));
+  auto sub_expr =
+    make_func_expr("-", discount_t, {discount_t, discount_t}, std::move(sub_children));
+
+  // Outer: price * (1.00 - discount) → return type DECIMAL(18, 4)
+  duckdb::vector<duckdb::unique_ptr<Expression>> mul_children;
+  mul_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(price_type, 0));
+  mul_children.push_back(std::move(sub_expr));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(
+    make_func_expr("*", mul_ret_type, {price_type, discount_t}, std::move(mul_children)));
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale4));
+
+  // Expected: price * (100 - discount) interpreted at scale -4.
+  //   1000.00 * 0.95 = 950.0000 → raw 100000 * 95 = 9500000
+  //   2000.00 * 0.90 = 1800.0000 → raw 200000 * 90 = 18000000
+  //   3000.00 * 0.85 = 2550.0000 → raw 300000 * 85 = 25500000
+  auto out0 = copy_column_to_host<int64_t>(ov.column(0));
+  std::vector<int64_t> expected;
+  expected.reserve(raw_price.size());
+  for (size_t i = 0; i < raw_price.size(); ++i) {
+    expected.push_back(raw_price[i] * (100 - raw_discount[i]));
   }
   REQUIRE(out0 == expected);
 }
