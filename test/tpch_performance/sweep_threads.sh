@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
-CONFIG_FILE="$PROJECT_DIR/test/cpp/integration/integration.cfg"
+CONFIG_FILE="$PROJECT_DIR/test/cpp/integration/integration.yaml"
 
 export SIRIUS_CONFIG_FILE="$CONFIG_FILE"
 
@@ -37,38 +37,28 @@ done
 update_config() {
     local pipeline=$1 scan=$2 task_creator=$3
     cat > "$CONFIG_FILE" << EOF
-sirius = {
-    topology = {
-        num_gpus = 1;
-    };
-    memory = {
-        gpu = {
-            usage_limit_fraction = 0.9;
-            reservation_limit_fraction = 1.0;
-        }
-        host = {
-            capacity_bytes = 50000000000;
-            initial_number_pools = 80;
-            pool_size = 512;
-            block_size = 1048576;
-        };
-    };
-    executor = {
-        pipeline = {
-            num_threads = ${pipeline};
-        };
-        duckdb_scan = {
-            num_threads = ${scan};
-            cache = true;
-        };
-        task_creator = {
-            num_threads = ${task_creator};
-        };
-        downgrade = {
-            num_threads = 4;
-        };
-    };
-};
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: 50000000000
+      initial_number_pools: 80
+      pool_size: 512
+      block_size: 1048576
+  executor:
+    pipeline:
+      num_threads: ${pipeline}
+    duckdb_scan:
+      num_threads: ${scan}
+      cache: "parquet"
+    task_creator:
+      num_threads: ${task_creator}
+    downgrade:
+      num_threads: 4
 EOF
 }
 

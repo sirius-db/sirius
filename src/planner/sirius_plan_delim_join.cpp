@@ -26,7 +26,7 @@ namespace sirius::planner {
 static void gather_delim_scans(
   sirius::op::sirius_physical_operator& op,
   duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>& delim_scans,
-  duckdb::idx_t delim_index)
+  std::size_t delim_index)
 {
   if (op.type == sirius::op::SiriusPhysicalOperatorType::DELIM_SCAN) {
     SIRIUS_LOG_DEBUG("Found a delim scan");
@@ -54,7 +54,7 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   D_ASSERT(plan && plan->type != sirius::op::SiriusPhysicalOperatorType::CROSS_PRODUCT);
   // duplicate eliminated join
   // first gather the scans on the duplicate eliminated data set from the delim side
-  const duckdb::idx_t delim_idx = op.delim_flipped ? 0 : 1;
+  const std::size_t delim_idx = op.delim_flipped ? 0 : 1;
   duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>> delim_scans;
   gather_delim_scans(*plan->children[delim_idx], delim_scans, ++this->delim_index);
   if (delim_scans.empty()) {

@@ -268,12 +268,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 {
   // now visit the children
   D_ASSERT(op.children.size() == 2);
-  duckdb::idx_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
-  duckdb::idx_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
+  std::size_t lhs_cardinality  = op.children[0]->EstimateCardinality(context);
+  std::size_t rhs_cardinality  = op.children[1]->EstimateCardinality(context);
 
   // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
   auto build_side_unique_cols = prove_unique_columns(*op.children[1]);
-
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;
@@ -285,10 +284,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
   }
 
-  duckdb::idx_t has_range = 0;
-  bool has_equality       = op.HasEquality(has_range);
-  bool can_merge          = has_range > 0;
-  bool can_iejoin         = has_range >= 2 && recursive_cte_tables.empty();
+  std::size_t has_range = 0;
+  bool has_equality     = op.HasEquality(has_range);
+  bool can_merge        = has_range > 0;
+  bool can_iejoin       = has_range >= 2 && recursive_cte_tables.empty();
   switch (op.join_type) {
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
@@ -376,7 +375,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   }
 
   // D_ASSERT(op.left_projection_map.empty());
-  // duckdb::idx_t nested_loop_join_threshold =
+  // std::size_t nested_loop_join_threshold =
   //   duckdb::DBConfig::GetSetting<duckdb::NestedLoopJoinThresholdSetting>(context);
   // if (left->estimated_cardinality < nested_loop_join_threshold ||
   //     right->estimated_cardinality < nested_loop_join_threshold) {
@@ -385,7 +384,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // }
 
   // if (can_merge && can_iejoin) {
-  //   duckdb::idx_t merge_join_threshold =
+  //   std::size_t merge_join_threshold =
   //     duckdb::DBConfig::GetSetting<duckdb::MergeJoinThresholdSetting>(context);
   //   if (left->estimated_cardinality < merge_join_threshold ||
   //       right->estimated_cardinality < merge_join_threshold) {
