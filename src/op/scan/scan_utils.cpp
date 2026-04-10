@@ -15,7 +15,15 @@
  */
 
 // sirius
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <log/logging.hpp>
 #include <op/scan/scan_utils.hpp>
+
+// standard library
+#include <format>
+#include <stdexcept>
+#include <vector>
 
 namespace sirius::op {
 

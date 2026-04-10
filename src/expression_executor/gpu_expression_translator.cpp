@@ -26,9 +26,6 @@ namespace sirius {
 
 using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
 
-namespace {
-
-/// @brief Convert a cudf::ast::ast_operator to a human-readable string.
 std::string ast_operator_to_string(cudf::ast::ast_operator op)
 {
   switch (op) {
@@ -36,13 +33,13 @@ std::string ast_operator_to_string(cudf::ast::ast_operator op)
     case cudf::ast::ast_operator::SUB: return "-";
     case cudf::ast::ast_operator::MUL: return "*";
     case cudf::ast::ast_operator::DIV: return "/";
-    case cudf::ast::ast_operator::TRUE_DIV: return "true_div";
-    case cudf::ast::ast_operator::FLOOR_DIV: return "floor_div";
+    case cudf::ast::ast_operator::TRUE_DIV: return "TRUE_DIV";
+    case cudf::ast::ast_operator::FLOOR_DIV: return "FLOOR_DIV";
     case cudf::ast::ast_operator::MOD: return "%";
-    case cudf::ast::ast_operator::PYMOD: return "pymod";
-    case cudf::ast::ast_operator::POW: return "**";
+    case cudf::ast::ast_operator::PYMOD: return "PYMOD";
+    case cudf::ast::ast_operator::POW: return "POW";
     case cudf::ast::ast_operator::EQUAL: return "==";
-    case cudf::ast::ast_operator::NULL_EQUAL: return "null_eq";
+    case cudf::ast::ast_operator::NULL_EQUAL: return "NULL_EQUAL";
     case cudf::ast::ast_operator::NOT_EQUAL: return "!=";
     case cudf::ast::ast_operator::LESS: return "<";
     case cudf::ast::ast_operator::GREATER: return ">";
@@ -51,42 +48,41 @@ std::string ast_operator_to_string(cudf::ast::ast_operator op)
     case cudf::ast::ast_operator::BITWISE_AND: return "&";
     case cudf::ast::ast_operator::BITWISE_OR: return "|";
     case cudf::ast::ast_operator::BITWISE_XOR: return "^";
-    case cudf::ast::ast_operator::LOGICAL_AND: return "AND";
-    case cudf::ast::ast_operator::NULL_LOGICAL_AND: return "null_and";
-    case cudf::ast::ast_operator::LOGICAL_OR: return "OR";
-    case cudf::ast::ast_operator::NULL_LOGICAL_OR: return "null_or";
-    case cudf::ast::ast_operator::IDENTITY: return "identity";
+    case cudf::ast::ast_operator::LOGICAL_AND: return "&&";
+    case cudf::ast::ast_operator::NULL_LOGICAL_AND: return "NULL_LOGICAL_AND";
+    case cudf::ast::ast_operator::LOGICAL_OR: return "||";
+    case cudf::ast::ast_operator::NULL_LOGICAL_OR: return "NULL_LOGICAL_OR";
+    case cudf::ast::ast_operator::IDENTITY: return "IDENTITY";
     case cudf::ast::ast_operator::IS_NULL: return "IS_NULL";
-    case cudf::ast::ast_operator::SIN: return "sin";
-    case cudf::ast::ast_operator::COS: return "cos";
-    case cudf::ast::ast_operator::TAN: return "tan";
-    case cudf::ast::ast_operator::ARCSIN: return "arcsin";
-    case cudf::ast::ast_operator::ARCCOS: return "arccos";
-    case cudf::ast::ast_operator::ARCTAN: return "arctan";
-    case cudf::ast::ast_operator::SINH: return "sinh";
-    case cudf::ast::ast_operator::COSH: return "cosh";
-    case cudf::ast::ast_operator::TANH: return "tanh";
-    case cudf::ast::ast_operator::ARCSINH: return "arcsinh";
-    case cudf::ast::ast_operator::ARCCOSH: return "arccosh";
-    case cudf::ast::ast_operator::ARCTANH: return "arctanh";
-    case cudf::ast::ast_operator::EXP: return "exp";
-    case cudf::ast::ast_operator::LOG: return "log";
-    case cudf::ast::ast_operator::SQRT: return "sqrt";
-    case cudf::ast::ast_operator::CBRT: return "cbrt";
-    case cudf::ast::ast_operator::CEIL: return "ceil";
-    case cudf::ast::ast_operator::FLOOR: return "floor";
-    case cudf::ast::ast_operator::ABS: return "abs";
-    case cudf::ast::ast_operator::RINT: return "rint";
+    case cudf::ast::ast_operator::SIN: return "SIN";
+    case cudf::ast::ast_operator::COS: return "COS";
+    case cudf::ast::ast_operator::TAN: return "TAN";
+    case cudf::ast::ast_operator::ARCSIN: return "ARCSIN";
+    case cudf::ast::ast_operator::ARCCOS: return "ARCCOS";
+    case cudf::ast::ast_operator::ARCTAN: return "ARCTAN";
+    case cudf::ast::ast_operator::SINH: return "SINH";
+    case cudf::ast::ast_operator::COSH: return "COSH";
+    case cudf::ast::ast_operator::TANH: return "TANH";
+    case cudf::ast::ast_operator::ARCSINH: return "ARCSINH";
+    case cudf::ast::ast_operator::ARCCOSH: return "ARCCOSH";
+    case cudf::ast::ast_operator::ARCTANH: return "ARCTANH";
+    case cudf::ast::ast_operator::EXP: return "EXP";
+    case cudf::ast::ast_operator::LOG: return "LOG";
+    case cudf::ast::ast_operator::SQRT: return "SQRT";
+    case cudf::ast::ast_operator::CBRT: return "CBRT";
+    case cudf::ast::ast_operator::CEIL: return "CEIL";
+    case cudf::ast::ast_operator::FLOOR: return "FLOOR";
+    case cudf::ast::ast_operator::ABS: return "ABS";
+    case cudf::ast::ast_operator::RINT: return "RINT";
     case cudf::ast::ast_operator::BIT_INVERT: return "~";
     case cudf::ast::ast_operator::NOT: return "NOT";
-    case cudf::ast::ast_operator::CAST_TO_INT64: return "cast_to_int64";
-    case cudf::ast::ast_operator::CAST_TO_UINT64: return "cast_to_uint64";
-    case cudf::ast::ast_operator::CAST_TO_FLOAT64: return "cast_to_float64";
-    default: return "unknown_op";
+    case cudf::ast::ast_operator::CAST_TO_INT64: return "CAST_TO_INT64";
+    case cudf::ast::ast_operator::CAST_TO_UINT64: return "CAST_TO_UINT64";
+    case cudf::ast::ast_operator::CAST_TO_FLOAT64: return "CAST_TO_FLOAT64";
+    default: return "UNKNOWN_OP";
   }
 }
 
-/// @brief Recursively produce a human-readable string for a cuDF AST expression.
 std::string expression_to_string(cudf::ast::expression const& expr)
 {
   if (auto const* op = dynamic_cast<cudf::ast::operation const*>(&expr)) {
@@ -199,8 +195,6 @@ std::string expression_to_string(cudf::ast::expression const& expr)
   }
   return "<unknown>";
 }
-
-}  // anonymous namespace
 
 std::string gpu_expression_translator::translated_expression::to_string() const
 {

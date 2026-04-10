@@ -28,7 +28,7 @@ namespace op {
 // static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
 //   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
 // {
-//   duckdb::set<duckdb::idx_t> group_indices;
+//   duckdb::set<std::size_t> group_indices;
 
 //   if (groups.empty()) { return {}; }
 
@@ -37,7 +37,7 @@ namespace op {
 //     auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
 //     group_indices.insert(bound_ref.index);
 //   }
-//   duckdb::idx_t highest_index = *group_indices.rbegin();
+//   std::size_t highest_index = *group_indices.rbegin();
 //   duckdb::vector<duckdb::LogicalType> types(highest_index + 1, duckdb::LogicalType::SQLNULL);
 //   for (auto& group : groups) {
 //     auto& bound_ref        = group->Cast<duckdb::BoundReferenceExpression>();
@@ -51,7 +51,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_grouped_aggregate(context,
                                       std::move(types),
                                       std::move(expressions),
@@ -77,8 +77,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
-  duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> grouping_functions_p,
-  duckdb::idx_t estimated_cardinality,
+  duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType group_validity,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
@@ -89,10 +89,10 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   // back later when necessary.
 
   // // get a list of all aggregates to be computed
-  // const duckdb::idx_t group_count = groups_p.size();
+  // const std::size_t group_count = groups_p.size();
   // if (grouping_sets.empty()) {
   //   duckdb::GroupingSet set;
-  //   for (duckdb::idx_t i = 0; i < group_count; i++) {
+  //   for (std::size_t i = 0; i < group_count; i++) {
   //     set.insert(i);
   //   }
   //   grouping_sets.push_back(std::move(set));
