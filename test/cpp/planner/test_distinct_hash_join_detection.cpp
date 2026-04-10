@@ -114,7 +114,9 @@ struct distinct_hash_join_fixture {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
     setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    db  = std::make_unique<DuckDB>(nullptr);
+    unsetenv("SIRIUS_DISABLE");
+    db = std::make_unique<DuckDB>(nullptr);
+    setenv("SIRIUS_DISABLE", "1", 1);
     con = std::make_unique<Connection>(*db);
 
     // Create all test tables upfront
