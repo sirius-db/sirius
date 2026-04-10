@@ -501,7 +501,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
       "build state {} in operator {}",
-      _hash_table_build_state,
+      static_cast<int>(_hash_table_build_state),
       this->get_operator_id()));
     return nullptr;
   }

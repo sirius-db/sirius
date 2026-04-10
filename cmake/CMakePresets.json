@@ -23,6 +23,18 @@
     {
       "configurePreset": "clang-relwithdebinfo",
       "name": "clang-relwithdebinfo"
+    },
+    {
+      "configurePreset": "vcpkg-debug",
+      "name": "vcpkg-debug"
+    },
+    {
+      "configurePreset": "vcpkg-release",
+      "name": "vcpkg-release"
+    },
+    {
+      "configurePreset": "vcpkg-relwithdebinfo",
+      "name": "vcpkg-relwithdebinfo"
     }
   ],
   "cmakeMinimumRequired": {
@@ -118,6 +130,53 @@
       "displayName": "Clang RelWithDebInfo",
       "inherits": "base-clang",
       "name": "clang-relwithdebinfo"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "CPM_LOCAL_PACKAGES_ONLY": "ON",
+        "VCPKG_BUILD": "ON",
+        "VCPKG_INSTALL_OPTIONS": "--clean-buildtrees-after-build",
+        "VCPKG_MANIFEST_DIR": "${sourceDir}/.."
+      },
+      "environment": {
+        "VCPKG_BUILD_TYPE": "release",
+        "VCPKG_DISABLE_METRICS": "1",
+        "VCPKG_LIBRARY_LINKAGE": "static"
+      },
+      "hidden": true,
+      "inherits": "base",
+      "name": "vcpkg-base"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/vcpkg-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -G -O0",
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
+        "CMAKE_C_FLAGS_DEBUG": "-g -O0"
+      },
+      "displayName": "vcpkg Debug",
+      "inherits": "vcpkg-base",
+      "name": "vcpkg-debug"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/vcpkg-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "displayName": "vcpkg Release",
+      "inherits": "vcpkg-base",
+      "name": "vcpkg-release"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/vcpkg-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "displayName": "vcpkg RelWithDebInfo",
+      "inherits": "vcpkg-base",
+      "name": "vcpkg-relwithdebinfo"
     }
   ],
   "version": 6
