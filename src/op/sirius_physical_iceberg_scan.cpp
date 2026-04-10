@@ -42,10 +42,10 @@ sirius_physical_iceberg_scan::sirius_physical_iceberg_scan(
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
   duckdb::vector<duckdb::LogicalType> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
-  duckdb::vector<duckdb::idx_t> projection_ids_p,
+  duckdb::vector<std::size_t> projection_ids_p,
   duckdb::vector<std::string> names_p,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters_p,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p)

@@ -33,7 +33,7 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
   for (auto& table_filter : table_filters.filters) {
     // find the relative column index from the absolute column index into the table
     duckdb::optional_idx column_index;
-    for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+    for (std::size_t i = 0; i < column_ids.size(); i++) {
       if (table_filter.first == column_ids[i].GetPrimaryIndex()) {
         column_index = i;
         break;
@@ -79,7 +79,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Since we don't pass filters to the DuckDB table function (they're applied by Sirius),
   // we need to ensure all filter columns are included in BOTH column_ids and projection_ids.
   // We track the original projection_ids so we can project back after filtering.
-  duckdb::vector<duckdb::idx_t> original_projection_ids = projection_ids;
+  duckdb::vector<std::size_t> original_projection_ids = projection_ids;
 
   // Save the original types before we modify projection_ids, because modifying projection_ids
   // might affect the types when we call ResolveOperatorTypes()
@@ -92,7 +92,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       // scanned by DuckDB
 
       bool found_in_projection = false;
-      for (duckdb::idx_t j = 0; j < projection_ids.size(); j++) {
+      for (std::size_t j = 0; j < projection_ids.size(); j++) {
         if (projection_ids[j] == entry.first) {
           found_in_projection = true;
           break;
@@ -106,7 +106,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Handle cases where table function doesn't support pushdown for specific column types
   if (table_filters && op.function.supports_pushdown_type) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
-    duckdb::unordered_set<duckdb::idx_t> to_remove;
+    duckdb::unordered_set<std::size_t> to_remove;
     for (auto& entry : table_filters->filters) {
       if (column_ids[entry.first].IsVirtualColumn()) {
         continue;  // Skip virtual columns (ROW_ID, EMPTY)
@@ -117,7 +117,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       // If the table function doesn't support pushdown for this column type,
       // create a separate filter operator for it
       if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
-        duckdb::idx_t column_id_filter = entry.first;
+        std::size_t column_id_filter = entry.first;
         auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
         select_list.push_back(entry.second->ToExpression(*column));
         to_remove.insert(entry.first);
@@ -161,7 +161,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
-      for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+      for (std::size_t i = 0; i < column_ids.size(); i++) {
         if (column_ids[i].GetPrimaryIndex() != i) {
           projection_necessary = true;
           break;

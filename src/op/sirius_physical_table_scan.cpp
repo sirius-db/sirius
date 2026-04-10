@@ -34,7 +34,7 @@
 namespace sirius {
 namespace op {
 
-uint64_t get_chunk_data_byte_size(duckdb::LogicalType type, duckdb::idx_t cardinality)
+uint64_t get_chunk_data_byte_size(duckdb::LogicalType type, std::size_t cardinality)
 {
   auto physical_size = duckdb::GetTypeIdSize(type.InternalType());
   return cardinality * physical_size;
@@ -46,10 +46,10 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
   duckdb::vector<duckdb::LogicalType> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
-  duckdb::vector<duckdb::idx_t> projection_ids_p,
+  duckdb::vector<std::size_t> projection_ids_p,
   duckdb::vector<std::string> names_p,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters_p,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p)
@@ -96,20 +96,21 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
-  const auto& raw_input_batches = input_data.get_data_batches();
+  auto& input                   = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& raw_input_batches = input.get_data_batches();
 
   // For parquet scan pipelines, filter and projection are already applied in
   // parquet_scan_task and the host_parquet_representation converters.
   // Also, only parquet file tails are small due to the partitioning logic, so batch concatenation
   // is not needed.
-  if (passthrough) { return std::make_unique<operator_data>(raw_input_batches); }
+  if (passthrough) { return std::make_unique<pipelineable_operator_data>(raw_input_batches); }
 
   // Build the column_ids index → batch position mapping once.
   // Both filter expression construction and post-filter projection use this.
@@ -140,7 +141,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After concatenation (or if only one batch), work with a single batch.
   const auto& batch_ref =
     single_batch ? single_batch : (!raw_input_batches.empty() ? raw_input_batches[0] : nullptr);
-  if (!batch_ref || !batch_ref->get_data()) { return std::make_unique<operator_data>(); }
+  if (!batch_ref || !batch_ref->get_data()) {
+    return std::make_unique<pipelineable_operator_data>();
+  }
 
   // Apply table filters as a GPU expression if present.
   std::shared_ptr<cucascade::data_batch> output_batch;
@@ -153,18 +156,18 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (filter_expr != nullptr) {
     duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
     output_batch = gpu_expression_executor.select(batch_ref, stream);
-    if (!output_batch) { return std::make_unique<operator_data>(); }
+    if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
   } else {
     output_batch = batch_ref;
   }
 
   // After filtering, project away filter-only columns if the batch has more
   // columns than the operator's output type list expects.
-  duckdb::idx_t expected_output_columns = types.size();
+  std::size_t expected_output_columns = types.size();
   auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
   auto& out_table = gpu_rep.get_table();
 
-  if (static_cast<duckdb::idx_t>(out_table.num_columns()) > expected_output_columns) {
+  if (static_cast<std::size_t>(out_table.num_columns()) > expected_output_columns) {
     SIRIUS_LOG_DEBUG(
       "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
       "column_ids.size()={}",
@@ -188,9 +191,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     // in the order the downstream operator expects.
     std::vector<std::unique_ptr<cudf::column>> selected;
     selected.reserve(expected_output_columns);
-    for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
+    for (std::size_t i = 0; i < expected_output_columns; i++) {
       auto batch_idx = batch_column_map[projection_ids[i]];
-      if (batch_idx == static_cast<duckdb::idx_t>(-1) || batch_idx >= columns.size()) {
+      if (batch_idx == static_cast<std::size_t>(-1) || batch_idx >= columns.size()) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
                       "columns.size()={}",
@@ -212,7 +215,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.push_back(std::move(output_batch));
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 }  // namespace op

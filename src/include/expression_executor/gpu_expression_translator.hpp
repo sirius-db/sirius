@@ -51,6 +51,16 @@
 namespace sirius {
 
 /**
+ * @brief Convert a cudf::ast::ast_operator to a human-readable string.
+ */
+std::string ast_operator_to_string(cudf::ast::ast_operator op);
+
+/**
+ * @brief Recursively produce a human-readable string for a cuDF AST expression.
+ */
+std::string expression_to_string(cudf::ast::expression const& expr);
+
+/**
  * @brief Class for translating (a subset of) DuckDB expressions and join conditions into cuDF ASTs
  * for GPU execution.
  *
