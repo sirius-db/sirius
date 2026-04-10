@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  3ec3b2184acce64f87d662bb49571d0bee9101893bfb73073ce13b64c8a4050fbccba35504deaef0726ee647e2c13b375c1c68922f7d5caba2aa18ac159eba68
+  ef9ecc51efdde4e73ea231cd59628dad3347ac4c10a4d2e45be789a2307fdccfca16844373a296f61f89a6e2aa95b04e71175d50ac488eb925fb4217eaaf20cc
   HEAD_REF
   main)
 
@@ -20,7 +20,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  00d2bb2c005f9e2c4e525af4350c8e8b7d6e67369da9c664c6c3d6080c33d6359b7142a311f3563479f7ac8e1bb0a2a520e8e926719dfeb8e27e49f8cd3e65ca
+  de9234549a96b2a73caa4bbbaf10500419c5f16069a430d172432c23e6d404b3ab9e595f6c0958d15f4f190fb50e1cd7dd02945b93cf428180df8feb8822ed94
   HEAD_REF
   main)
 
@@ -83,9 +83,9 @@ vcpkg_from_github(
   REPO
   NVIDIA/cuCollections
   REF
-  d3701ae8e7f2a08f25f9713e182692b4ca544112
+  f517bbb1277753b1852dfd388993383e401eaa38
   SHA512
-  2a35e079a86a62cca7dadf93b45609d86a0bdef1e987c0d5ec59600d1950e6d6a5e26e06cc3d165c389442ce5e25b461caf4cecd67c35369a72d742b1b5851cf
+  53f6185db57eba7391fd9b93b342d9da3c4cdf906dc47fad02cc1eb34867bb11ce798f0e94fee71a3cfb6423e6cad907ebe21e46997b4f4ef2b6e1e3b0a45d82
   HEAD_REF
   dev)
 
@@ -132,7 +132,7 @@ vcpkg_replace_string(
   "set_target_properties(nanoarrow_static PROPERTIES POSITION_INDEPENDENT_CODE ON)"
   "# set_target_properties disabled for vcpkg ALIAS target")
 
-# Use -I for vcpkg include dir to ensure vcpkg CCCL 3.2.0 headers beat pixi's
+# Use -I for vcpkg include dir to ensure vcpkg CCCL 3.3.0 headers beat pixi's
 # older CCCL. GTest is excluded from vcpkg deps (see vcpkg.json) to avoid header
 # conflicts with the CPM-provided GTest source that cudf needs for test
 # utilities.

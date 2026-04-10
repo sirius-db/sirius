@@ -27,7 +27,6 @@ mold = "*"
 [feature.dev-libs.dependencies]
 librmm = "*"
 libcurand-dev = "*"
-libconfig = "*"
 yaml-cpp = "*"
 libabseil = ">=20260107.0"
 duckdb = "=1.4.4"

@@ -63,16 +63,6 @@ find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
-# libconfig++: vcpkg provides it as libconfig::config++ via CMake config;
-# conda-forge provides it only via pkg-config.
-find_package(libconfig CONFIG QUIET)
-if(NOT TARGET libconfig::config++)
-  if(VCPKG_BUILD)
-    message(FATAL_ERROR "VCPKG_BUILD set but libconfig::config++ not found")
-  endif()
-  pkg_check_modules(LIBCONFIGPP REQUIRED IMPORTED_TARGET libconfig++)
-endif()
-find_package(absl REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
@@ -325,13 +315,8 @@ if(VCPKG_BUILD)
 endif()
 
 # Additional libraries only needed by the static extension
-if(TARGET libconfig::config++)
-  set(_LIBCONFIG_TARGET libconfig::config++)
-else()
-  set(_LIBCONFIG_TARGET PkgConfig::LIBCONFIGPP)
-endif()
 target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
-                      ${_LIBCONFIG_TARGET} absl::any_invocable)
+                      absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
