@@ -32,7 +32,7 @@ namespace op {
 static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
 {
-  duckdb::set<duckdb::idx_t> group_indices;
+  duckdb::set<std::size_t> group_indices;
 
   if (groups.empty()) { return {}; }
 
@@ -41,7 +41,7 @@ static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
     auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
     group_indices.insert(bound_ref.index);
   }
-  duckdb::idx_t highest_index = *group_indices.rbegin();
+  std::size_t highest_index = *group_indices.rbegin();
   duckdb::vector<duckdb::LogicalType> types(highest_index + 1, duckdb::LogicalType::SQLNULL);
   for (auto& group : groups) {
     auto& bound_ref        = group->Cast<duckdb::BoundReferenceExpression>();
@@ -63,13 +63,13 @@ static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
 }
 
 // Helper to convert vector<vector<idx_t>> to vector<unsafe_vector<idx_t>>
-static duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> convert_grouping_functions(
-  const duckdb::vector<duckdb::vector<duckdb::idx_t>>& src)
+static duckdb::vector<duckdb::unsafe_vector<std::size_t>> convert_grouping_functions(
+  const duckdb::vector<duckdb::vector<std::size_t>>& src)
 {
-  duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> result;
+  duckdb::vector<duckdb::unsafe_vector<std::size_t>> result;
   result.reserve(src.size());
   for (const auto& inner : src) {
-    duckdb::unsafe_vector<duckdb::idx_t> converted;
+    duckdb::unsafe_vector<std::size_t> converted;
     for (auto val : inner) {
       converted.push_back(val);
     }
@@ -102,7 +102,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   std::vector<AggregateSlot> aggregate_slots,
   bool has_avg,
   bool has_count_distinct,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     group_idx(std::move(group_idx)),
@@ -120,7 +120,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_grouped_aggregate_merge(context,
                                             std::move(types),
                                             std::move(expressions),
@@ -146,8 +146,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
-  duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> grouping_functions_p,
-  duckdb::idx_t estimated_cardinality,
+  duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType group_validity,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_partition_consumer_operator(
@@ -184,7 +184,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    return std::make_unique<operator_data>(input_batch);
+    return std::make_unique<pipelineable_operator_data>(input_batch);
   } else {
     return nullptr;
   }
@@ -194,7 +194,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
@@ -202,7 +203,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<operator_data>(input_data);
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one
@@ -219,7 +220,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // If no post-processing needed, return merged result directly
   if (!has_avg && !has_count_distinct) {
-    return std::make_unique<operator_data>(
+    return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
 
@@ -287,7 +288,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
   auto result       = sirius::make_data_batch(std::move(output_table), *space);
-  return std::make_unique<operator_data>(
+  return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }
 }  // namespace op

@@ -33,7 +33,7 @@ namespace op {
 
 namespace {
 
-std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& expr)
+std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& expr)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
     return expr.Cast<duckdb::BoundReferenceExpression>().index;
@@ -50,7 +50,7 @@ std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& e
 }  // namespace
 
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
-                                                     duckdb::idx_t estimated_cardinality,
+                                                     std::size_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build,
                                                      uint64_t hash_partition_bytes)
@@ -76,15 +76,15 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _hash_join_op      = op;  // set the hash join operator pointer for later use
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
-    for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
+    for (std::size_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
       auto& condition = hash_join_op.conditions[cond_idx];
       if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
           condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
         continue;
       }
-      std::optional<duckdb::idx_t> left_index =
+      std::optional<std::size_t> left_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
-      std::optional<duckdb::idx_t> right_index =
+      std::optional<std::size_t> right_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
       if (left_index.has_value() && right_index.has_value()) {
         // Determine if a type cast is needed for hash alignment.
@@ -116,7 +116,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _partition_keys            = grouped_aggregate_op.get_output_grouping_indices();
 
     // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate
-    // operator which may be what we want to use when we care about grouping sets for (duckdb::idx_t
+    // operator which may be what we want to use when we care about grouping sets for (std::size_t
     // i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
     //   auto& grouping = grouped_aggregate_op.groupings[i];
     //   for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {
@@ -153,7 +153,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator " +
                              std::to_string(this->get_operator_id()));
@@ -163,7 +164,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                              std::to_string(this->get_operator_id()));
   }
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
-    return std::make_unique<operator_data>(input_data);
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   auto input_batch = input_batches[0];
@@ -190,13 +191,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
-  return std::make_unique<operator_data>(partitioned_results);
+  return std::make_unique<pipelineable_operator_data>(partitioned_results);
 }
 
 void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::sink"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = pipelineable_input.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;
   for (auto& batch : input_batches) {

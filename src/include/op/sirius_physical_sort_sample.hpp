@@ -30,7 +30,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::SORT_SAMPLE;
 
-  static constexpr duckdb::idx_t DEFAULT_NUM_SAMPLE_BATCHES = 5;
+  static constexpr std::size_t DEFAULT_NUM_SAMPLE_BATCHES = 5;
 
   //! Maximum fraction of available GPU memory per partition (33%)
   static constexpr double MAX_PARTITION_MEMORY_FRACTION = 0.33;
@@ -39,14 +39,14 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   sirius_physical_sort_sample(duckdb::vector<duckdb::LogicalType> types,
                               duckdb::vector<duckdb::BoundOrderByNode> orders,
-                              duckdb::idx_t estimated_cardinality,
-                              duckdb::idx_t num_sample_batches = DEFAULT_NUM_SAMPLE_BATCHES);
+                              std::size_t estimated_cardinality,
+                              std::size_t num_sample_batches = DEFAULT_NUM_SAMPLE_BATCHES);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
 
   //! Number of batches to sample before computing partition boundaries
-  duckdb::idx_t num_sample_batches;
+  std::size_t num_sample_batches;
 
  public:
   bool is_source() const override { return true; }

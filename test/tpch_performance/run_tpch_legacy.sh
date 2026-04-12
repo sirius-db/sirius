@@ -99,8 +99,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Legacy Sirius uses gpu_buffer_init + gpu_processing; config file interferes
-unset SIRIUS_CONFIG_FILE
+# Legacy Sirius uses gpu_buffer_init + gpu_processing; disable Sirius auto-init
+export SIRIUS_DISABLE=1
 
 # Default CPU processing size to GPU processing size
 if [ -z "$CPU_PROCESSING_SIZE" ]; then

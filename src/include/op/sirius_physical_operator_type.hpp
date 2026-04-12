@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "duckdb/common/constants.hpp"
+#include <cstdint>
+#include <string>
 
 namespace sirius::op {
 
@@ -146,7 +147,9 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   SORT_SAMPLE,
   DUCKDB_SCAN,
   PARQUET_SCAN,
-  ICEBERG_SCAN
+  ICEBERG_SCAN,
+  PARQUET_METADATA_SCAN,
+  GPU_PARQUET_SCAN
 };
 
 std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type);
