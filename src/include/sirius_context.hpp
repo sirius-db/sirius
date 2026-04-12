@@ -18,7 +18,6 @@
 
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
-#include "extension_lock.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -204,7 +203,6 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
  private:
   void read_config_file_if_exists();
 
-  std::unique_ptr<sirius::extension_lock> extension_lock_;
   sirius::sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };

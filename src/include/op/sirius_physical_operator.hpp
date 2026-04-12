@@ -38,6 +38,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace sirius {
 
@@ -62,23 +63,40 @@ struct task_creation_hint {
 };
 
 /**
- * @brief Container for operator data batches.
+ * @brief Generic base class for operator input/output data.
  *
- * Wraps a collection of data batches that can be passed between operators.
+ * This is an intentionally minimal base class with no opinion on what the
+ * data should be. Derived classes define the concrete data representation.
  */
 class operator_data {
  public:
-  operator_data() = default;
-  explicit operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+  operator_data()          = default;
+  virtual ~operator_data() = default;
+
+  operator_data(const operator_data&)            = default;
+  operator_data& operator=(const operator_data&) = default;
+  operator_data(operator_data&&)                 = default;
+  operator_data& operator=(operator_data&&)      = default;
+};
+
+/**
+ * @brief Operator data carrying a collection of data batches for pipeline execution.
+ *
+ * This is the standard data container used by pipeline operators. It wraps a
+ * vector of data batches that flow between operators in a pipeline.
+ */
+class pipelineable_operator_data : public operator_data {
+ public:
+  pipelineable_operator_data() = default;
+  explicit pipelineable_operator_data(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))
   {
   }
 
-  virtual ~operator_data() = default;
-
   /**
-   * @brief Get mutable data batches.
-   * @return Mutable reference to vector of data batch pointers
+   * @brief Get the data batches.
+   * @return Const reference to vector of data batch pointers
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const
@@ -86,21 +104,50 @@ class operator_data {
     return _data_batches;
   }
 
+  /**
+   * @brief Move the data batches out of this container, leaving it empty.
+   * @return Vector of data batch pointers (moved out).
+   */
+  std::vector<std::shared_ptr<::cucascade::data_batch>> release_data_batches()
+  {
+    return std::move(_data_batches);
+  }
+
+  /**
+   * @brief Lock all data batches for processing in the requested memory space.
+   *
+   * Iterates over all batches and locks (or converts then locks) each one into the
+   * requested memory space. Returns the processing handles that keep the batches locked
+   * until they go out of scope.
+   *
+   * Returns std::nullopt if any batch fails to lock (triggers a retry/reschedule).
+   * Propagates rmm::out_of_memory so the caller can record metrics and reschedule.
+   *
+   * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
+   *                                current space.
+   * @param stream                  CUDA stream used for any data-movement kernels.
+   * @return Processing handles for all batches, or std::nullopt on lock failure.
+   */
+  virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                         rmm::cuda_stream_view stream);
+
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
 };
 
 /**
- * @brief Container for partitioned operator data.
+ * @brief Operator data with partition index for partitioned pipeline execution.
  *
- * Extends operator_data to include partition index information.
+ * Extends pipelineable_operator_data to include partition index information,
+ * used by partition-aware operators (partition, concat, etc.).
  */
-class partitioned_operator_data : public operator_data {
+class partitioned_operator_data : public pipelineable_operator_data {
  public:
   partitioned_operator_data() = default;
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx)
-    : operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
   }
 
@@ -125,7 +172,7 @@ class sirius_physical_operator {
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
                            duckdb::vector<duckdb::LogicalType> types,
-                           duckdb::idx_t estimated_cardinality)
+                           std::size_t estimated_cardinality)
     : type(type),
       types(std::move(types)),
       estimated_cardinality(estimated_cardinality),
@@ -142,7 +189,7 @@ class sirius_physical_operator {
   //! The types returned by this physical operator
   duckdb::vector<duckdb::LogicalType> types;
   //! The estimated cardinality of this physical operator
-  duckdb::idx_t estimated_cardinality;
+  std::size_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
   size_t operator_id;
 
@@ -320,7 +367,7 @@ class sirius_physical_operator {
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
-  bool all_ports_empty();
+  [[nodiscard]] virtual bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
 

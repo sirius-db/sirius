@@ -40,7 +40,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalExpressionGet& op)
 
   duckdb::ColumnDataAppendState append_state;
   collection->InitializeAppend(append_state);
-  for (duckdb::idx_t expression_idx = 0; expression_idx < op.expressions.size(); expression_idx++) {
+  for (std::size_t expression_idx = 0; expression_idx < op.expressions.size(); expression_idx++) {
     duckdb::ExpressionExecutor executor(context, op.expressions[expression_idx]);
     chunk.Reset();
     executor.Execute(chunk);

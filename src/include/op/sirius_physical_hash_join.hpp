@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cudf/cudf_utils.hpp"
+#include "cudf/join/distinct_hash_join.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
@@ -64,10 +65,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::unique_ptr<sirius_physical_operator> right,
     duckdb::vector<duckdb::JoinCondition> cond,
     duckdb::JoinType join_type,
-    const duckdb::vector<duckdb::idx_t>& left_projection_map,
-    const duckdb::vector<duckdb::idx_t>& right_projection_map,
+    const duckdb::vector<std::size_t>& left_projection_map,
+    const duckdb::vector<std::size_t>& right_projection_map,
     duckdb::vector<duckdb::LogicalType> delim_types,
-    duckdb::idx_t estimated_cardinality,
+    std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
   sirius_physical_hash_join(
@@ -76,7 +77,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::unique_ptr<sirius_physical_operator> right,
     duckdb::vector<duckdb::JoinCondition> cond,
     duckdb::JoinType join_type,
-    duckdb::idx_t estimated_cardinality,
+    std::size_t estimated_cardinality,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
@@ -165,6 +166,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
   uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
+  std::unique_ptr<cudf::distinct_hash_join>
+    _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
   std::shared_ptr<::cucascade::data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>
