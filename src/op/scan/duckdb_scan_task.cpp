@@ -109,16 +109,12 @@ size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
       auto max_len      = duckdb::StringStats::MaxStringLength(*stats);
       auto distinct_est = stats->GetDistinctCount();
 
-      // Use max_string_length as the base estimate. For high-cardinality columns
-      // (distinct > 10% of rows), the max is likely much larger than avg, so reduce.
-      // GetStatistics and GetDistinctCount are cheap (in-memory), no segment walk needed.
+      // Use max_string_length as the allocation bound. This is a hard upper bound
+      // on any individual string value, so the buffer is guaranteed to fit all data.
+      // Do NOT reduce below max_len — the 3/4 heuristic underestimates for fixed-format
+      // strings (e.g. phone numbers where nearly all values equal max_len), causing
+      // buffer overflows that corrupt adjacent columns' offset arrays.
       size_t estimated_avg = max_len;
-      if (distinct_est > 0 && total_rows > 0) {
-        double distinct_ratio = static_cast<double>(distinct_est) / total_rows;
-        if (distinct_ratio > 0.1) {
-          estimated_avg = std::max<size_t>(max_len * 3 / 4, 1);
-        }
-      }
 
       SIRIUS_LOG_INFO(
         "[duckdb_scan] metadata col {} (storage {}): max_string_length={}, distinct_est={}, "

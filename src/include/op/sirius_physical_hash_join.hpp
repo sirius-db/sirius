@@ -138,6 +138,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
+  std::size_t get_extra_memory_estimate() const override;
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 

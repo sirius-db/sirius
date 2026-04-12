@@ -545,11 +545,39 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 
   auto bytes_to_materialize_input =
     _local_state->cast<gpu_pipeline_task_local_state>()._bytes_to_materialize_input;
+
+  // Ask operators in this pipeline for extra memory they hold (e.g. hash join
+  // build tables that live on GPU for the operator's lifetime).
+  std::size_t extra_operator_memory = 0;
+  auto pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  if (pipeline) {
+    for (auto& op_ref : pipeline->get_operators()) {
+      extra_operator_memory += op_ref.get().get_extra_memory_estimate();
+    }
+  }
+
   auto& global  = _global_state->cast<gpu_pipeline_task_global_state>();
   auto estimate = global.get_memory_history().estimate_peak_memory(input_size);
-  if (estimate) { return *estimate + bytes_to_materialize_input; }
-  // Fallback: no history yet (first batch in pipeline)
-  return input_size * 2 + bytes_to_materialize_input;
+  if (estimate) { return *estimate + bytes_to_materialize_input + extra_operator_memory; }
+
+  // Fallback: no history yet (first batch in pipeline).
+  // Pipelines containing joins need more headroom because the join output can
+  // be wider than the probe input (gathering columns from both sides).  Detect
+  // this by checking whether any operator in the pipeline reports extra memory
+  // or is a join type.
+  bool has_join = false;
+  if (pipeline) {
+    for (auto& op_ref : pipeline->get_operators()) {
+      auto t = op_ref.get().type;
+      if (t == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+          t == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+        has_join = true;
+        break;
+      }
+    }
+  }
+  std::size_t multiplier = has_join ? 3 : 2;
+  return input_size * multiplier + bytes_to_materialize_input + extra_operator_memory;
 }
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()

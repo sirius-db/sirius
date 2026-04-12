@@ -185,6 +185,11 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  rmm::cuda_stream_view stream);
 
+  //! Extra GPU memory this operator needs beyond what the input batches require.
+  //! Used by the reservation system to avoid under-reserving for operators that
+  //! hold persistent state (e.g. hash join build tables).
+  virtual std::size_t get_extra_memory_estimate() const { return 0; }
+
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
   {

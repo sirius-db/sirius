@@ -667,9 +667,38 @@ static std::unique_ptr<operator_data> gather_join_output(
     left_oob = cudf::out_of_bounds_policy::NULLIFY;
   }
 
+  // Validate string column offsets before gather — corrupt offsets cause cudf
+  // to compute negative buffer sizes that wrap to huge allocations.
+  auto validate_string_cols = [&stream](cudf::table_view const& tv, char const* label) {
+    stream.synchronize();
+    for (cudf::size_type c = 0; c < tv.num_columns(); c++) {
+      auto col = tv.column(c);
+      if (col.type().id() != cudf::type_id::STRING || col.size() == 0) continue;
+      auto offsets_col = col.child(0);
+      // Copy first and last offset to host to validate
+      std::vector<int32_t> host_offsets(offsets_col.size());
+      cudaMemcpy(host_offsets.data(), offsets_col.head<int32_t>(),
+                 offsets_col.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+      auto first = host_offsets.front();
+      auto last  = host_offsets.back();
+      auto total_chars = last - first;
+      bool monotonic = true;
+      for (size_t i = 1; i < host_offsets.size(); i++) {
+        if (host_offsets[i] < host_offsets[i-1]) { monotonic = false; break; }
+      }
+      SIRIUS_LOG_INFO("[gather_validate] {} col[{}] STRING: rows={} offsets=[{}..{}] "
+                      "total_chars={} monotonic={}",
+                      label, c, col.size(), first, last, total_chars, monotonic);
+      if (!monotonic || first < 0 || total_chars < 0) {
+        SIRIUS_LOG_ERROR("[gather_validate] CORRUPT offsets in {} col[{}]!", label, c);
+      }
+    }
+  };
+
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   if (collect_left) {
     cudf::table_view left_cols_to_gather = left_full.select(lhs_col_idxs);
+    validate_string_cols(left_cols_to_gather, "left");
     cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
                                     left_indices->size(),
                                     left_indices->data(),
@@ -682,6 +711,7 @@ static std::unique_ptr<operator_data> gather_join_output(
   }
   if (collect_right) {
     cudf::table_view right_cols_to_gather = right_full.select(rhs_col_idxs);
+    validate_string_cols(right_cols_to_gather, "right");
     cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
                                      right_indices->size(),
                                      right_indices->data(),
@@ -761,6 +791,17 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
     make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
 }
 
+std::size_t sirius_physical_hash_join::get_extra_memory_estimate() const
+{
+  // In BUILD_PROBE mode, the build table lives on GPU for the lifetime of the
+  // operator. Probe-only tasks need enough reservation to cover the build
+  // table plus the join output, not just the probe input.
+  if (_build_table && _build_table->get_data()) {
+    return _build_table->get_data()->get_size_in_bytes();
+  }
+  return 0;
+}
+
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
@@ -815,6 +856,35 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
+      // Debug: dump table dimensions before join
+      {
+        auto build_view = _build_table->get_data()
+                            ->cast<cucascade::gpu_table_representation>()
+                            .get_table()
+                            .view();
+        SIRIUS_LOG_INFO("[hash_join_debug] id={} build: {}rows x {}cols, probe_keys: {}rows x {}cols, "
+                        "probe_batch: {}rows",
+                        this->get_operator_id(),
+                        build_view.num_rows(), build_view.num_columns(),
+                        probe_keys.num_rows(), probe_keys.num_columns(),
+                        get_cudf_table_view(*input_batches[0]).num_rows());
+        for (cudf::size_type c = 0; c < build_view.num_columns(); c++) {
+          auto col = build_view.column(c);
+          SIRIUS_LOG_INFO("[hash_join_debug]   build col[{}]: type={} rows={} null_count={} "
+                          "data={} offset={}",
+                          c, static_cast<int>(col.type().id()), col.size(),
+                          col.null_count(), col.head() != nullptr, col.offset());
+        }
+      }
+
+      // Pre-compute join size to check for overflow before allocation
+      auto join_size = _hash_table->inner_join_size(probe_keys, stream);
+      SIRIUS_LOG_INFO("[hash_join_debug] id={} calling {} join, probe_keys={}rows, "
+                      "pre-computed join_size={}",
+                      this->get_operator_id(),
+                      duckdb::JoinTypeToString(join_type),
+                      probe_keys.num_rows(),
+                      join_size);
       if (join_type == duckdb::JoinType::INNER) {
         auto result   = _hash_table->inner_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
@@ -831,6 +901,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         throw std::runtime_error("Unsupported join type in BUILD_PROBE mode: " +
                                  duckdb::JoinTypeToString(join_type));
       }
+      SIRIUS_LOG_INFO("[hash_join_debug] id={} join done, left_indices={} right_indices={}",
+                      this->get_operator_id(),
+                      left_indices ? left_indices->size() : 0,
+                      right_indices ? right_indices->size() : 0);
       left_full = get_cudf_table_view(*input_batches[0]);
       right_full =
         _build_table->get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
