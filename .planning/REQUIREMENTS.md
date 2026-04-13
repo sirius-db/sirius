@@ -53,8 +53,8 @@ Deferred to future release. Tracked but not in current roadmap.
 
 ### Extended Operations
 
-- **EXT-01**: `visit_if(predicate, callback)` — callback-under-lock pattern as safer alternative to get_if for MPMC use
-- **EXT-02**: `size_approx()` — explicitly-named approximate size for non-locking contexts
+- **EXT-01**: `visit_if(predicate, callback)` -- callback-under-lock pattern as safer alternative to get_if for MPMC use
+- **EXT-02**: `size_approx()` -- explicitly-named approximate size for non-locking contexts
 - **EXT-03**: `pop_if` with `max_scan_depth` parameter to bound worst-case lock hold time
 
 ## Out of Scope
@@ -78,34 +78,34 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CORE-01 | - | Pending |
-| CORE-02 | - | Pending |
-| CORE-03 | - | Pending |
-| CORE-04 | - | Pending |
-| CORE-05 | - | Pending |
-| LIFE-01 | - | Pending |
-| LIFE-02 | - | Pending |
-| LIFE-03 | - | Pending |
-| STAT-01 | - | Pending |
-| STAT-02 | - | Pending |
-| STAT-03 | - | Pending |
-| INSP-01 | - | Pending |
-| INSP-02 | - | Pending |
-| INSP-03 | - | Pending |
-| INSP-04 | - | Pending |
-| INSP-05 | - | Pending |
-| SAFE-01 | - | Pending |
-| SAFE-02 | - | Pending |
-| SAFE-03 | - | Pending |
-| STRC-01 | - | Pending |
-| STRC-02 | - | Pending |
-| STRC-03 | - | Pending |
+| CORE-01 | Phase 1 | Pending |
+| CORE-02 | Phase 1 | Pending |
+| CORE-03 | Phase 1 | Pending |
+| CORE-04 | Phase 1 | Pending |
+| CORE-05 | Phase 1 | Pending |
+| LIFE-01 | Phase 1 | Pending |
+| LIFE-02 | Phase 1 | Pending |
+| LIFE-03 | Phase 1 | Pending |
+| STAT-01 | Phase 1 | Pending |
+| STAT-02 | Phase 1 | Pending |
+| STAT-03 | Phase 1 | Pending |
+| INSP-01 | Phase 2 | Pending |
+| INSP-02 | Phase 2 | Pending |
+| INSP-03 | Phase 2 | Pending |
+| INSP-04 | Phase 2 | Pending |
+| INSP-05 | Phase 2 | Pending |
+| SAFE-01 | Phase 1 | Pending |
+| SAFE-02 | Phase 1 | Pending |
+| SAFE-03 | Phase 1 | Pending |
+| STRC-01 | Phase 1 | Pending |
+| STRC-02 | Phase 1 | Pending |
+| STRC-03 | Phase 1 | Pending |
 
 **Coverage:**
 - v1 requirements: 22 total
-- Mapped to phases: 0
-- Unmapped: 22
+- Mapped to phases: 22
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-13*
-*Last updated: 2026-04-13 after initial definition*
+*Last updated: 2026-04-13 after roadmap creation*
