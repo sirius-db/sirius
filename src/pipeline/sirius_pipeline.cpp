@@ -152,15 +152,15 @@ void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeli
 //   return result;
 // }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline::get_operators()
+std::vector<std::reference_wrapper<op::sirius_physical_operator>> sirius_pipeline::get_operators()
 {
   return operators;
 }
 
-duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>>
+std::vector<std::reference_wrapper<const op::sirius_physical_operator>>
 sirius_pipeline::get_operators() const
 {
-  duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
+  std::vector<std::reference_wrapper<const op::sirius_physical_operator>> result;
   result.reserve(operators.size());
   for (const auto& ref : operators) {
     result.push_back(ref.get());
@@ -221,7 +221,7 @@ void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline,
 
 void sirius_pipeline_build_state::set_pipeline_sink(
   sirius_pipeline& pipeline,
-  duckdb::optional_ptr<op::sirius_physical_operator> op,
+  sirius::optional_ptr<op::sirius_physical_operator> op,
   std::size_t sink_pipeline_count)
 {
   pipeline.sink = op;
@@ -240,13 +240,13 @@ void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipelin
   pipeline.operators.push_back(op);
 }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(
+sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(
   sirius_pipeline& pipeline)
 {
   return pipeline.source;
 }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(
+sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(
   sirius_pipeline& pipeline)
 {
   return pipeline.sink;
@@ -254,7 +254,7 @@ duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::
 
 void sirius_pipeline_build_state::set_pipeline_operators(
   sirius_pipeline& pipeline,
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators)
+  std::vector<std::reference_wrapper<op::sirius_physical_operator>> operators)
 {
   pipeline.operators = std::move(operators);
 }
@@ -265,7 +265,7 @@ duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pi
   return engine.create_child_pipeline(pipeline, op);
 }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
+std::vector<std::reference_wrapper<op::sirius_physical_operator>>
 sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
 {
   return pipeline.operators;
