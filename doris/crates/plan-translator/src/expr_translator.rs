@@ -62,9 +62,6 @@ pub fn translate_agg_expr(
         .context("aggregate expression missing fn_ data")?;
     let raw_name = fn_.name.function_name.clone();
 
-    // Get output type.
-    let output_type = type_mapper::map_type_desc(&root.type_)?;
-
     // Translate child arguments (skip root node).
     let num_children = root.num_children as usize;
     let mut idx = 1;
@@ -81,6 +78,15 @@ pub fn translate_agg_expr(
         (base.to_string(), true)
     } else {
         (raw_name, false)
+    };
+
+    // Doris can surface the wrong result type on some MIN/MAX finalize expressions
+    // over exchange data (e.g. Q15's max(total_revenue) arrives as BIGINT while the
+    // child expression is DOUBLE). MIN/MAX should preserve the child value type.
+    let output_type = if matches!(func_name.as_str(), "min" | "max") && expr.nodes.len() > 1 {
+        type_mapper::map_type_desc(&expr.nodes[1].type_)?
+    } else {
+        type_mapper::map_type_desc(&root.type_)?
     };
 
     Ok((func_name, args, output_type, is_distinct))
@@ -159,18 +165,47 @@ fn translate_slot_ref(
         .as_ref()
         .context("SLOT_REF node missing slot_ref data")?;
 
+    let should_expand_slot_expression = row_tuples
+        .map(|tuples| !tuples.contains(&slot_ref.tuple_id))
+        .unwrap_or(true);
+
     // Check for projection expansion first — handles computed expression slots
     // from scan node intermediate/final projections (e.g., `l_extendedprice * (1 - l_discount)`).
     // These slots can't be resolved by column position since they don't exist in the base table.
     // Use None for row_tuples: scan projections resolve against their own table, not
     // the JOIN context. The expanded expression's SLOT_REFs use slot_table_index.
-    if let Some(expr) = desc.get_slot_expression(slot_ref.slot_id) {
-        let expr = expr.clone();
-        let mut idx = 0;
-        match translate_expr_node(&expr.nodes, &mut idx, desc, registry, None) {
-            Ok(result) => return Ok(result),
-            Err(_) => {} // expansion failed; fall through to field ref
+    if should_expand_slot_expression {
+        if let Some(expr_info) = desc.get_slot_expression(slot_ref.slot_id) {
+            let expr = expr_info.expr.clone();
+            let saved_child_rel_names = (!expr_info.use_child_rel_names)
+                .then(|| desc.child_rel_column_names_snapshot())
+                .flatten();
+            if !expr_info.use_child_rel_names {
+                desc.clear_child_rel_column_names();
+            }
+            let mut idx = 0;
+            let translated = translate_expr_node(&expr.nodes, &mut idx, desc, registry, None);
+            if let Some(names) = saved_child_rel_names {
+                desc.set_child_rel_column_names(names);
+            }
+            match translated {
+                Ok(result) => return Ok(result),
+                Err(_) => {} // expansion failed; fall through to field ref
+            }
         }
+    }
+
+    if let Err(err) = desc.get_slot(slot_ref.slot_id) {
+        tracing::warn!(
+            slot_id = slot_ref.slot_id,
+            tuple_id = slot_ref.tuple_id,
+            row_tuples = ?row_tuples,
+            child_rel_column_names = ?desc.child_rel_column_names_snapshot(),
+            tuple_from_tuple_id = ?desc.tuple_slot_debug_info(slot_ref.tuple_id).ok(),
+            tuple_from_slot_id = ?desc.tuple_slot_debug_info(slot_ref.slot_id).ok(),
+            error = %err,
+            "translate_slot_ref: descriptor lookup failed before field resolution"
+        );
     }
 
     let col_idx = if let Some(tuples) = row_tuples {
@@ -320,6 +355,122 @@ pub(crate) fn make_scalar_fn(
     }
 }
 
+fn make_cast_expr(input: Expression, target_type: Type) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            input: Some(Box::new(input)),
+            r#type: Some(target_type),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
+    }
+}
+
+fn make_typed_null_expr(target_type: Type) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Literal(expression::Literal {
+            literal_type: Some(expression::literal::LiteralType::Null(target_type)),
+            ..Default::default()
+        })),
+    }
+}
+
+fn decimal_type_from_node(node: &TExprNode) -> Result<(i32, i32)> {
+    let substrait_type = type_mapper::map_type_desc(&node.type_)?;
+    match substrait_type.kind {
+        Some(r#type::Kind::Decimal(d)) => Ok((d.precision, d.scale)),
+        other => bail!(
+            "DECIMAL_LITERAL expected decimal type, got {:?} for literal {}",
+            other,
+            node.decimal_literal
+                .as_ref()
+                .map(|lit| lit.value.as_str())
+                .unwrap_or("<missing>")
+        ),
+    }
+}
+
+fn encode_decimal_value(value: &str, scale: i32) -> Result<[u8; 16]> {
+    if scale < 0 {
+        bail!("decimal scale must be non-negative, got {}", scale);
+    }
+
+    let raw = value.trim();
+    if raw.is_empty() {
+        bail!("empty decimal literal");
+    }
+
+    let (negative, magnitude) = if let Some(rest) = raw.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = raw.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, raw)
+    };
+
+    let mut parts = magnitude.split('.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        bail!("invalid decimal literal with multiple decimal points: {}", value);
+    }
+
+    if !int_part.chars().all(|c| c.is_ascii_digit()) {
+        bail!("invalid decimal literal integer part: {}", value);
+    }
+    if !frac_part.chars().all(|c| c.is_ascii_digit()) {
+        bail!("invalid decimal literal fractional part: {}", value);
+    }
+
+    let scale = scale as usize;
+    if frac_part.len() > scale {
+        bail!(
+            "decimal literal {} has {} fractional digits but scale is {}",
+            value,
+            frac_part.len(),
+            scale
+        );
+    }
+
+    let int_digits = if int_part.is_empty() { "0" } else { int_part };
+    let mut digits = String::with_capacity(int_digits.len() + scale.max(frac_part.len()));
+    digits.push_str(int_digits);
+    digits.push_str(frac_part);
+    for _ in frac_part.len()..scale {
+        digits.push('0');
+    }
+
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+
+    let mut unscaled = digits
+        .parse::<i128>()
+        .with_context(|| format!("decimal literal {} overflows i128", value))?;
+    if negative {
+        unscaled = -unscaled;
+    }
+    Ok(unscaled.to_le_bytes())
+}
+
+pub(crate) fn decimal_literal_to_literal(node: &TExprNode) -> Result<expression::Literal> {
+    let dec_lit = node
+        .decimal_literal
+        .as_ref()
+        .context("DECIMAL_LITERAL missing decimal_literal data")?;
+    let (precision, scale) = decimal_type_from_node(node)?;
+    let value = encode_decimal_value(&dec_lit.value, scale)?;
+
+    Ok(expression::Literal {
+        literal_type: Some(expression::literal::LiteralType::Decimal(
+            expression::literal::Decimal {
+                value: value.to_vec(),
+                precision,
+                scale,
+            },
+        )),
+        ..Default::default()
+    })
+}
+
 fn translate_binary_pred(
     node: &TExprNode,
     children: Vec<Expression>,
@@ -380,6 +531,30 @@ fn translate_function_call(
 ) -> Result<Expression> {
     let fn_ = node.fn_.as_ref().context("FUNCTION_CALL missing fn_ data")?;
     let func_name = &fn_.name.function_name;
+    if func_name == "if" {
+        if children.len() != 3 {
+            bail!("FUNCTION_CALL if expected 3 children, got {}", children.len());
+        }
+        let output_type = type_mapper::map_type_desc(&node.type_)?;
+        tracing::info!(
+            num_children = children.len(),
+            output_type = ?node.type_,
+            "translating Doris FUNCTION_CALL if as Substrait IfThen"
+        );
+        let mut children = children.into_iter();
+        let condition = children.next().unwrap();
+        let then_expr = make_cast_expr(children.next().unwrap(), output_type.clone());
+        let else_expr = make_cast_expr(children.next().unwrap(), output_type.clone());
+        return Ok(Expression {
+            rex_type: Some(expression::RexType::IfThen(Box::new(expression::IfThen {
+                ifs: vec![expression::if_then::IfClause {
+                    r#if: Some(condition),
+                    then: Some(then_expr),
+                }],
+                r#else: Some(Box::new(else_expr)),
+            }))),
+        });
+    }
 
     // Pick extension URI based on function name.
     let uri = match func_name.as_str() {
@@ -438,18 +613,8 @@ fn translate_in_pred(children: Vec<Expression>) -> Result<Expression> {
 }
 
 fn translate_decimal_literal(node: &TExprNode) -> Result<Expression> {
-    let dec_lit = node
-        .decimal_literal
-        .as_ref()
-        .context("DECIMAL_LITERAL missing decimal_literal data")?;
-    // Represent decimal as string literal — DuckDB will infer the correct type.
     Ok(Expression {
-        rex_type: Some(expression::RexType::Literal(expression::Literal {
-            literal_type: Some(expression::literal::LiteralType::String(
-                dec_lit.value.clone(),
-            )),
-            ..Default::default()
-        })),
+        rex_type: Some(expression::RexType::Literal(decimal_literal_to_literal(node)?)),
     })
 }
 
@@ -502,6 +667,13 @@ fn translate_case_expr(
 
     let has_case = case_expr.has_case_expr;
     let has_else = case_expr.has_else_expr;
+    tracing::info!(
+        has_case,
+        has_else,
+        num_children = children.len(),
+        "translating Doris CASE_EXPR"
+    );
+    let output_type = type_mapper::map_type_desc(&node.type_)?;
 
     if has_case {
         // CASE value WHEN v1 THEN r1 WHEN v2 THEN r2 ... [ELSE else_val] END
@@ -518,9 +690,18 @@ fn translate_case_expr(
                 bail!("CASE_EXPR has_else but no remaining children");
             }
             let (pairs, else_part) = remaining.split_at(remaining.len() - 1);
-            (pairs.to_vec(), Some(Box::new(else_part[0].clone())))
+            (
+                pairs.to_vec(),
+                Some(Box::new(make_cast_expr(
+                    else_part[0].clone(),
+                    output_type.clone(),
+                ))),
+            )
         } else {
-            (remaining, None)
+            (
+                remaining,
+                Some(Box::new(make_typed_null_expr(output_type.clone()))),
+            )
         };
 
         if pairs_slice.len() % 2 != 0 {
@@ -534,7 +715,7 @@ fn translate_case_expr(
         let mut ifs = Vec::new();
         for chunk in pairs_slice.chunks(2) {
             let when_val = chunk[0].clone();
-            let then_val = chunk[1].clone();
+            let then_val = make_cast_expr(chunk[1].clone(), output_type.clone());
             // Generate: case_value = when_val
             let condition = make_scalar_fn(
                 eq_anchor,
@@ -561,9 +742,18 @@ fn translate_case_expr(
                 bail!("CASE_EXPR has_else but no children");
             }
             let (pairs, else_part) = children.split_at(children.len() - 1);
-            (pairs.to_vec(), Some(Box::new(else_part[0].clone())))
+            (
+                pairs.to_vec(),
+                Some(Box::new(make_cast_expr(
+                    else_part[0].clone(),
+                    output_type.clone(),
+                ))),
+            )
         } else {
-            (children, None)
+            (
+                children,
+                Some(Box::new(make_typed_null_expr(output_type.clone()))),
+            )
         };
 
         if pairs_slice.len() % 2 != 0 {
@@ -577,7 +767,7 @@ fn translate_case_expr(
         for chunk in pairs_slice.chunks(2) {
             ifs.push(expression::if_then::IfClause {
                 r#if: Some(chunk[0].clone()),
-                then: Some(chunk[1].clone()),
+                then: Some(make_cast_expr(chunk[1].clone(), output_type.clone())),
             });
         }
 
@@ -717,11 +907,12 @@ pub fn remap_field_refs(expr: &mut Expression, orig_left_count: usize, orig_righ
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor_table::DescriptorTable;
+    use crate::descriptor_table::{DescriptorTable, SlotExpressionInfo};
     use crate::test_helpers::*;
     use doris_thrift::exprs::{TCaseExpr, TDateLiteral};
     use doris_thrift::opcodes::TExprOpcode;
     use doris_thrift::types::TPrimitiveType;
+    use std::collections::HashMap;
 
     fn make_test_desc() -> DescriptorTable {
         let desc_tbl = make_desc_table(
@@ -820,8 +1011,13 @@ mod tests {
         let result = translate_expr(&expr, &desc, &mut reg).unwrap();
         match result.rex_type.unwrap() {
             expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
-                expression::literal::LiteralType::String(s) => assert_eq!(s, "99.99"),
-                other => panic!("expected String (decimal), got {:?}", other),
+                expression::literal::LiteralType::Decimal(d) => {
+                    assert_eq!(d.precision, 10);
+                    assert_eq!(d.scale, 2);
+                    let raw: [u8; 16] = d.value.try_into().expect("decimal should be 16 bytes");
+                    assert_eq!(i128::from_le_bytes(raw), 9_999);
+                }
+                other => panic!("expected Decimal, got {:?}", other),
             },
             other => panic!("expected Literal, got {:?}", other),
         }
@@ -845,6 +1041,51 @@ mod tests {
                 other => panic!("expected String (date), got {:?}", other),
             },
             other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_slot_expression_is_not_expanded_when_projected_tuple_is_available() {
+        let desc_tbl = make_desc_table(
+            vec![(0, Some(1)), (4, None)],
+            vec![
+                (4, 0, 4, "l_quantity", TPrimitiveType::DOUBLE),
+                (5, 0, 5, "l_extendedprice", TPrimitiveType::DOUBLE),
+                (6, 0, 6, "l_discount", TPrimitiveType::DOUBLE),
+                (44, 4, -1, "", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let mut desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        let mut slot_expressions = HashMap::new();
+        slot_expressions.insert(
+            44,
+            SlotExpressionInfo {
+                expr: slot_ref_expr(6, type_desc(TPrimitiveType::DOUBLE)),
+                use_child_rel_names: false,
+            },
+        );
+        desc.set_slot_expressions(slot_expressions);
+
+        let expr = slot_ref_expr_in_tuple(44, 4, type_desc(TPrimitiveType::DOUBLE));
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr_in_context(&expr, &desc, &mut reg, &[4]).unwrap();
+
+        match result.rex_type.unwrap() {
+            expression::RexType::Selection(selection) => {
+                let direct = selection.reference_type.unwrap();
+                match direct {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => {
+                                assert_eq!(sf.field, 0);
+                            }
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
         }
     }
 
@@ -1119,6 +1360,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_function_call_if_translates_to_if_then() {
+        let expr = function_call_expr(
+            "if",
+            type_desc(TPrimitiveType::VARCHAR),
+            vec![
+                type_desc(TPrimitiveType::BOOLEAN),
+                type_desc(TPrimitiveType::VARCHAR),
+                type_desc(TPrimitiveType::VARCHAR),
+            ],
+            vec![
+                binary_pred_expr(
+                    TExprOpcode::GT,
+                    slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                    int_literal_expr(5),
+                ),
+                string_literal_expr("big"),
+                string_literal_expr("small"),
+            ],
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::IfThen(if_then) => {
+                assert_eq!(if_then.ifs.len(), 1);
+                assert!(if_then.r#else.is_some());
+                match if_then.ifs[0].then.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                    expression::RexType::Cast(_) => {}
+                    other => panic!("expected casted THEN branch, got {:?}", other),
+                }
+                match if_then.r#else.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                    expression::RexType::Cast(_) => {}
+                    other => panic!("expected casted ELSE branch, got {:?}", other),
+                }
+            }
+            other => panic!("expected IfThen, got {:?}", other),
+        }
+    }
+
     // ---- LIKE_PRED tests ----
 
     #[test]
@@ -1190,6 +1471,16 @@ mod tests {
             expression::RexType::IfThen(if_then) => {
                 assert_eq!(if_then.ifs.len(), 2, "should have 2 WHEN clauses");
                 assert!(if_then.r#else.is_some(), "should have ELSE");
+                for clause in &if_then.ifs {
+                    match clause.then.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                        expression::RexType::Cast(_) => {}
+                        other => panic!("expected casted THEN branch, got {:?}", other),
+                    }
+                }
+                match if_then.r#else.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                    expression::RexType::Cast(_) => {}
+                    other => panic!("expected casted ELSE branch, got {:?}", other),
+                }
             }
             other => panic!("expected IfThen, got {:?}", other),
         }
@@ -1218,7 +1509,14 @@ mod tests {
         match result.rex_type.unwrap() {
             expression::RexType::IfThen(if_then) => {
                 assert_eq!(if_then.ifs.len(), 1);
-                assert!(if_then.r#else.is_none(), "should have no ELSE");
+                assert!(if_then.r#else.is_some(), "should synthesize typed NULL ELSE");
+                match if_then.r#else.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                    expression::RexType::Literal(lit) => match lit.literal_type.as_ref().unwrap() {
+                        expression::literal::LiteralType::Null(_) => {}
+                        other => panic!("expected typed null ELSE, got {:?}", other),
+                    },
+                    other => panic!("expected literal ELSE, got {:?}", other),
+                }
             }
             other => panic!("expected IfThen, got {:?}", other),
         }
@@ -1262,6 +1560,14 @@ mod tests {
                         }
                         other => panic!("expected ScalarFunction (equal), got {:?}", other),
                     }
+                    match clause.then.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                        expression::RexType::Cast(_) => {}
+                        other => panic!("expected casted THEN branch, got {:?}", other),
+                    }
+                }
+                match if_then.r#else.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                    expression::RexType::Cast(_) => {}
+                    other => panic!("expected casted ELSE branch, got {:?}", other),
                 }
             }
             other => panic!("expected IfThen, got {:?}", other),

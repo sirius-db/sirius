@@ -61,8 +61,7 @@ fn mixed_ipc(n: usize) -> Vec<u8> {
 fn int64_ipc(n: usize) -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
     let values: Vec<i64> = (0..n as i64).collect();
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
     make_ipc(&batch)
 }
 
@@ -128,10 +127,7 @@ fn bench_pblock_decode(c: &mut Criterion) {
     for &n in &[100, 1_000, 10_000, 100_000] {
         let ipc = mixed_ipc(n);
         let (pblock, _) = arrow_ipc_to_pblock(&ipc).unwrap();
-        let pblock_size = pblock
-            .column_values
-            .as_ref()
-            .map_or(0, |v| v.len() as u64);
+        let pblock_size = pblock.column_values.as_ref().map_or(0, |v| v.len() as u64);
 
         group.throughput(Throughput::Bytes(pblock_size));
         group.bench_with_input(BenchmarkId::new("mixed", n), &pblock, |b, pb| {
@@ -142,10 +138,7 @@ fn bench_pblock_decode(c: &mut Criterion) {
     for &n in &[1_000, 10_000, 100_000] {
         let ipc = int64_ipc(n);
         let (pblock, _) = arrow_ipc_to_pblock(&ipc).unwrap();
-        let pblock_size = pblock
-            .column_values
-            .as_ref()
-            .map_or(0, |v| v.len() as u64);
+        let pblock_size = pblock.column_values.as_ref().map_or(0, |v| v.len() as u64);
         group.throughput(Throughput::Bytes(pblock_size));
         group.bench_with_input(BenchmarkId::new("int64_only", n), &pblock, |b, pb| {
             b.iter(|| decode_pblocks(&[pb.clone()]).unwrap());
@@ -210,13 +203,9 @@ fn bench_streamvbyte(c: &mut Criterion) {
         let bytes = (n * 4) as u64;
 
         group.throughput(Throughput::Bytes(bytes));
-        group.bench_with_input(
-            BenchmarkId::new("encode", n),
-            &values,
-            |b, vals| {
-                b.iter(|| streamvbyte_encode_for_bench(vals));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("encode", n), &values, |b, vals| {
+            b.iter(|| streamvbyte_encode_for_bench(vals));
+        });
     }
 
     group.finish();
@@ -270,9 +259,7 @@ fn bench_bump_allocator(c: &mut Criterion) {
             |b, &count| {
                 b.iter(|| {
                     let alloc = Mutex::new(BumpAllocatorSim::new(512 * 1024 * 1024));
-                    let sizes: Vec<usize> = (0..count)
-                        .map(|i| 1024 * (1 + i % 16))
-                        .collect();
+                    let sizes: Vec<usize> = (0..count).map(|i| 1024 * (1 + i % 16)).collect();
                     // Allocate all
                     for &sz in &sizes {
                         alloc.lock().unwrap().alloc(sz);

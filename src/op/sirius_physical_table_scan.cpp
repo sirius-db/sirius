@@ -183,30 +183,34 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                     projection_ids.size()));
     }
 
-    auto table   = gpu_rep.release_table();
-    auto columns = table->release();
+    auto* space = output_batch->get_memory_space();
+    if (!space) {
+      throw std::runtime_error("TABLE_SCAN projection error: output batch has no memory space");
+    }
 
-    // Select output columns using the batch column map.
-    // projection_ids[0..expected_output_columns) are the output columns
-    // in the order the downstream operator expects.
-    std::vector<std::unique_ptr<cudf::column>> selected;
+    // Deep-copy the projected columns into a new table. This avoids moving
+    // ownership out of the scan-produced table, which has been unstable for
+    // some reader outputs during downstream materialization/destruction.
+    std::vector<cudf::column_view> selected;
     selected.reserve(expected_output_columns);
+    auto view = out_table.view();
     for (std::size_t i = 0; i < expected_output_columns; i++) {
       auto batch_idx = batch_column_map[projection_ids[i]];
-      if (batch_idx == static_cast<std::size_t>(-1) || batch_idx >= columns.size()) {
+      if (batch_idx == static_cast<std::size_t>(-1) ||
+          batch_idx >= static_cast<std::size_t>(view.num_columns())) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
-                      "columns.size()={}",
+                      "view.num_columns()={}",
                       i,
                       projection_ids[i],
                       batch_idx,
-                      columns.size()));
+                      view.num_columns()));
       }
-      selected.push_back(std::move(columns[batch_idx]));
+      selected.push_back(view.column(batch_idx));
     }
 
-    auto projected_table = std::make_unique<cudf::table>(std::move(selected));
-    auto* space          = output_batch->get_memory_space();
+    auto projected_table = std::make_unique<cudf::table>(
+      cudf::table_view(selected), stream, space->get_default_allocator());
     auto projected_rep =
       std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
     output_batch = std::make_shared<cucascade::data_batch>(output_batch->get_batch_id(),

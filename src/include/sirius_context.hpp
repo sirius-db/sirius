@@ -204,7 +204,7 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   void read_config_file_if_exists();
 
   sirius::sirius_config config_;
-  duckdb::shared_ptr<SiriusContext> context_;
+  duckdb::weak_ptr<SiriusContext> context_;
 };
 
 }  // namespace duckdb

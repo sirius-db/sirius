@@ -264,6 +264,10 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
     nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
     sink_operators.get()->sink(output_data, stream);
+    // The sink path can enqueue GPU work (packing, D2H conversion, staging
+    // copies) against the input batches. Ensure that work is complete before
+    // this task drops `output_data` and its GPU-backed data_batches.
+    stream.synchronize();
     auto const sink_end = std::chrono::high_resolution_clock::now();
     auto const sink_duration =
       std::chrono::duration_cast<std::chrono::microseconds>(sink_end - sink_start);

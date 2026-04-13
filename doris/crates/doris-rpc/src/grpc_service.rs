@@ -12,6 +12,9 @@ use tracing::{info, instrument, warn};
 use doris_proto::doris::p_backend_service_server::PBackendService;
 use doris_proto::doris::*;
 use doris_thrift::data_sinks::TDataSinkType;
+use doris_thrift::data_sinks::TDataStreamSink;
+use doris_thrift::descriptors::TDescriptorTable;
+use doris_thrift::exprs::{TExpr, TExprNodeType};
 use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TPipelineFragmentParamsList};
 use doris_thrift::plan_nodes::{TFileFormatType, TPlanNode, TPlanNodeType};
 
@@ -26,11 +29,18 @@ use sirius_ffi::SiriusEngine;
 /// `n_nationkey, n_name, n_nationkey, n_name`.
 fn dedup_column_names(names: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashMap::<String, usize>::new();
-    names.into_iter().map(|name| {
-        let count = seen.entry(name.clone()).or_insert(0);
-        *count += 1;
-        if *count == 1 { name } else { format!("{}_{}", name, *count - 1) }
-    }).collect()
+    names
+        .into_iter()
+        .map(|name| {
+            let count = seen.entry(name.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                name
+            } else {
+                format!("{}_{}", name, *count - 1)
+            }
+        })
+        .collect()
 }
 
 use super::exchange_buffer::{ExchangeBuffer, ExchangeKey};
@@ -62,7 +72,11 @@ fn err_status(msg: &str) -> PStatus {
 ///   1 = single TExecPlanFragmentParams (unsupported)
 ///   2 = single TPipelineFragmentParams
 ///   3 = TPipelineFragmentParamsList (shared fields at list level)
-fn deserialize_params(data: Vec<u8>, compact: bool, version: i32) -> Result<Vec<TPipelineFragmentParams>, String> {
+fn deserialize_params(
+    data: Vec<u8>,
+    compact: bool,
+    version: i32,
+) -> Result<Vec<TPipelineFragmentParams>, String> {
     use thrift::protocol::{TBinaryInputProtocol, TCompactInputProtocol, TSerializable};
     use thrift::transport::TBufferedReadTransport;
 
@@ -95,19 +109,32 @@ fn deserialize_params(data: Vec<u8>, compact: bool, version: i32) -> Result<Vec<
         let mut all_params: Vec<TPipelineFragmentParams> = params_list;
 
         // Extract shared fields: prefer list-level, fall back to first fragment.
-        let shared_desc_tbl = list.desc_tbl.clone()
+        let shared_desc_tbl = list
+            .desc_tbl
+            .clone()
             .or_else(|| all_params.first().and_then(|p| p.desc_tbl.clone()));
-        let shared_query_globals = list.query_globals.clone()
+        let shared_query_globals = list
+            .query_globals
+            .clone()
             .or_else(|| all_params.first().and_then(|p| p.query_globals.clone()));
-        let shared_query_options = list.query_options.clone()
+        let shared_query_options = list
+            .query_options
+            .clone()
             .or_else(|| all_params.first().and_then(|p| p.query_options.clone()));
-        let shared_coord = list.coord.clone()
+        let shared_coord = list
+            .coord
+            .clone()
             .or_else(|| all_params.first().and_then(|p| p.coord.clone()));
-        let shared_resource_info = list.resource_info.clone()
+        let shared_resource_info = list
+            .resource_info
+            .clone()
             .or_else(|| all_params.first().and_then(|p| p.resource_info.clone()));
-        let shared_fragment_num = list.fragment_num_on_host
+        let shared_fragment_num = list
+            .fragment_num_on_host
             .or_else(|| all_params.first().and_then(|p| p.fragment_num_on_host));
-        let shared_file_scan_params = list.file_scan_params.clone()
+        let shared_file_scan_params = list
+            .file_scan_params
+            .clone()
             .or_else(|| all_params.first().and_then(|p| p.file_scan_params.clone()));
 
         for params in &mut all_params {
@@ -174,9 +201,7 @@ fn serialize_result_batch(rows: &[Vec<u8>], packet_seq: i64) -> Result<Vec<u8>, 
         batch
             .write_to_out_protocol(&mut protocol)
             .map_err(|e| format!("thrift serialize TResultBatch: {e}"))?;
-        protocol
-            .flush()
-            .map_err(|e| format!("thrift flush: {e}"))?;
+        protocol.flush().map_err(|e| format!("thrift flush: {e}"))?;
     }
     Ok(buf)
 }
@@ -206,39 +231,154 @@ fn arrow_type_to_doris(dt: &arrow::datatypes::DataType) -> PTypeDesc {
     // DATEV2=26, DATETIMEV2=27, DECIMAL32=29, DECIMAL64=30, DECIMAL128I=31
     use arrow::datatypes::DataType;
     let scalar = match dt {
-        DataType::Boolean => PScalarType { r#type: 2, len: None, precision: None, scale: None },
-        DataType::Int8 => PScalarType { r#type: 3, len: None, precision: None, scale: None },
-        DataType::Int16 => PScalarType { r#type: 4, len: None, precision: None, scale: None },
-        DataType::Int32 => PScalarType { r#type: 5, len: None, precision: None, scale: None },
-        DataType::Int64 => PScalarType { r#type: 6, len: None, precision: None, scale: None },
-        DataType::UInt8 => PScalarType { r#type: 3, len: None, precision: None, scale: None },
-        DataType::UInt16 => PScalarType { r#type: 4, len: None, precision: None, scale: None },
-        DataType::UInt32 => PScalarType { r#type: 5, len: None, precision: None, scale: None },
-        DataType::UInt64 => PScalarType { r#type: 6, len: None, precision: None, scale: None },
-        DataType::Float16 | DataType::Float32 => PScalarType { r#type: 7, len: None, precision: None, scale: None },
-        DataType::Float64 => PScalarType { r#type: 8, len: None, precision: None, scale: None },
-        DataType::Date32 | DataType::Date64 => PScalarType { r#type: 26, len: None, precision: None, scale: None }, // DATEV2
-        DataType::Timestamp(_, _) => PScalarType { r#type: 27, len: None, precision: None, scale: None }, // DATETIMEV2
-        DataType::Utf8 | DataType::LargeUtf8 => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING
+        DataType::Boolean => PScalarType {
+            r#type: 2,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::Int8 => PScalarType {
+            r#type: 3,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::Int16 => PScalarType {
+            r#type: 4,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::Int32 => PScalarType {
+            r#type: 5,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::Int64 => PScalarType {
+            r#type: 6,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::UInt8 => PScalarType {
+            r#type: 3,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::UInt16 => PScalarType {
+            r#type: 4,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::UInt32 => PScalarType {
+            r#type: 5,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::UInt64 => PScalarType {
+            r#type: 6,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::Float16 | DataType::Float32 => PScalarType {
+            r#type: 7,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::Float64 => PScalarType {
+            r#type: 8,
+            len: None,
+            precision: None,
+            scale: None,
+        },
+        DataType::Date32 | DataType::Date64 => PScalarType {
+            r#type: 26,
+            len: None,
+            precision: None,
+            scale: None,
+        }, // DATEV2
+        DataType::Timestamp(_, _) => PScalarType {
+            r#type: 27,
+            len: None,
+            precision: None,
+            scale: None,
+        }, // DATETIMEV2
+        DataType::Utf8 | DataType::LargeUtf8 => PScalarType {
+            r#type: 23,
+            len: Some(65533),
+            precision: None,
+            scale: None,
+        }, // STRING
         DataType::Decimal128(p, s) => {
             let p = *p as i32;
             let s = *s as i32;
             if p <= 9 {
-                PScalarType { r#type: 29, len: None, precision: Some(p), scale: Some(s) } // DECIMAL32
+                PScalarType {
+                    r#type: 29,
+                    len: None,
+                    precision: Some(p),
+                    scale: Some(s),
+                } // DECIMAL32
             } else if p <= 18 {
-                PScalarType { r#type: 30, len: None, precision: Some(p), scale: Some(s) } // DECIMAL64
+                PScalarType {
+                    r#type: 30,
+                    len: None,
+                    precision: Some(p),
+                    scale: Some(s),
+                } // DECIMAL64
             } else {
-                PScalarType { r#type: 31, len: None, precision: Some(p), scale: Some(s) } // DECIMAL128I
+                PScalarType {
+                    r#type: 31,
+                    len: None,
+                    precision: Some(p),
+                    scale: Some(s),
+                } // DECIMAL128I
             }
         }
-        DataType::Binary | DataType::LargeBinary => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (binary as string)
-        DataType::Time32(_) | DataType::Time64(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (no native Doris TIME)
-        DataType::Duration(_) | DataType::Interval(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING
-        DataType::List(_) | DataType::LargeList(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (array as string)
-        DataType::Struct(_) => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING (struct as string)
+        DataType::Binary | DataType::LargeBinary => PScalarType {
+            r#type: 23,
+            len: Some(65533),
+            precision: None,
+            scale: None,
+        }, // STRING (binary as string)
+        DataType::Time32(_) | DataType::Time64(_) => PScalarType {
+            r#type: 23,
+            len: Some(65533),
+            precision: None,
+            scale: None,
+        }, // STRING (no native Doris TIME)
+        DataType::Duration(_) | DataType::Interval(_) => PScalarType {
+            r#type: 23,
+            len: Some(65533),
+            precision: None,
+            scale: None,
+        }, // STRING
+        DataType::List(_) | DataType::LargeList(_) => PScalarType {
+            r#type: 23,
+            len: Some(65533),
+            precision: None,
+            scale: None,
+        }, // STRING (array as string)
+        DataType::Struct(_) => PScalarType {
+            r#type: 23,
+            len: Some(65533),
+            precision: None,
+            scale: None,
+        }, // STRING (struct as string)
         other => {
             warn!(arrow_type = ?other, "arrow_type_to_doris: unmapped type, falling back to STRING");
-            PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }
+            PScalarType {
+                r#type: 23,
+                len: Some(65533),
+                precision: None,
+                scale: None,
+            }
         }
     };
     PTypeDesc {
@@ -393,9 +533,7 @@ fn extract_file_scan_info(params: &TPipelineFragmentParams) -> Vec<plan_translat
 ///   3. Replacing EXCHANGE_NODE(0 children) in intermediate plans with the leaf plan
 ///
 /// This produces a single merged fragment that can be translated and executed atomically.
-fn merge_fragment_plans(
-    all_params: &[TPipelineFragmentParams],
-) -> Vec<TPipelineFragmentParams> {
+fn merge_fragment_plans(all_params: &[TPipelineFragmentParams]) -> Vec<TPipelineFragmentParams> {
     // No merge: execute each fragment independently via local exchange.
     // This preserves the FE's projection chain (division, CASE expressions,
     // column ordering) which gets broken when EXCHANGE_NODEs are replaced
@@ -429,9 +567,11 @@ fn merge_fragment_plans(
         }
 
         // Check if this fragment has any EXCHANGE_NODE(0 children) as a non-root node.
-        let has_exchange_child = plan.nodes.iter().skip(1).any(|n| {
-            n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0
-        });
+        let has_exchange_child = plan
+            .nodes
+            .iter()
+            .skip(1)
+            .any(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0);
 
         if has_exchange_child {
             intermediate_fragments.push(params.clone());
@@ -444,22 +584,28 @@ fn merge_fragment_plans(
     for (i, params) in all_params.iter().enumerate() {
         let plan = params.fragment.as_ref().and_then(|f| f.plan.as_ref());
         let node_types: Vec<_> = plan
-            .map(|p| p.nodes.iter().map(|n| (n.node_id, n.node_type, n.num_children)).collect())
+            .map(|p| {
+                p.nodes
+                    .iter()
+                    .map(|n| (n.node_id, n.node_type, n.num_children))
+                    .collect()
+            })
             .unwrap_or_default();
         let dest_node_ids: Vec<i32> = {
-            let sink = params.fragment.as_ref().and_then(|f| f.output_sink.as_ref());
+            let sink = params
+                .fragment
+                .as_ref()
+                .and_then(|f| f.output_sink.as_ref());
             match sink.map(|s| s.type_) {
-                Some(TDataSinkType::DATA_STREAM_SINK) => {
-                    sink.and_then(|s| s.stream_sink.as_ref())
-                        .map(|ss| vec![ss.dest_node_id])
-                        .unwrap_or_default()
-                }
-                Some(TDataSinkType::MULTI_CAST_DATA_STREAM_SINK) => {
-                    sink.and_then(|s| s.multi_cast_stream_sink.as_ref())
-                        .and_then(|mc| mc.sinks.as_ref())
-                        .map(|sinks| sinks.iter().map(|s| s.dest_node_id).collect())
-                        .unwrap_or_default()
-                }
+                Some(TDataSinkType::DATA_STREAM_SINK) => sink
+                    .and_then(|s| s.stream_sink.as_ref())
+                    .map(|ss| vec![ss.dest_node_id])
+                    .unwrap_or_default(),
+                Some(TDataSinkType::MULTI_CAST_DATA_STREAM_SINK) => sink
+                    .and_then(|s| s.multi_cast_stream_sink.as_ref())
+                    .and_then(|mc| mc.sinks.as_ref())
+                    .map(|sinks| sinks.iter().map(|s| s.dest_node_id).collect())
+                    .unwrap_or_default(),
                 _ => vec![],
             }
         };
@@ -505,23 +651,33 @@ fn merge_fragment_plans(
             None => return vec![],
         };
         match sink.type_ {
-            TDataSinkType::DATA_STREAM_SINK => {
-                sink.stream_sink.as_ref().map(|ss| vec![ss.dest_node_id]).unwrap_or_default()
-            }
-            TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => {
-                sink.multi_cast_stream_sink.as_ref()
-                    .and_then(|mc| mc.sinks.as_ref())
-                    .map(|sinks| sinks.iter().map(|s| s.dest_node_id).collect())
-                    .unwrap_or_default()
-            }
+            TDataSinkType::DATA_STREAM_SINK => sink
+                .stream_sink
+                .as_ref()
+                .map(|ss| vec![ss.dest_node_id])
+                .unwrap_or_default(),
+            TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => sink
+                .multi_cast_stream_sink
+                .as_ref()
+                .and_then(|mc| mc.sinks.as_ref())
+                .map(|sinks| sinks.iter().map(|s| s.dest_node_id).collect())
+                .unwrap_or_default(),
             _ => vec![],
         }
     };
     let leaf_dest_ids: std::collections::HashSet<i32> = leaf_fragments
         .iter()
         .flat_map(|p| extract_dest_ids(p))
-        .chain(intermediate_fragments.iter().flat_map(|p| extract_dest_ids(p)))
-        .chain(exchange_root_fragments.iter().flat_map(|p| extract_dest_ids(p)))
+        .chain(
+            intermediate_fragments
+                .iter()
+                .flat_map(|p| extract_dest_ids(p)),
+        )
+        .chain(
+            exchange_root_fragments
+                .iter()
+                .flat_map(|p| extract_dest_ids(p)),
+        )
         .collect();
 
     // Check if any fragment has EXCHANGE nodes that can't be satisfied by local
@@ -532,9 +688,11 @@ fn merge_fragment_plans(
             Some(p) => p,
             None => return false,
         };
-        let exchange_count = plan.nodes.iter().filter(|n| {
-            n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0
-        }).count();
+        let exchange_count = plan
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0)
+            .count();
 
         // When leaves have proper dest_node_ids, check if every EXCHANGE node
         // has a matching leaf. An EXCHANGE without a matching leaf depends on
@@ -572,11 +730,17 @@ fn merge_fragment_plans(
         false
     };
 
-    let any_remote = exchange_root_fragments.iter().any(|p| has_remote_exchanges(p))
-        || intermediate_fragments.iter().any(|p| has_remote_exchanges(p));
+    let any_remote = exchange_root_fragments
+        .iter()
+        .any(|p| has_remote_exchanges(p))
+        || intermediate_fragments
+            .iter()
+            .any(|p| has_remote_exchanges(p));
 
     if any_remote {
-        info!("merge_fragment_plans: remote exchanges detected, returning all fragments separately");
+        info!(
+            "merge_fragment_plans: remote exchanges detected, returning all fragments separately"
+        );
         // Return all fragments separately:
         // - Exchange-root/intermediate: async exchange path (wait for senders)
         // - Leaf fragments: execute scan, send results via bRPC to exchange destinations
@@ -627,9 +791,7 @@ fn merge_fragment_plans(
             }
         }
     }
-    let mut merged_leaf_local_params = leaf_fragments
-        .first()
-        .and_then(|p| p.local_params.clone());
+    let mut merged_leaf_local_params = leaf_fragments.first().and_then(|p| p.local_params.clone());
     for leaf in leaf_fragments.iter().skip(1) {
         if let Some(local) = &leaf.local_params {
             let merged = merged_leaf_local_params.get_or_insert_with(Vec::new);
@@ -704,18 +866,15 @@ fn merge_fragment_plans(
             // - No exchange IDs to resolve, OR
             // - No dest_node_id mapping exists (leaf_dest_ids empty) but we have
             //   a single_leaf fallback (legacy: simple pipelines without output_sink)
-            if all_resolved || exchange_ids.is_empty()
-                || (leaf_dest_ids.is_empty() && single_leaf.is_some()) {
+            if all_resolved
+                || exchange_ids.is_empty()
+                || (leaf_dest_ids.is_empty() && single_leaf.is_some())
+            {
                 // Merge: replace EXCHANGE_NODE(0 children) with resolved source nodes.
-                if let Some(plan) = params
-                    .fragment
-                    .as_mut()
-                    .and_then(|f| f.plan.as_mut())
-                {
+                if let Some(plan) = params.fragment.as_mut().and_then(|f| f.plan.as_mut()) {
                     let mut merged_nodes = Vec::new();
                     for node in &plan.nodes {
-                        if node.node_type == TPlanNodeType::EXCHANGE_NODE
-                            && node.num_children == 0
+                        if node.node_type == TPlanNodeType::EXCHANGE_NODE && node.num_children == 0
                         {
                             if let Some(source) = resolved_sources.get(&node.node_id) {
                                 merged_nodes.extend_from_slice(source);
@@ -752,9 +911,7 @@ fn merge_fragment_plans(
 
                 // Merge scan params and local params from inner levels.
                 if let Some(inner_scan) = &current_scan_params {
-                    let merged_scan = params
-                        .file_scan_params
-                        .get_or_insert_with(Default::default);
+                    let merged_scan = params.file_scan_params.get_or_insert_with(Default::default);
                     for (k, v) in inner_scan {
                         merged_scan.entry(*k).or_insert_with(|| v.clone());
                     }
@@ -799,9 +956,13 @@ fn merge_fragment_plans(
     // clear the output_sink so the result is stored locally (not sent via exchange).
     if exchange_root_fragments.is_empty() && intermediate_fragments.len() == 1 {
         if let Some(fragment) = intermediate_fragments[0].fragment.as_mut() {
-            if fragment.output_sink.as_ref()
-                .map(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK
-                      || s.type_ == TDataSinkType::MULTI_CAST_DATA_STREAM_SINK)
+            if fragment
+                .output_sink
+                .as_ref()
+                .map(|s| {
+                    s.type_ == TDataSinkType::DATA_STREAM_SINK
+                        || s.type_ == TDataSinkType::MULTI_CAST_DATA_STREAM_SINK
+                })
                 .unwrap_or(false)
             {
                 fragment.output_sink = None;
@@ -823,11 +984,7 @@ fn merge_fragment_plans(
             .unwrap_or_default();
 
         for params in &mut exchange_root_fragments {
-            if let Some(plan) = params
-                .fragment
-                .as_mut()
-                .and_then(|f| f.plan.as_mut())
-            {
+            if let Some(plan) = params.fragment.as_mut().and_then(|f| f.plan.as_mut()) {
                 // Replace the root EXCHANGE_NODE with the merged intermediate's plan.
                 let mut merged_nodes = Vec::new();
                 for node in &plan.nodes {
@@ -842,9 +999,7 @@ fn merge_fragment_plans(
 
             // Copy file_scan_params and additional local_params from outermost intermediate.
             if let Some(inter_scan) = &outermost.file_scan_params {
-                let merged_scan = params
-                    .file_scan_params
-                    .get_or_insert_with(Default::default);
+                let merged_scan = params.file_scan_params.get_or_insert_with(Default::default);
                 for (k, v) in inter_scan {
                     merged_scan.entry(*k).or_insert_with(|| v.clone());
                 }
@@ -916,26 +1071,46 @@ enum ExecPlan {
 }
 
 /// Execute a plan via Sirius GPU, falling back to DuckDB CPU.
-fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, force_cpu: bool) -> Result<Vec<u8>, String> {
+fn execute_plan(
+    engine: &SiriusEngine,
+    plan: ExecPlan,
+    no_cpu_fallback: bool,
+    force_cpu: bool,
+) -> Result<Vec<u8>, String> {
     // When force_cpu is set, downgrade GPU plans to CPU-only equivalents.
     if force_cpu {
         let cpu_plan = match plan {
-            ExecPlan::Substrait { bytes, sort_limit_sql } =>
-                ExecPlan::SubstraitCpuOnly { bytes, sort_limit_sql },
+            ExecPlan::Substrait {
+                bytes,
+                sort_limit_sql,
+            } => ExecPlan::SubstraitCpuOnly {
+                bytes,
+                sort_limit_sql,
+            },
             ExecPlan::Sql(sql) => ExecPlan::SqlCpuOnly(sql),
             other => other, // already CPU-only
         };
         return execute_plan(engine, cpu_plan, no_cpu_fallback, false);
     }
     match plan {
-        ExecPlan::Substrait { bytes, sort_limit_sql } => {
+        ExecPlan::Substrait {
+            bytes,
+            sort_limit_sql,
+        } => {
             // Pass the full Substrait plan (including SortRel/FetchRel) to the GPU engine.
             // The Sirius GPU planner handles ORDER_BY and LIMIT operators natively.
             let t0 = std::time::Instant::now();
-            tracing::info!(substrait_bytes = bytes.len(), "gpu_execution_substrait starting");
+            tracing::info!(
+                substrait_bytes = bytes.len(),
+                "gpu_execution_substrait starting"
+            );
             match engine.execute_substrait(&bytes, None) {
                 Ok(ipc) => {
-                    tracing::info!(elapsed_ms = t0.elapsed().as_millis() as u64, ipc_len = ipc.len(), "executed via gpu_execution_substrait");
+                    tracing::info!(
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        ipc_len = ipc.len(),
+                        "executed via gpu_execution_substrait"
+                    );
                     Ok(ipc)
                 }
                 Err(e) if no_cpu_fallback => {
@@ -949,7 +1124,10 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool, fo
                 }
             }
         }
-        ExecPlan::SubstraitCpuOnly { bytes, sort_limit_sql } => {
+        ExecPlan::SubstraitCpuOnly {
+            bytes,
+            sort_limit_sql,
+        } => {
             tracing::info!("executing via CPU from_substrait (no data tables, GPU skipped)");
             from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
         }
@@ -975,10 +1153,15 @@ fn from_substrait_with_sort(
     sort_limit_sql: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     if let Some(sql) = sort_limit_sql {
-        tracing::info!(sort_limit = %sql, "applying sort/limit wrapper to from_substrait");
+        tracing::info!(sort_limit = %sql, "executing stripped Substrait plan and post-sorting materialized IPC");
         let stripped = strip_sort_limit_from_substrait(bytes);
-        let plan_bytes = stripped.as_deref().unwrap_or(bytes);
-        engine.from_substrait_sorted(plan_bytes, sql).map_err(|e| e.to_string())
+        let plan_bytes = stripped.unwrap_or_else(|| bytes.to_vec());
+        let ipc_bytes = engine
+            .from_substrait(&plan_bytes)
+            .map_err(|e| e.to_string())?;
+        engine
+            .sort_ipc_result(&ipc_bytes, sql)
+            .map_err(|e| e.to_string())
     } else {
         engine.from_substrait(bytes).map_err(|e| e.to_string())
     }
@@ -1080,9 +1263,12 @@ fn project_ipc_columns(
     let indices = if let Some(explicit) = explicit_indices {
         // Validate: check that schema names at explicit indices match output_names.
         let names_match = explicit.len() == output_names.len()
-            && explicit.iter().zip(output_names.iter()).all(|(&idx, name)| {
-                idx < schema_names.len() && (schema_names[idx] == name || name.is_empty())
-            });
+            && explicit
+                .iter()
+                .zip(output_names.iter())
+                .all(|(&idx, name)| {
+                    idx < schema_names.len() && (schema_names[idx] == name || name.is_empty())
+                });
         if names_match {
             tracing::info!(
                 indices = ?explicit,
@@ -1254,6 +1440,268 @@ fn project_ipc_columns(
     Ok(buf)
 }
 
+fn log_small_ipc_rows(stage: &str, table: &str, ipc_bytes: &[u8]) {
+    use arrow::ipc::reader::StreamReader;
+
+    let Ok(reader) = StreamReader::try_new(Cursor::new(ipc_bytes), None) else {
+        return;
+    };
+    let schema = reader.schema();
+    let num_cols = schema.fields().len();
+    if num_cols > 8 {
+        return;
+    }
+
+    let mut rows = Vec::new();
+    for batch in reader.flatten() {
+        if batch.num_columns() > 8 {
+            return;
+        }
+        if batch.num_rows() + rows.len() > 16 {
+            return;
+        }
+        for row_idx in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for col_idx in 0..batch.num_columns() {
+                let field_name = schema.field(col_idx).name();
+                let value =
+                    arrow::util::display::array_value_to_string(batch.column(col_idx), row_idx)
+                        .unwrap_or_else(|_| "?".to_string());
+                row.push(format!("{field_name}={value}"));
+            }
+            rows.push(row);
+        }
+    }
+
+    if !rows.is_empty() {
+        tracing::info!(
+            stage,
+            table,
+            rows = ?rows,
+            "small IPC rows"
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OutputLayoutEntry {
+    slot_id: Option<i32>,
+    name: String,
+}
+
+fn slot_name_from_desc(desc_tbl: Option<&TDescriptorTable>, slot_id: i32) -> String {
+    desc_tbl
+        .and_then(|dt| dt.slot_descriptors.as_ref())
+        .and_then(|slots| slots.iter().find(|s| s.id == slot_id))
+        .map(|slot| slot.col_name.clone())
+        .unwrap_or_default()
+}
+
+fn tuple_output_layout(
+    desc_tbl: Option<&TDescriptorTable>,
+    tuple_id: i32,
+) -> Vec<OutputLayoutEntry> {
+    let Some(slots) = desc_tbl.and_then(|dt| dt.slot_descriptors.as_ref()) else {
+        return Vec::new();
+    };
+
+    let mut tuple_slots: Vec<_> = slots
+        .iter()
+        .filter(|slot| slot.parent == tuple_id && slot.is_materialized)
+        .collect();
+    tuple_slots.sort_by_key(|slot| (slot.column_pos < 0, slot.column_pos, slot.id));
+
+    tuple_slots
+        .into_iter()
+        .map(|slot| OutputLayoutEntry {
+            slot_id: Some(slot.id),
+            name: slot.col_name.clone(),
+        })
+        .collect()
+}
+
+fn expr_output_layout(
+    desc_tbl: Option<&TDescriptorTable>,
+    exprs: &[TExpr],
+) -> Vec<OutputLayoutEntry> {
+    exprs
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            let slot_id = expr.nodes.first().and_then(|node| {
+                if node.node_type == TExprNodeType::SLOT_REF {
+                    node.slot_ref.as_ref().map(|sr| sr.slot_id)
+                } else {
+                    None
+                }
+            });
+            let name = slot_id
+                .map(|id| slot_name_from_desc(desc_tbl, id))
+                .unwrap_or_else(|| format!("expr_{idx}"));
+            OutputLayoutEntry { slot_id, name }
+        })
+        .collect()
+}
+
+fn extract_fragment_output_layout(params: &TPipelineFragmentParams) -> Vec<OutputLayoutEntry> {
+    let desc_tbl = params.desc_tbl.as_ref();
+    if let Some(output_exprs) = params
+        .fragment
+        .as_ref()
+        .and_then(|f| f.output_exprs.as_ref())
+    {
+        return expr_output_layout(desc_tbl, output_exprs);
+    }
+
+    let Some(root) = params
+        .fragment
+        .as_ref()
+        .and_then(|f| f.plan.as_ref())
+        .and_then(|plan| plan.nodes.first())
+    else {
+        return Vec::new();
+    };
+
+    if root
+        .projections
+        .as_ref()
+        .map(|exprs| !exprs.is_empty())
+        .unwrap_or(false)
+    {
+        if let Some(output_tuple_id) = root.output_tuple_id {
+            return tuple_output_layout(desc_tbl, output_tuple_id);
+        }
+    }
+
+    let mut layout = Vec::new();
+    for &tuple_id in &root.row_tuples {
+        layout.extend(tuple_output_layout(desc_tbl, tuple_id));
+    }
+    layout
+}
+
+fn extract_stream_sink_output_layout(
+    params: &TPipelineFragmentParams,
+    stream_sink: &TDataStreamSink,
+) -> Vec<OutputLayoutEntry> {
+    let desc_tbl = params.desc_tbl.as_ref();
+    if let Some(output_exprs) = stream_sink.output_exprs.as_ref() {
+        if !output_exprs.is_empty() {
+            return expr_output_layout(desc_tbl, output_exprs);
+        }
+    }
+
+    stream_sink
+        .output_tuple_id
+        .map(|tuple_id| tuple_output_layout(desc_tbl, tuple_id))
+        .unwrap_or_default()
+}
+
+fn compute_exchange_projection(
+    source_layout: &[OutputLayoutEntry],
+    target_layout: &[OutputLayoutEntry],
+) -> Option<(Vec<String>, Vec<usize>)> {
+    if source_layout.is_empty() || target_layout.is_empty() {
+        return None;
+    }
+
+    let mut used = std::collections::HashSet::new();
+    let mut indices = Vec::with_capacity(target_layout.len());
+    for target in target_layout {
+        let idx = target
+            .slot_id
+            .and_then(|slot_id| {
+                source_layout
+                    .iter()
+                    .enumerate()
+                    .find(|(idx, source)| !used.contains(idx) && source.slot_id == Some(slot_id))
+                    .map(|(idx, _)| idx)
+            })
+            .or_else(|| {
+                if target.name.is_empty() {
+                    None
+                } else {
+                    source_layout
+                        .iter()
+                        .enumerate()
+                        .find(|(idx, source)| !used.contains(idx) && source.name == target.name)
+                        .map(|(idx, _)| idx)
+                }
+            })?;
+        used.insert(idx);
+        indices.push(idx);
+    }
+
+    let is_identity = indices.len() == source_layout.len()
+        && indices
+            .iter()
+            .enumerate()
+            .all(|(idx, &source_idx)| idx == source_idx);
+    if is_identity {
+        return None;
+    }
+
+    Some((
+        target_layout
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect(),
+        indices,
+    ))
+}
+
+fn project_ipc_for_exchange(ipc_bytes: &[u8], exch_info: &ExchangeInfo) -> Result<Vec<u8>, String> {
+    match exch_info.output_indices.as_deref() {
+        Some(indices) => project_ipc_columns(ipc_bytes, &exch_info.output_names, Some(indices)),
+        None => Ok(ipc_bytes.to_vec()),
+    }
+}
+
+fn maybe_project_location_for_exchange(
+    location: crate::nixl_integration::ExecutionLocation,
+    exch_info: &ExchangeInfo,
+) -> Result<crate::nixl_integration::ExecutionLocation, String> {
+    if exch_info.output_indices.is_none() {
+        return Ok(location);
+    }
+
+    let ipc_bytes = match &location {
+        crate::nixl_integration::ExecutionLocation::Cpu(bytes) => bytes.clone(),
+        crate::nixl_integration::ExecutionLocation::Gpu { ipc_bytes, .. } => ipc_bytes.clone(),
+        crate::nixl_integration::ExecutionLocation::PackedExchange { ipc_bytes, .. } => {
+            ipc_bytes.clone()
+        }
+    };
+    let projected = project_ipc_for_exchange(&ipc_bytes, exch_info)?;
+    Ok(crate::nixl_integration::ExecutionLocation::Cpu(projected))
+}
+
+fn exchange_location_from_artifact(
+    ipc_bytes: Vec<u8>,
+    artifact: Option<sirius_ffi::ExchangeArtifact>,
+) -> crate::nixl_integration::ExecutionLocation {
+    match artifact {
+        Some(artifact) if artifact.has_exchange_data() => {
+            info!(
+                staging_base = format_args!("0x{:x}", artifact.staging_base()),
+                num_partitions = artifact.packed_partitions().len(),
+                num_broadcast = artifact.packed_broadcast().len(),
+                "captured exchange artifact"
+            );
+            crate::nixl_integration::ExecutionLocation::from_exchange_artifact(artifact, ipc_bytes)
+        }
+        Some(artifact) => {
+            info!(
+                staging_base = format_args!("0x{:x}", artifact.staging_base()),
+                "exchange artifact had no packed data, using CPU IPC path"
+            );
+            drop(artifact);
+            crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
+        }
+        None => crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes),
+    }
+}
+
 /// Extract FE output column names from fragment output_exprs + desc_tbl.
 ///
 /// Returns the column names in the order the FE's SELECT list expects them.
@@ -1283,9 +1731,15 @@ fn extract_descriptor_column_names(params: &TPipelineFragmentParams) -> Vec<Stri
     // Collect materialized slots from all row_tuples of the root node.
     let mut names = Vec::new();
     for &tuple_id in &root.row_tuples {
-        for slot in slots.iter().filter(|s| s.parent == tuple_id && s.is_materialized) {
+        for slot in slots
+            .iter()
+            .filter(|s| s.parent == tuple_id && s.is_materialized)
+        {
             let safe = if slot.col_name.is_empty()
-                || !slot.col_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                || !slot
+                    .col_name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_')
             {
                 format!("expr_{}", names.len())
             } else {
@@ -1298,9 +1752,11 @@ fn extract_descriptor_column_names(params: &TPipelineFragmentParams) -> Vec<Stri
 }
 
 fn extract_fe_output_names(params: &TPipelineFragmentParams) -> Vec<String> {
-    use doris_thrift::exprs::TExprNodeType;
-
-    let output_exprs = match params.fragment.as_ref().and_then(|f| f.output_exprs.as_ref()) {
+    let output_exprs = match params
+        .fragment
+        .as_ref()
+        .and_then(|f| f.output_exprs.as_ref())
+    {
         Some(exprs) => exprs,
         None => return Vec::new(),
     };
@@ -1313,12 +1769,7 @@ fn extract_fe_output_names(params: &TPipelineFragmentParams) -> Vec<String> {
     let slot_map: std::collections::HashMap<i32, &str> = desc_tbl
         .slot_descriptors
         .as_ref()
-        .map(|slots| {
-            slots
-                .iter()
-                .map(|s| (s.id, s.col_name.as_str()))
-                .collect()
-        })
+        .map(|slots| slots.iter().map(|s| (s.id, s.col_name.as_str())).collect())
         .unwrap_or_default();
 
     output_exprs
@@ -1407,12 +1858,18 @@ fn generate_exchange_agg_merge_sql(
     let columns = table_schemas.get(&table_name)?;
 
     // Determine grouping columns: first N columns are GROUP BY keys.
-    let num_grouping = agg_node.grouping_exprs.as_ref().map(|g| g.len()).unwrap_or(0);
+    let num_grouping = agg_node
+        .grouping_exprs
+        .as_ref()
+        .map(|g| g.len())
+        .unwrap_or(0);
     let num_agg_fns = agg_node.aggregate_functions.len();
 
     if columns.len() < num_grouping + num_agg_fns {
         tracing::warn!(
-            columns = columns.len(), num_grouping, num_agg_fns,
+            columns = columns.len(),
+            num_grouping,
+            num_agg_fns,
             "exchange table column count mismatch for AGG merge"
         );
         return None;
@@ -1428,10 +1885,13 @@ fn generate_exchange_agg_merge_sql(
         // Get materialized slots for the exchange node's input tuple,
         // sorted by column_pos (matches DuckDB table column order).
         let input_tuple_id = *exch.row_tuples.first().unwrap_or(&0);
-        let mut input_slots: Vec<(i32, i32)> = params.desc_tbl.as_ref()
+        let mut input_slots: Vec<(i32, i32)> = params
+            .desc_tbl
+            .as_ref()
             .and_then(|dt| dt.slot_descriptors.as_ref())
             .map(|slots| {
-                slots.iter()
+                slots
+                    .iter()
                     .filter(|s| s.parent == input_tuple_id && s.is_materialized)
                     .map(|s| (s.id, s.column_pos))
                     .collect::<Vec<_>>()
@@ -1445,17 +1905,29 @@ fn generate_exchange_agg_merge_sql(
             let mut perm = Vec::new();
             let mut all_found = true;
             for agg_fn in &agg_node.aggregate_functions {
-                let slot_id = agg_fn.nodes.iter()
+                let slot_id = agg_fn
+                    .nodes
+                    .iter()
                     .find(|n| n.node_type == TExprNodeType::SLOT_REF)
                     .and_then(|n| n.slot_ref.as_ref())
                     .map(|sr| sr.slot_id);
                 if let Some(sid) = slot_id {
                     if let Some(pos) = measure_slots.iter().position(|&s| s == sid) {
                         perm.push(pos);
-                    } else { all_found = false; break; }
-                } else { all_found = false; break; }
+                    } else {
+                        all_found = false;
+                        break;
+                    }
+                } else {
+                    all_found = false;
+                    break;
+                }
             }
-            if all_found { perm } else { (0..num_agg_fns).collect() }
+            if all_found {
+                perm
+            } else {
+                (0..num_agg_fns).collect()
+            }
         } else {
             (0..num_agg_fns).collect()
         }
@@ -1476,9 +1948,10 @@ fn generate_exchange_agg_merge_sql(
         let col = &columns[col_idx];
 
         // Extract function name from the aggregate expression root node.
-        let func_name = agg_fn_expr.nodes.first().and_then(|n| {
-            n.fn_.as_ref().map(|f| f.name.function_name.as_str())
-        });
+        let func_name = agg_fn_expr
+            .nodes
+            .first()
+            .and_then(|n| n.fn_.as_ref().map(|f| f.name.function_name.as_str()));
 
         // Map original aggregate → merge function.
         let merge_fn = match func_name {
@@ -1488,7 +1961,10 @@ fn generate_exchange_agg_merge_sql(
             Some("max") => "MAX",
             Some("any_value") => "ANY_VALUE",
             Some(other) => {
-                tracing::warn!(func = other, "unknown aggregate merge function, defaulting to SUM");
+                tracing::warn!(
+                    func = other,
+                    "unknown aggregate merge function, defaulting to SUM"
+                );
                 "SUM"
             }
             None => "SUM",
@@ -1503,7 +1979,9 @@ fn generate_exchange_agg_merge_sql(
         let group_cols: Vec<String> = (1..=num_grouping).map(|i| i.to_string()).collect();
         format!(
             "SELECT {} FROM \"{}\" GROUP BY {}",
-            select, table_name, group_cols.join(", ")
+            select,
+            table_name,
+            group_cols.join(", ")
         )
     } else {
         format!("SELECT {} FROM \"{}\"", select, table_name)
@@ -1558,40 +2036,15 @@ fn generate_exchange_union_sql(params: &TPipelineFragmentParams) -> Option<Strin
 
 /// Extract exchange send destinations and partition strategy from fragment params.
 ///
-/// Returns `ExchangeInfo` if this fragment's output should be sent to remote BEs
-/// via transmit_block. Returns `None` for result sinks (where FE fetches data
-/// directly) or when destinations are empty.
-fn extract_exchange_destinations(
-    params: &TPipelineFragmentParams,
-) -> Option<ExchangeInfo> {
-    // Check if fragment has a DATA_STREAM_SINK output
-    let fragment = params.fragment.as_ref()?;
-    let output_sink = fragment.output_sink.as_ref()?;
-
-    // Handle both DATA_STREAM_SINK and MULTI_CAST_DATA_STREAM_SINK.
-    // MULTI_CAST is used by CTE queries (Q15) to share a scan across multiple consumers.
-    let (stream_sink, dest_node_id) = if output_sink.type_ == TDataSinkType::DATA_STREAM_SINK {
-        let ss = output_sink.stream_sink.as_ref()?;
-        (ss, ss.dest_node_id)
-    } else if output_sink.type_ == TDataSinkType::MULTI_CAST_DATA_STREAM_SINK {
-        // Multicast: use the first sink's destination (all sinks share the same data).
-        let mc = output_sink.multi_cast_stream_sink.as_ref()?;
-        let sinks = mc.sinks.as_ref()?;
-        let first = sinks.first()?;
-        (first, first.dest_node_id)
-    } else {
-        return None;
-    };
-
-    let destinations = params.destinations.as_ref()?;
-    if destinations.is_empty() {
-        return None;
-    }
-
-    let dests: Vec<ExchangeDest> = destinations
+/// Returns one `ExchangeInfo` per downstream exchange sink. `MULTI_CAST_DATA_STREAM_SINK`
+/// can fan out to multiple exchange nodes, so we must preserve each sink's
+/// `dest_node_id` instead of collapsing to the first one.
+fn build_exchange_destinations(
+    destinations: &[doris_thrift::data_sinks::TPlanFragmentDestination],
+) -> Vec<ExchangeDest> {
+    destinations
         .iter()
         .filter_map(|d| {
-            // Prefer brpc_server address, fall back to server address
             let addr = d
                 .brpc_server
                 .as_ref()
@@ -1602,41 +2055,193 @@ fn extract_exchange_destinations(
                 finst_id: (d.fragment_instance_id.hi, d.fragment_instance_id.lo),
             })
         })
-        .collect();
+        .collect()
+}
 
-    if dests.is_empty() {
+fn add_local_exchange_destination(
+    params: &TPipelineFragmentParams,
+    exch_info: &mut ExchangeInfo,
+    local_brpc_addr: &str,
+) {
+    if exch_info
+        .destinations
+        .iter()
+        .any(|d| d.brpc_addr == local_brpc_addr)
+    {
+        return;
+    }
+
+    let num_senders = get_num_senders(params, exch_info.dest_node_id);
+    if num_senders <= 1 && exch_info.destinations.is_empty() {
+        return;
+    }
+
+    info!(
+        dest_node_id = exch_info.dest_node_id,
+        existing_dests = exch_info.destinations.len(),
+        "adding local BE as exchange destination (FE only listed remote BEs)"
+    );
+    exch_info
+        .destinations
+        .push(crate::exchange_sender::ExchangeDest {
+            brpc_addr: local_brpc_addr.to_string(),
+            finst_id: (0, 0),
+        });
+    if let crate::hash_partitioner::PartitionStrategy::Hash {
+        ref mut num_destinations,
+        ..
+    } = exch_info.partition
+    {
+        *num_destinations = exch_info.destinations.len();
+    }
+}
+
+fn exchange_infos_with_local_destinations(
+    params: &TPipelineFragmentParams,
+    mut exchange_infos: Vec<ExchangeInfo>,
+    local_brpc_addr: &str,
+) -> Vec<ExchangeInfo> {
+    for exch_info in &mut exchange_infos {
+        add_local_exchange_destination(params, exch_info, local_brpc_addr);
+    }
+    exchange_infos
+}
+
+fn exec_plan_uses_gpu(plan: &ExecPlan) -> bool {
+    matches!(plan, ExecPlan::Substrait { .. } | ExecPlan::Sql(_))
+}
+
+fn should_capture_exchange_artifact(
+    exchange_infos: &[ExchangeInfo],
+    plan: &ExecPlan,
+    nixl_available: bool,
+) -> bool {
+    nixl_available
+        && exec_plan_uses_gpu(plan)
+        && exchange_infos.len() == 1
+        && exchange_infos
+            .first()
+            .map(|e| !e.destinations.is_empty())
+            .unwrap_or(false)
+}
+
+fn exchange_hash_partition_info(exchange_infos: &[ExchangeInfo]) -> Option<(usize, Vec<i32>)> {
+    if exchange_infos.len() != 1 {
         return None;
     }
 
-    // Extract partition strategy from TDataStreamSink.output_partition.
-    let output_partition = &stream_sink.output_partition;
+    let exch_info = exchange_infos.first()?;
+    match &exch_info.partition {
+        crate::hash_partitioner::PartitionStrategy::Hash {
+            num_destinations,
+            partition_exprs,
+            ..
+        } => Some((
+            *num_destinations,
+            (0..partition_exprs.len() as i32).collect(),
+        )),
+        _ => None,
+    }
+}
+
+fn extract_exchange_destinations(params: &TPipelineFragmentParams) -> Vec<ExchangeInfo> {
+    // Check if fragment has a DATA_STREAM_SINK output
+    let Some(fragment) = params.fragment.as_ref() else {
+        return Vec::new();
+    };
+    let Some(output_sink) = fragment.output_sink.as_ref() else {
+        return Vec::new();
+    };
+
     let enable_new_shuffle = params
         .query_options
         .as_ref()
         .and_then(|qo| qo.enable_new_shuffle_hash_method)
         .unwrap_or(false);
+    let fragment_output_layout = extract_fragment_output_layout(params);
 
-    let partition = partition_strategy_from_thrift(
-        &output_partition.type_,
-        &output_partition.partition_exprs,
-        dests.len(),
-        enable_new_shuffle,
-    );
+    let mut build_info =
+        |stream_sink: &doris_thrift::data_sinks::TDataStreamSink,
+         destinations: &[doris_thrift::data_sinks::TPlanFragmentDestination]| {
+            let dests = build_exchange_destinations(destinations);
+            if dests.is_empty() {
+                return None;
+            }
+            let partition = partition_strategy_from_thrift(
+                &stream_sink.output_partition.type_,
+                &stream_sink.output_partition.partition_exprs,
+                dests.len(),
+                enable_new_shuffle,
+            );
+            if !matches!(
+                partition,
+                super::hash_partitioner::PartitionStrategy::Broadcast
+            ) {
+                tracing::info!(
+                    dest_node_id = stream_sink.dest_node_id,
+                    num_dests = dests.len(),
+                    partition_type = ?stream_sink.output_partition.type_,
+                    "extracted hash-partitioned exchange"
+                );
+            }
+            let sink_output_layout = extract_stream_sink_output_layout(params, stream_sink);
+            let (output_names, output_indices) =
+                compute_exchange_projection(&fragment_output_layout, &sink_output_layout)
+                    .map(|(names, indices)| (names, Some(indices)))
+                    .unwrap_or_else(|| (Vec::new(), None));
+            if let Some(indices) = output_indices.as_ref() {
+                tracing::info!(
+                    dest_node_id = stream_sink.dest_node_id,
+                    output_indices = ?indices,
+                    output_names = ?output_names,
+                    "computed per-sink exchange projection"
+                );
+            }
+            Some(ExchangeInfo {
+                dest_node_id: stream_sink.dest_node_id,
+                destinations: dests,
+                partition,
+                output_names,
+                output_indices,
+            })
+        };
 
-    if !matches!(partition, super::hash_partitioner::PartitionStrategy::Broadcast) {
-        tracing::info!(
-            dest_node_id,
-            num_dests = dests.len(),
-            partition_type = ?output_partition.type_,
-            "extracted hash-partitioned exchange"
-        );
+    match output_sink.type_ {
+        TDataSinkType::DATA_STREAM_SINK => {
+            let Some(stream_sink) = output_sink.stream_sink.as_ref() else {
+                return Vec::new();
+            };
+            let Some(destinations) = params.destinations.as_ref() else {
+                return Vec::new();
+            };
+            build_info(stream_sink, destinations).into_iter().collect()
+        }
+        TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => {
+            let Some(mc_sink) = output_sink.multi_cast_stream_sink.as_ref() else {
+                return Vec::new();
+            };
+            let Some(sinks) = mc_sink.sinks.as_ref() else {
+                return Vec::new();
+            };
+
+            let mut infos = Vec::new();
+            for (sink_idx, stream_sink) in sinks.iter().enumerate() {
+                let destinations = mc_sink
+                    .destinations
+                    .as_ref()
+                    .and_then(|lists| lists.get(sink_idx))
+                    .or_else(|| params.destinations.as_ref());
+                let Some(destinations) = destinations else {
+                    continue;
+                };
+                if let Some(info) = build_info(stream_sink, destinations) {
+                    infos.push(info);
+                }
+            }
+            infos
+        }
+        _ => Vec::new(),
     }
-
-    Some(ExchangeInfo {
-        dest_node_id,
-        destinations: dests,
-        partition,
-    })
 }
 
 pub struct PBackendServiceHandler {
@@ -1679,12 +2284,18 @@ impl PBackendServiceHandler {
         }
     }
 
-    pub fn with_nixl_agent(mut self, agent: Option<Arc<super::nixl_exchange::NixlExchange>>) -> Self {
+    pub fn with_nixl_agent(
+        mut self,
+        agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
+    ) -> Self {
         self.nixl_agent = agent;
         self
     }
 
-    pub fn with_transfer_dispatcher(mut self, dispatcher: super::transfer_engine::TransferDispatcher) -> Self {
+    pub fn with_transfer_dispatcher(
+        mut self,
+        dispatcher: super::transfer_engine::TransferDispatcher,
+    ) -> Self {
         self.transfer_dispatcher = Some(dispatcher);
         self
     }
@@ -1736,7 +2347,10 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
-        info!(num_fragments = all_params.len(), "deserialized fragment params");
+        info!(
+            num_fragments = all_params.len(),
+            "deserialized fragment params"
+        );
 
         // Capture the result-sink fragment's instance ID BEFORE merge.
         // The result-sink fragment is fragment_id=0 (EXCHANGE_NODE at root with 0 children,
@@ -1746,12 +2360,16 @@ impl PBackendService for PBackendServiceHandler {
             hi: all_params[0].query_id.hi,
             lo: all_params[0].query_id.lo,
         };
-        let result_sink_finst_id = all_params.iter()
+        let result_sink_finst_id = all_params
+            .iter()
             .find(|p| p.fragment_id == Some(0))
             .or_else(|| all_params.first())
             .and_then(|p| p.local_params.as_ref())
             .and_then(|lp| lp.first())
-            .map(|p| FinstId { hi: p.fragment_instance_id.hi, lo: p.fragment_instance_id.lo })
+            .map(|p| FinstId {
+                hi: p.fragment_instance_id.hi,
+                lo: p.fragment_instance_id.lo,
+            })
             .filter(|id| id.hi != query_id_key.hi || id.lo != query_id_key.lo);
 
         // Merge multi-fragment plans for single-BE execution.
@@ -1799,8 +2417,8 @@ impl PBackendService for PBackendServiceHandler {
                     let key = ExchangeKey { query_id, node_id };
                     let num_senders = get_num_senders(params, node_id);
                     info!(
-                        ?query_id, node_id, num_senders,
-                        "registering exchange for fragment"
+                        ?query_id,
+                        node_id, num_senders, "registering exchange for fragment"
                     );
                     let notify = self.exchange_buffer.register(key, num_senders);
                     notifies.push(notify);
@@ -1835,7 +2453,11 @@ impl PBackendService for PBackendServiceHandler {
                     // Check if query was cancelled while we were waiting.
                     if buffer.is_cancelled(query_id.0, query_id.1) {
                         info!(%finst_id, "exchange task cancelled");
-                        store.store_error(finst_id, fragment_finst_id, "query cancelled".to_string());
+                        store.store_error(
+                            finst_id,
+                            fragment_finst_id,
+                            "query cancelled".to_string(),
+                        );
                         buffer.clear_cancelled(query_id.0, query_id.1);
                         return;
                     }
@@ -1844,6 +2466,7 @@ impl PBackendService for PBackendServiceHandler {
 
                     // Decode PBlocks (or register packed GPU tables) as exchange tables.
                     let mut table_schemas = std::collections::HashMap::<String, Vec<String>>::new();
+                    let mut gpu_exchange_tables = std::collections::HashSet::<String>::new();
                     let mut any_gpu_registration_failed = false;
                     for &node_id in &exchange_node_ids {
                         let key = ExchangeKey { query_id, node_id };
@@ -1906,7 +2529,8 @@ impl PBackendService for PBackendServiceHandler {
                             let reg_engine = engine.clone();
                             let reg_table = table_name.clone();
                             let packed_owned = packed_list;
-                            let overrides: Vec<(usize, String, Option<String>)> = col_overrides.iter()
+                            let overrides: Vec<(usize, String, Option<String>)> = col_overrides
+                                .iter()
                                 .map(|(i, name, t)| (*i, name.clone(), t.map(|s| s.to_string())))
                                 .collect();
                             let reg_result = tokio::task::spawn_blocking(move || {
@@ -1949,6 +2573,7 @@ impl PBackendService for PBackendServiceHandler {
                                 Ok(Ok(cols)) => {
                                     info!(table = %table_name, cols = cols.len(),
                                           "packed GPU table registered (zero CPU copies)");
+                                    gpu_exchange_tables.insert(table_name.clone());
                                     table_schemas.insert(table_name, cols);
                                     let _ = buffer.take(&key);
                                     continue;
@@ -1979,7 +2604,8 @@ impl PBackendService for PBackendServiceHandler {
                             let col_defs: Vec<String> = (|| -> Option<Vec<String>> {
                                 let plan = params.fragment.as_ref()?.plan.as_ref()?;
                                 let exch_node = plan.nodes.iter().find(|n| {
-                                    n.node_type == doris_thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE
+                                    n.node_type
+                                        == doris_thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE
                                         && n.num_children == 0
                                         && n.node_id == node_id
                                 })?;
@@ -1988,68 +2614,96 @@ impl PBackendService for PBackendServiceHandler {
                                 // TSlotDescriptor.parent links to TTupleDescriptor.id.
                                 let slots = dt.slot_descriptors.as_ref()?.as_slice();
                                 let mut defs = Vec::new();
-                                for slot in slots.iter().filter(|s| s.parent == tuple_id && s.is_materialized) {
-                                        use doris_thrift::types::TPrimitiveType;
-                                        let ptype: Option<doris_thrift::types::TPrimitiveType> = slot.slot_type.types.as_ref()
-                                            .and_then(|ts| ts.first())
-                                            .and_then(|tn| tn.scalar_type.as_ref())
-                                            .map(|s| s.type_);
-                                        let sql_type = match ptype {
-                                            Some(TPrimitiveType::BIGINT) => "BIGINT",
-                                            Some(TPrimitiveType::INT) => "INTEGER",
-                                            Some(TPrimitiveType::SMALLINT) => "SMALLINT",
-                                            Some(TPrimitiveType::TINYINT) => "TINYINT",
-                                            Some(TPrimitiveType::DOUBLE) => "DOUBLE",
-                                            Some(TPrimitiveType::FLOAT) => "FLOAT",
-                                            Some(TPrimitiveType::BOOLEAN) => "BOOLEAN",
-                                            Some(TPrimitiveType::DATE) | Some(TPrimitiveType::DATEV2) => "DATE",
-                                            Some(TPrimitiveType::DATETIME) | Some(TPrimitiveType::DATETIMEV2) => "TIMESTAMP",
-                                            Some(TPrimitiveType::DECIMALV2) => "DECIMAL(27,9)",
-                                            Some(TPrimitiveType::DECIMAL32) => "DECIMAL(9,0)",
-                                            Some(TPrimitiveType::DECIMAL64) => "DECIMAL(18,0)",
-                                            Some(TPrimitiveType::DECIMAL128I) => "DECIMAL(38,0)",
-                                            Some(TPrimitiveType::LARGEINT) => "HUGEINT",
-                                            Some(TPrimitiveType::CHAR) | Some(TPrimitiveType::STRING) => "VARCHAR",
-                                            // Default to BIGINT for aggregate measures (COUNT, SUM of int).
-                                            // VARCHAR default caused sum(VARCHAR) errors.
-                                            _ => "BIGINT",
-                                        };
-                                        let safe_name = if slot.col_name.is_empty()
-                                            || !slot.col_name.chars().all(|c| c.is_alphanumeric() || c == '_')
-                                        {
-                                            format!("col_{}", slot.id)
-                                        } else {
-                                            slot.col_name.clone()
-                                        };
-                                        defs.push(format!("\"{}\" {}", safe_name, sql_type));
+                                for slot in slots
+                                    .iter()
+                                    .filter(|s| s.parent == tuple_id && s.is_materialized)
+                                {
+                                    use doris_thrift::types::TPrimitiveType;
+                                    let ptype: Option<doris_thrift::types::TPrimitiveType> = slot
+                                        .slot_type
+                                        .types
+                                        .as_ref()
+                                        .and_then(|ts| ts.first())
+                                        .and_then(|tn| tn.scalar_type.as_ref())
+                                        .map(|s| s.type_);
+                                    let sql_type = match ptype {
+                                        Some(TPrimitiveType::BIGINT) => "BIGINT",
+                                        Some(TPrimitiveType::INT) => "INTEGER",
+                                        Some(TPrimitiveType::SMALLINT) => "SMALLINT",
+                                        Some(TPrimitiveType::TINYINT) => "TINYINT",
+                                        Some(TPrimitiveType::DOUBLE) => "DOUBLE",
+                                        Some(TPrimitiveType::FLOAT) => "FLOAT",
+                                        Some(TPrimitiveType::BOOLEAN) => "BOOLEAN",
+                                        Some(TPrimitiveType::DATE)
+                                        | Some(TPrimitiveType::DATEV2) => "DATE",
+                                        Some(TPrimitiveType::DATETIME)
+                                        | Some(TPrimitiveType::DATETIMEV2) => "TIMESTAMP",
+                                        Some(TPrimitiveType::DECIMALV2) => "DECIMAL(27,9)",
+                                        Some(TPrimitiveType::DECIMAL32) => "DECIMAL(9,0)",
+                                        Some(TPrimitiveType::DECIMAL64) => "DECIMAL(18,0)",
+                                        Some(TPrimitiveType::DECIMAL128I) => "DECIMAL(38,0)",
+                                        Some(TPrimitiveType::LARGEINT) => "HUGEINT",
+                                        Some(TPrimitiveType::CHAR)
+                                        | Some(TPrimitiveType::STRING) => "VARCHAR",
+                                        // Default to BIGINT for aggregate measures (COUNT, SUM of int).
+                                        // VARCHAR default caused sum(VARCHAR) errors.
+                                        _ => "BIGINT",
+                                    };
+                                    let safe_name = if slot.col_name.is_empty()
+                                        || !slot
+                                            .col_name
+                                            .chars()
+                                            .all(|c| c.is_alphanumeric() || c == '_')
+                                    {
+                                        format!("col_{}", slot.id)
+                                    } else {
+                                        slot.col_name.clone()
+                                    };
+                                    defs.push(format!("\"{}\" {}", safe_name, sql_type));
                                 }
                                 Some(defs)
-                            })().unwrap_or_default();
+                            })()
+                            .unwrap_or_default();
 
                             // Deduplicate column defs (self-joins produce duplicate names
                             // like n_nationkey, n_name, n_nationkey, n_name).
                             let col_defs = {
-                                let names: Vec<String> = col_defs.iter().map(|d| {
-                                    d.split('"').nth(1).unwrap_or("").to_string()
-                                }).collect();
-                                let types: Vec<String> = col_defs.iter().map(|d| {
-                                    d.rsplit_once('"').map(|(_, t)| t.trim().to_string()).unwrap_or_default()
-                                }).collect();
+                                let names: Vec<String> = col_defs
+                                    .iter()
+                                    .map(|d| d.split('"').nth(1).unwrap_or("").to_string())
+                                    .collect();
+                                let types: Vec<String> = col_defs
+                                    .iter()
+                                    .map(|d| {
+                                        d.rsplit_once('"')
+                                            .map(|(_, t)| t.trim().to_string())
+                                            .unwrap_or_default()
+                                    })
+                                    .collect();
                                 let deduped = dedup_column_names(names);
-                                deduped.into_iter().zip(types).map(|(n, t)| format!("\"{}\" {}", n, t)).collect::<Vec<_>>()
+                                deduped
+                                    .into_iter()
+                                    .zip(types)
+                                    .map(|(n, t)| format!("\"{}\" {}", n, t))
+                                    .collect::<Vec<_>>()
                             };
 
                             let engine_guard = engine.lock().unwrap();
                             if !col_defs.is_empty() {
                                 let create_sql = format!(
                                     "CREATE OR REPLACE TABLE \"{}\" ({})",
-                                    table_name, col_defs.join(", ")
+                                    table_name,
+                                    col_defs.join(", ")
                                 );
                                 info!(table = %table_name, sql = %create_sql, "creating empty exchange table");
                                 let _ = engine_guard.execute_sql(&create_sql);
                                 match engine_guard.get_table_columns(&table_name) {
-                                    Ok(cols) => { table_schemas.insert(table_name.clone(), cols); }
-                                    Err(_) => { table_schemas.insert(table_name.clone(), vec![]); }
+                                    Ok(cols) => {
+                                        table_schemas.insert(table_name.clone(), cols);
+                                    }
+                                    Err(_) => {
+                                        table_schemas.insert(table_name.clone(), vec![]);
+                                    }
                                 }
                             } else {
                                 warn!(table = %table_name, "no column info for empty exchange table");
@@ -2096,16 +2750,18 @@ impl PBackendService for PBackendServiceHandler {
                         }
 
                         // Extract column metadata from the first block.
-                        let col_info = pblock_decoder::extract_column_info(
-                            &blocks[0].column_metas,
-                        );
+                        let col_info = pblock_decoder::extract_column_info(&blocks[0].column_metas);
 
                         // Decode all blocks.
                         let decoded = match pblock_decoder::decode_pblocks(&blocks) {
                             Ok(d) => d,
                             Err(e) => {
                                 warn!(error = %e, table = %table_name, "failed to decode PBlocks");
-                                store.store_error(finst_id, fragment_finst_id, format!("decode PBlocks for {table_name}: {e}"));
+                                store.store_error(
+                                    finst_id,
+                                    fragment_finst_id,
+                                    format!("decode PBlocks for {table_name}: {e}"),
+                                );
                                 return;
                             }
                         };
@@ -2137,69 +2793,100 @@ impl PBackendService for PBackendServiceHandler {
                         let column_names: Vec<String> = {
                             // Try descriptor table first: the exchange node's output
                             // tuple has clean column names that match the FE's expectations.
-                            let desc_names: Option<Vec<String>> = params.desc_tbl.as_ref().and_then(|dt| {
-                                // Find the exchange node by matching the table name suffix.
-                                // Table name format: __EXCH_{hex}_{node_id}
-                                let node_id: Option<i32> = table_name.rsplit('_').next()
-                                    .and_then(|s| s.parse().ok());
-                                let exch_node = node_id.and_then(|nid| {
-                                    params.fragment.as_ref()?.plan.as_ref()?.nodes.iter()
-                                        .find(|n| n.node_id == nid)
-                                });
-                                if let Some(node) = exch_node {
-                                    let mut names = Vec::new();
-                                    for &tid in &node.row_tuples {
-                                        if let Some(slots) = dt.slot_descriptors.as_ref() {
-                                            for sd in slots {
-                                                if sd.parent == tid && sd.is_materialized {
-                                                    names.push(sd.col_name.clone());
+                            let desc_names: Option<Vec<String>> =
+                                params.desc_tbl.as_ref().and_then(|dt| {
+                                    // Find the exchange node by matching the table name suffix.
+                                    // Table name format: __EXCH_{hex}_{node_id}
+                                    let node_id: Option<i32> =
+                                        table_name.rsplit('_').next().and_then(|s| s.parse().ok());
+                                    let exch_node = node_id.and_then(|nid| {
+                                        params
+                                            .fragment
+                                            .as_ref()?
+                                            .plan
+                                            .as_ref()?
+                                            .nodes
+                                            .iter()
+                                            .find(|n| n.node_id == nid)
+                                    });
+                                    if let Some(node) = exch_node {
+                                        let mut names = Vec::new();
+                                        for &tid in &node.row_tuples {
+                                            if let Some(slots) = dt.slot_descriptors.as_ref() {
+                                                for sd in slots {
+                                                    if sd.parent == tid && sd.is_materialized {
+                                                        names.push(sd.col_name.clone());
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    if names.len() == keep_indices.len() {
-                                        Some(names)
+                                        if names.len() == keep_indices.len() {
+                                            Some(names)
+                                        } else {
+                                            None // mismatch, fall back
+                                        }
                                     } else {
-                                        None // mismatch, fall back
+                                        None
                                     }
-                                } else {
-                                    None
-                                }
-                            });
+                                });
 
                             let raw = desc_names.unwrap_or_else(|| {
-                                keep_indices.iter().enumerate().map(|(out_idx, &i)| {
-                                    let name = &col_info[i].0;
-                                    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                                        format!("col_{}", out_idx)
-                                    } else {
-                                        name.clone()
-                                    }
-                                }).collect()
+                                keep_indices
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(out_idx, &i)| {
+                                        let name = &col_info[i].0;
+                                        if name.is_empty()
+                                            || !name
+                                                .chars()
+                                                .all(|c| c.is_alphanumeric() || c == '_')
+                                        {
+                                            format!("col_{}", out_idx)
+                                        } else {
+                                            name.clone()
+                                        }
+                                    })
+                                    .collect()
                             });
                             dedup_column_names(raw)
                         };
-                        let column_types_sql: Vec<String> =
-                            keep_indices.iter().map(|&i| col_info[i].1.clone()).collect();
+                        let column_types_sql: Vec<String> = keep_indices
+                            .iter()
+                            .map(|&i| col_info[i].1.clone())
+                            .collect();
 
                         // Convert decoded columns to Arrow IPC and register via fast path.
                         let ipc_bytes = match pblock_decoder::decoded_columns_to_arrow_ipc(
-                            &decoded, &keep_indices,
+                            &decoded,
+                            &keep_indices,
                         ) {
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 warn!(error = %e, table = %table_name, "failed to convert exchange PBlock to Arrow IPC");
                                 // Fall back to SQL VALUES path.
-                                let column_data_csv: Vec<Vec<String>> = keep_indices.iter()
-                                    .map(|&i| pblock_decoder::column_to_sql_values(&decoded.columns[i], decoded.num_rows))
+                                let column_data_csv: Vec<Vec<String>> = keep_indices
+                                    .iter()
+                                    .map(|&i| {
+                                        pblock_decoder::column_to_sql_values(
+                                            &decoded.columns[i],
+                                            decoded.num_rows,
+                                        )
+                                    })
                                     .collect();
                                 let engine_guard = engine.lock().unwrap();
                                 if let Err(e2) = engine_guard.register_exchange_table(
-                                    &table_name, &column_names, &column_types_sql,
-                                    decoded.num_rows, &column_data_csv,
+                                    &table_name,
+                                    &column_names,
+                                    &column_types_sql,
+                                    decoded.num_rows,
+                                    &column_data_csv,
                                 ) {
                                     warn!(error = %e2, table = %table_name, "SQL VALUES fallback also failed");
-                                    store.store_error(finst_id, fragment_finst_id, format!("register exchange table {table_name}: {e2}"));
+                                    store.store_error(
+                                        finst_id,
+                                        fragment_finst_id,
+                                        format!("register exchange table {table_name}: {e2}"),
+                                    );
                                     return;
                                 }
                                 if let Ok(cols) = engine_guard.get_table_columns(&table_name) {
@@ -2216,14 +2903,19 @@ impl PBackendService for PBackendServiceHandler {
                             num_rows = decoded.num_rows,
                             "converted exchange PBlock to Arrow IPC"
                         );
+                        log_small_ipc_rows("exchange_decode", &table_name, &ipc_bytes);
 
                         // Register in DuckDB via IPC file (fast path).
                         let engine_guard = engine.lock().unwrap();
-                        if let Err(e) = engine_guard.register_exchange_table_from_ipc(
-                            &table_name, &ipc_bytes,
-                        ) {
+                        if let Err(e) =
+                            engine_guard.register_exchange_table_from_ipc(&table_name, &ipc_bytes)
+                        {
                             warn!(error = %e, table = %table_name, "IPC registration failed");
-                            store.store_error(finst_id, fragment_finst_id, format!("IPC registration for {table_name}: {e}"));
+                            store.store_error(
+                                finst_id,
+                                fragment_finst_id,
+                                format!("IPC registration for {table_name}: {e}"),
+                            );
                             return;
                         }
 
@@ -2252,7 +2944,8 @@ impl PBackendService for PBackendServiceHandler {
 
                     // Also register any file tables.
                     let file_scan_infos = extract_file_scan_info(&params);
-                    let mut file_scan_map = std::collections::HashMap::<String, plan_translator::FileScanInfo>::new();
+                    let mut file_scan_map =
+                        std::collections::HashMap::<String, plan_translator::FileScanInfo>::new();
                     if !file_scan_infos.is_empty() {
                         let engine_guard = engine.lock().unwrap();
                         for fsi in &file_scan_infos {
@@ -2273,13 +2966,25 @@ impl PBackendService for PBackendServiceHandler {
                                               "get_parquet_columns failed, falling back");
                                         let empty: Vec<String> = vec![];
                                         if let Err(e) = engine_guard.register_file_table(
-                                            &fsi.table_name, &fsi.files[0].path, &fsi.format, &empty,
+                                            &fsi.table_name,
+                                            &fsi.files[0].path,
+                                            &fsi.format,
+                                            &empty,
                                         ) {
                                             warn!(error = %e, table = %fsi.table_name, "failed to register file table");
-                                            store.store_error(finst_id, fragment_finst_id, format!("register file table '{}': {e}", fsi.table_name));
+                                            store.store_error(
+                                                finst_id,
+                                                fragment_finst_id,
+                                                format!(
+                                                    "register file table '{}': {e}",
+                                                    fsi.table_name
+                                                ),
+                                            );
                                             return;
                                         }
-                                        if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
+                                        if let Ok(columns) =
+                                            engine_guard.get_table_columns(&fsi.table_name)
+                                        {
                                             table_schemas.insert(fsi.table_name.clone(), columns);
                                         }
                                     }
@@ -2287,13 +2992,21 @@ impl PBackendService for PBackendServiceHandler {
                             } else {
                                 let empty: Vec<String> = vec![];
                                 if let Err(e) = engine_guard.register_file_table(
-                                    &fsi.table_name, &fsi.files[0].path, &fsi.format, &empty,
+                                    &fsi.table_name,
+                                    &fsi.files[0].path,
+                                    &fsi.format,
+                                    &empty,
                                 ) {
                                     warn!(error = %e, table = %fsi.table_name, "failed to register file table");
-                                    store.store_error(finst_id, fragment_finst_id, format!("register file table '{}': {e}", fsi.table_name));
+                                    store.store_error(
+                                        finst_id,
+                                        fragment_finst_id,
+                                        format!("register file table '{}': {e}", fsi.table_name),
+                                    );
                                     return;
                                 }
-                                if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
+                                if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name)
+                                {
                                     table_schemas.insert(fsi.table_name.clone(), columns);
                                 }
                             }
@@ -2307,69 +3020,88 @@ impl PBackendService for PBackendServiceHandler {
                     // 2. Everything else (AGG finalize, SORT, JOIN): Substrait path
                     //    AGG finalize uses INTERMEDIATE_TO_RESULT phase so DuckDB rewrites
                     //    count → sum, etc. for merging partial results.
-                    // Track whether GPU-resident exchange tables were registered (from packed nixl).
-                    // Currently not used — exchange fragments stay on CPU (SubstraitCpuOnly)
-                    // because the GPU engine doesn't support AGG finalize or UNION operations.
-                    // GPU-resident tables will be D2H-copied by DuckDB's ScanDataDuckDB when
-                    // the Substrait plan runs via from_substrait (CPU path).
-                    let has_gpu_tables = exchange_node_ids.iter().any(|&nid| {
-                        table_schemas.contains_key(&exchange_table_name(query_id.1, nid))
-                    });
+                    let all_exchange_tables_gpu = !exchange_node_ids.is_empty()
+                        && exchange_node_ids.iter().all(|&nid| {
+                            gpu_exchange_tables.contains(&exchange_table_name(query_id.1, nid))
+                        });
 
-                    let (exec_plan, output_names) =
-                        if let Some(union_sql) = generate_exchange_union_sql(&params) {
-                            // 1. UNION_NODE: trivial SQL (DuckDB SetRel broken for Substrait)
-                            info!(sql = %union_sql, "exchange fragment using UNION SQL path");
-                            (ExecPlan::SqlCpuOnly(union_sql), None)
-                        } else if false {
-                            // AGG merge SQL shortcut disabled: it skips node projections
-                            // (division, CASE expressions) that are critical for correctness.
-                            // Using Substrait path instead, which handles projections via
-                            // build_projection_slot_map + slot expression expansion.
-                            unreachable!()
-                        } else if any_gpu_registration_failed {
-                            // GPU table registration failed — some exchange tables are CPU-only.
-                            // Must use CPU Substrait to avoid GPU engine hanging on invalid tables.
-                            match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
-                                Ok(plan) => {
-                                    info!("exchange fragment using CPU Substrait (GPU registration failed)");
-                                    let exec = ExecPlan::SubstraitCpuOnly {
-                                        bytes: plan.substrait_bytes,
-                                        sort_limit_sql: plan.sort_limit_sql,
-                                    };
-                                    (exec, Some(plan.output_names))
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Substrait translation failed for exchange fragment");
-                                    store.store_error(finst_id, fragment_finst_id, format!("Substrait translation: {e}"));
-                                    return;
-                                }
+                    let (exec_plan, output_names) = if let Some(union_sql) =
+                        generate_exchange_union_sql(&params)
+                    {
+                        // 1. UNION_NODE: trivial SQL (DuckDB SetRel broken for Substrait)
+                        info!(sql = %union_sql, "exchange fragment using UNION SQL path");
+                        (ExecPlan::SqlCpuOnly(union_sql), None)
+                    } else if false {
+                        // AGG merge SQL shortcut disabled: it skips node projections
+                        // (division, CASE expressions) that are critical for correctness.
+                        // Using Substrait path instead, which handles projections via
+                        // build_projection_slot_map + slot expression expansion.
+                        unreachable!()
+                    } else if any_gpu_registration_failed {
+                        // GPU table registration failed — some exchange tables are CPU-only.
+                        // Must use CPU Substrait to avoid GPU engine hanging on invalid tables.
+                        match plan_translator::translate_fragment(
+                            &params,
+                            &table_schemas,
+                            &file_scan_map,
+                        ) {
+                            Ok(plan) => {
+                                info!("exchange fragment using CPU Substrait (GPU registration failed)");
+                                let exec = ExecPlan::SubstraitCpuOnly {
+                                    bytes: plan.substrait_bytes,
+                                    sort_limit_sql: plan.sort_limit_sql,
+                                };
+                                (exec, Some(plan.output_names))
                             }
-                        } else {
-                            // 3. Everything else (SORT, JOIN, plain exchange): Substrait path.
-                            // Use CPU for exchange-only fragments (no file scans) since
-                            // GPU hangs on CPU-registered exchange tables.
-                            match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
-                                Ok(plan) => {
-                                    // Exchange fragments use CPU Substrait: exchange tables are
-                                    // CPU-registered (PBlock decode) in 1-BE local exchange mode.
+                            Err(e) => {
+                                warn!(error = %e, "Substrait translation failed for exchange fragment");
+                                store.store_error(
+                                    finst_id,
+                                    fragment_finst_id,
+                                    format!("Substrait translation: {e}"),
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        // 3. Everything else (SORT, JOIN, plain exchange): Substrait path.
+                        // Stay on GPU when every exchange input is a packed GPU table and
+                        // the translator did not force CPU execution.
+                        match plan_translator::translate_fragment(
+                            &params,
+                            &table_schemas,
+                            &file_scan_map,
+                        ) {
+                            Ok(plan) => {
+                                let exec = if plan.force_cpu_substrait || !all_exchange_tables_gpu {
                                     info!("exchange fragment using CPU Substrait path");
-                                    let exec = ExecPlan::SubstraitCpuOnly {
+                                    ExecPlan::SubstraitCpuOnly {
                                         bytes: plan.substrait_bytes,
                                         sort_limit_sql: plan.sort_limit_sql,
-                                    };
-                                    (exec, Some(plan.output_names))
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Substrait translation failed for exchange fragment");
-                                    store.store_error(finst_id, fragment_finst_id, format!("Substrait translation: {e}"));
-                                    return;
-                                }
+                                    }
+                                } else {
+                                    info!("exchange fragment using GPU Substrait path");
+                                    ExecPlan::Substrait {
+                                        bytes: plan.substrait_bytes,
+                                        sort_limit_sql: plan.sort_limit_sql,
+                                    }
+                                };
+                                (exec, Some(plan.output_names))
                             }
-                        };
+                            Err(e) => {
+                                warn!(error = %e, "Substrait translation failed for exchange fragment");
+                                store.store_error(
+                                    finst_id,
+                                    fragment_finst_id,
+                                    format!("Substrait translation: {e}"),
+                                );
+                                return;
+                            }
+                        }
+                    };
 
                     // Check if this exchange fragment also needs to forward results.
-                    let exchange_dests = extract_exchange_destinations(&params);
+                    let exchange_infos = extract_exchange_destinations(&params);
 
                     // Extract slot descriptors for hash partition column resolution.
                     let desc_tbl_slots: Option<Vec<(i32, String)>> = params
@@ -2380,50 +3112,44 @@ impl PBackendService for PBackendServiceHandler {
 
                     // Extract sender_id from local_params (each BE gets a unique sender_id
                     // for the same fragment, so the receiver's ExchangeBuffer can distinguish senders).
-                    let sender_id = params.local_params.as_ref()
+                    let sender_id = params
+                        .local_params
+                        .as_ref()
                         .and_then(|lp| lp.first())
                         .map(|p| p.sender_id.unwrap_or(0))
                         .unwrap_or(0);
+                    let exchange_infos = exchange_infos_with_local_destinations(
+                        &params,
+                        exchange_infos,
+                        &local_brpc_addr,
+                    );
 
                     // For CPU-only plans (e.g. AGG merge SQL), skip GPU buffer detection
                     // to avoid stale GPU buffers from a previous leaf execution being
                     // mistakenly detected as the current result's location.
-                    let is_cpu_only = matches!(&exec_plan, ExecPlan::SqlCpuOnly(_));
+                    let is_cpu_only = !exec_plan_uses_gpu(&exec_plan);
 
                     // If this exchange fragment has destinations and nixl is available,
                     // retain GPU buffers so nixl can use them after query cleanup.
-                    let should_retain_exch = exchange_dests.is_some() && nixl_agent.is_some() && !is_cpu_only;
-                    let nixl_agent_for_exch_blocking = if should_retain_exch { nixl_agent.clone() } else { None };
-                    let engine_for_release = engine.clone();
-
-                    // Extract hash partition info for the GPU result_collector's per-partition packing.
-                    // Partition column indices are positional (0..N) matching the partition_exprs
-                    // order, which corresponds to the leading output columns of the data sink.
-                    // TODO: resolve actual column positions from SLOT_REF for non-leading keys.
-                    let hash_partition_info_exch: Option<(usize, Vec<i32>)> = exchange_dests.as_ref().and_then(|e| {
-                        if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, ref partition_exprs, .. } = &e.partition {
-                            Some((*num_destinations, (0..partition_exprs.len() as i32).collect()))
-                        } else { None }
-                    });
+                    let should_retain_exch = should_capture_exchange_artifact(
+                        &exchange_infos,
+                        &exec_plan,
+                        nixl_agent.is_some(),
+                    ) && !is_cpu_only;
+                    let hash_partition_info_exch = exchange_hash_partition_info(&exchange_infos);
 
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
-                        // Finalize exchange tables BEFORE retain_gpu_buffers creates a
-                        // new session (which resets staging_offset to 0). This materializes
-                        // pending_views from staging into owned cudf::tables via concatenate.
-                        if let Err(e) = engine.finalize_exchange_tables() {
-                            tracing::warn!(error = %e, "finalize_exchange_tables failed");
+                        // Finalize exchange tables before reusing the send staging region.
+                        if let Err(e) = engine.finalize_exchange_tables_direct() {
+                            tracing::warn!(error = %e, "finalize_exchange_tables_direct failed");
                         }
                         if should_retain_exch {
-                            if let Err(e) = engine.retain_gpu_buffers() {
-                                tracing::warn!(error = %e, "failed to set retain_gpu_buffers for exchange fragment");
-                            }
-                            // Set up hash partition config so the GPU result_collector
-                            // produces per-partition packed buffers in the staging buffer.
-                            if let Some((num_dests, ref col_indices)) = hash_partition_info_exch {
-                                if let Err(e) = engine.set_exchange_partition(num_dests, col_indices) {
-                                    tracing::warn!(error = %e, "failed to set exchange partition for exchange fragment");
-                                }
+                            let partition_spec = hash_partition_info_exch
+                                .as_ref()
+                                .map(|(num_dests, col_indices)| (*num_dests, col_indices.as_slice()));
+                            if let Err(e) = engine.begin_exchange_capture(partition_spec) {
+                                tracing::warn!(error = %e, "failed to begin exchange capture for exchange fragment");
                             }
                         }
                         let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
@@ -2436,103 +3162,77 @@ impl PBackendService for PBackendServiceHandler {
                         if is_cpu_only {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         } else if should_retain_exch {
-                            // Build location from packed staging data.
-                            let partitions = engine.get_packed_partitions().unwrap_or_default();
-                            let loc = if !partitions.is_empty() {
-                                // Hash-partitioned: per-partition packed GPU buffers.
-                                match engine.get_packed_gpu() {
-                                    Ok(Some((addr, size, metadata))) => {
-                                        tracing::info!(
-                                            addr = format_args!("0x{addr:x}"), size,
-                                            num_partitions = partitions.len(),
-                                            "packed GPU for hash-partitioned exchange forward"
-                                        );
-                                        let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(addr, size, metadata, ipc_bytes);
-                                        loc.set_packed_partitions(partitions);
-                                        loc
-                                    }
-                                    _ => {
-                                        tracing::info!("no packed GPU data despite partitions, using CPU path");
-                                        crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                                    }
-                                }
-                            } else {
-                                // Broadcast: per-batch packed GPU buffers.
-                                let broadcast_entries = engine.get_packed_broadcast_entries().unwrap_or_default();
-                                if !broadcast_entries.is_empty() {
-                                    let packed = engine.get_packed_gpu().ok().flatten();
-                                    let staging_addr = packed.as_ref().map(|(a, _, _)| *a).unwrap_or(0);
-                                    tracing::info!(
-                                        num_entries = broadcast_entries.len(),
-                                        staging_addr = format_args!("0x{staging_addr:x}"),
-                                        "packed GPU for broadcast exchange forward"
-                                    );
-                                    crate::nixl_integration::ExecutionLocation::from_broadcast_entries(
-                                        staging_addr, broadcast_entries, ipc_bytes)
-                                } else {
-                                    tracing::info!("no packed GPU data for broadcast exchange, using CPU IPC path");
-                                    crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                                }
-                            };
-                            // Move session to completed BEFORE releasing engine lock.
-                            // This prevents subsequent fragment executions from interfering
-                            // with this session's packed GPU data.
-                            let _ = engine.take_current_session();
-                            Ok(loc)
+                            let artifact = engine.take_exchange_artifact()
+                                .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                            Ok(exchange_location_from_artifact(ipc_bytes, artifact))
                         } else {
                             Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                         }
                     })
                     .await;
 
-                    // Helper to release retained GPU buffers after transfer (or on error).
-                    let release_retained_exch = || {
-                        if should_retain_exch {
-                            let eng = engine_for_release.lock().unwrap();
-                            if let Err(e) = eng.release_gpu_buffers() {
-                                tracing::warn!(error = %e, "failed to release retained GPU buffers");
-                            }
-                        }
-                    };
-
                     match exec_result {
                         Ok(Ok(location)) => {
-                            if let Some(mut exch_info) = exchange_dests {
-                                // The FE's destinations list may only include REMOTE BEs.
-                                // In Doris's standard model, local delivery is handled by the
-                                // internal pipeline. In our model, we need to explicitly include
-                                // the local BE as a destination for hash-partitioned exchanges
-                                // so the local exchange buffer receives data from this sender.
-                                let has_local = exch_info.destinations.iter().any(|d| d.brpc_addr == local_brpc_addr);
-                                if !has_local {
-                                    let num_senders = get_num_senders(&params, exch_info.dest_node_id);
-                                    if num_senders > 1 || !exch_info.destinations.is_empty() {
-                                        info!(
-                                            dest_node_id = exch_info.dest_node_id,
-                                            existing_dests = exch_info.destinations.len(),
-                                            "adding local BE as exchange destination (FE only listed remote BEs)"
-                                        );
-                                        exch_info.destinations.push(crate::exchange_sender::ExchangeDest {
-                                            brpc_addr: local_brpc_addr.clone(),
-                                            finst_id: (0, 0), // local, not used for bRPC
-                                        });
-                                        // Update partition strategy's num_destinations if hash-partitioned.
-                                        if let crate::hash_partitioner::PartitionStrategy::Hash { ref mut num_destinations, .. } = exch_info.partition {
-                                            *num_destinations = exch_info.destinations.len();
+                            if !exchange_infos.is_empty() {
+                                let query_id = (params.query_id.hi, params.query_id.lo);
+                                let send_result = if exchange_infos.len() == 1 {
+                                    match maybe_project_location_for_exchange(
+                                        location,
+                                        &exchange_infos[0],
+                                    ) {
+                                        Ok(projected_location) => {
+                                            crate::nixl_integration::send_exchange_with_nixl(
+                                                nixl_agent.as_ref(),
+                                                projected_location,
+                                                &exchange_infos[0],
+                                                query_id,
+                                                sender_id,
+                                                nixl_only,
+                                                &local_brpc_addr,
+                                                &exchange_buffer,
+                                                desc_tbl_slots.as_deref(),
+                                            )
+                                            .await
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                } else {
+                                    let ipc_bytes = location.into_ipc_bytes();
+                                    let mut result = Ok(());
+                                    for exch_info in &exchange_infos {
+                                        let projected_ipc =
+                                            match project_ipc_for_exchange(&ipc_bytes, exch_info) {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    result = Err(e);
+                                                    break;
+                                                }
+                                            };
+                                        if let Err(e) =
+                                            crate::nixl_integration::send_exchange_with_nixl(
+                                                nixl_agent.as_ref(),
+                                                crate::nixl_integration::ExecutionLocation::Cpu(
+                                                    projected_ipc,
+                                                ),
+                                                exch_info,
+                                                query_id,
+                                                sender_id,
+                                                nixl_only,
+                                                &local_brpc_addr,
+                                                &exchange_buffer,
+                                                desc_tbl_slots.as_deref(),
+                                            )
+                                            .await
+                                        {
+                                            result = Err(e);
+                                            break;
                                         }
                                     }
-                                }
-
-                                let query_id = (params.query_id.hi, params.query_id.lo);
-                                if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
-                                    nixl_agent.as_ref(),
-                                    location, &exch_info, query_id, sender_id, nixl_only,
-                                    &local_brpc_addr, &exchange_buffer,
-                                    desc_tbl_slots.as_deref(),
-                                ).await {
+                                    result
+                                };
+                                if let Err(e) = send_result {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
                                 }
-                                release_retained_exch();
                                 info!(%finst_id, sender_id, "exchange fragment forward complete");
                             } else {
                                 let mut ipc_bytes = location.into_ipc_bytes();
@@ -2548,15 +3248,21 @@ impl PBackendService for PBackendServiceHandler {
                                     // Extract column aliases from descriptor: maps col_N → real name.
                                     // This handles packed GPU tables where C++ uses generic col_N names.
                                     let aliases = extract_descriptor_column_names(&params);
-                                    let alias_ref = if !aliases.is_empty() && aliases.iter().any(|a| !a.starts_with("col_")) {
+                                    let alias_ref = if !aliases.is_empty()
+                                        && aliases.iter().any(|a| !a.starts_with("col_"))
+                                    {
                                         Some(aliases.as_slice())
                                     } else {
                                         None
                                     };
                                     info!(aliases = ?alias_ref, "IPC column aliases for reorder");
-                                    match crate::ipc_reorder::reorder_and_pad_ipc(&ipc_bytes, &fe_names, alias_ref) {
+                                    match crate::ipc_reorder::reorder_and_pad_ipc(
+                                        &ipc_bytes, &fe_names, alias_ref,
+                                    ) {
                                         Ok(reordered) => ipc_bytes = reordered,
-                                        Err(e) => warn!(error = %e, "IPC reorder failed, storing as-is"),
+                                        Err(e) => {
+                                            warn!(error = %e, "IPC reorder failed, storing as-is")
+                                        }
                                     }
                                 }
 
@@ -2571,18 +3277,23 @@ impl PBackendService for PBackendServiceHandler {
                                     }
                                     info!(%finst_id, "exchange fragment execution complete");
                                 }
-                                release_retained_exch();
                             }
                         }
                         Ok(Err(e)) => {
-                            release_retained_exch();
                             warn!(error = %e, %finst_id, "exchange fragment execution failed");
-                            store.store_error(finst_id, fragment_finst_id, format!("exchange execution: {e}"));
+                            store.store_error(
+                                finst_id,
+                                fragment_finst_id,
+                                format!("exchange execution: {e}"),
+                            );
                         }
                         Err(e) => {
-                            release_retained_exch();
                             warn!(error = %e, "exchange fragment spawn_blocking panicked");
-                            store.store_error(finst_id, fragment_finst_id, format!("exchange task panicked: {e}"));
+                            store.store_error(
+                                finst_id,
+                                fragment_finst_id,
+                                format!("exchange task panicked: {e}"),
+                            );
                         }
                     }
                 });
@@ -2600,7 +3311,8 @@ impl PBackendService for PBackendServiceHandler {
             // Step 4: Pass table_schemas + file_scan_map to the Substrait translator.
             let file_scan_infos = extract_file_scan_info(params);
             let mut table_schemas = std::collections::HashMap::<String, Vec<String>>::new();
-            let mut file_scan_map = std::collections::HashMap::<String, plan_translator::FileScanInfo>::new();
+            let mut file_scan_map =
+                std::collections::HashMap::<String, plan_translator::FileScanInfo>::new();
 
             if !file_scan_infos.is_empty() {
                 if let Some(engine) = &self.engine {
@@ -2626,14 +3338,24 @@ impl PBackendService for PBackendServiceHandler {
                                     warn!(error = %e, table = %fsi.table_name,
                                           "get_parquet_columns failed, falling back to table materialization");
                                     let empty: Vec<String> = vec![];
-                                    if let Err(e) = engine_guard.register_file_table(&fsi.table_name, &fsi.files[0].path, &fsi.format, &empty) {
+                                    if let Err(e) = engine_guard.register_file_table(
+                                        &fsi.table_name,
+                                        &fsi.files[0].path,
+                                        &fsi.format,
+                                        &empty,
+                                    ) {
                                         warn!(error = %e, table = %fsi.table_name, "failed to register file table");
                                         return Ok(Response::new(PExecPlanFragmentResult {
-                                            status: err_status(&format!("register file table '{}': {e}", fsi.table_name)),
+                                            status: err_status(&format!(
+                                                "register file table '{}': {e}",
+                                                fsi.table_name
+                                            )),
                                             ..Default::default()
                                         }));
                                     }
-                                    if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
+                                    if let Ok(columns) =
+                                        engine_guard.get_table_columns(&fsi.table_name)
+                                    {
                                         table_schemas.insert(fsi.table_name.clone(), columns);
                                     }
                                 }
@@ -2642,10 +3364,18 @@ impl PBackendService for PBackendServiceHandler {
                             // Single-file non-parquet (or single-file parquet on GPU path):
                             // register as DuckDB table.
                             let empty: Vec<String> = vec![];
-                            if let Err(e) = engine_guard.register_file_table(&fsi.table_name, &fsi.files[0].path, &fsi.format, &empty) {
+                            if let Err(e) = engine_guard.register_file_table(
+                                &fsi.table_name,
+                                &fsi.files[0].path,
+                                &fsi.format,
+                                &empty,
+                            ) {
                                 warn!(error = %e, table = %fsi.table_name, "failed to register file table");
                                 return Ok(Response::new(PExecPlanFragmentResult {
-                                    status: err_status(&format!("register file table '{}': {e}", fsi.table_name)),
+                                    status: err_status(&format!(
+                                        "register file table '{}': {e}",
+                                        fsi.table_name
+                                    )),
                                     ..Default::default()
                                 }));
                             }
@@ -2675,16 +3405,28 @@ impl PBackendService for PBackendServiceHandler {
             let (exec_plan, output_names, output_indices) =
                 match plan_translator::translate_fragment(params, &table_schemas, &file_scan_map) {
                     Ok(plan) => {
-                        info!(bytes = plan.substrait_bytes.len(), has_data_tables, force_cpu = plan.force_cpu_substrait, "translated to Substrait");
+                        info!(
+                            bytes = plan.substrait_bytes.len(),
+                            has_data_tables,
+                            force_cpu = plan.force_cpu_substrait,
+                            "translated to Substrait"
+                        );
                         // Force CPU for exchange-only fragments (no file scans,
                         // only exchange tables). GPU hangs on CPU-registered
                         // exchange tables.
                         let has_file_scans = !file_scan_infos.is_empty();
-                        let exec = if plan.force_cpu_substrait || !has_data_tables || !has_file_scans {
-                            ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
-                        } else {
-                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
-                        };
+                        let exec =
+                            if plan.force_cpu_substrait || !has_data_tables || !has_file_scans {
+                                ExecPlan::SubstraitCpuOnly {
+                                    bytes: plan.substrait_bytes,
+                                    sort_limit_sql: plan.sort_limit_sql,
+                                }
+                            } else {
+                                ExecPlan::Substrait {
+                                    bytes: plan.substrait_bytes,
+                                    sort_limit_sql: plan.sort_limit_sql,
+                                }
+                            };
                         (exec, Some(plan.output_names), plan.output_column_indices)
                     }
                     Err(e) => {
@@ -2701,7 +3443,9 @@ impl PBackendService for PBackendServiceHandler {
                 Some(e) => e.clone(),
                 None => {
                     return Ok(Response::new(PExecPlanFragmentResult {
-                        status: err_status("engine not initialized (built without duckdb-bundled?)"),
+                        status: err_status(
+                            "engine not initialized (built without duckdb-bundled?)",
+                        ),
                         ..Default::default()
                     }));
                 }
@@ -2711,13 +3455,13 @@ impl PBackendService for PBackendServiceHandler {
             let force_cpu = self.force_cpu;
 
             // Check if this fragment's output should be sent to remote BEs.
-            let exchange_dests = extract_exchange_destinations(params);
+            let exchange_infos = extract_exchange_destinations(params);
 
             // When this leaf has exchange destinations, make execution async
             // so the exec_plan_fragment gRPC response returns immediately.
             // Without this, the FE's 30s timeout fires because the leaf scan +
             // exchange send can take longer than 30s.
-            if exchange_dests.is_some() {
+            if !exchange_infos.is_empty() {
                 // Clone everything needed for the async task.
                 let params = params.clone();
                 let engine = match &self.engine {
@@ -2734,82 +3478,117 @@ impl PBackendService for PBackendServiceHandler {
                 let exec_plan = exec_plan;
                 let output_names = output_names;
                 let output_indices = output_indices;
-                let exchange_dests = exchange_dests;
-                let hash_partition_info: Option<(usize, Vec<i32>)> = exchange_dests.as_ref().and_then(|e| {
-                    if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, .. } = &e.partition {
-                        Some((*num_destinations, (0..2i32).collect()))
-                    } else { None }
-                });
+                let exchange_infos = exchange_infos_with_local_destinations(
+                    &params,
+                    exchange_infos,
+                    &local_brpc_addr,
+                );
+                let exchange_output_count = exchange_infos.len();
+                let hash_partition_info = exchange_hash_partition_info(&exchange_infos);
+                let plan_uses_gpu = exec_plan_uses_gpu(&exec_plan);
 
                 tokio::spawn(async move {
-                    let should_retain = nixl_agent.is_some();
+                    let should_retain = should_capture_exchange_artifact(
+                        &exchange_infos,
+                        &exec_plan,
+                        nixl_agent.is_some(),
+                    ) && plan_uses_gpu;
 
-                    let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
-                        let engine = engine.lock().unwrap();
-                        if should_retain {
-                            let _ = engine.retain_gpu_buffers();
-                            if let Some((num_dests, ref col_indices)) = hash_partition_info {
-                                let _ = engine.set_exchange_partition(num_dests, col_indices);
+                    let exec_result = tokio::task::spawn_blocking(
+                        move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
+                            let engine = engine.lock().unwrap();
+                            if should_retain {
+                                let _ = engine.finalize_exchange_tables_direct();
+                                let partition_spec =
+                                    hash_partition_info
+                                        .as_ref()
+                                        .map(|(num_dests, col_indices)| {
+                                            (*num_dests, col_indices.as_slice())
+                                        });
+                                let _ = engine.begin_exchange_capture(partition_spec);
                             }
-                        }
-                        let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
-                        if let Some(names) = output_names {
-                            ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
-                        }
-                        // Build location: GPU path only for hash-partitioned (has partitions).
-                        // Broadcast uses CPU IPC (staging only holds last batch).
-                        let location = if should_retain {
-                            let partitions = engine.get_packed_partitions().unwrap_or_default();
-                            let loc = if !partitions.is_empty() {
-                                let packed = engine.get_packed_gpu().ok().flatten();
-                                if let Some((addr, size, metadata)) = packed {
-                                    let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
-                                        addr, size, metadata, ipc_bytes);
-                                    loc.set_packed_partitions(partitions);
-                                    loc
-                                } else {
-                                    crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                                }
+                            let ipc_bytes =
+                                execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
+                            if let Some(names) = output_names {
+                                tracing::info!(
+                                    exchange_outputs = exchange_output_count,
+                                    output_names = ?names,
+                                    output_indices = ?output_indices,
+                                    "skipping leaf IPC projection for exchange send"
+                                );
+                            }
+                            // Build location: GPU path only for hash-partitioned (has partitions).
+                            // Broadcast uses CPU IPC (staging only holds last batch).
+                            let location = if should_retain {
+                                let artifact = engine
+                                    .take_exchange_artifact()
+                                    .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                                exchange_location_from_artifact(ipc_bytes, artifact)
                             } else {
                                 crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                             };
-                            // Move session to completed BEFORE releasing engine lock.
-                            let _ = engine.take_current_session();
-                            loc
-                        } else {
-                            crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                        };
-                        Ok(location)
-                    }).await;
+                            Ok(location)
+                        },
+                    )
+                    .await;
 
                     match exec_result {
                         Ok(Ok(location)) => {
-                            if let Some(mut exch_info) = exchange_dests {
-                                // Add local BE as destination if missing (same fix as exchange receiver path).
-                                let has_local = exch_info.destinations.iter().any(|d| d.brpc_addr == local_brpc_addr);
-                                if !has_local && !exch_info.destinations.is_empty() {
-                                    exch_info.destinations.push(crate::exchange_sender::ExchangeDest {
-                                        brpc_addr: local_brpc_addr.clone(),
-                                        finst_id: (0, 0),
-                                    });
-                                    if let crate::hash_partitioner::PartitionStrategy::Hash { ref mut num_destinations, .. } = exch_info.partition {
-                                        *num_destinations = exch_info.destinations.len();
-                                    }
-                                }
-
+                            if !exchange_infos.is_empty() {
                                 let query_id = (params.query_id.hi, params.query_id.lo);
-                                let sender_id = params.local_params.as_ref()
+                                let sender_id = params
+                                    .local_params
+                                    .as_ref()
                                     .and_then(|lp| lp.first())
                                     .map(|p| p.sender_id.unwrap_or(0))
                                     .unwrap_or(0);
-                                let desc_tbl_slots: Option<Vec<(i32, String)>> = params.desc_tbl.as_ref()
+                                let desc_tbl_slots: Option<Vec<(i32, String)>> = params
+                                    .desc_tbl
+                                    .as_ref()
                                     .and_then(|dt| dt.slot_descriptors.as_ref())
-                                    .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
-                                if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
-                                    nixl_agent.as_ref(), location, &exch_info, query_id,
-                                    sender_id, nixl_only, &local_brpc_addr, &exchange_buffer,
-                                    desc_tbl_slots.as_deref(),
-                                ).await {
+                                    .map(|slots| {
+                                        slots.iter().map(|s| (s.id, s.col_name.clone())).collect()
+                                    });
+                                let send_result = if exchange_infos.len() == 1 {
+                                    crate::nixl_integration::send_exchange_with_nixl(
+                                        nixl_agent.as_ref(),
+                                        location,
+                                        &exchange_infos[0],
+                                        query_id,
+                                        sender_id,
+                                        nixl_only,
+                                        &local_brpc_addr,
+                                        &exchange_buffer,
+                                        desc_tbl_slots.as_deref(),
+                                    )
+                                    .await
+                                } else {
+                                    let ipc_bytes = location.into_ipc_bytes();
+                                    let mut result = Ok(());
+                                    for exch_info in &exchange_infos {
+                                        if let Err(e) =
+                                            crate::nixl_integration::send_exchange_with_nixl(
+                                                nixl_agent.as_ref(),
+                                                crate::nixl_integration::ExecutionLocation::Cpu(
+                                                    ipc_bytes.clone(),
+                                                ),
+                                                exch_info,
+                                                query_id,
+                                                sender_id,
+                                                nixl_only,
+                                                &local_brpc_addr,
+                                                &exchange_buffer,
+                                                desc_tbl_slots.as_deref(),
+                                            )
+                                            .await
+                                        {
+                                            result = Err(e);
+                                            break;
+                                        }
+                                    }
+                                    result
+                                };
+                                if let Err(e) = send_result {
                                     tracing::warn!(error = %e, "async leaf exchange send failed");
                                 }
                             }
@@ -2826,116 +3605,98 @@ impl PBackendService for PBackendServiceHandler {
             // If this leaf has exchange destinations and nixl is available,
             // tell Sirius to retain GPU result buffers past query cleanup
             // so the nixl GPU-direct path can use them.
-            let should_retain = exchange_dests.is_some() && self.nixl_agent.is_some();
-            let nixl_agent_for_blocking = if should_retain { self.nixl_agent.clone() } else { None };
+            let should_retain = exchange_infos.len() == 1
+                && exchange_infos
+                    .first()
+                    .map(|e| e.destinations.len() > 1)
+                    .unwrap_or(false)
+                && self.nixl_agent.is_some();
+            let nixl_agent_for_blocking = if should_retain {
+                self.nixl_agent.clone()
+            } else {
+                None
+            };
 
             // Check if this is a hash-partitioned exchange.
-            let is_hash_partitioned = exchange_dests.as_ref()
-                .map(|e| matches!(e.partition, crate::hash_partitioner::PartitionStrategy::Hash { .. }))
-                .unwrap_or(false);
+            let is_hash_partitioned = exchange_infos.len() == 1
+                && exchange_infos
+                    .first()
+                    .map(|e| {
+                        matches!(
+                            e.partition,
+                            crate::hash_partitioner::PartitionStrategy::Hash { .. }
+                        )
+                    })
+                    .unwrap_or(false);
+            let exchange_output_count = exchange_infos.len();
             let hash_partition_info: Option<(usize, Vec<i32>)> = if is_hash_partitioned {
-                exchange_dests.as_ref().and_then(|e| {
-                    if let crate::hash_partitioner::PartitionStrategy::Hash { num_destinations, ref partition_exprs, .. } = &e.partition {
+                exchange_infos.first().and_then(|e| {
+                    if let crate::hash_partitioner::PartitionStrategy::Hash {
+                        num_destinations,
+                        ref partition_exprs,
+                        ..
+                    } = &e.partition
+                    {
                         // Partition columns are the leading output columns from the AGG/data node.
                         // For AGG→EXCHANGE plans: output = [group_by_keys..., agg_results...],
                         // and partition_exprs reference the group_by_keys (first N columns).
                         let col_indices: Vec<i32> = (0..partition_exprs.len() as i32).collect();
                         Some((*num_destinations, col_indices))
-                    } else { None }
+                    } else {
+                        None
+                    }
                 })
-            } else { None };
+            } else {
+                None
+            };
+            let exec_output_names = output_names.clone();
+            let exec_output_indices = output_indices.clone();
 
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                 let t_total = std::time::Instant::now();
                 let engine = engine.lock().unwrap();
                 if should_retain {
-                    if let Err(e) = engine.retain_gpu_buffers() {
-                        tracing::warn!(error = %e, "failed to set retain_gpu_buffers, nixl may not work");
+                    let _ = engine.finalize_exchange_tables_direct();
+                    let partition_spec = hash_partition_info
+                        .as_ref()
+                        .map(|(num_dests, col_indices)| (*num_dests, col_indices.as_slice()));
+                    if let Err(e) = engine.begin_exchange_capture(partition_spec) {
+                        tracing::warn!(error = %e, "failed to begin exchange capture, nixl may not work");
                     } else {
-                        tracing::info!("retain_gpu_buffers set before GPU execution");
-                    }
-                    // Set GPU hash partition config if needed.
-                    if let Some((num_dests, ref col_indices)) = hash_partition_info {
-                        if let Err(e) = engine.set_exchange_partition(num_dests, col_indices) {
-                            tracing::warn!(error = %e, "failed to set GPU partition config");
-                        } else {
-                            tracing::info!(num_dests, cols = ?col_indices, "GPU hash partition config set");
-                        }
+                        tracing::info!("exchange capture started before GPU execution");
                     }
                 }
                 let t_exec = std::time::Instant::now();
-                let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
+                let ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
                 tracing::info!(exec_ms = t_exec.elapsed().as_millis() as u64, ipc_len = ipc_bytes.len(), "execute_plan completed");
-                if let Some(names) = output_names {
-                    ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
+                if let Some(names) = exec_output_names {
+                    tracing::info!(
+                        exchange_outputs = exchange_output_count,
+                        output_names = ?names,
+                        output_indices = ?exec_output_indices,
+                        "skipping leaf IPC projection for exchange send"
+                    );
                 }
                 // Build ExecutionLocation from packed GPU data only.
                 // We skip the old detect_execution_location (GPUBufferManager individual
                 // buffers) entirely — those RMM sub-allocations can't be registered with
                 // nixl (UCX rejects them). The packed staging buffer is pre-registered.
                 let location = if should_retain {
-                    let partitions = engine.get_packed_partitions().unwrap_or_default();
-                    if !partitions.is_empty() {
-                        // Hash-partitioned: per-partition packed GPU buffers.
-                        let packed = engine.get_packed_gpu().ok().flatten();
-                        if let Some((addr, size, metadata)) = packed {
-                            tracing::info!(addr = format_args!("0x{addr:x}"), size, metadata_len = metadata.len(),
-                                          num_partitions = partitions.len(),
-                                          "packed GPU for hash-partitioned exchange");
-                            let mut loc = crate::nixl_integration::ExecutionLocation::from_packed(
-                                addr, size, metadata, ipc_bytes);
-                            loc.set_packed_partitions(partitions);
-                            loc
-                        } else {
-                            tracing::info!("partitions present but no packed GPU, using CPU path");
-                            crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                        }
-                    } else {
-                        // Broadcast: per-batch packed GPU buffers (accumulated across batches).
-                        let broadcast_entries = engine.get_packed_broadcast_entries().unwrap_or_default();
-                        if !broadcast_entries.is_empty() {
-                            let packed = engine.get_packed_gpu().ok().flatten();
-                            let staging_addr = packed.as_ref().map(|(a, _, _)| *a).unwrap_or(0);
-                            tracing::info!(
-                                num_entries = broadcast_entries.len(),
-                                staging_addr = format_args!("0x{staging_addr:x}"),
-                                "packed GPU for broadcast exchange"
-                            );
-                            crate::nixl_integration::ExecutionLocation::from_broadcast_entries(
-                                staging_addr, broadcast_entries, ipc_bytes)
-                        } else {
-                            tracing::info!("no packed GPU data for broadcast, using CPU IPC path");
-                            crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                        }
-                    }
+                    let artifact = engine.take_exchange_artifact()
+                        .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                    exchange_location_from_artifact(ipc_bytes, artifact)
                 } else {
                     crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                 };
-                // Move session to completed BEFORE releasing engine lock.
-                if should_retain {
-                    let _ = engine.take_current_session();
-                }
                 tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
                 Ok(location)
             })
             .await;
 
-            // Helper to release retained GPU buffers after nixl transfer (or on error).
-            let release_retained = |engine_arc: &Option<std::sync::Arc<std::sync::Mutex<sirius_ffi::SiriusEngine>>>| {
-                if should_retain {
-                    if let Some(eng) = engine_arc {
-                        let eng = eng.lock().unwrap();
-                        if let Err(e) = eng.release_gpu_buffers() {
-                            tracing::warn!(error = %e, "failed to release retained GPU buffers");
-                        }
-                    }
-                }
-            };
-
             match exec_result {
                 Ok(Ok(location)) => {
-                    if let Some(exch_info) = exchange_dests {
+                    if !exchange_infos.is_empty() {
                         // Send result to remote BEs via nixl GPU-direct or bRPC fallback.
                         let query_id = (params.query_id.hi, params.query_id.lo);
                         let sender_id = params
@@ -2944,43 +3705,109 @@ impl PBackendService for PBackendServiceHandler {
                             .and_then(|lp| lp.first())
                             .map(|p| p.sender_id.unwrap_or(0))
                             .unwrap_or(0);
-                        info!(
-                            %finst_id,
-                            dest_node_id = exch_info.dest_node_id,
-                            num_dests = exch_info.destinations.len(),
-                            "sending execution result to exchange destinations"
-                        );
                         // Extract slot descriptors for hash partition column resolution.
                         let desc_tbl_slots: Option<Vec<(i32, String)>> = params
                             .desc_tbl
                             .as_ref()
                             .and_then(|dt| dt.slot_descriptors.as_ref())
-                            .map(|slots| slots.iter().map(|s| (s.id, s.col_name.clone())).collect());
-                        if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
-                            self.nixl_agent.as_ref(),
-                            location,
-                            &exch_info,
-                            query_id,
-                            sender_id,
-                            self.nixl_only,
-                            &self.local_brpc_addr,
-                            &self.exchange_buffer,
-                            desc_tbl_slots.as_deref(),
-                        )
-                        .await
-                        {
-                            release_retained(&self.engine);
+                            .map(|slots| {
+                                slots.iter().map(|s| (s.id, s.col_name.clone())).collect()
+                            });
+                        let mut exchange_infos = exchange_infos;
+                        for exch_info in &mut exchange_infos {
+                            add_local_exchange_destination(
+                                params,
+                                exch_info,
+                                &self.local_brpc_addr,
+                            );
+                        }
+                        let send_result = if exchange_infos.len() == 1 {
+                            info!(
+                                %finst_id,
+                                dest_node_id = exchange_infos[0].dest_node_id,
+                                num_dests = exchange_infos[0].destinations.len(),
+                                "sending execution result to exchange destinations"
+                            );
+                            match maybe_project_location_for_exchange(location, &exchange_infos[0])
+                            {
+                                Ok(projected_location) => {
+                                    crate::nixl_integration::send_exchange_with_nixl(
+                                        self.nixl_agent.as_ref(),
+                                        projected_location,
+                                        &exchange_infos[0],
+                                        query_id,
+                                        sender_id,
+                                        self.nixl_only,
+                                        &self.local_brpc_addr,
+                                        &self.exchange_buffer,
+                                        desc_tbl_slots.as_deref(),
+                                    )
+                                    .await
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            let ipc_bytes = location.into_ipc_bytes();
+                            let mut result = Ok(());
+                            for exch_info in &exchange_infos {
+                                info!(
+                                    %finst_id,
+                                    dest_node_id = exch_info.dest_node_id,
+                                    num_dests = exch_info.destinations.len(),
+                                    "sending multicast execution result to exchange destinations"
+                                );
+                                let projected_ipc =
+                                    match project_ipc_for_exchange(&ipc_bytes, exch_info) {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            result = Err(e);
+                                            break;
+                                        }
+                                    };
+                                if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
+                                    self.nixl_agent.as_ref(),
+                                    crate::nixl_integration::ExecutionLocation::Cpu(projected_ipc),
+                                    exch_info,
+                                    query_id,
+                                    sender_id,
+                                    self.nixl_only,
+                                    &self.local_brpc_addr,
+                                    &self.exchange_buffer,
+                                    desc_tbl_slots.as_deref(),
+                                )
+                                .await
+                                {
+                                    result = Err(e);
+                                    break;
+                                }
+                            }
+                            result
+                        };
+                        if let Err(e) = send_result {
                             warn!(error = %e, %finst_id, "exchange send failed");
                             return Ok(Response::new(PExecPlanFragmentResult {
                                 status: err_status(&format!("exchange send: {e}")),
                                 ..Default::default()
                             }));
                         }
-                        release_retained(&self.engine);
                         info!(%finst_id, "exchange send complete");
                     } else {
                         // No exchange destinations — store result locally for fetch_data.
-                        let ipc_bytes = location.into_ipc_bytes();
+                        let mut ipc_bytes = location.into_ipc_bytes();
+                        if let Some(names) = output_names.as_ref() {
+                            tracing::info!(
+                                output_names = ?names,
+                                output_indices = ?output_indices,
+                                "projecting final IPC result before storing"
+                            );
+                            match project_ipc_columns(&ipc_bytes, names, output_indices.as_deref())
+                            {
+                                Ok(projected) => ipc_bytes = projected,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "final IPC projection failed, storing raw result")
+                                }
+                            }
+                        }
                         if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {
                             warn!(error = %e, %finst_id, "failed to store result");
                             return Ok(Response::new(PExecPlanFragmentResult {
@@ -2998,7 +3825,6 @@ impl PBackendService for PBackendServiceHandler {
                     }
                 }
                 Ok(Err(e)) => {
-                    release_retained(&self.engine);
                     warn!(error = %e, %finst_id, "execution failed");
                     return Ok(Response::new(PExecPlanFragmentResult {
                         status: err_status(&format!("execution: {e}")),
@@ -3006,7 +3832,6 @@ impl PBackendService for PBackendServiceHandler {
                     }));
                 }
                 Err(e) => {
-                    release_retained(&self.engine);
                     warn!(error = %e, "spawn_blocking panicked");
                     return Ok(Response::new(PExecPlanFragmentResult {
                         status: err_status(&format!("internal: {e}")),
@@ -3136,7 +3961,10 @@ impl PBackendService for PBackendServiceHandler {
         info!(finst_id = ?req.finst_id, "fetch_arrow_flight_schema");
 
         let finst_id = match req.finst_id {
-            Some(id) => FinstId { hi: id.hi, lo: id.lo },
+            Some(id) => FinstId {
+                hi: id.hi,
+                lo: id.lo,
+            },
             None => {
                 return Ok(Response::new(PFetchArrowFlightSchemaResult {
                     status: Some(err_status("missing finst_id")),
@@ -3156,9 +3984,9 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
-        let schema_bytes = entry.schema_ipc_bytes().map_err(|e| {
-            Status::internal(format!("failed to serialize schema: {e}"))
-        })?;
+        let schema_bytes = entry
+            .schema_ipc_bytes()
+            .map_err(|e| Status::internal(format!("failed to serialize schema: {e}")))?;
 
         Ok(Response::new(PFetchArrowFlightSchemaResult {
             status: Some(ok_status()),
@@ -3180,7 +4008,11 @@ impl PBackendService for PBackendServiceHandler {
         info!(%finst_id, "fetch_data");
 
         // Wait for the result — execution may still be in progress when FE calls fetch_data.
-        let entry = match self.result_store.wait_for(&finst_id, std::time::Duration::from_secs(60)).await {
+        let entry = match self
+            .result_store
+            .wait_for(&finst_id, std::time::Duration::from_secs(60))
+            .await
+        {
             Some(e) => e,
             None => {
                 warn!(%finst_id, "fetch_data: result not found after 60s timeout");
@@ -3229,31 +4061,150 @@ impl PBackendService for PBackendServiceHandler {
 
     // --- Stub implementations for unsupported methods ---
 
-    async fn fetch_arrow_data(&self, _: Request<PFetchArrowDataRequest>) -> Result<Response<PFetchArrowDataResult>, Status> { Err(unimpl()) }
-    async fn tablet_writer_open(&self, _: Request<PTabletWriterOpenRequest>) -> Result<Response<PTabletWriterOpenResult>, Status> { Err(unimpl()) }
-    async fn open_load_stream(&self, _: Request<POpenLoadStreamRequest>) -> Result<Response<POpenLoadStreamResponse>, Status> { Err(unimpl()) }
-    async fn tablet_writer_add_block(&self, _: Request<PTabletWriterAddBlockRequest>) -> Result<Response<PTabletWriterAddBlockResult>, Status> { Err(unimpl()) }
-    async fn tablet_writer_add_block_by_http(&self, _: Request<PEmptyRequest>) -> Result<Response<PTabletWriterAddBlockResult>, Status> { Err(unimpl()) }
-    async fn tablet_writer_cancel(&self, _: Request<PTabletWriterCancelRequest>) -> Result<Response<PTabletWriterCancelResult>, Status> { Err(unimpl()) }
-    async fn get_info(&self, _: Request<PProxyRequest>) -> Result<Response<PProxyResult>, Status> { Err(unimpl()) }
-    async fn update_cache(&self, _: Request<PUpdateCacheRequest>) -> Result<Response<PCacheResponse>, Status> { Err(unimpl()) }
-    async fn fetch_cache(&self, _: Request<PFetchCacheRequest>) -> Result<Response<PFetchCacheResult>, Status> { Err(unimpl()) }
-    async fn clear_cache(&self, _: Request<PClearCacheRequest>) -> Result<Response<PCacheResponse>, Status> { Err(unimpl()) }
-    async fn send_data(&self, _: Request<PSendDataRequest>) -> Result<Response<PSendDataResult>, Status> { Err(unimpl()) }
-    async fn commit(&self, _: Request<PCommitRequest>) -> Result<Response<PCommitResult>, Status> { Err(unimpl()) }
-    async fn rollback(&self, _: Request<PRollbackRequest>) -> Result<Response<PRollbackResult>, Status> { Err(unimpl()) }
-    async fn merge_filter(&self, _: Request<PMergeFilterRequest>) -> Result<Response<PMergeFilterResponse>, Status> { Err(unimpl()) }
-    async fn send_filter_size(&self, _: Request<PSendFilterSizeRequest>) -> Result<Response<PSendFilterSizeResponse>, Status> { Err(unimpl()) }
-    async fn sync_filter_size(&self, _: Request<PSyncFilterSizeRequest>) -> Result<Response<PSyncFilterSizeResponse>, Status> { Err(unimpl()) }
-    async fn apply_filterv2(&self, _: Request<PPublishFilterRequestV2>) -> Result<Response<PPublishFilterResponse>, Status> { Err(unimpl()) }
-    async fn fold_constant_expr(&self, _: Request<PConstantExprRequest>) -> Result<Response<PConstantExprResult>, Status> { Err(unimpl()) }
-    async fn transmit_block_by_http(&self, _: Request<PEmptyRequest>) -> Result<Response<PTransmitDataResult>, Status> { Err(unimpl()) }
-    async fn check_rpc_channel(&self, _: Request<PCheckRpcChannelRequest>) -> Result<Response<PCheckRpcChannelResponse>, Status> { Err(unimpl()) }
-    async fn reset_rpc_channel(&self, _: Request<PResetRpcChannelRequest>) -> Result<Response<PResetRpcChannelResponse>, Status> { Err(unimpl()) }
-    async fn hand_shake(&self, _: Request<PHandShakeRequest>) -> Result<Response<PHandShakeResponse>, Status> { Err(unimpl()) }
-    async fn request_slave_tablet_pull_rowset(&self, _: Request<PTabletWriteSlaveRequest>) -> Result<Response<PTabletWriteSlaveResult>, Status> { Err(unimpl()) }
-    async fn response_slave_tablet_pull_rowset(&self, _: Request<PTabletWriteSlaveDoneRequest>) -> Result<Response<PTabletWriteSlaveDoneResult>, Status> { Err(unimpl()) }
-    async fn outfile_write_success(&self, _: Request<POutfileWriteSuccessRequest>) -> Result<Response<POutfileWriteSuccessResult>, Status> { Err(unimpl()) }
+    async fn fetch_arrow_data(
+        &self,
+        _: Request<PFetchArrowDataRequest>,
+    ) -> Result<Response<PFetchArrowDataResult>, Status> {
+        Err(unimpl())
+    }
+    async fn tablet_writer_open(
+        &self,
+        _: Request<PTabletWriterOpenRequest>,
+    ) -> Result<Response<PTabletWriterOpenResult>, Status> {
+        Err(unimpl())
+    }
+    async fn open_load_stream(
+        &self,
+        _: Request<POpenLoadStreamRequest>,
+    ) -> Result<Response<POpenLoadStreamResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn tablet_writer_add_block(
+        &self,
+        _: Request<PTabletWriterAddBlockRequest>,
+    ) -> Result<Response<PTabletWriterAddBlockResult>, Status> {
+        Err(unimpl())
+    }
+    async fn tablet_writer_add_block_by_http(
+        &self,
+        _: Request<PEmptyRequest>,
+    ) -> Result<Response<PTabletWriterAddBlockResult>, Status> {
+        Err(unimpl())
+    }
+    async fn tablet_writer_cancel(
+        &self,
+        _: Request<PTabletWriterCancelRequest>,
+    ) -> Result<Response<PTabletWriterCancelResult>, Status> {
+        Err(unimpl())
+    }
+    async fn get_info(&self, _: Request<PProxyRequest>) -> Result<Response<PProxyResult>, Status> {
+        Err(unimpl())
+    }
+    async fn update_cache(
+        &self,
+        _: Request<PUpdateCacheRequest>,
+    ) -> Result<Response<PCacheResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn fetch_cache(
+        &self,
+        _: Request<PFetchCacheRequest>,
+    ) -> Result<Response<PFetchCacheResult>, Status> {
+        Err(unimpl())
+    }
+    async fn clear_cache(
+        &self,
+        _: Request<PClearCacheRequest>,
+    ) -> Result<Response<PCacheResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn send_data(
+        &self,
+        _: Request<PSendDataRequest>,
+    ) -> Result<Response<PSendDataResult>, Status> {
+        Err(unimpl())
+    }
+    async fn commit(&self, _: Request<PCommitRequest>) -> Result<Response<PCommitResult>, Status> {
+        Err(unimpl())
+    }
+    async fn rollback(
+        &self,
+        _: Request<PRollbackRequest>,
+    ) -> Result<Response<PRollbackResult>, Status> {
+        Err(unimpl())
+    }
+    async fn merge_filter(
+        &self,
+        _: Request<PMergeFilterRequest>,
+    ) -> Result<Response<PMergeFilterResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn send_filter_size(
+        &self,
+        _: Request<PSendFilterSizeRequest>,
+    ) -> Result<Response<PSendFilterSizeResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn sync_filter_size(
+        &self,
+        _: Request<PSyncFilterSizeRequest>,
+    ) -> Result<Response<PSyncFilterSizeResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn apply_filterv2(
+        &self,
+        _: Request<PPublishFilterRequestV2>,
+    ) -> Result<Response<PPublishFilterResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn fold_constant_expr(
+        &self,
+        _: Request<PConstantExprRequest>,
+    ) -> Result<Response<PConstantExprResult>, Status> {
+        Err(unimpl())
+    }
+    async fn transmit_block_by_http(
+        &self,
+        _: Request<PEmptyRequest>,
+    ) -> Result<Response<PTransmitDataResult>, Status> {
+        Err(unimpl())
+    }
+    async fn check_rpc_channel(
+        &self,
+        _: Request<PCheckRpcChannelRequest>,
+    ) -> Result<Response<PCheckRpcChannelResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn reset_rpc_channel(
+        &self,
+        _: Request<PResetRpcChannelRequest>,
+    ) -> Result<Response<PResetRpcChannelResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn hand_shake(
+        &self,
+        _: Request<PHandShakeRequest>,
+    ) -> Result<Response<PHandShakeResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn request_slave_tablet_pull_rowset(
+        &self,
+        _: Request<PTabletWriteSlaveRequest>,
+    ) -> Result<Response<PTabletWriteSlaveResult>, Status> {
+        Err(unimpl())
+    }
+    async fn response_slave_tablet_pull_rowset(
+        &self,
+        _: Request<PTabletWriteSlaveDoneRequest>,
+    ) -> Result<Response<PTabletWriteSlaveDoneResult>, Status> {
+        Err(unimpl())
+    }
+    async fn outfile_write_success(
+        &self,
+        _: Request<POutfileWriteSuccessRequest>,
+    ) -> Result<Response<POutfileWriteSuccessResult>, Status> {
+        Err(unimpl())
+    }
     async fn fetch_table_schema(
         &self,
         request: Request<PFetchTableSchemaRequest>,
@@ -3274,7 +4225,7 @@ impl PBackendService for PBackendServiceHandler {
         };
 
         let (file_path, file_format) = {
-            use thrift::protocol::{TCompactInputProtocol, TBinaryInputProtocol, TSerializable};
+            use thrift::protocol::{TBinaryInputProtocol, TCompactInputProtocol, TSerializable};
             use thrift::transport::TBufferedReadTransport;
 
             info!(
@@ -3314,7 +4265,8 @@ impl PBackendService for PBackendServiceHandler {
             };
 
             // Try compact first, then binary protocol.
-            let transport = TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes.clone())));
+            let transport =
+                TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes.clone())));
             let mut protocol = TCompactInputProtocol::new(transport);
             match doris_thrift::plan_nodes::TFileScanRange::read_from_in_protocol(&mut protocol) {
                 Ok(fsr) => {
@@ -3328,9 +4280,12 @@ impl PBackendService for PBackendServiceHandler {
                 }
                 Err(e) => {
                     warn!(error = %e, "fetch_table_schema: compact deser failed, trying binary");
-                    let transport = TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes)));
+                    let transport =
+                        TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes)));
                     let mut protocol = TBinaryInputProtocol::new(transport, true);
-                    match doris_thrift::plan_nodes::TFileScanRange::read_from_in_protocol(&mut protocol) {
+                    match doris_thrift::plan_nodes::TFileScanRange::read_from_in_protocol(
+                        &mut protocol,
+                    ) {
                         Ok(fsr) => {
                             info!(
                                 has_ranges = fsr.ranges.is_some(),
@@ -3391,35 +4346,39 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
-        let result = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<PTypeDesc>), String> {
-            let engine = engine.lock().unwrap();
-            // Get schema via prepared statement metadata (no data read needed).
-            let ipc_bytes = engine
-                .get_file_schema_ipc(&file_path, &format)
-                .map_err(|e| e.to_string())?;
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<String>, Vec<PTypeDesc>), String> {
+                let engine = engine.lock().unwrap();
+                // Get schema via prepared statement metadata (no data read needed).
+                let ipc_bytes = engine
+                    .get_file_schema_ipc(&file_path, &format)
+                    .map_err(|e| e.to_string())?;
 
-            if ipc_bytes.is_empty() {
-                return Err("empty schema IPC from get_file_schema_ipc".to_string());
-            }
+                if ipc_bytes.is_empty() {
+                    return Err("empty schema IPC from get_file_schema_ipc".to_string());
+                }
 
-            // Parse Arrow IPC to get schema.
-            use arrow::ipc::reader::StreamReader;
-            let reader = StreamReader::try_new(std::io::Cursor::new(&ipc_bytes), None)
-                .map_err(|e| format!("parse Arrow IPC: {e}"))?;
-            let schema = reader.schema();
+                // Parse Arrow IPC to get schema.
+                use arrow::ipc::reader::StreamReader;
+                let reader = StreamReader::try_new(std::io::Cursor::new(&ipc_bytes), None)
+                    .map_err(|e| format!("parse Arrow IPC: {e}"))?;
+                let schema = reader.schema();
 
-            let mut names = Vec::new();
-            let mut types = Vec::new();
-            for field in schema.fields() {
-                names.push(field.name().clone());
-                types.push(arrow_type_to_doris(field.data_type()));
-            }
-            Ok((names, types))
-        }).await.map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
-            .map_err(|e| {
-                warn!(error = %e, "fetch_table_schema: failed");
-                Status::internal(format!("describe: {e}"))
-            })?;
+                let mut names = Vec::new();
+                let mut types = Vec::new();
+                for field in schema.fields() {
+                    names.push(field.name().clone());
+                    types.push(arrow_type_to_doris(field.data_type()));
+                }
+                Ok((names, types))
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+        .map_err(|e| {
+            warn!(error = %e, "fetch_table_schema: failed");
+            Status::internal(format!("describe: {e}"))
+        })?;
 
         let (column_names, column_types) = result;
         let column_nums = column_names.len() as i32;
@@ -3433,16 +4392,64 @@ impl PBackendService for PBackendServiceHandler {
             column_types,
         }))
     }
-    async fn multiget_data(&self, _: Request<PMultiGetRequest>) -> Result<Response<PMultiGetResponse>, Status> { Err(unimpl()) }
-    async fn multiget_data_v2(&self, _: Request<PMultiGetRequestV2>) -> Result<Response<PMultiGetResponseV2>, Status> { Err(unimpl()) }
-    async fn get_file_cache_meta_by_tablet_id(&self, _: Request<PGetFileCacheMetaRequest>) -> Result<Response<PGetFileCacheMetaResponse>, Status> { Err(unimpl()) }
-    async fn warm_up_rowset(&self, _: Request<PWarmUpRowsetRequest>) -> Result<Response<PWarmUpRowsetResponse>, Status> { Err(unimpl()) }
-    async fn recycle_cache(&self, _: Request<PRecycleCacheRequest>) -> Result<Response<PRecycleCacheResponse>, Status> { Err(unimpl()) }
-    async fn tablet_fetch_data(&self, _: Request<PTabletKeyLookupRequest>) -> Result<Response<PTabletKeyLookupResponse>, Status> { Err(unimpl()) }
-    async fn get_column_ids_by_tablet_ids(&self, _: Request<PFetchColIdsRequest>) -> Result<Response<PFetchColIdsResponse>, Status> { Err(unimpl()) }
-    async fn get_tablet_rowset_versions(&self, _: Request<PGetTabletVersionsRequest>) -> Result<Response<PGetTabletVersionsResponse>, Status> { Err(unimpl()) }
-    async fn report_stream_load_status(&self, _: Request<PReportStreamLoadStatusRequest>) -> Result<Response<PReportStreamLoadStatusResponse>, Status> { Err(unimpl()) }
-    async fn glob(&self, request: Request<PGlobRequest>) -> Result<Response<PGlobResponse>, Status> {
+    async fn multiget_data(
+        &self,
+        _: Request<PMultiGetRequest>,
+    ) -> Result<Response<PMultiGetResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn multiget_data_v2(
+        &self,
+        _: Request<PMultiGetRequestV2>,
+    ) -> Result<Response<PMultiGetResponseV2>, Status> {
+        Err(unimpl())
+    }
+    async fn get_file_cache_meta_by_tablet_id(
+        &self,
+        _: Request<PGetFileCacheMetaRequest>,
+    ) -> Result<Response<PGetFileCacheMetaResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn warm_up_rowset(
+        &self,
+        _: Request<PWarmUpRowsetRequest>,
+    ) -> Result<Response<PWarmUpRowsetResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn recycle_cache(
+        &self,
+        _: Request<PRecycleCacheRequest>,
+    ) -> Result<Response<PRecycleCacheResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn tablet_fetch_data(
+        &self,
+        _: Request<PTabletKeyLookupRequest>,
+    ) -> Result<Response<PTabletKeyLookupResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn get_column_ids_by_tablet_ids(
+        &self,
+        _: Request<PFetchColIdsRequest>,
+    ) -> Result<Response<PFetchColIdsResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn get_tablet_rowset_versions(
+        &self,
+        _: Request<PGetTabletVersionsRequest>,
+    ) -> Result<Response<PGetTabletVersionsResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn report_stream_load_status(
+        &self,
+        _: Request<PReportStreamLoadStatusRequest>,
+    ) -> Result<Response<PReportStreamLoadStatusResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn glob(
+        &self,
+        request: Request<PGlobRequest>,
+    ) -> Result<Response<PGlobResponse>, Status> {
         let req = request.into_inner();
         let pattern = req.pattern.unwrap_or_default();
         info!(pattern = %pattern, "glob");
@@ -3525,18 +4532,78 @@ impl PBackendService for PBackendServiceHandler {
             files,
         }))
     }
-    async fn group_commit_insert(&self, _: Request<PGroupCommitInsertRequest>) -> Result<Response<PGroupCommitInsertResponse>, Status> { Err(unimpl()) }
-    async fn get_wal_queue_size(&self, _: Request<PGetWalQueueSizeRequest>) -> Result<Response<PGetWalQueueSizeResponse>, Status> { Err(unimpl()) }
-    async fn fetch_remote_tablet_schema(&self, _: Request<PFetchRemoteSchemaRequest>) -> Result<Response<PFetchRemoteSchemaResponse>, Status> { Err(unimpl()) }
-    async fn test_jdbc_connection(&self, _: Request<PJdbcTestConnectionRequest>) -> Result<Response<PJdbcTestConnectionResult>, Status> { Err(unimpl()) }
-    async fn alter_vault_sync(&self, _: Request<PAlterVaultSyncRequest>) -> Result<Response<PAlterVaultSyncResponse>, Status> { Err(unimpl()) }
-    async fn get_be_resource(&self, _: Request<PGetBeResourceRequest>) -> Result<Response<PGetBeResourceResponse>, Status> { Err(unimpl()) }
-    async fn delete_dictionary(&self, _: Request<PDeleteDictionaryRequest>) -> Result<Response<PDeleteDictionaryResponse>, Status> { Err(unimpl()) }
-    async fn commit_refresh_dictionary(&self, _: Request<PCommitRefreshDictionaryRequest>) -> Result<Response<PCommitRefreshDictionaryResponse>, Status> { Err(unimpl()) }
-    async fn abort_refresh_dictionary(&self, _: Request<PAbortRefreshDictionaryRequest>) -> Result<Response<PAbortRefreshDictionaryResponse>, Status> { Err(unimpl()) }
-    async fn get_tablet_rowsets(&self, _: Request<PGetTabletRowsetsRequest>) -> Result<Response<PGetTabletRowsetsResponse>, Status> { Err(unimpl()) }
-    async fn fetch_peer_data(&self, _: Request<PFetchPeerDataRequest>) -> Result<Response<PFetchPeerDataResponse>, Status> { Err(unimpl()) }
-    async fn request_cdc_client(&self, _: Request<PRequestCdcClientRequest>) -> Result<Response<PRequestCdcClientResult>, Status> { Err(unimpl()) }
+    async fn group_commit_insert(
+        &self,
+        _: Request<PGroupCommitInsertRequest>,
+    ) -> Result<Response<PGroupCommitInsertResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn get_wal_queue_size(
+        &self,
+        _: Request<PGetWalQueueSizeRequest>,
+    ) -> Result<Response<PGetWalQueueSizeResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn fetch_remote_tablet_schema(
+        &self,
+        _: Request<PFetchRemoteSchemaRequest>,
+    ) -> Result<Response<PFetchRemoteSchemaResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn test_jdbc_connection(
+        &self,
+        _: Request<PJdbcTestConnectionRequest>,
+    ) -> Result<Response<PJdbcTestConnectionResult>, Status> {
+        Err(unimpl())
+    }
+    async fn alter_vault_sync(
+        &self,
+        _: Request<PAlterVaultSyncRequest>,
+    ) -> Result<Response<PAlterVaultSyncResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn get_be_resource(
+        &self,
+        _: Request<PGetBeResourceRequest>,
+    ) -> Result<Response<PGetBeResourceResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn delete_dictionary(
+        &self,
+        _: Request<PDeleteDictionaryRequest>,
+    ) -> Result<Response<PDeleteDictionaryResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn commit_refresh_dictionary(
+        &self,
+        _: Request<PCommitRefreshDictionaryRequest>,
+    ) -> Result<Response<PCommitRefreshDictionaryResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn abort_refresh_dictionary(
+        &self,
+        _: Request<PAbortRefreshDictionaryRequest>,
+    ) -> Result<Response<PAbortRefreshDictionaryResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn get_tablet_rowsets(
+        &self,
+        _: Request<PGetTabletRowsetsRequest>,
+    ) -> Result<Response<PGetTabletRowsetsResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn fetch_peer_data(
+        &self,
+        _: Request<PFetchPeerDataRequest>,
+    ) -> Result<Response<PFetchPeerDataResponse>, Status> {
+        Err(unimpl())
+    }
+    async fn request_cdc_client(
+        &self,
+        _: Request<PRequestCdcClientRequest>,
+    ) -> Result<Response<PRequestCdcClientResult>, Status> {
+        Err(unimpl())
+    }
 }
 
 /// Start the PBackendService server with multi-protocol support.
@@ -3561,7 +4628,10 @@ pub async fn start_grpc_server(
     use tokio_stream::StreamExt;
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    info!(addr = listen_addr, "starting PBackendService multi-protocol server (gRPC + bRPC)");
+    info!(
+        addr = listen_addr,
+        "starting PBackendService multi-protocol server (gRPC + bRPC)"
+    );
 
     // Clone before moving into handler (nixl service also needs these).
     let nixl_agent_for_service = nixl_agent.clone();
@@ -3577,10 +4647,8 @@ pub async fn start_grpc_server(
         nixl_only,
     );
 
-    let dispatcher = super::transfer_engine::TransferDispatcher::standard(
-        nixl_agent.clone(),
-        nixl_only,
-    );
+    let dispatcher =
+        super::transfer_engine::TransferDispatcher::standard(nixl_agent.clone(), nixl_only);
     handler = handler
         .with_nixl_agent(nixl_agent)
         .with_transfer_dispatcher(dispatcher)
@@ -3589,22 +4657,21 @@ pub async fn start_grpc_server(
     let svc = PBackendServiceServer::new(handler);
 
     // Channel to feed gRPC connections to tonic's serve_with_incoming.
-    let (grpc_tx, grpc_rx) =
-        tokio::sync::mpsc::channel::<tokio::net::TcpStream>(64);
+    let (grpc_tx, grpc_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(64);
 
     // Build gRPC server with PBackendService + NixlMetadataService.
-    let mut server_builder = tonic::transport::Server::builder()
-        .add_service(svc);
+    let mut server_builder = tonic::transport::Server::builder().add_service(svc);
 
     {
         use doris_proto::nixl::NixlMetadataServiceServer;
         let nixl_handler = super::nixl_service::NixlMetadataServiceHandler::new(
             nixl_agent_for_service,
             exchange_buffer.clone(),
-        ).with_engine(engine_for_nixl);
+        )
+        .with_engine(engine_for_nixl);
         // Increase message size limits for large Arrow IPC payloads in transfer_complete.
         let nixl_svc = NixlMetadataServiceServer::new(nixl_handler)
-            .max_decoding_message_size(256 * 1024 * 1024)   // 256 MB
+            .max_decoding_message_size(256 * 1024 * 1024) // 256 MB
             .max_encoding_message_size(256 * 1024 * 1024);
         server_builder = server_builder.add_service(nixl_svc);
         info!("registered NixlMetadataService on gRPC server");
@@ -3613,10 +4680,7 @@ pub async fn start_grpc_server(
     // Spawn tonic gRPC server consuming forwarded connections.
     tokio::spawn(async move {
         let incoming = ReceiverStream::new(grpc_rx).map(Ok::<_, std::io::Error>);
-        if let Err(e) = server_builder
-            .serve_with_incoming(incoming)
-            .await
-        {
+        if let Err(e) = server_builder.serve_with_incoming(incoming).await {
             tracing::error!(error = %e, "tonic gRPC server error");
         }
     });
@@ -3643,17 +4707,23 @@ pub async fn start_grpc_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use doris_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink, TMultiCastDataStreamSink};
+    use doris_thrift::data_sinks::{
+        TDataSink, TDataSinkType, TDataStreamSink, TMultiCastDataStreamSink,
+    };
+    use doris_thrift::descriptors::{TDescriptorTable, TSlotDescriptor, TTupleDescriptor};
+    use doris_thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
     use doris_thrift::partitions::{TDataPartition, TPartitionType};
     use doris_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType};
-    use doris_thrift::types::{TNetworkAddress, TUniqueId};
+    use doris_thrift::types::{
+        TNetworkAddress, TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType,
+        TUniqueId,
+    };
     use std::collections::BTreeMap;
 
     /// Create a minimal TPipelineFragmentParams with the given plan nodes.
     fn make_params(nodes: Vec<TPlanNode>) -> TPipelineFragmentParams {
         TPipelineFragmentParams {
-            protocol_version:
-                doris_thrift::palo_internal_service::PaloInternalServiceVersion::V1,
+            protocol_version: doris_thrift::palo_internal_service::PaloInternalServiceVersion::V1,
             query_id: TUniqueId { hi: 1, lo: 2 },
             fragment_id: Some(0),
             per_exch_num_senders: BTreeMap::new(),
@@ -3810,6 +4880,141 @@ mod tests {
         }
     }
 
+    fn bigint_type_desc() -> TTypeDesc {
+        TTypeDesc {
+            types: Some(vec![TTypeNode {
+                type_: TTypeNodeType::SCALAR,
+                scalar_type: Some(TScalarType {
+                    type_: TPrimitiveType::BIGINT,
+                    len: None,
+                    precision: None,
+                    scale: None,
+                    variant_max_subcolumns_count: None,
+                }),
+                struct_fields: None,
+                contains_null: None,
+                contains_nulls: None,
+            }]),
+            is_nullable: Some(true),
+            byte_size: None,
+            sub_types: None,
+            result_is_nullable: None,
+            function_name: None,
+            be_exec_version: None,
+        }
+    }
+
+    fn slot_ref_expr(slot_id: i32) -> TExpr {
+        TExpr {
+            nodes: vec![TExprNode {
+                node_type: TExprNodeType::SLOT_REF,
+                type_: bigint_type_desc(),
+                num_children: 0,
+                fn_: None,
+                opcode: None,
+                child_type: None,
+                output_scale: 0,
+                is_nullable: None,
+                vector_opcode: None,
+                vararg_start_idx: None,
+                agg_expr: None,
+                int_literal: None,
+                float_literal: None,
+                string_literal: None,
+                bool_literal: None,
+                decimal_literal: None,
+                date_literal: None,
+                large_int_literal: None,
+                json_literal: None,
+                slot_ref: Some(TSlotRef {
+                    slot_id,
+                    tuple_id: 0,
+                    col_unique_id: None,
+                    is_virtual_slot: None,
+                }),
+                case_expr: None,
+                in_predicate: None,
+                is_null_pred: None,
+                like_pred: None,
+                literal_pred: None,
+                info_func: None,
+                tuple_is_null_pred: None,
+                fn_call_expr: None,
+                output_column: None,
+                output_type: None,
+                schema_change_expr: None,
+                column_ref: None,
+                match_predicate: None,
+                ipv4_literal: None,
+                ipv6_literal: None,
+                label: None,
+                timev2_literal: None,
+                varbinary_literal: None,
+                is_cast_nullable: None,
+                search_param: None,
+            }],
+        }
+    }
+
+    fn make_desc_table() -> TDescriptorTable {
+        TDescriptorTable {
+            tuple_descriptors: vec![TTupleDescriptor {
+                id: 7,
+                byte_size: 0,
+                num_null_bytes: 0,
+                table_id: None,
+                num_null_slots: None,
+            }],
+            slot_descriptors: Some(vec![
+                TSlotDescriptor {
+                    id: 23,
+                    parent: 7,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 0,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "supplier_no".to_string(),
+                    slot_idx: 0,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 24,
+                    parent: 7,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 1,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "total_revenue".to_string(),
+                    slot_idx: 1,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+            ]),
+            table_descriptors: None,
+        }
+    }
+
     // --- has_unresolved_exchanges ---
 
     #[test]
@@ -3820,9 +5025,7 @@ mod tests {
 
     #[test]
     fn test_has_unresolved_exchanges_no_exchanges() {
-        let params = make_params(vec![
-            make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         assert!(has_unresolved_exchanges(&params).is_empty());
     }
 
@@ -3838,9 +5041,7 @@ mod tests {
 
     #[test]
     fn test_has_unresolved_exchanges_receiver_detected() {
-        let params = make_params(vec![
-            make_node(5, TPlanNodeType::EXCHANGE_NODE, 0),
-        ]);
+        let params = make_params(vec![make_node(5, TPlanNodeType::EXCHANGE_NODE, 0)]);
         assert_eq!(has_unresolved_exchanges(&params), vec![5]);
     }
 
@@ -3900,7 +5101,7 @@ mod tests {
     #[test]
     fn test_extract_exchange_destinations_none_without_sink() {
         let params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
-        assert!(extract_exchange_destinations(&params).is_none());
+        assert!(extract_exchange_destinations(&params).is_empty());
     }
 
     #[test]
@@ -3923,28 +5124,28 @@ mod tests {
             dictionary_sink: None,
             blackhole_sink: None,
         });
-        assert!(extract_exchange_destinations(&params).is_none());
+        assert!(extract_exchange_destinations(&params).is_empty());
     }
 
     #[test]
     fn test_extract_exchange_destinations_with_brpc_server() {
         let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         params.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(7));
-        params.destinations = Some(vec![
-            doris_thrift::data_sinks::TPlanFragmentDestination {
-                fragment_instance_id: TUniqueId { hi: 10, lo: 20 },
-                server: TNetworkAddress {
-                    hostname: "192.168.1.1".to_string(),
-                    port: 9060,
-                },
-                brpc_server: Some(TNetworkAddress {
-                    hostname: "192.168.1.1".to_string(),
-                    port: 8060,
-                }),
+        params.destinations = Some(vec![doris_thrift::data_sinks::TPlanFragmentDestination {
+            fragment_instance_id: TUniqueId { hi: 10, lo: 20 },
+            server: TNetworkAddress {
+                hostname: "192.168.1.1".to_string(),
+                port: 9060,
             },
-        ]);
+            brpc_server: Some(TNetworkAddress {
+                hostname: "192.168.1.1".to_string(),
+                port: 8060,
+            }),
+        }]);
 
-        let info = extract_exchange_destinations(&params).unwrap();
+        let infos = extract_exchange_destinations(&params);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.dest_node_id, 7);
         assert_eq!(info.destinations.len(), 1);
         assert_eq!(info.destinations[0].brpc_addr, "192.168.1.1:8060");
@@ -3955,18 +5156,18 @@ mod tests {
     fn test_extract_exchange_destinations_fallback_to_server_addr() {
         let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         params.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(1));
-        params.destinations = Some(vec![
-            doris_thrift::data_sinks::TPlanFragmentDestination {
-                fragment_instance_id: TUniqueId { hi: 30, lo: 40 },
-                server: TNetworkAddress {
-                    hostname: "10.0.0.1".to_string(),
-                    port: 9060,
-                },
-                brpc_server: None,
+        params.destinations = Some(vec![doris_thrift::data_sinks::TPlanFragmentDestination {
+            fragment_instance_id: TUniqueId { hi: 30, lo: 40 },
+            server: TNetworkAddress {
+                hostname: "10.0.0.1".to_string(),
+                port: 9060,
             },
-        ]);
+            brpc_server: None,
+        }]);
 
-        let info = extract_exchange_destinations(&params).unwrap();
+        let infos = extract_exchange_destinations(&params);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.destinations[0].brpc_addr, "10.0.0.1:9060");
     }
 
@@ -3975,7 +5176,7 @@ mod tests {
         let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         params.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(1));
         params.destinations = Some(vec![]);
-        assert!(extract_exchange_destinations(&params).is_none());
+        assert!(extract_exchange_destinations(&params).is_empty());
     }
 
     #[test]
@@ -3985,30 +5186,188 @@ mod tests {
         params.destinations = Some(vec![
             doris_thrift::data_sinks::TPlanFragmentDestination {
                 fragment_instance_id: TUniqueId { hi: 1, lo: 2 },
-                server: TNetworkAddress { hostname: "be1".to_string(), port: 8060 },
+                server: TNetworkAddress {
+                    hostname: "be1".to_string(),
+                    port: 8060,
+                },
                 brpc_server: None,
             },
             doris_thrift::data_sinks::TPlanFragmentDestination {
                 fragment_instance_id: TUniqueId { hi: 3, lo: 4 },
-                server: TNetworkAddress { hostname: "be2".to_string(), port: 8060 },
+                server: TNetworkAddress {
+                    hostname: "be2".to_string(),
+                    port: 8060,
+                },
                 brpc_server: None,
             },
         ]);
 
-        let info = extract_exchange_destinations(&params).unwrap();
+        let infos = extract_exchange_destinations(&params);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.dest_node_id, 5);
         assert_eq!(info.destinations.len(), 2);
         assert_eq!(info.destinations[0].brpc_addr, "be1:8060");
         assert_eq!(info.destinations[1].brpc_addr, "be2:8060");
     }
 
+    #[test]
+    fn test_extract_exchange_destinations_multicast_per_sink() {
+        let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        let mut sink = make_multi_cast_data_stream_sink(&[6, 7]);
+        if let Some(mc) = sink.multi_cast_stream_sink.as_mut() {
+            mc.destinations = Some(vec![
+                vec![doris_thrift::data_sinks::TPlanFragmentDestination {
+                    fragment_instance_id: TUniqueId { hi: 10, lo: 20 },
+                    server: TNetworkAddress {
+                        hostname: "be1".to_string(),
+                        port: 8060,
+                    },
+                    brpc_server: None,
+                }],
+                vec![doris_thrift::data_sinks::TPlanFragmentDestination {
+                    fragment_instance_id: TUniqueId { hi: 30, lo: 40 },
+                    server: TNetworkAddress {
+                        hostname: "be2".to_string(),
+                        port: 8060,
+                    },
+                    brpc_server: None,
+                }],
+            ]);
+        }
+        params.fragment.as_mut().unwrap().output_sink = Some(sink);
+
+        let infos = extract_exchange_destinations(&params);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].dest_node_id, 6);
+        assert_eq!(infos[0].destinations[0].finst_id, (10, 20));
+        assert_eq!(infos[1].dest_node_id, 7);
+        assert_eq!(infos[1].destinations[0].finst_id, (30, 40));
+    }
+
+    #[test]
+    fn test_extract_exchange_destinations_multicast_projection_indices() {
+        let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        params.desc_tbl = Some(make_desc_table());
+        params.fragment.as_mut().unwrap().output_exprs =
+            Some(vec![slot_ref_expr(23), slot_ref_expr(24)]);
+
+        let mut sink = make_multi_cast_data_stream_sink(&[6, 7]);
+        if let Some(mc) = sink.multi_cast_stream_sink.as_mut() {
+            if let Some(sinks) = mc.sinks.as_mut() {
+                sinks[0].output_exprs = Some(vec![slot_ref_expr(23), slot_ref_expr(24)]);
+                sinks[1].output_exprs = Some(vec![slot_ref_expr(24)]);
+            }
+            mc.destinations = Some(vec![
+                vec![doris_thrift::data_sinks::TPlanFragmentDestination {
+                    fragment_instance_id: TUniqueId { hi: 10, lo: 20 },
+                    server: TNetworkAddress {
+                        hostname: "be1".to_string(),
+                        port: 8060,
+                    },
+                    brpc_server: None,
+                }],
+                vec![doris_thrift::data_sinks::TPlanFragmentDestination {
+                    fragment_instance_id: TUniqueId { hi: 30, lo: 40 },
+                    server: TNetworkAddress {
+                        hostname: "be2".to_string(),
+                        port: 8060,
+                    },
+                    brpc_server: None,
+                }],
+            ]);
+        }
+        params.fragment.as_mut().unwrap().output_sink = Some(sink);
+
+        let infos = extract_exchange_destinations(&params);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].output_indices, None);
+        assert_eq!(infos[1].output_indices, Some(vec![1]));
+        assert_eq!(infos[1].output_names, vec!["total_revenue"]);
+    }
+
+    #[test]
+    fn test_exchange_infos_with_local_destinations_adds_local_only_sink() {
+        let mut params = make_params(vec![]);
+        params.per_exch_num_senders.insert(5, 2);
+
+        let infos = exchange_infos_with_local_destinations(
+            &params,
+            vec![ExchangeInfo {
+                dest_node_id: 5,
+                destinations: vec![],
+                partition: crate::hash_partitioner::PartitionStrategy::Broadcast,
+                output_names: vec![],
+                output_indices: None,
+            }],
+            "127.0.0.1:8060",
+        );
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].destinations.len(), 1);
+        assert_eq!(infos[0].destinations[0].brpc_addr, "127.0.0.1:8060");
+    }
+
+    #[test]
+    fn test_exchange_hash_partition_info_uses_augmented_destination_count() {
+        let mut params = make_params(vec![]);
+        params.per_exch_num_senders.insert(5, 2);
+
+        let infos = exchange_infos_with_local_destinations(
+            &params,
+            vec![ExchangeInfo {
+                dest_node_id: 5,
+                destinations: vec![],
+                partition: crate::hash_partitioner::PartitionStrategy::Hash {
+                    partition_exprs: vec![slot_ref_expr(23)],
+                    num_destinations: 0,
+                    use_crc32c: false,
+                },
+                output_names: vec![],
+                output_indices: None,
+            }],
+            "127.0.0.1:8060",
+        );
+
+        assert_eq!(exchange_hash_partition_info(&infos), Some((1, vec![0])));
+    }
+
+    #[test]
+    fn test_should_capture_exchange_artifact_for_local_gpu_exchange() {
+        let infos = vec![ExchangeInfo {
+            dest_node_id: 5,
+            destinations: vec![ExchangeDest {
+                brpc_addr: "127.0.0.1:8060".to_string(),
+                finst_id: (0, 0),
+            }],
+            partition: crate::hash_partitioner::PartitionStrategy::Broadcast,
+            output_names: vec![],
+            output_indices: None,
+        }];
+
+        assert!(should_capture_exchange_artifact(
+            &infos,
+            &ExecPlan::Substrait {
+                bytes: vec![],
+                sort_limit_sql: None,
+            },
+            true,
+        ));
+        assert!(!should_capture_exchange_artifact(
+            &infos,
+            &ExecPlan::SubstraitCpuOnly {
+                bytes: vec![],
+                sort_limit_sql: None,
+            },
+            true,
+        ));
+    }
+
     // --- merge_fragment_plans ---
 
     #[test]
     fn test_merge_single_leaf_fragment() {
-        let params = make_params(vec![
-            make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         let merged = merge_fragment_plans(&[params]);
         assert_eq!(merged.len(), 1);
     }
@@ -4017,17 +5376,19 @@ mod tests {
     fn test_merge_exchange_root_with_leaf() {
         // Fragment 0: EXCHANGE_NODE(0 children) — result collector
         // Fragment 1: FILE_SCAN_NODE — leaf scan
-        let root = make_params(vec![
-            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
-        ]);
-        let leaf = make_params(vec![
-            make_node(1, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let root = make_params(vec![make_node(0, TPlanNodeType::EXCHANGE_NODE, 0)]);
+        let leaf = make_params(vec![make_node(1, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         let merged = merge_fragment_plans(&[root, leaf]);
         assert_eq!(merged.len(), 1);
         let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
-        assert!(plan.nodes.iter().any(|n| n.node_type == TPlanNodeType::FILE_SCAN_NODE));
-        assert!(!plan.nodes.iter().any(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE));
+        assert!(plan
+            .nodes
+            .iter()
+            .any(|n| n.node_type == TPlanNodeType::FILE_SCAN_NODE));
+        assert!(!plan
+            .nodes
+            .iter()
+            .any(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE));
     }
 
     #[test]
@@ -4038,9 +5399,7 @@ mod tests {
             make_node(0, TPlanNodeType::SORT_NODE, 1),
             make_node(1, TPlanNodeType::EXCHANGE_NODE, 0),
         ]);
-        let leaf = make_params(vec![
-            make_node(2, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let leaf = make_params(vec![make_node(2, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         let merged = merge_fragment_plans(&[intermediate, leaf]);
         assert_eq!(merged.len(), 1);
         let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
@@ -4059,9 +5418,7 @@ mod tests {
         exchange_root.per_exch_num_senders.insert(1, 1);
         exchange_root.per_exch_num_senders.insert(3, 1);
 
-        let leaf = make_params(vec![
-            make_node(2, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let leaf = make_params(vec![make_node(2, TPlanNodeType::FILE_SCAN_NODE, 0)]);
 
         let merged = merge_fragment_plans(&[exchange_root, leaf]);
         // exchange_count (2) > leaf_count (1) → skip merge.
@@ -4077,9 +5434,7 @@ mod tests {
     #[test]
     fn test_merge_only_exchange_root_no_leaf() {
         // Exchange-root with no leaf = depends on remote data.
-        let root = make_params(vec![
-            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
-        ]);
+        let root = make_params(vec![make_node(0, TPlanNodeType::EXCHANGE_NODE, 0)]);
         let merged = merge_fragment_plans(&[root]);
         assert_eq!(merged.len(), 1);
         let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
@@ -4092,16 +5447,12 @@ mod tests {
         // Fragment 0: EXCHANGE_NODE(0) — result collector
         // Fragment 1: SORT_NODE → EXCHANGE_NODE(0) — intermediate
         // Fragment 2: FILE_SCAN_NODE — leaf
-        let root = make_params(vec![
-            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
-        ]);
+        let root = make_params(vec![make_node(0, TPlanNodeType::EXCHANGE_NODE, 0)]);
         let intermediate = make_params(vec![
             make_node(1, TPlanNodeType::SORT_NODE, 1),
             make_node(2, TPlanNodeType::EXCHANGE_NODE, 0),
         ]);
-        let leaf = make_params(vec![
-            make_node(3, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let leaf = make_params(vec![make_node(3, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         let merged = merge_fragment_plans(&[root, intermediate, leaf]);
         // Result: single merged fragment (SORT_NODE → FILE_SCAN_NODE).
         assert_eq!(merged.len(), 1);
@@ -4130,9 +5481,7 @@ mod tests {
         // inner sends its output to exchange node 1 in outer
         inner.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(1));
 
-        let mut leaf = make_params(vec![
-            make_node(4, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let mut leaf = make_params(vec![make_node(4, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         leaf.fragment_id = Some(2);
         // leaf sends its output to exchange node 3 in inner
         leaf.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(3));
@@ -4151,14 +5500,10 @@ mod tests {
     #[test]
     fn test_merge_skipped_when_per_exch_senders_exceed_leaves() {
         // Single exchange node with 2 senders but only 1 leaf → remote.
-        let mut root = make_params(vec![
-            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
-        ]);
+        let mut root = make_params(vec![make_node(0, TPlanNodeType::EXCHANGE_NODE, 0)]);
         root.per_exch_num_senders.insert(0, 2);
 
-        let leaf = make_params(vec![
-            make_node(1, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let leaf = make_params(vec![make_node(1, TPlanNodeType::FILE_SCAN_NODE, 0)]);
 
         let merged = merge_fragment_plans(&[root, leaf]);
         // per_exch_num_senders[0] = 2 > 1 leaf → skip merge.
@@ -4184,8 +5529,9 @@ mod tests {
     }
 
     fn make_multi_cast_data_stream_sink(dest_node_ids: &[i32]) -> TDataSink {
-        let sinks: Vec<TDataStreamSink> = dest_node_ids.iter().map(|&id| {
-            TDataStreamSink {
+        let sinks: Vec<TDataStreamSink> = dest_node_ids
+            .iter()
+            .map(|&id| TDataStreamSink {
                 dest_node_id: id,
                 output_partition: TDataPartition {
                     type_: TPartitionType::UNPARTITIONED,
@@ -4204,8 +5550,8 @@ mod tests {
                 tablet_sink_tuple_id: None,
                 tablet_sink_exprs: None,
                 is_merge: None,
-            }
-        }).collect();
+            })
+            .collect();
         TDataSink {
             type_: TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
             stream_sink: None,
@@ -4266,9 +5612,7 @@ mod tests {
         frag1.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(9));
 
         // Fragment 2: FILE_SCAN, sends to exchange node 5
-        let mut frag2 = make_params(vec![
-            make_node(4, TPlanNodeType::FILE_SCAN_NODE, 0),
-        ]);
+        let mut frag2 = make_params(vec![make_node(4, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         frag2.fragment_id = Some(2);
         frag2.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(5));
 
@@ -4294,14 +5638,17 @@ mod tests {
         // All exchanges are local (multicast covers dest 6 and 7).
         // Should produce 1 merged fragment.
         assert_eq!(
-            merged.len(), 1,
+            merged.len(),
+            1,
             "CTE multicast plan should merge into 1 fragment, got {}",
             merged.len()
         );
 
         // Verify no EXCHANGE_NODE remains in merged plan.
         let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
-        let exchange_count = plan.nodes.iter()
+        let exchange_count = plan
+            .nodes
+            .iter()
             .filter(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0)
             .count();
         assert_eq!(

@@ -147,7 +147,8 @@ impl TransferHealth {
                 if std::time::Instant::now() >= until {
                     // Cooldown expired — re-enable.
                     drop(guard);
-                    self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                    self.consecutive_failures
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     *self.disabled_until.lock().unwrap() = None;
                     info!("GPU-direct transfers re-enabled after cooldown");
                     true
@@ -160,12 +161,16 @@ impl TransferHealth {
 
     /// Record a successful transfer.
     fn record_success(&self) {
-        self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.consecutive_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record a transfer failure. Returns true if transfers are now disabled.
     fn record_failure(&self) -> bool {
-        let failures = self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let failures = self
+            .consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         if failures >= 3 {
             let cooldown = std::time::Duration::from_secs(60);
             *self.disabled_until.lock().unwrap() = Some(std::time::Instant::now() + cooldown);
@@ -241,7 +246,9 @@ impl NixlExchange {
         // as host memory ("memory is detected as host"), causing SIGSEGV.
         match ensure_cuda_context() {
             Ok(()) => info!("CUDA context initialized for UCX GPU support"),
-            Err(e) => warn!(error = %e, "CUDA init failed, UCX will not support GPU-direct transfers"),
+            Err(e) => {
+                warn!(error = %e, "CUDA init failed, UCX will not support GPU-direct transfers")
+            }
         }
 
         // Create UCX backend for GPU transfers
@@ -295,7 +302,10 @@ impl NixlExchange {
         if unsafe { &*exchange.staging.get() }.is_some() {
             match exchange.agent.get_local_md() {
                 Ok(md) => {
-                    info!(md_len = md.len(), "cached nixl metadata (staging buffer registered)");
+                    info!(
+                        md_len = md.len(),
+                        "cached nixl metadata (staging buffer registered)"
+                    );
                     *exchange.cached_metadata.lock().unwrap() = Some(md);
                 }
                 Err(e) => warn!(error = %e, "failed to cache startup metadata"),
@@ -317,13 +327,18 @@ impl NixlExchange {
         // Cache metadata after registration.
         match self.agent.get_local_md() {
             Ok(md) => {
-                info!(md_len = md.len(), "cached nixl metadata (C++ staging buffer registered)");
+                info!(
+                    md_len = md.len(),
+                    "cached nixl metadata (C++ staging buffer registered)"
+                );
                 *self.cached_metadata.lock().unwrap() = Some(md);
             }
             Err(e) => warn!(error = %e, "failed to cache metadata after staging registration"),
         }
         // SAFETY: called at startup before any concurrent access.
-        unsafe { *self.staging.get() = Some(staging); }
+        unsafe {
+            *self.staging.get() = Some(staging);
+        }
         Ok(())
     }
 
@@ -333,11 +348,15 @@ impl NixlExchange {
     pub fn register_send_staging(&self, addr: usize, size: usize) -> Result<(), String> {
         use crate::gpu_staging_buffer::GpuStagingBuffer;
         // Just register with nixl — no bump allocator needed (C++ manages this buffer).
-        let _send_staging = GpuStagingBuffer::from_existing(addr, size, 0, &self.agent, &self.backend)?;
+        let _send_staging =
+            GpuStagingBuffer::from_existing(addr, size, 0, &self.agent, &self.backend)?;
         // Re-cache metadata after registering the new memory region.
         match self.agent.get_local_md() {
             Ok(md) => {
-                info!(md_len = md.len(), "cached nixl metadata (send + recv staging registered)");
+                info!(
+                    md_len = md.len(),
+                    "cached nixl metadata (send + recv staging registered)"
+                );
                 *self.cached_metadata.lock().unwrap() = Some(md);
             }
             Err(e) => warn!(error = %e, "failed to re-cache metadata after send staging"),
@@ -639,7 +658,8 @@ impl NixlExchange {
                         self.transfer_health.record_failure();
                         return Err(format!(
                             "nixl transfer timed out after {}s (data_size={})",
-                            timeout.as_secs(), data_bytes
+                            timeout.as_secs(),
+                            data_bytes
                         ));
                     }
                     std::thread::yield_now();
@@ -766,10 +786,7 @@ mod tests {
             return;
         };
 
-        let gpu_ptrs = vec![
-            (0x1000, 1024),
-            (0x2000, 2048),
-        ];
+        let gpu_ptrs = vec![(0x1000, 1024), (0x2000, 2048)];
         let device_id = 0;
 
         let result = exchange.create_gpu_descs(&gpu_ptrs, device_id);
@@ -820,15 +837,13 @@ mod tests {
     fn test_nixl_metadata_exchange_structure() {
         let msg = NixlMetadataExchange {
             metadata: vec![1, 2, 3, 4],
-            buffer_descs: vec![
-                GpuBufferDesc {
-                    addr: 0x1000,
-                    len: 100,
-                    device_id: 0,
-                },
-            ],
+            buffer_descs: vec![GpuBufferDesc {
+                addr: 0x1000,
+                len: 100,
+                device_id: 0,
+            }],
             column_info: vec![
-                ("col1".to_string(), 5), // INT32
+                ("col1".to_string(), 5),  // INT32
                 ("col2".to_string(), 16), // STRING
             ],
             num_rows: 42,

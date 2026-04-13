@@ -4,7 +4,7 @@
 //! Used by expression and scan translators to resolve column references.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
@@ -34,10 +34,19 @@ pub struct TupleInfo {
     pub slot_ids: Vec<i32>,
 }
 
+#[derive(Clone)]
+pub struct SlotExpressionInfo {
+    pub expr: TExpr,
+    /// When false, resolve the expanded expression against the slot's original
+    /// table/tuple schema instead of the currently compiled child Rel schema.
+    pub use_child_rel_names: bool,
+}
+
 /// Parsed descriptor table for efficient lookups.
 pub struct DescriptorTable {
     slots: HashMap<i32, SlotInfo>,
     tuples: HashMap<i32, TupleInfo>,
+    internal_slot_ids: HashSet<i32>,
     /// Override column lists for tables (table_name → column names in order).
     /// Set by the gRPC handler from DuckDB's actual table columns.
     table_column_overrides: HashMap<String, Vec<String>>,
@@ -45,7 +54,7 @@ pub struct DescriptorTable {
     /// Maps slot_id → TExpr that produces this slot's value.
     /// Used to inline computed expressions (e.g., `l_extendedprice * (1 - l_discount)`)
     /// from scan node intermediate/final projections into downstream nodes (AGG, SORT).
-    slot_expressions: HashMap<i32, TExpr>,
+    slot_expressions: HashMap<i32, SlotExpressionInfo>,
     /// Flattened column names from the compiled child Rel, set temporarily during
     /// AGG expression translation. Uses RefCell for interior mutability (the
     /// translate_node chain takes &DescriptorTable but AGG needs to set this).
@@ -57,6 +66,7 @@ impl DescriptorTable {
     pub fn from_thrift(desc_tbl: &TDescriptorTable) -> Result<Self> {
         let mut slots = HashMap::new();
         let mut tuples = HashMap::new();
+        let mut internal_slot_ids = HashSet::new();
 
         // Parse tuple descriptors.
         for td in &desc_tbl.tuple_descriptors {
@@ -74,6 +84,15 @@ impl DescriptorTable {
         if let Some(slot_descs) = &desc_tbl.slot_descriptors {
             for sd in slot_descs {
                 if sd.col_name.starts_with("__DORIS_") {
+                    internal_slot_ids.insert(sd.id);
+                    tracing::warn!(
+                        slot_id = sd.id,
+                        parent_tuple_id = sd.parent,
+                        column_pos = sd.column_pos,
+                        col_name = %sd.col_name,
+                        is_materialized = sd.is_materialized,
+                        "DescriptorTable: skipping Doris internal slot descriptor"
+                    );
                     continue;
                 }
                 let substrait_type = type_mapper::map_type_desc(&sd.slot_type)?;
@@ -98,13 +117,24 @@ impl DescriptorTable {
         }
 
         // Sort slot_ids by column_pos within each tuple.
+        // Doris often uses column_pos=-1 for synthesized aggregate/result slots.
+        // Those slots belong after the real input/grouping columns in the actual
+        // runtime row layout, not before them.
         for tuple in tuples.values_mut() {
-            tuple
-                .slot_ids
-                .sort_by_key(|&sid| slots.get(&sid).map(|s| s.column_pos).unwrap_or(0));
+            tuple.slot_ids.sort_by_key(|&sid| {
+                let pos = slots.get(&sid).map(|s| s.column_pos).unwrap_or(0);
+                (pos < 0, pos)
+            });
         }
 
-        Ok(Self { slots, tuples, table_column_overrides: HashMap::new(), slot_expressions: HashMap::new(), child_rel_column_names: RefCell::new(None) })
+        Ok(Self {
+            slots,
+            tuples,
+            internal_slot_ids,
+            table_column_overrides: HashMap::new(),
+            slot_expressions: HashMap::new(),
+            child_rel_column_names: RefCell::new(None),
+        })
     }
 
     pub fn get_slot(&self, slot_id: i32) -> Result<&SlotInfo> {
@@ -179,21 +209,18 @@ impl DescriptorTable {
             }
             global_idx += materialized.len();
         }
-        // If compiled child Rel column names are available, use them for resolution.
-        // This is the most reliable method for nested JoinRels where descriptor table
-        // tuples can't reconstruct the correct flattened column ordering.
-        if let Some(ref col_names) = *self.child_rel_column_names.borrow() {
-            if !slot.col_name.is_empty() {
-                if let Some(idx) = col_names.iter().position(|n| n == &slot.col_name) {
-                    tracing::debug!(
-                        slot_id,
-                        col_name = %slot.col_name,
-                        resolved_idx = idx,
-                        "slot_global_index: resolved via child Rel column names"
-                    );
-                    return Ok(idx);
-                }
-            }
+        // If compiled child Rel column names are available, prefer resolving against
+        // the intermediate tuple's own slot layout. This preserves duplicate names
+        // (e.g. n_name / n_name_1) and unnamed slots that would otherwise collapse
+        // under naive name-based matching.
+        if let Some(idx) = self.slot_index_from_parent_tuple_child_rel_columns(slot_id) {
+            tracing::debug!(
+                slot_id,
+                col_name = %slot.col_name,
+                resolved_idx = idx,
+                "slot_global_index: resolved via parent tuple child Rel mapping"
+            );
+            return Ok(idx);
         }
 
         // Slot's parent tuple not in row_tuples — fall back to name-based resolution.
@@ -267,6 +294,117 @@ impl DescriptorTable {
         }
         // Last resort: name-based matching in the given tuples (no overrides).
         self.slot_index_by_name_in_tuples(slot_id, row_tuples)
+    }
+
+    fn slot_index_from_child_rel_columns(
+        &self,
+        slot_id: i32,
+        row_tuples: &[i32],
+    ) -> Option<usize> {
+        let child_cols = self.child_rel_column_names.borrow();
+        let child_cols = child_cols.as_ref()?;
+        if child_cols.is_empty() {
+            return None;
+        }
+
+        let mut slot_to_child_idx = HashMap::<i32, usize>::new();
+        let mut used_child_cols = vec![false; child_cols.len()];
+        let mut unnamed_slots = Vec::<i32>::new();
+
+        for &tuple_id in row_tuples {
+            let tuple = self.get_tuple(tuple_id).ok()?;
+            for &sid in &tuple.slot_ids {
+                let slot = self.get_slot(sid).ok()?;
+                if !slot.is_materialized {
+                    continue;
+                }
+                if slot.col_name.is_empty() {
+                    unnamed_slots.push(sid);
+                    continue;
+                }
+                if let Some((idx, _)) = child_cols
+                    .iter()
+                    .enumerate()
+                    .find(|(idx, name)| !used_child_cols[*idx] && *name == &slot.col_name)
+                {
+                    slot_to_child_idx.insert(sid, idx);
+                    used_child_cols[idx] = true;
+                }
+            }
+        }
+
+        let remaining_child_cols: Vec<usize> = used_child_cols
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, used)| if !used { Some(idx) } else { None })
+            .collect();
+        for (sid, child_idx) in unnamed_slots.into_iter().zip(remaining_child_cols.into_iter()) {
+            slot_to_child_idx.insert(sid, child_idx);
+        }
+
+        slot_to_child_idx.get(&slot_id).copied()
+    }
+
+    fn slot_index_from_parent_tuple_child_rel_columns(&self, slot_id: i32) -> Option<usize> {
+        let child_cols = self.child_rel_column_names.borrow();
+        let child_cols = child_cols.as_ref()?;
+        if child_cols.is_empty() {
+            return None;
+        }
+
+        let slot = self.get_slot(slot_id).ok()?;
+        let tuple = self.get_tuple(slot.parent_tuple_id).ok()?;
+
+        let mut slot_to_child_idx = HashMap::<i32, usize>::new();
+        let mut used_child_cols = vec![false; child_cols.len()];
+        let mut unresolved_slots = Vec::<i32>::new();
+        let mut name_counts = HashMap::<String, usize>::new();
+
+        for &sid in &tuple.slot_ids {
+            let slot = self.get_slot(sid).ok()?;
+            if !slot.is_materialized {
+                continue;
+            }
+            if slot.col_name.is_empty() {
+                unresolved_slots.push(sid);
+                continue;
+            }
+
+            let name_seen = name_counts.entry(slot.col_name.clone()).or_insert(0);
+            let dedup_name = if *name_seen == 0 {
+                slot.col_name.clone()
+            } else {
+                format!("{}_{}", slot.col_name, *name_seen)
+            };
+            *name_seen += 1;
+
+            let matched_idx = child_cols
+                .iter()
+                .enumerate()
+                .find(|(idx, name)| {
+                    !used_child_cols[*idx]
+                        && (*name == &slot.col_name || *name == &dedup_name)
+                })
+                .map(|(idx, _)| idx);
+
+            if let Some(idx) = matched_idx {
+                slot_to_child_idx.insert(sid, idx);
+                used_child_cols[idx] = true;
+            } else {
+                unresolved_slots.push(sid);
+            }
+        }
+
+        let remaining_child_cols: Vec<usize> = used_child_cols
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, used)| if !used { Some(idx) } else { None })
+            .collect();
+        for (sid, child_idx) in unresolved_slots.into_iter().zip(remaining_child_cols.into_iter()) {
+            slot_to_child_idx.insert(sid, child_idx);
+        }
+
+        slot_to_child_idx.get(&slot_id).copied()
     }
 
     /// Resolve a slot to its column index in a compiled Substrait Rel's output.
@@ -382,12 +520,12 @@ impl DescriptorTable {
     /// will recursively translate the mapped TExpr instead of looking up a column
     /// position. This handles computed expression slots from scan node projections
     /// (e.g., `l_extendedprice * (1 - l_discount)` in TPC-H Q1).
-    pub fn set_slot_expressions(&mut self, map: HashMap<i32, TExpr>) {
+    pub fn set_slot_expressions(&mut self, map: HashMap<i32, SlotExpressionInfo>) {
         self.slot_expressions = map;
     }
 
     /// Get the expression that produces a slot's value (if it's a projection slot).
-    pub fn get_slot_expression(&self, slot_id: i32) -> Option<&TExpr> {
+    pub fn get_slot_expression(&self, slot_id: i32) -> Option<&SlotExpressionInfo> {
         self.slot_expressions.get(&slot_id)
     }
 
@@ -400,6 +538,29 @@ impl DescriptorTable {
     /// Clear the child Rel column names (after AGG expression translation).
     pub fn clear_child_rel_column_names(&self) {
         *self.child_rel_column_names.borrow_mut() = None;
+    }
+
+    pub fn child_rel_column_names_snapshot(&self) -> Option<Vec<String>> {
+        self.child_rel_column_names.borrow().clone()
+    }
+
+    pub fn is_internal_slot(&self, slot_id: i32) -> bool {
+        self.internal_slot_ids.contains(&slot_id)
+    }
+
+    pub fn tuple_slot_debug_info(&self, tuple_id: i32) -> Result<Vec<String>> {
+        let tuple = self.get_tuple(tuple_id)?;
+        let mut info = Vec::new();
+        for &slot_id in &tuple.slot_ids {
+            let slot = self.get_slot(slot_id)?;
+            if slot.is_materialized {
+                info.push(format!(
+                    "slot_id={} name={} column_pos={} nullable={}",
+                    slot.slot_id, slot.col_name, slot.column_pos, slot.is_nullable
+                ));
+            }
+        }
+        Ok(info)
     }
 
     /// Build a Substrait NamedStruct from a tuple's materialized columns.
@@ -492,11 +653,9 @@ impl DescriptorTable {
         // operates on the combined [left|right] schema — table-relative indices
         // from the table_id path would be wrong (they don't account for offsets
         // from other joined tables in the combined schema).
-        if let Some(ref col_names) = *self.child_rel_column_names.borrow() {
-            if !slot.col_name.is_empty() {
-                if let Some(idx) = col_names.iter().position(|n| n == &slot.col_name) {
-                    return Ok(idx);
-                }
+        if self.child_rel_column_names.borrow().is_some() {
+            if let Some(idx) = self.slot_index_from_parent_tuple_child_rel_columns(slot_id) {
+                return Ok(idx);
             }
         }
 
@@ -744,6 +903,36 @@ mod tests {
         assert!(desc.find_slot_by_name("id").is_some());
         assert!(desc.find_slot_by_name("name").is_some());
         assert!(desc.find_slot_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_slot_global_index_uses_child_rel_mapping_for_unnamed_slots() {
+        let desc_tbl = make_desc_table(
+            vec![(8, None)],
+            vec![
+                (38, 8, -1, "", TPrimitiveType::DOUBLE),
+                (37, 8, 0, "l_suppkey", TPrimitiveType::BIGINT),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        desc.set_child_rel_column_names(vec!["l_suppkey".into(), "col_1".into()]);
+
+        assert_eq!(desc.slot_global_index(37, &[8]).unwrap(), 0);
+        assert_eq!(desc.slot_global_index(38, &[8]).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_negative_column_pos_slots_sort_after_real_columns() {
+        let desc_tbl = make_desc_table(
+            vec![(8, None)],
+            vec![
+                (38, 8, -1, "", TPrimitiveType::DOUBLE),
+                (37, 8, 0, "l_suppkey", TPrimitiveType::BIGINT),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        let tuple = desc.get_tuple(8).unwrap();
+        assert_eq!(tuple.slot_ids, vec![37, 38]);
     }
 
     #[test]
@@ -1008,6 +1197,57 @@ mod tests {
         // row_tuples = [0], slot 50's parent_tuple=5 not in [0], and "extra_col"
         // is not a slot name in tuple 0. Should fall through to override.
         assert_eq!(desc.slot_global_index(50, &[0]).unwrap(), 1); // "extra_col" at pos 1 in override
+    }
+
+    #[test]
+    fn test_global_index_child_rel_mapping_preserves_duplicate_and_unnamed_slots() {
+        let desc_tbl = make_desc_table(
+            vec![(0, None), (5, None)],
+            vec![
+                (10, 0, 0, "left_only", TPrimitiveType::INT),
+                (50, 5, 0, "n_name", TPrimitiveType::VARCHAR),
+                (51, 5, 1, "n_name", TPrimitiveType::VARCHAR),
+                (52, 5, 2, "", TPrimitiveType::INT),
+                (53, 5, 3, "", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        desc.set_child_rel_column_names(vec![
+            "n_name".to_string(),
+            "n_name_1".to_string(),
+            "expr_2".to_string(),
+            "_1".to_string(),
+        ]);
+
+        assert_eq!(desc.slot_global_index(50, &[0]).unwrap(), 0);
+        assert_eq!(desc.slot_global_index(51, &[0]).unwrap(), 1);
+        assert_eq!(desc.slot_global_index(52, &[0]).unwrap(), 2);
+        assert_eq!(desc.slot_global_index(53, &[0]).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_table_index_child_rel_mapping_preserves_duplicate_and_unnamed_slots() {
+        let desc_tbl = make_desc_table(
+            vec![(5, None)],
+            vec![
+                (50, 5, 0, "n_name", TPrimitiveType::VARCHAR),
+                (51, 5, 1, "n_name", TPrimitiveType::VARCHAR),
+                (52, 5, 2, "", TPrimitiveType::INT),
+                (53, 5, 3, "", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        desc.set_child_rel_column_names(vec![
+            "n_name".to_string(),
+            "n_name_1".to_string(),
+            "expr_2".to_string(),
+            "_1".to_string(),
+        ]);
+
+        assert_eq!(desc.slot_table_index(50).unwrap(), 0);
+        assert_eq!(desc.slot_table_index(51).unwrap(), 1);
+        assert_eq!(desc.slot_table_index(52).unwrap(), 2);
+        assert_eq!(desc.slot_table_index(53).unwrap(), 3);
     }
 
     #[test]

@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use crate::gpu_staging_buffer::StagingLease;
-use crate::nixl_exchange::{GpuBufferDesc, NixlExchange};
-use crate::exchange_sender::ExchangeDest;
 use crate::exchange_buffer::{ExchangeBuffer, ExchangeKey, PackedGpuExchange};
+use crate::exchange_sender::ExchangeDest;
+use crate::gpu_staging_buffer::StagingLease;
 use crate::hash_partitioner::{ExchangeInfo, PartitionStrategy};
+use crate::nixl_exchange::{GpuBufferDesc, NixlExchange};
 use sirius_ffi::GpuColumnBuffers;
 
 /// Result of attempting to extract GPU buffer information from execution result.
@@ -48,56 +48,25 @@ pub enum ExecutionLocation {
         /// packed cudf buffer that should be sent to ALL exchange destinations.
         packed_broadcast: Vec<sirius_ffi::PackedBroadcastEntry>,
     },
+    /// Result is owned by a Sirius exchange artifact.
+    ///
+    /// This is the modern exchange path: the packed descriptors are Rust-owned,
+    /// while the opaque artifact keeps the underlying C++ session and GPU
+    /// resources alive until transfer completion.
+    PackedExchange {
+        ipc_bytes: Vec<u8>,
+        artifact: sirius_ffi::ExchangeArtifact,
+    },
 }
 
 impl ExecutionLocation {
-    /// Create a GPU location from a packed staging buffer.
-    ///
-    /// This is the primary constructor for GPU results — the packed buffer
-    /// is a single contiguous allocation in the pre-registered nixl staging
-    /// region, created by cudf::chunked_pack in the result collector.
-    pub fn from_packed(addr: usize, size: usize, metadata: Vec<u8>, ipc_bytes: Vec<u8>) -> Self {
-        Self::Gpu {
-            buffers: vec![GpuBufferDesc { addr, len: size, device_id: 0 }],
-            column_info: vec![],
-            column_buffers: vec![],
-            num_rows: 0,
-            schema_ipc: vec![],
-            ipc_bytes,
-            _staging_leases: vec![],
-            packed_metadata: Some(metadata),
-            packed_partitions: vec![],
-            packed_broadcast: vec![],
-        }
-    }
-
-    /// Create a GPU location from broadcast packed entries.
-    ///
-    /// Used when the broadcast path accumulates per-batch packed GPU buffers
-    /// in the staging region.
-    pub fn from_broadcast_entries(
-        staging_addr: usize,
-        entries: Vec<sirius_ffi::PackedBroadcastEntry>,
+    pub fn from_exchange_artifact(
+        artifact: sirius_ffi::ExchangeArtifact,
         ipc_bytes: Vec<u8>,
     ) -> Self {
-        Self::Gpu {
-            buffers: vec![GpuBufferDesc { addr: staging_addr, len: 0, device_id: 0 }],
-            column_info: vec![],
-            column_buffers: vec![],
-            num_rows: entries.iter().map(|e| e.num_rows).sum(),
-            schema_ipc: vec![],
+        Self::PackedExchange {
             ipc_bytes,
-            _staging_leases: vec![],
-            packed_metadata: None,
-            packed_partitions: vec![],
-            packed_broadcast: entries,
-        }
-    }
-
-    /// Store per-batch broadcast packed GPU buffers.
-    pub fn set_packed_broadcast(&mut self, entries: Vec<sirius_ffi::PackedBroadcastEntry>) {
-        if let Self::Gpu { packed_broadcast, .. } = self {
-            *packed_broadcast = entries;
+            artifact,
         }
     }
 
@@ -106,71 +75,7 @@ impl ExecutionLocation {
         match self {
             Self::Cpu(bytes) => bytes,
             Self::Gpu { ipc_bytes, .. } => ipc_bytes,
-        }
-    }
-
-    /// Store packed GPU buffer info from cudf::pack().
-    ///
-    /// The packed buffer is a single contiguous GPU allocation containing all
-    /// column data, null masks, and offsets. It's allocated by the C++ CUDA
-    /// runtime (same as RMM) so it stays valid after query cleanup.
-    pub fn set_packed_gpu(&mut self, addr: usize, size: usize, metadata: Vec<u8>) {
-        if let Self::Gpu { buffers, packed_metadata, column_buffers, .. } = self {
-            // Replace per-column buffer descriptors with a single packed buffer.
-            buffers.clear();
-            buffers.push(GpuBufferDesc {
-                addr,
-                len: size,
-                device_id: 0,
-            });
-            column_buffers.clear();
-            *packed_metadata = Some(metadata.clone());
-            tracing::info!(
-                addr = format_args!("0x{addr:x}"),
-                size,
-                metadata_len = metadata.len(),
-                "set packed GPU buffer for nixl transfer"
-            );
-        }
-    }
-
-    /// Store per-partition packed GPU buffers from GPU hash_partition.
-    pub fn set_packed_partitions(&mut self, parts: Vec<sirius_ffi::PackedPartition>) {
-        if let Self::Gpu { packed_partitions, .. } = self {
-            *packed_partitions = parts;
-        }
-    }
-
-    /// Apply staging results from C++ `sirius_stage_gpu_buffers()`.
-    ///
-    /// Updates GPU buffer addresses to point into the staging buffer at the
-    /// offsets reported by the C++ side.
-    pub fn apply_staging(&mut self, staging_base: usize, staged: &[sirius_ffi::StagedBuffer]) {
-        if let Self::Gpu { buffers, column_buffers, .. } = self {
-            for entry in staged {
-                let addr = staging_base + entry.staged_offset;
-                match entry.buf_type.as_str() {
-                    "data" => {
-                        if let Some(b) = buffers.get_mut(entry.buffer_idx) {
-                            b.addr = addr;
-                            b.len = entry.len;
-                        }
-                    }
-                    "null_mask" => {
-                        if let Some(cb) = column_buffers.get_mut(entry.buffer_idx) {
-                            cb.null_mask_addr = addr;
-                            cb.null_mask_len = entry.len;
-                        }
-                    }
-                    "offsets" => {
-                        if let Some(cb) = column_buffers.get_mut(entry.buffer_idx) {
-                            cb.offsets_addr = addr;
-                            cb.offsets_len = entry.len;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            Self::PackedExchange { ipc_bytes, .. } => ipc_bytes,
         }
     }
 
@@ -184,7 +89,13 @@ impl ExecutionLocation {
         &mut self,
         staging: &crate::gpu_staging_buffer::GpuStagingBuffer,
     ) -> bool {
-        if let Self::Gpu { buffers, column_buffers, _staging_leases, .. } = self {
+        if let Self::Gpu {
+            buffers,
+            column_buffers,
+            _staging_leases,
+            ..
+        } = self
+        {
             // Collect ALL buffers: data + null_mask + offsets (same order as transfer).
             let mut all_bufs: Vec<(usize, usize, u64)> = Vec::new();
             // Track which indices map back to data/null_mask/offsets per column.
@@ -250,7 +161,6 @@ impl ExecutionLocation {
             false
         }
     }
-
 }
 
 /// Detect whether execution result is in GPU or CPU memory.
@@ -321,7 +231,8 @@ pub fn detect_execution_location(
 /// of being silently handled. Useful for debugging nixl exchange issues.
 ///
 /// Self-transfer (destination is `local_brpc_addr`) uses a local fast-path:
-/// IPC → PBlock → ExchangeBuffer, bypassing both nixl and bRPC entirely.
+/// packed GPU artifacts stay on GPU when available, otherwise IPC → PBlock →
+/// ExchangeBuffer, bypassing both nixl and bRPC entirely.
 ///
 /// For `Hash` partition strategy, rows are hashed by partition columns and each
 /// destination receives only its partition's rows. For `Broadcast`, all
@@ -344,15 +255,14 @@ pub async fn send_exchange_with_nixl(
     let ipc_bytes = match &location {
         ExecutionLocation::Cpu(bytes) => bytes.clone(),
         ExecutionLocation::Gpu { ipc_bytes, .. } => ipc_bytes.clone(),
+        ExecutionLocation::PackedExchange { ipc_bytes, .. } => ipc_bytes.clone(),
     };
 
-    // For local 1-BE exchange, force CPU PBlock path everywhere.
-    // GPU-registered exchange tables can't be read by CPU from_substrait,
-    // and GPU Sort on packed tables hangs. PBlock decode creates proper
-    // CPU-accessible DuckDB tables that work with both CPU and GPU paths.
+    // For local 1-BE exchange, force the proven CPU PBlock path everywhere.
+    // The packed-GPU self-transfer path is the next design target, but it is
+    // not stable enough yet for the baseline correctness run.
     let all_local = destinations.iter().all(|d| d.brpc_addr == local_brpc_addr);
     let location = if all_local {
-        // Strip GPU packed data, keep only IPC bytes for PBlock conversion.
         ExecutionLocation::Cpu(ipc_bytes.clone())
     } else {
         location
@@ -360,23 +270,50 @@ pub async fn send_exchange_with_nixl(
 
     // For hash-partitioned exchange, split the data per destination first,
     // then route each partition's data to its destination (local or remote).
-    if let PartitionStrategy::Hash { ref partition_exprs, num_destinations, use_crc32c } = exch_info.partition {
+    if let PartitionStrategy::Hash {
+        ref partition_exprs,
+        num_destinations,
+        use_crc32c,
+    } = exch_info.partition
+    {
         return send_hash_partitioned(
-            nixl_agent, &location, &ipc_bytes, destinations, query_id, node_id,
-            sender_id, nixl_only, local_brpc_addr, exchange_buffer,
-            partition_exprs, num_destinations, use_crc32c, desc_tbl_slots,
-        ).await;
+            nixl_agent,
+            &location,
+            &ipc_bytes,
+            destinations,
+            query_id,
+            node_id,
+            sender_id,
+            nixl_only,
+            local_brpc_addr,
+            exchange_buffer,
+            partition_exprs,
+            num_destinations,
+            use_crc32c,
+            desc_tbl_slots,
+        )
+        .await;
     }
 
-    let all_local = true; // already computed above
-    let (packed_metadata, buffers, packed_broadcast) = if all_local {
-        // Force PBlock path for local exchange.
-        (None, &[][..], &[][..])
+    let (packed_metadata, buffers, packed_broadcast, packed_exchange) = if all_local {
+        (None, &[][..], &[][..], None)
     } else {
         match &location {
-            ExecutionLocation::Gpu { packed_metadata, buffers, packed_broadcast, .. } =>
-                (packed_metadata.as_deref(), buffers.as_slice(), packed_broadcast.as_slice()),
-            _ => (None, &[][..], &[][..]),
+            ExecutionLocation::Gpu {
+                packed_metadata,
+                buffers,
+                packed_broadcast,
+                ..
+            } => (
+                packed_metadata.as_deref(),
+                buffers.as_slice(),
+                packed_broadcast.as_slice(),
+                None,
+            ),
+            ExecutionLocation::PackedExchange { artifact, .. } => {
+                (None, &[][..], &[][..], Some(artifact))
+            }
+            _ => (None, &[][..], &[][..], None),
         }
     };
 
@@ -391,14 +328,63 @@ pub async fn send_exchange_with_nixl(
     for dest in &local_dests {
         let key = ExchangeKey { query_id, node_id };
 
+        if let Some(artifact) = packed_exchange {
+            if !artifact.packed_broadcast().is_empty() {
+                let staging_base = artifact.staging_base();
+                for entry in artifact.packed_broadcast() {
+                    if entry.packed_size == 0 {
+                        continue;
+                    }
+                    let src_addr = if entry.overflow_gpu_addr != 0 {
+                        entry.overflow_gpu_addr
+                    } else {
+                        staging_base + entry.staging_offset
+                    };
+                    let owned_addr = match crate::cuda_driver::cuda_alloc(entry.packed_size) {
+                        Ok(addr) => {
+                            if let Err(e) = crate::cuda_driver::cuda_memcpy_dtod(
+                                addr,
+                                src_addr,
+                                entry.packed_size,
+                            ) {
+                                tracing::warn!(error = %e, "self-transfer D2D copy failed, using staging addr");
+                                crate::cuda_driver::cuda_free(addr).ok();
+                                src_addr
+                            } else {
+                                addr
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "self-transfer cudaMalloc failed, using staging addr");
+                            src_addr
+                        }
+                    };
+                    exchange_buffer.store_packed_gpu(
+                        key.clone(),
+                        PackedGpuExchange {
+                            gpu_addr: owned_addr,
+                            gpu_size: entry.packed_size,
+                            cudf_metadata: entry.metadata.clone(),
+                            _staging_lease: None,
+                        },
+                    );
+                }
+                exchange_buffer.add_block(&key, sender_id, None, true);
+                tracing::info!(dest = %dest.brpc_addr, sender_id, num_entries = artifact.packed_broadcast().len(),
+                              "self-transfer: broadcast packed GPU (artifact-backed)");
+                continue;
+            }
+        }
+
         // Broadcast packed entries: copy from staging to owned buffer.
-        // CRITICAL: We must copy because release_gpu_buffers (called after each leaf
-        // fragment) clears completed sessions and resets staging offset. The next leaf
-        // fragment will overwrite the staging data. D2D copy is fast (~µs for KB/MB).
+        // The staging region is reused by later fragments, so self-transfer must
+        // take ownership before the next GPU execution overwrites it.
         if !packed_broadcast.is_empty() {
             let staging_base = buffers.first().map(|b| b.addr).unwrap_or(0);
             for entry in packed_broadcast {
-                if entry.packed_size == 0 { continue; }
+                if entry.packed_size == 0 {
+                    continue;
+                }
                 let src_addr = if entry.overflow_gpu_addr != 0 {
                     entry.overflow_gpu_addr
                 } else {
@@ -407,11 +393,15 @@ pub async fn send_exchange_with_nixl(
                 // D2D copy to new cudaMalloc buffer (independent of staging).
                 let owned_addr = match crate::cuda_driver::cuda_alloc(entry.packed_size) {
                     Ok(addr) => {
-                        if let Err(e) = crate::cuda_driver::cuda_memcpy_dtod(addr, src_addr, entry.packed_size) {
+                        if let Err(e) =
+                            crate::cuda_driver::cuda_memcpy_dtod(addr, src_addr, entry.packed_size)
+                        {
                             tracing::warn!(error = %e, "self-transfer D2D copy failed, using staging addr");
                             crate::cuda_driver::cuda_free(addr).ok();
                             src_addr
-                        } else { addr }
+                        } else {
+                            addr
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "self-transfer cudaMalloc failed, using staging addr");
@@ -439,11 +429,15 @@ pub async fn send_exchange_with_nixl(
             if let Some(buf) = buffers.first() {
                 let owned_addr = match crate::cuda_driver::cuda_alloc(buf.len) {
                     Ok(addr) => {
-                        if let Err(e) = crate::cuda_driver::cuda_memcpy_dtod(addr, buf.addr, buf.len) {
+                        if let Err(e) =
+                            crate::cuda_driver::cuda_memcpy_dtod(addr, buf.addr, buf.len)
+                        {
                             tracing::warn!(error = %e, "self-transfer D2D copy failed");
                             crate::cuda_driver::cuda_free(addr).ok();
                             buf.addr
-                        } else { addr }
+                        } else {
+                            addr
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "self-transfer cudaMalloc failed");
@@ -502,11 +496,17 @@ pub async fn send_exchange_with_nixl(
     match location {
         ExecutionLocation::Cpu(_) => {
             if nixl_only {
-                tracing::error!("nixl-only mode: result is CPU-resident, cannot use nixl GPU-direct transfer");
+                tracing::error!(
+                    "nixl-only mode: result is CPU-resident, cannot use nixl GPU-direct transfer"
+                );
                 return Err("nixl-only: no GPU buffers for GPU-direct exchange (execution fell back to CPU?)".to_string());
             }
             crate::exchange_sender::send_exchange_result(
-                &ipc_bytes, &remote_dests, query_id, node_id, sender_id,
+                &ipc_bytes,
+                &remote_dests,
+                query_id,
+                node_id,
+                sender_id,
             )
             .await
         }
@@ -528,8 +528,13 @@ pub async fn send_exchange_with_nixl(
                 }
                 tracing::warn!("GPU result but no nixl agent, falling back to bRPC");
                 return crate::exchange_sender::send_exchange_result(
-                    &ipc_bytes, &remote_dests, query_id, node_id, sender_id,
-                ).await;
+                    &ipc_bytes,
+                    &remote_dests,
+                    query_id,
+                    node_id,
+                    sender_id,
+                )
+                .await;
             };
 
             // Fast-path: skip nixl if a previous registration already detected
@@ -540,8 +545,13 @@ pub async fn send_exchange_with_nixl(
                 }
                 tracing::info!("UCX lacks CUDA support for GPU memory, using bRPC for exchange");
                 return crate::exchange_sender::send_exchange_result(
-                    &ipc_bytes, &remote_dests, query_id, node_id, sender_id,
-                ).await;
+                    &ipc_bytes,
+                    &remote_dests,
+                    query_id,
+                    node_id,
+                    sender_id,
+                )
+                .await;
             }
 
             // Broadcast with packed entries: send each entry to all destinations.
@@ -553,28 +563,53 @@ pub async fn send_exchange_with_nixl(
                 );
                 let staging_base = buffers.first().map(|b| b.addr).unwrap_or(0);
                 for entry in &packed_broadcast {
-                    if entry.packed_size == 0 { continue; }
+                    if entry.packed_size == 0 {
+                        continue;
+                    }
                     // Determine the GPU address of this entry.
                     let gpu_addr = if entry.overflow_gpu_addr != 0 {
                         entry.overflow_gpu_addr
                     } else {
                         staging_base + entry.staging_offset
                     };
-                    let buf_desc = GpuBufferDesc { addr: gpu_addr, len: entry.packed_size, device_id: 0 };
+                    let buf_desc = GpuBufferDesc {
+                        addr: gpu_addr,
+                        len: entry.packed_size,
+                        device_id: 0,
+                    };
 
                     for dest in &remote_dests {
                         if let Err(e) = send_nixl_to_peer(
-                            agent, &[buf_desc.clone()], &[], &[], entry.num_rows,
-                            &ipc_bytes, dest, query_id, node_id, sender_id,
-                            true, Some(&entry.metadata),
-                        ).await {
+                            agent,
+                            &[buf_desc.clone()],
+                            &[],
+                            &[],
+                            entry.num_rows,
+                            &ipc_bytes,
+                            dest,
+                            query_id,
+                            node_id,
+                            sender_id,
+                            true,
+                            Some(&entry.metadata),
+                        )
+                        .await
+                        {
                             if nixl_only {
-                                return Err(format!("nixl-only: broadcast nixl transfer to {} failed: {}", dest.brpc_addr, e));
+                                return Err(format!(
+                                    "nixl-only: broadcast nixl transfer to {} failed: {}",
+                                    dest.brpc_addr, e
+                                ));
                             }
                             tracing::warn!(error = %e, dest = %dest.brpc_addr, "broadcast nixl transfer failed, falling back to bRPC");
                             crate::exchange_sender::send_exchange_result(
-                                &ipc_bytes, &remote_dests, query_id, node_id, sender_id,
-                            ).await?;
+                                &ipc_bytes,
+                                &remote_dests,
+                                query_id,
+                                node_id,
+                                sender_id,
+                            )
+                            .await?;
                             return Ok(());
                         }
                     }
@@ -588,12 +623,26 @@ pub async fn send_exchange_with_nixl(
             // Try nixl GPU-direct for each remote destination.
             for dest in &remote_dests {
                 if let Err(e) = send_nixl_to_peer(
-                    agent, &buffers, &column_info, &column_buffers, num_rows,
-                    &ipc_bytes, dest, query_id, node_id, sender_id,
-                    staged, packed_metadata.as_deref(),
-                ).await {
+                    agent,
+                    &buffers,
+                    &column_info,
+                    &column_buffers,
+                    num_rows,
+                    &ipc_bytes,
+                    dest,
+                    query_id,
+                    node_id,
+                    sender_id,
+                    staged,
+                    packed_metadata.as_deref(),
+                )
+                .await
+                {
                     if nixl_only {
-                        return Err(format!("nixl-only: nixl transfer to {} failed: {}", dest.brpc_addr, e));
+                        return Err(format!(
+                            "nixl-only: nixl transfer to {} failed: {}",
+                            dest.brpc_addr, e
+                        ));
                     }
                     tracing::warn!(
                         error = %e,
@@ -601,13 +650,126 @@ pub async fn send_exchange_with_nixl(
                         "nixl transfer failed, falling back to bRPC"
                     );
                     crate::exchange_sender::send_exchange_result(
-                        &ipc_bytes, &remote_dests, query_id, node_id, sender_id,
-                    ).await?;
+                        &ipc_bytes,
+                        &remote_dests,
+                        query_id,
+                        node_id,
+                        sender_id,
+                    )
+                    .await?;
                     return Ok(());
                 }
             }
 
             Ok(())
+        }
+        ExecutionLocation::PackedExchange { artifact, .. } => {
+            let Some(agent) = nixl_agent else {
+                if nixl_only {
+                    return Err(
+                        "nixl-only: GPU exchange artifact but no nixl agent available".to_string(),
+                    );
+                }
+                tracing::warn!("GPU exchange artifact but no nixl agent, falling back to bRPC");
+                return crate::exchange_sender::send_exchange_result(
+                    &ipc_bytes,
+                    &remote_dests,
+                    query_id,
+                    node_id,
+                    sender_id,
+                )
+                .await;
+            };
+
+            if !agent.gpu_transfer_enabled() {
+                if nixl_only {
+                    return Err("nixl-only: UCX lacks CUDA support for GPU memory".to_string());
+                }
+                tracing::info!("UCX lacks CUDA support for GPU memory, using bRPC for exchange");
+                return crate::exchange_sender::send_exchange_result(
+                    &ipc_bytes,
+                    &remote_dests,
+                    query_id,
+                    node_id,
+                    sender_id,
+                )
+                .await;
+            }
+
+            if !artifact.packed_broadcast().is_empty() {
+                tracing::info!(
+                    num_entries = artifact.packed_broadcast().len(),
+                    num_dests = remote_dests.len(),
+                    staging_base = format_args!("0x{:x}", artifact.staging_base()),
+                    "sending broadcast GPU exchange data (artifact-backed)"
+                );
+                for entry in artifact.packed_broadcast() {
+                    if entry.packed_size == 0 {
+                        continue;
+                    }
+                    let gpu_addr = if entry.overflow_gpu_addr != 0 {
+                        entry.overflow_gpu_addr
+                    } else {
+                        artifact.staging_base() + entry.staging_offset
+                    };
+                    let buf_desc = GpuBufferDesc {
+                        addr: gpu_addr,
+                        len: entry.packed_size,
+                        device_id: 0,
+                    };
+
+                    for dest in &remote_dests {
+                        if let Err(e) = send_nixl_to_peer(
+                            agent,
+                            &[buf_desc.clone()],
+                            &[],
+                            &[],
+                            entry.num_rows,
+                            &ipc_bytes,
+                            dest,
+                            query_id,
+                            node_id,
+                            sender_id,
+                            entry.overflow_gpu_addr == 0,
+                            Some(&entry.metadata),
+                        )
+                        .await
+                        {
+                            if nixl_only {
+                                return Err(format!(
+                                    "nixl-only: broadcast nixl transfer to {} failed: {}",
+                                    dest.brpc_addr, e
+                                ));
+                            }
+                            tracing::warn!(error = %e, dest = %dest.brpc_addr, "broadcast nixl transfer failed, falling back to bRPC");
+                            crate::exchange_sender::send_exchange_result(
+                                &ipc_bytes,
+                                &remote_dests,
+                                query_id,
+                                node_id,
+                                sender_id,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            if nixl_only {
+                return Err(
+                    "nixl-only: packed exchange artifact had no broadcast entries".to_string(),
+                );
+            }
+            crate::exchange_sender::send_exchange_result(
+                &ipc_bytes,
+                &remote_dests,
+                query_id,
+                node_id,
+                sender_id,
+            )
+            .await
         }
     }
 }
@@ -631,10 +793,166 @@ async fn send_hash_partitioned(
     use_crc32c: bool,
     desc_tbl_slots: Option<&[(i32, String)]>,
 ) -> Result<(), String> {
-    use crate::hash_partitioner::{compute_dest_assignments, resolve_partition_columns, split_by_destination};
+    use crate::hash_partitioner::{
+        compute_dest_assignments, resolve_partition_columns, split_by_destination,
+    };
 
     // GPU hash-partitioned path: use per-partition packed buffers from staging.
-    if let ExecutionLocation::Gpu { ref packed_partitions, ref buffers, ref packed_metadata, .. } = _location {
+    if let ExecutionLocation::PackedExchange { artifact, .. } = _location {
+        let packed_partitions = artifact.packed_partitions();
+        if !packed_partitions.is_empty() {
+            tracing::info!(
+                num_partitions = packed_partitions.len(),
+                num_dests = destinations.len(),
+                staging_base = format_args!("0x{:x}", artifact.staging_base()),
+                "sending GPU hash-partitioned exchange data (artifact-backed)"
+            );
+
+            let send_staging_base = artifact.staging_base();
+            let num_dests = destinations.len();
+            for (dest_idx, dest) in destinations.iter().enumerate() {
+                let key = ExchangeKey { query_id, node_id };
+                let dest_entries: Vec<&sirius_ffi::PackedPartition> = packed_partitions
+                    .iter()
+                    .skip(dest_idx)
+                    .step_by(num_dests)
+                    .filter(|p| p.packed_size > 0)
+                    .collect();
+                let is_local = dest.brpc_addr == local_brpc_addr;
+
+                if !dest_entries.is_empty() {
+                    let total_rows: u32 = dest_entries.iter().map(|e| e.num_rows).sum();
+                    for p in &dest_entries {
+                        let part_addr = if p.overflow_gpu_addr != 0 {
+                            p.overflow_gpu_addr
+                        } else {
+                            send_staging_base + p.staging_offset
+                        };
+
+                        if is_local {
+                            let owned_addr = match crate::cuda_driver::cuda_alloc(p.packed_size) {
+                                Ok(addr) => match crate::cuda_driver::cuda_memcpy_dtod(
+                                    addr,
+                                    part_addr,
+                                    p.packed_size,
+                                ) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            src = format_args!("0x{part_addr:x}"),
+                                            dst = format_args!("0x{addr:x}"),
+                                            size = p.packed_size,
+                                            "hash partition self-transfer: D2D copy OK"
+                                        );
+                                        addr
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, src = format_args!("0x{part_addr:x}"),
+                                            "hash partition self-transfer: D2D COPY FAILED — using stale staging addr!");
+                                        crate::cuda_driver::cuda_free(addr).ok();
+                                        part_addr
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::error!(error = %e, size = p.packed_size,
+                                        "hash partition self-transfer: cudaMalloc FAILED — using stale staging addr!");
+                                    part_addr
+                                }
+                            };
+                            exchange_buffer.store_packed_gpu(
+                                key.clone(),
+                                PackedGpuExchange {
+                                    gpu_addr: owned_addr,
+                                    gpu_size: p.packed_size,
+                                    cudf_metadata: p.metadata.clone(),
+                                    _staging_lease: None,
+                                },
+                            );
+                        } else if let Some(agent) = _nixl_agent {
+                            let is_staged = p.overflow_gpu_addr == 0;
+                            let part_buf = GpuBufferDesc {
+                                addr: part_addr,
+                                len: p.packed_size,
+                                device_id: 0,
+                            };
+                            if let Err(e) = send_nixl_to_peer(
+                                agent,
+                                &[part_buf],
+                                &[],
+                                &[],
+                                p.num_rows,
+                                ipc_bytes,
+                                dest,
+                                query_id,
+                                node_id,
+                                sender_id,
+                                is_staged,
+                                Some(&p.metadata),
+                            )
+                            .await
+                            {
+                                if _nixl_only {
+                                    return Err(format!(
+                                        "nixl-only: partition transfer to {} failed: {}",
+                                        dest.brpc_addr, e
+                                    ));
+                                }
+                                tracing::warn!(error = %e, dest_idx, "nixl partition transfer failed, falling back to bRPC");
+                                crate::exchange_sender::send_exchange_result(
+                                    ipc_bytes,
+                                    &[dest.clone()],
+                                    query_id,
+                                    node_id,
+                                    sender_id,
+                                )
+                                .await?;
+                            }
+                        } else {
+                            if _nixl_only {
+                                return Err("nixl-only: no nixl agent for hash partition transfer"
+                                    .to_string());
+                            }
+                            crate::exchange_sender::send_exchange_result(
+                                ipc_bytes,
+                                &[dest.clone()],
+                                query_id,
+                                node_id,
+                                sender_id,
+                            )
+                            .await?;
+                        }
+                    }
+                    if is_local {
+                        exchange_buffer.add_block(&key, sender_id, None, true);
+                    }
+                    tracing::info!(
+                        dest_idx,
+                        dest = %dest.brpc_addr,
+                        num_entries = dest_entries.len(),
+                        total_rows,
+                        "GPU hash partition transfer complete"
+                    );
+                } else {
+                    if is_local {
+                        exchange_buffer.add_block(&key, sender_id, None, true);
+                    } else {
+                        crate::exchange_sender::send_eos(dest, query_id, node_id, sender_id)
+                            .await
+                            .map_err(|e| format!("empty partition EOS: {e}"))?;
+                    }
+                    tracing::info!(dest_idx, dest = %dest.brpc_addr, is_local, "empty partition EOS sent");
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    if let ExecutionLocation::Gpu {
+        ref packed_partitions,
+        ref buffers,
+        ref packed_metadata,
+        ..
+    } = _location
+    {
         if !packed_partitions.is_empty() {
             tracing::info!(
                 num_partitions = packed_partitions.len(),
@@ -648,7 +966,7 @@ async fn send_hash_partitioned(
             // Actually, partitions use the send staging buffer, not the packed buffer.
             // The send staging addr was set by set_staging_buffer. We need to know it.
             // For now, compute from the first partition's offset relative to known staging.
-            // The packed buffer (from get_packed_gpu) addr is the send staging base.
+            // The packed buffer addr is the send staging base.
             let send_staging_base = if let Some(ref _md) = packed_metadata {
                 buffers.first().map(|b| b.addr).unwrap_or(0)
             } else {
@@ -687,7 +1005,11 @@ async fn send_hash_partitioned(
                             // D2D copy from staging to owned buffer (staging may be
                             // released/reused between leaf fragments of the same query).
                             let owned_addr = match crate::cuda_driver::cuda_alloc(p.packed_size) {
-                                Ok(addr) => match crate::cuda_driver::cuda_memcpy_dtod(addr, part_addr, p.packed_size) {
+                                Ok(addr) => match crate::cuda_driver::cuda_memcpy_dtod(
+                                    addr,
+                                    part_addr,
+                                    p.packed_size,
+                                ) {
                                     Ok(()) => {
                                         tracing::info!(
                                             src = format_args!("0x{part_addr:x}"),
@@ -703,7 +1025,7 @@ async fn send_hash_partitioned(
                                         crate::cuda_driver::cuda_free(addr).ok();
                                         part_addr
                                     }
-                                }
+                                },
                                 Err(e) => {
                                     tracing::error!(error = %e, size = p.packed_size,
                                         "hash partition self-transfer: cudaMalloc FAILED — using stale staging addr!");
@@ -724,27 +1046,56 @@ async fn send_hash_partitioned(
                             // send_nixl_to_peer will handle registration (staged=false triggers
                             // on-demand registration via register_gpu_buffers).
                             let is_staged = p.overflow_gpu_addr == 0;
-                            let part_buf = GpuBufferDesc { addr: part_addr, len: p.packed_size, device_id: 0 };
+                            let part_buf = GpuBufferDesc {
+                                addr: part_addr,
+                                len: p.packed_size,
+                                device_id: 0,
+                            };
                             if let Err(e) = send_nixl_to_peer(
-                                agent, &[part_buf], &[], &[], p.num_rows,
-                                ipc_bytes, dest, query_id, node_id, sender_id,
-                                is_staged, Some(&p.metadata),
-                            ).await {
+                                agent,
+                                &[part_buf],
+                                &[],
+                                &[],
+                                p.num_rows,
+                                ipc_bytes,
+                                dest,
+                                query_id,
+                                node_id,
+                                sender_id,
+                                is_staged,
+                                Some(&p.metadata),
+                            )
+                            .await
+                            {
                                 if _nixl_only {
-                                    return Err(format!("nixl-only: partition transfer to {} failed: {}", dest.brpc_addr, e));
+                                    return Err(format!(
+                                        "nixl-only: partition transfer to {} failed: {}",
+                                        dest.brpc_addr, e
+                                    ));
                                 }
                                 tracing::warn!(error = %e, dest_idx, "nixl partition transfer failed, falling back to bRPC");
                                 crate::exchange_sender::send_exchange_result(
-                                    ipc_bytes, &[dest.clone()], query_id, node_id, sender_id,
-                                ).await?;
+                                    ipc_bytes,
+                                    &[dest.clone()],
+                                    query_id,
+                                    node_id,
+                                    sender_id,
+                                )
+                                .await?;
                             }
                         } else {
                             if _nixl_only {
-                                return Err("nixl-only: no nixl agent for hash partition transfer".to_string());
+                                return Err("nixl-only: no nixl agent for hash partition transfer"
+                                    .to_string());
                             }
                             crate::exchange_sender::send_exchange_result(
-                                ipc_bytes, &[dest.clone()], query_id, node_id, sender_id,
-                            ).await?;
+                                ipc_bytes,
+                                &[dest.clone()],
+                                query_id,
+                                node_id,
+                                sender_id,
+                            )
+                            .await?;
                         }
                     }
                     // Signal EOS after all batch entries for this destination.
@@ -764,9 +1115,9 @@ async fn send_hash_partitioned(
                     if is_local {
                         exchange_buffer.add_block(&key, sender_id, None, true);
                     } else {
-                        crate::exchange_sender::send_eos(
-                            dest, query_id, node_id, sender_id,
-                        ).await.map_err(|e| format!("empty partition EOS: {e}"))?;
+                        crate::exchange_sender::send_eos(dest, query_id, node_id, sender_id)
+                            .await
+                            .map_err(|e| format!("empty partition EOS: {e}"))?;
                     }
                     tracing::info!(dest_idx, dest = %dest.brpc_addr, is_local, "empty partition EOS sent");
                 }
@@ -781,9 +1132,8 @@ async fn send_hash_partitioned(
     let slots = desc_tbl_slots
         .ok_or_else(|| "hash partition requires descriptor table slots".to_string())?;
 
-    let (col_indices, doris_types) = resolve_partition_columns(
-        partition_exprs, slots, batch.schema().as_ref(),
-    )?;
+    let (col_indices, doris_types) =
+        resolve_partition_columns(partition_exprs, slots, batch.schema().as_ref())?;
 
     tracing::info!(
         num_rows = batch.num_rows(),
@@ -794,18 +1144,25 @@ async fn send_hash_partitioned(
     );
 
     let assignments = compute_dest_assignments(
-        &batch, &col_indices, num_destinations, use_crc32c, &doris_types,
+        &batch,
+        &col_indices,
+        num_destinations,
+        use_crc32c,
+        &doris_types,
     );
     let partitions = split_by_destination(&batch, &assignments, num_destinations)?;
 
     // Log partition distribution.
-    let row_counts: Vec<usize> = partitions.iter()
+    let row_counts: Vec<usize> = partitions
+        .iter()
         .map(|p| p.as_ref().map_or(0, |b| b.num_rows()))
         .collect();
     tracing::info!(?row_counts, "hash partition distribution");
 
     // Send each partition to its destination.
-    for (dest_idx, (dest, partition_batch)) in destinations.iter().zip(partitions.iter()).enumerate() {
+    for (dest_idx, (dest, partition_batch)) in
+        destinations.iter().zip(partitions.iter()).enumerate()
+    {
         let is_local = dest.brpc_addr == local_brpc_addr;
         let key = ExchangeKey { query_id, node_id };
 
@@ -828,13 +1185,23 @@ async fn send_hash_partitioned(
                 let (pblock, _) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&part_ipc)
                     .map_err(|e| format!("hash partition bRPC pblock: {e}"))?;
                 crate::exchange_sender::send_transmit_block(
-                    dest, query_id, node_id, sender_id, Some(pblock), false, 0,
-                ).await.map_err(|e| format!("hash partition send data to {}: {e}", dest.brpc_addr))?;
+                    dest,
+                    query_id,
+                    node_id,
+                    sender_id,
+                    Some(pblock),
+                    false,
+                    0,
+                )
+                .await
+                .map_err(|e| format!("hash partition send data to {}: {e}", dest.brpc_addr))?;
             }
             // Always send EOS.
             crate::exchange_sender::send_transmit_block(
                 dest, query_id, node_id, sender_id, None, true, 1,
-            ).await.map_err(|e| format!("hash partition send EOS to {}: {e}", dest.brpc_addr))?;
+            )
+            .await
+            .map_err(|e| format!("hash partition send EOS to {}: {e}", dest.brpc_addr))?;
             tracing::info!(dest_idx, dest = %dest.brpc_addr, "hash partition bRPC send complete");
         }
     }
@@ -848,8 +1215,8 @@ fn ipc_to_record_batch(ipc_bytes: &[u8]) -> Result<arrow::record_batch::RecordBa
     use std::io::Cursor;
 
     let cursor = Cursor::new(ipc_bytes);
-    let reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| format!("IPC stream reader: {e}"))?;
+    let reader =
+        StreamReader::try_new(cursor, None).map_err(|e| format!("IPC stream reader: {e}"))?;
 
     let batches: Vec<_> = reader
         .into_iter()
@@ -877,7 +1244,9 @@ fn record_batch_to_ipc(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u
     {
         let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
             .map_err(|e| format!("IPC writer: {e}"))?;
-        writer.write(batch).map_err(|e| format!("IPC write batch: {e}"))?;
+        writer
+            .write(batch)
+            .map_err(|e| format!("IPC write batch: {e}"))?;
         writer.finish().map_err(|e| format!("IPC finish: {e}"))?;
     }
     Ok(buf)
@@ -908,8 +1277,8 @@ pub async fn send_nixl_to_peer(
     packed_metadata: Option<&[u8]>,
 ) -> Result<(), String> {
     use doris_proto::nixl::{
-        NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest,
-        PGpuBufferDesc, PNixlTransferCompleteRequest,
+        NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest, PGpuBufferDesc,
+        PNixlTransferCompleteRequest,
     };
     use tracing::info;
 
@@ -957,7 +1326,10 @@ pub async fn send_nixl_to_peer(
         info!("buffers staged in pre-registered staging buffer, skipping registration");
         vec![]
     } else {
-        let buf_tuples: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len, b.device_id)).collect();
+        let buf_tuples: Vec<_> = src_buffers
+            .iter()
+            .map(|b| (b.addr, b.len, b.device_id))
+            .collect();
         agent.register_gpu_buffers(&buf_tuples)?
     };
 
@@ -986,9 +1358,9 @@ pub async fn send_nixl_to_peer(
                 let scale = column_buffers.get(i).map(|cb| cb.scale).unwrap_or(0);
                 // Infer precision from decimal width.
                 let precision = match *type_id {
-                    25 => 9,   // DECIMAL32
-                    26 => 18,  // DECIMAL64
-                    27 => 38,  // DECIMAL128
+                    25 => 9,  // DECIMAL32
+                    26 => 18, // DECIMAL64
+                    27 => 38, // DECIMAL128
                     _ => 0,
                 };
                 PColumnInfo {
@@ -1040,10 +1412,7 @@ pub async fn send_nixl_to_peer(
     }
 
     // Step 4: Load receiver's metadata (includes their registered dst buffers).
-    let remote_name = agent.force_load_remote_metadata(
-        &dest.brpc_addr,
-        &response.nixl_metadata,
-    )?;
+    let remote_name = agent.force_load_remote_metadata(&dest.brpc_addr, &response.nixl_metadata)?;
 
     // Step 5: Build flattened (src, dst) pairs for all buffers including sub-buffers.
     // Order per column: data, null_mask (if present), offsets (if present).
@@ -1057,21 +1426,16 @@ pub async fn send_nixl_to_peer(
         all_dst_ptrs.push((dst_b.addr as usize, dst_b.len as usize));
 
         // Null mask (only if both sender has data and receiver allocated space).
-        if let (Some(cb), Some(dst_nm)) = (
-            column_buffers.get(i),
-            response.dst_null_masks.get(i),
-        ) {
-            if cb.null_mask_addr != 0 && cb.null_mask_len > 0 && dst_nm.addr != 0 && dst_nm.len > 0 {
+        if let (Some(cb), Some(dst_nm)) = (column_buffers.get(i), response.dst_null_masks.get(i)) {
+            if cb.null_mask_addr != 0 && cb.null_mask_len > 0 && dst_nm.addr != 0 && dst_nm.len > 0
+            {
                 all_src_ptrs.push((cb.null_mask_addr, cb.null_mask_len));
                 all_dst_ptrs.push((dst_nm.addr as usize, dst_nm.len as usize));
             }
         }
 
         // String offsets (only if both sender has data and receiver allocated space).
-        if let (Some(cb), Some(dst_off)) = (
-            column_buffers.get(i),
-            response.dst_offsets.get(i),
-        ) {
+        if let (Some(cb), Some(dst_off)) = (column_buffers.get(i), response.dst_offsets.get(i)) {
             if cb.offsets_addr != 0 && cb.offsets_len > 0 && dst_off.addr != 0 && dst_off.len > 0 {
                 all_src_ptrs.push((cb.offsets_addr, cb.offsets_len));
                 all_dst_ptrs.push((dst_off.addr as usize, dst_off.len as usize));
@@ -1082,8 +1446,7 @@ pub async fn send_nixl_to_peer(
     let num_total_transfers = all_src_ptrs.len();
     info!(
         num_data_buffers = src_buffers.len(),
-        num_total_transfers,
-        "nixl transfer: flattened buffer pairs"
+        num_total_transfers, "nixl transfer: flattened buffer pairs"
     );
 
     // SENDER-SIDE integrity check: compute checksum of each src buffer.
@@ -1145,7 +1508,10 @@ pub async fn send_nixl_to_peer(
             .map(|(i, (name, type_id))| {
                 let scale = column_buffers.get(i).map(|cb| cb.scale).unwrap_or(0);
                 let precision = match *type_id {
-                    25 => 9, 26 => 18, 27 => 38, _ => 0,
+                    25 => 9,
+                    26 => 18,
+                    27 => 38,
+                    _ => 0,
                 };
                 PColumnInfo {
                     name: name.clone(),
@@ -1193,6 +1559,7 @@ pub async fn send_nixl_to_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_execution_location_cpu() {
@@ -1211,6 +1578,9 @@ mod tests {
             }
             ExecutionLocation::Gpu { .. } => {
                 // Could happen if engine has GPU result
+            }
+            ExecutionLocation::PackedExchange { .. } => {
+                panic!("detect_execution_location should not return PackedExchange")
             }
         }
     }
@@ -1231,6 +1601,8 @@ mod tests {
             dest_node_id: node_id,
             destinations: dests,
             partition: PartitionStrategy::Broadcast,
+            output_names: Vec::new(),
+            output_indices: None,
         }
     }
 
@@ -1251,7 +1623,9 @@ mod tests {
         let location = ExecutionLocation::Cpu(data.clone());
         match location {
             ExecutionLocation::Cpu(bytes) => assert_eq!(bytes, data),
-            ExecutionLocation::Gpu { .. } => panic!("expected Cpu variant"),
+            ExecutionLocation::Gpu { .. } | ExecutionLocation::PackedExchange { .. } => {
+                panic!("expected Cpu variant")
+            }
         }
     }
 
@@ -1283,20 +1657,27 @@ mod tests {
     fn test_gpu_location_into_ipc_bytes() {
         let ipc = vec![0x41, 0x52, 0x52, 0x4f, 0x57];
         let location = ExecutionLocation::Gpu {
-            buffers: vec![GpuBufferDesc { addr: 0x1000, len: 256, device_id: 0 }],
+            buffers: vec![GpuBufferDesc {
+                addr: 0x1000,
+                len: 256,
+                device_id: 0,
+            }],
             column_info: vec![("col1".to_string(), 5)],
             column_buffers: vec![GpuColumnBuffers {
-                null_mask_addr: 0, null_mask_len: 0,
-                offsets_addr: 0, offsets_len: 0,
-                null_count: 0, scale: 0,
+                null_mask_addr: 0,
+                null_mask_len: 0,
+                offsets_addr: 0,
+                offsets_len: 0,
+                null_count: 0,
+                scale: 0,
             }],
             num_rows: 10,
             schema_ipc: vec![],
             ipc_bytes: ipc.clone(),
             _staging_leases: vec![],
-                    packed_metadata: None,
-                    packed_partitions: vec![],
-                    packed_broadcast: vec![],
+            packed_metadata: None,
+            packed_partitions: vec![],
+            packed_broadcast: vec![],
         };
         assert_eq!(location.into_ipc_bytes(), ipc);
     }
@@ -1320,12 +1701,17 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: vec![],
             _staging_leases: vec![],
-                    packed_metadata: None,
-                    packed_partitions: vec![],
-                    packed_broadcast: vec![],
+            packed_metadata: None,
+            packed_partitions: vec![],
+            packed_broadcast: vec![],
         };
         match location {
-            ExecutionLocation::Gpu { buffers, num_rows, _staging_leases, .. } => {
+            ExecutionLocation::Gpu {
+                buffers,
+                num_rows,
+                _staging_leases,
+                ..
+            } => {
                 assert!(buffers.is_empty());
                 assert_eq!(num_rows, 0);
                 assert!(_staging_leases.is_empty());
@@ -1340,20 +1726,27 @@ mod tests {
         // bRPC will fail (no server), but we verify the fallback logic.
         let ipc = vec![0xAA, 0xBB, 0xCC];
         let location = ExecutionLocation::Gpu {
-            buffers: vec![GpuBufferDesc { addr: 0x1000, len: 256, device_id: 0 }],
+            buffers: vec![GpuBufferDesc {
+                addr: 0x1000,
+                len: 256,
+                device_id: 0,
+            }],
             column_info: vec![("col1".to_string(), 5)],
             column_buffers: vec![GpuColumnBuffers {
-                null_mask_addr: 0, null_mask_len: 0,
-                offsets_addr: 0, offsets_len: 0,
-                null_count: 0, scale: 0,
+                null_mask_addr: 0,
+                null_mask_len: 0,
+                offsets_addr: 0,
+                offsets_len: 0,
+                null_count: 0,
+                scale: 0,
             }],
             num_rows: 10,
             schema_ipc: vec![],
             ipc_bytes: ipc,
             _staging_leases: vec![],
-                    packed_metadata: None,
-                    packed_partitions: vec![],
-                    packed_broadcast: vec![],
+            packed_metadata: None,
+            packed_partitions: vec![],
+            packed_broadcast: vec![],
         };
         let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
         let dests = vec![ExchangeDest {
@@ -1363,12 +1756,12 @@ mod tests {
         let exch_info = make_broadcast_exch_info(dests, 0);
 
         let result = send_exchange_with_nixl(
-            None,     // no nixl agent
+            None, // no nixl agent
             location,
             &exch_info,
             (1, 2),
             0,
-            false,    // not nixl-only → bRPC fallback
+            false, // not nixl-only → bRPC fallback
             "localhost:8060",
             &exchange_buffer,
             None,
@@ -1382,16 +1775,20 @@ mod tests {
     async fn test_send_exchange_gpu_nixl_only_no_agent() {
         // GPU location, nixl_only=true, no agent → should error.
         let location = ExecutionLocation::Gpu {
-            buffers: vec![GpuBufferDesc { addr: 0x1000, len: 256, device_id: 0 }],
+            buffers: vec![GpuBufferDesc {
+                addr: 0x1000,
+                len: 256,
+                device_id: 0,
+            }],
             column_info: vec![],
             column_buffers: vec![],
             num_rows: 0,
             schema_ipc: vec![],
             ipc_bytes: vec![],
             _staging_leases: vec![],
-                    packed_metadata: None,
-                    packed_partitions: vec![],
-                    packed_broadcast: vec![],
+            packed_metadata: None,
+            packed_partitions: vec![],
+            packed_broadcast: vec![],
         };
         let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
         let dests = vec![ExchangeDest {
@@ -1466,6 +1863,146 @@ mod tests {
         buf
     }
 
+    fn bigint_type_desc() -> doris_thrift::types::TTypeDesc {
+        use doris_thrift::types::{
+            TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType,
+        };
+
+        TTypeDesc {
+            types: Some(vec![TTypeNode {
+                type_: TTypeNodeType::SCALAR,
+                scalar_type: Some(TScalarType {
+                    type_: TPrimitiveType::BIGINT,
+                    len: None,
+                    precision: None,
+                    scale: None,
+                    variant_max_subcolumns_count: None,
+                }),
+                struct_fields: None,
+                contains_null: None,
+                contains_nulls: None,
+            }]),
+            is_nullable: Some(true),
+            byte_size: None,
+            sub_types: None,
+            result_is_nullable: None,
+            function_name: None,
+            be_exec_version: None,
+        }
+    }
+
+    fn slot_ref_expr(slot_id: i32) -> doris_thrift::exprs::TExpr {
+        use doris_thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
+
+        TExpr {
+            nodes: vec![TExprNode {
+                node_type: TExprNodeType::SLOT_REF,
+                type_: bigint_type_desc(),
+                num_children: 0,
+                fn_: None,
+                opcode: None,
+                child_type: None,
+                output_scale: 0,
+                is_nullable: None,
+                vector_opcode: None,
+                vararg_start_idx: None,
+                agg_expr: None,
+                int_literal: None,
+                float_literal: None,
+                string_literal: None,
+                bool_literal: None,
+                decimal_literal: None,
+                date_literal: None,
+                large_int_literal: None,
+                json_literal: None,
+                slot_ref: Some(TSlotRef {
+                    slot_id,
+                    tuple_id: 0,
+                    col_unique_id: None,
+                    is_virtual_slot: None,
+                }),
+                case_expr: None,
+                in_predicate: None,
+                is_null_pred: None,
+                like_pred: None,
+                literal_pred: None,
+                info_func: None,
+                tuple_is_null_pred: None,
+                fn_call_expr: None,
+                output_column: None,
+                output_type: None,
+                schema_change_expr: None,
+                column_ref: None,
+                match_predicate: None,
+                ipv4_literal: None,
+                ipv6_literal: None,
+                label: None,
+                timev2_literal: None,
+                varbinary_literal: None,
+                is_cast_nullable: None,
+                search_param: None,
+            }],
+        }
+    }
+
+    fn make_hash_exch_info(
+        dests: Vec<ExchangeDest>,
+        node_id: i32,
+        partition_slot_id: i32,
+    ) -> ExchangeInfo {
+        ExchangeInfo {
+            dest_node_id: node_id,
+            destinations: dests.clone(),
+            partition: PartitionStrategy::Hash {
+                partition_exprs: vec![slot_ref_expr(partition_slot_id)],
+                num_destinations: dests.len(),
+                use_crc32c: true,
+            },
+            output_names: Vec::new(),
+            output_indices: None,
+        }
+    }
+
+    fn build_partsupp_like_ipc(num_rows: usize) -> Vec<u8> {
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ps_partkey", DataType::Int64, false),
+            Field::new("ps_suppkey", DataType::Int64, false),
+            Field::new("ps_availqty", DataType::Int64, false),
+            Field::new("ps_supplycost", DataType::Float64, false),
+        ]));
+
+        let partkeys: Vec<i64> = (0..num_rows).map(|i| 1000 + (i % 200_000) as i64).collect();
+        let suppkeys: Vec<i64> = (0..num_rows).map(|i| 1 + (i % 10_000) as i64).collect();
+        let availqty: Vec<i64> = (0..num_rows).map(|i| 1 + (i % 9_999) as i64).collect();
+        let supplycost: Vec<f64> = (0..num_rows)
+            .map(|i| ((i % 100_000) as f64) / 100.0)
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(partkeys)),
+                Arc::new(Int64Array::from(suppkeys)),
+                Arc::new(Int64Array::from(availqty)),
+                Arc::new(Float64Array::from(supplycost)),
+            ],
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
     #[tokio::test]
     async fn test_send_exchange_cpu_nixl_only() {
         // CPU location with nixl_only → should error (can't use nixl for CPU data).
@@ -1492,5 +2029,132 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("nixl-only"));
+    }
+
+    #[tokio::test]
+    #[ignore = "debug reproducer for single-destination hash self-transfer heap corruption"]
+    async fn repro_hash_self_transfer_single_dest_large_partsupp_like_batch() {
+        let ipc = build_partsupp_like_ipc(800_000);
+        let location = ExecutionLocation::Cpu(ipc);
+        let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let dests = vec![ExchangeDest {
+            brpc_addr: "localhost:8060".to_string(),
+            finst_id: (1, 1),
+        }];
+        let exch_info = make_hash_exch_info(dests, 42, 7);
+
+        let result = send_exchange_with_nixl(
+            None,
+            location,
+            &exch_info,
+            (11, 11),
+            0,
+            false,
+            "localhost:8060",
+            &exchange_buffer,
+            Some(&[(7, "ps_suppkey".to_string())]),
+        )
+        .await;
+
+        assert!(result.is_ok(), "hash self-transfer failed: {:?}", result);
+    }
+
+    #[tokio::test]
+    #[ignore = "debug reproducer using Sirius GPU output from TPC-H partsupp scan"]
+    async fn repro_hash_self_transfer_single_dest_partsupp_gpu_output() {
+        let partsupp_dir = std::path::Path::new("/data/tpch/sf1/p16/snappy/partsupp");
+        if !partsupp_dir.exists() {
+            eprintln!(
+                "skipping reproducer: {} not present",
+                partsupp_dir.display()
+            );
+            return;
+        }
+
+        let engine = sirius_ffi::SiriusEngine::new().expect("SiriusEngine::new");
+        engine.execute_sql("LOAD parquet").expect("LOAD parquet");
+        engine
+            .init_gpu_buffers("1GB", "1GB")
+            .expect("init_gpu_buffers");
+        engine.set_no_cpu_fallback().expect("set_no_cpu_fallback");
+
+        let sql = "SELECT ps_partkey, ps_suppkey, ps_availqty, ps_supplycost \
+                   FROM read_parquet('/data/tpch/sf1/p16/snappy/partsupp/*.parquet')";
+        let ipc = engine.execute_gpu(sql).expect("execute_gpu partsupp");
+
+        let location = ExecutionLocation::Cpu(ipc);
+        let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let dests = vec![ExchangeDest {
+            brpc_addr: "localhost:8060".to_string(),
+            finst_id: (1, 1),
+        }];
+        let exch_info = make_hash_exch_info(dests, 42, 7);
+
+        let result = send_exchange_with_nixl(
+            None,
+            location,
+            &exch_info,
+            (11, 12),
+            0,
+            false,
+            "localhost:8060",
+            &exchange_buffer,
+            Some(&[(7, "ps_suppkey".to_string())]),
+        )
+        .await;
+
+        assert!(result.is_ok(), "hash self-transfer failed: {:?}", result);
+    }
+
+    #[test]
+    #[ignore = "debug reproducer for teardown after a single GPU partsupp scan"]
+    fn repro_partsupp_gpu_scan_teardown_only() {
+        let partsupp_dir = std::path::Path::new("/data/tpch/sf1/p16/snappy/partsupp");
+        if !partsupp_dir.exists() {
+            eprintln!(
+                "skipping reproducer: {} not present",
+                partsupp_dir.display()
+            );
+            return;
+        }
+
+        let engine = sirius_ffi::SiriusEngine::new().expect("SiriusEngine::new");
+        engine.execute_sql("LOAD parquet").expect("LOAD parquet");
+        engine
+            .init_gpu_buffers("1GB", "1GB")
+            .expect("init_gpu_buffers");
+        engine.set_no_cpu_fallback().expect("set_no_cpu_fallback");
+
+        let sql = "SELECT ps_partkey, ps_suppkey, ps_availqty, ps_supplycost \
+                   FROM read_parquet('/data/tpch/sf1/p16/snappy/partsupp/*.parquet')";
+        let ipc = engine.execute_gpu(sql).expect("execute_gpu partsupp");
+        assert!(!ipc.is_empty(), "expected non-empty IPC output");
+    }
+
+    #[test]
+    #[ignore = "debug reproducer for libcudf row-group pruning on tpch nation"]
+    fn repro_row_group_pruning_nation_gpu_scan() {
+        let nation_path = std::path::Path::new("/data/tpch/sf1/p16/snappy/nation/nation.1.parquet");
+        if !nation_path.exists() {
+            eprintln!("skipping reproducer: {} not present", nation_path.display());
+            return;
+        }
+
+        std::env::set_var("SIRIUS_ENABLE_PARQUET_STATS_PRUNING", "1");
+
+        let engine = sirius_ffi::SiriusEngine::new().expect("SiriusEngine::new");
+        engine.execute_sql("LOAD parquet").expect("LOAD parquet");
+        engine
+            .init_gpu_buffers("1GB", "1GB")
+            .expect("init_gpu_buffers");
+        engine.set_no_cpu_fallback().expect("set_no_cpu_fallback");
+
+        let sql = "SELECT n_nationkey, n_name \
+                   FROM read_parquet('/data/tpch/sf1/p16/snappy/nation/nation.1.parquet') \
+                   WHERE n_nationkey < 5";
+        let ipc = engine
+            .execute_gpu(sql)
+            .expect("execute_gpu nation with pruning");
+        assert!(!ipc.is_empty(), "expected non-empty IPC output");
     }
 }

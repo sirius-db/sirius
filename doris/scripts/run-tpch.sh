@@ -195,7 +195,10 @@ run_tpch_query() {
     # Write query to temp file (avoids shell escaping issues with mysql -e)
     local tmpfile
     tmpfile=$(mktemp)
-    echo "SET query_timeout = ${timeout};" > "$tmpfile"
+    # Sirius does not implement Doris's lazy Top-N materialization over TVF/file scans.
+    # Disable that FE rewrite for this session so result columns are produced directly.
+    echo "SET topn_lazy_materialization_threshold = 0;" > "$tmpfile"
+    echo "SET query_timeout = ${timeout};" >> "$tmpfile"
     echo "$rewritten" >> "$tmpfile"
 
     local result

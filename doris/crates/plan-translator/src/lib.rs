@@ -241,6 +241,8 @@ pub struct TranslatedPlan {
 pub struct SortColumn {
     /// Column name to sort by (from the Substrait Rel's output).
     pub name: String,
+    /// 0-based output ordinal when the sort key has no stable name.
+    pub ordinal: Option<usize>,
     /// True for ascending order.
     pub ascending: bool,
     /// True for nulls first.
@@ -253,7 +255,8 @@ pub struct SortColumn {
 /// This allows the expression translator to inline computed expressions from scan projections
 /// when downstream nodes (AGG, SORT) reference these computed slots.
 fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::DescriptorTable) {
-    let mut slot_expressions: HashMap<i32, TExpr> = HashMap::new();
+    let mut slot_expressions: HashMap<i32, descriptor_table::SlotExpressionInfo> =
+        HashMap::new();
 
     for node in &plan.nodes {
         // Log projection info for debugging.
@@ -271,16 +274,16 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
             );
         }
 
-        // For FILE_SCAN_NODE: capture ALL projection expressions (named and unnamed).
-        // For other nodes (JOIN, AGG): only capture EMPTY-NAME slots to avoid breaking
-        // named slot resolution which uses different mechanisms (child_rel_column_names).
-        let scan_only = node.node_type == TPlanNodeType::FILE_SCAN_NODE;
-
         // Process intermediate projection layers.
+        //
+        // These tuples are not emitted as standalone ProjectRels in the current
+        // translator, so downstream expressions that reference their slots must
+        // be able to inline the producing expression regardless of node type.
         if let (Some(proj_list), Some(tuple_ids)) = (
             &node.intermediate_projections_list,
             &node.intermediate_output_tuple_id_list,
         ) {
+            let use_child_rel_names = node.node_type != TPlanNodeType::FILE_SCAN_NODE;
             for (layer_exprs, &tuple_id) in proj_list.iter().zip(tuple_ids.iter()) {
                 if let Ok(tuple) = desc.get_tuple(tuple_id) {
                     let materialized: Vec<i32> = tuple
@@ -296,14 +299,13 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
                     for (i, expr) in layer_exprs.iter().enumerate() {
                         if i < materialized.len() {
                             let sid = materialized[i];
-                            if scan_only
-                                || desc
-                                    .get_slot(sid)
-                                    .map(|s| s.col_name.is_empty())
-                                    .unwrap_or(false)
-                            {
-                                slot_expressions.insert(sid, expr.clone());
-                            }
+                            slot_expressions.insert(
+                                sid,
+                                descriptor_table::SlotExpressionInfo {
+                                    expr: expr.clone(),
+                                    use_child_rel_names,
+                                },
+                            );
                         }
                     }
                 }
@@ -311,6 +313,12 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
         }
 
         // Process final projections.
+        //
+        // Only FILE_SCAN_NODE final projections should be inlined later. Other
+        // node final projections are materialized as real ProjectRels, so
+        // downstream nodes must reference their projected output tuple
+        // positions rather than re-expanding the original expressions against
+        // the pre-projection input schema.
         if let (Some(projections), Some(output_tuple_id)) =
             (&node.projections, &node.output_tuple_id)
         {
@@ -328,13 +336,14 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
                 for (i, expr) in projections.iter().enumerate() {
                     if i < materialized.len() {
                         let sid = materialized[i];
-                        if scan_only
-                            || desc
-                                .get_slot(sid)
-                                .map(|s| s.col_name.is_empty())
-                                .unwrap_or(false)
-                        {
-                            slot_expressions.insert(sid, expr.clone());
+                        if node.node_type == TPlanNodeType::FILE_SCAN_NODE {
+                            slot_expressions.insert(
+                                sid,
+                                descriptor_table::SlotExpressionInfo {
+                                    expr: expr.clone(),
+                                    use_child_rel_names: false,
+                                },
+                            );
                         }
                     }
                 }
@@ -377,30 +386,32 @@ fn extract_sort_limit_from_plan(
         let is_asc = sort_info.is_asc_order.get(i).copied().unwrap_or(true);
         let nulls_first = sort_info.nulls_first.get(i).copied().unwrap_or(true);
 
-        let col_name = expr.nodes.first().and_then(|node| {
-            if node.node_type == TExprNodeType::SLOT_REF {
-                node.slot_ref.as_ref().and_then(|sr| {
-                    let slot = desc.get_slot(sr.slot_id).ok()?;
-                    if !slot.col_name.is_empty() {
-                        // Named column: find in Rel column names.
-                        if rel_column_names.iter().any(|n| n == &slot.col_name) {
-                            Some(slot.col_name.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        // Empty-name measure: use empty string (will match by position).
-                        Some(String::new())
-                    }
-                })
+        let resolved = expr.nodes.first().and_then(|node| {
+            if node.node_type != TExprNodeType::SLOT_REF {
+                return None;
+            }
+            let sr = node.slot_ref.as_ref()?;
+            let slot = desc.get_slot(sr.slot_id).ok()?;
+            let ordinal = if !sort_plan_node.row_tuples.is_empty() {
+                desc.slot_global_index(sr.slot_id, &sort_plan_node.row_tuples).ok()
             } else {
                 None
-            }
+            };
+            let name = if !slot.col_name.is_empty() && rel_column_names.iter().any(|n| n == &slot.col_name) {
+                Some(slot.col_name.clone())
+            } else {
+                ordinal
+                    .and_then(|idx| rel_column_names.get(idx))
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+            };
+            Some((name.unwrap_or_default(), ordinal))
         });
 
-        if let Some(name) = col_name {
+        if let Some((name, ordinal)) = resolved {
             sort_columns.push(SortColumn {
                 name,
+                ordinal,
                 ascending: is_asc,
                 nulls_first,
             });
@@ -413,9 +424,11 @@ fn extract_sort_limit_from_plan(
     // may include columns that DuckDB optimizes away (e.g., AGG columns in semi-joins).
     let mut order_parts = Vec::new();
     for sc in &sort_columns {
+        let dir = if sc.ascending { "ASC" } else { "DESC" };
         if !sc.name.is_empty() {
-            let dir = if sc.ascending { "ASC" } else { "DESC" };
             order_parts.push(format!("\"{}\" {}", sc.name, dir));
+        } else if let Some(ordinal) = sc.ordinal {
+            order_parts.push(format!("{} {}", ordinal + 1, dir));
         }
     }
 
@@ -504,67 +517,112 @@ pub fn translate_fragment(
     // Translate the plan tree into a Substrait Rel tree.
     let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, &table_schemas, file_scan_map)?;
 
-    // If output_exprs contain computed expressions (ARITHMETIC_EXPR, FUNCTION_CALL,
-    // CAST_EXPR, etc.), wrap the Rel in a ProjectRel to compute them. Without this,
-    // queries like Q8 (mkt_share = SUM(x)/SUM(y)) return raw aggregation columns
-    // without the final division.
+    // Honor fragment output_exprs as a real projection, not just for computed
+    // expressions. Doris uses output_exprs for final SELECT-list reordering and
+    // column dropping even when every expr is a SLOT_REF. Without this, the
+    // Substrait plan can keep extra join/agg columns that shift the FE result.
     if let Some(output_exprs) = fragment.output_exprs.as_ref() {
         let types: Vec<_> = output_exprs.iter().map(|e| {
             e.nodes.first().map(|n| format!("{:?}", n.node_type)).unwrap_or_default()
         }).collect();
         tracing::warn!(num_exprs = output_exprs.len(), types = ?types, "output_exprs types");
     }
-    let has_computed_output_exprs = fragment.output_exprs.as_ref().map_or(false, |exprs| {
-        exprs.iter().any(|e| {
-            e.nodes
-                .first()
-                .map_or(true, |n| n.node_type != TExprNodeType::SLOT_REF)
-        })
-    });
-
-    if has_computed_output_exprs {
-        if let Some(output_exprs) = fragment.output_exprs.as_ref() {
-            // Use root node's row_tuples for resolving SLOT_REFs in output_exprs
-            // against the plan's output schema.
+    let mut filtered_output_exprs: Option<Vec<TExpr>> = None;
+    if let Some(output_exprs) = fragment.output_exprs.as_ref() {
+        if !output_exprs.is_empty() {
+            let rel_names = node_translator::collect_rel_column_names(&rel);
+            if !rel_names.is_empty() {
+                desc.set_child_rel_column_names(rel_names.clone());
+            }
             let root_row_tuples = &plan.nodes[0].row_tuples;
+            let num_input = node_translator::count_rel_columns(&rel);
 
             let mut projections = Vec::new();
+            let mut kept_output_exprs = Vec::new();
             for expr in output_exprs {
+                let slot_ref_meta = expr
+                    .nodes
+                    .first()
+                    .and_then(|n| {
+                        if n.node_type == TExprNodeType::SLOT_REF {
+                            n.slot_ref.as_ref()
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(|sr| {
+                        desc.get_slot(sr.slot_id).ok().map(|slot| {
+                            (sr.slot_id, sr.tuple_id, slot.col_name.clone(), slot.column_pos)
+                        })
+                    });
                 let translated = expr_translator::translate_expr_in_context(
                     expr,
                     &desc,
                     &mut registry,
                     root_row_tuples,
                 )?;
+                tracing::info!(
+                    output_slot = ?slot_ref_meta,
+                    translated_field_idx = ?node_translator::extract_field_ref_index(&translated),
+                    root_row_tuples = ?root_row_tuples,
+                    rel_names = ?rel_names,
+                    "translated fragment output_expr"
+                );
+                let is_pure_slot_ref =
+                    expr.nodes.len() == 1
+                        && expr
+                            .nodes
+                            .first()
+                            .map(|n| n.node_type == TExprNodeType::SLOT_REF)
+                            .unwrap_or(false);
+                if is_pure_slot_ref {
+                    if let Some(field_idx) = node_translator::extract_field_ref_index(&translated) {
+                        if field_idx >= num_input as i32 {
+                            let slot_ref = expr.nodes[0].slot_ref.as_ref().unwrap();
+                            tracing::warn!(
+                                slot_id = slot_ref.slot_id,
+                                tuple_id = slot_ref.tuple_id,
+                                field_idx,
+                                num_input,
+                                root_row_tuples = ?root_row_tuples,
+                                "skipping fragment output_expr beyond input width"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 projections.push(translated);
+                kept_output_exprs.push(expr.clone());
             }
+            desc.clear_child_rel_column_names();
+            filtered_output_exprs = Some(kept_output_exprs);
 
-            let num_input = node_translator::count_rel_columns(&rel);
-            // Emit selects only the projected expressions (skip pass-through input columns).
             let output_mapping: Vec<i32> = (num_input as i32
                 ..num_input as i32 + projections.len() as i32)
                 .collect();
 
-            debug!(
-                num_input,
-                num_projections = projections.len(),
-                output_mapping = ?output_mapping,
-                "wrapping Rel in ProjectRel for computed output_exprs"
-            );
+            if !projections.is_empty() {
+                debug!(
+                    num_input,
+                    num_projections = projections.len(),
+                    output_mapping = ?output_mapping,
+                    "wrapping Rel in ProjectRel for fragment output_exprs"
+                );
 
-            rel = Rel {
-                rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
-                    common: Some(RelCommon {
-                        emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
-                            output_mapping,
-                        })),
+                rel = Rel {
+                    rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+                        common: Some(RelCommon {
+                            emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
+                                output_mapping,
+                            })),
+                            ..Default::default()
+                        }),
+                        input: Some(Box::new(rel)),
+                        expressions: projections,
                         ..Default::default()
-                    }),
-                    input: Some(Box::new(rel)),
-                    expressions: projections,
-                    ..Default::default()
-                }))),
-            };
+                    }))),
+                };
+            }
         }
     }
 
@@ -631,7 +689,7 @@ pub fn translate_fragment(
 
     // Build output names in the SELECT-list order the FE expects.
     // Prefer output_exprs (gives exact FE column order), fall back to row_tuples.
-    let output_names = if let Some(output_exprs) = fragment.output_exprs.as_ref() {
+    let output_names = if let Some(output_exprs) = filtered_output_exprs.as_ref() {
         let mut names = Vec::new();
         for expr in output_exprs {
             if let Some(first_node) = expr.nodes.first() {
@@ -648,6 +706,43 @@ pub fn translate_fragment(
             names.push(format!("expr_{}", names.len()));
         }
         debug!(source = "output_exprs", names = ?names, "output column names");
+        names
+    } else if let Some(output_exprs) = fragment.output_exprs.as_ref() {
+        let mut names = Vec::new();
+        for expr in output_exprs {
+            if let Some(first_node) = expr.nodes.first() {
+                if first_node.node_type == TExprNodeType::SLOT_REF {
+                    if let Some(slot_ref) = &first_node.slot_ref {
+                        if let Ok(slot) = desc.get_slot(slot_ref.slot_id) {
+                            names.push(slot.col_name.clone());
+                            continue;
+                        }
+                    }
+                }
+            }
+            names.push(format!("expr_{}", names.len()));
+        }
+        debug!(source = "output_exprs", names = ?names, "output column names");
+        names
+    } else if plan
+        .nodes
+        .first()
+        .and_then(|node| node.projections.as_ref())
+        .map(|exprs| !exprs.is_empty())
+        .unwrap_or(false)
+    {
+        let names: Vec<String> = rel_column_names
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                if name.is_empty() {
+                    format!("expr_{idx}")
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        debug!(source = "root_projections", names = ?names, "output column names");
         names
     } else if !plan.nodes.is_empty() {
         // Fallback: use row_tuples from root node.
@@ -899,6 +994,72 @@ mod tests {
             }
             other => panic!("expected Read, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_translate_fragment_root_scan_projections_materialize_output_tuple() {
+        let mut node = make_file_scan_node(0, 0, "customer");
+        node.projections = Some(vec![
+            slot_ref_expr_in_tuple(4, 0, varchar_type_desc()),
+            slot_ref_expr_in_tuple(5, 0, type_desc(TPrimitiveType::DOUBLE)),
+            cast_expr(
+                type_desc(TPrimitiveType::DOUBLE),
+                slot_ref_expr_in_tuple(5, 0, type_desc(TPrimitiveType::DOUBLE)),
+            ),
+            slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+        ]);
+        node.output_tuple_id = Some(1);
+
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(
+            vec![(0, Some(1)), (1, None)],
+            vec![
+                (0, 0, 0, "c_custkey", TPrimitiveType::BIGINT),
+                (4, 0, 4, "c_phone", TPrimitiveType::VARCHAR),
+                (5, 0, 5, "c_acctbal", TPrimitiveType::DOUBLE),
+                (10, 1, 0, "c_phone", TPrimitiveType::VARCHAR),
+                (11, 1, 1, "c_acctbal", TPrimitiveType::DOUBLE),
+                (12, 1, 2, "", TPrimitiveType::DOUBLE),
+                (13, 1, 3, "c_custkey", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "customer_0".to_string(),
+            vec![
+                "c_custkey".to_string(),
+                "c_phone".to_string(),
+                "c_acctbal".to_string(),
+            ],
+        );
+
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
+        assert_eq!(
+            result.output_names,
+            vec!["c_phone", "c_acctbal", "expr_2", "c_custkey"]
+        );
+
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        assert_eq!(
+            root.names,
+            vec!["c_phone", "c_acctbal", "", "c_custkey"],
+            "root relation should expose the scan's projected output tuple"
+        );
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Project(_) => {}
+            other => panic!("expected ProjectRel, got {:?}", std::mem::discriminant(other)),
+        }
+        assert_eq!(
+            node_translator::collect_rel_column_names(input),
+            vec!["c_phone", "c_acctbal", "", "c_custkey"]
+        );
     }
 
     #[test]
@@ -1294,6 +1455,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_sort_limit_sql_keeps_unnamed_measure_by_position() {
+        let scan = make_file_scan_node(1, 0, "data");
+        let sort = make_sort_node(
+            0,
+            vec![0],
+            vec![
+                slot_ref_expr_in_tuple(1, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+            ],
+            vec![false, true], // unnamed measure DESC, named key ASC
+            vec![false, true],
+            None,
+            10,
+        );
+        let plan = make_plan(vec![sort, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10))],
+            vec![
+                (0, 0, 0, "l_orderkey", TPrimitiveType::BIGINT),
+                (1, 0, 1, "", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(
+            result.sort_limit_sql.as_deref(),
+            Some("ORDER BY 2 DESC, \"l_orderkey\" ASC LIMIT 10")
+        );
+        assert_eq!(result.sort_columns.len(), 2);
+        assert_eq!(result.sort_columns[0].name, "");
+        assert_eq!(result.sort_columns[0].ordinal, Some(1));
+        assert_eq!(result.sort_columns[1].name, "l_orderkey");
+        assert_eq!(result.sort_columns[1].ordinal, Some(0));
+    }
+
     // ---- CROSS_JOIN_NODE tests ----
 
     #[test]
@@ -1325,6 +1523,141 @@ mod tests {
             }
             other => panic!("expected CrossRel, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    #[test]
+    fn test_cross_join_join_conjuncts_resolve_duplicate_child_slots() {
+        use doris_thrift::opcodes::TExprOpcode;
+        use substrait::proto::expression::field_reference;
+        use substrait::proto::expression::reference_segment;
+        use substrait::proto::Expression;
+
+        fn collect_field_refs(expr: &Expression, refs: &mut Vec<i32>) {
+            match expr.rex_type.as_ref() {
+                Some(substrait::proto::expression::RexType::Selection(sel)) => {
+                    if let Some(field_reference::ReferenceType::DirectReference(seg)) =
+                        sel.reference_type.as_ref()
+                    {
+                        if let Some(reference_segment::ReferenceType::StructField(sf)) =
+                            seg.reference_type.as_ref()
+                        {
+                            refs.push(sf.field);
+                        }
+                    }
+                }
+                Some(substrait::proto::expression::RexType::ScalarFunction(func)) => {
+                    for arg in &func.arguments {
+                        if let Some(substrait::proto::function_argument::ArgType::Value(expr)) =
+                            arg.arg_type.as_ref()
+                        {
+                            collect_field_refs(expr, refs);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let left_scan = make_file_scan_node(1, 0, "nation_left");
+        let right_scan = make_file_scan_node(2, 1, "nation_right");
+        let mut join_node = make_cross_join_node(0, vec![0, 1]);
+        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
+            compound_pred_expr(
+                TExprOpcode::COMPOUND_OR,
+                vec![
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    11,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                        ],
+                    ),
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    11,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ]);
+
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20)), (2, None)],
+            vec![
+                (0, 0, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (1, 0, 1, "n_name", TPrimitiveType::VARCHAR),
+                (2, 1, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (3, 1, 1, "n_name", TPrimitiveType::VARCHAR),
+                (10, 2, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (11, 2, 1, "n_name", TPrimitiveType::VARCHAR),
+                (12, 2, 2, "n_nationkey", TPrimitiveType::BIGINT),
+                (13, 2, 3, "n_name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        let filter = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Filter(filter) => filter,
+            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+        };
+        match filter.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
+            rel::RelType::Cross(_) => {}
+            other => panic!("expected CrossRel, got {:?}", std::mem::discriminant(other)),
+        }
+        assert!(
+            node_translator::validate_field_refs(input, "root").is_empty(),
+            "cross join predicate should resolve within the combined child schema"
+        );
+
+        let mut field_refs = Vec::new();
+        collect_field_refs(filter.condition.as_deref().unwrap(), &mut field_refs);
+        assert_eq!(
+            field_refs,
+            vec![1, 3, 1, 3],
+            "cross join predicate should reference the left and right n_name columns distinctly"
+        );
     }
 
     // ---- SELECT_NODE tests (filter pass-through) ----
@@ -1896,6 +2229,233 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_agg_uses_projected_join_output_tuple() {
+        use substrait::proto::expression::field_reference;
+        use substrait::proto::expression::reference_segment;
+
+        let left_scan = make_file_scan_node(3, 1, "part");
+        let right_scan = make_file_scan_node(4, 3, "lineitem");
+
+        let mut join_node = make_hash_join_node(
+            2,
+            doris_thrift::plan_nodes::TJoinOp::INNER_JOIN,
+            vec![1, 3],
+            vec![(
+                slot_ref_expr_in_tuple(10, 1, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(20, 3, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        join_node.projections = Some(vec![
+            slot_ref_expr_in_tuple(11, 1, type_desc(TPrimitiveType::VARCHAR)),
+            slot_ref_expr_in_tuple(21, 3, type_desc(TPrimitiveType::DOUBLE)),
+        ]);
+        join_node.output_tuple_id = Some(5);
+
+        let agg = make_aggregation_node(
+            1,
+            vec![6],
+            Some(vec![slot_ref_expr_in_tuple(
+                50,
+                5,
+                type_desc(TPrimitiveType::VARCHAR),
+            )]),
+            vec![agg_function_expr(
+                "sum",
+                type_desc(TPrimitiveType::DOUBLE),
+                vec![type_desc(TPrimitiveType::DOUBLE)],
+                vec![slot_ref_expr_in_tuple(
+                    51,
+                    5,
+                    type_desc(TPrimitiveType::DOUBLE),
+                )],
+            )],
+            6,
+            6,
+            false,
+        );
+
+        let plan = make_plan(vec![agg, join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(1, Some(100)), (3, Some(200)), (5, None), (6, None)],
+            vec![
+                (10, 1, 0, "p_partkey", TPrimitiveType::BIGINT),
+                (11, 1, 1, "p_type", TPrimitiveType::VARCHAR),
+                (20, 3, 0, "l_partkey", TPrimitiveType::BIGINT),
+                (21, 3, 1, "l_extendedprice", TPrimitiveType::DOUBLE),
+                (50, 5, 0, "p_type", TPrimitiveType::VARCHAR),
+                (51, 5, 1, "", TPrimitiveType::DOUBLE),
+                (60, 6, 0, "p_type", TPrimitiveType::VARCHAR),
+                (61, 6, 1, "", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+
+        assert!(
+            node_translator::validate_field_refs(input, "root").is_empty(),
+            "projected join child should not leave out-of-range field refs"
+        );
+
+        let agg = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Aggregate(agg) => agg,
+            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+        };
+
+        let grouping_expr = &agg.groupings[0].grouping_expressions[0];
+        let group_field_idx = match grouping_expr.rex_type.as_ref().unwrap() {
+            substrait::proto::expression::RexType::Selection(sel) => {
+                match sel.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        };
+        assert_eq!(group_field_idx, 0);
+
+        let measure_arg = match agg.measures[0]
+            .measure
+            .as_ref()
+            .unwrap()
+            .arguments[0]
+            .arg_type
+            .as_ref()
+            .unwrap()
+        {
+            substrait::proto::function_argument::ArgType::Value(expr) => expr,
+            other => panic!("expected value arg, got {:?}", other),
+        };
+        let measure_field_idx = match measure_arg.rex_type.as_ref().unwrap() {
+            substrait::proto::expression::RexType::Selection(sel) => {
+                match sel.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        };
+        assert_eq!(measure_field_idx, 1);
+    }
+
+    #[test]
+    fn test_outer_agg_uses_projected_agg_output_tuple() {
+        use substrait::proto::expression::field_reference;
+        use substrait::proto::expression::reference_segment;
+
+        let scan = make_file_scan_node(2, 0, "orders");
+
+        let mut inner_agg = make_aggregation_node(
+            1,
+            vec![1],
+            Some(vec![slot_ref_expr_in_tuple(
+                1,
+                0,
+                type_desc(TPrimitiveType::BIGINT),
+            )]),
+            vec![agg_function_expr(
+                "count",
+                type_desc(TPrimitiveType::BIGINT),
+                vec![],
+                vec![],
+            )],
+            1,
+            1,
+            false,
+        );
+        inner_agg.projections = Some(vec![slot_ref_expr_in_tuple(
+            11,
+            1,
+            type_desc(TPrimitiveType::BIGINT),
+        )]);
+        inner_agg.output_tuple_id = Some(3);
+
+        let outer_agg = make_aggregation_node(
+            0,
+            vec![4],
+            Some(vec![slot_ref_expr_in_tuple(
+                20,
+                3,
+                type_desc(TPrimitiveType::BIGINT),
+            )]),
+            vec![agg_function_expr(
+                "count",
+                type_desc(TPrimitiveType::BIGINT),
+                vec![],
+                vec![],
+            )],
+            4,
+            4,
+            false,
+        );
+
+        let plan = make_plan(vec![outer_agg, inner_agg, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(100)), (1, None), (3, None), (4, None)],
+            vec![
+                (0, 0, 0, "o_orderkey", TPrimitiveType::BIGINT),
+                (1, 0, 1, "o_custkey", TPrimitiveType::BIGINT),
+                (10, 1, 0, "o_custkey", TPrimitiveType::BIGINT),
+                (11, 1, 1, "", TPrimitiveType::BIGINT),
+                (20, 3, 0, "", TPrimitiveType::BIGINT),
+                (30, 4, 0, "", TPrimitiveType::BIGINT),
+                (31, 4, 1, "", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+
+        assert!(
+            node_translator::validate_field_refs(input, "root").is_empty(),
+            "outer aggregate should resolve grouping keys against projected child output"
+        );
+
+        let outer_agg = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Aggregate(agg) => agg,
+            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+        };
+        let grouping_expr = &outer_agg.groupings[0].grouping_expressions[0];
+        let group_field_idx = match grouping_expr.rex_type.as_ref().unwrap() {
+            substrait::proto::expression::RexType::Selection(sel) => {
+                match sel.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        };
+        assert_eq!(group_field_idx, 0);
+    }
+
     /// Test two-phase AGG collapse over a JOIN — verifies that after merge,
     /// the collapsed aggregation correctly references JOIN output indices.
     #[test]
@@ -2022,6 +2582,183 @@ mod tests {
             rel::RelType::Join(_) => {}
             other => panic!("expected JoinRel under collapsed AGG, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    #[test]
+    fn test_q03_partial_agg_arithmetic_uses_lineitem_measure_fields() {
+        use substrait::proto::expression::field_reference;
+        use substrait::proto::expression::reference_segment;
+        use substrait::proto::Expression;
+
+        fn collect_field_refs(expr: &Expression, refs: &mut Vec<i32>) {
+            match expr.rex_type.as_ref() {
+                Some(substrait::proto::expression::RexType::Selection(sel)) => {
+                    if let Some(field_reference::ReferenceType::DirectReference(seg)) =
+                        sel.reference_type.as_ref()
+                    {
+                        if let Some(reference_segment::ReferenceType::StructField(sf)) =
+                            seg.reference_type.as_ref()
+                        {
+                            refs.push(sf.field);
+                        }
+                    }
+                }
+                Some(substrait::proto::expression::RexType::ScalarFunction(func)) => {
+                    for arg in &func.arguments {
+                        if let Some(substrait::proto::function_argument::ArgType::Value(expr)) =
+                            arg.arg_type.as_ref()
+                        {
+                            collect_field_refs(expr, refs);
+                        }
+                    }
+                }
+                Some(substrait::proto::expression::RexType::Cast(cast)) => {
+                    if let Some(input) = cast.input.as_ref() {
+                        collect_field_refs(input, refs);
+                    }
+                }
+                Some(substrait::proto::expression::RexType::IfThen(if_then)) => {
+                    for if_clause in &if_then.ifs {
+                        if let Some(cond) = if_clause.r#if.as_ref() {
+                            collect_field_refs(cond, refs);
+                        }
+                        if let Some(then_expr) = if_clause.then.as_ref() {
+                            collect_field_refs(then_expr, refs);
+                        }
+                    }
+                    if let Some(else_expr) = if_then.r#else.as_ref() {
+                        collect_field_refs(else_expr, refs);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let customer_scan = make_file_scan_node(4, 0, "customer");
+        let orders_scan = make_file_scan_node(5, 1, "orders");
+        let lineitem_scan = make_file_scan_node(6, 2, "lineitem");
+
+        let customer_orders_join = make_hash_join_node(
+            3,
+            doris_thrift::plan_nodes::TJoinOp::INNER_JOIN,
+            vec![0, 1],
+            vec![(
+                slot_ref_expr_in_tuple(10, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(21, 1, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        let orders_lineitem_join = make_hash_join_node(
+            2,
+            doris_thrift::plan_nodes::TJoinOp::INNER_JOIN,
+            vec![0, 1, 2],
+            vec![(
+                slot_ref_expr_in_tuple(20, 1, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(30, 2, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+
+        let revenue_expr = function_call_expr(
+            "multiply",
+            decimal_type_desc(38, 4),
+            vec![decimal_type_desc(15, 2), decimal_type_desc(15, 2)],
+            vec![
+                slot_ref_expr_in_tuple(43, 3, decimal_type_desc(15, 2)),
+                function_call_expr(
+                    "subtract",
+                    decimal_type_desc(15, 2),
+                    vec![decimal_type_desc(15, 2), decimal_type_desc(15, 2)],
+                    vec![
+                        decimal_literal_expr("1.00", 15, 2),
+                        slot_ref_expr_in_tuple(44, 3, decimal_type_desc(15, 2)),
+                    ],
+                ),
+            ],
+        );
+
+        let partial_agg = make_aggregation_node(
+            1,
+            vec![3],
+            Some(vec![
+                slot_ref_expr_in_tuple(40, 3, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(41, 3, type_desc(TPrimitiveType::DATE)),
+                slot_ref_expr_in_tuple(42, 3, type_desc(TPrimitiveType::INT)),
+            ]),
+            vec![agg_function_expr(
+                "sum",
+                decimal_type_desc(38, 4),
+                vec![decimal_type_desc(38, 4)],
+                vec![revenue_expr],
+            )],
+            3,
+            3,
+            false,
+        );
+
+        let plan = make_plan(vec![
+            partial_agg,
+            orders_lineitem_join,
+            customer_orders_join,
+            customer_scan,
+            orders_scan,
+            lineitem_scan,
+        ]);
+        let desc = make_desc_table(
+            vec![(0, Some(100)), (1, Some(200)), (2, Some(300)), (3, None)],
+            vec![
+                (10, 0, 0, "c_custkey", TPrimitiveType::BIGINT),
+                (11, 0, 1, "c_mktsegment", TPrimitiveType::VARCHAR),
+                (20, 1, 0, "o_orderkey", TPrimitiveType::BIGINT),
+                (21, 1, 1, "o_custkey", TPrimitiveType::BIGINT),
+                (22, 1, 2, "o_orderdate", TPrimitiveType::DATE),
+                (23, 1, 3, "o_shippriority", TPrimitiveType::INT),
+                (30, 2, 0, "l_orderkey", TPrimitiveType::BIGINT),
+                (31, 2, 1, "l_extendedprice", TPrimitiveType::DECIMAL128I),
+                (32, 2, 2, "l_discount", TPrimitiveType::DECIMAL128I),
+                (40, 3, 0, "l_orderkey", TPrimitiveType::BIGINT),
+                (41, 3, 1, "o_orderdate", TPrimitiveType::DATE),
+                (42, 3, 2, "o_shippriority", TPrimitiveType::INT),
+                (43, 3, 3, "l_extendedprice", TPrimitiveType::DECIMAL128I),
+                (44, 3, 4, "l_discount", TPrimitiveType::DECIMAL128I),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let agg = match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
+            rel::RelType::Aggregate(agg) => agg,
+            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+        };
+
+        assert!(
+            node_translator::validate_field_refs(root.input.as_ref().unwrap(), "root").is_empty(),
+            "Q03-style partial agg should not leave invalid field refs"
+        );
+
+        let measure_arg = match agg.measures[0]
+            .measure
+            .as_ref()
+            .unwrap()
+            .arguments[0]
+            .arg_type
+            .as_ref()
+            .unwrap()
+        {
+            substrait::proto::function_argument::ArgType::Value(expr) => expr,
+            other => panic!("expected value arg, got {:?}", other),
+        };
+
+        let mut field_refs = Vec::new();
+        collect_field_refs(measure_arg, &mut field_refs);
+        assert_eq!(
+            field_refs,
+            vec![7, 8],
+            "Q03 revenue measure should reference l_extendedprice and l_discount from the 3-way join output"
+        );
     }
 
     // ---- LocalFiles tests (multi-file parquet scan) ----

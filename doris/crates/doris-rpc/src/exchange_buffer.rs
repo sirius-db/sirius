@@ -90,12 +90,18 @@ impl ExchangeBuffer {
             has_lease = data._staging_lease.is_some(),
             "store_packed_gpu"
         );
-        self.packed_gpu.entry(key).or_insert_with(Vec::new).push(data);
+        self.packed_gpu
+            .entry(key)
+            .or_insert_with(Vec::new)
+            .push(data);
     }
 
     /// Take all packed GPU exchange data for an exchange key.
     pub fn take_packed_gpu(&self, key: &ExchangeKey) -> Option<Vec<PackedGpuExchange>> {
-        self.packed_gpu.remove(key).map(|(_, v)| v).filter(|v| !v.is_empty())
+        self.packed_gpu
+            .remove(key)
+            .map(|(_, v)| v)
+            .filter(|v| !v.is_empty())
     }
 
     /// Check if a query has been cancelled.

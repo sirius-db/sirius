@@ -5,14 +5,15 @@
 //! left+right for JOINs). The Doris FE expects columns in the SELECT list
 //! order specified by `output_exprs`. This module reorders columns to match.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch, new_null_array};
+use arrow::array::{new_null_array, Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Reorder IPC columns to match FE output order, padding with NULLs for missing columns.
 ///
@@ -34,12 +35,29 @@ pub fn reorder_and_pad_ipc(
     let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None)
         .map_err(|e| format!("parse IPC for reorder+pad: {e}"))?;
     let schema = reader.schema();
-    // Use aliases if provided (maps col_0→real_name), otherwise use IPC field names.
-    let ipc_names: Vec<&str> = if let Some(aliases) = ipc_name_aliases {
-        // Aliases are positional — alias[i] is the real name for IPC column i.
-        aliases.iter().map(|s| s.as_str()).collect()
+    let alias_ref = ipc_name_aliases.filter(|aliases| {
+        if aliases.len() == schema.fields().len() {
+            true
+        } else {
+            warn!(
+                alias_len = aliases.len(),
+                ipc_cols = schema.fields().len(),
+                "ignoring IPC column aliases with mismatched width"
+            );
+            false
+        }
+    });
+    let schema_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let use_aliases = alias_ref.is_some()
+        && schema_names
+            .iter()
+            .all(|name| name.is_empty() || name.starts_with("col_"));
+    // Prefer real IPC schema names whenever they are meaningful. Descriptor-derived
+    // aliases are only reliable for generic col_N exchange schemas.
+    let ipc_names: Vec<&str> = if use_aliases {
+        alias_ref.unwrap().iter().map(|s| s.as_str()).collect()
     } else {
-        schema.fields().iter().map(|f| f.name().as_str()).collect()
+        schema_names.clone()
     };
 
     // Check if columns are already in the right order with EXACT name matching.
@@ -55,28 +73,34 @@ pub fn reorder_and_pad_ipc(
     }
 
     // Build name → IPC column index map (uses aliases if provided).
-    let ipc_name_to_idx: std::collections::HashMap<&str, usize> = ipc_names
+    let mut ipc_name_to_indices: HashMap<&str, VecDeque<usize>> = ipc_names
         .iter()
         .enumerate()
-        .map(|(i, name)| (*name, i))
-        .collect();
+        .fold(HashMap::new(), |mut acc, (i, name)| {
+            acc.entry(*name).or_default().push_back(i);
+            acc
+        });
 
     // For each FE output position, find the source IPC column index.
     // When aliases are provided, all names are treated as exact matches
     // (aliases already contain "expr_N" placeholders for aggregates).
     // Without aliases, "expr_N" names are matched by elimination.
-    let use_exact = ipc_name_aliases.is_some();
-    let mut used_ipc: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let use_exact = use_aliases;
+    let mut used_ipc: HashSet<usize> = HashSet::new();
     let mut mapping: Vec<Option<usize>> = Vec::with_capacity(fe_output_names.len());
     for name in fe_output_names {
-        if use_exact || !name.starts_with("expr_") {
-            if let Some(&idx) = ipc_name_to_idx.get(name.as_str()) {
-                mapping.push(Some(idx));
-                used_ipc.insert(idx);
-                continue;
+        let mut matched_idx = None;
+        if !name.is_empty() && (use_exact || !name.starts_with("expr_")) {
+            if let Some(indices) = ipc_name_to_indices.get_mut(name.as_str()) {
+                while let Some(idx) = indices.pop_front() {
+                    if used_ipc.insert(idx) {
+                        matched_idx = Some(idx);
+                        break;
+                    }
+                }
             }
         }
-        mapping.push(None); // Will be resolved below
+        mapping.push(matched_idx); // Remaining unresolved slots are filled below.
     }
     // Assign unmatched IPC columns to unmatched FE positions by order.
     let mut unmatched_ipc: Vec<usize> = (0..schema.fields().len())
@@ -131,7 +155,9 @@ pub fn reorder_and_pad_ipc(
             }
             let reordered = RecordBatch::try_new(reordered_schema.clone(), columns)
                 .map_err(|e| format!("build reordered batch: {e}"))?;
-            writer.write(&reordered).map_err(|e| format!("write batch: {e}"))?;
+            writer
+                .write(&reordered)
+                .map_err(|e| format!("write batch: {e}"))?;
         }
         writer.finish().map_err(|e| format!("finish IPC: {e}"))?;
     }
@@ -205,12 +231,8 @@ mod ipc_reorder_tests {
                 Arc::new(Int64Array::from(vec![3])),
             ],
         );
-        let result = reorder_and_pad_ipc(
-            &ipc,
-            &["a".into(), "b".into(), "c".into()],
-            None,
-        )
-        .unwrap();
+        let result =
+            reorder_and_pad_ipc(&ipc, &["a".into(), "b".into(), "c".into()], None).unwrap();
         assert_eq!(read_ipc_column_names(&result), vec!["a", "b", "c"]);
     }
 
@@ -224,12 +246,8 @@ mod ipc_reorder_tests {
                 Arc::new(Int64Array::from(vec![3])),
             ],
         );
-        let result = reorder_and_pad_ipc(
-            &ipc,
-            &["c".into(), "a".into(), "b".into()],
-            None,
-        )
-        .unwrap();
+        let result =
+            reorder_and_pad_ipc(&ipc, &["c".into(), "a".into(), "b".into()], None).unwrap();
         assert_eq!(read_ipc_column_names(&result), vec!["c", "a", "b"]);
         assert_eq!(read_ipc_first_row(&result), vec!["3", "1", "2"]);
     }
@@ -239,11 +257,16 @@ mod ipc_reorder_tests {
         // Q3: DuckDB returns [l_orderkey, o_orderdate, o_shippriority, sum(...)]
         // FE expects [l_orderkey, revenue(=sum), o_orderdate, o_shippriority]
         let ipc = make_ipc(
-            &["l_orderkey", "o_orderdate", "o_shippriority", "sum(revenue)"],
+            &[
+                "l_orderkey",
+                "o_orderdate",
+                "o_shippriority",
+                "sum(revenue)",
+            ],
             vec![
                 Arc::new(Int64Array::from(vec![100])),
-                Arc::new(Int64Array::from(vec![19050])),       // date as int
-                Arc::new(Int64Array::from(vec![0])),           // shippriority
+                Arc::new(Int64Array::from(vec![19050])), // date as int
+                Arc::new(Int64Array::from(vec![0])),     // shippriority
                 Arc::new(Float64Array::from(vec![406181.01])), // revenue
             ],
         );
@@ -252,7 +275,7 @@ mod ipc_reorder_tests {
             &ipc,
             &[
                 "l_orderkey".into(),
-                "expr_1".into(),       // aggregate → matched by elimination
+                "expr_1".into(), // aggregate → matched by elimination
                 "o_orderdate".into(),
                 "o_shippriority".into(),
             ],
@@ -262,7 +285,15 @@ mod ipc_reorder_tests {
         let names = read_ipc_column_names(&result);
         let values = read_ipc_first_row(&result);
         // The aggregate column should now be at position 1
-        assert_eq!(names, vec!["l_orderkey", "sum(revenue)", "o_orderdate", "o_shippriority"]);
+        assert_eq!(
+            names,
+            vec![
+                "l_orderkey",
+                "sum(revenue)",
+                "o_orderdate",
+                "o_shippriority"
+            ]
+        );
         assert_eq!(values, vec!["100", "406181.01", "19050", "0"]);
     }
 
@@ -278,12 +309,8 @@ mod ipc_reorder_tests {
                 Arc::new(Int64Array::from(vec![99])),
             ],
         );
-        let result = reorder_and_pad_ipc(
-            &ipc,
-            &["a".into(), "expr_0".into(), "b".into()],
-            None,
-        )
-        .unwrap();
+        let result =
+            reorder_and_pad_ipc(&ipc, &["a".into(), "expr_0".into(), "b".into()], None).unwrap();
         let names = read_ipc_column_names(&result);
         let values = read_ipc_first_row(&result);
         assert_eq!(names, vec!["a", "computed_col", "b"]);
@@ -299,12 +326,8 @@ mod ipc_reorder_tests {
                 Arc::new(Int64Array::from(vec![2])),
             ],
         );
-        let result = reorder_and_pad_ipc(
-            &ipc,
-            &["a".into(), "b".into(), "missing".into()],
-            None,
-        )
-        .unwrap();
+        let result =
+            reorder_and_pad_ipc(&ipc, &["a".into(), "b".into(), "missing".into()], None).unwrap();
         let names = read_ipc_column_names(&result);
         assert_eq!(names, vec!["a", "b", "missing"]);
         let values = read_ipc_first_row(&result);
@@ -322,12 +345,7 @@ mod ipc_reorder_tests {
                 Arc::new(Int64Array::from(vec![99])),
             ],
         );
-        let result = reorder_and_pad_ipc(
-            &ipc,
-            &["c".into(), "a".into()],
-            None,
-        )
-        .unwrap();
+        let result = reorder_and_pad_ipc(&ipc, &["c".into(), "a".into()], None).unwrap();
         let names = read_ipc_column_names(&result);
         let values = read_ipc_first_row(&result);
         assert_eq!(names, vec!["c", "a"]);
@@ -392,6 +410,87 @@ mod ipc_reorder_tests {
         let values = read_ipc_first_row(&result);
         // Revenue (406181.01) should be at position 1, dates at 2
         assert_eq!(values, vec!["100", "406181.01", "19050", "0"]);
+    }
+
+    #[test]
+    fn test_duplicate_fe_names_use_distinct_ipc_columns() {
+        // Q7-style self-join output: FE lost alias distinction and asks for the same
+        // base name twice, but the IPC schema still has unique columns.
+        let ipc = make_ipc(
+            &["n_name", "n_name_1", "l_year", "revenue"],
+            vec![
+                Arc::new(StringArray::from(vec!["FRANCE"])),
+                Arc::new(StringArray::from(vec!["GERMANY"])),
+                Arc::new(Int64Array::from(vec![1995])),
+                Arc::new(Float64Array::from(vec![54639732.7336])),
+            ],
+        );
+        let result = reorder_and_pad_ipc(
+            &ipc,
+            &["n_name".into(), "n_name".into(), "".into(), "".into()],
+            None,
+        )
+        .unwrap();
+        let values = read_ipc_first_row(&result);
+        assert_eq!(values, vec!["FRANCE", "GERMANY", "1995", "54639732.7336"]);
+    }
+
+    #[test]
+    fn test_meaningful_ipc_names_override_bad_aliases() {
+        // Q18-style final exchange result: IPC schema names are already meaningful,
+        // but descriptor aliases reflect the pre-project order and would corrupt
+        // the output if we trusted them.
+        let ipc = make_ipc(
+            &[
+                "c_name",
+                "c_custkey",
+                "o_orderkey",
+                "o_orderdate",
+                "o_totalprice",
+                "col_5",
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["Customer#000128120"])),
+                Arc::new(Int64Array::from(vec![128120])),
+                Arc::new(Int64Array::from(vec![4722021])),
+                Arc::new(StringArray::from(vec!["1994-04-07"])),
+                Arc::new(StringArray::from(vec!["544089.09"])),
+                Arc::new(StringArray::from(vec!["323.00"])),
+            ],
+        );
+        let aliases = vec![
+            "o_totalprice".to_string(),
+            "o_orderdate".to_string(),
+            "c_name".to_string(),
+            "c_custkey".to_string(),
+            "o_orderkey".to_string(),
+            "expr_5".to_string(),
+        ];
+        let result = reorder_and_pad_ipc(
+            &ipc,
+            &[
+                "c_name".into(),
+                "c_custkey".into(),
+                "o_orderkey".into(),
+                "o_orderdate".into(),
+                "o_totalprice".into(),
+                "".into(),
+            ],
+            Some(&aliases),
+        )
+        .unwrap();
+        let values = read_ipc_first_row(&result);
+        assert_eq!(
+            values,
+            vec![
+                "Customer#000128120",
+                "128120",
+                "4722021",
+                "1994-04-07",
+                "544089.09",
+                "323.00",
+            ]
+        );
     }
 
     #[test]

@@ -219,9 +219,7 @@ fn bench_staging_vs_per_buffer(c: &mut Criterion) {
         );
 
         // Per-buffer path: cuMemAlloc + nixl register per buffer (old path)
-        let alloc_sizes: Vec<(u64, u64)> = (0..count)
-            .map(|_| (1024 * 1024u64, 0u64))
-            .collect();
+        let alloc_sizes: Vec<(u64, u64)> = (0..count).map(|_| (1024 * 1024u64, 0u64)).collect();
 
         group.bench_with_input(
             BenchmarkId::new("per_buffer_alloc_register", format!("{}x1MB", count)),
@@ -293,18 +291,14 @@ fn bench_lease_lifecycle(c: &mut Criterion) {
     for &count in &[1, 10, 50, 100] {
         let sizes: Vec<(u64, u64)> = (0..count).map(|_| (4096u64, 0u64)).collect();
         group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(
-            BenchmarkId::new("alloc_drop", count),
-            &sizes,
-            |b, sizes| {
-                b.iter(|| {
-                    let leases = staging.try_allocate(sizes).expect("allocate failed");
-                    // Simulate reading lease addresses (prevents optimization)
-                    let _sum: usize = leases.iter().map(|l| l.addr()).sum();
-                    drop(leases);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("alloc_drop", count), &sizes, |b, sizes| {
+            b.iter(|| {
+                let leases = staging.try_allocate(sizes).expect("allocate failed");
+                // Simulate reading lease addresses (prevents optimization)
+                let _sum: usize = leases.iter().map(|l| l.addr()).sum();
+                drop(leases);
+            });
+        });
     }
 
     // Measure interleaved lease patterns (allocate first batch, then second, drop first)
@@ -315,7 +309,11 @@ fn bench_lease_lifecycle(c: &mut Criterion) {
         b.iter(|| {
             let leases_a = staging.try_allocate(&sizes_a).expect("alloc A failed");
             let leases_b = staging.try_allocate(&sizes_b).expect("alloc B failed");
-            let _sum: usize = leases_a.iter().chain(leases_b.iter()).map(|l| l.addr()).sum();
+            let _sum: usize = leases_a
+                .iter()
+                .chain(leases_b.iter())
+                .map(|l| l.addr())
+                .sum();
             drop(leases_a); // drop first batch (leases remain from B)
             drop(leases_b); // drop second → allocator resets
         });

@@ -49,18 +49,18 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
         );
 
         let backend_info = TBackendInfo::new(
-            self.state.be_port,            // be_port (required)
-            self.state.http_port,          // http_port (required)
-            Some(self.state.be_port),      // be_rpc_port
-            Some(self.state.brpc_port),    // brpc_port
-            Some(self.state.version.clone()), // version
-            Some(self.state.start_time_ms),  // be_start_time
-            Some("mix".to_string()), // be_node_role
-            Some(false),                   // is_shutdown
+            self.state.be_port,                 // be_port (required)
+            self.state.http_port,               // http_port (required)
+            Some(self.state.be_port),           // be_rpc_port
+            Some(self.state.brpc_port),         // brpc_port
+            Some(self.state.version.clone()),   // version
+            Some(self.state.start_time_ms),     // be_start_time
+            Some("mix".to_string()),            // be_node_role
+            Some(false),                        // is_shutdown
             Some(self.state.arrow_flight_port), // arrow_flight_sql_port
-            Some(32 * 1024 * 1024 * 1024_i64), // be_mem: 32 GB
-            None::<i64>,                   // fragment_executing_count
-            None::<i64>,                   // fragment_last_active_time
+            Some(32 * 1024 * 1024 * 1024_i64),  // be_mem: 32 GB
+            None::<i64>,                        // fragment_executing_count
+            None::<i64>,                        // fragment_last_active_time
         );
 
         let result = THeartbeatResult::new(
@@ -75,13 +75,10 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
 /// Start the HeartbeatService Thrift server (blocking).
 ///
 /// This should be called from a dedicated thread since TServer::listen blocks.
-pub fn start_heartbeat_server(
-    listen_addr: &str,
-    state: Arc<BeState>,
-) -> thrift::Result<()> {
+pub fn start_heartbeat_server(listen_addr: &str, state: Arc<BeState>) -> thrift::Result<()> {
     use thrift::protocol::{TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory};
-    use thrift::transport::{TBufferedReadTransportFactory, TBufferedWriteTransportFactory};
     use thrift::server::TServer;
+    use thrift::transport::{TBufferedReadTransportFactory, TBufferedWriteTransportFactory};
 
     let handler = HeartbeatHandler::new(state);
     let processor = handler.into_processor();
@@ -93,6 +90,9 @@ pub fn start_heartbeat_server(
 
     let mut server = TServer::new(i_tr_fact, i_pr_fact, o_tr_fact, o_pr_fact, processor, 4);
 
-    info!(addr = listen_addr, "starting HeartbeatService Thrift server");
+    info!(
+        addr = listen_addr,
+        "starting HeartbeatService Thrift server"
+    );
     server.listen(listen_addr)
 }

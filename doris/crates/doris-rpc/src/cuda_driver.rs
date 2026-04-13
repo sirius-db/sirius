@@ -78,11 +78,9 @@ pub fn cuda_free(dev_addr: usize) -> Result<(), String> {
 pub fn cuda_mem_get_address_range_no_ctx(dev_addr: usize) -> Result<(usize, usize), String> {
     let mut base: u64 = 0;
     let mut size: usize = 0;
-    unsafe {
-        sys::cuMemGetAddressRange_v2(&mut base, &mut size, dev_addr as u64)
-    }
-    .result()
-    .map_err(|e| format!("cuMemGetAddressRange(0x{dev_addr:x}): {e}"))?;
+    unsafe { sys::cuMemGetAddressRange_v2(&mut base, &mut size, dev_addr as u64) }
+        .result()
+        .map_err(|e| format!("cuMemGetAddressRange(0x{dev_addr:x}): {e}"))?;
     Ok((base as usize, size))
 }
 
@@ -147,11 +145,9 @@ pub fn cuda_mem_get_address_range(dev_addr: usize) -> Result<(usize, usize), Str
     ensure_cuda_context()?;
     let mut base: u64 = 0;
     let mut size: usize = 0;
-    unsafe {
-        sys::cuMemGetAddressRange_v2(&mut base, &mut size, dev_addr as u64)
-    }
-    .result()
-    .map_err(|e| format!("cuMemGetAddressRange(0x{dev_addr:x}): {e}"))?;
+    unsafe { sys::cuMemGetAddressRange_v2(&mut base, &mut size, dev_addr as u64) }
+        .result()
+        .map_err(|e| format!("cuMemGetAddressRange(0x{dev_addr:x}): {e}"))?;
     Ok((base as usize, size))
 }
 

@@ -224,9 +224,9 @@ impl BackendServiceSyncHandler for BackendHandler {
         &self,
         _request: backend_service::TPublishTopicRequest,
     ) -> thrift::Result<backend_service::TPublishTopicResult> {
-        Ok(backend_service::TPublishTopicResult::new(
-            not_implemented("publish_topic_info"),
-        ))
+        Ok(backend_service::TPublishTopicResult::new(not_implemented(
+            "publish_topic_info",
+        )))
     }
 
     fn handle_get_realtime_exec_status(
@@ -244,9 +244,9 @@ impl BackendServiceSyncHandler for BackendHandler {
         &self,
         _dictionary_ids: Vec<i64>,
     ) -> thrift::Result<backend_service::TDictionaryStatusList> {
-        Ok(backend_service::TDictionaryStatusList::new(None::<
-            Vec<backend_service::TDictionaryStatus>,
-        >))
+        Ok(backend_service::TDictionaryStatusList::new(
+            None::<Vec<backend_service::TDictionaryStatus>>,
+        ))
     }
 
     fn handle_test_storage_connectivity(

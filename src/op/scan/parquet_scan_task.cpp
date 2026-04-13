@@ -52,14 +52,26 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
 
-#if CUDF_VERSION_NUM < 2604
 namespace {
+
+bool parquet_stats_pruning_enabled()
+{
+  static bool const enabled = [] {
+    auto const* env = std::getenv("SIRIUS_ENABLE_PARQUET_STATS_PRUNING");
+    return env != nullptr && std::string_view(env) == "1";
+  }();
+  return enabled;
+}
+
+#if CUDF_VERSION_NUM < 2604
 // Fallback for cudf < 26.04 which lacks cudf::io::parquet::fetch_footer_to_host.
 // Reads the Parquet footer: last 8 bytes = [4-byte footer_len LE][4-byte "PAR1"],
 // then reads footer_len bytes before that.
@@ -86,8 +98,9 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
   auto const footer_offset = file_size - TAIL_SIZE - footer_len;
   return datasource.host_read(footer_offset, footer_len);
 }
-}  // namespace
 #endif
+
+}  // namespace
 
 namespace detail {
 
@@ -377,16 +390,23 @@ void parquet_scan_task_global_state::initialize_from_files()
                       _file_paths[file_idx],
                       row_groups_before_pruning);
       // clang-format on
-      // Prune row groups with filter pushdown using metadata statistics.
-      row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
-        row_group_indices, _reader_options, rmm::cuda_stream_default);
-      auto const row_groups_after_pruning = row_group_indices.size();
-      auto const pruned_row_groups        = row_groups_before_pruning - row_groups_after_pruning;
-      // clang-format off
-      SIRIUS_LOG_INFO("[parquet_scan_task_global_state]                    after: {} (pruned {})",
-                      row_groups_after_pruning,
-                      pruned_row_groups);
-      // clang-format on
+      if (parquet_stats_pruning_enabled()) {
+        // Prune row groups with filter pushdown using metadata statistics.
+        row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
+          row_group_indices, _reader_options, rmm::cuda_stream_default);
+        auto const row_groups_after_pruning = row_group_indices.size();
+        auto const pruned_row_groups = row_groups_before_pruning - row_groups_after_pruning;
+        // clang-format off
+        SIRIUS_LOG_INFO("[parquet_scan_task_global_state]                    after: {} (pruned {})",
+                        row_groups_after_pruning,
+                        pruned_row_groups);
+        // clang-format on
+      } else {
+        SIRIUS_LOG_WARN(
+          "[parquet_scan_task_global_state]                    stats pruning disabled; "
+          "keeping {} row groups",
+          row_groups_before_pruning);
+      }
     }
     auto const& file_metadata = _file_metadatas[file_idx];
 

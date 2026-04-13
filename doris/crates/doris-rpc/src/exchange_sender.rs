@@ -109,10 +109,7 @@ pub async fn send_transmit_block(
         .write_all(&payload)
         .await
         .map_err(|e| format!("write payload: {e}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("flush: {e}"))?;
+    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
 
     // Read response
     let mut resp_header = [0u8; HEADER_SIZE];
@@ -122,10 +119,7 @@ pub async fn send_transmit_block(
         .map_err(|e| format!("read response header: {e}"))?;
 
     if &resp_header[0..4] != BRPC_MAGIC {
-        return Err(format!(
-            "bad response magic: {:?}",
-            &resp_header[0..4]
-        ));
+        return Err(format!("bad response magic: {:?}", &resp_header[0..4]));
     }
 
     let resp_body_size = u32::from_be_bytes(resp_header[4..8].try_into().unwrap()) as usize;

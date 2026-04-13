@@ -5,8 +5,8 @@
 
 #![cfg(test)]
 
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Mock Agent for nixl testing.
 #[derive(Debug)]
@@ -152,7 +152,11 @@ impl Agent {
         Ok(XferRequest { id })
     }
 
-    pub fn post_xfer_req(&self, _req: &XferRequest, _params: Option<&Params>) -> Result<bool, String> {
+    pub fn post_xfer_req(
+        &self,
+        _req: &XferRequest,
+        _params: Option<&Params>,
+    ) -> Result<bool, String> {
         // Return true to indicate async (not completed immediately).
         Ok(true)
     }

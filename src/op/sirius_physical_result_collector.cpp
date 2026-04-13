@@ -228,6 +228,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
         if (should_retain) {
           auto& lgb = duckdb::LastGPUBuffers::GetInstance();
+          // Keep the source GPU batch alive until exchange transfer completes.
+          // The packed exchange path may still depend on buffers originating from
+          // this batch after the pipeline releases its local references.
+          lgb.RetainData(std::static_pointer_cast<void>(input_batch));
           auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
           auto [part_num, part_cols] = lgb.GetPartitionConfig();
 
@@ -236,31 +240,46 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
           if (part_num > 0 && !part_cols.empty() && staging_addr != 0) {
             // GPU hash partition + per-partition pack into staging.
-            std::vector<cudf::size_type> col_indices(part_cols.begin(), part_cols.end());
-            auto [partitioned_table, offsets] = cudf::hash_partition(
-                view, col_indices, part_num, cudf::hash_id::HASH_MURMUR3,
-                cudf::DEFAULT_HASH_SEED, stream);
+            // For a single destination, hash partitioning is a no-op. Bypass the
+            // cuDF partitioner entirely and pack the original view as one
+            // partition to avoid unnecessary ownership churn on the partitioned
+            // table.
+            std::unique_ptr<cudf::table> partitioned_table;
+            cudf::table_view partitioned_view = view;
+            std::vector<cudf::size_type> offsets{0};
+            if (part_num > 1) {
+              std::vector<cudf::size_type> col_indices(part_cols.begin(), part_cols.end());
+              auto partition_result = cudf::hash_partition(
+                  view, col_indices, part_num, cudf::hash_id::HASH_MURMUR3,
+                  cudf::DEFAULT_HASH_SEED, stream);
+              partitioned_table = std::move(partition_result.first);
+              offsets = std::move(partition_result.second);
+              partitioned_view = partitioned_table->view();
 
-            SIRIUS_LOG_INFO("[result_collector] GPU hash_partition: {} partitions, {} rows → offsets: [{}]",
-                            part_num, view.num_rows(),
-                            [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
+              SIRIUS_LOG_INFO("[result_collector] GPU hash_partition: {} partitions, {} rows → offsets: [{}]",
+                              part_num, view.num_rows(),
+                              [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
 
-            // Validate hash_partition output: check first INT32 value and STRING offsets.
-            for (cudf::size_type c = 0; c < partitioned_table->view().num_columns(); c++) {
-              auto col = partitioned_table->view().column(c);
-              if (col.type().id() == cudf::type_id::INT32 && col.size() > 0) {
-                int32_t first_val = 0;
-                cudaMemcpy(&first_val, col.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
-                SIRIUS_LOG_INFO("[result_collector] hash_part col {} INT32 first_val={}", c, first_val);
+              // Validate hash_partition output: check first INT32 value and STRING offsets.
+              for (cudf::size_type c = 0; c < partitioned_view.num_columns(); c++) {
+                auto col = partitioned_view.column(c);
+                if (col.type().id() == cudf::type_id::INT32 && col.size() > 0) {
+                  int32_t first_val = 0;
+                  cudaMemcpy(&first_val, col.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
+                  SIRIUS_LOG_INFO("[result_collector] hash_part col {} INT32 first_val={}", c, first_val);
+                }
+                if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0 && col.size() > 0) {
+                  auto child = col.child(0);
+                  int32_t first_off = 0, last_off = 0;
+                  cudaMemcpy(&first_off, child.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
+                  cudaMemcpy(&last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
+                  SIRIUS_LOG_INFO("[result_collector] hash_part col {} STRING first_off={} last_off={} offset={}",
+                                  c, first_off, last_off, col.offset());
+                }
               }
-              if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0 && col.size() > 0) {
-                auto child = col.child(0);
-                int32_t first_off = 0, last_off = 0;
-                cudaMemcpy(&first_off, child.data<int32_t>(), 4, cudaMemcpyDeviceToHost);
-                cudaMemcpy(&last_off, child.data<int32_t>() + child.size() - 1, 4, cudaMemcpyDeviceToHost);
-                SIRIUS_LOG_INFO("[result_collector] hash_part col {} STRING first_off={} last_off={} offset={}",
-                                c, first_off, last_off, col.offset());
-              }
+            } else {
+              SIRIUS_LOG_INFO("[result_collector] single-destination exchange: bypassing hash_partition for {} rows",
+                              view.num_rows());
             }
 
             std::vector<duckdb::PackedPartition> packed_parts;
@@ -272,9 +291,9 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             size_t exact_total = 0;
             for (int i = 0; i < part_num; i++) {
               auto start = offsets[i];
-              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_table->num_rows();
+              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_view.num_rows();
               if (end <= start) continue;
-              auto pslice = cudf::slice(partitioned_table->view(), {start, end});
+              auto pslice = cudf::slice(partitioned_view, {start, end});
               auto psz = cudf::chunked_pack::create(pslice[0], 1UL << 20, stream)->get_total_contiguous_size();
               exact_total += (psz + 255) & ~255UL;  // 256-byte align per partition
             }
@@ -284,13 +303,13 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
             for (int i = 0; i < part_num; i++) {
               auto start = offsets[i];
-              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_table->num_rows();
+              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_view.num_rows();
               auto num_rows = end - start;
               if (num_rows == 0) {
                 { duckdb::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
                 continue;
               }
-              auto slice = cudf::slice(partitioned_table->view(), {start, end});
+              auto slice = cudf::slice(partitioned_view, {start, end});
               auto total = cudf::chunked_pack::create(slice[0], 1UL << 20, stream)->get_total_contiguous_size();
               if (staging_offset + total > staging_size) {
                 // Overflow: pack into separate rmm::device_buffer instead of dropping data.
@@ -503,9 +522,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
   // Store accumulated GPU buffer metadata for detect_execution_location().
   if (!gpu_buffer_infos.empty()) {
     duckdb::LastGPUBuffers::GetInstance().Store(std::move(gpu_buffer_infos));
-  }
-  if (should_retain) {
-    duckdb::LastGPUBuffers::GetInstance().SetRetainNext(false);
   }
 }
 

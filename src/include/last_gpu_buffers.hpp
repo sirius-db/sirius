@@ -20,9 +20,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -93,6 +95,10 @@ class LastGPUBuffers {
         carry_offset = std::max(carry_offset, s->staging_offset);
       }
     }
+    for (const auto& [session_id, staging_offset] : inflight_staging_offsets_) {
+      (void)session_id;
+      carry_offset = std::max(carry_offset, staging_offset);
+    }
     auto session = std::make_unique<ExchangeSession>();
     session->session_id = next_session_id_++;
     session->staging_offset = carry_offset;
@@ -131,12 +137,23 @@ class LastGPUBuffers {
       std::remove_if(completed_sessions_.begin(), completed_sessions_.end(),
                      [session_id](const auto& s) { return s->session_id == session_id; }),
       completed_sessions_.end());
+    inflight_staging_offsets_.erase(session_id);
   }
 
   /// Store a taken session for later cleanup (when Rust calls end_session).
   void StoreCompletedSession(std::unique_ptr<ExchangeSession> session) {
     std::lock_guard<std::mutex> lock(mutex_);
     completed_sessions_.push_back(std::move(session));
+  }
+
+  void RegisterInflightArtifact(uint64_t session_id, size_t staging_offset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    inflight_staging_offsets_[session_id] = staging_offset;
+  }
+
+  void ReleaseInflightArtifact(uint64_t session_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    inflight_staging_offsets_.erase(session_id);
   }
 
   // --- Legacy GPU buffer metadata (for detect_execution_location) ---
@@ -178,7 +195,6 @@ class LastGPUBuffers {
       active_session_->partition_num = num_partitions;
       active_session_->partition_cols = std::move(column_indices);
       active_session_->packed_partitions.clear();
-      active_session_->staging_offset = 0;
     }
   }
 
@@ -319,6 +335,7 @@ class LastGPUBuffers {
 
   // Completed sessions waiting for end_session cleanup
   std::vector<std::unique_ptr<ExchangeSession>> completed_sessions_;
+  std::unordered_map<uint64_t, size_t> inflight_staging_offsets_;
 
   // Legacy GPU buffer metadata
   std::vector<GPUBufferInfo> buffers_;

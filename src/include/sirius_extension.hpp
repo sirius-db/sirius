@@ -90,6 +90,7 @@ class SiriusExtension : public Extension {
                                                          TableFunctionBindInput& input,
                                                          vector<LogicalType>& return_types,
                                                          vector<string>& names);
+  static void EnsureExchangeBufferManager();
 
   static bool buffer_is_initialized;
 };

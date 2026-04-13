@@ -145,13 +145,7 @@ pub fn arrow_ipc_to_pblock(ipc_bytes: &[u8]) -> Result<(PBlock, u32), String> {
 
         // Collect column data across all batches.
         if nullable {
-            encode_nullable_column(
-                &batches,
-                col_idx,
-                num_rows,
-                type_id,
-                &mut column_values,
-            )?;
+            encode_nullable_column(&batches, col_idx, num_rows, type_id, &mut column_values)?;
         } else {
             encode_column(&batches, col_idx, num_rows, type_id, &mut column_values)?;
         }
@@ -616,11 +610,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int32Array::from(vec![
-                Some(1),
-                None,
-                Some(3),
-            ]))],
+            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
         )
         .unwrap();
 
@@ -634,8 +624,11 @@ mod tests {
     #[test]
     fn test_empty_batch() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![] as Vec<i32>))]).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![] as Vec<i32>))],
+        )
+        .unwrap();
 
         let ipc = make_ipc(&batch);
         let (_pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
@@ -668,11 +661,8 @@ mod tests {
         let n = 100;
         let values: Vec<i64> = (0..n).map(|i| i * 1000 + 7).collect();
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(values.clone()))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.clone()))]).unwrap();
 
         let ipc = make_ipc(&batch);
         let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
@@ -700,11 +690,8 @@ mod tests {
             .map(|i| if i % 5 == 0 { None } else { Some(i * 3) })
             .collect();
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(values.clone()))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.clone()))]).unwrap();
 
         let ipc = make_ipc(&batch);
         let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
@@ -766,11 +753,8 @@ mod tests {
 
         let values = vec![1i32, 2, 3]; // 12 bytes, well under 256
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(values.clone()))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.clone()))]).unwrap();
 
         let ipc = make_ipc(&batch);
         let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
@@ -812,11 +796,8 @@ mod tests {
         // TPC-H-like dates: 1992-01-02, 1998-12-01
         let days = vec![8036i32, 10561]; // days since epoch for those dates
         let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Date32Array::from(days.clone()))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Date32Array::from(days.clone()))]).unwrap();
 
         let ipc = make_ipc(&batch);
         let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();

@@ -96,8 +96,7 @@ impl GpuStagingBuffer {
     ) -> Result<Self, String> {
         let base_addr = cuda_alloc(size)?;
 
-        let mut opt =
-            nixl_sys::OptArgs::new().map_err(|e| format!("OptArgs::new: {e}"))?;
+        let mut opt = nixl_sys::OptArgs::new().map_err(|e| format!("OptArgs::new: {e}"))?;
         opt.add_backend(backend)
             .map_err(|e| format!("add_backend: {e}"))?;
 
@@ -144,8 +143,7 @@ impl GpuStagingBuffer {
         agent: &nixl_sys::Agent,
         backend: &Backend,
     ) -> Result<Self, String> {
-        let mut opt =
-            nixl_sys::OptArgs::new().map_err(|e| format!("OptArgs::new: {e}"))?;
+        let mut opt = nixl_sys::OptArgs::new().map_err(|e| format!("OptArgs::new: {e}"))?;
         opt.add_backend(backend)
             .map_err(|e| format!("add_backend: {e}"))?;
 
@@ -322,10 +320,12 @@ impl GpuStagingBuffer {
 
         let mut leases = Vec::with_capacity(sizes.len());
         for &(len, _dev_id) in sizes {
-            let offset = allocator.alloc(len as usize).ok_or(StagingError::Overflow {
-                needed: len as usize,
-                available: allocator.capacity.saturating_sub(allocator.offset),
-            })?;
+            let offset = allocator
+                .alloc(len as usize)
+                .ok_or(StagingError::Overflow {
+                    needed: len as usize,
+                    available: allocator.capacity.saturating_sub(allocator.offset),
+                })?;
             let staged_addr = self.base_addr + offset;
 
             leases.push(StagingLease {
@@ -645,7 +645,8 @@ mod tests {
 
     #[test]
     fn test_staging_try_allocate() {
-        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-alloc-test") else {
+        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-alloc-test")
+        else {
             return;
         };
 
@@ -685,7 +686,8 @@ mod tests {
 
     #[test]
     fn test_staging_overflow_fallback() {
-        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-overflow-test") else {
+        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-overflow-test")
+        else {
             return;
         };
 
@@ -712,16 +714,13 @@ mod tests {
 
     #[test]
     fn test_staging_concurrent_leases() {
-        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-concurrent-test") else {
+        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-concurrent-test")
+        else {
             return;
         };
 
-        let Ok(staging) = GpuStagingBuffer::new(
-            4096,
-            0,
-            exchange.agent(),
-            exchange.backend(),
-        ) else {
+        let Ok(staging) = GpuStagingBuffer::new(4096, 0, exchange.agent(), exchange.backend())
+        else {
             return;
         };
 
@@ -747,16 +746,13 @@ mod tests {
 
     #[test]
     fn test_staging_lease_as_gpu_buffer_desc() {
-        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-desc-test") else {
+        let Some(exchange) = crate::nixl_exchange::NixlExchange::try_new("staging-desc-test")
+        else {
             return;
         };
 
-        let Ok(staging) = GpuStagingBuffer::new(
-            4096,
-            0,
-            exchange.agent(),
-            exchange.backend(),
-        ) else {
+        let Ok(staging) = GpuStagingBuffer::new(4096, 0, exchange.agent(), exchange.backend())
+        else {
             return;
         };
 

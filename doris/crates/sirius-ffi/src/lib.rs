@@ -3,6 +3,9 @@
 //! Provides a unified API for executing SQL queries and returning Arrow IPC bytes.
 //! Uses a bundled DuckDB instance with Sirius GPU extensions.
 
+use std::ffi::{c_char, c_void, CStr};
+use std::sync::OnceLock;
+
 /// High-level query execution engine.
 ///
 /// Wraps a DuckDB connection and provides a safe API for executing SQL queries
@@ -10,6 +13,134 @@
 pub struct SiriusEngine {
     conn: duckdb::Connection,
     has_substrait: bool,
+    exchange_api: &'static ExchangeApi,
+}
+
+type BeginExchangeCaptureFn = unsafe extern "C" fn(u64, *const i32, usize) -> u64;
+type TakeExchangeArtifactFn = unsafe extern "C" fn() -> *mut c_void;
+type DestroyExchangeArtifactFn = unsafe extern "C" fn(*mut c_void);
+type ArtifactStagingBaseFn = unsafe extern "C" fn(*const c_void) -> u64;
+type ArtifactCountFn = unsafe extern "C" fn(*const c_void) -> u64;
+type ArtifactGetPartitionFn = unsafe extern "C" fn(*const c_void, usize, *mut RawPackedPartitionView) -> i32;
+type ArtifactGetBroadcastFn = unsafe extern "C" fn(*const c_void, usize, *mut RawPackedBroadcastEntryView) -> i32;
+
+#[derive(Clone, Copy)]
+struct ExchangeApi {
+    last_error: unsafe extern "C" fn() -> *const c_char,
+    finalize_exchange_tables_direct: unsafe extern "C" fn() -> i32,
+    begin_exchange_capture: BeginExchangeCaptureFn,
+    take_exchange_artifact: TakeExchangeArtifactFn,
+    exchange_artifact_destroy: DestroyExchangeArtifactFn,
+    exchange_artifact_staging_base: ArtifactStagingBaseFn,
+    exchange_artifact_partition_count: ArtifactCountFn,
+    exchange_artifact_get_partition: ArtifactGetPartitionFn,
+    exchange_artifact_broadcast_count: ArtifactCountFn,
+    exchange_artifact_get_broadcast_entry: ArtifactGetBroadcastFn,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct RawPackedPartitionView {
+    partition_id: u64,
+    staging_offset: u64,
+    packed_size: u64,
+    metadata_ptr: *const u8,
+    metadata_len: u64,
+    num_rows: i32,
+    overflow_gpu_addr: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct RawPackedBroadcastEntryView {
+    entry_id: u64,
+    staging_offset: u64,
+    packed_size: u64,
+    metadata_ptr: *const u8,
+    metadata_len: u64,
+    num_rows: i32,
+    overflow_gpu_addr: u64,
+}
+
+static EXCHANGE_API: OnceLock<ExchangeApi> = OnceLock::new();
+static EXCHANGE_API_PATH: OnceLock<String> = OnceLock::new();
+
+fn load_exchange_api(sirius_ext_path: &str) -> Result<&'static ExchangeApi, EngineError> {
+    if let Some(api) = EXCHANGE_API.get() {
+        if let Some(path) = EXCHANGE_API_PATH.get() {
+            if path != sirius_ext_path {
+                return Err(EngineError::InitFailed(format!(
+                    "sirius exchange API already loaded from {path}, cannot switch to {sirius_ext_path}"
+                )));
+            }
+        }
+        return Ok(api);
+    }
+
+    let lib = unsafe { libloading::Library::new(sirius_ext_path) }
+        .map_err(|e| EngineError::InitFailed(format!("load sirius exchange API: {e}")))?;
+    let lib = Box::leak(Box::new(lib));
+    let api = ExchangeApi {
+        last_error: unsafe { load_symbol(lib, b"sirius_exchange_last_error\0")? },
+        finalize_exchange_tables_direct: unsafe {
+            load_symbol(lib, b"sirius_finalize_exchange_tables_direct\0")?
+        },
+        begin_exchange_capture: unsafe { load_symbol(lib, b"sirius_begin_exchange_capture\0")? },
+        take_exchange_artifact: unsafe { load_symbol(lib, b"sirius_take_exchange_artifact\0")? },
+        exchange_artifact_destroy: unsafe {
+            load_symbol(lib, b"sirius_exchange_artifact_destroy\0")?
+        },
+        exchange_artifact_staging_base: unsafe {
+            load_symbol(lib, b"sirius_exchange_artifact_staging_base\0")?
+        },
+        exchange_artifact_partition_count: unsafe {
+            load_symbol(lib, b"sirius_exchange_artifact_partition_count\0")?
+        },
+        exchange_artifact_get_partition: unsafe {
+            load_symbol(lib, b"sirius_exchange_artifact_get_partition\0")?
+        },
+        exchange_artifact_broadcast_count: unsafe {
+            load_symbol(lib, b"sirius_exchange_artifact_broadcast_count\0")?
+        },
+        exchange_artifact_get_broadcast_entry: unsafe {
+            load_symbol(lib, b"sirius_exchange_artifact_get_broadcast_entry\0")?
+        },
+    };
+
+    let _ = EXCHANGE_API_PATH.set(sirius_ext_path.to_string());
+    EXCHANGE_API
+        .set(api)
+        .map_err(|_| EngineError::InitFailed("exchange API already initialized".into()))?;
+    Ok(EXCHANGE_API.get().expect("exchange API just initialized"))
+}
+
+unsafe fn load_symbol<T: Copy>(
+    lib: &'static libloading::Library,
+    name: &[u8],
+) -> Result<T, EngineError> {
+    let symbol: libloading::Symbol<T> = lib
+        .get(name)
+        .map_err(|e| EngineError::InitFailed(format!("load symbol {}: {e}", String::from_utf8_lossy(name))))?;
+    Ok(*symbol)
+}
+
+fn exchange_last_error(api: &'static ExchangeApi) -> String {
+    let ptr = unsafe { (api.last_error)() };
+    if ptr.is_null() {
+        return "unknown sirius exchange error".to_string();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .trim()
+        .to_string()
+}
+
+fn copy_raw_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
+    if ptr.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    }
 }
 
 /// Serialize Arrow record batches into an IPC stream.
@@ -30,6 +161,21 @@ fn batches_to_ipc(batches: Vec<arrow::record_batch::RecordBatch>) -> Result<Vec<
                 .write(batch)
                 .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         }
+        writer
+            .finish()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+    }
+    Ok(buf)
+}
+
+/// Serialize an Arrow schema into a schema-only IPC stream.
+fn schema_to_ipc(schema: &arrow::datatypes::SchemaRef) -> Result<Vec<u8>, EngineError> {
+    use arrow::ipc::writer::StreamWriter;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, schema)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         writer
             .finish()
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
@@ -101,7 +247,13 @@ impl SiriusEngine {
             "CREATE MACRO \"if\"(cond, then_val, else_val) AS CASE WHEN cond THEN then_val ELSE else_val END"
         ).ok(); // Non-fatal if it fails
 
-        Ok(Self { conn, has_substrait })
+        let exchange_api = load_exchange_api(&sirius_ext)?;
+
+        Ok(Self {
+            conn,
+            has_substrait,
+            exchange_api,
+        })
     }
 
     /// Enable Sirius `enable_fallback_check` — throws for unsupported GPU ops.
@@ -125,10 +277,14 @@ impl SiriusEngine {
             .conn
             .prepare(sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let batches: Vec<RecordBatch> = stmt
+        let arrow_result = stmt
             .query_arrow([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let schema = arrow_result.get_schema();
+        let batches: Vec<RecordBatch> = arrow_result.collect();
+        if batches.is_empty() {
+            return schema_to_ipc(&schema);
+        }
         batches_to_ipc(batches)
     }
 
@@ -140,10 +296,14 @@ impl SiriusEngine {
             .conn
             .prepare("SELECT * FROM gpu_execution(?)")
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let batches: Vec<RecordBatch> = stmt
+        let arrow_result = stmt
             .query_arrow(duckdb::params![sql])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let schema = arrow_result.get_schema();
+        let batches: Vec<RecordBatch> = arrow_result.collect();
+        if batches.is_empty() {
+            return schema_to_ipc(&schema);
+        }
         batches_to_ipc(batches)
     }
 
@@ -164,11 +324,15 @@ impl SiriusEngine {
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         eprintln!("[sirius-ffi] execute_substrait: prepare took {}ms", t0.elapsed().as_millis());
         let t1 = std::time::Instant::now();
-        let batches: Vec<RecordBatch> = stmt
+        let arrow_result = stmt
             .query_arrow(duckdb::params![plan_bytes])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let schema = arrow_result.get_schema();
+        let batches: Vec<RecordBatch> = arrow_result.collect();
         eprintln!("[sirius-ffi] execute_substrait: query_arrow took {}ms, {} batches", t1.elapsed().as_millis(), batches.len());
+        if batches.is_empty() {
+            return schema_to_ipc(&schema);
+        }
         let t2 = std::time::Instant::now();
         let result = batches_to_ipc(batches);
         eprintln!("[sirius-ffi] execute_substrait: batches_to_ipc took {}ms", t2.elapsed().as_millis());
@@ -183,10 +347,19 @@ impl SiriusEngine {
             .conn
             .prepare("SELECT * FROM from_substrait(?::blob)")
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let batches: Vec<RecordBatch> = stmt
+        let arrow_result = stmt
             .query_arrow(duckdb::params![plan_bytes])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let schema = arrow_result.get_schema();
+        let batches: Vec<RecordBatch> = arrow_result.collect();
+        tracing::info!(
+            batch_count = batches.len(),
+            row_count = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            "from_substrait completed"
+        );
+        if batches.is_empty() {
+            return schema_to_ipc(&schema);
+        }
         batches_to_ipc(batches)
     }
 
@@ -202,11 +375,36 @@ impl SiriusEngine {
             .conn
             .prepare(&sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let batches: Vec<RecordBatch> = stmt
+        let arrow_result = stmt
             .query_arrow(duckdb::params![plan_bytes])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let schema = arrow_result.get_schema();
+        let batches: Vec<RecordBatch> = arrow_result.collect();
+        tracing::info!(
+            batch_count = batches.len(),
+            row_count = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            order_sql,
+            "from_substrait_sorted completed"
+        );
+        if batches.is_empty() {
+            return schema_to_ipc(&schema);
+        }
         batches_to_ipc(batches)
+    }
+
+    /// Apply ORDER BY / LIMIT / OFFSET SQL to an already materialized Arrow IPC result.
+    ///
+    /// This is used as a fallback for CPU paths where DuckDB's Substrait SortRel
+    /// or `SELECT * FROM from_substrait(...) ORDER BY ...` produce incorrect results.
+    pub fn sort_ipc_result(&self, ipc_bytes: &[u8], sql_suffix: &str) -> Result<Vec<u8>, EngineError> {
+        const TEMP_TABLE: &str = "__SIRIUS_POSTSORT";
+
+        let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", TEMP_TABLE));
+        self.register_exchange_table_from_ipc(TEMP_TABLE, ipc_bytes)?;
+        let sql = format!("SELECT * FROM \"{}\" {}", TEMP_TABLE, sql_suffix);
+        let result = self.execute_sql(&sql);
+        let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", TEMP_TABLE));
+        result
     }
 
     /// Get the Arrow schema of a file as IPC stream bytes (schema only, no data).
@@ -462,7 +660,11 @@ impl SiriusEngine {
                 .map_err(|e| EngineError::ExecFailed(format!("append batch: {e}")))?;
         }
 
-        // Flush is called implicitly when appender is dropped, but let's be explicit.
+        // Make the appender boundary explicit before later from_substrait calls
+        // open a fresh connection and read the exchange table.
+        appender
+            .flush()
+            .map_err(|e| EngineError::ExecFailed(format!("flush exchange table appender: {e}")))?;
         drop(appender);
 
         Ok(())
@@ -597,77 +799,111 @@ impl SiriusEngine {
         Ok(Some((base, size, device)))
     }
 
-    /// Tell Sirius to retain GPU result buffers past query cleanup.
-    /// Must be called BEFORE the GPU query that produces the exchange result.
-    pub fn retain_gpu_buffers(&self) -> Result<(), EngineError> {
-        // Must use prepare+query_arrow (not execute_batch) to properly consume
-        // the result set from this table function. execute_batch with SELECT
-        // leaves the connection "busy", blocking subsequent queries.
-        let mut stmt = self.conn
-            .prepare("SELECT * FROM sirius_retain_gpu_buffers()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
+    /// Finalize any pending exchange tables before staging-backed buffers are reused.
+    pub fn finalize_exchange_tables_direct(&self) -> Result<(), EngineError> {
+        let ok = unsafe { (self.exchange_api.finalize_exchange_tables_direct)() };
+        if ok == 0 {
+            return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+        }
         Ok(())
     }
 
-    /// Stage retained GPU buffers into a staging buffer using the C++ CUDA context.
+    /// Begin capturing the next GPU execution into an owned exchange artifact.
     ///
-    /// Copies all data/null_mask/offsets buffers from the last GPU execution into
-    /// the staging buffer at `staging_ptr`. Returns a list of (buffer_idx, offset, len, type)
-    /// describing the layout.
-    ///
-    /// This must be called from C++ because DuckDB loads extensions with RTLD_LOCAL,
-    /// so the C++ CUDA runtime (which allocated the RMM pool) is the only context
-    /// that can access the GPU buffer addresses.
-    pub fn stage_gpu_buffers(&self, staging_ptr: usize) -> Result<Vec<StagedBuffer>, EngineError> {
-        let sql = format!("SELECT * FROM sirius_stage_gpu_buffers({})", staging_ptr as i64);
-        let mut stmt = self.conn
-            .prepare(&sql)
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut rows = stmt.query([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+    /// `partition_spec` configures the result collector for hash-partitioned
+    /// exchange. When `None`, the collector uses the broadcast packing path.
+    pub fn begin_exchange_capture(
+        &self,
+        partition_spec: Option<(usize, &[i32])>,
+    ) -> Result<u64, EngineError> {
+        let (num_partitions, cols) = partition_spec
+            .map(|(num, cols)| (num as u64, cols))
+            .unwrap_or((0, &[][..]));
+        let session_id = unsafe {
+            (self.exchange_api.begin_exchange_capture)(num_partitions, cols.as_ptr(), cols.len())
+        };
+        if session_id == 0 {
+            return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+        }
+        Ok(session_id)
+    }
 
-        let mut staged = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let buffer_idx: i32 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let offset: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let len: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let buf_type: String = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            staged.push(StagedBuffer {
-                buffer_idx: buffer_idx as usize,
-                staged_offset: offset as usize,
-                len: len as usize,
-                buf_type,
+    /// Move the active exchange capture into a Rust-owned artifact.
+    pub fn take_exchange_artifact(&self) -> Result<Option<ExchangeArtifact>, EngineError> {
+        let handle = unsafe { (self.exchange_api.take_exchange_artifact)() };
+        if handle.is_null() {
+            let last_error = exchange_last_error(self.exchange_api);
+            if !last_error.is_empty() {
+                return Err(EngineError::ExecFailed(last_error));
+            }
+            return Ok(None);
+        }
+
+        let staging_base =
+            unsafe { (self.exchange_api.exchange_artifact_staging_base)(handle as *const c_void) }
+                as usize;
+
+        let partition_count =
+            unsafe { (self.exchange_api.exchange_artifact_partition_count)(handle as *const c_void) }
+                as usize;
+        let mut packed_partitions = Vec::with_capacity(partition_count);
+        for index in 0..partition_count {
+            let mut raw = RawPackedPartitionView::default();
+            let ok = unsafe {
+                (self.exchange_api.exchange_artifact_get_partition)(
+                    handle as *const c_void,
+                    index,
+                    &mut raw,
+                )
+            };
+            if ok == 0 {
+                unsafe { (self.exchange_api.exchange_artifact_destroy)(handle) };
+                return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+            }
+            packed_partitions.push(PackedPartition {
+                partition_id: raw.partition_id as usize,
+                staging_offset: raw.staging_offset as usize,
+                packed_size: raw.packed_size as usize,
+                metadata: copy_raw_bytes(raw.metadata_ptr, raw.metadata_len as usize),
+                num_rows: raw.num_rows as u32,
+                overflow_gpu_addr: raw.overflow_gpu_addr as usize,
             });
         }
-        Ok(staged)
-    }
 
-    /// Move the active exchange session to completed_sessions.
-    /// Must be called while the engine lock is held, AFTER get_packed_gpu/partitions
-    /// but BEFORE unlocking. This ensures the session's GPU data is safe from
-    /// interference by subsequent fragment executions.
-    pub fn take_current_session(&self) -> Result<(), EngineError> {
-        let mut stmt = self.conn
-            .prepare("SELECT * FROM sirius_take_current_session()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
-        Ok(())
-    }
+        let broadcast_count =
+            unsafe { (self.exchange_api.exchange_artifact_broadcast_count)(handle as *const c_void) }
+                as usize;
+        let mut packed_broadcast = Vec::with_capacity(broadcast_count);
+        for index in 0..broadcast_count {
+            let mut raw = RawPackedBroadcastEntryView::default();
+            let ok = unsafe {
+                (self.exchange_api.exchange_artifact_get_broadcast_entry)(
+                    handle as *const c_void,
+                    index,
+                    &mut raw,
+                )
+            };
+            if ok == 0 {
+                unsafe { (self.exchange_api.exchange_artifact_destroy)(handle) };
+                return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+            }
+            packed_broadcast.push(PackedBroadcastEntry {
+                entry_id: raw.entry_id as usize,
+                staging_offset: raw.staging_offset as usize,
+                packed_size: raw.packed_size as usize,
+                metadata: copy_raw_bytes(raw.metadata_ptr, raw.metadata_len as usize),
+                num_rows: raw.num_rows as u32,
+                overflow_gpu_addr: raw.overflow_gpu_addr as usize,
+            });
+        }
 
-    /// Release previously retained GPU buffers (after nixl transfer or on error).
-    pub fn release_gpu_buffers(&self) -> Result<(), EngineError> {
-        let mut stmt = self.conn
-            .prepare("SELECT * FROM sirius_release_gpu_buffers()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
-        Ok(())
+        Ok(Some(ExchangeArtifact {
+            handle,
+            destroy: self.exchange_api.exchange_artifact_destroy,
+            staging_base,
+            packed_partitions,
+            packed_broadcast,
+        }))
     }
 
     /// Get GPU buffer pointers from the last execution (for nixl GPU-direct exchange).
@@ -732,102 +968,6 @@ impl SiriusEngine {
             num_rows: num_rows_opt.unwrap_or(0),
             schema_ipc,
         }))
-    }
-
-    /// Get the packed GPU buffer from cudf::pack() (single contiguous buffer).
-    ///
-    /// Returns `(addr, size, metadata_bytes)` if pack() was called during the last
-    /// GPU execution with retain_gpu_buffers enabled. Returns `None` otherwise.
-    pub fn get_packed_gpu(&self) -> Result<Option<(usize, usize, Vec<u8>)>, EngineError> {
-        let mut stmt = self.conn
-            .prepare("SELECT gpu_addr, gpu_size, metadata FROM sirius_get_packed_gpu()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut rows = stmt.query([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        match rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            Some(row) => {
-                let addr: i64 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-                let size: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-                let metadata: Vec<u8> = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-                Ok(Some((addr as usize, size as usize, metadata)))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Set hash partition config for the next GPU execution.
-    /// The C++ result collector will GPU hash-partition the result before packing.
-    pub fn set_exchange_partition(&self, num_partitions: usize, col_indices: &[i32]) -> Result<(), EngineError> {
-        let list_str = col_indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
-        let sql = format!("SELECT * FROM sirius_set_exchange_partition({}, [{}])", num_partitions, list_str);
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow([]).map_err(|e| EngineError::ExecFailed(e.to_string()))?.collect();
-        Ok(())
-    }
-
-    /// Get per-partition packed GPU buffers from the last GPU execution.
-    pub fn get_packed_partitions(&self) -> Result<Vec<PackedPartition>, EngineError> {
-        let mut stmt = self.conn
-            .prepare("SELECT partition_id, staging_offset, packed_size, metadata, num_rows, overflow_gpu_addr FROM sirius_get_packed_partitions()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut rows = stmt.query([]).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let partition_id: i32 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let staging_offset: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let packed_size: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let metadata: Vec<u8> = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let num_rows: i32 = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let overflow_gpu_addr: i64 = row.get(5).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            result.push(PackedPartition {
-                partition_id: partition_id as usize,
-                staging_offset: staging_offset as usize,
-                packed_size: packed_size as usize,
-                metadata,
-                num_rows: num_rows as u32,
-                overflow_gpu_addr: overflow_gpu_addr as usize,
-            });
-        }
-        Ok(result)
-    }
-
-    /// Get per-batch broadcast packed GPU buffers from the last GPU execution.
-    pub fn get_packed_broadcast_entries(&self) -> Result<Vec<PackedBroadcastEntry>, EngineError> {
-        let mut stmt = self.conn
-            .prepare("SELECT entry_id, staging_offset, packed_size, metadata, num_rows, overflow_gpu_addr FROM sirius_get_packed_broadcast()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut rows = stmt.query([]).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let entry_id: i32 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let staging_offset: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let packed_size: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let metadata: Vec<u8> = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let num_rows: i32 = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let overflow_gpu_addr: i64 = row.get(5).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            result.push(PackedBroadcastEntry {
-                entry_id: entry_id as usize,
-                staging_offset: staging_offset as usize,
-                packed_size: packed_size as usize,
-                metadata,
-                num_rows: num_rows as u32,
-                overflow_gpu_addr: overflow_gpu_addr as usize,
-            });
-        }
-        Ok(result)
-    }
-
-    /// Finalize all exchange tables that have pending views.
-    /// Runs cudf::concatenate to materialize views from staging into owned tables.
-    /// Must be called BEFORE BeginSession() or any staging buffer reuse.
-    pub fn finalize_exchange_tables(&self) -> Result<(), EngineError> {
-        let mut stmt = self.conn
-            .prepare("SELECT * FROM sirius_finalize_exchange_tables()")
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .collect();
-        Ok(())
     }
 
     /// Finalize a single exchange table's pending views.
@@ -925,6 +1065,60 @@ impl SiriusEngine {
     }
 }
 
+/// Owned exchange result artifact returned by the modern GPU exchange path.
+///
+/// Keeps the underlying C++ exchange session alive until the artifact is
+/// dropped, while exposing stable Rust-owned descriptors for packed partitions
+/// and broadcast entries.
+pub struct ExchangeArtifact {
+    handle: *mut c_void,
+    destroy: DestroyExchangeArtifactFn,
+    staging_base: usize,
+    packed_partitions: Vec<PackedPartition>,
+    packed_broadcast: Vec<PackedBroadcastEntry>,
+}
+
+impl ExchangeArtifact {
+    pub fn staging_base(&self) -> usize {
+        self.staging_base
+    }
+
+    pub fn packed_partitions(&self) -> &[PackedPartition] {
+        &self.packed_partitions
+    }
+
+    pub fn packed_broadcast(&self) -> &[PackedBroadcastEntry] {
+        &self.packed_broadcast
+    }
+
+    pub fn has_exchange_data(&self) -> bool {
+        !self.packed_partitions.is_empty() || !self.packed_broadcast.is_empty()
+    }
+}
+
+impl std::fmt::Debug for ExchangeArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExchangeArtifact")
+            .field("handle", &self.handle)
+            .field("staging_base", &format_args!("0x{:x}", self.staging_base))
+            .field("packed_partitions", &self.packed_partitions.len())
+            .field("packed_broadcast", &self.packed_broadcast.len())
+            .finish()
+    }
+}
+
+unsafe impl Send for ExchangeArtifact {}
+unsafe impl Sync for ExchangeArtifact {}
+
+impl Drop for ExchangeArtifact {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { (self.destroy)(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
 /// A per-partition packed GPU buffer from GPU hash_partition + chunked_pack.
 #[derive(Debug, Clone)]
 pub struct PackedPartition {
@@ -948,19 +1142,6 @@ pub struct PackedBroadcastEntry {
     pub num_rows: u32,
     /// When non-zero, this entry overflowed the staging buffer.
     pub overflow_gpu_addr: usize,
-}
-
-/// A GPU buffer that has been staged (copied) into the nixl staging region.
-#[derive(Debug, Clone)]
-pub struct StagedBuffer {
-    /// Column index in the original GPU result.
-    pub buffer_idx: usize,
-    /// Byte offset within the staging buffer.
-    pub staged_offset: usize,
-    /// Buffer size in bytes.
-    pub len: usize,
-    /// Buffer type: "data", "null_mask", or "offsets".
-    pub buf_type: String,
 }
 
 /// Per-column extended GPU buffer info (null mask, string offsets).
@@ -1044,4 +1225,80 @@ pub enum EngineError {
 
     #[error("query execution failed: {0}")]
     ExecFailed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SiriusEngine;
+
+    #[test]
+    fn exchange_artifact_empty_roundtrip() {
+        let Ok(engine) = SiriusEngine::new() else {
+            return;
+        };
+
+        engine.finalize_exchange_tables_direct().unwrap();
+        let session_id = engine.begin_exchange_capture(None).unwrap();
+        assert!(session_id > 0);
+
+        let artifact = engine
+            .take_exchange_artifact()
+            .unwrap()
+            .expect("capture should yield an artifact");
+        assert!(!artifact.has_exchange_data());
+        assert!(artifact.packed_partitions().is_empty());
+        assert!(artifact.packed_broadcast().is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn exchange_artifact_broadcast_gpu_roundtrip() {
+        let engine = SiriusEngine::new().expect("engine");
+        engine
+            .conn
+            .execute_batch("LOAD parquet")
+            .expect("load parquet");
+        engine
+            .init_gpu_buffers("1GB", "1GB")
+            .expect("init_gpu_buffers");
+        engine
+            .conn
+            .execute_batch("SET enable_fallback_check = true")
+            .expect("enable_fallback_check");
+
+        let staging_size = 16 * 1024 * 1024;
+        let staging_addr = engine.cuda_alloc(staging_size).expect("cuda_alloc staging");
+        engine
+            .set_staging_buffer(staging_addr, staging_size)
+            .expect("set_staging_buffer");
+
+        engine
+            .finalize_exchange_tables_direct()
+            .expect("finalize_exchange_tables_direct");
+        let session_id = engine.begin_exchange_capture(None).expect("begin_exchange_capture");
+        assert!(session_id > 0);
+
+        let ipc = engine
+            .execute_gpu(
+                "SELECT n_nationkey, n_name \
+                 FROM read_parquet('/data/tpch/sf1/p16/snappy/nation/*.parquet')",
+            )
+            .expect("execute_gpu nation");
+        assert!(!ipc.is_empty());
+
+        let artifact = engine
+            .take_exchange_artifact()
+            .expect("take_exchange_artifact")
+            .expect("exchange artifact");
+        assert!(artifact.has_exchange_data());
+        assert_eq!(artifact.staging_base(), staging_addr);
+        assert!(artifact.packed_partitions().is_empty());
+        assert!(!artifact.packed_broadcast().is_empty());
+        assert!(
+            artifact
+                .packed_broadcast()
+                .iter()
+                .any(|entry| entry.packed_size > 0 && !entry.metadata.is_empty())
+        );
+    }
 }

@@ -196,13 +196,14 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   // Prune pure filter columns if necessary.
   auto const& post_filter_projection_ids = scan_data->post_filter_projection_ids;
   if (!post_filter_projection_ids.empty()) {
-    auto columns = table->release();
-    std::vector<std::unique_ptr<cudf::column>> projected_columns;
+    std::vector<cudf::column_view> projected_columns;
     projected_columns.reserve(post_filter_projection_ids.size());
+    auto view = table->view();
     for (auto const col_idx : post_filter_projection_ids) {
-      projected_columns.push_back(std::move(columns[col_idx]));
+      projected_columns.push_back(view.column(col_idx));
     }
-    table = std::make_unique<cudf::table>(std::move(projected_columns));
+    table = std::make_unique<cudf::table>(
+      cudf::table_view(projected_columns), stream, _gpu_memory_space.get_default_allocator());
     SIRIUS_LOG_DEBUG(
       "[sirius_gpu_parquet_scan_operator] Pruned pure filter columns; post-filter projection has "
       "{} columns",

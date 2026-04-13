@@ -55,7 +55,9 @@ fn make_exchange_batch(n: usize) -> RecordBatch {
             Arc::new(Int32Array::from(keys)),
             Arc::new(Int64Array::from(counts)),
             Arc::new(Float64Array::from(sums)),
-            Arc::new(StringArray::from(labels.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
         ],
     )
     .unwrap()
@@ -63,8 +65,12 @@ fn make_exchange_batch(n: usize) -> RecordBatch {
 
 /// Build a batch with nullable columns.
 fn make_nullable_batch(n: usize) -> RecordBatch {
-    let keys: Vec<Option<i32>> = (0..n).map(|i| if i % 7 == 0 { None } else { Some(i as i32) }).collect();
-    let vals: Vec<Option<&str>> = (0..n).map(|i| if i % 5 == 0 { None } else { Some("hello") }).collect();
+    let keys: Vec<Option<i32>> = (0..n)
+        .map(|i| if i % 7 == 0 { None } else { Some(i as i32) })
+        .collect();
+    let vals: Vec<Option<&str>> = (0..n)
+        .map(|i| if i % 5 == 0 { None } else { Some("hello") })
+        .collect();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, true),
@@ -109,27 +115,54 @@ fn test_exchange_roundtrip_multi_type() {
     assert_eq!(result.num_columns(), 4);
 
     // Verify data integrity: INT32 keys.
-    let keys = result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let keys = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     for i in 0..200 {
         assert_eq!(keys.value(i), (i % 10) as i32, "key mismatch at row {i}");
     }
 
     // Verify: INT64 counts.
-    let counts = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let counts = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for i in 0..200 {
-        assert_eq!(counts.value(i), (i * 2 + 1) as i64, "count mismatch at row {i}");
+        assert_eq!(
+            counts.value(i),
+            (i * 2 + 1) as i64,
+            "count mismatch at row {i}"
+        );
     }
 
     // Verify: DOUBLE sums.
-    let sums = result.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let sums = result
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     for i in 0..200 {
-        assert!((sums.value(i) - i as f64 * 1.5).abs() < 1e-10, "sum mismatch at row {i}");
+        assert!(
+            (sums.value(i) - i as f64 * 1.5).abs() < 1e-10,
+            "sum mismatch at row {i}"
+        );
     }
 
     // Verify: VARCHAR labels.
-    let labels = result.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    let labels = result
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     for i in 0..200 {
-        assert_eq!(labels.value(i), format!("group_{}", i % 10), "label mismatch at row {i}");
+        assert_eq!(
+            labels.value(i),
+            format!("group_{}", i % 10),
+            "label mismatch at row {i}"
+        );
     }
 }
 
@@ -148,7 +181,11 @@ fn test_exchange_roundtrip_nullable() {
     let result = &result_batches[0];
     assert_eq!(result.num_rows(), 150);
 
-    let ids = result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let ids = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     for i in 0..150 {
         if i % 7 == 0 {
             assert!(ids.is_null(i), "expected null at row {i}");
@@ -157,7 +194,11 @@ fn test_exchange_roundtrip_nullable() {
         }
     }
 
-    let names = result.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     for i in 0..150 {
         if i % 5 == 0 {
             assert!(names.is_null(i), "expected null at row {i}");
@@ -184,6 +225,75 @@ fn test_exchange_roundtrip_multiple_blocks() {
     let result_ipc = decoded_columns_to_arrow_ipc(&decoded, &keep_indices).unwrap();
     let result_batches = read_ipc(&result_ipc);
     assert_eq!(result_batches[0].num_rows(), 125);
+}
+
+#[test]
+fn test_exchange_roundtrip_q03_partial_agg_decimal() {
+    let revenue = Decimal128Array::from(vec![4061810111i128, 3903240610i128, 3801418088i128])
+        .with_precision_and_scale(38, 4)
+        .unwrap();
+    let order_dates = Date32Array::from(vec![9194, 9222, 9109]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int64, false),
+        Field::new("revenue", DataType::Decimal128(38, 4), false),
+        Field::new("o_orderdate", DataType::Date32, false),
+        Field::new("o_shippriority", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![2456423, 3459808, 492164])),
+            Arc::new(revenue),
+            Arc::new(order_dates),
+            Arc::new(Int32Array::from(vec![0, 0, 0])),
+        ],
+    )
+    .unwrap();
+
+    let ipc = make_ipc(&batch);
+    let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
+    assert_eq!(num_rows, 3);
+
+    let decoded = decode_pblocks(&[pblock]).unwrap();
+    let keep_indices: Vec<usize> = (0..4).collect();
+    let result_ipc = decoded_columns_to_arrow_ipc(&decoded, &keep_indices).unwrap();
+    let result_batches = read_ipc(&result_ipc);
+    let result = &result_batches[0];
+
+    assert_eq!(
+        result.schema().field(1).data_type(),
+        &DataType::Decimal128(38, 4)
+    );
+    let orderkeys = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let revenue = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let order_dates = result
+        .column(2)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    let shippriority = result
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    assert_eq!(orderkeys.value(0), 2456423);
+    assert_eq!(revenue.value(0), 4061810111i128);
+    assert_eq!(order_dates.value(0), 9194);
+    assert_eq!(shippriority.value(0), 0);
+
+    assert_eq!(orderkeys.value(1), 3459808);
+    assert_eq!(revenue.value(1), 3903240610i128);
+    assert_eq!(order_dates.value(1), 9222);
+    assert_eq!(shippriority.value(1), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +352,10 @@ fn test_hash_partition_roundtrip() {
     // Hash-partition by group_key (column 0).
     let assignments = compute_dest_assignments(
         &batch,
-        &[0],                       // partition by first column
+        &[0], // partition by first column
         num_dests,
-        false,                      // CRC32 (not CRC32C)
-        &[TPrimitiveType::INT],     // Doris type
+        false,                  // CRC32 (not CRC32C)
+        &[TPrimitiveType::INT], // Doris type
     );
     assert_eq!(assignments.len(), 200);
 
@@ -254,7 +364,11 @@ fn test_hash_partition_roundtrip() {
     assert_eq!(parts.len(), num_dests);
 
     // Each destination should get some rows (200 rows / 3 dests).
-    let total_rows: usize = parts.iter().filter_map(|p| p.as_ref()).map(|b| b.num_rows()).sum();
+    let total_rows: usize = parts
+        .iter()
+        .filter_map(|p| p.as_ref())
+        .map(|b| b.num_rows())
+        .sum();
     assert_eq!(total_rows, 200, "no rows should be lost in partitioning");
 
     // Encode each partition to PBlock, decode back, and verify.
@@ -281,17 +395,17 @@ fn test_hash_partition_roundtrip() {
         assert_eq!(result.num_rows(), part.num_rows());
 
         // Verify all rows in this partition hash to this destination.
-        let keys = result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let re_assignments = compute_dest_assignments(
-            result,
-            &[0],
-            num_dests,
-            false,
-            &[TPrimitiveType::INT],
-        );
+        let keys = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let re_assignments =
+            compute_dest_assignments(result, &[0], num_dests, false, &[TPrimitiveType::INT]);
         for (row, &dest) in re_assignments.iter().enumerate() {
             assert_eq!(
-                dest, dest_idx as u32,
+                dest,
+                dest_idx as u32,
                 "row {row} (key={}) should hash to dest {dest_idx}, got {dest}",
                 keys.value(row)
             );
@@ -306,7 +420,10 @@ fn test_hash_partition_roundtrip() {
     all_keys_after.sort();
     let mut original_keys: Vec<i32> = (0..200).map(|i| (i % 10) as i32).collect();
     original_keys.sort();
-    assert_eq!(all_keys_after, original_keys, "partition roundtrip lost or duplicated rows");
+    assert_eq!(
+        all_keys_after, original_keys,
+        "partition roundtrip lost or duplicated rows"
+    );
 }
 
 #[test]
@@ -317,16 +434,20 @@ fn test_hash_partition_multi_column() {
 
     let assignments = compute_dest_assignments(
         &batch,
-        &[0, 1],                                       // partition by columns 0 and 1
+        &[0, 1], // partition by columns 0 and 1
         num_dests,
-        true,                                          // CRC32C
+        true, // CRC32C
         &[TPrimitiveType::INT, TPrimitiveType::BIGINT],
     );
     assert_eq!(assignments.len(), 100);
     assert!(assignments.iter().all(|&d| d < num_dests as u32));
 
     let parts = split_by_destination(&batch, &assignments, num_dests).unwrap();
-    let total_rows: usize = parts.iter().filter_map(|p| p.as_ref()).map(|b| b.num_rows()).sum();
+    let total_rows: usize = parts
+        .iter()
+        .filter_map(|p| p.as_ref())
+        .map(|b| b.num_rows())
+        .sum();
     assert_eq!(total_rows, 100);
 }
 
@@ -336,13 +457,8 @@ fn test_hash_partition_nullable_key() {
     let num_dests = 3;
 
     // Hash on nullable id column — NULLs should all go to the same destination.
-    let assignments = compute_dest_assignments(
-        &batch,
-        &[0],
-        num_dests,
-        false,
-        &[TPrimitiveType::INT],
-    );
+    let assignments =
+        compute_dest_assignments(&batch, &[0], num_dests, false, &[TPrimitiveType::INT]);
     assert_eq!(assignments.len(), 100);
 
     // All NULL rows (every 7th) should hash to the same destination.

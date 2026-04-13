@@ -155,6 +155,7 @@ set(EXTENSION_SOURCES
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp
+    src/sirius_exchange_c_api.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
     src/util/stream_check_wrapper.cpp

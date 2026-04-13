@@ -68,6 +68,30 @@ namespace duckdb {
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
+namespace {
+constexpr size_t EXCHANGE_GPU_CACHE_SIZE = 512ULL * 1024ULL * 1024ULL;
+constexpr size_t EXCHANGE_GPU_PROCESSING_SIZE = 512ULL * 1024ULL * 1024ULL;
+constexpr size_t EXCHANGE_CPU_PROCESSING_SIZE = 512ULL * 1024ULL * 1024ULL;
+}  // namespace
+
+void SiriusExtension::EnsureExchangeBufferManager()
+{
+  if (buffer_is_initialized) {
+    return;
+  }
+
+  SIRIUS_LOG_WARN(
+    "[EnsureExchangeBufferManager] GPUBufferManager not initialized; lazily initializing "
+    "exchange manager with cache={} processing={} cpu_processing={}",
+    EXCHANGE_GPU_CACHE_SIZE,
+    EXCHANGE_GPU_PROCESSING_SIZE,
+    EXCHANGE_CPU_PROCESSING_SIZE);
+  auto* gpu_buffer_manager = &GPUBufferManager::GetInstance(
+    EXCHANGE_GPU_CACHE_SIZE, EXCHANGE_GPU_PROCESSING_SIZE, EXCHANGE_CPU_PROCESSING_SIZE);
+  (void)gpu_buffer_manager;
+  buffer_is_initialized = true;
+}
+
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
   shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
@@ -1641,24 +1665,20 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
       // then cudf::unpack runs from the stored copy. This ensures the table_view's
       // internal references to the metadata buffer remain valid.
       int num_cols = 0, num_rows_out = 0;
-      if (buffer_is_initialized) {
-        auto& mgr = GPUBufferManager::GetInstance();
-        mgr.registerExternalTablePacked(table_name, gpu_ptr, gpu_size, std::move(md_blob),
-                                        num_cols, num_rows_out);
-      }
+      SiriusExtension::EnsureExchangeBufferManager();
+      auto& mgr = GPUBufferManager::GetInstance();
+      mgr.registerExternalTablePacked(table_name, gpu_ptr, gpu_size, std::move(md_blob),
+                                      num_cols, num_rows_out);
 
       // Re-unpack locally for column type inspection (CREATE TABLE SQL).
       // Use the original md_blob — wait, it was moved. Use stored copy from manager.
       cudf::table_view view;
-      if (buffer_is_initialized) {
-        auto& mgr = GPUBufferManager::GetInstance();
-        string up = table_name;
-        transform(up.begin(), up.end(), up.begin(), ::toupper);
-        auto it = mgr.tables.find(up);
-        if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
-          view = it->second->pending_views.back();
-          num_cols = view.num_columns();
-        }
+      string up = table_name;
+      transform(up.begin(), up.end(), up.begin(), ::toupper);
+      auto it = mgr.tables.find(up);
+      if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
+        view = it->second->pending_views.back();
+        num_cols = view.num_columns();
       }
 
       // Build CREATE TABLE SQL for the Rust caller to execute.
@@ -1864,9 +1884,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
       auto& data = data_p.bind_data->CastNoConst<FinalizeData>();
       if (data.finished) { output.SetCardinality(0); return; }
       data.finished = true;
-      if (buffer_is_initialized) {
-        GPUBufferManager::GetInstance().finalizeExchangeTables();
-      }
+      SiriusExtension::EnsureExchangeBufferManager();
+      GPUBufferManager::GetInstance().finalizeExchangeTables();
       output.SetValue(0, 0, Value("finalized"));
       output.SetCardinality(1);
     };
@@ -1893,9 +1912,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
       auto& data = data_p.bind_data->CastNoConst<FinalizeOneData>();
       if (data.finished) { output.SetCardinality(0); return; }
       data.finished = true;
-      if (buffer_is_initialized) {
-        GPUBufferManager::GetInstance().finalizeExchangeTable(data.table_name);
-      }
+      SiriusExtension::EnsureExchangeBufferManager();
+      GPUBufferManager::GetInstance().finalizeExchangeTable(data.table_name);
       output.SetValue(0, 0, Value("finalized"));
       output.SetCardinality(1);
     };

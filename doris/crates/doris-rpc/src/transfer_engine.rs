@@ -134,6 +134,7 @@ impl NixlTransferEngine {
                 })
             }
             ExecutionLocation::Cpu(_) => unreachable!("constructed as Gpu"),
+            ExecutionLocation::PackedExchange { .. } => unreachable!("constructed as Gpu"),
         }
     }
 
@@ -604,7 +605,9 @@ mod tests {
         let d = TransferDispatcher::standard(Some(agent), false);
 
         // Should skip nixl and use bRPC (index 1).
-        let (staged, idx) = d.stage(sample_payload()).expect("stage should succeed with bRPC");
+        let (staged, idx) = d
+            .stage(sample_payload())
+            .expect("stage should succeed with bRPC");
         assert_eq!(idx, 1, "should fall back to bRPC");
         assert_eq!(staged.ipc_bytes, vec![0xAA, 0xBB, 0xCC]);
     }
@@ -662,10 +665,9 @@ mod tests {
     fn test_nixl_engine_stage_with_staging_buffer() {
         // Validates that the staging buffer is accessible and engine reports it.
         // Can't stage real data because sample_payload has fake GPU addresses.
-        let Some(ex) = NixlExchange::try_new_with_staging(
-            "nixl-stage-staging-test",
-            Some(4 * 1024 * 1024),
-        ) else {
+        let Some(ex) =
+            NixlExchange::try_new_with_staging("nixl-stage-staging-test", Some(4 * 1024 * 1024))
+        else {
             return;
         };
         let agent = Arc::new(ex);
@@ -706,7 +708,10 @@ mod tests {
         // After Phase 3 cleanup, StagedPayload should not have rmm_pool_registered.
         let staged = BrpcTransferEngine.stage(sample_payload()).unwrap();
         let debug = format!("{:?}", staged);
-        assert!(!debug.contains("rmm_pool"), "rmm_pool_registered should be removed");
+        assert!(
+            !debug.contains("rmm_pool"),
+            "rmm_pool_registered should be removed"
+        );
     }
 
     // -- GpuTransferPayload with sub-buffers --
@@ -714,7 +719,11 @@ mod tests {
     #[test]
     fn test_brpc_stage_with_sub_buffers() {
         let payload = GpuTransferPayload {
-            buffers: vec![GpuBufferDesc { addr: 0x1000, len: 256, device_id: 0 }],
+            buffers: vec![GpuBufferDesc {
+                addr: 0x1000,
+                len: 256,
+                device_id: 0,
+            }],
             column_info: vec![("col1".to_string(), 15)], // VARCHAR
             column_buffers: vec![GpuColumnBuffers {
                 null_mask_addr: 0x3000,

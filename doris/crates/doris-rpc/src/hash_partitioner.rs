@@ -45,6 +45,11 @@ pub struct ExchangeInfo {
     pub dest_node_id: i32,
     pub destinations: Vec<ExchangeDest>,
     pub partition: PartitionStrategy,
+    /// Optional projection to apply to the fragment result before sending it
+    /// to this exchange destination. Needed for multicast sinks where each
+    /// downstream exchange may consume a different tuple/schema.
+    pub output_names: Vec<String>,
+    pub output_indices: Option<Vec<usize>>,
 }
 
 /// Build `PartitionStrategy` from Doris Thrift types.
@@ -194,10 +199,19 @@ fn crc32c_shuffle_mix(mut h: u32) -> u32 {
 }
 
 /// Hash one column into the running hash array.
-fn hash_column(hashes: &mut [u32], array: &dyn Array, doris_type: &TPrimitiveType, use_crc32c: bool) {
+fn hash_column(
+    hashes: &mut [u32],
+    array: &dyn Array,
+    doris_type: &TPrimitiveType,
+    use_crc32c: bool,
+) {
     // Dispatch on Arrow data type.
     match array.data_type() {
-        DataType::Boolean => hash_boolean(hashes, array.as_any().downcast_ref::<BooleanArray>().unwrap(), use_crc32c),
+        DataType::Boolean => hash_boolean(
+            hashes,
+            array.as_any().downcast_ref::<BooleanArray>().unwrap(),
+            use_crc32c,
+        ),
         DataType::Int8 => hash_primitive::<Int8Type>(hashes, array, use_crc32c),
         DataType::Int16 => hash_primitive::<Int16Type>(hashes, array, use_crc32c),
         DataType::Int32 => hash_primitive::<Int32Type>(hashes, array, use_crc32c),
@@ -210,13 +224,24 @@ fn hash_column(hashes: &mut [u32], array: &dyn Array, doris_type: &TPrimitiveTyp
         DataType::Utf8 => hash_string::<i32>(hashes, array, use_crc32c),
         DataType::LargeUtf8 => hash_string::<i64>(hashes, array, use_crc32c),
         DataType::Date32 => hash_date32(hashes, array, doris_type, use_crc32c),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, _) => hash_primitive::<TimestampSecondType>(hashes, array, use_crc32c),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, _) => hash_primitive::<TimestampMillisecondType>(hashes, array, use_crc32c),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => hash_primitive::<TimestampMicrosecondType>(hashes, array, use_crc32c),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => hash_primitive::<TimestampNanosecondType>(hashes, array, use_crc32c),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, _) => {
+            hash_primitive::<TimestampSecondType>(hashes, array, use_crc32c)
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, _) => {
+            hash_primitive::<TimestampMillisecondType>(hashes, array, use_crc32c)
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
+            hash_primitive::<TimestampMicrosecondType>(hashes, array, use_crc32c)
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+            hash_primitive::<TimestampNanosecondType>(hashes, array, use_crc32c)
+        }
         DataType::Decimal128(_, _) => hash_decimal128(hashes, array, use_crc32c),
         dt => {
-            tracing::warn!(?dt, "unsupported data type for hash partitioning, hashing as zero bytes");
+            tracing::warn!(
+                ?dt,
+                "unsupported data type for hash partitioning, hashing as zero bytes"
+            );
             // Fallback: hash 4 zero bytes for every row (same as NULL).
             for h in hashes.iter_mut() {
                 *h = do_crc32(*h, &[0u8; 4], use_crc32c);
@@ -256,8 +281,15 @@ fn hash_boolean(hashes: &mut [u32], arr: &BooleanArray, use_crc32c: bool) {
 }
 
 /// Hash a string (Utf8/LargeUtf8) array: raw string bytes (no length prefix).
-fn hash_string<O: arrow::array::OffsetSizeTrait>(hashes: &mut [u32], array: &dyn Array, use_crc32c: bool) {
-    let arr = array.as_any().downcast_ref::<GenericStringArray<O>>().unwrap();
+fn hash_string<O: arrow::array::OffsetSizeTrait>(
+    hashes: &mut [u32],
+    array: &dyn Array,
+    use_crc32c: bool,
+) {
+    let arr = array
+        .as_any()
+        .downcast_ref::<GenericStringArray<O>>()
+        .unwrap();
     for (i, h) in hashes.iter_mut().enumerate() {
         if arr.is_null(i) {
             *h = do_crc32(*h, &[0u8; 4], use_crc32c);
@@ -269,7 +301,12 @@ fn hash_string<O: arrow::array::OffsetSizeTrait>(hashes: &mut [u32], array: &dyn
 }
 
 /// Hash Date32 array: legacy DATE (type 9) hashes as string repr, DATEV2 (type 26) as raw bytes.
-fn hash_date32(hashes: &mut [u32], array: &dyn Array, doris_type: &TPrimitiveType, use_crc32c: bool) {
+fn hash_date32(
+    hashes: &mut [u32],
+    array: &dyn Array,
+    doris_type: &TPrimitiveType,
+    use_crc32c: bool,
+) {
     let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
     let is_legacy_date = *doris_type == TPrimitiveType::DATE;
 
@@ -433,7 +470,8 @@ mod tests {
         ]));
         let key_col = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let val_col = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g", "h"]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(key_col), Arc::new(val_col)]).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(key_col), Arc::new(val_col)]).unwrap();
 
         let assignments = compute_dest_assignments(
             &batch,
@@ -483,13 +521,7 @@ mod tests {
         let key_col = Int32Array::from(vec![Some(1), None, Some(3), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(key_col)]).unwrap();
 
-        let assignments = compute_dest_assignments(
-            &batch,
-            &[0],
-            2,
-            false,
-            &[TPrimitiveType::INT],
-        );
+        let assignments = compute_dest_assignments(&batch, &[0], 2, false, &[TPrimitiveType::INT]);
 
         assert_eq!(assignments.len(), 4);
         // NULL rows should get the same destination (both hash as 4 zero bytes).
@@ -501,9 +533,7 @@ mod tests {
 
     #[test]
     fn test_split_by_destination() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let id_col = Int32Array::from(vec![10, 20, 30, 40, 50]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_col)]).unwrap();
 
@@ -543,9 +573,7 @@ mod tests {
 
     #[test]
     fn test_split_all_to_one_dest() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let col = Int32Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
@@ -586,17 +614,16 @@ mod tests {
 
     #[test]
     fn test_hash_boolean_column() {
-        let schema = Arc::new(Schema::new(vec![Field::new("flag", DataType::Boolean, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            true,
+        )]));
         let col = BooleanArray::from(vec![Some(true), Some(false), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
-        let assignments = compute_dest_assignments(
-            &batch,
-            &[0],
-            2,
-            false,
-            &[TPrimitiveType::BOOLEAN],
-        );
+        let assignments =
+            compute_dest_assignments(&batch, &[0], 2, false, &[TPrimitiveType::BOOLEAN]);
         assert_eq!(assignments.len(), 3);
         // true and false should hash differently.
         // (They may or may not end up in different partitions mod 2, but they should hash differently.)
@@ -604,21 +631,18 @@ mod tests {
 
     #[test]
     fn test_hash_decimal128_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("amount", DataType::Decimal128(18, 2), true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(18, 2),
+            true,
+        )]));
         let col = Decimal128Array::from(vec![Some(12345), Some(67890), None])
             .with_precision_and_scale(18, 2)
             .unwrap();
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
-        let assignments = compute_dest_assignments(
-            &batch,
-            &[0],
-            3,
-            false,
-            &[TPrimitiveType::DECIMAL128I],
-        );
+        let assignments =
+            compute_dest_assignments(&batch, &[0], 3, false, &[TPrimitiveType::DECIMAL128I]);
         assert_eq!(assignments.len(), 3);
         for &a in &assignments {
             assert!(a < 3);

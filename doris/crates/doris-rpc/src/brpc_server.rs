@@ -72,8 +72,12 @@ async fn handle_one_frame(
     let correlation_id = meta.correlation_id.unwrap_or(0);
 
     let req_meta = meta.request.as_ref();
-    let service = req_meta.and_then(|m| m.service_name.as_deref()).unwrap_or("");
-    let method = req_meta.and_then(|m| m.method_name.as_deref()).unwrap_or("");
+    let service = req_meta
+        .and_then(|m| m.service_name.as_deref())
+        .unwrap_or("");
+    let method = req_meta
+        .and_then(|m| m.method_name.as_deref())
+        .unwrap_or("");
 
     // Payload is after meta, before any attachment.
     let attachment_size = meta.attachment_size.unwrap_or(0) as usize;

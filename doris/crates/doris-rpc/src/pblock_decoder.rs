@@ -77,10 +77,10 @@ fn type_byte_width(type_id: i32) -> usize {
         x if x == TypeId::Int128 as i32 || x == TypeId::Uint128 as i32 => 16,
         x if x == TypeId::Float as i32 => 4,
         x if x == TypeId::Double as i32 => 8,
-        x if x == TypeId::Datev2 as i32 => 4,       // uint32
-        x if x == TypeId::Datetimev2 as i32 => 8,    // uint64
-        x if x == TypeId::Date as i32 => 8,           // int64 (VecDateTimeValue)
-        x if x == TypeId::Datetime as i32 => 8,       // int64
+        x if x == TypeId::Datev2 as i32 => 4,     // uint32
+        x if x == TypeId::Datetimev2 as i32 => 8, // uint64
+        x if x == TypeId::Date as i32 => 8,       // int64 (VecDateTimeValue)
+        x if x == TypeId::Datetime as i32 => 8,   // int64
         x if x == TypeId::Decimal32 as i32 => 4,
         x if x == TypeId::Decimal64 as i32 => 8,
         x if x == TypeId::Decimal128 as i32 => 16,
@@ -130,8 +130,8 @@ fn decompress(
         x if x == CompressionTypePb::Zstd as i32 => {
             let mut out = Vec::with_capacity(uncompressed_size);
             let cursor = std::io::Cursor::new(data);
-            let mut decoder = zstd::Decoder::new(cursor)
-                .map_err(|e| format!("zstd decoder init: {e}"))?;
+            let mut decoder =
+                zstd::Decoder::new(cursor).map_err(|e| format!("zstd decoder init: {e}"))?;
             std::io::Read::read_to_end(&mut decoder, &mut out)
                 .map_err(|e| format!("zstd decompress: {e}"))?;
             Ok(out)
@@ -216,10 +216,7 @@ fn read_raw_or_fail(
 /// Read string chars: value_len(8) + raw or LZ4 compressed chars.
 fn read_string_chars(data: &[u8], offset: &mut usize) -> Result<Vec<u8>, String> {
     if *offset + 8 > data.len() {
-        return Err(format!(
-            "truncated string value_len at offset {}",
-            *offset
-        ));
+        return Err(format!("truncated string value_len at offset {}", *offset));
     }
     let value_len = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap()) as usize;
     *offset += 8;
@@ -271,7 +268,12 @@ fn decode_fixed_data(
 ) -> Result<Vec<u8>, String> {
     let n = real_saved_num as usize;
     let mem_size = n * width;
-    let raw = read_raw_or_fail(data, offset, mem_size, &format!("fixed column '{col_name}'"))?;
+    let raw = read_raw_or_fail(
+        data,
+        offset,
+        mem_size,
+        &format!("fixed column '{col_name}'"),
+    )?;
 
     // Expand const column: replicate single value to row_num
     if real_saved_num == 1 && row_num > 1 {
@@ -298,8 +300,12 @@ fn decode_string_data(
 
     // Read offsets: N * sizeof(UInt32) = N * 4 bytes
     let offsets_mem_size = n * 4;
-    let raw_offsets =
-        read_raw_or_fail(data, offset, offsets_mem_size, &format!("string offsets '{col_name}'"))?;
+    let raw_offsets = read_raw_or_fail(
+        data,
+        offset,
+        offsets_mem_size,
+        &format!("string offsets '{col_name}'"),
+    )?;
 
     // Parse UInt32 offsets
     let mut doris_offsets = Vec::with_capacity(n);
@@ -327,7 +333,11 @@ fn decode_string_data(
         let start = if i == 0 { 0 } else { doris_offsets[i - 1] };
         let end_with_null = doris_offsets[i];
         // String bytes are between start and end_with_null-1 (skip the \0)
-        let end = if end_with_null > start { end_with_null - 1 } else { start };
+        let end = if end_with_null > start {
+            end_with_null - 1
+        } else {
+            start
+        };
         if end > start && end <= chars.len() {
             clean_data.extend_from_slice(&chars[start..end]);
         }
@@ -496,8 +506,12 @@ fn decode_nullable_column(
 
     // Read null map: real_saved_num * sizeof(bool) = real_saved_num bytes
     let null_mem_size = null_header.real_saved_num as usize;
-    let raw_null_map =
-        read_raw_or_fail(data, offset, null_mem_size, &format!("null map '{col_name}'"))?;
+    let raw_null_map = read_raw_or_fail(
+        data,
+        offset,
+        null_mem_size,
+        &format!("null map '{col_name}'"),
+    )?;
 
     // Expand const null map if needed
     let null_map = if null_header.real_saved_num == 1 && null_header.row_num > 1 {
@@ -526,7 +540,9 @@ fn decode_single_block(block: &PBlock) -> Result<(Vec<DecodedColumn>, u32), Stri
     // Decompress block-level compression if needed.
     let data = if block.compressed.unwrap_or(false) {
         let uncompressed_size = block.uncompressed_size.unwrap_or(0) as usize;
-        let compression = block.compression_type.unwrap_or(CompressionTypePb::Snappy as i32);
+        let compression = block
+            .compression_type
+            .unwrap_or(CompressionTypePb::Snappy as i32);
         decompress(raw_bytes, compression, uncompressed_size)?
     } else {
         raw_bytes.clone()
@@ -617,7 +633,9 @@ pub fn type_id_to_sql(type_id: i32, precision: u32, scale: u32) -> String {
         x if x == TypeId::String as i32 => "VARCHAR".to_string(),
         x if x == TypeId::Bytes as i32 => "BLOB".to_string(),
         x if x == TypeId::Datev2 as i32 || x == TypeId::Date as i32 => "DATE".to_string(),
-        x if x == TypeId::Datetimev2 as i32 || x == TypeId::Datetime as i32 => "TIMESTAMP".to_string(),
+        x if x == TypeId::Datetimev2 as i32 || x == TypeId::Datetime as i32 => {
+            "TIMESTAMP".to_string()
+        }
         x if x == TypeId::Decimal32 as i32
             || x == TypeId::Decimal64 as i32
             || x == TypeId::Decimal128 as i32
@@ -675,7 +693,11 @@ pub fn column_to_sql_values(col: &DecodedColumn, num_rows: u32) -> Vec<String> {
             }
         } else if col.type_id == TypeId::Boolean as i32 {
             let v = col.data[row];
-            if v != 0 { "TRUE".to_string() } else { "FALSE".to_string() }
+            if v != 0 {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
         } else {
             // Fixed-width numeric: read LE bytes and format.
             let width = type_byte_width(col.type_id);
@@ -775,7 +797,12 @@ fn format_decimal(value: i128, scale: u32) -> String {
     let divisor = 10i128.pow(scale);
     let integer_part = value / divisor;
     let frac_part = (value % divisor).unsigned_abs();
-    format!("{}.{:0>width$}", integer_part, frac_part, width = scale as usize)
+    format!(
+        "{}.{:0>width$}",
+        integer_part,
+        frac_part,
+        width = scale as usize
+    )
 }
 
 /// Extract column metadata (name + SQL type) from a PBlock's column_metas.
@@ -785,7 +812,11 @@ pub fn extract_column_info(metas: &[PColumnMeta]) -> Vec<(String, String)> {
         .map(|m| {
             let name = m.name.clone().unwrap_or_default();
             let type_id = m.r#type.unwrap_or(TypeId::Unknown as i32);
-            let precision = m.decimal_param.as_ref().and_then(|d| d.precision).unwrap_or(0);
+            let precision = m
+                .decimal_param
+                .as_ref()
+                .and_then(|d| d.precision)
+                .unwrap_or(0);
             let scale = m.decimal_param.as_ref().and_then(|d| d.scale).unwrap_or(0);
             let sql_type = type_id_to_sql(type_id, precision, scale);
             (name, sql_type)
@@ -877,7 +908,9 @@ pub fn decoded_columns_to_arrow_ipc(
                     }
                 }
                 NullBuffer::new(arrow::buffer::BooleanBuffer::new(
-                    Buffer::from(bits), 0, num_rows,
+                    Buffer::from(bits),
+                    0,
+                    num_rows,
                 ))
             })
         } else {
@@ -891,28 +924,32 @@ pub fn decoded_columns_to_arrow_ipc(
                     bits[r / 8] |= 1 << (r % 8);
                 }
             }
-            let bool_buf = arrow::buffer::BooleanBuffer::new(
-                Buffer::from(bits), 0, num_rows,
-            );
+            let bool_buf = arrow::buffer::BooleanBuffer::new(Buffer::from(bits), 0, num_rows);
             let arr = BooleanArray::new(bool_buf, null_buf);
-            (Field::new(&name, DataType::Boolean, col.is_nullable), Arc::new(arr))
+            (
+                Field::new(&name, DataType::Boolean, col.is_nullable),
+                Arc::new(arr),
+            )
         } else if is_string_type(col.type_id) {
             // Build StringArray from offsets + data.
             if let Some(offsets) = &col.offsets {
                 // Arrow StringArray uses i32 offsets.
-                let arrow_offsets: Vec<i32> = offsets.iter()
-                    .map(|&o| o as i32)
-                    .collect();
-                let offsets_buf = OffsetBuffer::new(
-                    arrow::buffer::ScalarBuffer::from(arrow_offsets),
-                );
+                let arrow_offsets: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
+                let offsets_buf =
+                    OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(arrow_offsets));
                 let values_buf = Buffer::from_slice_ref(&col.data);
                 let arr = StringArray::new(offsets_buf, values_buf, null_buf);
-                (Field::new(&name, DataType::Utf8, col.is_nullable), Arc::new(arr))
+                (
+                    Field::new(&name, DataType::Utf8, col.is_nullable),
+                    Arc::new(arr),
+                )
             } else {
                 // No offsets — empty strings.
                 let arr = StringArray::from(vec![""; num_rows]);
-                (Field::new(&name, DataType::Utf8, col.is_nullable), Arc::new(arr))
+                (
+                    Field::new(&name, DataType::Utf8, col.is_nullable),
+                    Arc::new(arr),
+                )
             }
         } else {
             // Fixed-width numeric types: create from raw LE bytes buffer.
@@ -920,41 +957,60 @@ pub fn decoded_columns_to_arrow_ipc(
             match col.type_id {
                 x if x == TypeId::Int8 as i32 => {
                     let arr = Int8Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::Int8, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::Int8, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Uint8 as i32 => {
                     let arr = UInt8Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::UInt8, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::UInt8, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Int16 as i32 => {
                     let arr = Int16Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::Int16, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::Int16, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Uint16 as i32 => {
                     let arr = UInt16Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::UInt16, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::UInt16, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Int32 as i32 => {
                     let arr = Int32Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::Int32, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::Int32, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Datev2 as i32 => {
                     // DATEV2: packed uint32 (year<<9 | month<<5 | day) → Arrow Date32 (days since epoch).
-                    let days: Vec<i32> = (0..num_rows).map(|r| {
-                        let off = r * 4;
-                        let v = u32::from_le_bytes(col.data[off..off+4].try_into().unwrap_or([0;4]));
-                        let year = (v >> 9) as i32;
-                        let month = ((v >> 5) & 0xF) as u32;
-                        let day = (v & 0x1F) as u32;
-                        // Days since 1970-01-01 (civil calendar algorithm).
-                        let y = if month <= 2 { year - 1 } else { year };
-                        let m = if month <= 2 { month + 9 } else { month - 3 };
-                        let era = if y >= 0 { y } else { y - 399 } / 400;
-                        let yoe = (y - era * 400) as u32;
-                        let doy = (153 * m + 2) / 5 + day - 1;
-                        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-                        (era * 146097 + doe as i32 - 719468) as i32
-                    }).collect();
+                    let days: Vec<i32> = (0..num_rows)
+                        .map(|r| {
+                            let off = r * 4;
+                            let v = u32::from_le_bytes(
+                                col.data[off..off + 4].try_into().unwrap_or([0; 4]),
+                            );
+                            let year = (v >> 9) as i32;
+                            let month = ((v >> 5) & 0xF) as u32;
+                            let day = (v & 0x1F) as u32;
+                            // Days since 1970-01-01 (civil calendar algorithm).
+                            let y = if month <= 2 { year - 1 } else { year };
+                            let m = if month <= 2 { month + 9 } else { month - 3 };
+                            let era = if y >= 0 { y } else { y - 399 } / 400;
+                            let yoe = (y - era * 400) as u32;
+                            let doy = (153 * m + 2) / 5 + day - 1;
+                            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                            (era * 146097 + doe as i32 - 719468) as i32
+                        })
+                        .collect();
                     let arr = Date32Array::from(days).with_data_type(DataType::Date32);
                     let arr = if let Some(nb) = null_buf {
                         // Reconstruct with null buffer
@@ -962,31 +1018,59 @@ pub fn decoded_columns_to_arrow_ipc(
                     } else {
                         arr
                     };
-                    (Field::new(&name, DataType::Date32, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::Date32, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Uint32 as i32 || x == TypeId::Ipv4 as i32 => {
                     let arr = UInt32Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::UInt32, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::UInt32, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
-                x if x == TypeId::Int64 as i32 || x == TypeId::Date as i32 || x == TypeId::Datetime as i32 => {
+                x if x == TypeId::Int64 as i32
+                    || x == TypeId::Date as i32
+                    || x == TypeId::Datetime as i32 =>
+                {
                     let arr = Int64Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::Int64, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::Int64, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Uint64 as i32 || x == TypeId::Datetimev2 as i32 => {
                     let arr = UInt64Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::UInt64, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::UInt64, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Float as i32 => {
                     let arr = Float32Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::Float32, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::Float32, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
                 x if x == TypeId::Double as i32 => {
                     let arr = Float64Array::new(buf.into(), null_buf);
-                    (Field::new(&name, DataType::Float64, col.is_nullable), Arc::new(arr))
+                    (
+                        Field::new(&name, DataType::Float64, col.is_nullable),
+                        Arc::new(arr),
+                    )
                 }
-                x if x == TypeId::Int128 as i32 || x == TypeId::Uint128 as i32
-                    || x == TypeId::Decimal128 as i32 || x == TypeId::Decimal128i as i32 => {
-                    let p = if col.precision > 0 { col.precision as u8 } else { 38 };
+                x if x == TypeId::Int128 as i32
+                    || x == TypeId::Uint128 as i32
+                    || x == TypeId::Decimal128 as i32
+                    || x == TypeId::Decimal128i as i32 =>
+                {
+                    let p = if col.precision > 0 {
+                        col.precision as u8
+                    } else {
+                        38
+                    };
                     let s = col.scale as i8;
                     let arr = Decimal128Array::new(buf.into(), null_buf)
                         .with_precision_and_scale(p, s)
@@ -998,9 +1082,15 @@ pub fn decoded_columns_to_arrow_ipc(
                 }
                 x if x == TypeId::Decimal32 as i32 => {
                     // Widen Decimal32 (i32) to Decimal128 (i128) for Arrow.
-                    let p = if col.precision > 0 { col.precision as u8 } else { 9 };
+                    let p = if col.precision > 0 {
+                        col.precision as u8
+                    } else {
+                        9
+                    };
                     let s = col.scale as i8;
-                    let values: Vec<i128> = col.data.chunks_exact(4)
+                    let values: Vec<i128> = col
+                        .data
+                        .chunks_exact(4)
                         .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i128)
                         .collect();
                     let arr = Decimal128Array::from(values)
@@ -1008,7 +1098,9 @@ pub fn decoded_columns_to_arrow_ipc(
                         .map_err(|e| format!("decimal32 precision/scale: {e}"))?;
                     let arr = if let Some(nb) = null_buf {
                         // Re-apply nulls.
-                        let data = arr.into_data().into_builder()
+                        let data = arr
+                            .into_data()
+                            .into_builder()
                             .null_bit_buffer(Some(nb.into_inner().into_inner()))
                             .build()
                             .map_err(|e| format!("decimal32 null: {e}"))?;
@@ -1025,16 +1117,24 @@ pub fn decoded_columns_to_arrow_ipc(
                 }
                 x if x == TypeId::Decimal64 as i32 => {
                     // Widen Decimal64 (i64) to Decimal128 (i128) for Arrow.
-                    let p = if col.precision > 0 { col.precision as u8 } else { 18 };
+                    let p = if col.precision > 0 {
+                        col.precision as u8
+                    } else {
+                        18
+                    };
                     let s = col.scale as i8;
-                    let values: Vec<i128> = col.data.chunks_exact(8)
+                    let values: Vec<i128> = col
+                        .data
+                        .chunks_exact(8)
                         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as i128)
                         .collect();
                     let arr = Decimal128Array::from(values)
                         .with_precision_and_scale(p, s)
                         .map_err(|e| format!("decimal64 precision/scale: {e}"))?;
                     let arr = if let Some(nb) = null_buf {
-                        let data = arr.into_data().into_builder()
+                        let data = arr
+                            .into_data()
+                            .into_builder()
                             .null_bit_buffer(Some(nb.into_inner().into_inner()))
                             .build()
                             .map_err(|e| format!("decimal64 null: {e}"))?;
@@ -1054,7 +1154,9 @@ pub fn decoded_columns_to_arrow_ipc(
                     let width = type_byte_width(col.type_id);
                     if width > 0 {
                         // Fixed-width unknown: use Int64 as fallback.
-                        let values: Vec<i64> = col.data.chunks(8)
+                        let values: Vec<i64> = col
+                            .data
+                            .chunks(8)
                             .map(|c| {
                                 let mut buf = [0u8; 8];
                                 buf[..c.len()].copy_from_slice(c);
@@ -1063,11 +1165,17 @@ pub fn decoded_columns_to_arrow_ipc(
                             .take(num_rows)
                             .collect();
                         let arr = Int64Array::from(values);
-                        (Field::new(&name, DataType::Int64, col.is_nullable), Arc::new(arr))
+                        (
+                            Field::new(&name, DataType::Int64, col.is_nullable),
+                            Arc::new(arr),
+                        )
                     } else {
                         // Variable-width unknown: use Utf8.
                         let arr = StringArray::from(vec![""; num_rows]);
-                        (Field::new(&name, DataType::Utf8, col.is_nullable), Arc::new(arr))
+                        (
+                            Field::new(&name, DataType::Utf8, col.is_nullable),
+                            Arc::new(arr),
+                        )
                     }
                 }
             }
@@ -1086,7 +1194,9 @@ pub fn decoded_columns_to_arrow_ipc(
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
             .map_err(|e| format!("IPC writer init: {e}"))?;
-        writer.write(&batch).map_err(|e| format!("IPC write: {e}"))?;
+        writer
+            .write(&batch)
+            .map_err(|e| format!("IPC write: {e}"))?;
         writer.finish().map_err(|e| format!("IPC finish: {e}"))?;
     }
     Ok(buf)
@@ -1258,7 +1368,10 @@ mod tests {
         assert_eq!(mask, &[0, 1, 0]);
 
         assert_eq!(i64::from_le_bytes(col.data[0..8].try_into().unwrap()), 100);
-        assert_eq!(i64::from_le_bytes(col.data[16..24].try_into().unwrap()), 300);
+        assert_eq!(
+            i64::from_le_bytes(col.data[16..24].try_into().unwrap()),
+            300
+        );
     }
 
     #[test]
@@ -1292,10 +1405,7 @@ mod tests {
         // Column 1: STRING ["foo", "bar"]
         serialize_string_col(&mut col_bytes, &["foo", "bar"]);
 
-        let block = make_pblock(
-            vec![int32_meta("id"), string_meta("name")],
-            col_bytes,
-        );
+        let block = make_pblock(vec![int32_meta("id"), string_meta("name")], col_bytes);
         let decoded = decode_pblocks(&[block]).unwrap();
 
         assert_eq!(decoded.num_rows, 2);
@@ -1335,7 +1445,9 @@ mod tests {
         for (i, expected) in [1i32, 2, 3, 4, 5].iter().enumerate() {
             let offset = i * 4;
             let val = i32::from_le_bytes(
-                decoded.columns[0].data[offset..offset + 4].try_into().unwrap(),
+                decoded.columns[0].data[offset..offset + 4]
+                    .try_into()
+                    .unwrap(),
             );
             assert_eq!(val, *expected, "row {} mismatch", i);
         }
@@ -1423,7 +1535,10 @@ mod tests {
     fn test_type_id_to_sql() {
         assert_eq!(type_id_to_sql(TypeId::Int32 as i32, 0, 0), "INTEGER");
         assert_eq!(type_id_to_sql(TypeId::String as i32, 0, 0), "VARCHAR");
-        assert_eq!(type_id_to_sql(TypeId::Decimal64 as i32, 18, 6), "DECIMAL(18, 6)");
+        assert_eq!(
+            type_id_to_sql(TypeId::Decimal64 as i32, 18, 6),
+            "DECIMAL(18, 6)"
+        );
         assert_eq!(type_id_to_sql(TypeId::Boolean as i32, 0, 0), "BOOLEAN");
     }
 
@@ -1591,7 +1706,11 @@ mod tests {
 
         let vals = column_to_sql_values(&col, 2);
         // First row has \0: should be a blob literal
-        assert!(vals[0].starts_with("'\\x"), "expected blob literal, got: {}", vals[0]);
+        assert!(
+            vals[0].starts_with("'\\x"),
+            "expected blob literal, got: {}",
+            vals[0]
+        );
         assert!(vals[0].ends_with("'::BLOB"));
         // Second row is clean UTF-8: should be a normal string literal
         assert_eq!(vals[1], "'clean'");

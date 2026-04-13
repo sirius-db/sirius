@@ -48,11 +48,7 @@ impl FragmentManager {
     }
 
     /// Register a new fragment for execution.
-    pub fn submit(
-        &self,
-        id: FragmentInstanceId,
-        substrait_plan: Vec<u8>,
-    ) -> Arc<FragmentContext> {
+    pub fn submit(&self, id: FragmentInstanceId, substrait_plan: Vec<u8>) -> Arc<FragmentContext> {
         let ctx = Arc::new(FragmentContext {
             id: id.clone(),
             state: FragmentState::Preparing,
@@ -75,9 +71,8 @@ impl FragmentManager {
 
     /// Cancel all fragments for a given query.
     pub fn cancel_query(&self, query_hi: i64, query_lo: i64) {
-        self.fragments.retain(|id, _| {
-            id.query_hi != query_hi || id.query_lo != query_lo
-        });
+        self.fragments
+            .retain(|id, _| id.query_hi != query_hi || id.query_lo != query_lo);
     }
 
     /// Get the number of active fragments.

@@ -141,100 +141,63 @@ fn build_arrow_array(
         }
         DataType::Int8 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(Int8Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(Int8Array::new(buf.into(), nulls)))
         }
         DataType::Int16 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(Int16Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(Int16Array::new(buf.into(), nulls)))
         }
         DataType::Int32 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(Int32Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(Int32Array::new(buf.into(), nulls)))
         }
         DataType::Int64 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(Int64Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(Int64Array::new(buf.into(), nulls)))
         }
         DataType::UInt8 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(UInt8Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(UInt8Array::new(buf.into(), nulls)))
         }
         DataType::UInt16 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(UInt16Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(UInt16Array::new(buf.into(), nulls)))
         }
         DataType::UInt32 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(UInt32Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(UInt32Array::new(buf.into(), nulls)))
         }
         DataType::UInt64 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(UInt64Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(UInt64Array::new(buf.into(), nulls)))
         }
         DataType::Float32 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(Float32Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(Float32Array::new(buf.into(), nulls)))
         }
         DataType::Float64 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(Float64Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(Float64Array::new(buf.into(), nulls)))
         }
         DataType::Date32 => {
             let buf = Buffer::from(data);
-            Ok(Arc::new(Date32Array::new(
-                buf.into(),
-                nulls,
-            )))
+            Ok(Arc::new(Date32Array::new(buf.into(), nulls)))
         }
         DataType::Timestamp(unit, tz) => {
             let buf = Buffer::from(data);
             let sb: arrow::buffer::ScalarBuffer<i64> = buf.into();
             match unit {
                 arrow::datatypes::TimeUnit::Second => Ok(Arc::new(
-                    TimestampSecondArray::new(sb, nulls)
-                        .with_timezone_opt(tz.clone()),
+                    TimestampSecondArray::new(sb, nulls).with_timezone_opt(tz.clone()),
                 )),
                 arrow::datatypes::TimeUnit::Millisecond => Ok(Arc::new(
-                    TimestampMillisecondArray::new(sb, nulls)
-                        .with_timezone_opt(tz.clone()),
+                    TimestampMillisecondArray::new(sb, nulls).with_timezone_opt(tz.clone()),
                 )),
                 arrow::datatypes::TimeUnit::Microsecond => Ok(Arc::new(
-                    TimestampMicrosecondArray::new(sb, nulls)
-                        .with_timezone_opt(tz.clone()),
+                    TimestampMicrosecondArray::new(sb, nulls).with_timezone_opt(tz.clone()),
                 )),
                 arrow::datatypes::TimeUnit::Nanosecond => Ok(Arc::new(
-                    TimestampNanosecondArray::new(sb, nulls)
-                        .with_timezone_opt(tz.clone()),
+                    TimestampNanosecondArray::new(sb, nulls).with_timezone_opt(tz.clone()),
                 )),
             }
         }
@@ -249,9 +212,7 @@ fn build_arrow_array(
             let offsets_sb: arrow::buffer::ScalarBuffer<i32> = offsets_buf.into();
             let offset_buf = arrow::buffer::OffsetBuffer::new(offsets_sb);
             Ok(Arc::new(GenericStringArray::<i32>::new(
-                offset_buf,
-                values_buf,
-                nulls,
+                offset_buf, values_buf, nulls,
             )))
         }
         DataType::Decimal128(p, s) => {
@@ -289,7 +250,9 @@ fn build_arrow_array(
                     .map_err(|e| format!("Decimal128 precision/scale: {e}"))?,
             ))
         }
-        _ => Err(format!("unsupported Arrow type for GPU reconstruction: {arrow_type:?}")),
+        _ => Err(format!(
+            "unsupported Arrow type for GPU reconstruction: {arrow_type:?}"
+        )),
     }
 }
 
@@ -376,9 +339,7 @@ pub fn reconstruct_ipc_from_gpu_buffers(
         writer
             .write(&batch)
             .map_err(|e| format!("IPC write: {e}"))?;
-        writer
-            .finish()
-            .map_err(|e| format!("IPC finish: {e}"))?;
+        writer.finish().map_err(|e| format!("IPC finish: {e}"))?;
     }
 
     Ok(buf)

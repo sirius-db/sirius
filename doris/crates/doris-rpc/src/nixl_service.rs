@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 
-use crate::nixl_exchange::{NixlExchange, NixlRegisteredBuffer};
 use crate::exchange_buffer::ExchangeBuffer;
+use crate::nixl_exchange::{NixlExchange, NixlRegisteredBuffer};
 
 /// NIXL metadata exchange service handler.
 pub struct NixlMetadataServiceHandler {
@@ -37,10 +37,7 @@ enum PendingDstBuffers {
 }
 
 impl NixlMetadataServiceHandler {
-    pub fn new(
-        nixl_agent: Option<Arc<NixlExchange>>,
-        exchange_buffer: ExchangeBuffer,
-    ) -> Self {
+    pub fn new(nixl_agent: Option<Arc<NixlExchange>>, exchange_buffer: ExchangeBuffer) -> Self {
         Self {
             nixl_agent,
             exchange_buffer,
@@ -49,7 +46,10 @@ impl NixlMetadataServiceHandler {
         }
     }
 
-    pub fn with_engine(mut self, engine: Option<Arc<std::sync::Mutex<sirius_ffi::SiriusEngine>>>) -> Self {
+    pub fn with_engine(
+        mut self,
+        engine: Option<Arc<std::sync::Mutex<sirius_ffi::SiriusEngine>>>,
+    ) -> Self {
         self.engine = engine;
         self
     }
@@ -100,11 +100,23 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         // Try the staging buffer first (pre-registered, avoids per-transfer
         // cuMemAlloc+register overhead). Fall back to allocate_and_register
         // if the staging buffer overflows or is not available.
-        let sizes: Vec<_> = req.src_buffers.iter().map(|b| (b.len, b.device_id)).collect();
+        let sizes: Vec<_> = req
+            .src_buffers
+            .iter()
+            .map(|b| (b.len, b.device_id))
+            .collect();
 
         // Collect sub-buffer sizes (null_mask and offsets per column).
-        let null_mask_sizes: Vec<_> = req.src_null_masks.iter().map(|b| (b.len, b.device_id)).collect();
-        let offsets_sizes: Vec<_> = req.src_offsets.iter().map(|b| (b.len, b.device_id)).collect();
+        let null_mask_sizes: Vec<_> = req
+            .src_null_masks
+            .iter()
+            .map(|b| (b.len, b.device_id))
+            .collect();
+        let offsets_sizes: Vec<_> = req
+            .src_offsets
+            .iter()
+            .map(|b| (b.len, b.device_id))
+            .collect();
 
         // Flatten all non-zero sizes for allocation.
         let mut all_sizes: Vec<(u64, u64)> = Vec::new();
@@ -150,60 +162,62 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         }
 
         let dst = match agent.staging() {
-            Some(staging) => {
-                match staging.try_allocate(&all_sizes) {
-                    Ok(leases) => {
-                        info!(
-                            num = leases.len(),
-                            staging_used = staging.stats().used,
-                            "receiver: allocated dst buffers from staging buffer"
-                        );
-                        DstBuffers::Staged(leases)
-                    }
-                    Err(e) => {
-                        info!(error = %e, "receiver: staging overflow, falling back to cuMemAlloc");
-                        match agent.allocate_and_register_gpu_buffers(&all_sizes) {
-                            Ok(r) => DstBuffers::Registered(r),
-                            Err(e) => {
-                                warn!(error = %e, "failed to allocate/register dst GPU buffers");
-                                return Ok(Response::new(PExchangeNixlMetadataResponse {
-                                    dst_buffers: vec![],
-                                    remote_agent_name: String::new(),
-                                    status_code: 1,
-                                    error_msgs: vec![format!("allocate_and_register: {e}")],
-                                    nixl_metadata: vec![],
-                                    dst_null_masks: vec![],
-                                    dst_offsets: vec![],
-                                }));
-                            }
+            Some(staging) => match staging.try_allocate(&all_sizes) {
+                Ok(leases) => {
+                    info!(
+                        num = leases.len(),
+                        staging_used = staging.stats().used,
+                        "receiver: allocated dst buffers from staging buffer"
+                    );
+                    DstBuffers::Staged(leases)
+                }
+                Err(e) => {
+                    info!(error = %e, "receiver: staging overflow, falling back to cuMemAlloc");
+                    match agent.allocate_and_register_gpu_buffers(&all_sizes) {
+                        Ok(r) => DstBuffers::Registered(r),
+                        Err(e) => {
+                            warn!(error = %e, "failed to allocate/register dst GPU buffers");
+                            return Ok(Response::new(PExchangeNixlMetadataResponse {
+                                dst_buffers: vec![],
+                                remote_agent_name: String::new(),
+                                status_code: 1,
+                                error_msgs: vec![format!("allocate_and_register: {e}")],
+                                nixl_metadata: vec![],
+                                dst_null_masks: vec![],
+                                dst_offsets: vec![],
+                            }));
                         }
                     }
                 }
-            }
-            None => {
-                match agent.allocate_and_register_gpu_buffers(&all_sizes) {
-                    Ok(r) => DstBuffers::Registered(r),
-                    Err(e) => {
-                        warn!(error = %e, "failed to allocate/register dst GPU buffers");
-                        return Ok(Response::new(PExchangeNixlMetadataResponse {
-                            dst_buffers: vec![],
-                            remote_agent_name: String::new(),
-                            status_code: 1,
-                            error_msgs: vec![format!("allocate_and_register: {e}")],
-                            nixl_metadata: vec![],
-                            dst_null_masks: vec![],
-                            dst_offsets: vec![],
-                        }));
-                    }
+            },
+            None => match agent.allocate_and_register_gpu_buffers(&all_sizes) {
+                Ok(r) => DstBuffers::Registered(r),
+                Err(e) => {
+                    warn!(error = %e, "failed to allocate/register dst GPU buffers");
+                    return Ok(Response::new(PExchangeNixlMetadataResponse {
+                        dst_buffers: vec![],
+                        remote_agent_name: String::new(),
+                        status_code: 1,
+                        error_msgs: vec![format!("allocate_and_register: {e}")],
+                        nixl_metadata: vec![],
+                        dst_null_masks: vec![],
+                        dst_offsets: vec![],
+                    }));
                 }
-            }
+            },
         };
 
         // Helper to get (addr, len, device_id) for a buffer at index.
         let get_buf = |idx: usize| -> (usize, usize, u64) {
             match &dst {
-                DstBuffers::Staged(leases) => (leases[idx].addr(), leases[idx].len(), leases[idx].device_id()),
-                DstBuffers::Registered(regs) => (regs[idx].addr(), regs[idx].len(), regs[idx].device_id()),
+                DstBuffers::Staged(leases) => (
+                    leases[idx].addr(),
+                    leases[idx].len(),
+                    leases[idx].device_id(),
+                ),
+                DstBuffers::Registered(regs) => {
+                    (regs[idx].addr(), regs[idx].len(), regs[idx].device_id())
+                }
             }
         };
         let total_allocated = match &dst {
@@ -215,7 +229,11 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         let mut dst_buffers: Vec<PGpuBufferDesc> = Vec::new();
         let mut dst_null_masks: Vec<PGpuBufferDesc> = Vec::new();
         let mut dst_offsets: Vec<PGpuBufferDesc> = Vec::new();
-        let zero_desc = PGpuBufferDesc { addr: 0, len: 0, device_id: 0 };
+        let zero_desc = PGpuBufferDesc {
+            addr: 0,
+            len: 0,
+            device_id: 0,
+        };
 
         for &(data_idx, nm_idx, off_idx) in &buffer_map {
             let (addr, len, dev) = get_buf(data_idx);
@@ -307,7 +325,11 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         // Step 4: Get receiver metadata.
         // When staging buffer is used, memory layout is stable → use cached metadata.
         // Otherwise, get fresh metadata (includes newly registered dst buffers).
-        let receiver_metadata = match if used_staging { agent.get_metadata() } else { agent.get_fresh_metadata() } {
+        let receiver_metadata = match if used_staging {
+            agent.get_metadata()
+        } else {
+            agent.get_fresh_metadata()
+        } {
             Ok(md) => md,
             Err(e) => {
                 if let Some(vec) = self.pending_buffers.lock().unwrap().get_mut(&pending_key) {
@@ -375,12 +397,14 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
 
         // Parse query_id from LE bytes.
         let query_id_hi = i64::from_le_bytes(
-            req.query_id_hi.get(..8)
+            req.query_id_hi
+                .get(..8)
                 .and_then(|s| s.try_into().ok())
                 .unwrap_or([0u8; 8]),
         );
         let query_id_lo = i64::from_le_bytes(
-            req.query_id_lo.get(..8)
+            req.query_id_lo
+                .get(..8)
                 .and_then(|s| s.try_into().ok())
                 .unwrap_or([0u8; 8]),
         );
@@ -391,9 +415,10 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         // The exchange async task (which holds the engine lock) will call
         // cudf::unpack + gpu_register_table to register the table on GPU.
         if !req.packed_cudf_metadata.is_empty() {
-            let dst_buf = req.dst_buffers.first().ok_or_else(|| {
-                Status::internal("packed transfer: no dst buffer")
-            })?;
+            let dst_buf = req
+                .dst_buffers
+                .first()
+                .ok_or_else(|| Status::internal("packed transfer: no dst buffer"))?;
 
             info!(
                 gpu_addr = format_args!("0x{:x}", dst_buf.addr),
@@ -403,7 +428,9 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             );
 
             // FULL buffer checksum: D2H the entire buffer and compute checksum.
-            if let Ok(buf) = crate::cuda_driver::gpu_to_host(dst_buf.addr as usize, dst_buf.len as usize) {
+            if let Ok(buf) =
+                crate::cuda_driver::gpu_to_host(dst_buf.addr as usize, dst_buf.len as usize)
+            {
                 let checksum: u64 = buf.iter().map(|&b| b as u64).sum();
                 info!(
                     gpu_addr = format_args!("0x{:x}", dst_buf.addr),
@@ -415,7 +442,10 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
 
             // Move ONE staging lease from pending_buffers into the PackedGpuExchange.
             // Pop from the Vec (not remove!) to keep other entries' leases alive.
-            let staging_lease = self.pending_buffers.lock().unwrap()
+            let staging_lease = self
+                .pending_buffers
+                .lock()
+                .unwrap()
                 .get_mut(&pending_key)
                 .and_then(|vec| vec.pop())
                 .and_then(|pb| match pb {
@@ -437,7 +467,8 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 },
             );
             // Signal EOS (no PBlock data — the exchange task will use packed GPU path).
-            self.exchange_buffer.add_block(&key, req.sender_id, None, true);
+            self.exchange_buffer
+                .add_block(&key, req.sender_id, None, true);
 
             return Ok(Response::new(PNixlTransferCompleteResponse {
                 status_code: 0,
@@ -460,13 +491,12 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         Ok(Response::new(PNixlTransferCompleteResponse {
             status_code: 1,
             error_msgs: vec![
-                "non-packed nixl transfer not supported — all transfers must use cudf::pack format".into()
+                "non-packed nixl transfer not supported — all transfers must use cudf::pack format"
+                    .into(),
             ],
         }))
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -240,22 +240,33 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+  spdlog::info("SiriusContext::terminate: begin");
 
+  spdlog::info("SiriusContext::terminate: stopping pipeline executor");
   pipeline_executor_->stop();
   pipeline_executor_.reset();
+  spdlog::info("SiriusContext::terminate: pipeline executor stopped");
+
+  spdlog::info("SiriusContext::terminate: stopping task creator");
   task_creator_->stop_thread_pool();
   task_creator_.reset();
+  spdlog::info("SiriusContext::terminate: task creator stopped");
+
+  spdlog::info("SiriusContext::terminate: stopping downgrade executors");
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
   downgrade_executors_.clear();
+  spdlog::info("SiriusContext::terminate: downgrade executors stopped");
 
   // Ensure all CUDA operations (including async copies from downgrade tasks)
   // are complete before destroying pinned memory pools.  cudaStreamDestroy
   // returns immediately even when copies are still in-flight; without this
   // sync, the subsequent cudaFreeHost inside the memory manager destructor
   // can deadlock against a new cudaHostAlloc from the next SiriusContext.
+  spdlog::info("SiriusContext::terminate: synchronizing device");
   cudaDeviceSynchronize();
+  spdlog::info("SiriusContext::terminate: device synchronized");
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
@@ -267,12 +278,35 @@ void SiriusContext::terminate()
 
   // Release the slab allocator before tearing down the memory manager, since
   // its owned_allocations_ will return blocks back to the fixed_size_host_memory_resource.
+  spdlog::info("SiriusContext::terminate: resetting small pinned allocator");
   small_pinned_allocator_.reset();
+  spdlog::info("SiriusContext::terminate: small pinned allocator reset");
 
+  // Make teardown order explicit. Any lingering query/repository state that still
+  // references GPU batches must be destroyed before the memory manager goes away.
+  spdlog::info("SiriusContext::terminate: resetting query and repositories");
+  query_.reset();
+  if (data_repository_manager_) {
+    auto leaked = data_repository_manager_->clear_all_repositories();
+    for (auto const& info : leaked) {
+      spdlog::warn(
+        "SiriusContext::terminate: operator {} port '{}' still had {} un-consumed "
+        "data batch(es) during shutdown.",
+        info.operator_id,
+        info.port_id,
+        info.count);
+    }
+    data_repository_manager_.reset();
+  }
+  spdlog::info("SiriusContext::terminate: query and repositories reset");
+
+  spdlog::info("SiriusContext::terminate: shutting down memory manager");
   memory_manager_->shutdown();
   memory_manager_.reset();
+  spdlog::info("SiriusContext::terminate: memory manager shut down");
 
   is_initialized_ = false;
+  spdlog::info("SiriusContext::terminate: done");
 }
 
 sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memory_manager()
@@ -389,7 +423,13 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 {
   spdlog::info("Connection opened.");
-  if (context_) { context.registered_state->Insert("sirius_state", context_); }
+  auto sirius_context = context_.lock();
+  if (!sirius_context) {
+    sirius_context = duckdb::make_shared_ptr<SiriusContext>();
+    sirius_context->initialize(config_);
+    context_ = sirius_context;
+  }
+  context.registered_state->Insert("sirius_state", std::move(sirius_context));
 }
 
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
@@ -452,8 +492,6 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     config_.apply_defaults();
   }
 
-  context_ = duckdb::make_shared_ptr<SiriusContext>();
-  context_->initialize(config_);
 }
 
 }  // namespace duckdb
