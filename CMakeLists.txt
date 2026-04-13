@@ -28,6 +28,11 @@ endif()
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 
+option(
+  SIRIUS_BUILD_GPU_MICROBENCH
+  "Build sirius_gpu_microbench (Google Benchmark libcudf operator microbench suite)"
+  OFF)
+
 # In the vcpkg build, vcpkg headers must take priority over: 1) conda's CCCL
 # 3.1.4 (injected via CXXFLAGS as -I.../include/cccl) 2) DuckDB's bundled fmt
 # 6.1.2 (uses duckdb_fmt namespace, incompatible with spdlog) Fix: strip conda
@@ -431,3 +436,7 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
+
+if(SIRIUS_BUILD_GPU_MICROBENCH)
+  add_subdirectory(test/cpp/microbench)
+endif()

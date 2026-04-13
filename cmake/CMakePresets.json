@@ -86,7 +86,8 @@
     {
       "binaryDir": "${sourceDir}/../build/release",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "SIRIUS_BUILD_GPU_MICROBENCH": "ON"
       },
       "displayName": "GCC Release",
       "inherits": "base",
