@@ -43,6 +43,14 @@
 #include <duckdb/storage/statistics/string_stats.hpp>
 
 #include <op/scan/direct_block_scan.hpp>
+#include <cuda/scan/gpu_decode.cuh>
+#include <cuda/scan/gpu_native_decode.cuh>
+
+// cucascade (for gpu_table_representation in GPU native decode path)
+#include <cucascade/data/gpu_data_representation.hpp>
+
+// sirius (for SiriusContext::get_memory_manager in GPU native decode path)
+#include <sirius_context.hpp>
 
 #include <chrono>
 #include <cuda_runtime.h>
@@ -658,7 +666,43 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   columns.reserve(_num_columns);
   for (size_t ci = 0; ci < _column_builders.size(); ci++) {
     auto& builder = _column_builders[ci];
-    columns.push_back(builder.make_column_metadata(_row_offset));
+    auto col_meta = builder.make_column_metadata(_row_offset);
+
+    // --- Integrity check: log column metadata and verify buffer contents ---
+    SIRIUS_LOG_INFO("[integrity] make_data_batch col{}: type_id={} scale={} num_rows={} "
+                    "data_offset={} data_size={} null_count={} has_mask={} mask_offset={} "
+                    "type_size={} total_data_bytes={} children={}",
+                    ci, static_cast<int>(col_meta.type_id), col_meta.scale,
+                    col_meta.num_rows, col_meta.data_offset, col_meta.data_size,
+                    col_meta.null_count, col_meta.has_null_mask, col_meta.null_mask_offset,
+                    builder.type_size, builder.total_data_bytes, col_meta.children.size());
+
+    // For numeric columns: compute a checksum of the host buffer data
+    if (col_meta.has_data && col_meta.data_size > 0
+        && col_meta.type_id != cudf::type_id::STRING && _allocation) {
+      int64_t checksum = 0;
+      size_t block_size = _allocation->block_size();
+      size_t remaining = col_meta.data_size;
+      size_t offset = col_meta.data_offset;
+      while (remaining > 0) {
+        size_t bi = offset / block_size;
+        size_t bo = offset % block_size;
+        size_t chunk = std::min(remaining, block_size - bo);
+        auto block_span = _allocation->at(bi);
+        auto* ptr = reinterpret_cast<const uint8_t*>(block_span.data()) + bo;
+        // XOR-based checksum of 8-byte chunks
+        for (size_t i = 0; i + 8 <= chunk; i += 8) {
+          int64_t val;
+          std::memcpy(&val, ptr + i, 8);
+          checksum ^= val;
+        }
+        offset += chunk;
+        remaining -= chunk;
+      }
+      SIRIUS_LOG_INFO("[integrity] col{} host buffer xor_checksum={}", ci, checksum);
+    }
+
+    columns.push_back(std::move(col_meta));
   }
 
   // Make the host table allocation
@@ -800,75 +844,91 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // === Direct block scan benchmark (first task only) ===
+  // === GPU native decode path ===
+  // For task_id==0, try to decode the entire table directly from pinned DuckDB segments
+  // using GPU kernels (bitpacking, dictionary, uncompressed, constant).
+  // Falls back to the CPU scan loop if any column has unsupported compression.
+  bool used_gpu_native_decode = false;
   if (_task_id == 0) {
     try {
+      using clock = std::chrono::steady_clock;
+      auto t0 = clock::now();
+
       auto& bind_data = g_state._op.bind_data->Cast<duckdb::TableScanBindData>();
       auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
       auto& storage   = table.GetStorage();
 
-      auto bench_start = std::chrono::steady_clock::now();
+      // Phase 1: Pin all segments (data + validity) for all columns
+      std::vector<column_scan_result> col_scans(l_state._num_columns);
+      std::vector<duckdb::LogicalType> col_types;
+      col_types.reserve(l_state._num_columns);
 
-      // Pin all segments for all scanned columns
-      size_t total_pinned = 0;
-      size_t total_segments = 0;
-      for (size_t i = 0; i < l_state._num_columns; ++i) {
-        auto storage_col = duckdb::StorageIndex(g_state._op.column_ids[i].GetPrimaryIndex());
-        auto result = direct_block_scan_column(storage, storage_col, l_state._exec_ctx.client);
-        total_pinned += result.total_pinned_bytes;
-        total_segments += result.segments.size();
+      for (size_t ci = 0; ci < l_state._num_columns; ++ci) {
+        auto storage_col = duckdb::StorageIndex(g_state._op.column_ids[ci].GetPrimaryIndex());
+        col_scans[ci] = direct_block_scan_column_full(storage, storage_col, l_state._exec_ctx.client);
+        col_types.push_back(g_state._op.scanned_types[ci]);
       }
 
-      auto bench_end = std::chrono::steady_clock::now();
-      auto bench_us  = std::chrono::duration_cast<std::chrono::microseconds>(bench_end - bench_start).count();
+      auto t1_pin = clock::now();
 
-      // Also measure: cudaMemcpy ONE column's pinned blocks to GPU (raw, no decode)
-      // Use a small buffer (one block at a time) to avoid GPU OOM from the RMM pool.
-      double us_memcpy    = 0;
-      size_t bytes_copied = 0;
-      {
-        constexpr size_t BLOCK_SIZE = 262144;  // 256KB
-        void* gpu_buf               = nullptr;
-        auto cuda_err                = cudaMalloc(&gpu_buf, BLOCK_SIZE);
-        if (cuda_err == cudaSuccess && gpu_buf) {
-          // Copy first column's segments as benchmark
-          auto storage_col = duckdb::StorageIndex(g_state._op.column_ids[0].GetPrimaryIndex());
-          auto result2     = direct_block_scan_column(storage, storage_col, l_state._exec_ctx.client);
+      // Phase 2: GPU decode all columns → cudf::table
+      auto& mem_mgr = g_state._sirius_ctx->get_memory_manager();
+      auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+      auto* gpu_space = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+      auto mr = gpu_space->get_default_allocator();
 
-          auto memcpy_start = std::chrono::steady_clock::now();
-          for (auto& seg : result2.segments) {
-            if (seg.data_ptr && seg.persistent && seg.segment_size > 0) {
-              auto copy_size = std::min(seg.segment_size, BLOCK_SIZE);
-              cudaMemcpy(gpu_buf, seg.data_ptr, copy_size, cudaMemcpyHostToDevice);
-              bytes_copied += copy_size;
-            }
-          }
-          cudaDeviceSynchronize();
-          auto memcpy_end = std::chrono::steady_clock::now();
-          us_memcpy       = std::chrono::duration_cast<std::chrono::microseconds>(
-                        memcpy_end - memcpy_start)
-                        .count();
+      auto gpu_table = sirius::cuda::scan::gpu_decode_table(
+          col_scans, col_types, stream, mr);
 
-          cudaFree(gpu_buf);
-        }
+      auto t2_decode = clock::now();
+
+      // Phase 3: Wrap in gpu_table_representation and create data batch
+      auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+          std::move(gpu_table), *gpu_space);
+      auto batch = std::make_shared<cucascade::data_batch>(
+          ::sirius::get_next_batch_id(), std::move(gpu_repr));
+
+      // Phase 4: Drain DuckDB table function to synchronize state
+      l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
+                                g_state._op.scanned_types);
+      while (get_next_chunk(l_state, g_state)) {
+        l_state._chunk.Reset();
+      }
+      l_state._local_state_drained = true;
+
+      auto t3_drain = clock::now();
+
+      auto us = [](clock::time_point a, clock::time_point b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+      };
+
+      size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
+      size_t total_segs = 0, total_pinned_mb = 0;
+      for (auto& cs : col_scans) {
+        total_segs += cs.data.segments.size();
+        total_pinned_mb += cs.data.total_pinned_bytes;
       }
 
       SIRIUS_LOG_INFO(
-        "[direct_scan] BENCHMARK: pinned {} cols, {} segs, {:.1f}MB in {:.1f}ms. "
-        "cudaMemcpy col0 ({:.1f}MB) in {:.1f}ms = {:.1f} GB/s",
-        l_state._num_columns,
-        total_segments,
-        total_pinned / (1024.0 * 1024.0),
-        bench_us / 1000.0,
-        bytes_copied / (1024.0 * 1024.0),
-        us_memcpy / 1000.0,
-        us_memcpy > 0 ? (bytes_copied / (us_memcpy / 1e6)) / 1e9 : 0);
+          "[gpu_native_decode] SUCCESS: {} rows, {} cols, {} segs, {:.1f}MB pinned | "
+          "pin={:.1f}ms decode={:.1f}ms drain={:.1f}ms total={:.1f}ms",
+          total_rows, l_state._num_columns, total_segs,
+          total_pinned_mb / (1024.0 * 1024.0),
+          us(t0, t1_pin) / 1000.0,
+          us(t1_pin, t2_decode) / 1000.0,
+          us(t2_decode, t3_drain) / 1000.0,
+          us(t0, t3_drain) / 1000.0);
+
+      used_gpu_native_decode = true;
+      return std::make_unique<op::pipelineable_operator_data>(
+          std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
+
     } catch (std::exception const& e) {
-      SIRIUS_LOG_DEBUG("[direct_scan] benchmark skipped: {}", e.what());
+      SIRIUS_LOG_INFO("[gpu_native_decode] falling back to CPU scan: {}", e.what());
     }
   }
 
-  // === Scan instrumentation counters ===
+  // === Scan instrumentation counters (CPU fallback path) ===
   double us_get_next_chunk = 0;
   double us_chunk_fits     = 0;
   double us_flatten        = 0;
@@ -880,15 +940,16 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   size_t dict_vectors_flattened = 0;
   size_t dict_varchar_vectors_flattened = 0;
   size_t chunk_fits_skipped = 0;
+  bool used_direct_scan = false;
 
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
                             g_state._op.scanned_types);
 
-  // Enter the scan loop to accumulate a data batch
+  // Enter the scan loop to accumulate a data batch (skip if direct scan already filled)
   bool chunk_available = false;
-  {
+  if (!used_direct_scan) {
     scoped_timer t(us_get_next_chunk);
     chunk_available = get_next_chunk(l_state, g_state);
   }
