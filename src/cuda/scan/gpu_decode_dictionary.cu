@@ -91,6 +91,19 @@ __global__ void kernel_gather_strings(
 // Host-side API
 //===----------------------------------------------------------------------===//
 
+/// Tiny kernel: write d_offsets[row_count] = d_offsets[row_count-1] + d_lengths[row_count-1].
+/// This sets the sentinel value needed by cuDF string columns, entirely on GPU.
+__global__ void kernel_write_offset_sentinel(
+    const uint32_t* __restrict__ d_prefix_offsets,  // Prefix-summed offsets (uint32)
+    const uint32_t* __restrict__ d_lengths,
+    uint32_t* __restrict__ d_sentinel_slot,          // &d_offsets[row_count] as uint32
+    uint32_t row_count)
+{
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    d_sentinel_slot[0] = d_prefix_offsets[row_count - 1] + d_lengths[row_count - 1];
+  }
+}
+
 void gpu_decode_dictionary(
     const uint8_t* segment_data,
     size_t segment_size,
@@ -101,7 +114,9 @@ void gpu_decode_dictionary(
     uint8_t** d_chars_out,
     size_t* total_chars_out,
     rmm::cuda_stream_view stream,
-    void* d_scratch)
+    void* d_scratch,
+    uint32_t max_string_length,
+    uint8_t* d_chars_preallocated)
 {
   const uint8_t* base = segment_data + block_offset;
 
@@ -124,9 +139,9 @@ void gpu_decode_dictionary(
   uint32_t dict_end_offset = block_offset + header.dict_end;
 
   SIRIUS_LOG_DEBUG(
-      "[gpu_decode] dict: rows={}, dict_size={}, dict_end={}, idx_count={}, width={}",
+      "[gpu_decode] dict: rows={}, dict_size={}, dict_end={}, idx_count={}, width={}, max_str_len={}",
       row_count, header.dict_size, header.dict_end,
-      header.index_buffer_count, header.bitpacking_width);
+      header.index_buffer_count, header.bitpacking_width, max_string_length);
 
   // 1. Copy the entire segment block to GPU — use scratch buffer if provided
   uint8_t* d_segment = nullptr;
@@ -174,41 +189,175 @@ void gpu_decode_dictionary(
       d_lengths, reinterpret_cast<uint32_t*>(d_offsets),
       row_count, stream.value());
 
-  // Read total_chars = last_offset + last_length. Requires sync since we need the
-  // value to allocate the char buffer. This is the one unavoidable sync per segment.
-  cudaStreamSynchronize(stream.value());
-
-  uint32_t last_offset = 0, last_length = 0;
-  cudaMemcpy(&last_offset, reinterpret_cast<uint32_t*>(d_offsets) + row_count - 1,
-             sizeof(uint32_t), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&last_length, d_lengths + row_count - 1,
-             sizeof(uint32_t), cudaMemcpyDeviceToHost);
-  uint32_t total_chars = last_offset + last_length;
-
-  // Set sentinel: d_offsets[row_count] = total_chars
-  cudaMemcpyAsync(reinterpret_cast<uint32_t*>(d_offsets) + row_count,
-                  &total_chars, sizeof(uint32_t),
-                  cudaMemcpyHostToDevice, stream.value());
-
-  *total_chars_out = total_chars;
-
-  // 6. Allocate char buffer and gather strings
+  // 6. Allocate char buffer and gather strings.
+  // When max_string_length is known from segment stats, we can allocate an
+  // upper-bound buffer (row_count * max_string_length) without any GPU sync.
+  // The sentinel offset is written by a tiny GPU kernel instead of host readback.
   uint8_t* d_chars = nullptr;
-  if (total_chars > 0) {
-    cudaMallocAsync(&d_chars, total_chars, stream.value());
+
+  if (max_string_length > 0) {
+    // FAST PATH: no sync needed — use upper-bound allocation or caller buffer
+    size_t upper_bound_chars = static_cast<size_t>(row_count) * max_string_length;
+
+    if (d_chars_preallocated) {
+      d_chars = d_chars_preallocated;
+    } else {
+      cudaMallocAsync(&d_chars, upper_bound_chars, stream.value());
+    }
 
     const uint8_t* d_dict_end_ptr = d_segment + dict_end_offset;
     kernel_gather_strings<<<blocks, THREADS, 0, stream.value()>>>(
         d_indices, d_idx_buf, d_dict_end_ptr,
         d_offsets, d_chars, row_count);
+
+    // Write sentinel d_offsets[row_count] on GPU — no host readback
+    kernel_write_offset_sentinel<<<1, 1, 0, stream.value()>>>(
+        reinterpret_cast<uint32_t*>(d_offsets), d_lengths,
+        reinterpret_cast<uint32_t*>(d_offsets) + row_count, row_count);
+
+    *total_chars_out = upper_bound_chars;
+  } else {
+    // FALLBACK: sync to read exact total_chars for allocation
+    cudaStreamSynchronize(stream.value());
+
+    uint32_t last_offset = 0, last_length = 0;
+    cudaMemcpy(&last_offset, reinterpret_cast<uint32_t*>(d_offsets) + row_count - 1,
+               sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&last_length, d_lengths + row_count - 1,
+               sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    uint32_t total_chars = last_offset + last_length;
+
+    cudaMemcpyAsync(reinterpret_cast<uint32_t*>(d_offsets) + row_count,
+                    &total_chars, sizeof(uint32_t),
+                    cudaMemcpyHostToDevice, stream.value());
+
+    *total_chars_out = total_chars;
+
+    if (total_chars > 0) {
+      cudaMallocAsync(&d_chars, total_chars, stream.value());
+
+      const uint8_t* d_dict_end_ptr = d_segment + dict_end_offset;
+      kernel_gather_strings<<<blocks, THREADS, 0, stream.value()>>>(
+          d_indices, d_idx_buf, d_dict_end_ptr,
+          d_offsets, d_chars, row_count);
+    }
   }
 
-  *d_chars_out = d_chars;
+  // When using preallocated buffer, don't return it (caller owns it).
+  *d_chars_out = d_chars_preallocated ? nullptr : d_chars;
 
   // Cleanup temp buffers (async — caller syncs the stream)
   cudaFreeAsync(d_indices, stream.value());
   cudaFreeAsync(d_lengths, stream.value());
   cudaFreeAsync(d_cub_temp, stream.value());
+  if (own_segment) cudaFreeAsync(d_segment, stream.value());
+}
+
+//===----------------------------------------------------------------------===//
+// Uncompressed string segment decode
+//===----------------------------------------------------------------------===//
+// DuckDB uncompressed VARCHAR layout:
+//   [0..3]  dictionary_size (uint32)
+//   [4..7]  dictionary_end  (uint32)
+//   [8..]   duckdb_offsets[row_count] (int32 each, cumulative from dict_end)
+//   string data stored backwards from dict_end
+//
+// duckdb_offsets[i] is the cumulative byte position.
+// String i has length = abs(off[i]) - abs(off[i-1]), data at dict_end - abs(off[i]).
+
+/// Convert DuckDB backward-cumulative offsets to cudf forward offsets and gather chars.
+__global__ void kernel_uncompressed_string_decode(
+    const int32_t* __restrict__ d_duckdb_offsets,  // DuckDB offset array on GPU
+    const uint8_t* __restrict__ d_dict_end,        // Pointer to dict_end in GPU segment
+    int32_t* __restrict__ d_cudf_offsets,           // Output: cudf-style offsets
+    uint8_t* __restrict__ d_chars,                  // Output: char buffer
+    uint32_t num_rows)
+{
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_rows) return;
+
+  int32_t cur_off = d_duckdb_offsets[tid];
+  int32_t prev_off = (tid > 0) ? d_duckdb_offsets[tid - 1] : 0;
+
+  // Absolute values (negative = overflow string, not handled on GPU)
+  uint32_t abs_cur  = static_cast<uint32_t>(cur_off >= 0 ? cur_off : -cur_off);
+  uint32_t abs_prev = static_cast<uint32_t>(prev_off >= 0 ? prev_off : -prev_off);
+  uint32_t str_len = abs_cur - abs_prev;
+
+  // cudf offset for this row = sum of all previous string lengths = abs(off[tid-1])
+  // (This is the EXCLUSIVE prefix sum: offset[0]=0, offset[i]=abs(off[i-1]))
+  d_cudf_offsets[tid] = static_cast<int32_t>(abs_prev);
+
+  // Gather string bytes from dictionary (stored backwards from dict_end)
+  const uint8_t* str_ptr = d_dict_end - abs_cur;
+  int32_t out_pos = static_cast<int32_t>(abs_prev);
+  for (uint32_t b = 0; b < str_len; ++b) {
+    d_chars[out_pos + b] = str_ptr[b];
+  }
+}
+
+/// Write sentinel offset[row_count] = abs(duckdb_offset[row_count-1]).
+__global__ void kernel_uncompressed_write_sentinel(
+    const int32_t* __restrict__ d_duckdb_offsets,
+    int32_t* __restrict__ d_cudf_offsets,
+    uint32_t row_count)
+{
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    int32_t last = d_duckdb_offsets[row_count - 1];
+    d_cudf_offsets[row_count] = (last >= 0) ? last : -last;
+  }
+}
+
+void gpu_decode_uncompressed_string(
+    const uint8_t* segment_data,
+    size_t segment_size,
+    uint32_t block_offset,
+    uint32_t row_count,
+    int32_t* d_offsets,
+    uint8_t* d_chars,
+    rmm::cuda_stream_view stream,
+    void* d_scratch)
+{
+  const uint8_t* base = segment_data + block_offset;
+
+  // Parse header on host
+  uint32_t dict_size, dict_end;
+  std::memcpy(&dict_size, base, sizeof(uint32_t));
+  std::memcpy(&dict_end, base + 4, sizeof(uint32_t));
+
+  SIRIUS_LOG_DEBUG(
+      "[gpu_decode] uncompressed string: rows={}, dict_size={}, dict_end={}",
+      row_count, dict_size, dict_end);
+
+  // Copy the segment block to GPU
+  uint8_t* d_segment = nullptr;
+  bool own_segment = false;
+  if (d_scratch) {
+    d_segment = static_cast<uint8_t*>(d_scratch);
+  } else {
+    cudaMallocAsync(&d_segment, segment_size, stream.value());
+    own_segment = true;
+  }
+  cudaMemcpyAsync(d_segment, segment_data, segment_size,
+                  cudaMemcpyHostToDevice, stream.value());
+
+  // DuckDB offsets start at byte 8 within the segment
+  const int32_t* d_duckdb_offsets =
+      reinterpret_cast<const int32_t*>(d_segment + block_offset + 8);
+  const uint8_t* d_dict_end_ptr = d_segment + block_offset + dict_end;
+
+  constexpr uint32_t THREADS = 256;
+  uint32_t blocks = (row_count + THREADS - 1) / THREADS;
+
+  // Single kernel: convert offsets + gather chars
+  kernel_uncompressed_string_decode<<<blocks, THREADS, 0, stream.value()>>>(
+      d_duckdb_offsets, d_dict_end_ptr,
+      d_offsets, d_chars, row_count);
+
+  // Write sentinel
+  kernel_uncompressed_write_sentinel<<<1, 1, 0, stream.value()>>>(
+      d_duckdb_offsets, d_offsets, row_count);
+
   if (own_segment) cudaFreeAsync(d_segment, stream.value());
 }
 

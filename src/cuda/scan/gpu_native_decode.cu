@@ -322,6 +322,19 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
 // String column decode
 //===----------------------------------------------------------------------===//
 
+/// Kernel to add a constant offset to a range of int32 values.
+/// Used to adjust per-segment offsets to global positions in the concat buffer.
+__global__ void kernel_adjust_offsets(
+    int32_t* __restrict__ d_offsets,
+    int32_t adjustment,
+    uint32_t count)
+{
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < count) {
+    d_offsets[tid] += adjustment;
+  }
+}
+
 std::unique_ptr<cudf::column> decode_string_column(
     column_scan_result& col_scan,
     rmm::cuda_stream_view stream,
@@ -333,59 +346,97 @@ std::unique_ptr<cudf::column> decode_string_column(
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
 
-  // Check all segments are GPU-decodable for strings
+  // Validate all segments and check if GPU concat path is available
+  // (requires max_string_length on every dictionary segment)
+  bool can_gpu_concat = true;
   for (auto const& seg : col_scan.data.segments) {
-    if (!seg.persistent || !seg.data_ptr) continue;
+    if (!seg.persistent || !seg.data_ptr || seg.row_count == 0) continue;
     if (!is_gpu_decodable_string(seg.compression)) {
       throw std::runtime_error(
           "gpu_native_decode: unsupported string compression " +
           std::to_string(static_cast<int>(seg.compression)) +
           " — falling back to CPU scan");
     }
+    if ((seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY
+         || seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED)
+        && seg.max_string_length == 0) {
+      can_gpu_concat = false;
+    }
   }
 
-  // For string columns, we decode each segment separately (each produces offsets + chars),
-  // then concatenate the results. For now, we handle the single-segment and common cases.
+  if (!can_gpu_concat) {
+    throw std::runtime_error(
+        "gpu_native_decode: dictionary segment missing max_string_length stats "
+        "— falling back to CPU scan");
+  }
 
-  // Collect per-segment decoded strings
-  struct segment_strings {
-    rmm::device_uvector<int32_t> offsets;
-    uint8_t* d_chars;       // owned via cudaMalloc, caller frees
-    size_t total_chars;
-    size_t row_count;
-    segment_strings(rmm::cuda_stream_view s, rmm::device_async_resource_ref m)
-        : offsets(0, s, m), d_chars(nullptr), total_chars(0), row_count(0) {}
+  //===----------------------------------------------------------------------===//
+  // GPU CONCAT PATH: decode all segments directly into final buffers.
+  // No D2H, no host merge, no H2D re-upload for string data.
+  //===----------------------------------------------------------------------===//
+
+  // Phase 1: Compute per-segment layout on host
+  struct seg_layout {
+    size_t row_start;       // first row index in the final column
+    size_t char_start;      // byte offset in the final chars buffer
+    size_t char_capacity;   // row_count * max_string_length (upper bound)
   };
+  std::vector<seg_layout> layouts;
+  layouts.reserve(col_scan.data.segments.size());
 
-  std::vector<segment_strings> seg_results;
-  size_t grand_total_chars = 0;
+  size_t cum_rows = 0, cum_chars = 0;
+  for (auto const& seg : col_scan.data.segments) {
+    seg_layout l;
+    l.row_start = cum_rows;
+    l.char_start = cum_chars;
+    if (seg.row_count > 0 && seg.persistent && seg.data_ptr
+        && (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY
+            || seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED)) {
+      l.char_capacity = static_cast<size_t>(seg.row_count) * seg.max_string_length;
+    } else {
+      l.char_capacity = 0;
+    }
+    layouts.push_back(l);
+    cum_rows += seg.row_count;
+    cum_chars += l.char_capacity;
+  }
+  size_t total_chars_upper = cum_chars;
 
-  for (auto& seg : col_scan.data.segments) {
+  // Phase 2: Allocate final buffers on GPU (one alloc each)
+  rmm::device_uvector<int32_t> d_offsets(total_rows + 1, stream, mr);
+  rmm::device_buffer d_chars(total_chars_upper > 0 ? total_chars_upper : 1, stream, mr);
+  auto* d_chars_base = static_cast<uint8_t*>(d_chars.data());
+
+  // Phase 3: Decode each segment directly into its slice of the final buffers
+  constexpr uint32_t ADJ_THREADS = 256;
+
+  for (size_t si = 0; si < col_scan.data.segments.size(); ++si) {
+    auto& seg = col_scan.data.segments[si];
+    auto& layout = layouts[si];
     if (seg.row_count == 0) continue;
 
-    segment_strings result(stream, mr);
-    result.row_count = seg.row_count;
+    int32_t* d_seg_offsets = d_offsets.data() + layout.row_start;
 
-    if (!seg.persistent || !seg.data_ptr) {
-      // Non-persistent segment: produce empty strings
-      result.offsets = rmm::device_uvector<int32_t>(seg.row_count + 1, stream, mr);
-      cudaMemsetAsync(result.offsets.data(), 0,
+    if (!seg.persistent || !seg.data_ptr
+        || seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+      // Empty / constant: zero offsets for this segment
+      cudaMemsetAsync(d_seg_offsets, 0,
                       (seg.row_count + 1) * sizeof(int32_t), stream.value());
-      result.d_chars = nullptr;
-      result.total_chars = 0;
-    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
-      // Constant string: all rows have the same value
-      // For constant segments, the data_ptr points to the constant value
-      // We produce empty strings for now (constant string segments are rare)
-      result.offsets = rmm::device_uvector<int32_t>(seg.row_count + 1, stream, mr);
-      cudaMemsetAsync(result.offsets.data(), 0,
-                      (seg.row_count + 1) * sizeof(int32_t), stream.value());
-      result.d_chars = nullptr;
-      result.total_chars = 0;
-    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY) {
-      // GPU dictionary decode
+    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
       const uint8_t* block_base = seg.data_ptr - seg.block_offset;
-      result.offsets = rmm::device_uvector<int32_t>(seg.row_count + 1, stream, mr);
+      uint8_t* d_seg_chars = d_chars_base + layout.char_start;
+
+      gpu_decode_uncompressed_string(
+          block_base, DUCKDB_BLOCK_SIZE,
+          static_cast<uint32_t>(seg.block_offset),
+          static_cast<uint32_t>(seg.row_count),
+          d_seg_offsets,
+          d_seg_chars,
+          stream,
+          d_scratch);
+    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY) {
+      const uint8_t* block_base = seg.data_ptr - seg.block_offset;
+      uint8_t* d_seg_chars = d_chars_base + layout.char_start;
 
       uint8_t* d_chars_out = nullptr;
       size_t total_chars_out = 0;
@@ -395,77 +446,41 @@ std::unique_ptr<cudf::column> decode_string_column(
           static_cast<uint32_t>(seg.block_offset),
           static_cast<uint32_t>(DUCKDB_BLOCK_SIZE),
           static_cast<uint32_t>(seg.row_count),
-          result.offsets.data(),
+          d_seg_offsets,
           &d_chars_out,
           &total_chars_out,
           stream,
-          d_scratch);
-
-      result.d_chars = d_chars_out;
-      result.total_chars = total_chars_out;
-    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
-      // Uncompressed strings — DuckDB stores as dictionary format (offsets + data)
-      // This is the same layout as dictionary but without bitpacked indices
-      // For now, throw to fall back — uncompressed strings have a complex layout
-      throw std::runtime_error(
-          "gpu_native_decode: uncompressed string segments not yet supported "
-          "— falling back to CPU scan");
+          d_scratch,
+          seg.max_string_length,
+          d_seg_chars);  // pre-allocated: write chars here
     }
 
-    grand_total_chars += result.total_chars;
-    seg_results.push_back(std::move(result));
+    // Adjust this segment's offsets by adding the char slice start.
+    // For the last segment, also adjust the sentinel at d_offsets[total_rows].
+    if (layout.char_start > 0) {
+      bool is_last = (layout.row_start + seg.row_count >= total_rows);
+      uint32_t adj_count = static_cast<uint32_t>(seg.row_count) + (is_last ? 1 : 0);
+      uint32_t adj_blocks = (adj_count + ADJ_THREADS - 1) / ADJ_THREADS;
+      kernel_adjust_offsets<<<adj_blocks, ADJ_THREADS, 0, stream.value()>>>(
+          d_seg_offsets,
+          static_cast<int32_t>(layout.char_start),
+          adj_count);
+    }
   }
 
-  // Merge segments into a single offsets + chars pair on host, then upload
+  // Phase 4: Single sync — all GPU work is done
   stream.synchronize();
-  rmm::device_uvector<int64_t> final_offsets(total_rows + 1, stream, mr);
-  rmm::device_buffer final_chars(grand_total_chars, stream, mr);
 
-  std::vector<int64_t> h_offsets(total_rows + 1);
-  std::vector<uint8_t> h_chars(grand_total_chars);
-  int64_t char_offset = 0;
-  size_t row_pos = 0;
+  // Read the sentinel to get the actual total chars (for logging)
+  int32_t actual_total_chars = 0;
+  cudaMemcpy(&actual_total_chars, d_offsets.data() + total_rows,
+             sizeof(int32_t), cudaMemcpyDeviceToHost);
 
-  for (auto& seg_res : seg_results) {
-    if (seg_res.row_count == 0) continue;
-
-    // Download segment offsets
-    std::vector<int32_t> seg_offsets(seg_res.row_count + 1);
-    cudaMemcpy(seg_offsets.data(), seg_res.offsets.data(),
-               (seg_res.row_count + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost);
-
-    // Download segment chars
-    if (seg_res.total_chars > 0 && seg_res.d_chars) {
-      cudaMemcpy(h_chars.data() + char_offset, seg_res.d_chars,
-                 seg_res.total_chars, cudaMemcpyDeviceToHost);
-    }
-
-    // Adjust offsets to be global
-    for (size_t r = 0; r < seg_res.row_count; ++r) {
-      h_offsets[row_pos + r] = char_offset + seg_offsets[r];
-    }
-    char_offset += seg_offsets[seg_res.row_count];
-
-    // Free segment chars
-    if (seg_res.d_chars) { cudaFreeAsync(seg_res.d_chars, stream.value()); }
-
-    row_pos += seg_res.row_count;
-  }
-  h_offsets[total_rows] = char_offset;
-
-  // Upload final merged offsets and chars
-  cudaMemcpyAsync(final_offsets.data(), h_offsets.data(),
-                  (total_rows + 1) * sizeof(int64_t), cudaMemcpyHostToDevice, stream.value());
-  if (grand_total_chars > 0) {
-    cudaMemcpyAsync(final_chars.data(), h_chars.data(),
-                    grand_total_chars, cudaMemcpyHostToDevice, stream.value());
-  }
-
-  // Build offsets column
+  // Build offsets column (int32 — sufficient for per-column data)
   auto offsets_col = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::INT64},
+      cudf::data_type{cudf::type_id::INT32},
       static_cast<cudf::size_type>(total_rows + 1),
-      final_offsets.release(),
+      d_offsets.release(),
       rmm::device_buffer{0, stream, mr},
       0);
 
@@ -520,13 +535,15 @@ std::unique_ptr<cudf::column> decode_string_column(
     null_count = static_cast<cudf::size_type>(total_rows - valid_count);
   }
 
-  SIRIUS_LOG_INFO("[gpu_native_decode] string col: {} rows, {} chars, {} segs",
-                  total_rows, grand_total_chars, seg_results.size());
+  SIRIUS_LOG_INFO("[gpu_native_decode] string col: {} rows, {} actual chars "
+                  "({} upper), {} segs, gpu_concat=true",
+                  total_rows, actual_total_chars, total_chars_upper,
+                  col_scan.data.segments.size());
 
   return cudf::make_strings_column(
       static_cast<cudf::size_type>(total_rows),
       std::move(offsets_col),
-      std::move(final_chars),
+      std::move(d_chars),
       null_count,
       std::move(null_mask));
 }

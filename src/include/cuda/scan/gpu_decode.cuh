@@ -94,19 +94,26 @@ struct dict_decode_result {
 
 /// @brief Decode a dictionary-compressed string segment on GPU.
 ///
-/// Has one mid-stream sync to read total_chars for char buffer allocation.
-/// Otherwise async — caller must sync the stream.
+/// When max_string_length > 0, runs fully async — no mid-stream sync.
+/// When max_string_length == 0, falls back to a mid-stream sync to read
+/// the exact total_chars for allocation.
 ///
-/// @param segment_data   Host pointer to pinned segment block data
-/// @param segment_size   Size of segment data in bytes
-/// @param block_offset   Offset within the block to the segment start
-/// @param block_size     Total block size (usually 262144 = 256KB)
-/// @param row_count      Total rows in the segment
-/// @param d_offsets      Pre-allocated device buffer ((row_count+1) * sizeof(int32_t))
-/// @param d_chars_out    Output: device pointer to allocated char buffer (caller must free)
-/// @param total_chars_out Output: total bytes in char buffer
-/// @param stream         CUDA stream
-/// @param d_scratch      Optional pre-allocated device buffer (>= segment_size bytes).
+/// @param segment_data       Host pointer to pinned segment block data
+/// @param segment_size       Size of segment data in bytes
+/// @param block_offset       Offset within the block to the segment start
+/// @param block_size         Total block size (usually 262144 = 256KB)
+/// @param row_count          Total rows in the segment
+/// @param d_offsets          Pre-allocated device buffer ((row_count+1) * sizeof(int32_t))
+/// @param d_chars_out        Output: device pointer to allocated char buffer (caller must free).
+///                           Set to nullptr when d_chars_preallocated is used.
+/// @param total_chars_out    Output: total bytes in char buffer (only valid after stream sync)
+/// @param stream             CUDA stream
+/// @param d_scratch          Optional pre-allocated device buffer (>= segment_size bytes).
+/// @param max_string_length  Upper bound on any single string length from segment stats.
+///                           0 means unknown (falls back to sync path).
+/// @param d_chars_preallocated  Optional pre-allocated char output buffer. When non-null,
+///                              chars are written here instead of internally allocated.
+///                              Caller owns the buffer. *d_chars_out is set to nullptr.
 void gpu_decode_dictionary(
     const uint8_t* segment_data,
     size_t segment_size,
@@ -116,6 +123,40 @@ void gpu_decode_dictionary(
     int32_t* d_offsets,
     uint8_t** d_chars_out,
     size_t* total_chars_out,
+    rmm::cuda_stream_view stream,
+    void* d_scratch = nullptr,
+    uint32_t max_string_length = 0,
+    uint8_t* d_chars_preallocated = nullptr);
+
+//===----------------------------------------------------------------------===//
+// Host-side API: decode an uncompressed string segment on GPU
+//===----------------------------------------------------------------------===//
+
+/// @brief Decode an uncompressed string segment on GPU.
+///
+/// DuckDB uncompressed VARCHAR layout:
+///   [0..3]  dictionary_size (uint32)
+///   [4..7]  dictionary_end  (uint32)
+///   [8..]   offsets[row_count] (int32, cumulative from dict_end backwards)
+///   string data at (dict_end - offset[i])
+///
+/// Fully async — caller must sync the stream.
+///
+/// @param segment_data       Host pointer to pinned segment block data
+/// @param segment_size       Size of segment data in bytes
+/// @param block_offset       Offset within the block to the segment start
+/// @param row_count          Total rows in the segment
+/// @param d_offsets          Pre-allocated device buffer ((row_count+1) * sizeof(int32_t))
+/// @param d_chars            Pre-allocated device char output buffer
+/// @param stream             CUDA stream
+/// @param d_scratch          Optional pre-allocated device buffer (>= segment_size bytes)
+void gpu_decode_uncompressed_string(
+    const uint8_t* segment_data,
+    size_t segment_size,
+    uint32_t block_offset,
+    uint32_t row_count,
+    int32_t* d_offsets,
+    uint8_t* d_chars,
     rmm::cuda_stream_view stream,
     void* d_scratch = nullptr);
 

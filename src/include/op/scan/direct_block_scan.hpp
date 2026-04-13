@@ -28,6 +28,7 @@ struct direct_block_scan_result {
     duckdb::block_id_t block_id = -1;
     bool persistent             = false;
     duckdb::CompressionType compression = duckdb::CompressionType::COMPRESSION_AUTO;
+    uint32_t max_string_length  = 0;   // From segment stats (VARCHAR only, 0 = unknown)
   };
 
   std::vector<segment_info> segments;

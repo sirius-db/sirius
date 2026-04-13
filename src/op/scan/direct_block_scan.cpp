@@ -19,6 +19,7 @@
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
+#include <duckdb/storage/statistics/string_stats.hpp>
 
 #include <chrono>
 
@@ -173,6 +174,11 @@ direct_block_scan_result scan_segment_tree(
       seg_info.persistent   = true;
       seg_info.compression  = segment.GetCompressionType();
       result.total_pinned_bytes += segment.SegmentSize();
+
+      // Extract max_string_length from segment stats (VARCHAR columns only)
+      if (duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+        seg_info.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+      }
     } else {
       seg_info.data_ptr   = nullptr;
       seg_info.persistent = false;
