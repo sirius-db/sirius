@@ -75,12 +75,13 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
 }
 )***";
 
-  return cudf::transform({input},
-                         udf,
-                         cudf::data_type{cudf::type_id::STRING},
-                         false,
-                         std::nullopt,
-                         cudf::null_aware::YES);
+  cudf::transform_input ti = input;
+  return cudf::transform_extended(std::span(&ti, 1),
+                                  udf,
+                                  cudf::data_type{cudf::type_id::STRING},
+                                  cudf::udf_source_type::CUDA,
+                                  std::nullopt,
+                                  cudf::null_aware::YES);
 }
 
 }  // namespace expression
