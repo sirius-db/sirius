@@ -40,10 +40,9 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_data_batches();
 
-  // duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
   sirius::experimental::gpu_expression_executor gpu_expression_executor(
     select_list,
-    sirius::experimental::expression_executor_strategy::MATERIALIZE,
+    sirius::experimental::expression_executor_strategy::AST_INTERPRET,
     cudf::get_current_device_resource_ref(),
     stream);
 

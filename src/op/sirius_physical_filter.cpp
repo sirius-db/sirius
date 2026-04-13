@@ -54,10 +54,9 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   const auto& input_batches = input.get_data_batches();
 
   // The executor uses the data_batch API to filter rows according to `expression`.
-  // duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
   sirius::experimental::gpu_expression_executor gpu_expression_executor(
     expression.get(),
-    sirius::experimental::expression_executor_strategy::MATERIALIZE,
+    sirius::experimental::expression_executor_strategy::AST_INTERPRET,
     cudf::get_current_device_resource_ref(),
     stream);
 
