@@ -53,6 +53,27 @@ Sequential scan using DuckDB's execution engine. Accumulates chunks into fixed-s
 
 Direct Parquet file scan. Reads column-chunk byte ranges and optionally materializes (decompresses) to table format. Tracks `has_more_partitions` atomic flag. Row groups are partitioned by `approximate_batch_size`.
 
+### `sirius_physical_iceberg_scan` — `ICEBERG_SCAN`
+**File:** `src/include/op/sirius_physical_iceberg_scan.hpp`
+
+Apache Iceberg table scan with GPU-accelerated delete filters. Inherits from `sirius_physical_parquet_scan` since Iceberg uses Parquet as the data layer. Supports Iceberg V1 (append-only) and V2 (positional and equality deletes).
+
+- **Delete filter pipeline:** Composes `positional_delete_filter` (sorted row position binary search) and `equality_delete_filter` (GPU `cudf::distinct_hash_join` anti-join mask) to apply deletes entirely on GPU with no D2H copies
+- **Metadata:** Custom `iceberg_metadata_reader` with lightweight Avro parser for manifest-list and manifest files
+- **Key members:** `positional_delete_files`, `equality_delete_files`
+
+See [Scan — Iceberg Scan](scan.md#iceberg-scan) for details.
+
+### `sirius_parquet_metadata_scan_operator` — `PARQUET_METADATA_SCAN`
+**File:** `src/include/op/scan/sirius_parquet_metadata_scan_operator.hpp`
+
+First pipeline operator in the two-pipeline Parquet scan architecture. Parses Parquet footers for up to 8 files per task, attempts cuDF AST filter translation, and emits `partitioned_parquet_metadata` containing reader options, file metadata, and row-group partitions. See [Scan — Two-Pipeline Metadata Scan](scan.md#two-pipeline-metadata-scan).
+
+### `sirius_gpu_parquet_scan_operator` — `GPU_PARQUET_SCAN`
+**File:** `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp`
+
+Second pipeline operator in the two-pipeline Parquet scan architecture. Acts as sink of Pipeline 1 (accumulating metadata from `PARQUET_METADATA_SCAN`) and source of Pipeline 2 (serving `parquet_scan_data` tasks that call `cudf::io::read_parquet`). See [Scan — Two-Pipeline Metadata Scan](scan.md#two-pipeline-metadata-scan).
+
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
 
@@ -103,8 +124,20 @@ Three execution modes:
 | Mode | When Used | cuDF API |
 |------|-----------|----------|
 | `STANDARD` | Default, multi-partition Cartesian product | `cudf::inner_join()`, `cudf::left_join()`, etc. |
-| `BUILD_PROBE` | Small build side (< `max_build_hash_table_bytes`, 1 partition) | `cudf::hash_join` (build once, probe many) |
+| `BUILD_PROBE` | Small build side (< `max_build_hash_table_bytes`, 1 partition) | `cudf::hash_join` or `cudf::distinct_hash_join` (build once, probe many) |
 | `MIXED_JOIN` | Equality + inequality conditions on disjoint columns | `cudf::mixed_join()` with cuDF AST |
+
+#### Distinct Hash Join Optimization
+In BUILD_PROBE mode, when the build-side keys are proven unique, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join`. This optimization applies when:
+- Join type is INNER or LEFT
+- Build-side keys are proven unique via logical plan analysis (`prove_unique_columns()` in `src/planner/sirius_plan_comparison_join.cpp`)
+
+Uniqueness is detected by walking the DuckDB logical plan:
+- **PRIMARY KEY** on `LogicalGet` (with column mapping through `projection_ids`)
+- **GROUP BY** uniqueness on `LogicalAggregate`
+- Propagates through `LogicalFilter`, `LogicalOrder`, `LogicalLimit`, `LogicalTopN`, and `LogicalProjection`
+
+Only PRIMARY KEY is considered (not plain UNIQUE) due to NULL handling semantics with `null_equality::UNEQUAL`. IS NOT DISTINCT FROM joins are excluded since they require `null_equality::EQUAL`.
 
 Build/probe state machine for BUILD_PROBE mode:
 ```mermaid
@@ -116,13 +149,15 @@ stateDiagram-v2
     BUILT --> DESTROYED
 ```
 
+When `get_next_task_hint()` is called after the operator is already finished, it returns `std::nullopt` (no new tasks needed).
+
 Key members:
 - `conditions` — join predicates (equality and inequality)
 - `join_type` — INNER, LEFT, RIGHT, OUTER
-- `_hash_table` — cached `cudf::hash_join` (BUILD_PROBE mode)
+- `_hash_table` — cached `cudf::hash_join` or `cudf::distinct_hash_join` (BUILD_PROBE mode)
 - `_build_table` — materialized build-side data batch
 - `key_casts` — type alignment info for hash key matching
-- `unique_build_keys` / `unique_probe_keys` — cardinality hints
+- `unique_build_keys` / `unique_probe_keys` — cardinality hints (used to select distinct vs standard hash join)
 
 Supported join types: INNER, LEFT, RIGHT, OUTER via `cudf::inner_join()`, `cudf::left_join()`, `cudf::full_outer_join()`.
 
@@ -142,9 +177,9 @@ Local sort of each data batch.
 ### `sirius_physical_top_n` — `TOP_N`
 **File:** `src/include/op/sirius_physical_top_n.hpp`
 
-Combined ORDER + LIMIT: sorts and returns only the top N rows.
+Combined ORDER + LIMIT: selects and sorts the top N rows.
 
-- **Key members:** `orders`, `limit`, `offset`, `dynamic_filter`
+- **GPU execution:** Two-step process: `cudf::top_k_order()` selects top-N row indices, then `cudf::sort_by_key()` sorts the gathered rows to ensure deterministic output ordering- **Key members:** `orders`, `limit`, `offset`, `dynamic_filter`
 
 ### `sirius_physical_ungrouped_aggregate` — `UNGROUPED_AGGREGATE`
 **File:** `src/include/op/sirius_physical_ungrouped_aggregate.hpp`
@@ -153,6 +188,8 @@ Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 
 - **GPU execution:** `gpu_aggregate_impl::local_ungrouped_aggregate()` using `cudf::reduce()`
 - **Supported:** MIN, MAX, SUM, COUNT_ALL, COUNT_VALID
+- **DECIMAL overflow handling:** DECIMAL SUM casts to a wider type before reduction — DECIMAL32→DECIMAL64, DECIMAL64→DECIMAL128 — to prevent overflow
+- **BIGINT SUM fallback:** BIGINT (INT64) SUM falls back to CPU execution because GPU lacks INT128 accumulator support. Without this, silent overflow produces incorrect results. BIGINT arithmetic operations (ADD, SUB, MUL) also fall back to CPU for the same reason.
 
 ### `sirius_physical_grouped_aggregate` — `HASH_GROUP_BY`
 **File:** `src/include/op/sirius_physical_grouped_aggregate.hpp`
@@ -267,6 +304,9 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 |----------|----------|-----------|
 | DUCKDB_SCAN | Scan | DuckDB table function |
 | PARQUET_SCAN | Scan | Direct Parquet reading |
+| ICEBERG_SCAN | Scan | Parquet reading with Iceberg delete filters |
+| PARQUET_METADATA_SCAN | Scan | Parquet footer parsing + row group partitioning |
+| GPU_PARQUET_SCAN | Scan | Parquet byte reading from metadata |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `GpuExpressionExecutor::select()` |
@@ -281,7 +321,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | HASH_GROUP_BY | Agg | `gpu_aggregate_impl::local_grouped_aggregate()` |
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
-| HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()` |
+| HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()` or `cudf::distinct_hash_join` |
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |

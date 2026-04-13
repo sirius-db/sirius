@@ -151,14 +151,19 @@ The event loop bridges task creation (which pushes to `_task_queue`) with GPU ex
 
 One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for executing GPU pipeline tasks.
 
+### Executor Class Hierarchy
+
+All executors (`gpu_pipeline_executor`, `downgrade_executor`, `duckdb_scan_executor`) inherit from `itask_executor`, which provides shared infrastructure: thread pool, task queue, `_running` flag, and `start/stop/schedule/drain_and_wait` lifecycle methods. Subclasses implement `manager_loop()` (required) and optional hooks `get_per_thread_init`, `on_start`, `on_stop`.
+
+Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `reserve() -> pool.dispatch(slot, fn)` model with RAII slot release.
+
 ### Components
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `_thread_pool` | `exec::thread_pool` | Worker threads (default: 4), each pinned to GPU device |
+| `_thread_pool` | `exec::bounded_thread_pool` | Worker threads (default: 4), each pinned to GPU device, with slot-based concurrency control |
 | `_task_queue` | `interruptible_mpmc<itask>` | Thread-safe queue for incoming tasks |
 | `_manager_thread` | `std::thread` | Runs `manager_loop()` |
-| `_kiosk` | `exec::kiosk` | Ticket-based semaphore limiting concurrency |
 | `_stream_pool` | `exclusive_stream_pool` | Pool of CUDA streams, one per worker |
 | `_memory_space` | `memory_space*` | GPU memory for making reservations |
 | `_task_request_publisher` | `publisher<task_request>` | Channel to signal pipeline executor |
@@ -169,13 +174,13 @@ One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for 
 
 ```
 while running:
-    1. kiosk.acquire()                    -- block until a worker is free
+    1. thread_pool.reserve()              -- block until a worker slot is available (RAII)
     2. task_request_publisher.send()      -- tell pipeline executor we can accept work
     3. task_queue.pop()                   -- block until a task is available
     4. memory_space.make_reservation()    -- reserve GPU memory for the task
     5. task.set_reservation(reservation)  -- attach reservation to task
     6. stream_pool.acquire_stream()       -- get a CUDA stream
-    7. thread_pool.schedule(lambda):      -- dispatch to worker
+    7. thread_pool.dispatch(slot, lambda): -- dispatch to worker (slot released on completion)
          a. task.execute(stream)
          b. On OOM: retry (see below)
          c. On success: check query completion
@@ -268,3 +273,5 @@ This ensures that when `drain_after_error()` returns, no tasks are referencing o
 | `src/include/pipeline/sirius_pipeline.hpp` | Pipeline structure |
 | `src/include/pipeline/sirius_pipeline_itask.hpp` | Task interface |
 | `src/include/pipeline/task_request.hpp` | Executor↔pipeline request |
+| `src/include/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
+| `src/include/parallel/task_executor.hpp` | `itask_executor` base class for all executors |

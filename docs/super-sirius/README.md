@@ -45,4 +45,4 @@ Super Sirius is the new task-based GPU execution engine in Sirius, invoked via `
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
 
-<!-- last-updated-commit: 0e8333299ea85134d3072b8e36e76d5b9254b83c -->
+<!-- last-updated-commit: d40e8ce9d605d8c0a9118159bc34cf6c234e6abe -->
