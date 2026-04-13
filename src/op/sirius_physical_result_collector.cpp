@@ -32,7 +32,7 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // sirius exceptions
-#include <sirius/exception.hpp>
+#include "sirius/exception.hpp"
 
 // duckdb
 #include <duckdb/main/materialized_query_result.hpp>
@@ -123,7 +123,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
   if (input_batches.empty()) {
     return;  // todo(kevin) we should handle this case properly
-    throw invalid_input_exception("[GPUPhysicalMaterializedCollector] input_batches is null");
   }
 
   auto sink_single_batch = [this,
