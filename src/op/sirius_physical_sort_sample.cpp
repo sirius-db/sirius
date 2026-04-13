@@ -51,7 +51,9 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
 std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
 {
   // If boundaries already computed, use default behavior (process batches as they arrive)
-  if (_boundary_state.load(std::memory_order_acquire) == 2) { return sirius_physical_operator::get_next_task_hint(); }
+  if (_boundary_state.load(std::memory_order_acquire) == 2) {
+    return sirius_physical_operator::get_next_task_hint();
+  }
 
   // Need to wait for N batches before computing boundaries
   auto port_ids = get_port_ids();
@@ -115,6 +117,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     _boundary_state.store(2, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
+
+  // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
+  // reset state to NOT_STARTED so the rescheduled task can win the CAS and retry.
+  try {
 
   // 2. Concatenate all sample batches into one table
   std::vector<cudf::table_view> sample_views;
@@ -247,7 +253,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                          cudf::out_of_bounds_policy::DONT_CHECK,
                                          stream,
                                          space->get_default_allocator());
-    _num_partitions = num_parts;
+    _num_partitions       = num_parts;
   }
 
   // Pipeline framework calls stream.synchronize() after execute() returns, before
@@ -255,6 +261,13 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // so _partition_boundaries is fully materialized on the GPU before sort_partition
   // ever reads it. No explicit sync needed here.
   _boundary_state.store(2, std::memory_order_release);
+
+  } catch (...) {
+    // Reset to NOT_STARTED so the rescheduled task (or another in-flight task) can
+    // win the CAS election and retry boundary computation.
+    _boundary_state.store(0, std::memory_order_release);
+    throw;
+  }
 
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
