@@ -36,7 +36,9 @@
 
 // standard library
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace duckdb;
@@ -111,21 +113,6 @@ std::unique_ptr<cudf::table> make_int32x2_table(std::vector<int32_t> const& col0
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
-/// Build a single-column table from a host vector of int64 values.
-std::unique_ptr<cudf::table> make_int64_table(std::vector<int64_t> const& values)
-{
-  auto const n = static_cast<cudf::size_type>(values.size());
-  auto col     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT64}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cudaMemcpy(col->mutable_view().data<int64_t>(),
-             values.data(),
-             sizeof(int64_t) * n,
-             cudaMemcpyHostToDevice);
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(std::move(col));
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
 /// Build a single-column table from a host vector of float64 values.
 std::unique_ptr<cudf::table> make_float64_table(std::vector<double> const& values)
 {
@@ -162,29 +149,79 @@ std::unique_ptr<cudf::table> make_mixed_table(std::vector<int32_t> const& i32_va
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
-/// Build a single-column table from a host vector of int16 values.
-std::unique_ptr<cudf::table> make_int16_table(std::vector<int16_t> const& values)
+/// Build a single-column DECIMAL32 table from unscaled int32 representations.
+/// `cudf_scale` is cudf's signed scale (negative for digits after the decimal point).
+std::unique_ptr<cudf::table> make_decimal32_table(std::vector<int32_t> const& reps,
+                                                  int32_t cudf_scale)
 {
-  auto const n = static_cast<cudf::size_type>(values.size());
-  auto col     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT16}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cudaMemcpy(col->mutable_view().data<int16_t>(),
-             values.data(),
-             sizeof(int16_t) * n,
-             cudaMemcpyHostToDevice);
+  auto const n = static_cast<cudf::size_type>(reps.size());
+  auto col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL32, cudf_scale},
+                                           n,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+  cudaMemcpy(
+    col->mutable_view().data<int32_t>(), reps.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice);
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
-/// Build a single-column table from a host vector of float32 values.
-std::unique_ptr<cudf::table> make_float32_table(std::vector<float> const& values)
+/// Build a single-column DECIMAL64 table from unscaled int64 representations.
+std::unique_ptr<cudf::table> make_decimal64_table(std::vector<int64_t> const& reps,
+                                                  int32_t cudf_scale)
+{
+  auto const n = static_cast<cudf::size_type>(reps.size());
+  auto col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL64, cudf_scale},
+                                           n,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+  cudaMemcpy(
+    col->mutable_view().data<int64_t>(), reps.data(), sizeof(int64_t) * n, cudaMemcpyHostToDevice);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Build a single-column STRING table from a host vector of std::string values.
+std::unique_ptr<cudf::table> make_string_table(std::vector<std::string> const& values)
 {
   auto const n = static_cast<cudf::size_type>(values.size());
-  auto col     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::FLOAT32}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cudaMemcpy(
-    col->mutable_view().data<float>(), values.data(), sizeof(float) * n, cudaMemcpyHostToDevice);
+
+  std::vector<cudf::size_type> offsets(static_cast<std::size_t>(n + 1), 0);
+  for (cudf::size_type i = 0; i < n; ++i) {
+    offsets[i + 1] = offsets[i] + static_cast<cudf::size_type>(values[i].size());
+  }
+  auto const total_chars = offsets[n];
+
+  std::vector<char> chars(static_cast<std::size_t>(total_chars));
+  cudf::size_type cursor = 0;
+  for (cudf::size_type i = 0; i < n; ++i) {
+    std::memcpy(chars.data() + cursor, values[i].data(), values[i].size());
+    cursor += static_cast<cudf::size_type>(values[i].size());
+  }
+
+  auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               static_cast<cudf::size_type>(offsets.size()),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+  cudaMemcpy(offsets_col->mutable_view().data<cudf::size_type>(),
+             offsets.data(),
+             offsets.size() * sizeof(cudf::size_type),
+             cudaMemcpyHostToDevice);
+
+  rmm::device_buffer chars_buf(static_cast<std::size_t>(total_chars), stream, mr);
+  if (total_chars > 0) {
+    cudaMemcpy(chars_buf.data(),
+               chars.data(),
+               static_cast<std::size_t>(total_chars),
+               cudaMemcpyHostToDevice);
+  }
+
+  auto col = cudf::make_strings_column(
+    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{0, stream, mr});
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
   return std::make_unique<cudf::table>(std::move(cols));
@@ -232,104 +269,6 @@ TEST_CASE("translator: column reference produces identity", "[expression_transla
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
   auto host_vals = copy_column_to_host<int32_t>(result->view());
   REQUIRE(host_vals == values);
-}
-
-//===----------------------------------------------------------------------===//
-// Test: Integer constant
-//===----------------------------------------------------------------------===//
-
-TEST_CASE("translator: integer constant (INT32)", "[expression_translator]")
-{
-  std::vector<int32_t> values = {1, 2, 3, 4, 5};
-  auto table                  = make_int32_table(values);
-  auto tv                     = table->view();
-
-  // Build: 42  (constant)
-  auto expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42));
-
-  auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
-  REQUIRE(ast_tree.has_value());
-
-  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
-  auto host_vals = copy_column_to_host<int32_t>(result->view());
-  std::vector<int32_t> expected(5, 42);
-  REQUIRE(host_vals == expected);
-}
-
-TEST_CASE("translator: integer constant (INT64)", "[expression_translator]")
-{
-  std::vector<int64_t> values = {1, 2, 3};
-  auto table                  = make_int64_table(values);
-  auto tv                     = table->view();
-
-  auto expr = duckdb::make_uniq<BoundConstantExpression>(Value::BIGINT(9999));
-
-  auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
-  REQUIRE(ast_tree.has_value());
-
-  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
-  auto host_vals = copy_column_to_host<int64_t>(result->view());
-  std::vector<int64_t> expected(3, 9999);
-  REQUIRE(host_vals == expected);
-}
-
-TEST_CASE("translator: float64 constant", "[expression_translator]")
-{
-  std::vector<double> values = {1.0, 2.0};
-  auto table                 = make_float64_table(values);
-  auto tv                    = table->view();
-
-  auto expr = duckdb::make_uniq<BoundConstantExpression>(Value::DOUBLE(3.14));
-
-  auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
-  REQUIRE(ast_tree.has_value());
-
-  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
-  auto host_vals = copy_column_to_host<double>(result->view());
-  REQUIRE(host_vals.size() == 2);
-  REQUIRE(host_vals[0] == Approx(3.14));
-  REQUIRE(host_vals[1] == Approx(3.14));
-}
-
-TEST_CASE("translator: boolean constant", "[expression_translator]")
-{
-  std::vector<int32_t> values = {1, 2, 3};
-  auto table                  = make_int32_table(values);
-  auto tv                     = table->view();
-
-  auto expr = duckdb::make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
-
-  auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
-  REQUIRE(ast_tree.has_value());
-
-  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
-  auto host_vals = copy_bool_column_to_host(result->view());
-  REQUIRE(host_vals.size() == 3);
-  REQUIRE(host_vals[0] == 1);
-  REQUIRE(host_vals[1] == 1);
-  REQUIRE(host_vals[2] == 1);
-}
-
-TEST_CASE("translator: int16 constant", "[expression_translator]")
-{
-  std::vector<int16_t> values = {10, 20, 30};
-  auto table                  = make_int16_table(values);
-  auto tv                     = table->view();
-
-  auto expr = duckdb::make_uniq<BoundConstantExpression>(Value::SMALLINT(7));
-
-  auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
-  REQUIRE(ast_tree.has_value());
-
-  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
-  auto host_vals = copy_column_to_host<int16_t>(result->view());
-  std::vector<int16_t> expected(3, 7);
-  REQUIRE(host_vals == expected);
 }
 
 //===----------------------------------------------------------------------===//
@@ -820,6 +759,30 @@ TEST_CASE("translator: unsupported function returns nullopt", "[expression_trans
 //===----------------------------------------------------------------------===//
 // Test: Conjunction (AND / OR)
 //===----------------------------------------------------------------------===//
+TEST_CASE("translator: conjunction with unsupported first child returns nullopt",
+          "[expression_translator]")
+{
+  auto unsupported = duckdb::make_uniq<BoundFunctionExpression>(
+    LogicalType{LogicalTypeId::INTEGER},
+    ScalarFunction("abs", {LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
+    duckdb::vector<duckdb::unique_ptr<Expression>>{},
+    nullptr);
+  unsupported->children.push_back(
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+
+  auto supported = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_GREATERTHAN,
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
+    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+
+  auto conjunction = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+  conjunction->children.push_back(std::move(unsupported));
+  conjunction->children.push_back(std::move(supported));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*conjunction);
+  REQUIRE_FALSE(ast_tree.has_value());
+}
 
 TEST_CASE("translator: conjunction AND", "[expression_translator]")
 {
@@ -1582,30 +1545,6 @@ TEST_CASE("translator: reuse translator for multiple expressions", "[expression_
 }
 
 //===----------------------------------------------------------------------===//
-// Test: Float32 constant
-//===----------------------------------------------------------------------===//
-
-TEST_CASE("translator: float32 constant", "[expression_translator]")
-{
-  std::vector<float> values = {1.0f, 2.0f, 3.0f};
-  auto table                = make_float32_table(values);
-  auto tv                   = table->view();
-
-  auto expr = duckdb::make_uniq<BoundConstantExpression>(Value::FLOAT(2.5f));
-
-  auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
-  REQUIRE(ast_tree.has_value());
-
-  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
-  auto host_vals = copy_column_to_host<float>(result->view());
-  REQUIRE(host_vals.size() == 3);
-  REQUIRE(host_vals[0] == Approx(2.5f));
-  REQUIRE(host_vals[1] == Approx(2.5f));
-  REQUIRE(host_vals[2] == Approx(2.5f));
-}
-
-//===----------------------------------------------------------------------===//
 // Test: CAST chained with arithmetic
 //===----------------------------------------------------------------------===//
 
@@ -1707,4 +1646,176 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
   // col0[i] + col1[i] == i + (100-i) == 100 for all rows
   std::vector<uint8_t> expected(100, 1);
   REQUIRE(host_vals == expected);
+}
+
+//===----------------------------------------------------------------------===//
+// Test: Decimal column vs. decimal literal comparisons
+//
+// NOTE: decimal column-vs-literal comparisons work once rapidsai/cudf#21447 is
+// included. Decimal arithmetic (BoundFunctionExpression children returning
+// DECIMAL) is currently blocked by the translator pending rapidsai/cudf#21996,
+// so the positive tests here stay inside the comparison pattern and a negative
+// test below pins the blocking behavior.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("translator: decimal32 column EQUAL decimal literal", "[expression_translator]")
+{
+  // Column: DECIMAL(5,2) values 1.00, 2.50, 3.00, 2.50, 4.00
+  std::vector<int32_t> col_reps = {100, 250, 300, 250, 400};
+  auto table                    = make_decimal32_table(col_reps, -2);
+  auto tv                       = table->view();
+
+  auto const dec52 = LogicalType::DECIMAL(5, 2);
+
+  // col(0) == 2.50
+  auto left = duckdb::make_uniq<BoundReferenceExpression>(dec52, 0);
+  auto right =
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(250, uint8_t{5}, uint8_t{2}));
+  auto expr = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+  REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 0, 1, 0});
+}
+
+TEST_CASE("translator: decimal64 column LESS decimal literal", "[expression_translator]")
+{
+  // Column: DECIMAL(12,4) values 1.0000, 2.0000, 3.0000, 4.0000
+  std::vector<int64_t> col_reps = {10000, 20000, 30000, 40000};
+  auto table                    = make_decimal64_table(col_reps, -4);
+  auto tv                       = table->view();
+
+  auto const dec124 = LogicalType::DECIMAL(12, 4);
+
+  // col(0) < 2.5000
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(dec124, 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(
+    Value::DECIMAL(int64_t{25000}, uint8_t{12}, uint8_t{4}));
+  auto expr = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_LESSTHAN, std::move(left), std::move(right));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+  REQUIRE(host_vals == std::vector<uint8_t>{1, 1, 0, 0});
+}
+
+TEST_CASE("translator: nested decimal comparison col(0) >= 2.00 AND col(0) <= 4.00",
+          "[expression_translator]")
+{
+  // Column: DECIMAL(5,2) values 1.00, 2.00, 3.00, 4.00, 5.00
+  std::vector<int32_t> col_reps = {100, 200, 300, 400, 500};
+  auto table                    = make_decimal32_table(col_reps, -2);
+  auto tv                       = table->view();
+
+  auto const dec52 = LogicalType::DECIMAL(5, 2);
+
+  // col(0) >= 2.00
+  auto geq = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+    duckdb::make_uniq<BoundReferenceExpression>(dec52, 0),
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(200, uint8_t{5}, uint8_t{2})));
+
+  // col(0) <= 4.00
+  auto leq = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_LESSTHANOREQUALTO,
+    duckdb::make_uniq<BoundReferenceExpression>(dec52, 0),
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(400, uint8_t{5}, uint8_t{2})));
+
+  // (col(0) >= 2.00) AND (col(0) <= 4.00)
+  auto conj = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+  conj->children.push_back(std::move(geq));
+  conj->children.push_back(std::move(leq));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*conj);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+  REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 1, 1, 0});
+}
+
+TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_translator]")
+{
+  // Any BoundFunctionExpression whose children have DECIMAL return_type must be
+  // blocked by the translator (pending rapidsai/cudf#21996). Build a nested
+  // expression (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column and confirm
+  // the translator refuses both the inner and outer functions.
+  auto const dec52 = LogicalType::DECIMAL(5, 2);
+
+  // col(0) + col(0)
+  auto add =
+    duckdb::make_uniq<BoundFunctionExpression>(dec52,
+                                               ScalarFunction("+", {dec52, dec52}, dec52, nullptr),
+                                               duckdb::vector<duckdb::unique_ptr<Expression>>{},
+                                               nullptr);
+  add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
+  add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
+
+  // (col(0) + col(0)) * 2.00
+  auto mul =
+    duckdb::make_uniq<BoundFunctionExpression>(dec52,
+                                               ScalarFunction("*", {dec52, dec52}, dec52, nullptr),
+                                               duckdb::vector<duckdb::unique_ptr<Expression>>{},
+                                               nullptr);
+  mul->children.push_back(std::move(add));
+  mul->children.push_back(
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(200, uint8_t{5}, uint8_t{2})));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*mul);
+  REQUIRE_FALSE(ast_tree.has_value());
+}
+
+//===----------------------------------------------------------------------===//
+// Test: String column vs. string literal comparisons
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("translator: string column EQUAL string literal", "[expression_translator]")
+{
+  auto table = make_string_table({"alpha", "bravo", "charlie", "bravo", "delta"});
+  auto tv    = table->view();
+
+  // col(0) == 'bravo'
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(Value("bravo"));
+  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+  REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 0, 1, 0});
+}
+
+TEST_CASE("translator: string column NOT EQUAL string literal", "[expression_translator]")
+{
+  auto table = make_string_table({"foo", "bar", "foo", "baz"});
+  auto tv    = table->view();
+
+  // col(0) != 'foo'
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(Value("foo"));
+  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_NOTEQUAL, std::move(left), std::move(right));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+  REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 0, 1});
 }

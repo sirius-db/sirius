@@ -26,7 +26,7 @@ namespace op {
 sirius_physical_projection::sirius_physical_projection(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
     select_list(std::move(select_list))
@@ -37,7 +37,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_projection::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
 
@@ -49,7 +50,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     auto projected_batch = gpu_expression_executor.execute(batch, stream);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 }  // namespace op

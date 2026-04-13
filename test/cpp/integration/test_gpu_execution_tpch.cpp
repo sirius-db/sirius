@@ -69,7 +69,7 @@ class GPUExecutionFixtureBase {
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
       // Fallback: create an isolated DuckDB (e.g. when running a single test directly)
-      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.yaml";
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
@@ -186,7 +186,7 @@ class GPUExecutionFixtureBase {
 /**
  * @brief Catch2 test fixture for GPU execution tests.
  *
- * Initializes a DuckDB instance with the integration.cfg config and provides
+ * Initializes a DuckDB instance with the integration.yaml config and provides
  * a compare_gpu_vs_cpu method for validating GPU execution against CPU results.
  */
 class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
@@ -207,7 +207,7 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
 /**
  * @brief Catch2 test fixture for GPU execution tests.
  *
- * Initializes a DuckDB instance with the integration.cfg config and provides
+ * Initializes a DuckDB instance with the integration.yaml config and provides
  * a compare_gpu_vs_cpu method for validating GPU execution against CPU results.
  */
 class GPUExecutionParquetFixture : public GPUExecutionFixtureBase {

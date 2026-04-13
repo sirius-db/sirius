@@ -536,8 +536,9 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
   // Record memory metrics for future reservation estimates.
   // Scan tasks don't have peak memory tracking, so use output size as proxy.
   if (auto output_data = compute_task(stream); output_data) {
-    std::size_t output_bytes = 0;
-    for (const auto& batch : output_data->get_data_batches()) {
+    auto& pipelineable_output_data = dynamic_cast<op::pipelineable_operator_data&>(*output_data);
+    std::size_t output_bytes       = 0;
+    for (const auto& batch : pipelineable_output_data.get_data_batches()) {
       if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
     }
     auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
@@ -602,18 +603,20 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
 
   // Make data batch and push to repository
   if (l_state._row_offset > 0) {
-    return std::make_unique<op::operator_data>(
+    return std::make_unique<op::pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()});
   }
 
-  return std::make_unique<op::operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  return std::make_unique<op::pipelineable_operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{});
 }
 
 void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  std::for_each(std::make_move_iterator(output_data.get_data_batches().begin()),
-                std::make_move_iterator(output_data.get_data_batches().end()),
-                [this](auto batch) { this->_data_repo->add_data_batch(std::move(batch)); });
+  auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
+  for (auto& batch : pipelineable_output.release_data_batches()) {
+    _data_repo->add_data_batch(std::move(batch));
+  }
 }
 
 std::size_t duckdb_scan_task::get_estimated_reservation_size() const
