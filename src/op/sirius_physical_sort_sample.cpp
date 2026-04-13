@@ -121,146 +121,145 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
   // reset state to NOT_STARTED so the rescheduled task can win the CAS and retry.
   try {
-
-  // 2. Concatenate all sample batches into one table
-  std::vector<cudf::table_view> sample_views;
-  size_t total_sample_bytes = 0;
-  sample_views.reserve(valid_batches.size());
-  for (auto const& batch : valid_batches) {
-    auto view = get_cudf_table_view(*batch);
-    sample_views.push_back(view);
-    total_sample_bytes += batch->get_data()->get_size_in_bytes();
-  }
-
-  auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());
-
-  // 3. Build cudf order vectors from BoundOrderByNode
-  std::vector<int> order_key_idx;
-  std::vector<cudf::order> column_order;
-  std::vector<cudf::null_order> null_precedence;
-  order_key_idx.reserve(orders.size());
-  column_order.reserve(orders.size());
-  null_precedence.reserve(orders.size());
-
-  for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw not_implemented_exception("Sort sample only supports bound reference expressions");
+    // 2. Concatenate all sample batches into one table
+    std::vector<cudf::table_view> sample_views;
+    size_t total_sample_bytes = 0;
+    sample_views.reserve(valid_batches.size());
+    for (auto const& batch : valid_batches) {
+      auto view = get_cudf_table_view(*batch);
+      sample_views.push_back(view);
+      total_sample_bytes += batch->get_data()->get_size_in_bytes();
     }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
-    order_key_idx.push_back(idx);
-    column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
-                                                                    : cudf::order::DESCENDING);
-    null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                                ? cudf::null_order::BEFORE
-                                : cudf::null_order::AFTER);
-  }
 
-  // 4. Sort the concatenated sample by sort keys
-  std::vector<cudf::column_view> sort_cols;
-  for (int idx : order_key_idx) {
-    sort_cols.push_back(concat_table->view().column(idx));
-  }
-  auto sorted_indices = cudf::sorted_order(cudf::table_view(sort_cols),
-                                           column_order,
-                                           null_precedence,
+    auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());
+
+    // 3. Build cudf order vectors from BoundOrderByNode
+    std::vector<int> order_key_idx;
+    std::vector<cudf::order> column_order;
+    std::vector<cudf::null_order> null_precedence;
+    order_key_idx.reserve(orders.size());
+    column_order.reserve(orders.size());
+    null_precedence.reserve(orders.size());
+
+    for (auto const& ord : orders) {
+      if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+        throw not_implemented_exception("Sort sample only supports bound reference expressions");
+      }
+      auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+      order_key_idx.push_back(idx);
+      column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
+                                                                      : cudf::order::DESCENDING);
+      null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
+                                  ? cudf::null_order::BEFORE
+                                  : cudf::null_order::AFTER);
+    }
+
+    // 4. Sort the concatenated sample by sort keys
+    std::vector<cudf::column_view> sort_cols;
+    for (int idx : order_key_idx) {
+      sort_cols.push_back(concat_table->view().column(idx));
+    }
+    auto sorted_indices = cudf::sorted_order(cudf::table_view(sort_cols),
+                                             column_order,
+                                             null_precedence,
+                                             stream,
+                                             space->get_default_allocator());
+
+    auto sorted_table = cudf::gather(concat_table->view(),
+                                     sorted_indices->view(),
+                                     cudf::out_of_bounds_policy::DONT_CHECK,
+                                     stream,
+                                     space->get_default_allocator());
+
+    // 5. Compute number of partitions
+    size_t total_rows      = static_cast<size_t>(sorted_table->num_rows());
+    size_t avg_batch_bytes = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
+    size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
+    size_t num_parts          = 1;
+    if (estimated_cardinality == 0 || avg_rows_per_batch == 0) {
+      SIRIUS_LOG_WARN(
+        "Sort sample: estimated_cardinality={} or avg_rows_per_batch={} is zero, "
+        "defaulting to 1 partition",
+        estimated_cardinality,
+        avg_rows_per_batch);
+    } else {
+      size_t total_batch_count =
+        (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
+      size_t estimated_total_bytes = avg_batch_bytes * total_batch_count;
+      size_t available_memory      = space->get_available_memory(stream);
+      size_t max_partition_bytes   = _max_partition_bytes_override > 0
+                                       ? _max_partition_bytes_override
+                                       : static_cast<size_t>(static_cast<double>(available_memory) *
+                                                           MAX_PARTITION_MEMORY_FRACTION);
+
+      if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
+        num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
+      }
+
+      SIRIUS_LOG_DEBUG(
+        "Sort sample: estimated_cardinality={}, total_rows={}, avg_rows_per_batch={}, "
+        "avg_batch_bytes={}, total_batch_count={}, "
+        "estimated_total_bytes={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+        estimated_cardinality,
+        total_rows,
+        avg_rows_per_batch,
+        avg_batch_bytes,
+        total_batch_count,
+        estimated_total_bytes,
+        available_memory,
+        max_partition_bytes,
+        num_parts);
+    }
+
+    // 6. Pick P-1 evenly-spaced boundary rows from the sorted sample (sort key columns only)
+    if (num_parts <= 1 || total_rows == 0) {
+      // Single partition — no boundaries needed
+      _num_partitions = 1;
+      _partition_boundaries.reset();
+    } else {
+      // Compute boundary row indices: [total_rows/P, 2*total_rows/P, ..., (P-1)*total_rows/P]
+      size_t num_boundaries = num_parts - 1;
+      std::vector<int32_t> boundary_indices_host;
+      boundary_indices_host.reserve(num_boundaries);
+      for (size_t i = 1; i <= num_boundaries; i++) {
+        auto idx = static_cast<int32_t>((i * total_rows) / num_parts);
+        if (idx >= static_cast<int32_t>(total_rows)) { idx = static_cast<int32_t>(total_rows) - 1; }
+        boundary_indices_host.push_back(idx);
+      }
+
+      // Create a device column with the boundary indices
+      auto indices_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                   static_cast<cudf::size_type>(num_boundaries),
+                                                   cudf::mask_state::UNALLOCATED,
+                                                   stream,
+                                                   space->get_default_allocator());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(indices_col->mutable_view().data<int32_t>(),
+                                    boundary_indices_host.data(),
+                                    num_boundaries * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+
+      // Extract only the sort key columns from sorted table for the boundaries
+      std::vector<cudf::column_view> sort_key_cols;
+      for (int idx : order_key_idx) {
+        sort_key_cols.push_back(sorted_table->view().column(idx));
+      }
+      cudf::table_view sort_keys_view(sort_key_cols);
+
+      // Gather boundary rows
+      _partition_boundaries = cudf::gather(sort_keys_view,
+                                           indices_col->view(),
+                                           cudf::out_of_bounds_policy::DONT_CHECK,
                                            stream,
                                            space->get_default_allocator());
-
-  auto sorted_table = cudf::gather(concat_table->view(),
-                                   sorted_indices->view(),
-                                   cudf::out_of_bounds_policy::DONT_CHECK,
-                                   stream,
-                                   space->get_default_allocator());
-
-  // 5. Compute number of partitions
-  size_t total_rows         = static_cast<size_t>(sorted_table->num_rows());
-  size_t avg_batch_bytes    = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
-  size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
-  size_t num_parts          = 1;
-  if (estimated_cardinality == 0 || avg_rows_per_batch == 0) {
-    SIRIUS_LOG_WARN(
-      "Sort sample: estimated_cardinality={} or avg_rows_per_batch={} is zero, "
-      "defaulting to 1 partition",
-      estimated_cardinality,
-      avg_rows_per_batch);
-  } else {
-    size_t total_batch_count =
-      (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
-    size_t estimated_total_bytes = avg_batch_bytes * total_batch_count;
-    size_t available_memory      = space->get_available_memory(stream);
-    size_t max_partition_bytes   = _max_partition_bytes_override > 0
-                                     ? _max_partition_bytes_override
-                                     : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                         MAX_PARTITION_MEMORY_FRACTION);
-
-    if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
-      num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
+      _num_partitions       = num_parts;
     }
 
-    SIRIUS_LOG_DEBUG(
-      "Sort sample: estimated_cardinality={}, total_rows={}, avg_rows_per_batch={}, "
-      "avg_batch_bytes={}, total_batch_count={}, "
-      "estimated_total_bytes={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
-      estimated_cardinality,
-      total_rows,
-      avg_rows_per_batch,
-      avg_batch_bytes,
-      total_batch_count,
-      estimated_total_bytes,
-      available_memory,
-      max_partition_bytes,
-      num_parts);
-  }
-
-  // 6. Pick P-1 evenly-spaced boundary rows from the sorted sample (sort key columns only)
-  if (num_parts <= 1 || total_rows == 0) {
-    // Single partition — no boundaries needed
-    _num_partitions = 1;
-    _partition_boundaries.reset();
-  } else {
-    // Compute boundary row indices: [total_rows/P, 2*total_rows/P, ..., (P-1)*total_rows/P]
-    size_t num_boundaries = num_parts - 1;
-    std::vector<int32_t> boundary_indices_host;
-    boundary_indices_host.reserve(num_boundaries);
-    for (size_t i = 1; i <= num_boundaries; i++) {
-      auto idx = static_cast<int32_t>((i * total_rows) / num_parts);
-      if (idx >= static_cast<int32_t>(total_rows)) { idx = static_cast<int32_t>(total_rows) - 1; }
-      boundary_indices_host.push_back(idx);
-    }
-
-    // Create a device column with the boundary indices
-    auto indices_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                                 static_cast<cudf::size_type>(num_boundaries),
-                                                 cudf::mask_state::UNALLOCATED,
-                                                 stream,
-                                                 space->get_default_allocator());
-    CUDF_CUDA_TRY(cudaMemcpyAsync(indices_col->mutable_view().data<int32_t>(),
-                                  boundary_indices_host.data(),
-                                  num_boundaries * sizeof(int32_t),
-                                  cudaMemcpyHostToDevice,
-                                  stream.value()));
-
-    // Extract only the sort key columns from sorted table for the boundaries
-    std::vector<cudf::column_view> sort_key_cols;
-    for (int idx : order_key_idx) {
-      sort_key_cols.push_back(sorted_table->view().column(idx));
-    }
-    cudf::table_view sort_keys_view(sort_key_cols);
-
-    // Gather boundary rows
-    _partition_boundaries = cudf::gather(sort_keys_view,
-                                         indices_col->view(),
-                                         cudf::out_of_bounds_policy::DONT_CHECK,
-                                         stream,
-                                         space->get_default_allocator());
-    _num_partitions       = num_parts;
-  }
-
-  // Pipeline framework calls stream.synchronize() after execute() returns, before
-  // publish_output(). Pipeline C only starts after all Pipeline B tasks complete,
-  // so _partition_boundaries is fully materialized on the GPU before sort_partition
-  // ever reads it. No explicit sync needed here.
-  _boundary_state.store(2, std::memory_order_release);
+    // Pipeline framework calls stream.synchronize() after execute() returns, before
+    // publish_output(). Pipeline C only starts after all Pipeline B tasks complete,
+    // so _partition_boundaries is fully materialized on the GPU before sort_partition
+    // ever reads it. No explicit sync needed here.
+    _boundary_state.store(2, std::memory_order_release);
 
   } catch (...) {
     // Reset to NOT_STARTED so the rescheduled task (or another in-flight task) can
