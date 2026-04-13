@@ -27,6 +27,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
@@ -185,6 +186,57 @@ std::unique_ptr<cudf::table> make_float32_table(std::vector<float> const& values
     cudf::data_type{cudf::type_id::FLOAT32}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   cudaMemcpy(
     col->mutable_view().data<float>(), values.data(), sizeof(float) * n, cudaMemcpyHostToDevice);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Build a single-column DECIMAL32 table from host int32 rep values.
+std::unique_ptr<cudf::table> make_decimal32_table(std::vector<int32_t> const& rep_values,
+                                                  int32_t scale)
+{
+  auto const n = static_cast<cudf::size_type>(rep_values.size());
+  auto col     = cudf::make_fixed_point_column(
+    cudf::data_type{cudf::type_id::DECIMAL32, scale}, n, cudf::mask_state::UNALLOCATED, stream, mr);
+  cudaMemcpy(col->mutable_view().data<int32_t>(),
+             rep_values.data(),
+             sizeof(int32_t) * n,
+             cudaMemcpyHostToDevice);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Build a single-column DECIMAL64 table from host int64 rep values.
+std::unique_ptr<cudf::table> make_decimal64_table(std::vector<int64_t> const& rep_values,
+                                                  int32_t scale)
+{
+  auto const n = static_cast<cudf::size_type>(rep_values.size());
+  auto col     = cudf::make_fixed_point_column(
+    cudf::data_type{cudf::type_id::DECIMAL64, scale}, n, cudf::mask_state::UNALLOCATED, stream, mr);
+  cudaMemcpy(col->mutable_view().data<int64_t>(),
+             rep_values.data(),
+             sizeof(int64_t) * n,
+             cudaMemcpyHostToDevice);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Build a single-column DECIMAL128 table from host __int128_t rep values.
+std::unique_ptr<cudf::table> make_decimal128_table(std::vector<__int128_t> const& rep_values,
+                                                   int32_t scale)
+{
+  auto const n = static_cast<cudf::size_type>(rep_values.size());
+  auto col     = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL128, scale},
+                                           n,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+  cudaMemcpy(col->mutable_view().data<__int128_t>(),
+             rep_values.data(),
+             sizeof(__int128_t) * n,
+             cudaMemcpyHostToDevice);
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
   return std::make_unique<cudf::table>(std::move(cols));
@@ -1734,30 +1786,143 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
 }
 
 //===----------------------------------------------------------------------===//
-// Test: Decimal constants are disabled
+// Test: Decimal constant translation
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("translator: decimal constants return nullopt", "[expression_translator]")
+TEST_CASE("translator: DECIMAL32 constant translates successfully", "[expression_translator]")
 {
-  // DECIMAL32 (small precision)
-  {
-    auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(42, 5, 2));
-    auto translator = make_translator();
-    auto ast_tree   = translator.translate_expression(*expr);
-    REQUIRE_FALSE(ast_tree.has_value());
+  auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(42, 5, 2));
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+}
+
+TEST_CASE("translator: DECIMAL64 constant translates successfully", "[expression_translator]")
+{
+  auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(12345, 12, 4));
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+}
+
+TEST_CASE("translator: DECIMAL128 constant translates successfully", "[expression_translator]")
+{
+  auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(99999, 30, 6));
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+}
+
+TEST_CASE("translator: DECIMAL128 constant with large hugeint value", "[expression_translator]")
+{
+  duckdb::hugeint_t big_val;
+  big_val.upper = 1;
+  big_val.lower = 0;  // 2^64
+
+  auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(big_val, 30, 6));
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+}
+
+//===----------------------------------------------------------------------===//
+// Test: Decimal column reference translation
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("translator: DECIMAL64 column reference translates successfully",
+          "[expression_translator]")
+{
+  auto expr       = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, 2), 0);
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+}
+
+//===----------------------------------------------------------------------===//
+// Test: Decimal comparison (column vs constant) — end-to-end
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("translator: DECIMAL64 comparison col(0) > constant", "[expression_translator]")
+{
+  // col values in rep: 100, 250, 350, 500 (i.e., 1.00, 2.50, 3.50, 5.00)
+  // constant: 200 (i.e., 2.00)
+  // expected: false, true, true, true
+  std::vector<int64_t> col_reps = {100, 250, 350, 500};
+  int32_t const scale           = -2;
+  auto table                    = make_decimal64_table(col_reps, scale);
+  auto tv                       = table->view();
+
+  auto left = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, 2), 0);
+  auto right =
+    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(static_cast<int64_t>(200), 18, 2));
+  auto expr = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_GREATERTHAN, std::move(left), std::move(right));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+
+  std::vector<uint8_t> expected;
+  for (auto rep : col_reps) {
+    expected.push_back(rep > 200 ? 1U : 0U);
   }
-  // DECIMAL64 (medium precision)
-  {
-    auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(12345, 12, 4));
-    auto translator = make_translator();
-    auto ast_tree   = translator.translate_expression(*expr);
-    REQUIRE_FALSE(ast_tree.has_value());
+  REQUIRE(host_vals == expected);
+}
+
+TEST_CASE("translator: DECIMAL32 comparison col(0) == constant", "[expression_translator]")
+{
+  // col values in rep: 100, 200, 300, 200, 500
+  // constant: 200 (i.e., 2.00)
+  // expected: false, true, false, true, false
+  std::vector<int32_t> col_reps = {100, 200, 300, 200, 500};
+  int32_t const scale           = -2;
+  auto table                    = make_decimal32_table(col_reps, scale);
+  auto tv                       = table->view();
+
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(5, 2), 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(200, 5, 2));
+  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+
+  std::vector<uint8_t> expected;
+  for (auto rep : col_reps) {
+    expected.push_back(rep == 200 ? 1U : 0U);
   }
-  // DECIMAL128 (large precision)
-  {
-    auto expr       = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(99999, 30, 6));
-    auto translator = make_translator();
-    auto ast_tree   = translator.translate_expression(*expr);
-    REQUIRE_FALSE(ast_tree.has_value());
+  REQUIRE(host_vals == expected);
+}
+
+TEST_CASE("translator: DECIMAL128 comparison col(0) <= constant", "[expression_translator]")
+{
+  std::vector<__int128_t> col_reps = {100000, 200000, 300000, 400000};
+  int32_t const scale              = -6;
+  auto table                       = make_decimal128_table(col_reps, scale);
+  auto tv                          = table->view();
+
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(30, 6), 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(200000, 30, 6));
+  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(left), std::move(right));
+
+  auto translator = make_translator();
+  auto ast_tree   = translator.translate_expression(*expr);
+  REQUIRE(ast_tree.has_value());
+
+  auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
+  auto host_vals = copy_bool_column_to_host(result->view());
+
+  std::vector<uint8_t> expected;
+  for (auto rep : col_reps) {
+    expected.push_back(rep <= 200000 ? 1U : 0U);
   }
+  REQUIRE(host_vals == expected);
 }
