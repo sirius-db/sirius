@@ -42,15 +42,6 @@
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 
-#include <op/scan/direct_block_scan.hpp>
-#include <cuda/scan/gpu_decode.cuh>
-#include <cuda/scan/gpu_native_decode.cuh>
-
-// cucascade (for gpu_table_representation in GPU native decode path)
-#include <cucascade/data/gpu_data_representation.hpp>
-
-// sirius (for SiriusContext::get_memory_manager in GPU native decode path)
-#include <sirius_context.hpp>
 
 #include <chrono>
 #include <cuda_runtime.h>
@@ -844,91 +835,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // === GPU native decode path ===
-  // For task_id==0, try to decode the entire table directly from pinned DuckDB segments
-  // using GPU kernels (bitpacking, dictionary, uncompressed, constant).
-  // Falls back to the CPU scan loop if any column has unsupported compression.
-  bool used_gpu_native_decode = false;
-  if (_task_id == 0) {
-    try {
-      using clock = std::chrono::steady_clock;
-      auto t0 = clock::now();
-
-      auto& bind_data = g_state._op.bind_data->Cast<duckdb::TableScanBindData>();
-      auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
-      auto& storage   = table.GetStorage();
-
-      // Phase 1: Pin all segments (data + validity) for all columns
-      std::vector<column_scan_result> col_scans(l_state._num_columns);
-      std::vector<duckdb::LogicalType> col_types;
-      col_types.reserve(l_state._num_columns);
-
-      for (size_t ci = 0; ci < l_state._num_columns; ++ci) {
-        auto storage_col = duckdb::StorageIndex(g_state._op.column_ids[ci].GetPrimaryIndex());
-        col_scans[ci] = direct_block_scan_column_full(storage, storage_col, l_state._exec_ctx.client);
-        col_types.push_back(g_state._op.scanned_types[ci]);
-      }
-
-      auto t1_pin = clock::now();
-
-      // Phase 2: GPU decode all columns → cudf::table
-      auto& mem_mgr = g_state._sirius_ctx->get_memory_manager();
-      auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-      auto* gpu_space = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
-      auto mr = gpu_space->get_default_allocator();
-
-      auto gpu_table = sirius::cuda::scan::gpu_decode_table(
-          col_scans, col_types, stream, mr);
-
-      auto t2_decode = clock::now();
-
-      // Phase 3: Wrap in gpu_table_representation and create data batch
-      auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-          std::move(gpu_table), *gpu_space);
-      auto batch = std::make_shared<cucascade::data_batch>(
-          ::sirius::get_next_batch_id(), std::move(gpu_repr));
-
-      // Phase 4: Drain DuckDB table function to synchronize state
-      l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
-                                g_state._op.scanned_types);
-      while (get_next_chunk(l_state, g_state)) {
-        l_state._chunk.Reset();
-      }
-      l_state._local_state_drained = true;
-
-      auto t3_drain = clock::now();
-
-      auto us = [](clock::time_point a, clock::time_point b) {
-        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-      };
-
-      size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
-      size_t total_segs = 0, total_pinned_mb = 0;
-      for (auto& cs : col_scans) {
-        total_segs += cs.data.segments.size();
-        total_pinned_mb += cs.data.total_pinned_bytes;
-      }
-
-      SIRIUS_LOG_INFO(
-          "[gpu_native_decode] SUCCESS: {} rows, {} cols, {} segs, {:.1f}MB pinned | "
-          "pin={:.1f}ms decode={:.1f}ms drain={:.1f}ms total={:.1f}ms",
-          total_rows, l_state._num_columns, total_segs,
-          total_pinned_mb / (1024.0 * 1024.0),
-          us(t0, t1_pin) / 1000.0,
-          us(t1_pin, t2_decode) / 1000.0,
-          us(t2_decode, t3_drain) / 1000.0,
-          us(t0, t3_drain) / 1000.0);
-
-      used_gpu_native_decode = true;
-      return std::make_unique<op::pipelineable_operator_data>(
-          std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
-
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_INFO("[gpu_native_decode] falling back to CPU scan: {}", e.what());
-    }
-  }
-
-  // === Scan instrumentation counters (CPU fallback path) ===
+  // === Scan instrumentation counters ===
   double us_get_next_chunk = 0;
   double us_chunk_fits     = 0;
   double us_flatten        = 0;

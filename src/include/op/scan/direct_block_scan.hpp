@@ -11,6 +11,7 @@
 #include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_index.hpp>
+#include <duckdb/storage/table/row_group.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -64,5 +65,13 @@ column_scan_result direct_block_scan_column_full(
   duckdb::DataTable& storage,
   duckdb::StorageIndex col_idx,
   duckdb::ClientContext& context);
+
+/// @brief Pin data and validity segments for a specific subset of row groups.
+/// Like direct_block_scan_column_full but only visits the given row groups.
+column_scan_result direct_block_scan_column_range(
+  duckdb::DataTable& storage,
+  duckdb::StorageIndex col_idx,
+  duckdb::ClientContext& context,
+  const std::vector<duckdb::RowGroup*>& row_groups);
 
 }  // namespace sirius::op::scan

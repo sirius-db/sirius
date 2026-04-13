@@ -46,6 +46,7 @@ class sirius_pipeline_task_global_state;
 
 namespace sirius::op::scan {
 class duckdb_scan_task_global_state;
+class gpu_native_scan_global_state;
 class parquet_scan_task_global_state;
 class iceberg_scan_task_global_state;
 }  // namespace sirius::op::scan
@@ -190,6 +191,8 @@ class task_creator {
   exec::interruptible_mpmc<std::unique_ptr<task_creation_request>> _task_creation_queue;
 
   // Map of operator ID to global state for scan operators
+  std::map<size_t, std::shared_ptr<op::scan::gpu_native_scan_global_state>>
+    _gpu_native_scan_global_state_map;
   std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>>
     _scan_operator_global_state_map;
   std::map<size_t, std::shared_ptr<op::scan::parquet_scan_task_global_state>>

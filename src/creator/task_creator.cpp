@@ -19,6 +19,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/gpu_native_scan_task.hpp"
 #include "op/scan/iceberg_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -66,6 +67,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
 
+  _gpu_native_scan_global_state_map.clear();
   _scan_operator_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
 
@@ -81,13 +83,24 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
 
     if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      _scan_operator_global_state_map.emplace(
-        operator_id,
-        std::make_shared<op::scan::duckdb_scan_task_global_state>(
-          pipeline,
-          *_pipeline_executor,
-          *_client_context,
-          &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
+      auto* scan_op = &source_operator->Cast<op::sirius_physical_duckdb_scan>();
+
+      // Try GPU native scan first — bypasses DuckDB table function entirely
+      auto gpu_state = std::make_shared<op::scan::gpu_native_scan_global_state>(
+        pipeline, *_pipeline_executor, *_client_context, scan_op);
+
+      if (gpu_state->viable()) {
+        _gpu_native_scan_global_state_map.emplace(operator_id, std::move(gpu_state));
+      } else {
+        // Fall back to standard DuckDB scan with table function
+        _scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::duckdb_scan_task_global_state>(
+            pipeline,
+            *_pipeline_executor,
+            *_client_context,
+            scan_op));
+      }
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
       auto it = _parquet_scan_operator_global_state_map.find(operator_id);
       if (it != _parquet_scan_operator_global_state_map.end()) {
@@ -131,7 +144,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     }
   }
   _num_scans_in_plan =
-    _scan_operator_global_state_map.size() + _parquet_scan_operator_global_state_map.size();
+    _gpu_native_scan_global_state_map.size() +
+    _scan_operator_global_state_map.size() +
+    _parquet_scan_operator_global_state_map.size();
 }
 
 void task_creator::drain_pending_tasks()
@@ -145,6 +160,7 @@ void task_creator::drain_pending_tasks()
 void task_creator::reset(bool keep_parquet_metadata)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
+  _gpu_native_scan_global_state_map.clear();
   _scan_operator_global_state_map.clear();
   if (!keep_parquet_metadata) { _parquet_scan_operator_global_state_map.clear(); }
   _gpu_operator_global_state_map.clear();
@@ -183,9 +199,18 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // task creator should never schedule additional scans from downstream.
     // (Parquet scans are fine — they use partition indices that self-limit.)
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
-      if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
+      // GPU native scan tasks self-manage via continuations once started.
+      // But if the scan hasn't started yet, let it through so the scheduling
+      // dispatch creates the first task.
+      auto gpu_it = _gpu_native_scan_global_state_map.find(producer->get_operator_id());
+      if (gpu_it != _gpu_native_scan_global_state_map.end() && gpu_it->second->has_started()) {
         return nullptr;
+      }
+      auto it = _scan_operator_global_state_map.find(producer->get_operator_id());
+      if (it != _scan_operator_global_state_map.end()) {
+        if (it->second->is_source_drained() || !it->second->can_create_more_tasks()) {
+          return nullptr;
+        }
       }
     }
     return get_operator_for_next_task(producer);
@@ -290,33 +315,43 @@ void task_creator::manager_loop()
         }
         // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-          // Check to see if you need to create a new global s for this scan operator
-          size_t operator_id          = node->get_operator_id();
-          auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
-
-          const auto& op_params =
-            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-              ->get_config()
-              .get_operator_params();
-          auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-            *scan_task_global_state,
-            *_execution_context,
-            op_params.scan_task_batch_size,
-            op_params.default_scan_task_varchar_size);
+          size_t operator_id = node->get_operator_id();
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
               "No destination data repositories provided for scan task creation.");
           }
-          auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
-            get_next_task_id(),
-            destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably
-                                               // needs to be multiple possible destination data
-                                               // repositories
-            std::move(scan_task_local_state),
-            scan_task_global_state);
-          pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
-                                          // with the task creation
-          _pipeline_executor->schedule(std::move(scan_task));
+
+          // Check for GPU native scan path first
+          auto gpu_it = _gpu_native_scan_global_state_map.find(operator_id);
+          if (gpu_it != _gpu_native_scan_global_state_map.end()) {
+            auto& gpu_state = gpu_it->second;
+            auto scan_task  = std::make_unique<op::scan::gpu_native_scan_task>(
+              get_next_task_id(),
+              destination_data_repositories[0],
+              gpu_state);
+            pipeline->mark_task_created();
+            _pipeline_executor->schedule(std::move(scan_task));
+          } else {
+            // Fall back to standard DuckDB scan task
+            auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
+
+            const auto& op_params =
+              _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                ->get_config()
+                .get_operator_params();
+            auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+              *scan_task_global_state,
+              *_execution_context,
+              op_params.scan_task_batch_size,
+              op_params.default_scan_task_varchar_size);
+            auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
+              get_next_task_id(),
+              destination_data_repositories[0],
+              std::move(scan_task_local_state),
+              scan_task_global_state);
+            pipeline->mark_task_created();
+            _pipeline_executor->schedule(std::move(scan_task));
+          }
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                    node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();

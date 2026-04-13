@@ -23,6 +23,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/gpu_native_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 
@@ -85,6 +86,8 @@ pipeline_executor::~pipeline_executor() { stop(); }
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
+    _scan_executor->schedule(std::move(task));
+  } else if (task->is<sirius::op::scan::gpu_native_scan_task>()) {
     _scan_executor->schedule(std::move(task));
   } else if (task->is<sirius::op::scan::parquet_scan_task>()) {
     _scan_executor->schedule(std::move(task));

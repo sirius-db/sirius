@@ -149,8 +149,6 @@ size_t direct_copy_fixed_column(
   return copied_bytes;
 }
 
-namespace {
-
 /// @brief Walk a ColumnData's segment tree, pin all blocks, return segment info vector.
 direct_block_scan_result scan_segment_tree(
   duckdb::ColumnData& col_data,
@@ -190,8 +188,6 @@ direct_block_scan_result scan_segment_tree(
   }
   return result;
 }
-
-}  // anonymous namespace
 
 column_scan_result direct_block_scan_column_full(
   duckdb::DataTable& storage,
@@ -294,6 +290,78 @@ column_scan_result direct_block_scan_column_full(
     result.has_nulls,
     (result.data.total_pinned_bytes + result.validity.total_pinned_bytes) / (1024.0 * 1024.0),
     result.data.pin_time_us / 1000.0);
+
+  return result;
+}
+
+column_scan_result direct_block_scan_column_range(
+  duckdb::DataTable& storage,
+  duckdb::StorageIndex col_idx,
+  duckdb::ClientContext& context,
+  const std::vector<duckdb::RowGroup*>& row_groups)
+{
+  auto& buffer_manager = duckdb::BufferManager::GetBufferManager(context);
+
+  column_scan_result result;
+  result.data.total_rows     = 0;
+  result.validity.total_rows = 0;
+
+  auto start = std::chrono::steady_clock::now();
+
+  for (auto* rg : row_groups) {
+    auto& col_data = rg->GetColumnDirect(col_idx);
+
+    // Count rows in this row group
+    auto& seg_tree = col_data.GetSegmentTree();
+    {
+      auto seg_node = seg_tree.GetRootSegment();
+      while (seg_node) {
+        result.data.total_rows += seg_node->GetNode().count.load();
+        seg_node = seg_tree.GetNextSegment(*seg_node);
+      }
+    }
+
+    // Scan data segments
+    auto data_scan = scan_segment_tree(col_data, buffer_manager);
+    result.data.total_pinned_bytes += data_scan.total_pinned_bytes;
+    for (auto& s : data_scan.segments) {
+      result.data.segments.push_back(std::move(s));
+    }
+
+    // Check nullability
+    {
+      auto seg_node = seg_tree.GetRootSegment();
+      while (seg_node) {
+        if (seg_node->GetNode().stats.statistics.CanHaveNull()) {
+          result.has_nulls = true;
+        }
+        seg_node = seg_tree.GetNextSegment(*seg_node);
+      }
+    }
+
+    // Scan validity segments
+    try {
+      auto& std_col  = col_data.Cast<duckdb::StandardColumnData>();
+      auto& val_data = std_col.GetValidityData();
+
+      if (result.has_nulls) {
+        auto val_scan = scan_segment_tree(val_data, buffer_manager);
+        result.validity.total_pinned_bytes += val_scan.total_pinned_bytes;
+        for (auto& s : val_scan.segments) {
+          result.validity.segments.push_back(std::move(s));
+        }
+      }
+    } catch (...) {
+      // Not a StandardColumnData — no validity to scan
+    }
+  }
+
+  result.validity.total_rows = result.data.total_rows;
+
+  auto end = std::chrono::steady_clock::now();
+  result.data.pin_time_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+  result.validity.pin_time_us = result.data.pin_time_us;
 
   return result;
 }
