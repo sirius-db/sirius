@@ -95,34 +95,45 @@ void gpu_native_scan_global_state::check_viability()
     return;
   }
 
-  auto& buffer_manager = duckdb::BufferManager::GetBufferManager(client_ctx_);
+  // Walk all row groups → all segments for each projected column.
+  // Two goals in one pass:
+  //   1. Verify every segment has GPU-decodable compression
+  //   2. Compute the actual decoded GPU size per row group (for batch sizing)
+  //
+  // For fixed-width columns: decoded size = row_count × type_size
+  // For VARCHAR columns: decoded size = row_count × (4 bytes offsets + max_string_length chars)
+  //   max_string_length comes from segment stats — we already check it for DICTIONARY viability.
+
+  size_t total_decoded_bytes = 0;
+  size_t total_rows          = 0;
 
   for (auto* rg : row_groups_) {
     for (size_t ci = 0; ci < col_indices_.size(); ++ci) {
       auto& col_data = rg->GetColumnDirect(col_indices_[ci]);
       auto& seg_tree = col_data.GetSegmentTree();
       auto seg_node  = seg_tree.GetRootSegment();
+      bool is_varchar = col_types_[ci].id() == duckdb::LogicalTypeId::VARCHAR;
 
       while (seg_node) {
-        auto& segment     = seg_node->GetNode();
-        auto compression  = segment.GetCompressionType();
+        auto& segment    = seg_node->GetNode();
+        auto compression = segment.GetCompressionType();
+        auto row_count   = segment.count.load();
 
+        // --- Viability check ---
         switch (compression) {
           case duckdb::CompressionType::COMPRESSION_BITPACKING:
           case duckdb::CompressionType::COMPRESSION_CONSTANT:
           case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
-            break;  // Always supported
+            break;
 
           case duckdb::CompressionType::COMPRESSION_DICTIONARY:
-            // Dictionary needs max_string_length for GPU concat path
-            if (col_types_[ci].id() == duckdb::LogicalTypeId::VARCHAR) {
-              if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
-                SIRIUS_LOG_INFO(
-                  "[gpu_native_scan] not viable: col {} DICTIONARY segment missing max_string_length",
-                  col_indices_[ci].GetPrimaryIndex());
-                viable_ = false;
-                return;
-              }
+            if (is_varchar &&
+                !duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+              SIRIUS_LOG_INFO(
+                "[gpu_native_scan] not viable: col {} DICTIONARY segment missing max_string_length",
+                col_indices_[ci].GetPrimaryIndex());
+              viable_ = false;
+              return;
             }
             break;
 
@@ -134,53 +145,46 @@ void gpu_native_scan_global_state::check_viability()
             return;
         }
 
+        // --- Decoded size calculation ---
+        if (is_varchar) {
+          // cudf STRING column: int32 offsets (row_count+1) + char data
+          uint32_t max_len = 0;
+          if (duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+            max_len = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+          }
+          total_decoded_bytes += row_count * (4 + max_len);  // offsets + chars upper bound
+        } else {
+          total_decoded_bytes += row_count * duckdb::GetTypeIdSize(col_types_[ci].InternalType());
+        }
+
+        // Count rows (only from first column to avoid double-counting)
+        if (ci == 0) { total_rows += row_count; }
+
         seg_node = seg_tree.GetNextSegment(*seg_node);
       }
     }
   }
 
   viable_ = true;
+
+  // Compute average decoded bytes per row group
+  if (!row_groups_.empty() && total_rows > 0) {
+    decoded_bytes_per_rg_ = total_decoded_bytes / row_groups_.size();
+  }
 }
 
 void gpu_native_scan_global_state::compute_batch_size()
 {
-  // Estimate the decoded GPU size per row group to determine how many row groups
-  // fit in one batch (target: scan_task_batch_size from config, default 512MB).
   auto target_bytes = sirius_ctx_->get_config().get_operator_params().scan_task_batch_size;
 
-  // Estimate bytes per row: sum of physical type sizes across all projected columns.
-  // For VARCHAR: use 32 bytes as a rough estimate (offsets + chars).
-  size_t bytes_per_row = 0;
-  for (auto& type : col_types_) {
-    switch (type.InternalType()) {
-      case duckdb::PhysicalType::BOOL:
-      case duckdb::PhysicalType::INT8:
-      case duckdb::PhysicalType::UINT8:   bytes_per_row += 1; break;
-      case duckdb::PhysicalType::INT16:
-      case duckdb::PhysicalType::UINT16:  bytes_per_row += 2; break;
-      case duckdb::PhysicalType::INT32:
-      case duckdb::PhysicalType::UINT32:
-      case duckdb::PhysicalType::FLOAT:   bytes_per_row += 4; break;
-      case duckdb::PhysicalType::INT64:
-      case duckdb::PhysicalType::UINT64:
-      case duckdb::PhysicalType::DOUBLE:  bytes_per_row += 8; break;
-      case duckdb::PhysicalType::INT128:  bytes_per_row += 16; break;
-      case duckdb::PhysicalType::VARCHAR: bytes_per_row += 32; break;  // rough estimate
-      default:                            bytes_per_row += 8; break;
-    }
+  if (decoded_bytes_per_rg_ == 0) {
+    row_groups_per_batch_ = row_groups_.size();
+    return;
   }
 
-  if (bytes_per_row == 0) { bytes_per_row = 8; }
-
-  // Each row group has DEFAULT_ROW_GROUP_SIZE rows (122,880)
-  constexpr size_t rows_per_rg = 122880;
-  size_t bytes_per_rg          = bytes_per_row * rows_per_rg;
-
-  // Number of row groups that fit in the target batch size
-  size_t rgs_per_batch = target_bytes / bytes_per_rg;
+  size_t rgs_per_batch  = target_bytes / decoded_bytes_per_rg_;
   if (rgs_per_batch == 0) { rgs_per_batch = 1; }
 
-  // Cap at total row groups (no point batching beyond what exists)
   row_groups_per_batch_ = std::min(rgs_per_batch, row_groups_.size());
 }
 
