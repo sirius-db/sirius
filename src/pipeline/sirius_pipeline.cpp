@@ -195,13 +195,13 @@ std::size_t sirius_pipeline::update_batch_index(std::size_t old_index, std::size
 {
   std::lock_guard<std::mutex> l(batch_lock);
   if (new_index < *batch_indexes.begin()) {
-    throw internal_exception("Processing batch index %llu, but previous min batch index was %llu",
+    throw internal_exception("Processing batch index {}, but previous min batch index was {}",
                              new_index,
                              *batch_indexes.begin());
   }
   auto entry = batch_indexes.find(old_index);
   if (entry == batch_indexes.end()) {
-    throw internal_exception("Batch index %llu was not found in set of active batch indexes",
+    throw internal_exception("Batch index {} was not found in set of active batch indexes",
                              old_index);
   }
   batch_indexes.erase(entry);
