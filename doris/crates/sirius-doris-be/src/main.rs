@@ -97,11 +97,7 @@ fn main() {
     let engine = SiriusEngine::new()
         .expect("FATAL: engine init failed (substrait + sirius extensions must be loadable)");
     info!("DuckDB engine initialized");
-    // Initialize GPU buffers for Sirius GPU execution.
-    match engine.init_gpu_buffers(&config.gpu_cache_size, &config.gpu_processing_size) {
-        Ok(()) => info!(cache = %config.gpu_cache_size, processing = %config.gpu_processing_size, "GPU buffers initialized"),
-        Err(err) => warn!(error = %err, "GPU buffer init failed, gpu_execution will fall back to DuckDB CPU"),
-    }
+    info!("Super Sirius runtime initialized");
     if config.no_cpu_fallback {
         match engine.set_no_cpu_fallback() {
             Ok(()) => info!("CPU fallback disabled (enable_fallback_check = true)"),

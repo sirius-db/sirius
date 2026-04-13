@@ -25,4 +25,3 @@ mod nixl_exchange_mock;
 pub mod nixl_integration;
 pub mod nixl_service;
 pub mod pblock_decoder;
-pub mod transfer_engine;

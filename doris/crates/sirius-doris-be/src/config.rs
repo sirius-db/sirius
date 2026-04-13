@@ -50,14 +50,6 @@ pub struct BeConfig {
     #[arg(long, default_value_t = false)]
     pub force_cpu: bool,
 
-    /// GPU cache buffer size (e.g. "2GB", "1024MB").
-    #[arg(long, default_value = "2GB")]
-    pub gpu_cache_size: String,
-
-    /// GPU processing buffer size (e.g. "2GB", "1024MB").
-    #[arg(long, default_value = "2GB")]
-    pub gpu_processing_size: String,
-
     /// Require nixl GPU-direct for all inter-BE exchanges.
     /// When enabled, queries fail instead of silently falling back to bRPC.
     #[arg(long, default_value_t = false)]

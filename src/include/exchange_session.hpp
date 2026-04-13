@@ -73,12 +73,6 @@ class ExchangeSession {
   std::vector<int> partition_cols;
 
   // --- Packed GPU data (set during execution by result_collector) ---
-  // Single packed buffer (broadcast path)
-  std::shared_ptr<void> packed_gpu_data;
-  uintptr_t packed_gpu_addr = 0;
-  size_t packed_gpu_size = 0;
-  std::unique_ptr<std::vector<uint8_t>> packed_metadata;
-
   // Per-partition packed data (accumulated across batches)
   std::vector<PackedPartition> packed_partitions;
   // Per-batch broadcast packed data (accumulated across batches)
@@ -95,15 +89,6 @@ class ExchangeSession {
   size_t staging_lease_size = 0;
 
   // --- Methods ---
-
-  /// Store packed data from single-pack or hash_partition path.
-  void store_packed(std::shared_ptr<void> data, uintptr_t addr,
-                    size_t size, std::unique_ptr<std::vector<uint8_t>> md) {
-    packed_gpu_data = std::move(data);
-    packed_gpu_addr = addr;
-    packed_gpu_size = size;
-    packed_metadata = std::move(md);
-  }
 
   /// Accumulate per-partition packed data from a new batch.
   void accumulate_partitions(std::vector<PackedPartition> parts) {

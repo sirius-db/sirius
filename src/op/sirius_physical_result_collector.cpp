@@ -142,7 +142,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
   // Check if GPU buffer retention is requested (for nixl GPU-direct exchange).
   bool should_retain = duckdb::LastGPUBuffers::GetInstance().ShouldRetain();
   SIRIUS_LOG_INFO("[result_collector] sink called: {} batches, should_retain={}", input_batches.size(), should_retain);
-  std::vector<duckdb::GPUBufferInfo> gpu_buffer_infos;
 
   for (auto const& input_batch : input_batches) {
     auto* data = input_batch->get_data();
@@ -158,87 +157,22 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
     // If data is in GPU tier, convert to HOST tier first
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
-      // Capture GPU buffer metadata before D2H conversion (for nixl exchange).
-      {
-        auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
-        cudf::table_view view = gpu_rep.get_table().view();
-        int device_id = input_batch->get_memory_space()
-                          ? input_batch->get_memory_space()->get_device_id()
-                          : 0;
+      auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
+      cudf::table_view view = gpu_rep.get_table().view();
 
-        for (cudf::size_type i = 0; i < view.num_columns(); i++) {
-          cudf::column_view col = view.column(i);
-          size_t nrows = static_cast<size_t>(col.size());
+      if (should_retain) {
+        auto& lgb = duckdb::LastGPUBuffers::GetInstance();
+        // Keep the source GPU batch alive until exchange transfer completes.
+        // The packed exchange path may still depend on buffers originating from
+        // this batch after the pipeline releases its local references.
+        lgb.RetainData(std::static_pointer_cast<void>(input_batch));
+        auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
+        auto [part_num, part_cols] = lgb.GetPartitionConfig();
 
-          // Data buffer.
-          uintptr_t addr = reinterpret_cast<uintptr_t>(col.data<uint8_t>());
-          size_t len = 0;
+        SIRIUS_LOG_INFO("[result_collector] retain path: part_num={} part_cols={} staging_addr=0x{:x}",
+                        part_num, part_cols.size(), staging_addr);
 
-          // Null mask (validity bitmap).
-          uintptr_t null_mask_addr = 0;
-          size_t null_mask_len = 0;
-          int null_cnt = static_cast<int>(col.null_count());
-          if (col.nullable() && col.null_mask() != nullptr) {
-            null_mask_addr = reinterpret_cast<uintptr_t>(col.null_mask());
-            // cudf bitmask: 1 bit per element, padded to 64-byte boundary.
-            null_mask_len = cudf::bitmask_allocation_size_bytes(col.size());
-          }
-
-          // String offsets (child[0] for STRING type).
-          uintptr_t offsets_addr = 0;
-          size_t offsets_len = 0;
-
-          if (cudf::is_fixed_width(col.type())) {
-            len = nrows * cudf::size_of(col.type());
-          } else if (col.type().id() == cudf::type_id::STRING && col.num_children() > 0) {
-            // STRING: data ptr = chars buffer, child(0) = offsets (INT32).
-            // Chars size: computed from last offset value.
-            // For now, use the offset range to determine chars size:
-            //   chars_len = offsets[nrows] - offsets[0] (would need D2H to read).
-            //   Approximate: total representation size minus offsets size.
-            auto offsets_col = col.child(0);
-            offsets_addr = reinterpret_cast<uintptr_t>(offsets_col.data<int32_t>());
-            offsets_len = static_cast<size_t>(offsets_col.size()) * sizeof(int32_t);
-            // Chars length: gpu_rep knows the total, but per-column isn't exposed.
-            // Use the full table representation size as upper bound for now.
-            // The receiver will use offsets[nrows] (D2H'd) to determine actual chars size.
-            len = gpu_rep.get_size_in_bytes();
-          } else {
-            len = gpu_rep.get_size_in_bytes();
-          }
-
-          std::string col_name = (static_cast<size_t>(i) < names.size())
-                                   ? names[i]
-                                   : "col_" + std::to_string(i);
-          gpu_buffer_infos.push_back({
-            addr,
-            len,
-            device_id,
-            std::move(col_name),
-            static_cast<int>(col.type().id()),
-            nrows,
-            null_mask_addr,
-            null_mask_len,
-            offsets_addr,
-            offsets_len,
-            null_cnt,
-            col.type().scale(),
-          });
-        }
-
-        if (should_retain) {
-          auto& lgb = duckdb::LastGPUBuffers::GetInstance();
-          // Keep the source GPU batch alive until exchange transfer completes.
-          // The packed exchange path may still depend on buffers originating from
-          // this batch after the pipeline releases its local references.
-          lgb.RetainData(std::static_pointer_cast<void>(input_batch));
-          auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
-          auto [part_num, part_cols] = lgb.GetPartitionConfig();
-
-          SIRIUS_LOG_INFO("[result_collector] retain path: part_num={} part_cols={} staging_addr=0x{:x}",
-                          part_num, part_cols.size(), staging_addr);
-
-          if (part_num > 0 && !part_cols.empty() && staging_addr != 0) {
+        if (part_num > 0 && !part_cols.empty() && staging_addr != 0) {
             // GPU hash partition + per-partition pack into staging.
             // For a single destination, hash partitioning is a no-op. Bypass the
             // cuDF partitioner entirely and pack the original view as one
@@ -389,11 +323,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                               actual_total_packed, aligned_estimate, aligned_estimate - actual_total_packed);
             }
             lgb.AccumulatePackedPartitions(std::move(packed_parts));
-            // Also set packed_gpu_addr so get_packed_gpu() returns non-None.
-            // The Rust exchange forward needs this to detect GPU-packed data.
-            lgb.StorePackedData(nullptr, staging_addr, staging_offset,
-                                std::make_unique<std::vector<uint8_t>>());
-          } else if (staging_addr != 0 && staging_size > 0) {
+        } else if (staging_addr != 0 && staging_size > 0) {
             // Broadcast path: accumulate each batch as a separate entry.
             // Reserve a staging region atomically BEFORE packing, to prevent
             // concurrent sink() calls from overlapping in the staging buffer.
@@ -433,10 +363,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
               entry.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
               lgb.AccumulatePackedBroadcast(std::move(entry));
             }
-            // Keep StorePackedData for the Rust side to detect GPU-packed data.
-            lgb.StorePackedData(nullptr, staging_addr, lgb.GetStagingOffset(),
-                                std::make_unique<std::vector<uint8_t>>());
-          } else {
+        } else {
             // No staging buffer — pack into rmm::device_buffer.
             auto packed = cudf::pack(view);
             auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
@@ -450,8 +377,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             entry.overflow_gpu_addr = gpu_addr;
             entry.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
             lgb.AccumulatePackedBroadcast(std::move(entry));
-            lgb.StorePackedData(nullptr, 0, 0, std::make_unique<std::vector<uint8_t>>());
-          }
         }
       }
 
@@ -519,10 +444,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     }
   }
 
-  // Store accumulated GPU buffer metadata for detect_execution_location().
-  if (!gpu_buffer_infos.empty()) {
-    duckdb::LastGPUBuffers::GetInstance().Store(std::move(gpu_buffer_infos));
-  }
 }
 
 }  // namespace op

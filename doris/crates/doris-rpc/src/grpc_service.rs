@@ -2253,8 +2253,6 @@ pub struct PBackendServiceHandler {
     force_cpu: bool,
     nixl_only: bool,
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
-    /// Transfer dispatcher for inter-BE exchange (nixl → bRPC fallback).
-    transfer_dispatcher: Option<super::transfer_engine::TransferDispatcher>,
     /// This BE's brpc address as seen by other BEs (advertise_host:brpc_port).
     /// Used to detect self-transfer (destination == local BE).
     local_brpc_addr: String,
@@ -2279,7 +2277,6 @@ impl PBackendServiceHandler {
             force_cpu,
             nixl_only,
             nixl_agent: None,
-            transfer_dispatcher: None,
             local_brpc_addr: String::new(),
         }
     }
@@ -2289,14 +2286,6 @@ impl PBackendServiceHandler {
         agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
     ) -> Self {
         self.nixl_agent = agent;
-        self
-    }
-
-    pub fn with_transfer_dispatcher(
-        mut self,
-        dispatcher: super::transfer_engine::TransferDispatcher,
-    ) -> Self {
-        self.transfer_dispatcher = Some(dispatcher);
         self
     }
 
@@ -4647,11 +4636,8 @@ pub async fn start_grpc_server(
         nixl_only,
     );
 
-    let dispatcher =
-        super::transfer_engine::TransferDispatcher::standard(nixl_agent.clone(), nixl_only);
     handler = handler
         .with_nixl_agent(nixl_agent)
-        .with_transfer_dispatcher(dispatcher)
         .with_local_brpc_addr(local_brpc_addr);
 
     let svc = PBackendServiceServer::new(handler);

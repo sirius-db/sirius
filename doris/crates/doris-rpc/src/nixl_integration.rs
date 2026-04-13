@@ -1,7 +1,6 @@
 //! Integration layer between nixl GPU-direct exchange and query execution.
 //!
 //! Handles:
-//! - Detecting GPU-resident results (from sirius-ffi engine)
 //! - Extracting GPU buffer pointers for nixl transfer
 //! - Coordinating metadata exchange and transfer
 //! - Fallback to bRPC when GPU-direct unavailable
@@ -37,10 +36,6 @@ pub enum ExecutionLocation {
         /// Staging buffer leases. Kept alive until transfer completes.
         /// When present, buffer addresses point into the staging buffer.
         _staging_leases: Vec<StagingLease>,
-        /// cudf::pack() metadata for the packed GPU buffer (if packed).
-        /// When present, `buffers` contains a single descriptor pointing to
-        /// the contiguous packed buffer in the nixl staging region.
-        packed_metadata: Option<Vec<u8>>,
         /// Per-partition packed buffers from GPU hash_partition + chunked_pack.
         /// When present, each entry has (staging_offset, size, cudf_metadata, num_rows).
         packed_partitions: Vec<sirius_ffi::PackedPartition>,
@@ -163,68 +158,6 @@ impl ExecutionLocation {
     }
 }
 
-/// Detect whether execution result is in GPU or CPU memory.
-///
-/// Returns `ExecutionLocation::Gpu` if the engine executed on GPU and result
-/// buffers are still GPU-resident, otherwise `ExecutionLocation::Cpu` with
-/// the standard Arrow IPC bytes.
-pub fn detect_execution_location(
-    ipc_bytes: Vec<u8>,
-    _engine: &sirius_ffi::SiriusEngine,
-) -> ExecutionLocation {
-    {
-        // Try to extract GPU buffer pointers from the engine.
-        // If the last execution was GPU-accelerated and buffers are still in VRAM,
-        // the engine can provide the raw GPU addresses.
-        match _engine.get_last_gpu_result_buffers() {
-            Ok(Some(gpu_info)) => {
-                for (i, &(addr, len, dev)) in gpu_info.buffer_addrs.iter().enumerate() {
-                    tracing::info!(
-                        buf_idx = i,
-                        addr = format_args!("0x{:x}", addr),
-                        len,
-                        device_id = dev,
-                        "detect_execution_location: GPU buffer"
-                    );
-                }
-                tracing::info!(
-                    num_buffers = gpu_info.buffer_addrs.len(),
-                    num_rows = gpu_info.num_rows,
-                    "detect_execution_location: GPU buffers found"
-                );
-                return ExecutionLocation::Gpu {
-                    buffers: gpu_info
-                        .buffer_addrs
-                        .iter()
-                        .map(|&(addr, len, device_id)| GpuBufferDesc {
-                            addr,
-                            len,
-                            device_id,
-                        })
-                        .collect(),
-                    column_info: gpu_info.column_info,
-                    column_buffers: gpu_info.column_buffers,
-                    num_rows: gpu_info.num_rows,
-                    schema_ipc: gpu_info.schema_ipc,
-                    ipc_bytes,
-                    _staging_leases: vec![],
-                    packed_metadata: None,
-                    packed_partitions: vec![],
-                    packed_broadcast: vec![],
-                };
-            }
-            Ok(None) => {
-                tracing::info!("detect_execution_location: no GPU buffers (CPU execution)");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "detect_execution_location: get_last_gpu_result_buffers failed");
-            }
-        }
-    }
-
-    ExecutionLocation::Cpu(ipc_bytes)
-}
-
 /// Send exchange result using nixl GPU-direct if available, otherwise bRPC.
 ///
 /// When `nixl_only` is true, bRPC fallback is disabled — errors surface instead
@@ -295,25 +228,17 @@ pub async fn send_exchange_with_nixl(
         .await;
     }
 
-    let (packed_metadata, buffers, packed_broadcast, packed_exchange) = if all_local {
-        (None, &[][..], &[][..], None)
+    let (buffers, packed_broadcast, packed_exchange) = if all_local {
+        (&[][..], &[][..], None)
     } else {
         match &location {
             ExecutionLocation::Gpu {
-                packed_metadata,
                 buffers,
                 packed_broadcast,
                 ..
-            } => (
-                packed_metadata.as_deref(),
-                buffers.as_slice(),
-                packed_broadcast.as_slice(),
-                None,
-            ),
-            ExecutionLocation::PackedExchange { artifact, .. } => {
-                (None, &[][..], &[][..], Some(artifact))
-            }
-            _ => (None, &[][..], &[][..], None),
+            } => (buffers.as_slice(), packed_broadcast.as_slice(), None),
+            ExecutionLocation::PackedExchange { artifact, .. } => (&[][..], &[][..], Some(artifact)),
+            _ => (&[][..], &[][..], None),
         }
     };
 
@@ -424,47 +349,6 @@ pub async fn send_exchange_with_nixl(
             continue;
         }
 
-        // Single packed GPU data: copy from staging to owned buffer.
-        if let Some(ref md) = packed_metadata {
-            if let Some(buf) = buffers.first() {
-                let owned_addr = match crate::cuda_driver::cuda_alloc(buf.len) {
-                    Ok(addr) => {
-                        if let Err(e) =
-                            crate::cuda_driver::cuda_memcpy_dtod(addr, buf.addr, buf.len)
-                        {
-                            tracing::warn!(error = %e, "self-transfer D2D copy failed");
-                            crate::cuda_driver::cuda_free(addr).ok();
-                            buf.addr
-                        } else {
-                            addr
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "self-transfer cudaMalloc failed");
-                        buf.addr
-                    }
-                };
-                tracing::info!(
-                    dest = %dest.brpc_addr,
-                    src = format_args!("0x{:x}", buf.addr),
-                    dst = format_args!("0x{:x}", owned_addr),
-                    size = buf.len,
-                    "self-transfer: packed GPU path (D2D copy from staging)"
-                );
-                exchange_buffer.store_packed_gpu(
-                    key.clone(),
-                    PackedGpuExchange {
-                        gpu_addr: owned_addr,
-                        gpu_size: buf.len,
-                        cudf_metadata: md.to_vec(),
-                        _staging_lease: None,
-                    },
-                );
-                exchange_buffer.add_block(&key, sender_id, None, true);
-                continue;
-            }
-        }
-
         tracing::info!(
             dest = %dest.brpc_addr,
             sender_id,
@@ -519,7 +403,6 @@ pub async fn send_exchange_with_nixl(
             ipc_bytes: _,
             _staging_leases,
             packed_partitions: _,
-            packed_metadata,
             packed_broadcast,
         } => {
             let Some(agent) = nixl_agent else {
@@ -618,7 +501,7 @@ pub async fn send_exchange_with_nixl(
             }
 
             // Packed buffers are always in the staging region.
-            let staged = packed_metadata.is_some() || !_staging_leases.is_empty();
+            let staged = !_staging_leases.is_empty();
 
             // Try nixl GPU-direct for each remote destination.
             for dest in &remote_dests {
@@ -634,7 +517,7 @@ pub async fn send_exchange_with_nixl(
                     node_id,
                     sender_id,
                     staged,
-                    packed_metadata.as_deref(),
+                    None,
                 )
                 .await
                 {
@@ -949,7 +832,6 @@ async fn send_hash_partitioned(
     if let ExecutionLocation::Gpu {
         ref packed_partitions,
         ref buffers,
-        ref packed_metadata,
         ..
     } = _location
     {
@@ -963,15 +845,7 @@ async fn send_hash_partitioned(
             // Get the send staging base address from the first buffer.
             // Partitions are at staging_base + partition.staging_offset.
             let staging_base = buffers.first().map(|b| b.addr).unwrap_or(0);
-            // Actually, partitions use the send staging buffer, not the packed buffer.
-            // The send staging addr was set by set_staging_buffer. We need to know it.
-            // For now, compute from the first partition's offset relative to known staging.
-            // The packed buffer addr is the send staging base.
-            let send_staging_base = if let Some(ref _md) = packed_metadata {
-                buffers.first().map(|b| b.addr).unwrap_or(0)
-            } else {
-                0
-            };
+            let send_staging_base = staging_base;
 
             // Partition entries may come from multiple batches. With N dests
             // and B batches, there are N*B entries: [b0_d0, b0_d1, b1_d0, b1_d1, ...].
@@ -1561,40 +1435,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[test]
-    fn test_execution_location_cpu() {
-        // Mock IPC bytes.
-        let ipc = vec![1, 2, 3, 4];
-
-        // Skip test if engine not available (duckdb-bundled feature not enabled).
-        let Ok(engine) = sirius_ffi::SiriusEngine::new() else {
-            return;
-        };
-
-        let location = detect_execution_location(ipc.clone(), &engine);
-        match location {
-            ExecutionLocation::Cpu(bytes) => {
-                assert_eq!(bytes, ipc);
-            }
-            ExecutionLocation::Gpu { .. } => {
-                // Could happen if engine has GPU result
-            }
-            ExecutionLocation::PackedExchange { .. } => {
-                panic!("detect_execution_location should not return PackedExchange")
-            }
-        }
-    }
-
-    #[test]
-    fn test_execution_location_gpu() {
-        // This test requires GPU execution, skip in CI.
-        // Demonstrates API usage pattern:
-
-        // 1. Execute query on GPU
-        // 2. Call detect_execution_location
-        // 3. Match on Gpu variant to extract buffer descriptors
-    }
-
     /// Build a broadcast ExchangeInfo for testing.
     fn make_broadcast_exch_info(dests: Vec<ExchangeDest>, node_id: i32) -> ExchangeInfo {
         ExchangeInfo {
@@ -1675,7 +1515,6 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: ipc.clone(),
             _staging_leases: vec![],
-            packed_metadata: None,
             packed_partitions: vec![],
             packed_broadcast: vec![],
         };
@@ -1701,7 +1540,6 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: vec![],
             _staging_leases: vec![],
-            packed_metadata: None,
             packed_partitions: vec![],
             packed_broadcast: vec![],
         };
@@ -1744,7 +1582,6 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: ipc,
             _staging_leases: vec![],
-            packed_metadata: None,
             packed_partitions: vec![],
             packed_broadcast: vec![],
         };
@@ -1786,7 +1623,6 @@ mod tests {
             schema_ipc: vec![],
             ipc_bytes: vec![],
             _staging_leases: vec![],
-            packed_metadata: None,
             packed_partitions: vec![],
             packed_broadcast: vec![],
         };

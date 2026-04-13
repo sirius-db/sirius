@@ -777,28 +777,6 @@ impl SiriusEngine {
     /// Get the RMM processing pool base address and size.
     ///
     /// Returns `(base_addr, size, device_id)` for the GPU processing pool.
-    /// Used by nixl to register the pool region for GPU-direct transfers.
-    pub fn get_pool_info(&self) -> Result<Option<(usize, usize, u32)>, EngineError> {
-        let mut stmt = self.conn
-            .prepare("SELECT pool_base, pool_size, device_id FROM sirius_get_pool_info()")
-            .map_err(|e| EngineError::ExecFailed(format!("sirius_get_pool_info: {e}")))?;
-        let batches: Vec<_> = stmt.query_arrow([])
-            .map_err(|e| EngineError::ExecFailed(format!("sirius_get_pool_info: {e}")))?
-            .collect();
-        if batches.is_empty() || batches[0].num_rows() == 0 {
-            return Ok(None);
-        }
-        let batch = &batches[0];
-        use arrow::array::{Int32Array, Int64Array};
-        let base = batch.column(0).as_any().downcast_ref::<Int64Array>()
-            .ok_or_else(|| EngineError::ExecFailed("pool_base not i64".into()))?.value(0) as usize;
-        let size = batch.column(1).as_any().downcast_ref::<Int64Array>()
-            .ok_or_else(|| EngineError::ExecFailed("pool_size not i64".into()))?.value(0) as usize;
-        let device = batch.column(2).as_any().downcast_ref::<Int32Array>()
-            .ok_or_else(|| EngineError::ExecFailed("device_id not i32".into()))?.value(0) as u32;
-        Ok(Some((base, size, device)))
-    }
-
     /// Finalize any pending exchange tables before staging-backed buffers are reused.
     pub fn finalize_exchange_tables_direct(&self) -> Result<(), EngineError> {
         let ok = unsafe { (self.exchange_api.finalize_exchange_tables_direct)() };
@@ -903,70 +881,6 @@ impl SiriusEngine {
             staging_base,
             packed_partitions,
             packed_broadcast,
-        }))
-    }
-
-    /// Get GPU buffer pointers from the last execution (for nixl GPU-direct exchange).
-    ///
-    /// Returns `Ok(Some(...))` if the last query was GPU-accelerated and buffers are
-    /// still resident in GPU memory. Returns `Ok(None)` if executed on CPU or buffers
-    /// have been freed. Returns `Err` on query failure.
-    pub fn get_last_gpu_result_buffers(&self) -> Result<Option<GpuResultInfo>, EngineError> {
-        let sql = "SELECT buffer_id, addr, len, device_id, column_name, type_id, num_rows, null_mask_addr, null_mask_len, offsets_addr, offsets_len, null_count, scale FROM sirius_get_last_gpu_buffers()";
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .map_err(|e| EngineError::ExecFailed(format!("sirius_get_last_gpu_buffers: {e}")))?;
-
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| EngineError::ExecFailed(format!("query gpu buffers: {e}")))?;
-
-        let mut buffer_addrs = Vec::new();
-        let mut column_info = Vec::new();
-        let mut column_buffers = Vec::new();
-        let mut num_rows_opt = None;
-
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let addr: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let len: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let device_id: i64 = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let column_name: String = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let type_id: i32 = row.get(5).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let num_rows: i64 = row.get(6).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let null_mask_addr: i64 = row.get(7).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let null_mask_len: i64 = row.get(8).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let offsets_addr: i64 = row.get(9).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let offsets_len: i64 = row.get(10).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let null_count: i32 = row.get(11).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let scale: i32 = row.get(12).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-
-            buffer_addrs.push((addr as usize, len as usize, device_id as u64));
-            column_info.push((column_name, type_id));
-            column_buffers.push(GpuColumnBuffers {
-                null_mask_addr: null_mask_addr as usize,
-                null_mask_len: null_mask_len as usize,
-                offsets_addr: offsets_addr as usize,
-                offsets_len: offsets_len as usize,
-                null_count,
-                scale,
-            });
-            num_rows_opt = Some(num_rows as u32);
-        }
-
-        if buffer_addrs.is_empty() {
-            return Ok(None);
-        }
-
-        // Get schema IPC bytes (query the schema without data).
-        let schema_ipc = Vec::new(); // TODO: extract schema from last query
-
-        Ok(Some(GpuResultInfo {
-            buffer_addrs,
-            column_info,
-            column_buffers,
-            num_rows: num_rows_opt.unwrap_or(0),
-            schema_ipc,
         }))
     }
 
@@ -1159,21 +1073,6 @@ pub struct GpuColumnBuffers {
     pub null_count: i32,
     /// Decimal scale (from cudf data_type::scale()), 0 for non-decimal types.
     pub scale: i32,
-}
-
-/// GPU result buffer information for nixl transfers.
-#[derive(Debug, Clone)]
-pub struct GpuResultInfo {
-    /// GPU buffer addresses: (addr, len, device_id).
-    pub buffer_addrs: Vec<(usize, usize, u64)>,
-    /// Column metadata: (name, type_id).
-    pub column_info: Vec<(String, i32)>,
-    /// Extended per-column buffer info (null masks, string offsets).
-    pub column_buffers: Vec<GpuColumnBuffers>,
-    /// Number of rows.
-    pub num_rows: u32,
-    /// Arrow IPC schema bytes.
-    pub schema_ipc: Vec<u8>,
 }
 
 /// Map Arrow DataType to DuckDB SQL type string.

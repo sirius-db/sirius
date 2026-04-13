@@ -190,8 +190,6 @@ for n in $(seq 1 "$NUM_BES"); do
         --brpc-port "$brpc_port" \
         --http-port "$http_port" \
         --arrow-flight-port "$flight_port" \
-        --gpu-cache-size 5GB \
-        --gpu-processing-size 5GB \
         --advertise-host "$host" \
         --fe "$FE_MYSQL" \
         $EXTRA_BE_FLAGS \
