@@ -45,8 +45,8 @@ extern "C" int cudaProfilerStop();
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
-#include "gpu_explain.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "gpu_explain.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
