@@ -39,6 +39,11 @@ class optimizer_guard {
     auto disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
 #endif
