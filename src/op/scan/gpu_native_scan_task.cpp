@@ -7,6 +7,7 @@
 
 #include <cuda/scan/gpu_native_decode.cuh>
 #include <log/logging.hpp>
+#include <sirius_config.hpp>
 
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -65,8 +66,7 @@ gpu_native_scan_global_state::gpu_native_scan_global_state(
   check_viability();
 
   if (viable_) {
-    // Phase 1: all row groups in one batch
-    row_groups_per_batch_ = row_groups_.size();
+    compute_batch_size();
 
     SIRIUS_LOG_INFO(
       "[gpu_native_scan] viable: {} row groups, {} cols, batch_size={}",
@@ -140,6 +140,48 @@ void gpu_native_scan_global_state::check_viability()
   }
 
   viable_ = true;
+}
+
+void gpu_native_scan_global_state::compute_batch_size()
+{
+  // Estimate the decoded GPU size per row group to determine how many row groups
+  // fit in one batch (target: scan_task_batch_size from config, default 512MB).
+  auto target_bytes = sirius_ctx_->get_config().get_operator_params().scan_task_batch_size;
+
+  // Estimate bytes per row: sum of physical type sizes across all projected columns.
+  // For VARCHAR: use 32 bytes as a rough estimate (offsets + chars).
+  size_t bytes_per_row = 0;
+  for (auto& type : col_types_) {
+    switch (type.InternalType()) {
+      case duckdb::PhysicalType::BOOL:
+      case duckdb::PhysicalType::INT8:
+      case duckdb::PhysicalType::UINT8:   bytes_per_row += 1; break;
+      case duckdb::PhysicalType::INT16:
+      case duckdb::PhysicalType::UINT16:  bytes_per_row += 2; break;
+      case duckdb::PhysicalType::INT32:
+      case duckdb::PhysicalType::UINT32:
+      case duckdb::PhysicalType::FLOAT:   bytes_per_row += 4; break;
+      case duckdb::PhysicalType::INT64:
+      case duckdb::PhysicalType::UINT64:
+      case duckdb::PhysicalType::DOUBLE:  bytes_per_row += 8; break;
+      case duckdb::PhysicalType::INT128:  bytes_per_row += 16; break;
+      case duckdb::PhysicalType::VARCHAR: bytes_per_row += 32; break;  // rough estimate
+      default:                            bytes_per_row += 8; break;
+    }
+  }
+
+  if (bytes_per_row == 0) { bytes_per_row = 8; }
+
+  // Each row group has DEFAULT_ROW_GROUP_SIZE rows (122,880)
+  constexpr size_t rows_per_rg = 122880;
+  size_t bytes_per_rg          = bytes_per_row * rows_per_rg;
+
+  // Number of row groups that fit in the target batch size
+  size_t rgs_per_batch = target_bytes / bytes_per_rg;
+  if (rgs_per_batch == 0) { rgs_per_batch = 1; }
+
+  // Cap at total row groups (no point batching beyond what exists)
+  row_groups_per_batch_ = std::min(rgs_per_batch, row_groups_.size());
 }
 
 std::optional<gpu_native_scan_global_state::row_group_range>

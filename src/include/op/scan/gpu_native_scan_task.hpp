@@ -101,6 +101,9 @@ class gpu_native_scan_global_state : public pipeline::sirius_pipeline_task_globa
   /// @brief Walk row group tree, cache RowGroup pointers.
   void cache_row_groups();
 
+  /// @brief Compute row_groups_per_batch_ from estimated decoded size vs config batch size.
+  void compute_batch_size();
+
   // --- Fields ---
   duckdb::DataTable* storage_;
   duckdb::ClientContext& client_ctx_;
