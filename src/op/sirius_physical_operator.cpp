@@ -162,7 +162,7 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
       state.set_pipeline_source(current, *this);
     } else {
       if (children.size() != 1) {
-        throw duckdb::InternalException("Operator not supported in build_pipelines");
+        throw internal_exception("Operator not supported in build_pipelines");
       }
       state.add_pipeline_operator(current, *this);
       children[0]->build_pipelines(current, meta_pipeline);
@@ -184,7 +184,7 @@ sirius_physical_operator::get_sources() const
       return result;
     } else {
       if (children.size() != 1) {
-        throw duckdb::InternalException("Operator not supported in get_sources");
+        throw internal_exception("Operator not supported in get_sources");
       }
       return children[0]->get_sources();
     }
@@ -228,8 +228,8 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
     for (auto& [port_name, port_ptr] : ports) {
       ports_string += port_name + ", ";
     }
-    throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
-                                    get_name() + " existing ports are: " + ports_string);
+    throw internal_exception("Port " + std::string(port_id) + " not found in operator " +
+                             get_name() + " existing ports are: " + ports_string);
   }
   return it->second;
 }
