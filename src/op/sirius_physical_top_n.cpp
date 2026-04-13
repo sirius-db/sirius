@@ -45,8 +45,8 @@ namespace {
 std::unique_ptr<cudf::table> compute_top_n_table(
   cudf::table_view input,
   duckdb::vector<duckdb::BoundOrderByNode> const& orders,
-  duckdb::idx_t limit,
-  duckdb::idx_t offset,
+  std::size_t limit,
+  std::size_t offset,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref memory_resource)
 {
@@ -130,10 +130,10 @@ std::unique_ptr<cudf::table> compute_top_n_table(
 sirius_physical_top_n::sirius_physical_top_n(
   duckdb::vector<duckdb::LogicalType> types_p,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
-  duckdb::idx_t limit,
-  duckdb::idx_t offset,
+  std::size_t limit,
+  std::size_t offset,
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
@@ -149,9 +149,11 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
                                                               rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (limit == 0) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   std::shared_ptr<cucascade::data_batch> input_batch;
@@ -164,12 +166,14 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
     }
   }
   if (!input_batch) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto* space = input_batch->get_memory_space();
   if (space == nullptr) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto& input_table =
@@ -182,7 +186,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
-  return std::make_unique<operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* top_n)
@@ -200,10 +204,10 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(
   duckdb::vector<duckdb::LogicalType> types_p,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
-  duckdb::idx_t limit,
-  duckdb::idx_t offset,
+  std::size_t limit,
+  std::size_t offset,
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
@@ -217,9 +221,11 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
                                                                     rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (limit == 0) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   // Use the memory space from the first valid batch (all batches are expected to share the same
@@ -232,7 +238,8 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
     }
   }
   if (space == nullptr) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   // std::vector<std::unique_ptr<cudf::table>> owned_tables;
@@ -244,7 +251,8 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   }
 
   if (concat_views.empty()) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   std::unique_ptr<cudf::table> combined;
@@ -272,7 +280,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
-  return std::make_unique<operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::get_next_task_input_data()
@@ -292,7 +300,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::get_next_task_input_
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
 }  // namespace op

@@ -36,6 +36,7 @@ using namespace sirius::op;
 using namespace cucascade;
 using namespace cucascade::memory;
 using sirius::op::operator_data;
+using sirius::op::pipelineable_operator_data;
 
 namespace {
 
@@ -197,8 +198,9 @@ TEMPLATE_TEST_CASE("sirius_physical_concat concatenates multiple data_batches",
   auto outputs = concat_op.execute(partitioned_operator_data(input_batches, 0), default_stream());
 
   // Verify: single output batch with correct total rows
-  REQUIRE(outputs->get_data_batches().size() == 1);
-  auto& out_table = outputs->get_data_batches()[0]
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto& out_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                      .get_data_batches()[0]
                       ->get_data()
                       ->cast<cucascade::gpu_table_representation>()
                       .get_table();
@@ -229,9 +231,10 @@ TEST_CASE("sirius_physical_concat returns single batch as-is", "[physical_concat
 
   auto outputs = concat_op.execute(partitioned_operator_data({input_batch}, 0), default_stream());
 
-  REQUIRE(outputs->get_data_batches().size() == 1);
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
   // Single batch should be the same pointer (passthrough)
-  REQUIRE(outputs->get_data_batches()[0].get() == input_batch.get());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0].get() ==
+          input_batch.get());
 }
 
 TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
@@ -244,7 +247,7 @@ TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
     partitioned_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{}, 0),
     default_stream());
 
-  REQUIRE(outputs->get_data_batches().empty());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().empty());
 }
 
 TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
@@ -265,8 +268,9 @@ TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
   std::vector<std::shared_ptr<data_batch>> input = {batch1, nullptr, batch2, nullptr};
   auto outputs = concat_op.execute(partitioned_operator_data(input, 0), default_stream());
 
-  REQUIRE(outputs->get_data_batches().size() == 1);
-  auto& out_table = outputs->get_data_batches()[0]
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto& out_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                      .get_data_batches()[0]
                       ->get_data()
                       ->cast<cucascade::gpu_table_representation>()
                       .get_table();
@@ -426,15 +430,18 @@ TEST_CASE("sirius_physical_concat stops concatenating at concat_batch_bytes thre
   // First call: should return some batches but not all (threshold exceeded)
   auto result1 = concat_op.get_next_task_input_data();
   REQUIRE(result1 != nullptr);
-  REQUIRE(result1->get_data_batches().size() < static_cast<std::size_t>(num_batches));
-  REQUIRE(result1->get_data_batches().size() >= 1);
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result1).get_data_batches().size() <
+          static_cast<std::size_t>(num_batches));
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result1).get_data_batches().size() >= 1);
 
   // Collect total batches returned across multiple calls
-  std::size_t total_batches_returned = result1->get_data_batches().size();
+  std::size_t total_batches_returned =
+    dynamic_cast<const pipelineable_operator_data&>(*result1).get_data_batches().size();
   while (true) {
     auto result = concat_op.get_next_task_input_data();
     if (!result) { break; }
-    total_batches_returned += result->get_data_batches().size();
+    total_batches_returned +=
+      dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches().size();
   }
 
   // All batches should eventually be consumed
@@ -477,7 +484,8 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
   // With concat_all=true, all batches in the partition should be returned in one call
   auto result = concat_op.get_next_task_input_data();
   REQUIRE(result != nullptr);
-  REQUIRE(result->get_data_batches().size() == static_cast<std::size_t>(num_batches));
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches().size() ==
+          static_cast<std::size_t>(num_batches));
 
   // No more batches remaining
   auto result2 = concat_op.get_next_task_input_data();
@@ -606,7 +614,8 @@ TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe", "[p
       if (!result) { break; }
       total_calls.fetch_add(1, std::memory_order_relaxed);
       std::lock_guard<std::mutex> lg(collected_mutex);
-      for (auto& batch : result->get_data_batches()) {
+      for (auto& batch :
+           dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches()) {
         if (batch) { collected_batch_ids.push_back(batch->get_batch_id()); }
       }
     }
@@ -678,7 +687,8 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
       // Synchronize the stream before accessing results
       cudaStreamSynchronize(raw_stream);
 
-      thread_outputs[thread_id] = std::move(outputs->get_data_batches());
+      thread_outputs[thread_id] =
+        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches();
 
       cudaStreamDestroy(raw_stream);
     } catch (const std::exception& e) {

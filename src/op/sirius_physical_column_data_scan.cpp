@@ -30,7 +30,7 @@ namespace op {
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
   duckdb::vector<duckdb::LogicalType> types,
   SiriusPhysicalOperatorType op_type,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection_p)
   : sirius_physical_operator(op_type, std::move(types), estimated_cardinality),
     collection(std::move(collection_p)),
@@ -41,8 +41,8 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
   duckdb::vector<duckdb::LogicalType> types,
   SiriusPhysicalOperatorType op_type,
-  duckdb::idx_t estimated_cardinality,
-  duckdb::idx_t cte_index)
+  std::size_t estimated_cardinality,
+  std::size_t cte_index)
   : sirius_physical_operator(op_type, std::move(types), estimated_cardinality),
     collection(nullptr),
     cte_index(cte_index)
@@ -105,7 +105,8 @@ std::unique_ptr<operator_data> sirius_physical_column_data_scan::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_column_data_scan::execute"};
-  return std::make_unique<operator_data>(input_data);
+  return std::make_unique<pipelineable_operator_data>(
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 }  // namespace op

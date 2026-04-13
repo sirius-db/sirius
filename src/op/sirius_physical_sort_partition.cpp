@@ -41,8 +41,8 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(sirius_physical_o
 sirius_physical_sort_partition::sirius_physical_sort_partition(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
-  duckdb::vector<duckdb::idx_t> projections_p,
-  duckdb::idx_t estimated_cardinality)
+  duckdb::vector<std::size_t> projections_p,
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_PARTITION, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
@@ -54,14 +54,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   // If no sample operator or only 1 partition, pass through
   if (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1) {
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return std::make_unique<operator_data>(input_data);
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
@@ -161,7 +162,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     num_parts,
     duration.count() / 1000.0);
 
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 void sirius_physical_sort_partition::finalize_operator()
