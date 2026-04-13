@@ -2107,6 +2107,17 @@ fn exchange_infos_with_local_destinations(
     exchange_infos
 }
 
+fn exchange_infos_are_all_local(exchange_infos: &[ExchangeInfo], local_brpc_addr: &str) -> bool {
+    !exchange_infos.is_empty()
+        && exchange_infos.iter().all(|info| {
+            !info.destinations.is_empty()
+                && info
+                    .destinations
+                    .iter()
+                    .all(|dest| dest.brpc_addr == local_brpc_addr)
+        })
+}
+
 fn exec_plan_uses_gpu(plan: &ExecPlan) -> bool {
     matches!(plan, ExecPlan::Substrait { .. } | ExecPlan::Sql(_))
 }
@@ -2256,6 +2267,12 @@ pub struct PBackendServiceHandler {
     /// This BE's brpc address as seen by other BEs (advertise_host:brpc_port).
     /// Used to detect self-transfer (destination == local BE).
     local_brpc_addr: String,
+    pending_query_tasks: Arc<tokio::sync::Mutex<Vec<PendingQueryTask>>>,
+}
+
+struct PendingQueryTask {
+    query_id: (i64, i64),
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl PBackendServiceHandler {
@@ -2278,6 +2295,7 @@ impl PBackendServiceHandler {
             nixl_only,
             nixl_agent: None,
             local_brpc_addr: String::new(),
+            pending_query_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2292,6 +2310,48 @@ impl PBackendServiceHandler {
     pub fn with_local_brpc_addr(mut self, addr: String) -> Self {
         self.local_brpc_addr = addr;
         self
+    }
+
+    async fn wait_for_other_query_tasks(&self, current_query_id: (i64, i64)) {
+        let to_wait = {
+            let mut pending = self.pending_query_tasks.lock().await;
+            let mut retained = Vec::with_capacity(pending.len());
+            let mut to_wait = Vec::new();
+            for task in pending.drain(..) {
+                if task.query_id == current_query_id && !task.handle.is_finished() {
+                    retained.push(task);
+                } else {
+                    to_wait.push(task);
+                }
+            }
+            *pending = retained;
+            to_wait
+        };
+
+        for task in to_wait {
+            if task.query_id != current_query_id {
+                info!(
+                    previous_query_hi = task.query_id.0,
+                    previous_query_lo = task.query_id.1,
+                    current_query_hi = current_query_id.0,
+                    current_query_lo = current_query_id.1,
+                    "waiting for detached task from previous query before reusing shared engine"
+                );
+            }
+            if let Err(e) = task.handle.await {
+                warn!(
+                    error = %e,
+                    query_hi = task.query_id.0,
+                    query_lo = task.query_id.1,
+                    "detached query task join failed"
+                );
+            }
+        }
+    }
+
+    async fn track_query_task(&self, query_id: (i64, i64), handle: tokio::task::JoinHandle<()>) {
+        let mut pending = self.pending_query_tasks.lock().await;
+        pending.push(PendingQueryTask { query_id, handle });
     }
 }
 
@@ -2340,6 +2400,11 @@ impl PBackendService for PBackendServiceHandler {
             num_fragments = all_params.len(),
             "deserialized fragment params"
         );
+
+        if let Some(first) = all_params.first() {
+            self.wait_for_other_query_tasks((first.query_id.hi, first.query_id.lo))
+                .await;
+        }
 
         // Capture the result-sink fragment's instance ID BEFORE merge.
         // The result-sink fragment is fragment_id=0 (EXCHANGE_NODE at root with 0 children,
@@ -2433,7 +2498,7 @@ impl PBackendService for PBackendServiceHandler {
                 let exchange_buffer = self.exchange_buffer.clone();
 
                 // Spawn async task: wait for exchange data, decode, load, execute.
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     // Wait for all exchange nodes to receive all their data.
                     for notify in &notifies {
                         notify.notified().await;
@@ -3287,6 +3352,8 @@ impl PBackendService for PBackendServiceHandler {
                     }
                 });
 
+                self.track_query_task(query_id, task).await;
+
                 // Return immediately — execution happens asynchronously.
                 continue;
             }
@@ -3464,131 +3531,141 @@ impl PBackendService for PBackendServiceHandler {
                 let force_cpu = self.force_cpu;
                 let nixl_only = self.nixl_only;
                 let local_brpc_addr = self.local_brpc_addr.clone();
-                let exec_plan = exec_plan;
-                let output_names = output_names;
-                let output_indices = output_indices;
-                let exchange_infos = exchange_infos_with_local_destinations(
+                let exchange_infos_with_local = exchange_infos_with_local_destinations(
                     &params,
-                    exchange_infos,
+                    exchange_infos.clone(),
                     &local_brpc_addr,
                 );
-                let exchange_output_count = exchange_infos.len();
-                let hash_partition_info = exchange_hash_partition_info(&exchange_infos);
+                let all_local_exchange =
+                    exchange_infos_are_all_local(&exchange_infos_with_local, &local_brpc_addr);
+                let exchange_output_count = exchange_infos_with_local.len();
+                let hash_partition_info = exchange_hash_partition_info(&exchange_infos_with_local);
                 let plan_uses_gpu = exec_plan_uses_gpu(&exec_plan);
 
-                tokio::spawn(async move {
-                    let should_retain = should_capture_exchange_artifact(
-                        &exchange_infos,
-                        &exec_plan,
-                        nixl_agent.is_some(),
-                    ) && plan_uses_gpu;
+                if !all_local_exchange {
+                    let exec_plan = exec_plan;
+                    let output_names = output_names.clone();
+                    let output_indices = output_indices.clone();
+                    let exchange_infos = exchange_infos_with_local;
+                    let query_id = (params.query_id.hi, params.query_id.lo);
+                    let task = tokio::spawn(async move {
+                        let should_retain = should_capture_exchange_artifact(
+                            &exchange_infos,
+                            &exec_plan,
+                            nixl_agent.is_some(),
+                        ) && plan_uses_gpu;
 
-                    let exec_result = tokio::task::spawn_blocking(
-                        move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
-                            let engine = engine.lock().unwrap();
-                            if should_retain {
-                                let _ = engine.finalize_exchange_tables_direct();
-                                let partition_spec =
-                                    hash_partition_info
-                                        .as_ref()
-                                        .map(|(num_dests, col_indices)| {
-                                            (*num_dests, col_indices.as_slice())
-                                        });
-                                let _ = engine.begin_exchange_capture(partition_spec);
-                            }
-                            let ipc_bytes =
-                                execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
-                            if let Some(names) = output_names {
-                                tracing::info!(
-                                    exchange_outputs = exchange_output_count,
-                                    output_names = ?names,
-                                    output_indices = ?output_indices,
-                                    "skipping leaf IPC projection for exchange send"
-                                );
-                            }
-                            // Build location: GPU path only for hash-partitioned (has partitions).
-                            // Broadcast uses CPU IPC (staging only holds last batch).
-                            let location = if should_retain {
-                                let artifact = engine
-                                    .take_exchange_artifact()
-                                    .map_err(|e| format!("take_exchange_artifact: {e}"))?;
-                                exchange_location_from_artifact(ipc_bytes, artifact)
-                            } else {
-                                crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
-                            };
-                            Ok(location)
-                        },
-                    )
-                    .await;
-
-                    match exec_result {
-                        Ok(Ok(location)) => {
-                            if !exchange_infos.is_empty() {
-                                let query_id = (params.query_id.hi, params.query_id.lo);
-                                let sender_id = params
-                                    .local_params
-                                    .as_ref()
-                                    .and_then(|lp| lp.first())
-                                    .map(|p| p.sender_id.unwrap_or(0))
-                                    .unwrap_or(0);
-                                let desc_tbl_slots: Option<Vec<(i32, String)>> = params
-                                    .desc_tbl
-                                    .as_ref()
-                                    .and_then(|dt| dt.slot_descriptors.as_ref())
-                                    .map(|slots| {
-                                        slots.iter().map(|s| (s.id, s.col_name.clone())).collect()
-                                    });
-                                let send_result = if exchange_infos.len() == 1 {
-                                    crate::nixl_integration::send_exchange_with_nixl(
-                                        nixl_agent.as_ref(),
-                                        location,
-                                        &exchange_infos[0],
-                                        query_id,
-                                        sender_id,
-                                        nixl_only,
-                                        &local_brpc_addr,
-                                        &exchange_buffer,
-                                        desc_tbl_slots.as_deref(),
-                                    )
-                                    .await
+                        let exec_result = tokio::task::spawn_blocking(
+                            move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
+                                let engine = engine.lock().unwrap();
+                                if should_retain {
+                                    let _ = engine.finalize_exchange_tables_direct();
+                                    let partition_spec =
+                                        hash_partition_info
+                                            .as_ref()
+                                            .map(|(num_dests, col_indices)| {
+                                                (*num_dests, col_indices.as_slice())
+                                            });
+                                    let _ = engine.begin_exchange_capture(partition_spec);
+                                }
+                                let ipc_bytes =
+                                    execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
+                                if let Some(names) = output_names {
+                                    tracing::info!(
+                                        exchange_outputs = exchange_output_count,
+                                        output_names = ?names,
+                                        output_indices = ?output_indices,
+                                        "skipping leaf IPC projection for exchange send"
+                                    );
+                                }
+                                // Build location: GPU path only for hash-partitioned (has partitions).
+                                // Broadcast uses CPU IPC (staging only holds last batch).
+                                let location = if should_retain {
+                                    let artifact = engine
+                                        .take_exchange_artifact()
+                                        .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                                    exchange_location_from_artifact(ipc_bytes, artifact)
                                 } else {
-                                    let ipc_bytes = location.into_ipc_bytes();
-                                    let mut result = Ok(());
-                                    for exch_info in &exchange_infos {
-                                        if let Err(e) =
-                                            crate::nixl_integration::send_exchange_with_nixl(
-                                                nixl_agent.as_ref(),
-                                                crate::nixl_integration::ExecutionLocation::Cpu(
-                                                    ipc_bytes.clone(),
-                                                ),
-                                                exch_info,
-                                                query_id,
-                                                sender_id,
-                                                nixl_only,
-                                                &local_brpc_addr,
-                                                &exchange_buffer,
-                                                desc_tbl_slots.as_deref(),
-                                            )
-                                            .await
-                                        {
-                                            result = Err(e);
-                                            break;
-                                        }
-                                    }
-                                    result
+                                    crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes)
                                 };
-                                if let Err(e) = send_result {
-                                    tracing::warn!(error = %e, "async leaf exchange send failed");
+                                Ok(location)
+                            },
+                        )
+                        .await;
+
+                        match exec_result {
+                            Ok(Ok(location)) => {
+                                if !exchange_infos.is_empty() {
+                                    let query_id = (params.query_id.hi, params.query_id.lo);
+                                    let sender_id = params
+                                        .local_params
+                                        .as_ref()
+                                        .and_then(|lp| lp.first())
+                                        .map(|p| p.sender_id.unwrap_or(0))
+                                        .unwrap_or(0);
+                                    let desc_tbl_slots: Option<Vec<(i32, String)>> = params
+                                        .desc_tbl
+                                        .as_ref()
+                                        .and_then(|dt| dt.slot_descriptors.as_ref())
+                                        .map(|slots| {
+                                            slots.iter().map(|s| (s.id, s.col_name.clone())).collect()
+                                        });
+                                    let send_result = if exchange_infos.len() == 1 {
+                                        crate::nixl_integration::send_exchange_with_nixl(
+                                            nixl_agent.as_ref(),
+                                            location,
+                                            &exchange_infos[0],
+                                            query_id,
+                                            sender_id,
+                                            nixl_only,
+                                            &local_brpc_addr,
+                                            &exchange_buffer,
+                                            desc_tbl_slots.as_deref(),
+                                        )
+                                        .await
+                                    } else {
+                                        let ipc_bytes = location.into_ipc_bytes();
+                                        let mut result = Ok(());
+                                        for exch_info in &exchange_infos {
+                                            if let Err(e) =
+                                                crate::nixl_integration::send_exchange_with_nixl(
+                                                    nixl_agent.as_ref(),
+                                                    crate::nixl_integration::ExecutionLocation::Cpu(
+                                                        ipc_bytes.clone(),
+                                                    ),
+                                                    exch_info,
+                                                    query_id,
+                                                    sender_id,
+                                                    nixl_only,
+                                                    &local_brpc_addr,
+                                                    &exchange_buffer,
+                                                    desc_tbl_slots.as_deref(),
+                                                )
+                                                .await
+                                            {
+                                                result = Err(e);
+                                                break;
+                                            }
+                                        }
+                                        result
+                                    };
+                                    if let Err(e) = send_result {
+                                        tracing::warn!(error = %e, "async leaf exchange send failed");
+                                    }
                                 }
                             }
+                            Ok(Err(e)) => tracing::warn!(error = %e, "async leaf execution failed"),
+                            Err(e) => tracing::warn!(error = %e, "async leaf spawn_blocking panicked"),
                         }
-                        Ok(Err(e)) => tracing::warn!(error = %e, "async leaf execution failed"),
-                        Err(e) => tracing::warn!(error = %e, "async leaf spawn_blocking panicked"),
-                    }
-                });
+                    });
 
-                // Return immediately — leaf execution happens asynchronously.
-                continue;
+                    self.track_query_task(query_id, task).await;
+
+                    // Return immediately — leaf execution happens asynchronously.
+                    continue;
+                }
+
+                info!(exchange_outputs = exchange_output_count, "running all-local leaf exchange synchronously");
             }
 
             // If this leaf has exchange destinations and nixl is available,
