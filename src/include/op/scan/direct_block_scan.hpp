@@ -36,6 +36,13 @@ struct direct_block_scan_result {
   int64_t pin_time_us       = 0;
 };
 
+/// @brief Full column scan result including both data and validity segments.
+struct column_scan_result {
+  direct_block_scan_result data;
+  direct_block_scan_result validity;
+  bool has_nulls = false;  // True if any data segment reports HasNull()
+};
+
 /// @brief Walk segment tree, pin all blocks for a column.
 /// Returns raw data pointers ready for cudaMemcpy or GPU decode.
 direct_block_scan_result direct_block_scan_column(
@@ -49,5 +56,12 @@ size_t direct_copy_fixed_column(
   direct_block_scan_result& scan_result,
   uint8_t* dest_buffer,
   size_t type_size);
+
+/// @brief Walk segment tree for both data and validity, pin all blocks.
+/// Returns data segments + validity segments ready for GPU decode.
+column_scan_result direct_block_scan_column_full(
+  duckdb::DataTable& storage,
+  duckdb::StorageIndex col_idx,
+  duckdb::ClientContext& context);
 
 }  // namespace sirius::op::scan
