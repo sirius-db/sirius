@@ -4,14 +4,16 @@ This document covers the scan subsystem end-to-end: how data enters Super Sirius
 
 ## Overview
 
-Super Sirius supports two scan paths:
+Super Sirius supports four scan paths:
 
 | Path | Operator | Use Case | Data Flow |
 |------|----------|----------|-----------|
 | **DuckDB Scan** | `DUCKDB_SCAN` | General DuckDB-managed tables | DuckDB table function → column builders → `host_data_representation` |
 | **Parquet Scan** | `PARQUET_SCAN` | Direct Parquet file reading | Parquet byte ranges → `host_parquet_representation` |
+| **Metadata Scan** | `PARQUET_METADATA_SCAN` → `GPU_PARQUET_SCAN` | Two-pipeline Parquet reading | Metadata parsing pipeline → GPU parquet read pipeline |
+| **Iceberg Scan** | `ICEBERG_SCAN` | Apache Iceberg V1/V2 tables | Parquet scan + GPU-accelerated delete filters |
 
-Both paths funnel data through the same scan executor and data repository infrastructure.
+All paths funnel data through the same scan executor and data repository infrastructure.
 
 ## Scan Operators
 
@@ -40,6 +42,21 @@ Direct Parquet file scan. Maintains:
 - `scanned_ids` — mapping of projection IDs to file column indices
 - `has_more_partitions` — atomic flag for pipeline completion
 - Row groups are partitioned by `approximate_batch_size` in the global state
+
+### `sirius_physical_iceberg_scan`
+**File:** `src/include/op/sirius_physical_iceberg_scan.hpp`
+
+Iceberg table scan. Inherits from `sirius_physical_parquet_scan`. Holds delete file lists (`positional_delete_files`, `equality_delete_files`) and routes through the GPU parquet scan pipeline with a post-convert delete filter hook. See [Iceberg Scan](#iceberg-scan) below.
+
+### `sirius_parquet_metadata_scan_operator` — `PARQUET_METADATA_SCAN`
+**File:** `src/include/op/scan/sirius_parquet_metadata_scan_operator.hpp`
+
+First pipeline in the two-pipeline scan architecture. Parses Parquet footers and computes row group partitions. Its `get_next_task_input_data()` atomically advances `_next_file_idx` and returns a `parquet_metadata_input` covering up to 8 files. Its `execute()` reads footers (via `cudf::io::parquet::fetch_footer_to_host()`), attempts AST filter translation using `gpu_expression_translator`, and emits `partitioned_parquet_metadata` containing reader options, file metadata, and row-group partitions.
+
+### `sirius_gpu_parquet_scan_operator` — `GPU_PARQUET_SCAN`
+**File:** `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp`
+
+Second pipeline in the two-pipeline scan architecture. Acts as the sink of Pipeline 1 (accumulating metadata) and the source of Pipeline 2 (serving self-contained `parquet_scan_data` tasks). Each task calls `cudf::io::read_parquet`, applies fallback DuckDB expression filtering if AST translation failed, and prunes pure-filter columns post-filtering.
 
 ## DuckDB Scan Task
 
@@ -240,27 +257,74 @@ Uses deferred lambda with CUDA event synchronization:
 1. Records `cuda_event_guard` after async copies
 2. Returns future that syncs the event on `get()`
 
+## Row Group Pruning
+When filter pushdown is enabled and the `gpu_expression_translator` successfully converts DuckDB `TableFilterSet` filters into a cuDF AST, two optimizations activate:
+
+1. **Row group statistics pruning:** During `parquet_scan_task_global_state::initialize_from_files()`, `filter_row_groups_with_stats()` uses Parquet column min/max statistics to discard row groups that cannot match the filter predicate — before any I/O is scheduled.
+
+2. **Reader-level filter pushdown:** The cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. The `TABLE_SCAN` operator is set to passthrough (`passthrough = true`) since filtering is already done by the reader.
+
+If AST translation fails (e.g., unsupported expression types), the `TABLE_SCAN` operator runs the `GpuExpressionExecutor` on the decoded batch as before.
+
+**Filter translation path:** `TableFilterSet` → `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER` and `IS_NOT_NULL` types) → `gpu_expression_translator` → cuDF AST tree.
+
+## Batch Coalescing
+When many small Parquet files each produce a tiny GPU batch, per-task scheduling and kernel launch overhead dominates. Two mechanisms address this:
+
+1. **Accumulation in `get_next_task_input_data()`** (`sirius_physical_table_scan`): Pops batches in a loop until `accumulated_bytes >= scan_task_batch_size` OR `batch_count >= 32`, returning a `pipelineable_operator_data` wrapping the accumulated batches.
+
+2. **GPU concatenation in `execute()`**: When multiple batches are accumulated, calls `cudf::concatenate()` to produce a single fused table before filtering/projecting, reducing kernel launches.
+
+When the parquet scan pipeline applies filter+projection via the cuDF reader (passthrough mode from filter pushdown), `TABLE_SCAN` skips concatenation — only the DuckDB-source code path goes through coalescing.
+
+## Iceberg Scan
+
+**File:** `src/include/op/sirius_physical_iceberg_scan.hpp`, `src/op/scan/iceberg_scan_task.cpp`
+
+`sirius_physical_iceberg_scan` inherits from `sirius_physical_parquet_scan` and adds support for Iceberg V1 and V2 tables.
+
+### Supported Iceberg Features
+
+| Version | Feature | Implementation |
+|---------|---------|---------------|
+| V1 | Append-only (no deletes) | Identical to plain parquet scan |
+| V2 | Positional deletes | `positional_delete_filter`: binary-searches sorted row positions, builds boolean mask, applies `cudf::apply_boolean_mask` |
+| V2 | Equality deletes | `equality_delete_filter`: builds `cudf::distinct_hash_join` with delete key rows, probes with data chunk keys, computes anti-join mask on GPU via `thrust::transform` (custom CUDA kernel in `equality_delete_mask.cu`), applies `cudf::apply_boolean_mask` |
+
+### Architecture
+
+- `iceberg_scan_task_global_state` inherits from `parquet_scan_task_global_state`. Its `build_delete_pipeline()` reads delete files via `iceberg_metadata_reader` (lightweight Avro parser for manifest-list and manifest files) and installs a composed `iceberg_delete_pipeline` as a `post_convert_fn_t` hook.
+- The `post_convert_fn_t` hook fires after each row-group batch is decompressed to a `cudf::table`, applying all delete filters in-place with zero `cudaMemcpy D2H` in the hot path.
+- Equality-delete key columns not in the user's projection are force-projected, then stripped via zero-copy `release()` + truncate after all filters run.
+- V3 deletion vectors are not yet implemented but the interface supports adding them.
+
 ## Complete Scan Flow
 
 ```mermaid
 graph TD
     TS[sirius_physical_table_scan] -->|"converted"| DS[DUCKDB_SCAN]
     TS -->|"or"| PS[PARQUET_SCAN]
+    TS -->|"or"| IS[ICEBERG_SCAN]
 
     DS -->|"task_creator.schedule()"| TC[task_creator]
     PS -->|"task_creator.schedule()"| TC
+    IS -->|"task_creator.schedule()"| TC
 
     TC -->|"create task"| DST[duckdb_scan_task]
     TC -->|"create task"| PST[parquet_scan_task]
+    TC -->|"create task"| IST["iceberg_scan_task<br/>(parquet + delete filters)"]
 
     DST -->|"dispatch"| SE[scan_executor]
     PST -->|"dispatch"| SE
+    IST -->|"dispatch"| SE
 
     SE -->|"execute on worker"| DST2[DuckDB table function → column builders → host_data_representation]
     SE -->|"execute on worker"| PST2[Parquet byte reads → host_parquet_representation]
+    SE -->|"execute on worker"| IST2["Parquet reads → GPU delete filters → host_parquet_representation"]
 
     DST2 -->|"publish"| DR[data_repository]
     PST2 -->|"publish"| DR
+    IST2 -->|"publish"| DR
 
     DR -->|"consumed by"| GPT[gpu_pipeline_task]
 ```
@@ -280,4 +344,10 @@ graph TD
 | `src/op/scan/cached_ranges.cpp` | Byte range coalescing and lookup |
 | `src/include/op/scan/cached_ranges.hpp` | Cache range structure |
 | `src/include/op/scan/config.hpp` | Scan config, cache_level enum |
+| `src/include/op/scan/sirius_parquet_metadata_scan_operator.hpp` | Metadata scan operator (two-pipeline architecture) |
+| `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp` | GPU parquet scan operator (two-pipeline architecture) |
+| `src/include/op/sirius_physical_iceberg_scan.hpp` | Iceberg scan operator |
+| `src/include/op/scan/iceberg_scan_task.hpp` | Iceberg scan task with delete filters |
+| `src/include/op/scan/iceberg_metadata_reader.hpp` | Iceberg Avro manifest reader |
+| `src/op/scan/scan_utils.cpp` | Row group pruning, `build_batch_column_map()` |
 | `src/include/data/cached_data_representation.hpp` | Cached data wrappers |
