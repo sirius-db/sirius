@@ -177,9 +177,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
     throw invalid_input_exception("sirius_physical_plan is NULL");
   auto& result_collector =
     sirius_physical_plan.get()->Cast<op::sirius_physical_materialized_collector>();
-  result_collector.sink_state = result_collector.get_global_sink_state(context);
-  duckdb::unique_ptr<duckdb::QueryResult> res =
-    result_collector.get_result(*(result_collector.sink_state));
+  duckdb::unique_ptr<duckdb::QueryResult> res = result_collector.get_result();
   return res;
 }
 

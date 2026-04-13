@@ -19,12 +19,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
-#include "duckdb/common/enums/order_preservation_type.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/execution/execution_context.hpp"
-#include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -193,11 +189,7 @@ class sirius_physical_operator {
   //! The unique ID of this operator (auto-incremented at creation)
   size_t operator_id;
 
-  //! The global sink state of this operator
-  duckdb::unique_ptr<duckdb::GlobalSinkState> sink_state;
-  //! The global state of this operator
-  duckdb::unique_ptr<duckdb::GlobalOperatorState> op_state;
-  //! Lock for (re)setting any of the operator states
+  //! Lock for concurrent access to operator state
   std::mutex lock;
 
  public:
@@ -223,45 +215,27 @@ class sirius_physical_operator {
 
  public:
   // Operator interface
-  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(
-    duckdb::ExecutionContext& context) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
-    duckdb::ClientContext& context) const;
-
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
-  virtual duckdb::OrderPreservationType operator_order() const
+  virtual sirius::OrderPreservationType operator_order() const
   {
-    return duckdb::OrderPreservationType::INSERTION_ORDER;
+    return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Source interface
-  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
-    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
-    duckdb::ClientContext& context) const;
-
   virtual bool is_source() const { return false; }
 
   //! The type of order emitted by the operator (as a source)
-  virtual duckdb::OrderPreservationType source_order() const
+  virtual sirius::OrderPreservationType source_order() const
   {
-    return duckdb::OrderPreservationType::INSERTION_ORDER;
+    return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Sink interface
-  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
-    duckdb::ExecutionContext& context) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
-    duckdb::ClientContext& context) const;
-
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }

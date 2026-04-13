@@ -72,7 +72,7 @@ class sirius_physical_plan_generator {
                                        sirius::op::sirius_physical_operator& plan);
   //! The order preservation type of the given operator decided by recursively looking at its
   //! children
-  static duckdb::OrderPreservationType order_preservation_recursive(
+  static sirius::OrderPreservationType order_preservation_recursive(
     sirius::op::sirius_physical_operator& op);
 
   static bool has_equality(duckdb::vector<duckdb::JoinCondition>& conds, std::size_t& range_count);

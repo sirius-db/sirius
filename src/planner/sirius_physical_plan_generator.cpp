@@ -35,7 +35,7 @@ sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientCon
 
 sirius_physical_plan_generator::~sirius_physical_plan_generator() {}
 
-duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
+sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
   sirius::op::sirius_physical_operator& op)
 {
   if (op.is_source()) { return op.source_order(); }
@@ -48,23 +48,23 @@ duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation
       continue;
     }
     auto child_preservation = order_preservation_recursive(*child);
-    if (child_preservation != duckdb::OrderPreservationType::INSERTION_ORDER) {
+    if (child_preservation != sirius::OrderPreservationType::INSERTION_ORDER) {
       return child_preservation;
     }
     child_idx++;
   }
-  return duckdb::OrderPreservationType::INSERTION_ORDER;
+  return sirius::OrderPreservationType::INSERTION_ORDER;
 }
 
 bool sirius_physical_plan_generator::preserve_insertion_order(
   duckdb::ClientContext& context, sirius::op::sirius_physical_operator& plan)
 {
   auto preservation_type = order_preservation_recursive(plan);
-  if (preservation_type == duckdb::OrderPreservationType::FIXED_ORDER) {
+  if (preservation_type == sirius::OrderPreservationType::FIXED_ORDER) {
     // always need to maintain preservation order
     return true;
   }
-  if (preservation_type == duckdb::OrderPreservationType::NO_ORDER) {
+  if (preservation_type == sirius::OrderPreservationType::NO_ORDER) {
     // never need to preserve order
     return false;
   }

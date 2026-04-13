@@ -75,8 +75,6 @@ void sirius_physical_result_collector::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   // operator is a sink, build a pipeline
-  sink_state.reset();
-
   D_ASSERT(children.empty());
 
   // single operator: the operator becomes the data source of the current pipeline
@@ -96,11 +94,8 @@ sirius_physical_materialized_collector::sirius_physical_materialized_collector(
 {
 }
 
-duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::get_result(
-  duckdb::GlobalSinkState& state)
+duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::get_result()
 {
-  (void)state;  // Silence unused parameter warning
-
   auto props = _client_ctx.GetClientProperties();
 
   std::lock_guard<std::mutex> guard(lock);

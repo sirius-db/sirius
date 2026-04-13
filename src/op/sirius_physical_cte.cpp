@@ -51,8 +51,6 @@ void sirius_physical_cte::build_pipelines(pipeline::sirius_pipeline& current,
                                           pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   D_ASSERT(children.size() == 2);
-  op_state.reset();
-  sink_state.reset();
 
   auto& state = meta_pipeline.get_state();
 

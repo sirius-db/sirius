@@ -54,9 +54,9 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::FIXED_ORDER;
+    return sirius::OrderPreservationType::FIXED_ORDER;
   }
 
  public:

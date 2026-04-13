@@ -107,9 +107,6 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
 void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline& current,
                                                       pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  op_state.reset();
-  sink_state.reset();
-
   auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
   child_meta_pipeline.build(*children[0]);
 
@@ -130,9 +127,6 @@ void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline&
 void sirius_physical_right_delim_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  op_state.reset();
-  sink_state.reset();
-
   auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
   child_meta_pipeline.build(*children[0]);
 

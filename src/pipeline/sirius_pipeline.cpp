@@ -44,13 +44,13 @@ bool sirius_pipeline::is_order_dependent() const
 {
   if (source) {
     auto source_order = source->source_order();
-    if (source_order == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
-    if (source_order == duckdb::OrderPreservationType::NO_ORDER) { return false; }
+    if (source_order == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
+    if (source_order == sirius::OrderPreservationType::NO_ORDER) { return false; }
   }
   for (auto& op_ref : operators) {
     auto& op = op_ref.get();
-    if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
-    if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
+    if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
+    if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
   }
   if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(engine.context)) {
     return false;
