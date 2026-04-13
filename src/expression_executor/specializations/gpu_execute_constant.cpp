@@ -49,7 +49,7 @@ execute_result make_execute_result_from_scalar(
   execution_mode mode)
 {
   if (mode == execution_mode::AST) {
-    auto expr_ref              = ast_tree.emplace<cudf::ast::literal>(*device_scalar);
+    auto const& expr_ref       = ast_tree.emplace<cudf::ast::literal>(*device_scalar);
     auto const temp_scalar_idx = temp_scalars.size();
     temp_scalars.push_back(std::move(device_scalar));
     return execute_result(ast_node(expr_ref, {temp_scalar_idx}, std::vector<std::size_t>{}));
