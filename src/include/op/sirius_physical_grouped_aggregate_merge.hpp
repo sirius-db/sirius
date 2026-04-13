@@ -115,9 +115,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   // Source interface
   bool is_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::NO_ORDER;
+    return sirius::OrderPreservationType::NO_ORDER;
   }
 
   // Sink interface
