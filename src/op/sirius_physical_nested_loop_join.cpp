@@ -211,9 +211,6 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
   sirius_physical_operator& op,
   bool build_rhs)
 {
-  op.op_state.reset();
-  op.sink_state.reset();
-
   auto& state = meta_pipeline.get_state();
   state.add_pipeline_operator(current, op);
 
