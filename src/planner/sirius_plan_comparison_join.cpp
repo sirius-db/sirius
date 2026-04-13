@@ -307,9 +307,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     //                                     std::move(op.filter_pushdown));
     // join.Cast<PhysicalHashJoin>().join_stats = std::move(op.join_stats);
     // return join;
-    const auto& op_params = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                              ->get_config()
-                              .get_operator_params();
+    uint64_t max_build_ht_bytes = sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (sirius_ctx) {
+      max_build_ht_bytes = sirius_ctx->get_config().get_operator_params().max_build_hash_table_bytes;
+    }
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,
       std::move(left),
@@ -321,7 +323,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(op.mark_types),
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
-      op_params.max_build_hash_table_bytes);
+      max_build_ht_bytes);
     auto& hj      = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats = std::move(op.join_stats);
 
