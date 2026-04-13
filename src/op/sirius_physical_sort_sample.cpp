@@ -51,7 +51,7 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
 std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
 {
   // If boundaries already computed, use default behavior (process batches as they arrive)
-  if (_boundaries_computed.load()) { return sirius_physical_operator::get_next_task_hint(); }
+  if (_boundary_state.load(std::memory_order_acquire) == 2) { return sirius_physical_operator::get_next_task_hint(); }
 
   // Need to wait for N batches before computing boundaries
   auto port_ids = get_port_ids();
@@ -82,8 +82,18 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_data_batches();
 
-  // After boundaries are computed, just pass through
-  if (_boundaries_computed.load()) {
+  // Fast path: boundaries already computed — just pass through.
+  if (_boundary_state.load(std::memory_order_acquire) == 2) {
+    SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+  }
+
+  // Elect exactly one winner via CAS (0=not started → 1=computing).
+  // The task_creator's while loop dispatches one task per batch, so multiple tasks
+  // can be in-flight simultaneously. Losers passthrough without blocking — they don't
+  // need the boundaries themselves; sort_partition accesses them in a later pipeline.
+  int expected = 0;
+  if (!_boundary_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -102,7 +112,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   }
 
   if (valid_batches.empty() || !space) {
-    _boundaries_computed.store(true);
+    _boundary_state.store(2, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -237,10 +247,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                          cudf::out_of_bounds_policy::DONT_CHECK,
                                          stream,
                                          space->get_default_allocator());
-    _num_partitions       = num_parts;
+    _num_partitions = num_parts;
   }
 
-  _boundaries_computed.store(true);
+  // Pipeline framework calls stream.synchronize() after execute() returns, before
+  // publish_output(). Pipeline C only starts after all Pipeline B tasks complete,
+  // so _partition_boundaries is fully materialized on the GPU before sort_partition
+  // ever reads it. No explicit sync needed here.
+  _boundary_state.store(2, std::memory_order_release);
 
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
