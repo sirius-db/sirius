@@ -25,8 +25,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
         with:
           cache: false
           pixi-version: v0.65.0
@@ -49,26 +51,66 @@ jobs:
         build-type:
           - release
           - debug
+        environment: [default]
+        cudf-channel:
+          - stable
         exclude:
           - compiler: gcc
             build-type: debug
           - compiler: clang
             build-type: release
+        include:
+          - arch: x64
+            compiler: gcc
+            build-type: release
+            environment: vcpkg
+            cudf-channel: stable
+          - arch: arm64
+            compiler: gcc
+            build-type: release
+            environment: default
+            cudf-channel: nightly
       fail-fast: false
-    runs-on: ${{ format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
+    runs-on: >-
+      ${{ matrix.environment == 'vcpkg'
+        && fromJSON('["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"]')
+        || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
+    timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
+    continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+      - name: Unshallow vcpkg for version overrides
+        if: matrix.environment == 'vcpkg'
+        run: git -C vcpkg rev-parse --is-shallow-repository | grep -q true && git -C vcpkg fetch --unshallow || true
+
+      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
         with:
           cache: false
           pixi-version: v0.65.0
-          activate-environment: true
+          activate-environment: ${{ matrix.environment != 'vcpkg' && matrix.cudf-channel != 'nightly' }}
+          environments: >-
+            ${{ matrix.cudf-channel == 'nightly' && 'nightly-runner'
+              || matrix.environment }}
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      - run: make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        if: matrix.environment == 'vcpkg'
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+        if: matrix.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"
+
+      - name: Build (vcpkg)
+        if: matrix.environment == 'vcpkg'
+        run: |
+          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
+          pixi run -e vcpkg cmake --build build/vcpkg-release

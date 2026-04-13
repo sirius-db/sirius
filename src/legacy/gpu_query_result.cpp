@@ -84,13 +84,11 @@ idx_t GPUQueryResult::RowCount() const
   return row_count;
 }
 
-unique_ptr<DataChunk> GPUQueryResult::Fetch() { return FetchRaw(); }
+unique_ptr<DataChunk> GPUQueryResult::FetchInternal() { return result_collection->GetNext(); }
 
 Value GPUQueryResult::GetValue(idx_t column, idx_t index)
 {
   throw InternalException("GetValue not implemented for GPUQueryResult");
 }
-
-unique_ptr<DataChunk> GPUQueryResult::FetchRaw() { return result_collection->GetNext(); }
 
 }  // namespace duckdb

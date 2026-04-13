@@ -31,7 +31,7 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::BoundLimitNode limit_val_p,
   duckdb::BoundLimitNode offset_val_p,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   bool parallel)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::STREAMING_LIMIT, std::move(types), estimated_cardinality),
@@ -68,7 +68,8 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
     throw duckdb::NotImplementedException("Streaming limit with non-constant limit value");
@@ -123,7 +124,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     _limit_exhausted.store(true, std::memory_order_release);
   }
 
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 std::string sirius_physical_streaming_limit::params_to_string() const

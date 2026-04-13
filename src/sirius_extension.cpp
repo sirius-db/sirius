@@ -30,6 +30,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
@@ -45,6 +46,7 @@ extern "C" int cudaProfilerStop();
 #include "gpu_physical_plan_generator.hpp"
 #endif
 #include "gpu_explain.hpp"
+#include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -69,6 +71,84 @@ struct SiriusTableFunctionData : public TableFunctionData {
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
+  //! Original options from the connection
+  ClientConfig original_config;
+  set<OptimizerType> original_disabled_optimizers;
+
+  void PrepareConnection(ClientContext& context)
+  {
+    // First collect original options
+    original_config              = context.config;
+    original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
+
+    // The user might want to disable the optimizer of the new connection
+    context.config.enable_optimizer = enable_optimizer;
+    // We want for sure to disable the internal compression optimizations.
+    // These are DuckDB specific, no other system implements these. Also,
+    // respect the user's settings if they chose to disable any specific optimizers.
+    //
+    // The InClauseRewriter optimization converts large `IN` clauses to a
+    // "mark join" against a `ColumnDataCollection`, which may not make
+    // sense in other systems and would complicate the conversion to Substrait.
+    set<OptimizerType> disabled_optimizers =
+      DBConfig::GetConfig(context).options.disabled_optimizers;
+    disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
+    disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
+    // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
+    // If error(varchar) gets implemented in substrait this can be removed
+    // context.config.scalar_subquery_error_on_multiple_rows = false;
+    DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
+  }
+
+  // Reset configuration
+  void CleanupConnection(ClientContext& context) const
+  {
+    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled_optimizers;
+    context.config                                           = original_config;
+  }
+
+  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context)
+  {
+    PrepareConnection(context);
+    unique_ptr<LogicalOperator> plan;
+    try {
+      Parser parser(context.GetParserOptions());
+      parser.ParseQuery(query);
+
+      Planner planner(context);
+      planner.CreatePlan(std::move(parser.statements[0]));
+      D_ASSERT(planner.plan);
+
+      plan = std::move(planner.plan);
+
+      if (context.config.enable_optimizer) {
+        Optimizer optimizer(*planner.binder, context);
+        plan = optimizer.Optimize(std::move(plan));
+      }
+
+      // After optimization, refresh types before column binding resolution
+      // to ensure types are consistent (some optimizers may have set stale types)
+      plan->ResolveOperatorTypes();
+
+      ColumnBindingResolver resolver;
+      ColumnBindingResolver::Verify(*plan);
+      resolver.VisitOperator(*plan);
+    } catch (...) {
+      CleanupConnection(context);
+      throw;
+    }
+
+    CleanupConnection(context);
+    return plan;
+  }
 };
 
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -83,6 +163,84 @@ struct GPUTableFunctionData : public TableFunctionData {
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
+  //! Original options from the connection
+  ClientConfig original_config;
+  set<OptimizerType> original_disabled_optimizers;
+
+  void PrepareConnection(ClientContext& context)
+  {
+    // First collect original options
+    original_config              = context.config;
+    original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
+
+    // The user might want to disable the optimizer of the new connection
+    context.config.enable_optimizer = enable_optimizer;
+    // We want for sure to disable the internal compression optimizations.
+    // These are DuckDB specific, no other system implements these. Also,
+    // respect the user's settings if they chose to disable any specific optimizers.
+    //
+    // The InClauseRewriter optimization converts large `IN` clauses to a
+    // "mark join" against a `ColumnDataCollection`, which may not make
+    // sense in other systems and would complicate the conversion to Substrait.
+    set<OptimizerType> disabled_optimizers =
+      DBConfig::GetConfig(context).options.disabled_optimizers;
+    disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
+    disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
+    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
+    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
+    // to keep the query on the scan -> aggregate path where the GPU can execute it.
+    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
+    // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
+    // If error(varchar) gets implemented in substrait this can be removed
+    // context.config.scalar_subquery_error_on_multiple_rows = false;
+    DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
+  }
+
+  // Reset configuration
+  void CleanupConnection(ClientContext& context) const
+  {
+    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled_optimizers;
+    context.config                                           = original_config;
+  }
+
+  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context)
+  {
+    PrepareConnection(context);
+    unique_ptr<LogicalOperator> plan;
+    try {
+      Parser parser(context.GetParserOptions());
+      parser.ParseQuery(query);
+
+      Planner planner(context);
+      planner.CreatePlan(std::move(parser.statements[0]));
+      D_ASSERT(planner.plan);
+
+      plan = std::move(planner.plan);
+
+      if (context.config.enable_optimizer) {
+        Optimizer optimizer(*planner.binder, context);
+        plan = optimizer.Optimize(std::move(plan));
+      }
+
+      // After optimization, refresh types before column binding resolution
+      // to ensure types are consistent (some optimizers may have set stale types)
+      plan->ResolveOperatorTypes();
+
+      ColumnBindingResolver resolver;
+      ColumnBindingResolver::Verify(*plan);
+      resolver.VisitOperator(*plan);
+    } catch (...) {
+      CleanupConnection(context);
+      throw;
+    }
+
+    CleanupConnection(context);
+    return plan;
+  }
 };
 
 void do_nothing_context(ClientContext*) {}
@@ -877,12 +1035,20 @@ static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
 
-  auto& db     = loader.GetDatabaseInstance();
-  auto& config = DBConfig::GetConfig(db);
-  config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
+  auto& db           = loader.GetDatabaseInstance();
+  auto& config       = DBConfig::GetConfig(db);
+  auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr = callback.get();
+  config.GetCallbackManager().Register(std::move(callback));
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register SiriusContext on connections that were opened before the extension
+  // was loaded (e.g. when loaded via LOAD in Python or the CLI).
+  for (auto& ctx : ConnectionManager::Get(db).GetConnectionList()) {
+    callback_ptr->OnConnectionOpened(*ctx);
+  }
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }

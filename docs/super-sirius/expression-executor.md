@@ -21,7 +21,7 @@ Both methods accept a `data_batch` and return a new `data_batch` with the result
 |----------------|-------|---------|
 | Column reference | `BoundReferenceExpression` | `column #3` |
 | Constant | `BoundConstantExpression` | `42`, `'hello'` |
-| Comparison | `BoundComparisonExpression` | `a > b`, `x = 10` |
+| Comparison | `BoundComparisonExpression` | `a > b`, `x = 10`, `a IS NOT DISTINCT FROM b` |
 | Conjunction | `BoundConjunctionExpression` | `a AND b`, `x OR y` |
 | Arithmetic/logical | `BoundOperatorExpression` | `a + b`, `NOT x` |
 | Function call | `BoundFunctionExpression` | `UPPER(name)`, `YEAR(date)` |
@@ -75,6 +75,10 @@ struct translated_expression {
 | Casting | Fixed-width types (INT, FLOAT, DOUBLE) |
 | Column references | With LEFT/RIGHT table reference tracking |
 
+### IS NOT DISTINCT FROM
+
+`IS NOT DISTINCT FROM` is supported in GPU comparison execution via `cudf::binary_operator::NULL_EQUALS`, which treats NULLs as equal (unlike standard comparisons where NULL comparisons yield NULL). This enables full GPU execution for IS NOT DISTINCT FROM predicates.
+
 ### Unsupported Translations
 
 These return `nullopt`, causing the caller to fall back to row-by-row evaluation:
@@ -82,7 +86,7 @@ These return `nullopt`, causing the caller to fall back to row-by-row evaluation
 - COALESCE, TRY
 - CAST with non-fixed-width types (e.g., VARCHAR)
 - Parameter expressions
-- DISTINCT operators
+- DISTINCT operators (IS DISTINCT FROM throws `NotImplementedException`)
 
 ### Join Condition Translation
 

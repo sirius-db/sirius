@@ -27,7 +27,7 @@ namespace op {
 sirius_physical_filter::sirius_physical_filter(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-  duckdb::idx_t estimated_cardinality)
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
 {
@@ -50,7 +50,8 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
                                                                rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_filter::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   // The executor uses the data_batch API to filter rows according to `expression`.
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
@@ -63,7 +64,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
     auto filtered_batch = gpu_expression_executor.select(batch, stream);
     if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
   }
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 std::string sirius_physical_filter::params_to_string() const

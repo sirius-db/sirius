@@ -35,7 +35,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
         with:
           cache: false
           pixi-version: v0.65.0
@@ -52,7 +52,7 @@ jobs:
         run: tar -cf build.tar build/release/
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: build.tar
           if-no-files-found: error
@@ -65,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
+      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
         with:
           cache: false
           pixi-version: v0.65.0
@@ -88,7 +88,7 @@ jobs:
 
       - name: TPC-H performance snapshot
         env:
-          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.cfg
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
           PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
         run: |
           ./test/tpch_performance/benchmark_and_validate.sh 1

@@ -40,7 +40,7 @@ duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation
 {
   if (op.is_source()) { return op.source_order(); }
 
-  duckdb::idx_t child_idx = 0;
+  std::size_t child_idx = 0;
   for (auto& child : op.children) {
     // Do not take the materialization phase of physical CTEs into account
     if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE && child_idx == 0) {
@@ -69,7 +69,7 @@ bool sirius_physical_plan_generator::preserve_insertion_order(
     return false;
   }
   // preserve insertion order - check flags
-  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(context)) {
+  if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context)) {
     // preserving insertion order is disabled by config
     return false;
   }
@@ -88,18 +88,18 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
   // Resolve the types of each operator.
-  profiler.StartPhase(duckdb::MetricsType::PHYSICAL_PLANNER_RESOLVE_TYPES);
+  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
   op->ResolveOperatorTypes();
   profiler.EndPhase();
 
   // Resolve the column references.
-  profiler.StartPhase(duckdb::MetricsType::PHYSICAL_PLANNER_COLUMN_BINDING);
+  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
   duckdb::ColumnBindingResolver resolver;
   resolver.VisitOperator(*op);
   profiler.EndPhase();
 
   // then create the main physical plan
-  profiler.StartPhase(duckdb::MetricsType::PHYSICAL_PLANNER_CREATE_PLAN);
+  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
   auto plan = create_plan(*op);
   profiler.EndPhase();
 

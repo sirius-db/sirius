@@ -15,11 +15,9 @@
  */
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
-// #include "sirius_physical_expression_scan.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -31,57 +29,30 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalExpressionGet& op)
   D_ASSERT(op.children.size() == 1);
   auto plan = create_plan(*op.children[0]);
 
-  // auto expr_scan = duckdb::make_uniq<PhysicalExpressionScan>(op.types, std::move(op.expressions),
-  // op.estimated_cardinality); expr_scan->children.push_back(std::move(plan)); if
-  // (!expr_scan->IsFoldable()) { 	return std::move(expr_scan);
-  // }
-  // auto &allocator = duckdb::Allocator::Get(context);
-  // simple expression scan (i.e. no subqueries to evaluate and no prepared statement parameters)
-  // we can evaluate all the expressions right now and turn this into a chunk collection scan
+  // Evaluate all expressions at plan time using DuckDB's ExpressionExecutor
+  // and materialize results into a ColumnDataCollection. This mirrors DuckDB's
+  // own foldable optimization in plan_expression_get.cpp.
+  auto collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(context, op.types);
+
+  auto& allocator = duckdb::Allocator::Get(context);
+  duckdb::DataChunk chunk;
+  chunk.Initialize(allocator, op.types);
+
+  duckdb::ColumnDataAppendState append_state;
+  collection->InitializeAppend(append_state);
+  for (std::size_t expression_idx = 0; expression_idx < op.expressions.size(); expression_idx++) {
+    duckdb::ExpressionExecutor executor(context, op.expressions[expression_idx]);
+    chunk.Reset();
+    executor.Execute(chunk);
+    collection->Append(append_state, chunk);
+  }
+
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
     op.types,
     sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
     op.expressions.size(),
-    duckdb::make_uniq<duckdb::ColumnDataCollection>(context, op.types));
+    std::move(collection));
 
-  // DataChunk chunk;
-  // chunk.Initialize(allocator, op.types);
-
-  // ColumnDataAppendState append_state;
-  // chunk_scan->collection->InitializeAppend(append_state);
-  // for (duckdb::idx_t expression_idx = 0; expression_idx < expr_scan->expressions.size();
-  // expression_idx++) { 	chunk.Reset(); 	expr_scan->EvaluateExpression(context, expression_idx,
-  // nullptr, chunk); 	chunk_scan->collection->Append(append_state, chunk);
-  // }
-  // return std::move(chunk_scan);
-  // duckdb::GPUBufferManager* gpuBufferManager = &(duckdb::GPUBufferManager::GetInstance());
-  // cudf::set_current_device_resource(gpuBufferManager->mr);
-  for (duckdb::idx_t expression_idx = 0; expression_idx < op.expressions.size(); expression_idx++) {
-    SIRIUS_LOG_DEBUG("Expression idx: {}", expression_idx);
-    if (op.expressions[expression_idx].size() > 1) {
-      throw duckdb::NotImplementedException("Expression get not supported");
-    }
-    // uint64_t* h_data = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-    // uint64_t* d_data = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-    if (op.expressions[expression_idx][0]->type == duckdb::ExpressionType::VALUE_CONSTANT) {
-      auto& constant_expr =
-        op.expressions[expression_idx][0]->Cast<duckdb::BoundConstantExpression>();
-      if (constant_expr.value.type() != duckdb::LogicalType::BIGINT) {
-        throw duckdb::InvalidInputException("Expression get only supports BIGINT constants");
-      }
-      // h_data[0] = constant_expr.value.GetValue<uint64_t>();
-      // callCudaMemcpy(d_data, h_data, 1 * sizeof(uint64_t), cudaMemcpyHostToDevice);
-      // duckdb::callCudaMemcpyHostToDevice<uint64_t>(d_data, h_data, 1, 0);
-    } else {
-      throw duckdb::NotImplementedException("Expression get not supported");
-    }
-    // chunk_scan->intermediate_relation             =
-    // duckdb::make_shared_ptr<duckdb::GPUIntermediateRelation>(1); auto validity_mask =
-    // duckdb::createNullMask(1); chunk_scan->intermediate_relation->columns[0] =
-    // duckdb::make_shared_ptr<duckdb::GPUColumn>(
-    //   1, duckdb::GPUColumnType(duckdb::GPUColumnTypeId::INT64),
-    //   reinterpret_cast<uint8_t*>(d_data), validity_mask);
-  }
   return std::move(chunk_scan);
 }
 
