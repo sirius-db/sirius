@@ -123,8 +123,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       }
     };
 
-    auto left      = execute(*expr.children[0], execution_mode::AST);
-    auto right     = execute(*expr.children[1], execution_mode::AST);
+    auto left             = execute(*expr.children[0], execution_mode::AST);
+    auto right            = execute(*expr.children[1], execution_mode::AST);
     auto const& func_expr = _ast_tree.emplace<cudf::ast::operation>(
       function_type_switch_ast(func_string), left.get_expr(), right.get_expr());
 
