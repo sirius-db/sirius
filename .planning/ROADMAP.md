@@ -30,8 +30,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans:** 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — TDD: Implement inspectable_mpsc header + single-threaded unit tests
-- [ ] 01-02-PLAN.md — Multi-threaded MPSC concurrency stress tests (SAFE-01)
+- [x] 01-01-PLAN.md — TDD: Implement inspectable_mpsc header + single-threaded unit tests
+- [x] 01-02-PLAN.md — Multi-threaded MPSC concurrency stress tests (SAFE-01)
 
 ### Phase 2: Predicate Inspection
 **Goal**: Consumers can search the queue for specific elements by predicate and selectively remove or inspect them, with control over search direction
