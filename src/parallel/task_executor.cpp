@@ -19,7 +19,10 @@
 namespace sirius {
 namespace parallel {
 
-void itask_executor::schedule(std::unique_ptr<itask> task) { _task_queue.push(std::move(task)); }
+void itask_executor::schedule(std::unique_ptr<itask> task)
+{
+  static_cast<void>(_task_queue.push(std::move(task)));
+}
 
 void itask_executor::start()
 {
