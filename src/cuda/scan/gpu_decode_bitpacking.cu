@@ -259,7 +259,8 @@ static void decode_typed(
     rmm::cuda_stream_view stream,
     void* d_scratch,
     void* d_meta_scratch,
-    size_t meta_scratch_size)
+    size_t meta_scratch_size,
+    bool skip_block_copy)
 {
   // 1. Parse metadata on host
   auto groups = parse_metadata(segment_data, block_offset, row_count, sizeof(T));
@@ -274,8 +275,10 @@ static void decode_typed(
     cudaMallocAsync(&d_segment, segment_size, stream.value());
     own_segment = true;
   }
-  cudaMemcpyAsync(d_segment, segment_data, segment_size,
-                  cudaMemcpyHostToDevice, stream.value());
+  if (!skip_block_copy) {
+    cudaMemcpyAsync(d_segment, segment_data, segment_size,
+                    cudaMemcpyHostToDevice, stream.value());
+  }
 
   // 3. Copy metadata array to GPU — use scratch buffer if provided
   gpu_bp_meta* d_meta = nullptr;
@@ -322,19 +325,20 @@ void gpu_decode_bitpacking(
     rmm::cuda_stream_view stream,
     void* d_scratch,
     void* d_meta_scratch,
-    size_t meta_scratch_size)
+    size_t meta_scratch_size,
+    bool skip_block_copy)
 {
   // Fully async — caller is responsible for stream synchronization.
   switch (type_size) {
     case 4:
       is_signed
-          ? decode_typed<int32_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size)
-          : decode_typed<uint32_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size);
+          ? decode_typed<int32_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy)
+          : decode_typed<uint32_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy);
       break;
     case 8:
       is_signed
-          ? decode_typed<int64_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size)
-          : decode_typed<uint64_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size);
+          ? decode_typed<int64_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy)
+          : decode_typed<uint64_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy);
       break;
     default:
       SIRIUS_LOG_ERROR("[gpu_decode] unsupported type_size={}", type_size);

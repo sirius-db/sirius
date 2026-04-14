@@ -79,7 +79,8 @@ void gpu_decode_bitpacking(
     rmm::cuda_stream_view stream,
     void* d_scratch = nullptr,
     void* d_meta_scratch = nullptr,
-    size_t meta_scratch_size = 0);
+    size_t meta_scratch_size = 0,
+    bool skip_block_copy = false);
 
 //===----------------------------------------------------------------------===//
 // Pre-allocated temp buffers for string segment decode

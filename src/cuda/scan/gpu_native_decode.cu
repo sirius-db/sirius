@@ -167,6 +167,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
 
   size_t row_offset = 0;
   size_t gpu_decoded_segs = 0;
+  const uint8_t* last_block_base = nullptr;
 
   for (auto& seg : col_scan.data.segments) {
     if (!seg.persistent || !seg.data_ptr || seg.row_count == 0) {
@@ -220,13 +221,16 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
 
       case duckdb::CompressionType::COMPRESSION_BITPACKING: {
         const uint8_t* block_base = seg.data_ptr - seg.block_offset;
+        bool block_cached = (block_base == last_block_base);
+        if (!block_cached) last_block_base = block_base;
         gpu_decode_bitpacking(
             block_base, DUCKDB_BLOCK_SIZE,
             static_cast<uint32_t>(seg.block_offset),
             static_cast<uint32_t>(seg.row_count),
             type_size, is_signed,
             d_dest, stream,
-            d_scratch, d_meta_scratch, meta_scratch_size);
+            d_scratch, d_meta_scratch, meta_scratch_size,
+            block_cached);
         gpu_decoded_segs++;
         break;
       }
