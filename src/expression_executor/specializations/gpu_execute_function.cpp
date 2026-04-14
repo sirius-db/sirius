@@ -137,7 +137,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    // JIT compile the AST Subtree
+    // Evaluate the AST subtree
     auto result_column = execute_ast(func_expr);
 
     // Release consumed temporaries

@@ -16,9 +16,12 @@
 
 #include "op/sirius_physical_projection.hpp"
 
+#include "config.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 
 #include <nvtx3/nvtx3.hpp>
+
+#include <duckdb/common/exception.hpp>
 
 namespace sirius {
 namespace op {
@@ -40,18 +43,25 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_data_batches();
 
+  /// TODO: the operator should choose the execution strategy based on statistics and a deeper
+  /// understand of the trade-offs between the different strategies. See:
+  /// https://github.com/sirius-db/sirius/issues/636
+  sirius::experimental::expression_executor_strategy strategy;
+  if (!sirius::experimental::string_to_strategy(duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY,
+                                                strategy)) {
+    throw duckdb::InvalidInputException(
+      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
+      "ast_jit",
+      duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY);
+  }
   sirius::experimental::gpu_expression_executor gpu_expression_executor(
-    select_list,
-    sirius::experimental::expression_executor_strategy::AST_INTERPRET,
-    cudf::get_current_device_resource_ref(),
-    stream);
+    select_list, strategy, cudf::get_current_device_resource_ref(), stream);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    // auto projected_batch = gpu_expression_executor.execute(batch, stream);
     auto projected_batch = gpu_expression_executor.execute(batch);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }

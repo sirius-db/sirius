@@ -73,7 +73,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression c
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    // JIT compile the AST Subtree
+    // Evaluate the AST subtree
     auto result_column = execute_ast(between_expr);
     release_temporaries({input.get_temp_scalar_indices(),
                          lower.get_temp_scalar_indices(),
@@ -85,10 +85,6 @@ execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression c
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  if (mode == execution_mode::AST) {
-    auto result = execute(expr, execution_mode::MATERIALIZE);
-    return materialize_as_ast_column(result.release_column());
-  }
   auto comparison_type_switch = [](duckdb::BoundBetweenExpression const& expr)
     -> std::pair<cudf::binary_operator, cudf::binary_operator> {
     cudf::binary_operator lower_op;

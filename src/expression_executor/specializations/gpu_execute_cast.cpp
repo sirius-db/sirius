@@ -59,7 +59,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
         ast_result(cast_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
     }
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    // JIT compile the AST Subtree
+    // Evaluate the AST subtree
     auto result_column = execute_ast(cast_expr);
 
     // Release consumed temporaries
@@ -72,7 +72,10 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
   auto child             = execute(*expr.child, execution_mode::MATERIALIZE);
   D_ASSERT(!child.is_scalar());  // CAST should never be called on a scalar
   auto result_column = cudf::cast(child.get_column_view(), return_type, _stream, _mr);
-  if (mode == execution_mode::AST) { return materialize_as_ast_column(std::move(result_column)); }
+  if (mode == execution_mode::AST) {
+    // The parent is executing in AST mode, so add the materialized result to the AST tree.
+    return materialize_as_ast_column(std::move(result_column));
+  }
   return execute_result(std::move(result_column));
 }
 

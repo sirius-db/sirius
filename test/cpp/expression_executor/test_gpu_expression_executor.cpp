@@ -1677,6 +1677,61 @@ TEMPLATE_TEST_CASE("experimental select IS NULL and IS NOT NULL",
   }
 }
 
+TEMPLATE_TEST_CASE("experimental select COMPARE_NOT_DISTINCT_FROM",
+                   "[expression_executor][experimental]",
+                   mat_strategy,
+                   ast_interpret_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // Actual values: {10, NULL, 30, NULL, 50} — nulls must be distinct from 30
+  std::vector<int32_t> values = {10, 99, 30, 99, 50};
+  std::vector<bool> valids    = {true, false, true, false, true};
+  auto input                  = make_int32_batch_with_nulls(*space, values, valids);
+
+  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
+    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(30)));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(std::move(cmp));
+
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  REQUIRE(ov.num_rows() == 1);
+  REQUIRE(ov.column(0).null_count() == 0);
+  REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30});
+}
+
+TEMPLATE_TEST_CASE("experimental select COMPARE_DISTINCT_FROM",
+                   "[expression_executor][experimental]",
+                   mat_strategy,
+                   ast_interpret_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // Actual values: {10, NULL, 30, NULL, 50} — nulls must be distinct from 30
+  std::vector<int32_t> values = {10, 99, 30, 99, 50};
+  std::vector<bool> valids    = {true, false, true, false, true};
+  auto input                  = make_int32_batch_with_nulls(*space, values, valids);
+
+  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_DISTINCT_FROM,
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
+    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(30)));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(std::move(cmp));
+
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  REQUIRE(ov.num_rows() == 4);
+  REQUIRE(ov.column(0).null_count() == 2);
+}
+
 TEMPLATE_TEST_CASE("experimental select NOT operator",
                    "[expression_executor][experimental]",
                    mat_strategy,

@@ -51,6 +51,7 @@
 #include <array>
 #include <memory>
 #include <string_view>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -79,6 +80,24 @@ enum class expression_executor_strategy {
   AST_INTERPRET,
   AST_JIT,
 };
+
+/**
+ * @brief Parse a string into an expression_executor_strategy.
+ * Accepts "materialize", "ast_interpret", "ast_jit".
+ * @return true on success; false on unrecognized input.
+ */
+inline bool string_to_strategy(std::string_view sv, expression_executor_strategy& out)
+{
+  static std::unordered_map<std::string_view, expression_executor_strategy> const map = {
+    {"materialize", expression_executor_strategy::MATERIALIZE},
+    {"ast_interpret", expression_executor_strategy::AST_INTERPRET},
+    {"ast_jit", expression_executor_strategy::AST_JIT},
+  };
+  auto it = map.find(sv);
+  if (it == map.end()) { return false; }
+  out = it->second;
+  return true;
+}
 
 /**
  * @brief The gpu_expression_executor is responsible for evaluating DuckDB expressions on the GPU

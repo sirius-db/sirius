@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "duckdb/common/enums/expression_type.hpp"
+
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_executor_state.hpp>
 #include <operator/empty_str_check.cuh>
@@ -26,6 +28,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf
+#include <cudf/ast/ast_operator.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/transform.hpp>
@@ -52,11 +55,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpressio
         case COMPARE_LESSTHAN: return cudf::ast::ast_operator::LESS;
         case COMPARE_LESSTHANOREQUALTO: return cudf::ast::ast_operator::LESS_EQUAL;
         case COMPARE_NOTEQUAL: return cudf::ast::ast_operator::NOT_EQUAL;
-        case COMPARE_DISTINCT_FROM:
-        case COMPARE_NOT_DISTINCT_FROM:
-          throw duckdb::NotImplementedException(
-            "[expression_executor:comparison] DISTINCT comparisons not supported in expression "
-            "executor.");
+        case COMPARE_DISTINCT_FROM:  // Fallthrough: special handling below
+        case COMPARE_NOT_DISTINCT_FROM: return cudf::ast::ast_operator::NULL_EQUAL;
         default:
           throw duckdb::InternalException(
             "[expression_executor:comparison] Unrecognized comparison type : {}",
@@ -68,18 +68,23 @@ execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpressio
     auto right            = execute(*expr.right, execution_mode::AST);
     auto const& comp_expr = _ast_tree.emplace<cudf::ast::operation>(
       comparison_type_switch_ast(expr), left.get_expr(), right.get_expr());
+    // COMPARE_DISTINCT_FROM is semantically equivalent to NOT(NULL_EQUAL())
+    auto const& final_comp_expr =
+      expr.GetExpressionType() == duckdb::ExpressionType::COMPARE_DISTINCT_FROM
+        ? _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comp_expr)
+        : comp_expr;
 
     //===----------1: AST Mode----------===//
     if (mode == execution_mode::AST) {
       return execute_result(
-        ast_result(comp_expr,
+        ast_result(final_comp_expr,
                    {left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
                    {left.get_temp_column_indices(), right.get_temp_column_indices()}));
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    // JIT compile the AST Subtree
-    auto result_column = execute_ast(comp_expr);
+    // Evaluate the AST subtree
+    auto result_column = execute_ast(final_comp_expr);
 
     // Release consumed temporaries
     release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
@@ -102,11 +107,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpressio
       case COMPARE_LESSTHAN: return cudf::binary_operator::LESS;
       case COMPARE_LESSTHANOREQUALTO: return cudf::binary_operator::LESS_EQUAL;
       case COMPARE_NOTEQUAL: return cudf::binary_operator::NOT_EQUAL;
-      case COMPARE_DISTINCT_FROM:
-      case COMPARE_NOT_DISTINCT_FROM:
-        throw duckdb::NotImplementedException(
-          "[expression_executor:comparison] DISTINCT comparisons not supported in expression "
-          "executor.");
+      case COMPARE_DISTINCT_FROM: return cudf::binary_operator::NULL_NOT_EQUALS;
+      case COMPARE_NOT_DISTINCT_FROM: return cudf::binary_operator::NULL_EQUALS;
       default:
         throw duckdb::InternalException(
           "[expression_executor:comparison] Unrecognized comparison type : {}",
@@ -192,11 +194,11 @@ struct ComparisonDispatcher {
                                                                      executor.execution_stream,
                                                                      executor.resource_ref);
         auto result      = cudf::binary_operation(left,
-                                             date_scalar,
-                                             ComparisonOp,
-                                             return_type,
-                                             executor.execution_stream,
-                                             executor.resource_ref);
+                                                  date_scalar,
+                                                  ComparisonOp,
+                                                  return_type,
+                                                  executor.execution_stream,
+                                                  executor.resource_ref);
         return result;
       } else {
         // Regular int32_t comparison

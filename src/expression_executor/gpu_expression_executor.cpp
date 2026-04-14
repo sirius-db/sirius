@@ -439,7 +439,8 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
           return count;
         }
         case duckdb::ExpressionType::OPERATOR_COALESCE:
-          /// KEVIN: TODO
+          /// TODO: Implement COALESCE operator
+          /// GitHub issue ticket: https://github.com/sirius-db/sirius/issues/635
           throw duckdb::NotImplementedException(
             "[gpu_expression_executor] count_ast_ops called on an unsupported COALESCE operator "
             "expression.");
