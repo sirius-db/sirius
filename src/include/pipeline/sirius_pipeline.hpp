@@ -67,7 +67,7 @@ class sirius_pipeline_build_state {
                          std::size_t sink_pipeline_count);
   void set_pipeline_operators(
     sirius_pipeline& pipeline,
-    std::vector<std::reference_wrapper<op::sirius_physical_operator>> operators);
+    duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators);
   void add_pipeline_operator(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
   duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(sirius_engine& engine,
                                                             sirius_pipeline& pipeline,
@@ -75,7 +75,7 @@ class sirius_pipeline_build_state {
 
   sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_source(sirius_pipeline& pipeline);
   sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_sink(sirius_pipeline& pipeline);
-  std::vector<std::reference_wrapper<op::sirius_physical_operator>> get_pipeline_operators(
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> get_pipeline_operators(
     sirius_pipeline& pipeline);
 };
 
@@ -116,8 +116,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   // const;
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
-  std::vector<std::reference_wrapper<op::sirius_physical_operator>> get_operators();
-  std::vector<std::reference_wrapper<const op::sirius_physical_operator>> get_operators() const;
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> get_operators();
+  duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>> get_operators() const;
 
   sirius::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
 
@@ -171,7 +171,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! The source of this pipeline
   sirius::optional_ptr<op::sirius_physical_operator> source;
   //! The chain of intermediate operators
-  std::vector<std::reference_wrapper<op::sirius_physical_operator>> operators;
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators;
   //! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
   sirius::optional_ptr<op::sirius_physical_operator> sink;
 

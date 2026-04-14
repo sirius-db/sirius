@@ -79,7 +79,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! Recursively gets the last child added
   sirius_meta_pipeline& get_last_child();
   //! Get the dependencies (within this sirius_meta_pipeline) of the given Pipeline
-  const std::vector<std::reference_wrapper<sirius_pipeline>>* get_dependencies(
+  const duckdb::vector<std::reference_wrapper<sirius_pipeline>>* get_dependencies(
     sirius_pipeline& dependent) const;
   //! Whether the sink of this pipeline is a join build
   MetaPipelineType Type() const;
@@ -141,7 +141,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! All pipelines with a different source, but the same sink
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipelines;
   //! Dependencies within this sirius_meta_pipeline
-  sirius::reference_map_t<sirius_pipeline, std::vector<std::reference_wrapper<sirius_pipeline>>>
+  sirius::reference_map_t<sirius_pipeline, duckdb::vector<std::reference_wrapper<sirius_pipeline>>>
     dependencies;
   //! Other MetaPipelines that this sirius_meta_pipeline depends on
   duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> children;

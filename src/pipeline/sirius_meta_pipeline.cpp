@@ -79,8 +79,8 @@ sirius_meta_pipeline& sirius_meta_pipeline::get_last_child()
   return *current_children.get().back();
 }
 
-const std::vector<std::reference_wrapper<sirius_pipeline>>* sirius_meta_pipeline::get_dependencies(
-  sirius_pipeline& dependent) const
+const duckdb::vector<std::reference_wrapper<sirius_pipeline>>*
+sirius_meta_pipeline::get_dependencies(sirius_pipeline& dependent) const
 {
   auto it = dependencies.find(dependent);
   if (it == dependencies.end()) {
@@ -149,7 +149,7 @@ void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
   if (!including) { it++; }
 
   // collect pipelines that were created from then
-  std::vector<std::reference_wrapper<pipeline::sirius_pipeline>> created_pipelines;
+  duckdb::vector<std::reference_wrapper<pipeline::sirius_pipeline>> created_pipelines;
   for (; it != pipelines.end(); it++) {
     if (duckdb::RefersToSameObject(**it, dependent)) {
       // cannot depend on itself
