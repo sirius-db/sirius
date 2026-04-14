@@ -114,6 +114,7 @@ bool is_gpu_decodable_string(duckdb::CompressionType ct)
     case duckdb::CompressionType::COMPRESSION_DICTIONARY:
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
     case duckdb::CompressionType::COMPRESSION_CONSTANT:
+    case duckdb::CompressionType::COMPRESSION_FSST:
       return true;
     default:
       return false;
@@ -358,7 +359,8 @@ std::unique_ptr<cudf::column> decode_string_column(
           " — falling back to CPU scan");
     }
     if ((seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY
-         || seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED)
+         || seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED
+         || seg.compression == duckdb::CompressionType::COMPRESSION_FSST)
         && seg.max_string_length == 0) {
       can_gpu_concat = false;
     }
@@ -391,7 +393,8 @@ std::unique_ptr<cudf::column> decode_string_column(
     l.char_start = cum_chars;
     if (seg.row_count > 0 && seg.persistent && seg.data_ptr
         && (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY
-            || seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED)) {
+            || seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED
+            || seg.compression == duckdb::CompressionType::COMPRESSION_FSST)) {
       l.char_capacity = static_cast<size_t>(seg.row_count) * seg.max_string_length;
     } else {
       l.char_capacity = 0;
@@ -463,6 +466,18 @@ std::unique_ptr<cudf::column> decode_string_column(
           d_scratch,
           seg.max_string_length,
           d_seg_chars);  // pre-allocated: write chars here
+    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_FSST) {
+      const uint8_t* block_base = seg.data_ptr - seg.block_offset;
+      uint8_t* d_seg_chars = d_chars_base + seg_char_start;
+
+      gpu_decode_fsst(
+          block_base, DUCKDB_BLOCK_SIZE,
+          static_cast<uint32_t>(seg.block_offset),
+          static_cast<uint32_t>(seg.row_count),
+          d_seg_offsets,
+          d_seg_chars,
+          stream,
+          d_scratch);
     }
 
     // Read back sentinel to learn actual char count for this segment.

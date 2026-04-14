@@ -143,10 +143,11 @@ void gpu_native_scan_global_state::check_viability()
             break;
 
           case duckdb::CompressionType::COMPRESSION_DICTIONARY:
+          case duckdb::CompressionType::COMPRESSION_FSST:
             if (is_varchar &&
                 !duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
               SIRIUS_LOG_INFO(
-                "[gpu_native_scan] not viable: col {} DICTIONARY segment missing max_string_length",
+                "[gpu_native_scan] not viable: col {} segment missing max_string_length",
                 col_indices_[ci].GetPrimaryIndex());
               viable_ = false;
               return;

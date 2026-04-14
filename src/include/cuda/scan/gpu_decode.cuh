@@ -161,6 +161,39 @@ void gpu_decode_uncompressed_string(
     void* d_scratch = nullptr);
 
 //===----------------------------------------------------------------------===//
+// Host-side API: decode an FSST-compressed string segment on GPU
+//===----------------------------------------------------------------------===//
+
+/// @brief Decode an FSST-compressed string segment on GPU.
+///
+/// FSST (Fast Static Symbol Table) maps 1-byte codes to 1-8 byte symbols.
+/// The segment stores bitpacked compressed string lengths, a serialized
+/// symbol table, and a dictionary of compressed string data (backwards
+/// from dict_end).
+///
+/// Pipeline: unpack lengths → InclusiveSum → compute decompressed lengths
+/// → ExclusiveSum → FSST decompress → write sentinel.
+/// Fully async — caller must sync the stream.
+///
+/// @param segment_data       Host pointer to pinned segment block data
+/// @param segment_size       Size of segment data in bytes
+/// @param block_offset       Offset within the block to the segment start
+/// @param row_count          Total rows in the segment
+/// @param d_offsets          Pre-allocated device buffer ((row_count+1) * sizeof(int32_t))
+/// @param d_chars            Pre-allocated device char output buffer
+/// @param stream             CUDA stream
+/// @param d_scratch          Optional pre-allocated device buffer (>= segment_size bytes)
+void gpu_decode_fsst(
+    const uint8_t* segment_data,
+    size_t segment_size,
+    uint32_t block_offset,
+    uint32_t row_count,
+    int32_t* d_offsets,
+    uint8_t* d_chars,
+    rmm::cuda_stream_view stream,
+    void* d_scratch = nullptr);
+
+//===----------------------------------------------------------------------===//
 // Device functions: inline bitpacking extraction (for future operator fusion)
 //===----------------------------------------------------------------------===//
 
