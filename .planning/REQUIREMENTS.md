@@ -16,8 +16,8 @@ Requirements for Task Queue Refactor milestone. Each maps to roadmap phases.
 
 ### Queue Integration
 
-- [ ] **INTG-01**: Replace `interruptible_mpmc` with `inspectable_mpsc` in the `itask_executor` interface
-- [ ] **INTG-02**: Update all `itask_executor` implementations to use `inspectable_mpsc`
+- [x] **INTG-01**: Replace `interruptible_mpmc` with `inspectable_mpsc` in the `itask_executor` interface
+- [x] **INTG-02**: Update all `itask_executor` implementations to use `inspectable_mpsc`
 
 ## Future Requirements
 
@@ -39,8 +39,8 @@ None — milestone is self-contained.
 | CLEAN-02 | Phase 3 | Complete |
 | CLEAN-03 | Phase 3 | Complete |
 | CLEAN-04 | Phase 3 | Complete |
-| INTG-01 | Phase 4 | Pending |
-| INTG-02 | Phase 4 | Pending |
+| INTG-01 | Phase 4 | Complete |
+| INTG-02 | Phase 4 | Complete |
 
 **Coverage:**
 - v1.1 requirements: 6 total

@@ -47,7 +47,7 @@ Plans:
   4. The project builds successfully and all existing tests pass after the queue replacement
 **Plans:** 1 plan
 Plans:
-- [ ] 04-01-PLAN.md — Replace interruptible_mpmc with inspectable_mpsc in itask_executor, build and test
+- [x] 04-01-PLAN.md — Replace interruptible_mpmc with inspectable_mpsc in itask_executor, build and test
 
 ## Progress
 
