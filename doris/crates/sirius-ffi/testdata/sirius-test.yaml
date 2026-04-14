@@ -1,0 +1,28 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.05
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.80
+      downgrade_stop_fraction: 0.60
+    host:
+      capacity_bytes: 4Gi
+      initial_number_pools: 4
+      pool_size: 8
+      block_size: 1Mi
+  executor:
+    pipeline:
+      num_threads: 2
+    downgrade:
+      num_threads: 1
+    duckdb_scan:
+      num_threads: 2
+      cache: "parquet"
+    task_creator:
+      num_threads: 1
+  operator_params:
+    scan_task_batch_size: 512Mi
+    hash_partition_bytes: 512Mi
+    concat_batch_bytes: 512Mi

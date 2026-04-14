@@ -24,6 +24,11 @@
 
 namespace duckdb {
 
+enum class ExchangeCaptureMode : uint8_t {
+  MaterializeAndCapture = 0,
+  ExchangeOnly = 1,
+};
+
 /// Per-partition packed GPU buffer from cudf::hash_partition + chunked_pack.
 struct PackedPartition {
   size_t staging_offset;
@@ -72,6 +77,7 @@ class ExchangeSession {
   int partition_num = 0;
   std::vector<int> partition_cols;
   std::vector<int> projection_indices;
+  ExchangeCaptureMode capture_mode = ExchangeCaptureMode::MaterializeAndCapture;
 
   // --- Packed GPU data (set during execution by result_collector) ---
   // Per-partition packed data (accumulated across batches)

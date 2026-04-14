@@ -136,6 +136,14 @@ class LastGPUBuffers {
     return {};
   }
 
+  ExchangeCaptureMode GetCaptureMode() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_session_) {
+      return active_session_->capture_mode;
+    }
+    return ExchangeCaptureMode::MaterializeAndCapture;
+  }
+
   void SetPartitionConfig(int num_partitions, std::vector<int> column_indices) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_session_) {
@@ -149,6 +157,13 @@ class LastGPUBuffers {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_session_) {
       active_session_->projection_indices = std::move(projection_indices);
+    }
+  }
+
+  void SetCaptureMode(ExchangeCaptureMode capture_mode) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_session_) {
+      active_session_->capture_mode = capture_mode;
     }
   }
 

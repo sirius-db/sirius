@@ -79,6 +79,20 @@ fn fragment_cpu_substrait_reason(plan: &TPlan) -> Option<&'static str> {
     None
 }
 
+pub fn fragment_cpu_substrait_reason_for_params(
+    params: &TPipelineFragmentParams,
+) -> Option<&'static str> {
+    params
+        .fragment
+        .as_ref()
+        .and_then(|fragment| fragment.plan.as_ref())
+        .and_then(fragment_cpu_substrait_reason)
+}
+
+pub fn fragment_must_use_cpu_substrait(params: &TPipelineFragmentParams) -> bool {
+    fragment_cpu_substrait_reason_for_params(params).is_some()
+}
+
 /// Substrait extension URIs for standard function sets.
 pub const URI_COMPARISON: &str =
     "https://github.com/substrait-io/substrait/blob/main/extensions/functions_comparison.yaml";

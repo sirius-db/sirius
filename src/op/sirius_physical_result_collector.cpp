@@ -222,6 +222,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
   // Check if GPU buffer retention is requested (for nixl GPU-direct exchange).
   bool should_retain = duckdb::LastGPUBuffers::GetInstance().ShouldRetain();
+  auto capture_mode = duckdb::LastGPUBuffers::GetInstance().GetCaptureMode();
+  bool exchange_only = capture_mode == duckdb::ExchangeCaptureMode::ExchangeOnly;
   SIRIUS_LOG_INFO("[result_collector] sink called: {} batches, should_retain={}", input_batches.size(), should_retain);
 
   for (auto const& input_batch : input_batches) {
@@ -485,6 +487,13 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             entry.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
             lgb.AccumulatePackedBroadcast(std::move(entry));
         }
+      }
+
+      if (should_retain && exchange_only && exchange_view_storage) {
+        SIRIUS_LOG_INFO(
+          "[result_collector] exchange-only capture: skipping host materialization for {} rows",
+          exchange_view.num_rows());
+        continue;
       }
 
       // Make the HOST memory reservation
