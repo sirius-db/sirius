@@ -77,49 +77,35 @@ pipelineable_operator_data::prepare_for_processing(
 // LCOV_EXCL_START
 duckdb::unique_ptr<duckdb::OperatorState> sirius_physical_operator::get_operator_state(
   duckdb::ExecutionContext& context) const
-{
-  return duckdb::make_uniq<duckdb::OperatorState>();
-}
+{ return duckdb::make_uniq<duckdb::OperatorState>(); }
 
 duckdb::unique_ptr<duckdb::GlobalOperatorState> sirius_physical_operator::get_global_operator_state(
   duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalOperatorState>();
-}
+{ return duckdb::make_uniq<duckdb::GlobalOperatorState>(); }
 
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
 duckdb::unique_ptr<duckdb::LocalSourceState> sirius_physical_operator::get_local_source_state(
   duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const
-{
-  return duckdb::make_uniq<duckdb::LocalSourceState>();
-}
+{ return duckdb::make_uniq<duckdb::LocalSourceState>(); }
 
 duckdb::unique_ptr<duckdb::GlobalSourceState> sirius_physical_operator::get_global_source_state(
   duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalSourceState>();
-}
+{ return duckdb::make_uniq<duckdb::GlobalSourceState>(); }
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
 duckdb::unique_ptr<duckdb::LocalSinkState> sirius_physical_operator::get_local_sink_state(
   duckdb::ExecutionContext& context) const
-{
-  return duckdb::make_uniq<duckdb::LocalSinkState>();
-}
+{ return duckdb::make_uniq<duckdb::LocalSinkState>(); }
 
 duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global_sink_state(
   duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalSinkState>();
-}
+{ return duckdb::make_uniq<duckdb::GlobalSinkState>(); }
 
 std::string sirius_physical_operator::get_name() const
-{
-  return SiriusPhysicalOperatorToString(type);
-}
+{ return SiriusPhysicalOperatorToString(type); }
 
 std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }
 
@@ -260,15 +246,11 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
 }
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
-{
-  next_port_after_sink.push_back(port_info);
-}
+{ next_port_after_sink.push_back(port_info); }
 
 std::vector<sirius_physical_operator::next_port_info>&
 sirius_physical_operator::get_next_port_after_sink()
-{
-  return next_port_after_sink;
-}
+{ return next_port_after_sink; }
 
 std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
@@ -287,6 +269,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   // if no unfinished barriers, then is this operator ready to create a task?
   if (std::all_of(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
+        if (!p->repo) { return true; }  // dependency-only port; not data-gating
         return (p->type != MemoryBarrierType::FULL && p->repo->total_size() > 0) ||
                (p->type == MemoryBarrierType::FULL && p->repo->total_size() > 0 &&
                 p->src_pipeline && p->src_pipeline->is_pipeline_finished());
@@ -316,6 +299,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   for (auto& [port_name, port_ptr] : ports) {
+    if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
     auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
@@ -328,6 +312,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
 bool sirius_physical_operator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
+    if(!port_ptr->repo) { continue; } // dependencey-only port; always empty
     if (port_ptr->repo->total_size() != 0) { return false; }
   }
   return true;
@@ -351,9 +336,7 @@ bool sirius_physical_operator::has_full_barrier_from(const pipeline::sirius_pipe
 
 duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()
   const noexcept
-{
-  return _pipeline;
-}
+{ return _pipeline; }
 
 void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
 {

@@ -23,49 +23,13 @@
 
 // cudf
 #include <cudf/io/datasource.hpp>
-#if CUDF_VERSION_NUM >= 2604
 #include <cudf/io/parquet_io_utils.hpp>
-#endif
 
 // standard library
 #include <algorithm>
 #include <stdexcept>
 
 namespace sirius::op::scan {
-
-//===----------------------------------------------------------------------===//
-// Fallback footer reader for cudf < 26.04
-//===----------------------------------------------------------------------===//
-#if CUDF_VERSION_NUM < 2604
-namespace {
-// NOTE: The buffer returned here must have an identical byte layout to what
-// cudf::io::parquet::fetch_footer_to_host (cudf >= 26.04) returns so that the
-// footer_len / footer_offset / metadata_bytes calculations in execute() remain
-// consistent across both code paths.  Both paths return only the thrift-encoded
-// footer body (footer_len bytes starting at file_size - TAIL_SIZE - footer_len),
-// NOT including the leading PAR1 magic bytes.  The caller separately accounts for
-// the leading magic and the 8-byte trailer when computing metadata_bytes.
-std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
-  cudf::io::datasource& datasource)
-{
-  constexpr size_t PARQUET_MAGIC_SIZE = 4;
-  constexpr size_t FOOTER_LEN_SIZE    = 4;
-  constexpr size_t TAIL_SIZE          = PARQUET_MAGIC_SIZE + FOOTER_LEN_SIZE;
-
-  auto const file_size = datasource.size();
-  if (file_size < TAIL_SIZE + PARQUET_MAGIC_SIZE) {
-    throw std::runtime_error("File too small to be a valid Parquet file");
-  }
-
-  auto tail_buf    = datasource.host_read(file_size - TAIL_SIZE, TAIL_SIZE);
-  auto const* tail = tail_buf->data();
-
-  uint32_t footer_len      = tail[0] | (tail[1] << 8) | (tail[2] << 16) | (tail[3] << 24);
-  auto const footer_offset = file_size - TAIL_SIZE - footer_len;
-  return datasource.host_read(footer_offset, footer_len);
-}
-}  // namespace
-#endif
 
 //===----------------------------------------------------------------------===//
 // Constructor
@@ -249,11 +213,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     result->datasources.push_back(cudf::io::datasource::create(file_path));
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
-#if CUDF_VERSION_NUM >= 2604
     footer_buffer = cudf::io::parquet::fetch_footer_to_host(*result->datasources.back());
-#else
-    footer_buffer = fetch_footer_to_host_fallback(*result->datasources.back());
-#endif
 
     //===----------Parse metadata----------===//
     hybrid_scan_reader reader(
