@@ -1,7 +1,11 @@
 name: ARC Runner Validation
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - dev
+  pull_request:
+  merge_group:
 
 jobs:
   test-cpu-xl:
