@@ -194,11 +194,11 @@ struct ComparisonDispatcher {
                                                                      executor.execution_stream,
                                                                      executor.resource_ref);
         auto result      = cudf::binary_operation(left,
-                                                  date_scalar,
-                                                  ComparisonOp,
-                                                  return_type,
-                                                  executor.execution_stream,
-                                                  executor.resource_ref);
+                                             date_scalar,
+                                             ComparisonOp,
+                                             return_type,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
         return result;
       } else {
         // Regular int32_t comparison

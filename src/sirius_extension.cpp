@@ -715,9 +715,7 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
 
-static void SetExpressionExecutorStrategy(ClientContext& context,
-                                          SetScope scope,
-                                          Value& parameter)
+static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto value = StringValue::Get(parameter);
   if (value != "materialize" && value != "ast_interpret" && value != "ast_jit") {
