@@ -2,12 +2,12 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: Task Queue Refactor
-status: defining_requirements
-stopped_at: Defining requirements
-last_updated: "2026-04-14T18:00:00.000Z"
+status: ready_to_plan
+stopped_at: Roadmap created
+last_updated: "2026-04-14T18:30:00.000Z"
 last_activity: 2026-04-14
 progress:
-  total_phases: 0
+  total_phases: 2
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -21,14 +21,30 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-14)
 
 **Core value:** Thread-safe queue with predicate-based element inspection and selective removal
-**Current focus:** Milestone v1.1 — Task Queue Refactor
+**Current focus:** Phase 3 — Dead Code Removal
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-04-14 — Milestone v1.1 started
+Phase: 3 of 4 (Dead Code Removal)
+Plan: — (not yet planned)
+Status: Ready to plan
+Last activity: 2026-04-14 — Roadmap created for v1.1
+
+Progress: [░░░░░░░░░░] 0%
+
+## Performance Metrics
+
+**Velocity:**
+- Total plans completed: 3 (from v1.0)
+- Average duration: ~23 min
+- Total execution time: ~1.1 hours
+
+**By Phase:**
+
+| Phase | Plans | Total | Avg/Plan |
+|-------|-------|-------|----------|
+| 1. Core Queue | 2 | ~46 min | ~23 min |
+| 2. Predicate Inspection | 1 | ~23 min | ~23 min |
 
 ## Accumulated Context
 
@@ -37,11 +53,8 @@ Last activity: 2026-04-14 — Milestone v1.1 started
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- std::deque over std::list for cache locality during iteration
-- std::mutex + std::condition_variable over std::shared_mutex for write-heavy MPSC
-- std::unique_ptr<T> ownership semantics
-- std::function for predicate params (flexibility over templates)
-- Raw T* return from get_if (avoids ownership transfer)
+- Dead code removal before integration (simplifies codebase first)
+- Existing tests must pass; no new tests required for v1.1
 
 ### Pending Todos
 
@@ -54,5 +67,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-04-14
-Stopped at: Defining requirements for v1.1
-Resume with: Continue milestone setup
+Stopped at: Roadmap created for v1.1 milestone
+Resume with: `/gsd-plan-phase 3`
