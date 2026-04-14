@@ -282,3 +282,234 @@ TEST_CASE("inspectable_mpsc blocking pop receives pushed item", "[inspectable_mp
   consumer.join();
   REQUIRE(received_value.load() == 999);
 }
+
+// =============================================================================
+// Multi-threaded MPSC stress tests (SAFE-01)
+// =============================================================================
+
+TEST_CASE("inspectable_mpsc concurrent producers single consumer", "[inspectable_mpsc]")
+{
+  inspectable_mpsc<int> queue;
+  constexpr int num_producers      = 4;
+  constexpr int items_per_producer = 100;
+  constexpr int total_items        = num_producers * items_per_producer;
+
+  std::atomic<int> produced_count{0};
+  std::atomic<int> consumed_count{0};
+
+  // Start consumer thread (try_pop loop)
+  std::thread consumer([&]() {
+    while (consumed_count.load() < total_items) {
+      auto result = queue.try_pop();
+      if (result != nullptr) {
+        consumed_count.fetch_add(1);
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  // Start 4 producer threads
+  std::vector<std::thread> producers;
+  for (int i = 0; i < num_producers; ++i) {
+    producers.emplace_back([&, producer_id = i]() {
+      for (int j = 0; j < items_per_producer; ++j) {
+        int value = producer_id * items_per_producer + j;
+        while (!queue.push(std::make_unique<int>(value))) {
+          if (!queue.is_open()) return;
+          std::this_thread::yield();
+        }
+        produced_count.fetch_add(1);
+      }
+    });
+  }
+
+  // Join all producers first
+  for (auto& p : producers) {
+    p.join();
+  }
+
+  // Wait for consumer with 5s timeout
+  auto start   = std::chrono::steady_clock::now();
+  auto timeout = 5s;
+  while (consumed_count.load() < total_items) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start > timeout) {
+      if (consumer.joinable()) consumer.detach();
+      FAIL("Timeout waiting for consumption");
+    }
+  }
+
+  consumer.join();
+
+  REQUIRE(produced_count.load() == total_items);
+  REQUIRE(consumed_count.load() == total_items);
+}
+
+TEST_CASE("inspectable_mpsc concurrent emplace single consumer", "[inspectable_mpsc]")
+{
+  inspectable_mpsc<test_payload> queue;
+  constexpr int num_producers      = 4;
+  constexpr int items_per_producer = 50;
+  constexpr int total_items        = num_producers * items_per_producer;
+
+  std::atomic<int> produced_count{0};
+  std::atomic<int> consumed_count{0};
+
+  // Single consumer with try_pop
+  std::thread consumer([&]() {
+    while (consumed_count.load() < total_items) {
+      auto result = queue.try_pop();
+      if (result != nullptr) {
+        consumed_count.fetch_add(1);
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  // 4 producers using emplace
+  std::vector<std::thread> producers;
+  for (int i = 0; i < num_producers; ++i) {
+    producers.emplace_back([&, producer_id = i]() {
+      for (int j = 0; j < items_per_producer; ++j) {
+        int value = producer_id * items_per_producer + j;
+        while (!queue.emplace(value, "data_" + std::to_string(value))) {
+          if (!queue.is_open()) return;
+          std::this_thread::yield();
+        }
+        produced_count.fetch_add(1);
+      }
+    });
+  }
+
+  for (auto& p : producers) {
+    p.join();
+  }
+
+  // Wait for consumption with 5s timeout
+  auto start   = std::chrono::steady_clock::now();
+  auto timeout = 5s;
+  while (consumed_count.load() < total_items) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start > timeout) {
+      if (consumer.joinable()) consumer.detach();
+      FAIL("Timeout waiting for consumption");
+    }
+  }
+
+  consumer.join();
+
+  REQUIRE(produced_count.load() == total_items);
+  REQUIRE(consumed_count.load() == total_items);
+}
+
+TEST_CASE("inspectable_mpsc blocking pop with concurrent producers", "[inspectable_mpsc]")
+{
+  inspectable_mpsc<int> queue;
+  constexpr int num_producers      = 4;
+  constexpr int items_per_producer = 25;
+  constexpr int total_items        = num_producers * items_per_producer;
+  std::atomic<int> consumed_count{0};
+
+  // Consumer thread using blocking pop()
+  std::thread consumer([&]() {
+    while (consumed_count.load() < total_items) {
+      auto result = queue.pop();
+      if (result != nullptr) {
+        consumed_count.fetch_add(1);
+      } else {
+        // Interrupted -- exit
+        break;
+      }
+    }
+  });
+
+  // 4 producers with yield between pushes to create interleaving
+  std::vector<std::thread> producers;
+  for (int i = 0; i < num_producers; ++i) {
+    producers.emplace_back([&, producer_id = i]() {
+      for (int j = 0; j < items_per_producer; ++j) {
+        int value = producer_id * items_per_producer + j;
+        while (!queue.push(std::make_unique<int>(value))) {
+          if (!queue.is_open()) return;
+          std::this_thread::yield();
+        }
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  // Join producers
+  for (auto& p : producers) {
+    p.join();
+  }
+
+  // Wait for consumer with 5s timeout
+  auto start   = std::chrono::steady_clock::now();
+  auto timeout = 5s;
+  while (consumed_count.load() < total_items) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start > timeout) {
+      queue.interrupt();
+      if (consumer.joinable()) consumer.detach();
+      FAIL("Timeout waiting for consumption");
+    }
+  }
+
+  // Interrupt to unblock consumer if it re-entered pop() after consuming all items
+  queue.interrupt();
+  consumer.join();
+
+  REQUIRE(consumed_count.load() == total_items);
+}
+
+TEST_CASE("inspectable_mpsc interrupt unblocks concurrent pop", "[inspectable_mpsc]")
+{
+  inspectable_mpsc<int> queue;
+  std::atomic<bool> consumer_started{false};
+  std::atomic<bool> consumer_returned{false};
+  std::unique_ptr<int> pop_result;
+
+  // Consumer thread: block in pop()
+  std::thread consumer([&]() {
+    consumer_started = true;
+    pop_result       = queue.pop();
+    consumer_returned = true;
+  });
+
+  // Wait until consumer has started (spin with yield, 100ms timeout)
+  auto start   = std::chrono::steady_clock::now();
+  auto timeout = 100ms;
+  while (!consumer_started.load()) {
+    std::this_thread::sleep_for(1ms);
+    if (std::chrono::steady_clock::now() - start > timeout) {
+      queue.interrupt();
+      if (consumer.joinable()) consumer.detach();
+      FAIL("Timeout waiting for consumer to start");
+    }
+  }
+
+  // Give consumer a moment to actually enter the blocking wait
+  std::this_thread::sleep_for(50ms);
+
+  // Verify consumer is still blocked
+  REQUIRE_FALSE(consumer_returned.load());
+
+  // Interrupt should unblock the consumer
+  queue.interrupt();
+
+  // Wait for consumer to return with 1s timeout
+  start   = std::chrono::steady_clock::now();
+  timeout = 1s;
+  while (!consumer_returned.load()) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start > timeout) {
+      if (consumer.joinable()) consumer.detach();
+      FAIL("Timeout waiting for consumer to return after interrupt");
+    }
+  }
+
+  consumer.join();
+  REQUIRE(pop_result == nullptr);
+}
