@@ -82,6 +82,23 @@ void gpu_decode_bitpacking(
     size_t meta_scratch_size = 0);
 
 //===----------------------------------------------------------------------===//
+// Pre-allocated temp buffers for string segment decode
+//===----------------------------------------------------------------------===//
+
+/// Reusable GPU buffers for string decode, allocated once per column and
+/// shared across all segments.  Eliminates thousands of per-segment
+/// cudaMallocAsync / cudaFreeAsync calls.
+struct string_decode_temp {
+  uint32_t* d_buf_a;               ///< Temp uint32 (max_seg_rows): indices / compressed_lengths
+  uint32_t* d_buf_b;               ///< Temp uint32 (max_seg_rows): lengths / compressed_offsets
+  uint32_t* d_buf_c;               ///< Temp uint32 (max_seg_rows): decompressed_lengths (FSST)
+  void*     d_cub_temp;            ///< CUB scratch space
+  size_t    cub_temp_bytes;        ///< Size of d_cub_temp
+  uint8_t*  d_fsst_len;            ///< FSST decoder len[255] on GPU
+  unsigned long long* d_fsst_sym;  ///< FSST decoder symbol[255] on GPU
+};
+
+//===----------------------------------------------------------------------===//
 // Host-side API: decode a dictionary string segment on GPU
 //===----------------------------------------------------------------------===//
 
@@ -126,7 +143,8 @@ void gpu_decode_dictionary(
     rmm::cuda_stream_view stream,
     void* d_scratch = nullptr,
     uint32_t max_string_length = 0,
-    uint8_t* d_chars_preallocated = nullptr);
+    uint8_t* d_chars_preallocated = nullptr,
+    string_decode_temp* temp = nullptr);
 
 //===----------------------------------------------------------------------===//
 // Host-side API: decode an uncompressed string segment on GPU
@@ -191,7 +209,8 @@ void gpu_decode_fsst(
     int32_t* d_offsets,
     uint8_t* d_chars,
     rmm::cuda_stream_view stream,
-    void* d_scratch = nullptr);
+    void* d_scratch = nullptr,
+    string_decode_temp* temp = nullptr);
 
 //===----------------------------------------------------------------------===//
 // Device functions: inline bitpacking extraction (for future operator fusion)

@@ -116,7 +116,8 @@ void gpu_decode_dictionary(
     rmm::cuda_stream_view stream,
     void* d_scratch,
     uint32_t max_string_length,
-    uint8_t* d_chars_preallocated)
+    uint8_t* d_chars_preallocated,
+    string_decode_temp* temp)
 {
   const uint8_t* base = segment_data + block_offset;
 
@@ -155,11 +156,22 @@ void gpu_decode_dictionary(
   cudaMemcpyAsync(d_segment, segment_data, segment_size,
                   cudaMemcpyHostToDevice, stream.value());
 
-  // 2. Allocate temp buffers on GPU
-  uint32_t* d_indices = nullptr;   // Unpacked selection indices
-  uint32_t* d_lengths = nullptr;   // String lengths
-  cudaMallocAsync(&d_indices, row_count * sizeof(uint32_t), stream.value());
-  cudaMallocAsync(&d_lengths, row_count * sizeof(uint32_t), stream.value());
+  // 2. Resolve temp buffers: use caller-provided or allocate
+  uint32_t* d_indices = nullptr;
+  uint32_t* d_lengths = nullptr;
+  void* d_cub_scratch = nullptr;
+  size_t cub_scratch_bytes = 0;
+  bool own_temp = (temp == nullptr);
+
+  if (temp) {
+    d_indices     = temp->d_buf_a;
+    d_lengths     = temp->d_buf_b;
+    d_cub_scratch = temp->d_cub_temp;
+    cub_scratch_bytes = temp->cub_temp_bytes;
+  } else {
+    cudaMallocAsync(&d_indices, row_count * sizeof(uint32_t), stream.value());
+    cudaMallocAsync(&d_lengths, row_count * sizeof(uint32_t), stream.value());
+  }
 
   // 3. Unpack selection indices
   constexpr uint32_t THREADS = 256;
@@ -175,24 +187,21 @@ void gpu_decode_dictionary(
       d_indices, d_idx_buf, d_lengths, row_count);
 
   // 5. Exclusive prefix sum of lengths -> offsets (using CUB)
-  size_t cub_temp_bytes = 0;
-  cub::DeviceScan::ExclusiveSum(
-      nullptr, cub_temp_bytes,
-      d_lengths, reinterpret_cast<uint32_t*>(d_offsets),
-      row_count, stream.value());
+  if (own_temp) {
+    cub_scratch_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(
+        nullptr, cub_scratch_bytes,
+        d_lengths, reinterpret_cast<uint32_t*>(d_offsets),
+        row_count, stream.value());
+    cudaMallocAsync(&d_cub_scratch, cub_scratch_bytes, stream.value());
+  }
 
-  uint8_t* d_cub_temp = nullptr;
-  cudaMallocAsync(&d_cub_temp, cub_temp_bytes, stream.value());
-
   cub::DeviceScan::ExclusiveSum(
-      d_cub_temp, cub_temp_bytes,
+      d_cub_scratch, cub_scratch_bytes,
       d_lengths, reinterpret_cast<uint32_t*>(d_offsets),
       row_count, stream.value());
 
   // 6. Allocate char buffer and gather strings.
-  // When max_string_length is known from segment stats, we can allocate an
-  // upper-bound buffer (row_count * max_string_length) without any GPU sync.
-  // The sentinel offset is written by a tiny GPU kernel instead of host readback.
   uint8_t* d_chars = nullptr;
 
   if (max_string_length > 0) {
@@ -246,10 +255,12 @@ void gpu_decode_dictionary(
   // When using preallocated buffer, don't return it (caller owns it).
   *d_chars_out = d_chars_preallocated ? nullptr : d_chars;
 
-  // Cleanup temp buffers (async — caller syncs the stream)
-  cudaFreeAsync(d_indices, stream.value());
-  cudaFreeAsync(d_lengths, stream.value());
-  cudaFreeAsync(d_cub_temp, stream.value());
+  // Cleanup (only if we allocated internally)
+  if (own_temp) {
+    cudaFreeAsync(d_indices, stream.value());
+    cudaFreeAsync(d_lengths, stream.value());
+    cudaFreeAsync(d_cub_scratch, stream.value());
+  }
   if (own_segment) cudaFreeAsync(d_segment, stream.value());
 }
 

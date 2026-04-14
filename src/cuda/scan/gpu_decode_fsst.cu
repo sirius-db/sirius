@@ -194,7 +194,8 @@ void gpu_decode_fsst(
     int32_t* d_offsets,
     uint8_t* d_chars,
     rmm::cuda_stream_view stream,
-    void* d_scratch)
+    void* d_scratch,
+    string_decode_temp* temp)
 {
   const uint8_t* base = segment_data + block_offset;
 
@@ -227,29 +228,42 @@ void gpu_decode_fsst(
   cudaMemcpyAsync(d_segment, segment_data, segment_size,
                   cudaMemcpyHostToDevice, stream.value());
 
-  // --- GPU: copy decoder len/symbol arrays ---
+  // --- Resolve temp buffers: use caller-provided or allocate ---
   uint8_t* d_decoder_len = nullptr;
   unsigned long long* d_decoder_symbol = nullptr;
-  cudaMallocAsync(&d_decoder_len, 255, stream.value());
-  cudaMallocAsync(&d_decoder_symbol, 255 * sizeof(unsigned long long),
-                  stream.value());
+  uint32_t* d_compressed_lengths = nullptr;
+  uint32_t* d_compressed_offsets = nullptr;
+  uint32_t* d_decompressed_lengths = nullptr;
+  void* d_cub_scratch = nullptr;
+  size_t cub_scratch_bytes = 0;
+  bool own_temp = (temp == nullptr);
+
+  if (temp) {
+    d_decoder_len         = temp->d_fsst_len;
+    d_decoder_symbol      = temp->d_fsst_sym;
+    d_compressed_lengths  = temp->d_buf_a;
+    d_compressed_offsets  = temp->d_buf_b;
+    d_decompressed_lengths = temp->d_buf_c;
+    d_cub_scratch         = temp->d_cub_temp;
+    cub_scratch_bytes     = temp->cub_temp_bytes;
+  } else {
+    cudaMallocAsync(&d_decoder_len, 255, stream.value());
+    cudaMallocAsync(&d_decoder_symbol, 255 * sizeof(unsigned long long),
+                    stream.value());
+    cudaMallocAsync(&d_compressed_lengths,
+                    row_count * sizeof(uint32_t), stream.value());
+    cudaMallocAsync(&d_compressed_offsets,
+                    row_count * sizeof(uint32_t), stream.value());
+    cudaMallocAsync(&d_decompressed_lengths,
+                    row_count * sizeof(uint32_t), stream.value());
+  }
+
+  // Upload decoder data (always needed — symbol table varies per segment)
   cudaMemcpyAsync(d_decoder_len, decoder.len, 255,
                   cudaMemcpyHostToDevice, stream.value());
   cudaMemcpyAsync(d_decoder_symbol, decoder.symbol,
                   255 * sizeof(unsigned long long),
                   cudaMemcpyHostToDevice, stream.value());
-
-  // --- GPU: allocate temp buffers ---
-  uint32_t* d_compressed_lengths = nullptr;
-  uint32_t* d_compressed_offsets = nullptr;
-  uint32_t* d_decompressed_lengths = nullptr;
-
-  cudaMallocAsync(&d_compressed_lengths,
-                  row_count * sizeof(uint32_t), stream.value());
-  cudaMallocAsync(&d_compressed_offsets,
-                  row_count * sizeof(uint32_t), stream.value());
-  cudaMallocAsync(&d_decompressed_lengths,
-                  row_count * sizeof(uint32_t), stream.value());
 
   constexpr uint32_t THREADS = 256;
   uint32_t blocks = (row_count + THREADS - 1) / THREADS;
@@ -262,22 +276,19 @@ void gpu_decode_fsst(
       header.bitpacking_width);
 
   // Step 2: InclusiveSum → cumulative compressed byte offsets (from dict_end)
-  size_t cub_temp_bytes = 0;
+  if (own_temp) {
+    cub_scratch_bytes = 0;
+    cub::DeviceScan::InclusiveSum(
+        nullptr, cub_scratch_bytes,
+        d_compressed_lengths, d_compressed_offsets,
+        row_count, stream.value());
+    cudaMallocAsync(&d_cub_scratch, cub_scratch_bytes, stream.value());
+  }
+
   cub::DeviceScan::InclusiveSum(
-      nullptr, cub_temp_bytes,
+      d_cub_scratch, cub_scratch_bytes,
       d_compressed_lengths, d_compressed_offsets,
       row_count, stream.value());
-
-  uint8_t* d_cub_temp = nullptr;
-  cudaMallocAsync(&d_cub_temp, cub_temp_bytes, stream.value());
-
-  cub::DeviceScan::InclusiveSum(
-      d_cub_temp, cub_temp_bytes,
-      d_compressed_lengths, d_compressed_offsets,
-      row_count, stream.value());
-
-  cudaFreeAsync(d_cub_temp, stream.value());
-  d_cub_temp = nullptr;
 
   // Step 3: Compute decompressed string lengths (scan codes, count bytes)
   const uint8_t* d_dict_end =
@@ -288,17 +299,8 @@ void gpu_decode_fsst(
       d_decoder_len, d_decompressed_lengths, row_count);
 
   // Step 4: ExclusiveSum of decompressed lengths → cudf output offsets
-  cub_temp_bytes = 0;
   cub::DeviceScan::ExclusiveSum(
-      nullptr, cub_temp_bytes,
-      d_decompressed_lengths,
-      reinterpret_cast<uint32_t*>(d_offsets),
-      row_count, stream.value());
-
-  cudaMallocAsync(&d_cub_temp, cub_temp_bytes, stream.value());
-
-  cub::DeviceScan::ExclusiveSum(
-      d_cub_temp, cub_temp_bytes,
+      d_cub_scratch, cub_scratch_bytes,
       d_decompressed_lengths,
       reinterpret_cast<uint32_t*>(d_offsets),
       row_count, stream.value());
@@ -316,13 +318,15 @@ void gpu_decode_fsst(
       reinterpret_cast<uint32_t*>(d_offsets) + row_count,
       row_count);
 
-  // --- Cleanup temp buffers (async) ---
-  cudaFreeAsync(d_compressed_lengths, stream.value());
-  cudaFreeAsync(d_compressed_offsets, stream.value());
-  cudaFreeAsync(d_decompressed_lengths, stream.value());
-  cudaFreeAsync(d_cub_temp, stream.value());
-  cudaFreeAsync(d_decoder_len, stream.value());
-  cudaFreeAsync(d_decoder_symbol, stream.value());
+  // --- Cleanup (only if we allocated internally) ---
+  if (own_temp) {
+    cudaFreeAsync(d_compressed_lengths, stream.value());
+    cudaFreeAsync(d_compressed_offsets, stream.value());
+    cudaFreeAsync(d_decompressed_lengths, stream.value());
+    cudaFreeAsync(d_cub_scratch, stream.value());
+    cudaFreeAsync(d_decoder_len, stream.value());
+    cudaFreeAsync(d_decoder_symbol, stream.value());
+  }
   if (own_segment) cudaFreeAsync(d_segment, stream.value());
 }
 
