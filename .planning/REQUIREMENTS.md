@@ -9,10 +9,10 @@ Requirements for Task Queue Refactor milestone. Each maps to roadmap phases.
 
 ### Dead Code Removal
 
-- [ ] **CLEAN-01**: Verify `gpu_pipeline_queue` is unused and remove its header, source, and any tests
-- [ ] **CLEAN-02**: Verify `pipeline_queue` is unused and remove its header, source, and any tests
-- [ ] **CLEAN-03**: Verify `duckdb_scan_task_queue` is unused and remove its header, source, and any tests
-- [ ] **CLEAN-04**: Verify `itask_queue` is unused and remove its header, source, and any tests
+- [x] **CLEAN-01**: Verify `gpu_pipeline_queue` is unused and remove its header, source, and any tests
+- [x] **CLEAN-02**: Verify `pipeline_queue` is unused and remove its header, source, and any tests
+- [x] **CLEAN-03**: Verify `duckdb_scan_task_queue` is unused and remove its header, source, and any tests
+- [x] **CLEAN-04**: Verify `itask_queue` is unused and remove its header, source, and any tests
 
 ### Queue Integration
 
@@ -35,10 +35,10 @@ None — milestone is self-contained.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CLEAN-01 | Phase 3 | Pending |
-| CLEAN-02 | Phase 3 | Pending |
-| CLEAN-03 | Phase 3 | Pending |
-| CLEAN-04 | Phase 3 | Pending |
+| CLEAN-01 | Phase 3 | Complete |
+| CLEAN-02 | Phase 3 | Complete |
+| CLEAN-03 | Phase 3 | Complete |
+| CLEAN-04 | Phase 3 | Complete |
 | INTG-01 | Phase 4 | Pending |
 | INTG-02 | Phase 4 | Pending |
 

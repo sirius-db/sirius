@@ -34,7 +34,7 @@
   3. The project builds successfully and all existing tests pass after removal
 **Plans:** 1 plan
 Plans:
-- [ ] 03-01-PLAN.md — Delete legacy queue files, clean references, build and test
+- [x] 03-01-PLAN.md — Delete legacy queue files, clean references, build and test
 
 ### Phase 4: Queue Integration
 **Goal**: itask_executor and all its implementations use inspectable_mpsc instead of interruptible_mpmc
