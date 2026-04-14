@@ -1,6 +1,11 @@
 # NOTICE - Actions permissions policy (see .github/workflows/test.yml header).
 # Pinned third-party actions must use full commit SHAs per org policy.
+# If using org action allowlists, allow: benchmark-action/github-action-benchmark@*
 name: GPU microbench
+
+permissions:
+  contents: write
+  pull-requests: write
 
 on:
   schedule:
@@ -19,6 +24,11 @@ on:
           - daily
           - weekly
           - full
+      fail_on_regression:
+        description: "Fail the job if a benchmark regresses vs the gh-pages baseline (see alert-threshold)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -115,6 +125,35 @@ jobs:
               if rt is not None:
                   print(f"| `{name}` | {rt:.3f} {unit} | {it} |")
           PY
+
+      - name: Configure benchmark regression gate
+        if: success()
+        id: bench_flags
+        run: |
+          fail_on_alert=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ github.event.inputs.fail_on_regression }}" = "true" ]; then
+            fail_on_alert=true
+          fi
+          echo "fail_on_alert=$fail_on_alert" >> "$GITHUB_OUTPUT"
+
+      # Charts + history on gh-pages; compares to last run and warns on regression.
+      - name: Store benchmark result (github-action-benchmark)
+        if: success()
+        uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
+        with:
+          name: Sirius GPU Microbench (${{ steps.profile.outputs.name }})
+          tool: googlecpp
+          output-file-path: ${{ github.workspace }}/runs/microbench/ci_${{ github.run_id }}_${{ steps.profile.outputs.name }}/benchmark.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench/gpu-microbench/${{ steps.profile.outputs.name }}
+          alert-threshold: "125%"
+          comment-on-alert: true
+          summary-always: true
+          max-items-in-chart: 50
+          fail-on-alert: ${{ steps.bench_flags.outputs.fail_on_alert == 'true' }}
 
       - name: Upload results
         if: success()

@@ -97,6 +97,31 @@ Workflow: `.github/workflows/gpu-microbench.yml`
 - **Artifacts:** JSON under `runs/microbench/ci_<run_id>_<profile>/` (30-day retention).
 - **Summary:** Markdown table of benchmark **real** time written to the job summary.
 
+### Continuous benchmark (charts + regression warnings)
+
+The workflow runs **[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark)** (`tool: googlecpp`) after each successful sweep. It:
+
+- **Stores** history and **pushes** JSON + generated pages to the **`gh-pages`** branch under
+  `dev/bench/gpu-microbench/<profile>/` (separate paths for `daily`, `weekly`, and `full`).
+- **Visualizes** trends (interactive charts on GitHub Pages once enabled).
+- **Warns** on regressions: default **`alert-threshold: 125%`** (alert if a case is **>1.25× slower** than the baseline stored on `gh-pages`).
+  - **`summary-always: true`** adds a comparison to the **Actions job summary** (works for scheduled runs).
+  - **`comment-on-alert: true`** can comment on PRs when that workflow is triggered from a PR with the same action (optional future hook-up).
+
+**One-time repo setup**
+
+1. **Allow the action** (if the org uses an action allowlist): add `benchmark-action/github-action-benchmark@*` (see `.github/workflows/test.yml` NOTICE).
+2. **GitHub Pages:** Settings → Pages → Build and deployment → deploy from branch **`gh-pages`**, folder **`/ (root)`** (or follow your org standard). After the first successful run, open:
+
+   `https://<owner>.github.io/<repo>/dev/bench/gpu-microbench/daily/`
+   (replace `daily` with `weekly` or `full` as needed.)
+
+**Optional: fail the job on regression**
+
+Manual runs only: set workflow input **`fail_on_regression`** to **true**. That sets **`fail-on-alert: true`** so the job fails if any benchmark exceeds **`alert-threshold`** vs the last stored baseline. Scheduled runs do **not** fail by default (noise + runner variance).
+
+Tune **`alert-threshold`** in `.github/workflows/gpu-microbench.yml` if 125% is too tight for GPU variance on self-hosted hardware.
+
 ## Interpreting artifacts
 
 Download the artifact zip and open `benchmark.json`. With `UseRealTime` and millisecond units, `real_time` and `time_unit` are the primary wall-clock metrics. `cpu_time` may still appear in the schema; prefer **`real_time`** for these benchmarks.
