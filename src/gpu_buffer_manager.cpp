@@ -36,6 +36,32 @@ namespace duckdb {
 using sirius::AggregationType;
 using sirius::OrderByType;
 
+namespace {
+
+cudf::table_view apply_projection_indices(
+  cudf::table_view view,
+  const std::vector<int32_t>& projection_indices)
+{
+  if (projection_indices.empty()) {
+    return view;
+  }
+
+  std::vector<cudf::column_view> projected_columns;
+  projected_columns.reserve(projection_indices.size());
+  for (auto idx : projection_indices) {
+    if (idx < 0 || idx >= view.num_columns()) {
+      throw InvalidInputException(StringUtil::Format(
+        "projection index %d out of range for packed table with %d columns",
+        idx,
+        view.num_columns()));
+    }
+    projected_columns.push_back(view.column(idx));
+  }
+  return cudf::table_view(projected_columns);
+}
+
+}  // namespace
+
 template int16_t* GPUBufferManager::customCudaMalloc<int16_t>(size_t size, int gpu, bool caching);
 
 template int* GPUBufferManager::customCudaMalloc<int>(size_t size, int gpu, bool caching);
@@ -636,9 +662,8 @@ void GPUBufferManager::registerExternalTable(
 
   // First registration: store the view directly (zero-copy).
   // The packed buffer stays alive until release_gpu_buffers().
-  // packed_cudf_table is set to nullptr — duckdb_scan_task will
-  // use the finalized table after finalize_pending_views().
-  rel->packed_cudf_table = nullptr;
+  // packed_cudf_table is populated after finalize_pending_views().
+  rel->packed_cudf_table.reset();
   rel->pending_metadata.push_back(std::move(metadata));
   rel->pending_views.push_back(view);
   rel->pending_total_rows = num_rows;
@@ -678,6 +703,7 @@ void GPUBufferManager::registerExternalTablePacked(
     uint8_t* gpu_data,
     size_t gpu_size,
     std::string metadata,
+    const std::vector<int32_t>& projection_indices,
     int& out_num_cols,
     int& out_num_rows) {
 
@@ -704,7 +730,8 @@ void GPUBufferManager::registerExternalTablePacked(
     // Unpack from the STORED metadata (stable pointer).
     auto& stored_md = existing->second->pending_metadata.back();
     auto* md_ptr = reinterpret_cast<const uint8_t*>(stored_md.data());
-    cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
+    auto raw_view = cudf::unpack(md_ptr, gpu_data);
+    auto view = apply_projection_indices(raw_view, projection_indices);
 
     // Check if cudf::unpack modified the GPU data.
     {
@@ -726,6 +753,7 @@ void GPUBufferManager::registerExternalTablePacked(
 
     existing->second->pending_views.push_back(view);
     existing->second->pending_gpu_ptrs.push_back(gpu_data);
+    existing->second->pending_projection_indices.push_back(projection_indices);
     auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
     existing->second->pending_total_rows = total_rows;
     for (auto& col : existing->second->columns) {
@@ -815,13 +843,14 @@ void GPUBufferManager::registerExternalTablePacked(
   auto num_cols_est = 0; // Will be set after unpack.
   auto rel = make_shared_ptr<GPUIntermediateRelation>(0);
   rel->names = up_table_name;
-  rel->packed_cudf_table = nullptr;
+  rel->packed_cudf_table.reset();
   rel->pending_metadata.push_back(std::move(metadata));
 
   // Unpack from the STORED metadata (stable pointer).
   auto& stored_md = rel->pending_metadata.back();
   auto* md_ptr = reinterpret_cast<const uint8_t*>(stored_md.data());
-  cudf::table_view view = cudf::unpack(md_ptr, gpu_data);
+  auto raw_view = cudf::unpack(md_ptr, gpu_data);
+  auto view = apply_projection_indices(raw_view, projection_indices);
 
   auto num_cols = view.num_columns();
   auto num_rows = static_cast<size_t>(view.num_rows());
@@ -882,6 +911,7 @@ void GPUBufferManager::registerExternalTablePacked(
 
   rel->pending_views.push_back(view);
   rel->pending_gpu_ptrs.push_back(gpu_data);
+  rel->pending_projection_indices.push_back(projection_indices);
   rel->pending_total_rows = num_rows;
   tables[up_table_name] = rel;
   out_num_cols = num_cols;

@@ -128,12 +128,27 @@ class LastGPUBuffers {
     return {0, {}};
   }
 
+  std::vector<int> GetProjectionIndices() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_session_) {
+      return active_session_->projection_indices;
+    }
+    return {};
+  }
+
   void SetPartitionConfig(int num_partitions, std::vector<int> column_indices) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_session_) {
       active_session_->partition_num = num_partitions;
       active_session_->partition_cols = std::move(column_indices);
       active_session_->packed_partitions.clear();
+    }
+  }
+
+  void SetProjectionIndices(std::vector<int> projection_indices) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_session_) {
+      active_session_->projection_indices = std::move(projection_indices);
     }
   }
 

@@ -71,6 +71,7 @@ class ExchangeSession {
   // --- Partition config (set before execution) ---
   int partition_num = 0;
   std::vector<int> partition_cols;
+  std::vector<int> projection_indices;
 
   // --- Packed GPU data (set during execution by result_collector) ---
   // Per-partition packed data (accumulated across batches)

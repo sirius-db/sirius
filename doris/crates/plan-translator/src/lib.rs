@@ -11,7 +11,7 @@ use prost::Message;
 use tracing::debug;
 
 use doris_thrift::exprs::{TExpr, TExprNodeType};
-use doris_thrift::plan_nodes::{TPlan, TPlanNodeType};
+use doris_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNodeType};
 use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUri};
@@ -35,6 +35,48 @@ fn dedup_column_names(names: Vec<String>) -> Vec<String> {
         *count += 1;
         if *count == 1 { name } else { format!("{}_{}", name, *count - 1) }
     }).collect()
+}
+
+fn is_semi_or_anti_join_op(join_op: &TJoinOp) -> bool {
+    matches!(
+        *join_op,
+        TJoinOp::LEFT_SEMI_JOIN
+            | TJoinOp::RIGHT_SEMI_JOIN
+            | TJoinOp::LEFT_ANTI_JOIN
+            | TJoinOp::RIGHT_ANTI_JOIN
+            | TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN
+            | TJoinOp::NULL_AWARE_LEFT_SEMI_JOIN
+    )
+}
+
+/// Return a CPU-routing reason when the fragment must execute through DuckDB
+/// `from_substrait()` because the current Sirius GPU path cannot safely
+/// consume the translated shape.
+fn fragment_cpu_substrait_reason(plan: &TPlan) -> Option<&'static str> {
+    for node in &plan.nodes {
+        match node.node_type {
+            TPlanNodeType::CROSS_JOIN_NODE => {
+                return Some("CROSS_JOIN_NODE");
+            }
+            TPlanNodeType::HASH_JOIN_NODE => {
+                let Some(hash_join) = node.hash_join_node.as_ref() else {
+                    continue;
+                };
+                let has_other_join_conjuncts = hash_join
+                    .other_join_conjuncts
+                    .as_ref()
+                    .is_some_and(|conjuncts| !conjuncts.is_empty());
+                let has_vother_join_conjunct = hash_join.vother_join_conjunct.is_some();
+                if !is_semi_or_anti_join_op(&hash_join.join_op)
+                    && (has_other_join_conjuncts || has_vother_join_conjunct)
+                {
+                    return Some("HASH_JOIN_NODE with non-equality predicates on non-SEMI/ANTI join");
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Substrait extension URIs for standard function sets.
@@ -232,7 +274,8 @@ pub struct TranslatedPlan {
     pub sort_columns: Vec<SortColumn>,
     /// LIMIT from the sort node, applied after sorting.
     pub sort_limit: Option<i64>,
-    /// Reserved for future use (always false currently).
+    /// Force the Doris BE to execute the fragment with CPU `from_substrait()`
+    /// instead of `gpu_execution_substrait()`.
     pub force_cpu_substrait: bool,
 }
 
@@ -473,6 +516,20 @@ pub fn translate_fragment(
     table_schemas: &HashMap<String, Vec<String>>,
     file_scan_map: &HashMap<String, FileScanInfo>,
 ) -> Result<TranslatedPlan> {
+    translate_fragment_with_table_types(
+        params,
+        table_schemas,
+        &HashMap::new(),
+        file_scan_map,
+    )
+}
+
+pub fn translate_fragment_with_table_types(
+    params: &TPipelineFragmentParams,
+    table_schemas: &HashMap<String, Vec<String>>,
+    table_schema_types: &HashMap<String, Vec<substrait::proto::Type>>,
+    file_scan_map: &HashMap<String, FileScanInfo>,
+) -> Result<TranslatedPlan> {
     let fragment = params
         .fragment
         .as_ref()
@@ -481,6 +538,11 @@ pub fn translate_fragment(
         .plan
         .as_ref()
         .context("TPlanFragment has no plan")?;
+    let force_cpu_substrait_reason = fragment_cpu_substrait_reason(plan);
+    let force_cpu_substrait = force_cpu_substrait_reason.is_some();
+    if let Some(reason) = force_cpu_substrait_reason {
+        debug!(reason, "forcing CPU Substrait for fragment");
+    }
 
     // Build descriptor table for column resolution.
     let desc_tbl = params
@@ -515,7 +577,15 @@ pub fn translate_fragment(
     let mut registry = ExtensionRegistry::new();
 
     // Translate the plan tree into a Substrait Rel tree.
-    let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, &table_schemas, file_scan_map)?;
+    let mut rel = node_translator::translate_plan(
+        plan,
+        &desc,
+        &scan_params,
+        &mut registry,
+        &table_schemas,
+        table_schema_types,
+        file_scan_map,
+    )?;
 
     // Honor fragment output_exprs as a real projection, not just for computed
     // expressions. Doris uses output_exprs for final SELECT-list reordering and
@@ -877,7 +947,7 @@ pub fn translate_fragment(
         sort_limit_sql,
         sort_columns,
         sort_limit,
-        force_cpu_substrait: false,
+        force_cpu_substrait,
     })
 }
 
@@ -885,8 +955,104 @@ pub fn translate_fragment(
 mod tests {
     use super::*;
     use crate::test_helpers::*;
+    use doris_thrift::plan_nodes::{TJoinOp, TPlanNodeType};
     use doris_thrift::types::TPrimitiveType;
+    use duckdb::{params, Config, Connection};
     use substrait::proto::{plan_rel, read_rel, rel, rel_common};
+
+    fn substrait_test_conn() -> Connection {
+        let config = Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .expect("duckdb config");
+        let conn = Connection::open_in_memory_with_flags(config).expect("duckdb in-memory");
+        let sirius_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let substrait_ext = format!(
+            "{}/substrait/build/release/extension/substrait/substrait.duckdb_extension",
+            sirius_root
+        );
+        conn.execute_batch(&format!("LOAD '{}'", substrait_ext))
+            .expect("load substrait extension");
+        conn
+    }
+
+    fn sort_rows(rows: &mut [Vec<String>]) {
+        rows.sort();
+    }
+
+    fn install_nation_fixture(conn: &Connection, table_name: &str) {
+        let sql = format!(
+            "CREATE OR REPLACE TABLE \"{table_name}\" AS
+             SELECT * FROM (VALUES
+                (6::BIGINT, 'FRANCE'),
+                (7::BIGINT, 'GERMANY')
+             ) AS t(n_nationkey, n_name)"
+        );
+        conn.execute_batch(&sql).expect("install nation fixture");
+    }
+
+    fn value_ref_to_string(value: duckdb::types::ValueRef<'_>) -> String {
+        match value {
+            duckdb::types::ValueRef::Null => "NULL".to_string(),
+            duckdb::types::ValueRef::Boolean(v) => v.to_string(),
+            duckdb::types::ValueRef::TinyInt(v) => v.to_string(),
+            duckdb::types::ValueRef::SmallInt(v) => v.to_string(),
+            duckdb::types::ValueRef::Int(v) => v.to_string(),
+            duckdb::types::ValueRef::BigInt(v) => v.to_string(),
+            duckdb::types::ValueRef::HugeInt(v) => v.to_string(),
+            duckdb::types::ValueRef::UTinyInt(v) => v.to_string(),
+            duckdb::types::ValueRef::USmallInt(v) => v.to_string(),
+            duckdb::types::ValueRef::UInt(v) => v.to_string(),
+            duckdb::types::ValueRef::UBigInt(v) => v.to_string(),
+            duckdb::types::ValueRef::Float(v) => v.to_string(),
+            duckdb::types::ValueRef::Double(v) => v.to_string(),
+            duckdb::types::ValueRef::Decimal(v) => v.to_string(),
+            duckdb::types::ValueRef::Text(v) => std::str::from_utf8(v)
+                .expect("utf8 text")
+                .to_string(),
+            other => panic!("unsupported test value type: {:?}", other),
+        }
+    }
+
+    fn query_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = conn.prepare(sql).expect("prepare query");
+        let mut rows = stmt.query([]).expect("run query");
+        let col_count = rows
+            .as_ref()
+            .expect("executed statement")
+            .column_count();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().expect("next row") {
+            let mut values = Vec::with_capacity(col_count);
+            for col_idx in 0..col_count {
+                values.push(value_ref_to_string(row.get_ref_unwrap(col_idx)));
+            }
+            out.push(values);
+        }
+        out
+    }
+
+    fn query_rows_from_substrait(conn: &Connection, plan_bytes: &[u8]) -> Vec<Vec<String>> {
+        let plan = Plan::decode(plan_bytes).expect("decode substrait plan");
+        let col_count = match plan.relations.first().and_then(|rel| rel.rel_type.as_ref()) {
+            Some(plan_rel::RelType::Root(root)) => root.names.len(),
+            other => panic!("expected Root relation, got {:?}", other),
+        };
+        let mut stmt = conn
+            .prepare("SELECT * FROM from_substrait(?::blob)")
+            .expect("prepare from_substrait");
+        let mut rows = stmt
+            .query(params![plan_bytes])
+            .expect("execute from_substrait");
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().expect("next row") {
+            let mut values = Vec::with_capacity(col_count);
+            for col_idx in 0..col_count {
+                values.push(value_ref_to_string(row.get_ref_unwrap(col_idx)));
+            }
+            out.push(values);
+        }
+        out
+    }
 
     #[test]
     fn test_translate_fragment_substrait_union() {
@@ -1090,6 +1256,11 @@ mod tests {
         let params = make_fragment_params(plan, desc);
 
         let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        // Exchange-only fragments (no cross/nested-loop join) are GPU-eligible.
+        assert!(
+            !result.force_cpu_substrait,
+            "exchange-only fragments should NOT be forced to CPU substrait"
+        );
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1224,6 +1395,86 @@ mod tests {
             }
             other => panic!("expected JoinRel, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    #[test]
+    fn test_hash_join_inner_with_vother_predicate_forces_cpu_substrait() {
+        use doris_thrift::opcodes::TExprOpcode;
+        use doris_thrift::plan_nodes::TJoinOp;
+
+        let mut join_node = make_hash_join_node(
+            0,
+            TJoinOp::INNER_JOIN,
+            vec![0, 1],
+            vec![(
+                slot_ref_expr_in_tuple(1, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        join_node.hash_join_node.as_mut().unwrap().vother_join_conjunct = Some(binary_pred_expr(
+            TExprOpcode::LT,
+            slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+            slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
+        ));
+        let left_scan = make_file_scan_node(1, 0, "orders");
+        let right_scan = make_file_scan_node(2, 1, "customers");
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20))],
+            vec![
+                (0, 0, 0, "order_id", TPrimitiveType::BIGINT),
+                (1, 0, 1, "cust_id", TPrimitiveType::BIGINT),
+                (2, 1, 0, "cust_id", TPrimitiveType::BIGINT),
+                (3, 1, 1, "name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        assert!(
+            result.force_cpu_substrait,
+            "non-SEMI/ANTI hash joins with vother predicates should route through CPU"
+        );
+    }
+
+    #[test]
+    fn test_hash_join_left_semi_with_vother_predicate_stays_gpu_eligible() {
+        use doris_thrift::opcodes::TExprOpcode;
+        use doris_thrift::plan_nodes::TJoinOp;
+
+        let mut join_node = make_hash_join_node(
+            0,
+            TJoinOp::LEFT_SEMI_JOIN,
+            vec![0],
+            vec![(
+                slot_ref_expr_in_tuple(1, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        join_node.hash_join_node.as_mut().unwrap().vother_join_conjunct = Some(binary_pred_expr(
+            TExprOpcode::LT,
+            slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+            slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
+        ));
+        let left_scan = make_file_scan_node(1, 0, "orders");
+        let right_scan = make_file_scan_node(2, 1, "customers");
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20))],
+            vec![
+                (0, 0, 0, "order_id", TPrimitiveType::BIGINT),
+                (1, 0, 1, "cust_id", TPrimitiveType::BIGINT),
+                (2, 1, 0, "cust_id", TPrimitiveType::BIGINT),
+                (3, 1, 1, "name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        assert!(
+            !result.force_cpu_substrait,
+            "mixed SEMI/ANTI hash joins remain GPU-eligible"
+        );
     }
 
     // ---- AGGREGATION_NODE tests (TPC-H: GROUP BY, COUNT, SUM) ----
@@ -1660,6 +1911,553 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_nested_loop_inner_join_with_general_predicate_uses_cross_filter() {
+        use doris_thrift::opcodes::TExprOpcode;
+
+        let left_scan = make_file_scan_node(1, 0, "nation_left");
+        let right_scan = make_file_scan_node(2, 1, "nation_right");
+        let mut join_node = make_cross_join_node(0, vec![0, 1]);
+        join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
+        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
+            compound_pred_expr(
+                TExprOpcode::COMPOUND_OR,
+                vec![
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    11,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                        ],
+                    ),
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    11,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ]);
+
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20)), (2, None)],
+            vec![
+                (0, 0, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (1, 0, 1, "n_name", TPrimitiveType::VARCHAR),
+                (2, 1, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (3, 1, 1, "n_name", TPrimitiveType::VARCHAR),
+                (10, 2, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (11, 2, 1, "n_name", TPrimitiveType::VARCHAR),
+                (12, 2, 2, "n_nationkey", TPrimitiveType::BIGINT),
+                (13, 2, 3, "n_name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        let filter = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Filter(filter) => filter,
+            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+        };
+        match filter.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
+            rel::RelType::Cross(_) => {}
+            other => panic!("expected CrossRel, got {:?}", std::mem::discriminant(other)),
+        }
+        assert!(
+            node_translator::validate_field_refs(input, "root").is_empty(),
+            "nested-loop inner join predicate should resolve within the combined child schema"
+        );
+        assert_eq!(
+            node_translator::collect_rel_column_names(input),
+            vec![
+                "n_nationkey".to_string(),
+                "n_name".to_string(),
+                "n_nationkey_1".to_string(),
+                "n_name_1".to_string(),
+            ],
+            "nested-loop join children should expose unique output names to DuckDB"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_nested_loop_inner_join_duplicate_names_executes_via_from_substrait() {
+        use doris_thrift::opcodes::TExprOpcode;
+
+        let left_scan = make_file_scan_node(1, 0, "nation_left");
+        let right_scan = make_file_scan_node(2, 1, "nation_right");
+        let mut join_node = make_cross_join_node(0, vec![0, 1]);
+        join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
+        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
+            compound_pred_expr(
+                TExprOpcode::COMPOUND_OR,
+                vec![
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    11,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                        ],
+                    ),
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    11,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    2,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ]);
+
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20)), (2, None)],
+            vec![
+                (0, 0, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (1, 0, 1, "n_name", TPrimitiveType::VARCHAR),
+                (2, 1, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (3, 1, 1, "n_name", TPrimitiveType::VARCHAR),
+                (10, 2, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (11, 2, 1, "n_name", TPrimitiveType::VARCHAR),
+                (12, 2, 2, "n_nationkey", TPrimitiveType::BIGINT),
+                (13, 2, 3, "n_name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let conn = substrait_test_conn();
+        install_nation_fixture(&conn, "nation_left_1");
+        install_nation_fixture(&conn, "nation_right_2");
+
+        let mut actual = query_rows_from_substrait(&conn, &result.substrait_bytes);
+        let mut baseline = query_rows(
+            &conn,
+            "SELECT * FROM nation_left_1, nation_right_2
+             WHERE ((nation_left_1.n_name = 'FRANCE' AND nation_right_2.n_name = 'GERMANY')
+                 OR (nation_left_1.n_name = 'GERMANY' AND nation_right_2.n_name = 'FRANCE'))",
+        );
+        let mut expected = vec![
+            vec![
+                "6".to_string(),
+                "FRANCE".to_string(),
+                "7".to_string(),
+                "GERMANY".to_string(),
+            ],
+            vec![
+                "7".to_string(),
+                "GERMANY".to_string(),
+                "6".to_string(),
+                "FRANCE".to_string(),
+            ],
+        ];
+        sort_rows(&mut actual);
+        sort_rows(&mut baseline);
+        sort_rows(&mut expected);
+        assert_eq!(baseline, expected);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_q7_nation_exchange_fragment_executes_via_from_substrait() {
+        use doris_thrift::opcodes::TExprOpcode;
+
+        let exchange = make_exchange_node(1, vec![1]);
+        let right_scan = make_file_scan_node(2, 3, "nation");
+        let mut join_node = make_cross_join_node(3, vec![5]);
+        join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
+        join_node.nested_loop_join_node.as_mut().unwrap().vintermediate_tuple_id_list =
+            Some(vec![4]);
+        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
+            compound_pred_expr(
+                TExprOpcode::COMPOUND_OR,
+                vec![
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    4,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    15,
+                                    4,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                        ],
+                    ),
+                    compound_pred_expr(
+                        TExprOpcode::COMPOUND_AND,
+                        vec![
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    13,
+                                    4,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("GERMANY"),
+                            ),
+                            binary_pred_expr(
+                                TExprOpcode::EQ,
+                                slot_ref_expr_in_tuple(
+                                    15,
+                                    4,
+                                    type_desc(TPrimitiveType::VARCHAR),
+                                ),
+                                string_literal_expr("FRANCE"),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ]);
+        join_node.projections = Some(vec![
+            slot_ref_expr_in_tuple(12, 4, type_desc(TPrimitiveType::BIGINT)),
+            slot_ref_expr_in_tuple(13, 4, type_desc(TPrimitiveType::VARCHAR)),
+            slot_ref_expr_in_tuple(14, 4, type_desc(TPrimitiveType::BIGINT)),
+            slot_ref_expr_in_tuple(15, 4, type_desc(TPrimitiveType::VARCHAR)),
+        ]);
+        join_node.output_tuple_id = Some(5);
+
+        let plan = make_plan(vec![join_node, exchange, right_scan]);
+        let desc = make_desc_table(
+            vec![(1, None), (3, Some(30)), (4, None), (5, None)],
+            vec![
+                (0, 1, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (1, 1, 1, "n_name", TPrimitiveType::VARCHAR),
+                (6, 3, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (7, 3, 1, "n_name", TPrimitiveType::VARCHAR),
+                (12, 4, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (13, 4, 1, "n_name", TPrimitiveType::VARCHAR),
+                (14, 4, 2, "n_nationkey", TPrimitiveType::BIGINT),
+                (15, 4, 3, "n_name", TPrimitiveType::VARCHAR),
+                (20, 5, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (21, 5, 1, "n_name", TPrimitiveType::VARCHAR),
+                (22, 5, 2, "n_nationkey", TPrimitiveType::BIGINT),
+                (23, 5, 3, "n_name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "__EXCH_q7_test_1".to_string(),
+            vec!["n_nationkey".to_string(), "n_name".to_string()],
+        );
+
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
+        assert!(
+            result.force_cpu_substrait,
+            "Q7 nested-loop exchange fragment should be classified as CPU-only"
+        );
+        let conn = substrait_test_conn();
+        install_nation_fixture(&conn, "__EXCH_q7_test_1");
+        install_nation_fixture(&conn, "nation_2");
+
+        let mut actual = query_rows_from_substrait(&conn, &result.substrait_bytes);
+        let mut baseline = query_rows(
+            &conn,
+            "SELECT e.n_nationkey, e.n_name, n.n_nationkey, n.n_name
+             FROM \"__EXCH_q7_test_1\" e, nation_2 n
+             WHERE ((e.n_name = 'FRANCE' AND n.n_name = 'GERMANY')
+                 OR (e.n_name = 'GERMANY' AND n.n_name = 'FRANCE'))",
+        );
+        let mut expected = vec![
+            vec![
+                "6".to_string(),
+                "FRANCE".to_string(),
+                "7".to_string(),
+                "GERMANY".to_string(),
+            ],
+            vec![
+                "7".to_string(),
+                "GERMANY".to_string(),
+                "6".to_string(),
+                "FRANCE".to_string(),
+            ],
+        ];
+        sort_rows(&mut actual);
+        sort_rows(&mut baseline);
+        sort_rows(&mut expected);
+        assert_eq!(baseline, expected);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_nested_loop_inner_join_aggregate_child_names_are_uniquified() {
+        fn collect_field_refs(expr: &substrait::proto::Expression, refs: &mut Vec<i32>) {
+            match expr.rex_type.as_ref() {
+                Some(substrait::proto::expression::RexType::Selection(selection)) => {
+                    if let Some(substrait::proto::expression::field_reference::ReferenceType::DirectReference(segment)) =
+                        selection.reference_type.as_ref()
+                    {
+                        if let Some(substrait::proto::expression::reference_segment::ReferenceType::StructField(field)) =
+                            segment.reference_type.as_ref()
+                        {
+                            refs.push(field.field);
+                        }
+                    }
+                }
+                Some(substrait::proto::expression::RexType::ScalarFunction(func)) => {
+                    for arg in &func.arguments {
+                        if let Some(substrait::proto::function_argument::ArgType::Value(expr)) =
+                            arg.arg_type.as_ref()
+                        {
+                            collect_field_refs(expr, refs);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let left_scan = make_file_scan_node(1, 0, "parts");
+        let right_scan = make_file_scan_node(3, 1, "partsupp");
+        let right_agg = make_aggregation_node(
+            2,
+            vec![2],
+            Some(vec![slot_ref_expr_in_tuple(
+                2,
+                1,
+                type_desc(TPrimitiveType::BIGINT),
+            )]),
+            vec![agg_function_expr(
+                "sum",
+                type_desc(TPrimitiveType::BIGINT),
+                vec![type_desc(TPrimitiveType::BIGINT)],
+                vec![slot_ref_expr_in_tuple(
+                    3,
+                    1,
+                    type_desc(TPrimitiveType::BIGINT),
+                )],
+            )],
+            2,
+            2,
+            true,
+        );
+        let mut join_node = make_cross_join_node(0, vec![0, 2]);
+        join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
+        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
+            binary_pred_expr(
+                doris_thrift::opcodes::TExprOpcode::EQ,
+                slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(20, 2, type_desc(TPrimitiveType::BIGINT)),
+            ),
+        ]);
+
+        let plan = make_plan(vec![join_node, left_scan, right_agg, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20)), (2, None)],
+            vec![
+                (0, 0, 0, "ps_partkey", TPrimitiveType::BIGINT),
+                (2, 1, 0, "ps_partkey", TPrimitiveType::BIGINT),
+                (3, 1, 1, "ps_supplycost", TPrimitiveType::BIGINT),
+                (20, 2, 0, "ps_partkey", TPrimitiveType::BIGINT),
+                (21, 2, 1, "sum_supplycost", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        let filter = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Filter(filter) => filter,
+            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+        };
+        assert_eq!(
+            node_translator::collect_rel_column_names(input),
+            vec![
+                "ps_partkey".to_string(),
+                "ps_partkey_1".to_string(),
+                "".to_string(),
+            ],
+            "aggregate child grouping keys should be renamed without inventing measure names"
+        );
+        let mut field_refs = Vec::new();
+        collect_field_refs(filter.condition.as_deref().unwrap(), &mut field_refs);
+        assert_eq!(
+            field_refs,
+            vec![0, 1],
+            "aggregate nested-loop predicate should compare left key to renamed aggregate key"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_nested_loop_inner_join_aggregate_child_duplicate_names_executes_via_from_substrait() {
+        let left_scan = make_file_scan_node(1, 0, "parts");
+        let right_scan = make_file_scan_node(3, 1, "partsupp");
+        let right_agg = make_aggregation_node(
+            2,
+            vec![2],
+            Some(vec![slot_ref_expr_in_tuple(
+                2,
+                1,
+                type_desc(TPrimitiveType::BIGINT),
+            )]),
+            vec![agg_function_expr(
+                "sum",
+                type_desc(TPrimitiveType::BIGINT),
+                vec![type_desc(TPrimitiveType::BIGINT)],
+                vec![slot_ref_expr_in_tuple(
+                    3,
+                    1,
+                    type_desc(TPrimitiveType::BIGINT),
+                )],
+            )],
+            2,
+            2,
+            true,
+        );
+        let mut join_node = make_cross_join_node(0, vec![0, 2]);
+        join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
+        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
+            binary_pred_expr(
+                doris_thrift::opcodes::TExprOpcode::EQ,
+                slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(20, 2, type_desc(TPrimitiveType::BIGINT)),
+            ),
+        ]);
+
+        let plan = make_plan(vec![join_node, left_scan, right_agg, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20)), (2, None)],
+            vec![
+                (0, 0, 0, "ps_partkey", TPrimitiveType::BIGINT),
+                (2, 1, 0, "ps_partkey", TPrimitiveType::BIGINT),
+                (3, 1, 1, "ps_supplycost", TPrimitiveType::BIGINT),
+                (20, 2, 0, "ps_partkey", TPrimitiveType::BIGINT),
+                (21, 2, 1, "sum_supplycost", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
+        let conn = substrait_test_conn();
+        conn.execute_batch(
+            "CREATE OR REPLACE TABLE parts_1 AS
+                 SELECT * FROM (VALUES (1::BIGINT), (2::BIGINT)) AS t(ps_partkey);
+             CREATE OR REPLACE TABLE partsupp_3 AS
+                 SELECT * FROM (
+                     VALUES
+                        (1::BIGINT, 10::BIGINT),
+                        (1::BIGINT, 20::BIGINT),
+                        (2::BIGINT, 5::BIGINT)
+                 ) AS t(ps_partkey, ps_supplycost);",
+        )
+        .expect("install aggregate nested-loop fixtures");
+
+        let mut actual = query_rows_from_substrait(&conn, &result.substrait_bytes);
+        let mut baseline = query_rows(
+            &conn,
+            "SELECT p.ps_partkey, agg.ps_partkey, agg.sum_supplycost
+             FROM parts_1 p,
+                  (SELECT ps_partkey, SUM(ps_supplycost) AS sum_supplycost
+                   FROM partsupp_3
+                   GROUP BY ps_partkey) agg
+             WHERE p.ps_partkey = agg.ps_partkey",
+        );
+        let mut expected = vec![
+            vec!["1".to_string(), "1".to_string(), "30".to_string()],
+            vec!["2".to_string(), "2".to_string(), "5".to_string()],
+        ];
+        sort_rows(&mut actual);
+        sort_rows(&mut baseline);
+        sort_rows(&mut expected);
+        assert_eq!(baseline, expected);
+        assert_eq!(actual, expected);
+    }
+
     // ---- SELECT_NODE tests (filter pass-through) ----
 
     #[test]
@@ -1760,7 +2558,6 @@ mod tests {
         // Simulate Q2 fragment 0: MATERIALIZATION_NODE (8 output cols) → EXCHANGE_NODE (4 cols).
         // The exchange table only has 4 columns, but the root's row_tuples references 8.
         // translate_fragment should truncate output_names to 4 (the Rel's actual columns).
-        use doris_thrift::plan_nodes::TPlanNodeType;
 
         // Tuple 0: MATERIALIZATION_NODE output — 8 columns (includes late-materialized ones)
         // Tuple 1: EXCHANGE_NODE output — 4 columns (actually available in exchange data)

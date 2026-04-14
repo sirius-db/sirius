@@ -54,7 +54,9 @@ SIRIUS_EXCHANGE_C_API_EXPORT int sirius_finalize_exchange_tables_direct();
 SIRIUS_EXCHANGE_C_API_EXPORT uint64_t sirius_begin_exchange_capture(
   uint64_t num_partitions,
   const int32_t* column_indices,
-  size_t num_columns);
+  size_t num_columns,
+  const int32_t* projection_indices,
+  size_t num_projection_indices);
 SIRIUS_EXCHANGE_C_API_EXPORT sirius_exchange_artifact_handle* sirius_take_exchange_artifact();
 SIRIUS_EXCHANGE_C_API_EXPORT void sirius_exchange_artifact_destroy(
   sirius_exchange_artifact_handle* handle);

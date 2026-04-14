@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use crate::exchange_buffer::{ExchangeBuffer, ExchangeKey, PackedGpuExchange};
+use arrow::ipc::reader::StreamReader;
+
+use crate::exchange_buffer::{ExchangeBuffer, ExchangeKey, LocalGpuArtifact, PackedGpuExchange};
 use crate::exchange_sender::ExchangeDest;
 use crate::gpu_staging_buffer::StagingLease;
 use crate::hash_partitioner::{ExchangeInfo, PartitionStrategy};
@@ -158,6 +160,108 @@ impl ExecutionLocation {
     }
 }
 
+fn log_first_ipc_row(stage: &str, ipc_bytes: &[u8]) {
+    let Ok(reader) = StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None) else {
+        return;
+    };
+    let schema = reader.schema();
+
+    for batch in reader.flatten() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let mut row = Vec::with_capacity(batch.num_columns());
+        for col_idx in 0..batch.num_columns() {
+            let field_name = schema.field(col_idx).name();
+            let value = arrow::util::display::array_value_to_string(batch.column(col_idx), 0)
+                .unwrap_or_else(|_| "?".to_string());
+            row.push(format!("{field_name}={value}"));
+        }
+        tracing::info!(stage, row = ?row, "first IPC row");
+        break;
+    }
+}
+
+fn encode_nonempty_pblock_from_ipc(
+    ipc_bytes: &[u8],
+    context: &str,
+) -> Result<Option<doris_proto::doris::PBlock>, String> {
+    let (pblock, num_rows) = crate::arrow_to_pblock::arrow_ipc_to_pblock(ipc_bytes)
+        .map_err(|e| format!("{context}: {e}"))?;
+    Ok((num_rows > 0).then_some(pblock))
+}
+
+fn send_local_packed_exchange(
+    artifact: sirius_ffi::ExchangeArtifact,
+    ipc_bytes: Vec<u8>,
+    exch_info: &ExchangeInfo,
+    query_id: (i64, i64),
+    node_id: i32,
+    sender_id: i32,
+    exchange_buffer: &ExchangeBuffer,
+) -> Result<(), String> {
+    use std::sync::Arc;
+
+    log_first_ipc_row("send_local_packed_exchange_ipc", &ipc_bytes);
+
+    let shared_artifact = Arc::new(artifact);
+    let shared_ipc = Arc::new(ipc_bytes);
+    let destinations = &exch_info.destinations;
+    let num_dests = destinations.len();
+    match &exch_info.partition {
+        PartitionStrategy::Hash { .. } => {
+            for (dest_idx, _dest) in destinations.iter().enumerate() {
+                let key = ExchangeKey { query_id, node_id };
+                let partition_indices: Vec<usize> = shared_artifact
+                    .packed_partitions()
+                    .iter()
+                    .enumerate()
+                    .skip(dest_idx)
+                    .step_by(num_dests)
+                    .filter_map(|(idx, part)| (part.packed_size > 0).then_some(idx))
+                    .collect();
+                if !partition_indices.is_empty() {
+                    exchange_buffer.store_local_gpu_artifact(
+                        key.clone(),
+                        LocalGpuArtifact::select_from_exchange_artifact(
+                            shared_artifact.clone(),
+                            shared_ipc.clone(),
+                            &partition_indices,
+                            &[],
+                        ),
+                    );
+                }
+                exchange_buffer.add_block(&key, sender_id, None, true);
+            }
+        }
+        PartitionStrategy::Broadcast | PartitionStrategy::Random => {
+            let broadcast_indices: Vec<usize> = shared_artifact
+                .packed_broadcast()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, entry)| (entry.packed_size > 0).then_some(idx))
+                .collect();
+            for _dest in destinations {
+                let key = ExchangeKey { query_id, node_id };
+                if !broadcast_indices.is_empty() {
+                    exchange_buffer.store_local_gpu_artifact(
+                        key.clone(),
+                        LocalGpuArtifact::select_from_exchange_artifact(
+                            shared_artifact.clone(),
+                            shared_ipc.clone(),
+                            &[],
+                            &broadcast_indices,
+                        ),
+                    );
+                }
+                exchange_buffer.add_block(&key, sender_id, None, true);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Send exchange result using nixl GPU-direct if available, otherwise bRPC.
 ///
 /// When `nixl_only` is true, bRPC fallback is disabled — errors surface instead
@@ -191,18 +295,26 @@ pub async fn send_exchange_with_nixl(
         ExecutionLocation::PackedExchange { ipc_bytes, .. } => ipc_bytes.clone(),
     };
 
-    // For local 1-BE exchange, force the proven CPU PBlock path everywhere.
-    // The packed-GPU self-transfer path is the next design target, but it is
-    // not stable enough yet for the baseline correctness run.
     let all_local = destinations.iter().all(|d| d.brpc_addr == local_brpc_addr);
     let location = if all_local {
-        ExecutionLocation::Cpu(ipc_bytes.clone())
+        match location {
+            ExecutionLocation::PackedExchange { ipc_bytes, artifact } => {
+                return send_local_packed_exchange(
+                    artifact,
+                    ipc_bytes,
+                    exch_info,
+                    query_id,
+                    node_id,
+                    sender_id,
+                    exchange_buffer,
+                );
+            }
+            other => other,
+        }
     } else {
         location
     };
 
-    // For hash-partitioned exchange, split the data per destination first,
-    // then route each partition's data to its destination (local or remote).
     if let PartitionStrategy::Hash {
         ref partition_exprs,
         num_destinations,
@@ -237,7 +349,9 @@ pub async fn send_exchange_with_nixl(
                 packed_broadcast,
                 ..
             } => (buffers.as_slice(), packed_broadcast.as_slice(), None),
-            ExecutionLocation::PackedExchange { artifact, .. } => (&[][..], &[][..], Some(artifact)),
+            ExecutionLocation::PackedExchange { artifact, .. } => {
+                (&[][..], &[][..], Some(artifact))
+            }
             _ => (&[][..], &[][..], None),
         }
     };
@@ -361,9 +475,11 @@ pub async fn send_exchange_with_nixl(
             tracing::info!(dest = %dest.brpc_addr, sender_id, "self-transfer: empty IPC, sent EOS only");
             continue;
         }
-        let (pblock, _num_rows) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&ipc_bytes)
-            .map_err(|e| format!("self-transfer arrow_ipc_to_pblock: {e}"))?;
-        exchange_buffer.add_block(&key, sender_id, Some(pblock), false);
+        if let Some(pblock) =
+            encode_nonempty_pblock_from_ipc(&ipc_bytes, "self-transfer arrow_ipc_to_pblock")?
+        {
+            exchange_buffer.add_block(&key, sender_id, Some(pblock), false);
+        }
         exchange_buffer.add_block(&key, sender_id, None, true);
         tracing::info!(
             dest = %dest.brpc_addr,
@@ -1044,9 +1160,11 @@ async fn send_hash_partitioned(
             // Self-transfer via ExchangeBuffer.
             if let Some(batch) = partition_batch {
                 let part_ipc = record_batch_to_ipc(batch)?;
-                let (pblock, _) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&part_ipc)
-                    .map_err(|e| format!("hash partition self-transfer pblock: {e}"))?;
-                exchange_buffer.add_block(&key, sender_id, Some(pblock), false);
+                if let Some(pblock) =
+                    encode_nonempty_pblock_from_ipc(&part_ipc, "hash partition self-transfer pblock")?
+                {
+                    exchange_buffer.add_block(&key, sender_id, Some(pblock), false);
+                }
             }
             // Always send EOS.
             exchange_buffer.add_block(&key, sender_id, None, true);
@@ -1056,19 +1174,21 @@ async fn send_hash_partitioned(
             // TODO(phase 4): GPU-direct nixl per-partition path.
             if let Some(batch) = partition_batch {
                 let part_ipc = record_batch_to_ipc(batch)?;
-                let (pblock, _) = crate::arrow_to_pblock::arrow_ipc_to_pblock(&part_ipc)
-                    .map_err(|e| format!("hash partition bRPC pblock: {e}"))?;
-                crate::exchange_sender::send_transmit_block(
-                    dest,
-                    query_id,
-                    node_id,
-                    sender_id,
-                    Some(pblock),
-                    false,
-                    0,
-                )
-                .await
-                .map_err(|e| format!("hash partition send data to {}: {e}", dest.brpc_addr))?;
+                if let Some(pblock) =
+                    encode_nonempty_pblock_from_ipc(&part_ipc, "hash partition bRPC pblock")?
+                {
+                    crate::exchange_sender::send_transmit_block(
+                        dest,
+                        query_id,
+                        node_id,
+                        sender_id,
+                        Some(pblock),
+                        false,
+                        0,
+                    )
+                    .await
+                    .map_err(|e| format!("hash partition send data to {}: {e}", dest.brpc_addr))?;
+                }
             }
             // Always send EOS.
             crate::exchange_sender::send_transmit_block(
@@ -1676,6 +1796,41 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn test_send_exchange_self_transfer_empty_ipc_sends_eos_only() {
+        let ipc = build_empty_test_ipc();
+        let location = ExecutionLocation::Cpu(ipc);
+        let exchange_buffer = crate::exchange_buffer::ExchangeBuffer::new();
+        let dests = vec![ExchangeDest {
+            brpc_addr: "localhost:8060".to_string(),
+            finst_id: (1, 1),
+        }];
+        let exch_info = make_broadcast_exch_info(dests, 42);
+        let key = crate::exchange_buffer::ExchangeKey {
+            query_id: (1, 2),
+            node_id: 42,
+        };
+
+        let result = send_exchange_with_nixl(
+            None,
+            location,
+            &exch_info,
+            (1, 2),
+            0,
+            false,
+            "localhost:8060",
+            &exchange_buffer,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            exchange_buffer.take(&key).is_empty(),
+            "empty IPC should not produce an empty PBlock"
+        );
+    }
+
     /// Build minimal valid Arrow IPC bytes for testing.
     fn build_test_ipc() -> Vec<u8> {
         use arrow::array::Int32Array;
@@ -1694,6 +1849,19 @@ mod tests {
         {
             let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
             writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    fn build_empty_test_ipc() -> Vec<u8> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
             writer.finish().unwrap();
         }
         buf

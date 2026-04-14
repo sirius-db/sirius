@@ -36,6 +36,15 @@ pub(crate) fn extract_field_ref_index(expr: &Expression) -> Option<i32> {
     }
 }
 
+#[derive(Clone)]
+struct TranslatedAggregateMeasure {
+    func_name: String,
+    arguments: Vec<FunctionArgument>,
+    output_type: Type,
+    is_distinct: bool,
+    arg_field_indices: Vec<i32>,
+}
+
 /// Translate a Doris TPlan (flat pre-order node list) into a Substrait Rel tree.
 pub fn translate_plan(
     plan: &TPlan,
@@ -43,13 +52,23 @@ pub fn translate_plan(
     scan_params: &BTreeMap<i32, TFileScanRangeParams>,
     registry: &mut ExtensionRegistry,
     table_schemas: &HashMap<String, Vec<String>>,
+    table_schema_types: &HashMap<String, Vec<Type>>,
     file_scan_map: &HashMap<String, FileScanInfo>,
 ) -> Result<Rel> {
     if plan.nodes.is_empty() {
         bail!("TPlan has no nodes");
     }
     let mut idx = 0;
-    translate_node(&plan.nodes, &mut idx, desc, scan_params, registry, table_schemas, file_scan_map)
+    translate_node(
+        &plan.nodes,
+        &mut idx,
+        desc,
+        scan_params,
+        registry,
+        table_schemas,
+        table_schema_types,
+        file_scan_map,
+    )
 }
 
 fn translate_node(
@@ -59,6 +78,7 @@ fn translate_node(
     scan_params: &BTreeMap<i32, TFileScanRangeParams>,
     registry: &mut ExtensionRegistry,
     table_schemas: &HashMap<String, Vec<String>>,
+    table_schema_types: &HashMap<String, Vec<Type>>,
     file_scan_map: &HashMap<String, FileScanInfo>,
 ) -> Result<Rel> {
     if *idx >= nodes.len() {
@@ -78,21 +98,26 @@ fn translate_node(
         "translate_node: processing plan node"
     );
 
-    // Save the first child's TPlanNode reference before advancing through children.
-    // Needed for:
-    //   - Joins: count left-side columns for field offsets
-    //   - Aggregation/Sort: resolve SLOT_REFs against the child's output schema
     let num_children = node.num_children as usize;
-    let first_child_node = if num_children >= 1 && *idx < nodes.len() {
-        Some(nodes[*idx].clone())
-    } else {
-        None
-    };
-
-    // Recursively translate children first (pre-order: children follow this node).
-    let children: Vec<Rel> = (0..num_children)
-        .map(|_| translate_node(nodes, idx, desc, scan_params, registry, table_schemas, file_scan_map))
-        .collect::<Result<_>>()?;
+    let mut child_root_nodes = Vec::with_capacity(num_children);
+    let mut children = Vec::with_capacity(num_children);
+    for _ in 0..num_children {
+        if *idx >= nodes.len() {
+            bail!("unexpected end of plan nodes while collecting child roots");
+        }
+        child_root_nodes.push(nodes[*idx].clone());
+        children.push(translate_node(
+            nodes,
+            idx,
+            desc,
+            scan_params,
+            registry,
+            table_schemas,
+            table_schema_types,
+            file_scan_map,
+        )?);
+    }
+    let first_child_node = child_root_nodes.first().cloned();
 
     // Translate this node based on type.
     let rel = if node.node_type == TPlanNodeType::FILE_SCAN_NODE {
@@ -125,7 +150,11 @@ fn translate_node(
                 .context("EXCHANGE_NODE has no row_tuples")?;
             let base_schema = match table_schemas.get(&exchange_table_name) {
                 Some(columns) if !columns.is_empty() => {
-                    scan_translator::build_exchange_schema(columns, desc)?
+                    if let Some(actual_types) = table_schema_types.get(&exchange_table_name) {
+                        scan_translator::build_schema_from_exact_types(columns, actual_types)?
+                    } else {
+                        scan_translator::build_exchange_schema(columns, desc)?
+                    }
                 }
                 _ => {
                     // No column info (empty exchange or not registered) — use descriptor.
@@ -244,7 +273,7 @@ fn translate_node(
         return translate_nested_loop_join_node(
             node,
             children,
-            first_child_node.as_ref(),
+            &child_root_nodes,
             desc,
             registry,
         );
@@ -632,6 +661,277 @@ pub(crate) fn collect_rel_column_names(rel: &Rel) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+fn rename_input_field_names(
+    input_names: &[String],
+    field_idx: i32,
+    desired_name: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    let field_idx = usize::try_from(field_idx)
+        .with_context(|| format!("{context}: negative field index {field_idx}"))?;
+    if field_idx >= input_names.len() {
+        bail!(
+            "{context}: field index {} out of bounds for {} input columns",
+            field_idx,
+            input_names.len()
+        );
+    }
+    let mut renamed = input_names.to_vec();
+    renamed[field_idx] = desired_name.to_string();
+    Ok(renamed)
+}
+
+fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
+    let current_names = collect_rel_column_names(&rel);
+    if current_names.len() != new_names.len() {
+        bail!(
+            "cannot rename rel output names: {} names -> {} names",
+            current_names.len(),
+            new_names.len()
+        );
+    }
+    if current_names == new_names {
+        return Ok(rel);
+    }
+
+    let mut rel = rel;
+    match rel.rel_type.as_mut() {
+        Some(rel::RelType::Read(read)) => {
+            let schema = read
+                .base_schema
+                .as_mut()
+                .context("ReadRel missing base_schema while renaming output names")?;
+            if schema.names.len() != new_names.len() {
+                bail!(
+                    "cannot rename ReadRel schema: {} names -> {} names",
+                    schema.names.len(),
+                    new_names.len()
+                );
+            }
+            schema.names = new_names.to_vec();
+            Ok(rel)
+        }
+        Some(rel::RelType::Filter(filter)) => {
+            let input = filter
+                .input
+                .take()
+                .context("FilterRel missing input while renaming output names")?;
+            filter.input = Some(Box::new(rename_rel_output_schema(*input, new_names)?));
+            Ok(rel)
+        }
+        Some(rel::RelType::Sort(sort)) => {
+            let input = sort
+                .input
+                .take()
+                .context("SortRel missing input while renaming output names")?;
+            sort.input = Some(Box::new(rename_rel_output_schema(*input, new_names)?));
+            Ok(rel)
+        }
+        Some(rel::RelType::Fetch(fetch)) => {
+            let input = fetch
+                .input
+                .take()
+                .context("FetchRel missing input while renaming output names")?;
+            fetch.input = Some(Box::new(rename_rel_output_schema(*input, new_names)?));
+            Ok(rel)
+        }
+        Some(rel::RelType::Project(project)) => {
+            let input = project
+                .input
+                .take()
+                .context("ProjectRel missing input while renaming output names")?;
+            let input_names = collect_rel_column_names(&input);
+            let current_output_names = current_names;
+            let expressions = &project.expressions;
+
+            let desired_input_names = if expressions.is_empty() {
+                new_names.to_vec()
+            } else {
+                if expressions.len() != new_names.len() {
+                    bail!(
+                        "cannot rename ProjectRel output names: {} names -> {} project expressions",
+                        new_names.len(),
+                        expressions.len()
+                    );
+                }
+                let mut desired_input_names = input_names.clone();
+                for (idx, (expr, desired_name)) in expressions.iter().zip(new_names.iter()).enumerate()
+                {
+                    if *desired_name == current_output_names[idx] {
+                        continue;
+                    }
+                    let field_idx = extract_field_ref_index(expr).with_context(|| {
+                        format!(
+                            "cannot rename computed ProjectRel output at position {idx} from {:?} to {:?}",
+                            current_output_names[idx], desired_name
+                        )
+                    })?;
+                    desired_input_names =
+                        rename_input_field_names(&desired_input_names, field_idx, desired_name, "ProjectRel")?;
+                }
+                desired_input_names
+            };
+
+            project.input = Some(Box::new(rename_rel_output_schema(*input, &desired_input_names)?));
+            Ok(rel)
+        }
+        Some(rel::RelType::Aggregate(agg)) => {
+            let input = agg
+                .input
+                .take()
+                .context("AggregateRel missing input while renaming output names")?;
+            let input_names = collect_rel_column_names(&input);
+            let grouping = agg.groupings.first();
+            let grouping_exprs = grouping
+                .map(|g| g.grouping_expressions.as_slice())
+                .unwrap_or(&[]);
+            let group_count = grouping_exprs.len();
+            let measure_count = agg.measures.len();
+            if group_count + measure_count != new_names.len() {
+                bail!(
+                    "cannot rename AggregateRel output names: {} names for {} groupings + {} measures",
+                    new_names.len(),
+                    group_count,
+                    measure_count
+                );
+            }
+
+            let mut desired_input_names = input_names.clone();
+            for (idx, (expr, desired_name)) in grouping_exprs.iter().zip(new_names.iter()).enumerate() {
+                if *desired_name == current_names[idx] {
+                    continue;
+                }
+                let field_idx = extract_field_ref_index(expr).with_context(|| {
+                    format!(
+                        "cannot rename AggregateRel grouping output at position {idx} from {:?} to {:?}",
+                        current_names[idx], desired_name
+                    )
+                })?;
+                desired_input_names =
+                    rename_input_field_names(&desired_input_names, field_idx, desired_name, "AggregateRel")?;
+            }
+            for (measure_idx, desired_name) in new_names[group_count..].iter().enumerate() {
+                let current_name = &current_names[group_count + measure_idx];
+                if desired_name != current_name {
+                    bail!(
+                        "cannot rename AggregateRel measure output at position {} from {:?} to {:?}",
+                        measure_idx,
+                        current_name,
+                        desired_name
+                    );
+                }
+            }
+
+            agg.input = Some(Box::new(rename_rel_output_schema(*input, &desired_input_names)?));
+            Ok(rel)
+        }
+        Some(rel::RelType::Join(join)) => {
+            let left = join
+                .left
+                .take()
+                .context("JoinRel missing left input while renaming output names")?;
+            let right = join
+                .right
+                .take()
+                .context("JoinRel missing right input while renaming output names")?;
+            let left_width = collect_rel_column_names(&left).len();
+            let right_width = collect_rel_column_names(&right).len();
+            if left_width + right_width != new_names.len() {
+                bail!(
+                    "cannot rename JoinRel output names: {} names for {} left + {} right columns",
+                    new_names.len(),
+                    left_width,
+                    right_width
+                );
+            }
+            join.left = Some(Box::new(rename_rel_output_schema(*left, &new_names[..left_width])?));
+            join.right = Some(Box::new(rename_rel_output_schema(
+                *right,
+                &new_names[left_width..left_width + right_width],
+            )?));
+            Ok(rel)
+        }
+        Some(rel::RelType::Cross(cross)) => {
+            let left = cross
+                .left
+                .take()
+                .context("CrossRel missing left input while renaming output names")?;
+            let right = cross
+                .right
+                .take()
+                .context("CrossRel missing right input while renaming output names")?;
+            let left_width = collect_rel_column_names(&left).len();
+            let right_width = collect_rel_column_names(&right).len();
+            if left_width + right_width != new_names.len() {
+                bail!(
+                    "cannot rename CrossRel output names: {} names for {} left + {} right columns",
+                    new_names.len(),
+                    left_width,
+                    right_width
+                );
+            }
+            cross.left = Some(Box::new(rename_rel_output_schema(*left, &new_names[..left_width])?));
+            cross.right = Some(Box::new(rename_rel_output_schema(
+                *right,
+                &new_names[left_width..left_width + right_width],
+            )?));
+            Ok(rel)
+        }
+        other => bail!("cannot rename output names for nested-loop child rel {:?}", other),
+    }
+}
+
+fn uniquify_nested_loop_child_names(left: Rel, right: Rel) -> Result<(Rel, Vec<String>, Rel, Vec<String>)> {
+    let left_names = collect_rel_column_names(&left);
+    let right_names = collect_rel_column_names(&right);
+
+    let mut seen = HashMap::<String, usize>::new();
+    let mut unique_left = Vec::with_capacity(left_names.len());
+    for name in left_names {
+        if name.is_empty() {
+            unique_left.push(name);
+            continue;
+        }
+        let count = seen.entry(name.clone()).or_insert(0);
+        let unique = if *count == 0 {
+            name.clone()
+        } else {
+            format!("{}_{}", name, *count)
+        };
+        *count += 1;
+        unique_left.push(unique);
+    }
+
+    let mut unique_right = Vec::with_capacity(right_names.len());
+    for name in right_names {
+        if name.is_empty() {
+            unique_right.push(name);
+            continue;
+        }
+        let count = seen.entry(name.clone()).or_insert(0);
+        let unique = if *count == 0 {
+            name.clone()
+        } else {
+            format!("{}_{}", name, *count)
+        };
+        *count += 1;
+        unique_right.push(unique);
+    }
+
+    let renamed_left = if collect_rel_column_names(&left) != unique_left {
+        rename_rel_output_schema(left, &unique_left)?
+    } else {
+        left
+    };
+    let renamed_right = if collect_rel_column_names(&right) != unique_right {
+        rename_rel_output_schema(right, &unique_right)?
+    } else {
+        right
+    };
+
+    Ok((renamed_left, unique_left, renamed_right, unique_right))
 }
 
 #[cfg(test)]
@@ -1272,7 +1572,7 @@ fn translate_aggregation_node(
         .as_ref()
         .context("AGGREGATION_NODE missing agg_node data")?;
 
-    let input = children.into_iter().next().unwrap();
+    let mut input = children.into_iter().next().unwrap();
 
     // Collapse two-phase aggregation: if this is the finalize phase and the child
     // is already a partial AggregateRel, unwrap the child and use a single aggregation.
@@ -1482,12 +1782,14 @@ fn translate_aggregation_node(
         vec![]
     };
 
+    let is_exchange_finalize =
+        agg_node.need_finalize && matches!(input.rel_type.as_ref(), Some(rel::RelType::Read(_)));
+
     // Translate aggregate function measures.
-    let mut measures = Vec::new();
+    let mut translated_measures = Vec::new();
     for agg_fn_expr in &agg_node.aggregate_functions {
         let (func_name, arguments, output_type, is_distinct) =
             expr_translator::translate_agg_expr(agg_fn_expr, desc, registry, child_row_tuples)?;
-
         let arg_slots: Vec<String> = agg_fn_expr
             .nodes
             .iter()
@@ -1523,8 +1825,7 @@ fn translate_aggregation_node(
         tracing::info!(
             node_id = node.node_id,
             need_finalize = agg_node.need_finalize,
-            is_exchange_finalize = agg_node.need_finalize
-                && matches!(input.rel_type.as_ref(), Some(rel::RelType::Read(_))),
+            is_exchange_finalize,
             func_name = %func_name,
             child_row_tuples = ?child_row_tuples,
             child_col_names = ?desc.child_rel_column_names_snapshot(),
@@ -1535,16 +1836,21 @@ fn translate_aggregation_node(
             "translate_aggregation_node: aggregate measure"
         );
 
-        let func_anchor = registry.register_function(crate::URI_AGGREGATE, &func_name);
+        translated_measures.push(TranslatedAggregateMeasure {
+            func_name,
+            arguments,
+            output_type,
+            is_distinct,
+            arg_field_indices,
+        });
+    }
 
-        // Phase depends on context:
-        // - need_finalize + child is Read (exchange table) → INTERMEDIATE_TO_RESULT (4)
-        //   The exchange table contains partial aggregation results from remote BEs.
-        // - need_finalize + child is Aggregate (two-phase collapse) → handled above
-        // - need_finalize (other) → INITIAL_TO_RESULT (3)
-        // - !need_finalize → INITIAL_TO_INTERMEDIATE (1)
-        let is_exchange_finalize = agg_node.need_finalize
-            && matches!(input.rel_type.as_ref(), Some(rel::RelType::Read(_)));
+    // Clear child Rel column names now that expressions are translated.
+    desc.clear_child_rel_column_names();
+
+    let mut measures = Vec::new();
+    for measure in translated_measures {
+        let func_anchor = registry.register_function(crate::URI_AGGREGATE, &measure.func_name);
         let phase = if is_exchange_finalize {
             4 // INTERMEDIATE_TO_RESULT: merge partial results from exchange
         } else if agg_node.need_finalize {
@@ -1552,14 +1858,13 @@ fn translate_aggregation_node(
         } else {
             1 // INITIAL_TO_INTERMEDIATE
         };
-
-        let invocation = if is_distinct { 2 } else { 1 }; // DISTINCT=2, ALL=1
+        let invocation = if measure.is_distinct { 2 } else { 1 }; // DISTINCT=2, ALL=1
 
         measures.push(aggregate_rel::Measure {
             measure: Some(AggregateFunction {
                 function_reference: func_anchor,
-                arguments,
-                output_type: Some(output_type),
+                arguments: measure.arguments,
+                output_type: Some(measure.output_type),
                 phase,
                 invocation,
                 sorts: vec![],
@@ -1569,9 +1874,6 @@ fn translate_aggregation_node(
             filter: None,
         });
     }
-
-    // Clear child Rel column names now that expressions are translated.
-    desc.clear_child_rel_column_names();
 
     let num_grouping = grouping_expressions.len();
     let num_measures = measures.len();
@@ -1799,7 +2101,9 @@ fn projection_source_row_tuples(
 }
 
 fn projected_child_row_tuples(node: &TPlanNode) -> Option<Vec<i32>> {
-    let projections = node.projections.as_ref()?;
+    let Some(projections) = node.projections.as_ref() else {
+        return (!node.row_tuples.is_empty()).then(|| node.row_tuples.clone());
+    };
     if projections.is_empty() {
         return (!node.row_tuples.is_empty()).then(|| node.row_tuples.clone());
     }
@@ -1821,6 +2125,19 @@ fn projected_child_row_tuples(node: &TPlanNode) -> Option<Vec<i32>> {
     }
 
     (!node.row_tuples.is_empty()).then(|| node.row_tuples.clone())
+}
+
+fn combined_join_child_row_tuples(child_nodes: &[TPlanNode]) -> Option<Vec<i32>> {
+    if child_nodes.len() != 2 {
+        return None;
+    }
+
+    let left = projected_child_row_tuples(&child_nodes[0])?;
+    let right = projected_child_row_tuples(&child_nodes[1])?;
+
+    let mut combined = left;
+    combined.extend(right);
+    Some(combined)
 }
 
 /// Create a simple FieldReference expression for a column index.
@@ -1944,11 +2261,17 @@ fn translate_sort_node(
     apply_node_projections(rel, node, desc, registry)
 }
 
-/// Translate NESTED_LOOP_JOIN_NODE → Substrait CrossRel (for CROSS_JOIN) or JoinRel.
+/// Translate Doris nested-loop joins.
+///
+/// Doris uses this physical node family for general nested-loop execution, including
+/// `join_op = INNER_JOIN` with arbitrary boolean conjuncts (for example Q7's nation
+/// pair filter). DuckDB's `from_substrait` path handles those reliably as
+/// `CrossRel + FilterRel`, not as a `JoinRel` with a general expression. So for
+/// INNER/CROSS nested-loop joins we preserve the physical semantics explicitly.
 fn translate_nested_loop_join_node(
     node: &TPlanNode,
     children: Vec<Rel>,
-    _first_child_node: Option<&TPlanNode>,
+    child_nodes: &[TPlanNode],
     desc: &DescriptorTable,
     registry: &mut ExtensionRegistry,
 ) -> Result<Rel> {
@@ -1966,12 +2289,27 @@ fn translate_nested_loop_join_node(
     let mut iter = children.into_iter();
     let left = iter.next().unwrap();
     let right = iter.next().unwrap();
-
-    let left_col_names = collect_rel_column_names(&left);
-    let right_col_names = collect_rel_column_names(&right);
+    let (left, left_col_names, right, right_col_names) =
+        uniquify_nested_loop_child_names(left, right)?;
+    let combined_row_tuples = combined_join_child_row_tuples(child_nodes);
+    let combined_child_col_names = {
+        let mut combined = left_col_names.clone();
+        combined.extend(right_col_names.clone());
+        combined
+    };
     let mut join_conditions = Vec::new();
 
     let mut translate_join_condition = |expr: &TExpr| -> Result<Expression> {
+        if let Some(row_tuples) = combined_row_tuples.as_deref() {
+            if !combined_child_col_names.is_empty() {
+                desc.set_child_rel_column_names(combined_child_col_names.clone());
+            }
+            let translated =
+                expr_translator::translate_expr_in_context(expr, desc, registry, row_tuples);
+            desc.clear_child_rel_column_names();
+            return translated;
+        }
+
         let mut combined = left_col_names.clone();
         combined.extend(right_col_names.clone());
         if !combined.is_empty() {
@@ -1991,8 +2329,8 @@ fn translate_nested_loop_join_node(
         join_conditions.push(translate_join_condition(conjunct)?);
     }
 
-    if nlj.join_op == TJoinOp::CROSS_JOIN {
-        // CrossRel for pure cross joins.
+    if matches!(nlj.join_op, TJoinOp::CROSS_JOIN | TJoinOp::INNER_JOIN) {
+        // Preserve nested-loop INNER/CROSS semantics explicitly as CrossRel + FilterRel.
         let cross_rel = Rel {
             rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
                 left: Some(Box::new(left)),
@@ -2019,7 +2357,7 @@ fn translate_nested_loop_join_node(
         let rel = apply_conjuncts(result, node, desc, registry)?;
         apply_node_projections(rel, node, desc, registry)
     } else {
-        // Non-cross nested loop join → JoinRel.
+        // Non-inner nested loop join → JoinRel.
         let expression = and_expressions(join_conditions, registry).map(Box::new);
 
         let join_rel = Rel {

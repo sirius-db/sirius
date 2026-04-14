@@ -169,6 +169,7 @@ class GPUBufferManager {
                                    uint8_t* gpu_data,
                                    size_t gpu_size,
                                    std::string metadata,
+                                   const std::vector<int32_t>& projection_indices,
                                    int& out_num_cols,
                                    int& out_num_rows);
 

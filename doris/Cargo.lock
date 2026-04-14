@@ -2647,6 +2647,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "doris-thrift",
+ "duckdb",
  "ordered-float 2.10.1",
  "prost",
  "substrait",

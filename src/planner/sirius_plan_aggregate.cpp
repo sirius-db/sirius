@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -238,6 +239,30 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
 
+  for (std::size_t i = 0; i < op.expressions.size(); i++) {
+    auto& aggregate = op.expressions[i]->Cast<duckdb::BoundAggregateExpression>();
+    std::string child_refs;
+    for (std::size_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
+      if (child_idx > 0) {
+        child_refs += ",";
+      }
+      auto& child = *aggregate.children[child_idx];
+      if (child.type == duckdb::ExpressionType::BOUND_REF) {
+        auto& ref = child.Cast<duckdb::BoundReferenceExpression>();
+        child_refs += "#" + std::to_string(ref.index);
+      } else {
+        child_refs += child.GetName();
+      }
+    }
+    SIRIUS_LOG_INFO(
+      "[sirius_plan_aggregate] expr[{}] fn={} distinct={} children=[{}] return_type={}",
+      i,
+      aggregate.function.name,
+      aggregate.IsDistinct(),
+      child_refs,
+      aggregate.return_type.ToString());
+  }
+
   // Downcast HUGEINT to BIGINT since cuDF does not support int128
   downcast_hugeint_types(op.types, op.expressions);
 
@@ -389,6 +414,23 @@ sirius_physical_plan_generator::extract_aggregate_expressions(
     }
   }
   if (expressions.empty()) { return child; }
+  std::string refs;
+  for (std::size_t i = 0; i < expressions.size(); i++) {
+    if (i > 0) {
+      refs += ",";
+    }
+    if (expressions[i]->type == duckdb::ExpressionType::BOUND_REF) {
+      auto& ref = expressions[i]->Cast<duckdb::BoundReferenceExpression>();
+      refs += "#" + std::to_string(ref.index);
+    } else {
+      refs += expressions[i]->GetName();
+    }
+  }
+  SIRIUS_LOG_INFO(
+    "[sirius_plan_aggregate] extract projection over child={} exprs=[{}] output_cols={}",
+    child->get_name(),
+    refs,
+    types.size());
   auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
     std::move(types), std::move(expressions), child->estimated_cardinality);
   projection->children.push_back(std::move(child));

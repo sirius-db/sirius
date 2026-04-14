@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use tokio::sync::Notify;
 
 use doris_proto::doris::PBlock;
+use sirius_ffi::{ExchangeArtifact, PackedBroadcastEntry, PackedPartition};
 
 /// Key identifying an exchange stream: (query_id, dest_node_id).
 ///
@@ -59,6 +60,119 @@ impl std::fmt::Debug for PackedGpuExchange {
     }
 }
 
+/// Local same-process GPU exchange payload.
+///
+/// This is the target ownership model for all-local exchange: the artifact owns
+/// the underlying C++ session and GPU resources, while the copied descriptors
+/// give Rust stable access to the packed layout without another control-plane
+/// lookup.
+pub struct LocalGpuArtifact {
+    _artifact: Option<Arc<ExchangeArtifact>>,
+    ipc_bytes: Arc<Vec<u8>>,
+    staging_base: usize,
+    packed_partitions: Vec<PackedPartition>,
+    packed_broadcast: Vec<PackedBroadcastEntry>,
+}
+
+impl LocalGpuArtifact {
+    pub fn from_exchange_artifact(artifact: ExchangeArtifact, ipc_bytes: Vec<u8>) -> Self {
+        let artifact = Arc::new(artifact);
+        let ipc_bytes = Arc::new(ipc_bytes);
+        let partition_indices: Vec<usize> = (0..artifact.packed_partitions().len()).collect();
+        let broadcast_indices: Vec<usize> = (0..artifact.packed_broadcast().len()).collect();
+        Self::select_from_exchange_artifact(
+            artifact,
+            ipc_bytes,
+            &partition_indices,
+            &broadcast_indices,
+        )
+    }
+
+    pub fn select_from_exchange_artifact(
+        artifact: Arc<ExchangeArtifact>,
+        ipc_bytes: Arc<Vec<u8>>,
+        partition_indices: &[usize],
+        broadcast_indices: &[usize],
+    ) -> Self {
+        Self {
+            ipc_bytes,
+            staging_base: artifact.staging_base(),
+            packed_partitions: partition_indices
+                .iter()
+                .filter_map(|&idx| artifact.packed_partitions().get(idx).cloned())
+                .collect(),
+            packed_broadcast: broadcast_indices
+                .iter()
+                .filter_map(|&idx| artifact.packed_broadcast().get(idx).cloned())
+                .collect(),
+            _artifact: Some(artifact),
+        }
+    }
+
+    pub fn staging_base(&self) -> usize {
+        self.staging_base
+    }
+
+    pub fn packed_partitions(&self) -> &[PackedPartition] {
+        &self.packed_partitions
+    }
+
+    pub fn packed_broadcast(&self) -> &[PackedBroadcastEntry] {
+        &self.packed_broadcast
+    }
+
+    pub fn ipc_bytes(&self) -> &[u8] {
+        self.ipc_bytes.as_slice()
+    }
+
+    pub fn has_exchange_data(&self) -> bool {
+        !self.packed_partitions.is_empty() || !self.packed_broadcast.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        staging_base: usize,
+        packed_partition_count: usize,
+        packed_broadcast_count: usize,
+    ) -> Self {
+        Self {
+            _artifact: None,
+            ipc_bytes: Arc::new(Vec::new()),
+            staging_base,
+            packed_partitions: (0..packed_partition_count)
+                .map(|i| PackedPartition {
+                    partition_id: i,
+                    staging_offset: i * 64,
+                    packed_size: 64,
+                    metadata: Vec::new(),
+                    num_rows: 1,
+                    overflow_gpu_addr: 0,
+                })
+                .collect(),
+            packed_broadcast: (0..packed_broadcast_count)
+                .map(|i| PackedBroadcastEntry {
+                    entry_id: i,
+                    staging_offset: i * 64,
+                    packed_size: 64,
+                    metadata: Vec::new(),
+                    num_rows: 1,
+                    overflow_gpu_addr: 0,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalGpuArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalGpuArtifact")
+            .field("staging_base", &format_args!("0x{:x}", self.staging_base))
+            .field("packed_partitions", &self.packed_partitions.len())
+            .field("packed_broadcast", &self.packed_broadcast.len())
+            .finish()
+    }
+}
+
 /// Concurrent buffer for exchange data arriving from multiple senders.
 #[derive(Clone)]
 pub struct ExchangeBuffer {
@@ -69,6 +183,13 @@ pub struct ExchangeBuffer {
     /// stores the packed buffer info here. The exchange async task retrieves it
     /// and calls gpu_register_table to make the data available to DuckDB on GPU.
     packed_gpu: Arc<DashMap<ExchangeKey, Vec<PackedGpuExchange>>>,
+    /// Local same-process GPU exchange payloads.
+    ///
+    /// This is not wired into execution yet; the immediate goal is to give the
+    /// runtime a typed home for owned local GPU artifacts so the zero-copy
+    /// exchange redesign can replace the current CPU/PBlock fallback without
+    /// adding another global lifetime path.
+    local_gpu: Arc<DashMap<ExchangeKey, Vec<LocalGpuArtifact>>>,
 }
 
 impl ExchangeBuffer {
@@ -77,6 +198,7 @@ impl ExchangeBuffer {
             entries: Arc::new(DashMap::new()),
             cancelled: Arc::new(DashMap::new()),
             packed_gpu: Arc::new(DashMap::new()),
+            local_gpu: Arc::new(DashMap::new()),
         }
     }
 
@@ -99,6 +221,30 @@ impl ExchangeBuffer {
     /// Take all packed GPU exchange data for an exchange key.
     pub fn take_packed_gpu(&self, key: &ExchangeKey) -> Option<Vec<PackedGpuExchange>> {
         self.packed_gpu
+            .remove(key)
+            .map(|(_, v)| v)
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Store local same-process GPU exchange payload for an exchange key.
+    pub fn store_local_gpu_artifact(&self, key: ExchangeKey, artifact: LocalGpuArtifact) {
+        tracing::info!(
+            query_id = ?(key.query_id),
+            node_id = key.node_id,
+            staging_base = format_args!("0x{:x}", artifact.staging_base()),
+            packed_partitions = artifact.packed_partitions().len(),
+            packed_broadcast = artifact.packed_broadcast().len(),
+            "store_local_gpu_artifact"
+        );
+        self.local_gpu
+            .entry(key)
+            .or_insert_with(Vec::new)
+            .push(artifact);
+    }
+
+    /// Take all local same-process GPU payloads for an exchange key.
+    pub fn take_local_gpu_artifacts(&self, key: &ExchangeKey) -> Option<Vec<LocalGpuArtifact>> {
+        self.local_gpu
             .remove(key)
             .map(|(_, v)| v)
             .filter(|v| !v.is_empty())
@@ -186,17 +332,33 @@ impl ExchangeBuffer {
     /// so async exchange tasks unblock and can check `is_cancelled()`.
     pub fn cancel_query(&self, query_hi: i64, query_lo: i64) {
         self.cancelled.insert((query_hi, query_lo), ());
-        let keys_to_remove: Vec<ExchangeKey> = self
+        let mut keys_to_remove: Vec<ExchangeKey> = self
             .entries
             .iter()
             .filter(|e| e.key().query_id == (query_hi, query_lo))
             .map(|e| e.key().clone())
             .collect();
+        keys_to_remove.extend(
+            self.packed_gpu
+                .iter()
+                .filter(|e| e.key().query_id == (query_hi, query_lo))
+                .map(|e| e.key().clone()),
+        );
+        keys_to_remove.extend(
+            self.local_gpu
+                .iter()
+                .filter(|e| e.key().query_id == (query_hi, query_lo))
+                .map(|e| e.key().clone()),
+        );
+        let mut seen = HashSet::new();
+        keys_to_remove.retain(|key| seen.insert(key.clone()));
         for key in &keys_to_remove {
             if let Some((_, entry)) = self.entries.remove(key) {
                 // Wake any waiting tasks so they see the entry is gone.
                 entry.notify.notify_one();
             }
+            self.packed_gpu.remove(key);
+            self.local_gpu.remove(key);
         }
     }
 
@@ -409,5 +571,45 @@ mod tests {
         assert!(buf.take(&k1).is_empty());
         assert!(buf.take(&k2).is_empty());
         assert_eq!(buf.take(&k_other).len(), 1);
+    }
+
+    #[test]
+    fn test_store_and_take_local_gpu_artifacts() {
+        let buf = ExchangeBuffer::new();
+        let k = key(7, 8, 9);
+
+        buf.store_local_gpu_artifact(k.clone(), LocalGpuArtifact::for_test(0x1000, 2, 1));
+
+        let artifacts = buf
+            .take_local_gpu_artifacts(&k)
+            .expect("local gpu artifact should be stored");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].staging_base(), 0x1000);
+        assert_eq!(artifacts[0].packed_partitions().len(), 2);
+        assert_eq!(artifacts[0].packed_broadcast().len(), 1);
+        assert!(artifacts[0].has_exchange_data());
+        assert!(buf.take_local_gpu_artifacts(&k).is_none());
+    }
+
+    #[test]
+    fn test_cancel_query_removes_packed_and_local_gpu_entries() {
+        let buf = ExchangeBuffer::new();
+        let k = key(50, 60, 3);
+
+        buf.store_packed_gpu(
+            k.clone(),
+            PackedGpuExchange {
+                gpu_addr: 0x1234,
+                gpu_size: 64,
+                cudf_metadata: vec![1, 2, 3],
+                _staging_lease: None,
+            },
+        );
+        buf.store_local_gpu_artifact(k.clone(), LocalGpuArtifact::for_test(0x2000, 1, 0));
+
+        buf.cancel_query(50, 60);
+
+        assert!(buf.take_packed_gpu(&k).is_none());
+        assert!(buf.take_local_gpu_artifacts(&k).is_none());
     }
 }
