@@ -151,8 +151,8 @@ class uring_reactor : public sirius_io_reactor {
   std::atomic<uint64_t> _wake_seq{0};
   std::atomic<bool> _stop{false};
   std::thread _worker;
-  moodycamel::ConcurrentQueue<device_read_req> _queue;
-  moodycamel::ConcurrentQueue<host_read_req> _host_queue;
+  duckdb_moodycamel::ConcurrentQueue<device_read_req> _queue;
+  duckdb_moodycamel::ConcurrentQueue<host_read_req> _host_queue;
   std::atomic<uint64_t> _cuda_seq{0};
 };
 

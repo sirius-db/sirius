@@ -45,7 +45,7 @@ static constexpr size_t NUM_CHUNKS    = 32;         ///< Bounce slots per reacto
 static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment (bytes).
 
 // ---------------------------------------------------------------------------
-// read_context
+// request context
 // ---------------------------------------------------------------------------
 
 /**
@@ -54,7 +54,7 @@ static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment (byt
  * A single read may be split into multiple sub-requests. All sub-requests
  * decrement @c pending; the last one resolves the promise.
  */
-struct read_context {
+struct request_context {
   std::promise<size_t> promise;    ///< Resolved when all sub-requests finish.
   std::atomic<size_t> pending{0};  ///< Outstanding sub-request count.
   size_t total_bytes{0};           ///< Bytes originally requested (returned on success).
@@ -99,18 +99,18 @@ struct device_read_req {
   size_t data_size{0};    ///< Bytes to actually copy to the device destination.
   uint8_t* dst{nullptr};  ///< Device destination pointer (pre-offset by caller).
   cudaStream_t stream{nullptr};
-  std::shared_ptr<read_context> ctx;  ///< Shared completion context.
+  std::shared_ptr<request_context> ctx;  ///< Shared completion context.
 };
 
 /**
  * @brief Descriptor for one buffered host read pushed to a reactor.
  */
 struct host_read_req {
-  int fd{-1};                         ///< Buffered @c O_RDONLY file descriptor.
-  size_t offset{0};                   ///< Byte offset in the file.
-  size_t size{0};                     ///< Bytes to read.
-  uint8_t* dst{nullptr};              ///< Host destination pointer.
-  std::shared_ptr<read_context> ctx;  ///< Shared completion context.
+  int fd{-1};                            ///< Buffered @c O_RDONLY file descriptor.
+  size_t offset{0};                      ///< Byte offset in the file.
+  size_t size{0};                        ///< Bytes to read.
+  uint8_t* dst{nullptr};                 ///< Host destination pointer.
+  std::shared_ptr<request_context> ctx;  ///< Shared completion context.
 };
 
 // ---------------------------------------------------------------------------
@@ -169,9 +169,9 @@ class sirius_ioctx;
  * @brief Abstract datasource extending cudf::io::datasource with batch read
  *        APIs.
  */
-class sirius_datasource : public cudf::io::datasource {
+class io_datasource : public cudf::io::datasource {
  public:
-  ~sirius_datasource() override = default;
+  ~io_datasource() override = default;
 
   virtual std::future<size_t> host_read_ranges_async(
     std::vector<cudf::io::text::byte_range_info> const& ranges,

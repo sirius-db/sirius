@@ -17,7 +17,7 @@
 #pragma once
 
 #include "io/types.hpp"
-#include "io/uring_reactor.hpp"
+#include "io/uring/uring_reactor.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
@@ -196,12 +196,12 @@ class uring_ioctx : public sirius_ioctx {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Concrete @c sirius_datasource backed by io_uring.
+ * @brief Concrete @c io_datasource backed by io_uring.
  *
  * Thin delegate: every read method forwards to @c sirius_ioctx, passing the
  * owned @c sirius_io_object by reference.
  */
-class uring_datasource : public sirius_datasource {
+class uring_datasource : public io_datasource {
  public:
   static constexpr size_t NUM_BUFFERS = NUM_CHUNKS;
   static constexpr size_t BUFFER_SIZE = CHUNK_SIZE;
@@ -226,12 +226,17 @@ class uring_datasource : public sirius_datasource {
   // ---- cudf::io::datasource overrides ---------------------------------------
 
   [[nodiscard]] size_t size() const override;
+
   [[nodiscard]] bool supports_device_read() const override;
+
   [[nodiscard]] bool is_device_read_preferred(size_t) const override;
 
   size_t host_read(size_t offset, size_t size, uint8_t* dst) override;
+
   std::unique_ptr<datasource::buffer> host_read(size_t offset, size_t size) override;
+
   std::future<size_t> host_read_async(size_t offset, size_t size, uint8_t* dst) override;
+
   std::future<std::unique_ptr<datasource::buffer>> host_read_async(size_t offset,
                                                                    size_t size) override;
 
@@ -242,6 +247,7 @@ class uring_datasource : public sirius_datasource {
                      size_t size,
                      uint8_t* dst,
                      rmm::cuda_stream_view stream) override;
+
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,

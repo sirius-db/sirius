@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
-#include "io/uring_reactor.hpp"
+#include "io/uring/uring_reactor.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <deque>
+#include <ranges>
 
 namespace sirius::io {
 

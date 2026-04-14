@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-#include "io/uring_datasource.hpp"
+#include "io/uring/uring_ioctx.hpp"
+
+#include "io/types.hpp"
 
 #include <fcntl.h>
 #include <spdlog/spdlog.h>
@@ -258,7 +260,7 @@ std::future<size_t> uring_ioctx::enqueue_device_read(
 
   size_t n_chunks = (a_end - a_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-  auto ctx         = std::make_shared<read_context>();
+  auto ctx         = std::make_shared<request_context>();
   ctx->total_bytes = size;
   ctx->pending.store(n_chunks, std::memory_order_relaxed);
   std::future<size_t> fut = ctx->promise.get_future();
@@ -301,8 +303,8 @@ std::future<size_t> uring_ioctx::host_read_ranges_async(
   size_t total    = 0;
   size_t n_active = 0;
   for (size_t i = 0; i < ranges.size(); ++i) {
-    size_t off = static_cast<size_t>(ranges[i].offset());
-    size_t sz  = std::min(static_cast<size_t>(ranges[i].size()),
+    auto off  = static_cast<size_t>(ranges[i].offset());
+    size_t sz = std::min(static_cast<size_t>(ranges[i].size()),
                          file_size > off ? file_size - off : size_t{0});
     if (sz > 0 && sz <= dst[i].size()) {
       total += sz;
@@ -316,14 +318,14 @@ std::future<size_t> uring_ioctx::host_read_ranges_async(
     return p.get_future();
   }
 
-  auto ctx         = std::make_shared<read_context>();
+  auto ctx         = std::make_shared<request_context>();
   ctx->total_bytes = total;
   ctx->pending.store(n_active, std::memory_order_relaxed);
 
   auto* reactor = uobj.reactor();
   for (size_t i = 0; i < ranges.size(); ++i) {
-    size_t off = static_cast<size_t>(ranges[i].offset());
-    size_t sz  = std::min(static_cast<size_t>(ranges[i].size()),
+    auto off  = static_cast<size_t>(ranges[i].offset());
+    size_t sz = std::min(static_cast<size_t>(ranges[i].size()),
                          file_size > off ? file_size - off : size_t{0});
     if (sz == 0 || sz > dst[i].size()) continue;
     host_read_req req;
@@ -343,83 +345,6 @@ size_t uring_ioctx::host_read_ranges(sirius_io_object& obj,
                                      std::span<cudf::host_span<std::byte>> dst)
 {
   return host_read_ranges_async(obj, ranges, dst).get();
-}
-
-// ---------------------------------------------------------------------------
-// uring_datasource
-// ---------------------------------------------------------------------------
-
-uring_datasource::uring_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
-                                   std::unique_ptr<sirius_io_object> io_object)
-  : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
-{
-  auto* uobj = dynamic_cast<uring_io_object*>(_io_object.get());
-  auto* uctx = dynamic_cast<uring_ioctx*>(_io_ctx.get());
-  if (uobj && uctx && !uobj->reactor()) uobj->set_reactor(&uctx->assign_reactor());
-}
-
-size_t uring_datasource::size() const { return _io_object->size(); }
-
-bool uring_datasource::supports_device_read() const { return true; }
-
-bool uring_datasource::is_device_read_preferred(size_t) const { return true; }
-
-size_t uring_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
-{
-  return _io_ctx->host_read(*_io_object, offset, size, dst);
-}
-
-std::unique_ptr<cudf::io::datasource::buffer> uring_datasource::host_read(size_t offset,
-                                                                          size_t size)
-{
-  return _io_ctx->host_read(*_io_object, offset, size);
-}
-
-std::future<size_t> uring_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
-{
-  return _io_ctx->host_read_async(*_io_object, offset, size, dst);
-}
-
-std::future<std::unique_ptr<cudf::io::datasource::buffer>> uring_datasource::host_read_async(
-  size_t offset, size_t size)
-{
-  return _io_ctx->host_read_async(*_io_object, offset, size);
-}
-
-std::unique_ptr<cudf::io::datasource::buffer> uring_datasource::device_read(
-  size_t offset, size_t size, rmm::cuda_stream_view stream)
-{
-  return _io_ctx->device_read(*_io_object, offset, size, stream);
-}
-
-size_t uring_datasource::device_read(size_t offset,
-                                     size_t size,
-                                     uint8_t* dst,
-                                     rmm::cuda_stream_view stream)
-{
-  return _io_ctx->device_read(*_io_object, offset, size, dst, stream);
-}
-
-std::future<size_t> uring_datasource::device_read_async(size_t offset,
-                                                        size_t size,
-                                                        uint8_t* dst,
-                                                        rmm::cuda_stream_view stream)
-{
-  return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
-}
-
-std::future<size_t> uring_datasource::host_read_ranges_async(
-  std::vector<cudf::io::text::byte_range_info> const& ranges,
-  std::span<cudf::host_span<std::byte>> dst)
-{
-  return _io_ctx->host_read_ranges_async(*_io_object, ranges, dst);
-}
-
-size_t uring_datasource::host_read_ranges(
-  std::vector<cudf::io::text::byte_range_info> const& ranges,
-  std::span<cudf::host_span<std::byte>> dst)
-{
-  return _io_ctx->host_read_ranges(*_io_object, ranges, dst);
 }
 
 }  // namespace sirius::io
