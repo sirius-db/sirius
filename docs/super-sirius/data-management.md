@@ -93,14 +93,28 @@ Operators access their ports by string name:
 
 ### `operator_data`
 
-Wraps a `vector<shared_ptr<data_batch>>` for operator input/output:
+Minimal empty base class. Provides a generic extension point for any type of operator data — signaling objects, metadata-only data, or non-batch representations can derive from `operator_data` without being forced into the batch model.
+
+### `pipelineable_operator_data`
+
+Extends `operator_data` with batch-based data flow (previously this logic lived directly in `operator_data`):
+- `std::vector<shared_ptr<data_batch>>` — the batch vector
+- `get_data_batches()` / `release_data_batches()` — access and ownership transfer
+- `prepare_for_processing()` — virtual hook for pre-execution preparation
 - Created by `get_next_task_input_data()` from port pops
 - Passed through the operator chain during `execute()`
-- Each batch may be from a different port
 
 ### `partitioned_operator_data`
 
-Extends `operator_data` with a partition index. Used by partition-aware operators (CONCAT, MERGE_SORT, MERGE_GROUP_BY) to track which partition the data belongs to.
+Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, MERGE_SORT, MERGE_GROUP_BY) to track which partition the data belongs to.
+
+### Class Hierarchy
+
+```
+operator_data                       (empty generic base)
+  └── pipelineable_operator_data    (batch vector + data flow methods)
+       └── partitioned_operator_data (adds partition_idx)
+```
 
 ## Data Format Conversion
 

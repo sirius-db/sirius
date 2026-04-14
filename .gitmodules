@@ -9,7 +9,7 @@
 	branch = main
 [submodule "substrait"]
 	path = substrait
-	url = https://github.com/duckdb/substrait.git
+	url = https://github.com/sirius-db/duckdb-substrait-extension.git
 	branch = main
 [submodule "cucascade"]
 	path = cucascade
@@ -22,3 +22,6 @@
 	path = .claude/claude-tools
 	url = https://github.com/sirius-db/claude-tools.git
 	branch = main
+[submodule "vcpkg"]
+	path = vcpkg
+	url = https://github.com/Microsoft/vcpkg.git

@@ -16,12 +16,14 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
+#include "creator/task_creator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_engine.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -42,13 +44,13 @@ bool sirius_pipeline::is_order_dependent() const
 {
   if (source) {
     auto source_order = source->source_order();
-    if (source_order == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
-    if (source_order == duckdb::OrderPreservationType::NO_ORDER) { return false; }
+    if (source_order == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
+    if (source_order == sirius::OrderPreservationType::NO_ORDER) { return false; }
   }
   for (auto& op_ref : operators) {
     auto& op = op_ref.get();
-    if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
-    if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
+    if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
+    if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
   }
   if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(engine.context)) {
     return false;
@@ -61,7 +63,7 @@ void sirius_pipeline::reset_sink()
 {
   if (sink) {
     if (!sink->is_sink()) {
-      throw duckdb::InternalException("Sink of pipeline does not have is_sink set");
+      throw internal_exception("Sink of pipeline does not have is_sink set");
     }
     std::lock_guard<std::mutex> guard(sink->lock);
     // if (!sink->sink_state) { sink->sink_state =
@@ -87,7 +89,7 @@ void sirius_pipeline::reset()
 void sirius_pipeline::reset_source(bool force)
 {
   if (source && !source->is_source()) {
-    throw duckdb::InternalException("Source of pipeline does not have is_source set");
+    throw internal_exception("Source of pipeline does not have is_source set");
   }
   if (force || !source_state) {
     // source_state = source->get_global_source_state(get_client_context());
@@ -150,15 +152,16 @@ void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeli
 //   return result;
 // }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline::get_operators()
+duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>>
+sirius_pipeline::get_operators()
 {
   return operators;
 }
 
-duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>>
+duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>>
 sirius_pipeline::get_operators() const
 {
-  duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
+  duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>> result;
   result.reserve(operators.size());
   for (const auto& ref : operators) {
     result.push_back(ref.get());
@@ -181,27 +184,26 @@ void sirius_pipeline::clear_source()
   batch_indexes.clear();
 }
 
-duckdb::idx_t sirius_pipeline::register_new_batch_index()
+std::size_t sirius_pipeline::register_new_batch_index()
 {
   std::lock_guard<std::mutex> l(batch_lock);
-  duckdb::idx_t minimum = batch_indexes.empty() ? base_batch_index : *batch_indexes.begin();
+  std::size_t minimum = batch_indexes.empty() ? base_batch_index : *batch_indexes.begin();
   batch_indexes.insert(minimum);
   return minimum;
 }
 
-duckdb::idx_t sirius_pipeline::update_batch_index(duckdb::idx_t old_index, duckdb::idx_t new_index)
+std::size_t sirius_pipeline::update_batch_index(std::size_t old_index, std::size_t new_index)
 {
   std::lock_guard<std::mutex> l(batch_lock);
   if (new_index < *batch_indexes.begin()) {
-    throw duckdb::InternalException(
-      "Processing batch index %llu, but previous min batch index was %llu",
-      new_index,
-      *batch_indexes.begin());
+    throw internal_exception("Processing batch index {}, but previous min batch index was {}",
+                             new_index,
+                             *batch_indexes.begin());
   }
   auto entry = batch_indexes.find(old_index);
   if (entry == batch_indexes.end()) {
-    throw duckdb::InternalException("Batch index %llu was not found in set of active batch indexes",
-                                    old_index);
+    throw internal_exception("Batch index {} was not found in set of active batch indexes",
+                             old_index);
   }
   batch_indexes.erase(entry);
   batch_indexes.insert(new_index);
@@ -220,8 +222,8 @@ void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline,
 
 void sirius_pipeline_build_state::set_pipeline_sink(
   sirius_pipeline& pipeline,
-  duckdb::optional_ptr<op::sirius_physical_operator> op,
-  duckdb::idx_t sink_pipeline_count)
+  sirius::optional_ptr<op::sirius_physical_operator> op,
+  std::size_t sink_pipeline_count)
 {
   pipeline.sink = op;
   if (pipeline.sink)
@@ -239,13 +241,13 @@ void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipelin
   pipeline.operators.push_back(op);
 }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(
+sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(
   sirius_pipeline& pipeline)
 {
   return pipeline.source;
 }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(
+sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(
   sirius_pipeline& pipeline)
 {
   return pipeline.sink;
@@ -253,7 +255,7 @@ duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::
 
 void sirius_pipeline_build_state::set_pipeline_operators(
   sirius_pipeline& pipeline,
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators)
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators)
 {
   pipeline.operators = std::move(operators);
 }
@@ -264,7 +266,7 @@ duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pi
   return engine.create_child_pipeline(pipeline, op);
 }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
+duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>>
 sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
 {
   return pipeline.operators;
@@ -277,6 +279,23 @@ bool sirius_pipeline::is_pipeline_finished() const
   return pipeline_finished.load();
 }
 
+void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
+
+void sirius_pipeline::notify_downstream_pipelines()
+{
+  // Schedule output consumers via the task_creator so downstream pipelines
+  // whose FULL-barrier ports are now unblocked will get tasks created.
+  if (_task_creator) {
+    for (auto* consumer : get_output_consumers()) {
+      _task_creator->schedule(consumer);
+    }
+  }
+
+  for (auto* parent : get_parents()) {
+    parent->update_pipeline_status();
+  }
+}
+
 void sirius_pipeline::update_pipeline_status()
 {
   auto end_nvtx_range_if_finished = [this]() {
@@ -285,27 +304,32 @@ void sirius_pipeline::update_pipeline_status()
     }
   };
 
+  // Skip if already finished — avoids redundant re-evaluation and re-notification.
+  if (pipeline_finished.load()) { return; }
+
   if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
     if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
                                  // get_next_task_hint() to check if the source is ready?
       pipeline_finished.store(true);
       end_nvtx_range_if_finished();
+      notify_downstream_pipelines();
       return;
     }
   } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
     auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
     if (!parquet_scan.has_more_partitions) {
-      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
-      end_nvtx_range_if_finished();
+      if (tasks_created.load() == tasks_completed.load()) {
+        pipeline_finished = true;
+        end_nvtx_range_if_finished();
+        notify_downstream_pipelines();
+      }
       return;
     }
   } else {
     op::sirius_physical_operator* first_node =
       operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
-    if (first_node == nullptr) {
-      throw duckdb::InternalException("First node of pipeline is nullptr");
-    }
+    if (first_node == nullptr) { throw internal_exception("First node of pipeline is nullptr"); }
     // Check if any operator has exhausted its limit — this allows the pipeline to finish
     // early without waiting for the source pipeline to drain all remaining batches.
     bool limit_exhausted = false;
@@ -325,9 +349,11 @@ void sirius_pipeline::update_pipeline_status()
         for (auto& op : get_operators()) {
           op.get().finalize_operator();
         }
+        end_nvtx_range_if_finished();
+        notify_downstream_pipelines();
       }
     }
-    end_nvtx_range_if_finished();
+    if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
   }
 }
 

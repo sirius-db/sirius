@@ -38,14 +38,14 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
 
   sirius_physical_top_n_merge(duckdb::vector<duckdb::LogicalType> types_p,
                               duckdb::vector<duckdb::BoundOrderByNode> orders,
-                              duckdb::idx_t limit,
-                              duckdb::idx_t offset,
+                              std::size_t limit,
+                              std::size_t offset,
                               duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
-                              duckdb::idx_t estimated_cardinality);
+                              std::size_t estimated_cardinality);
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  duckdb::idx_t limit;
-  duckdb::idx_t offset;
+  std::size_t limit;
+  std::size_t offset;
   //! Dynamic table filter (if any)
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
 
@@ -54,9 +54,9 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::FIXED_ORDER;
+    return sirius::OrderPreservationType::FIXED_ORDER;
   }
 
  public:

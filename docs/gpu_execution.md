@@ -20,14 +20,12 @@ Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PA
 
 ## Configuration
 
-`gpu_execution` requires a config file in [libconfig++](https://hyperreckoning.com/libconfig/) format. Point to it via the `SIRIUS_CONFIG_FILE` environment variable, or place it at the default path `~/.sirius/sirius.cfg`.
-
-An example config file is provided at [`test/cpp/integration/integration.cfg`](../test/cpp/integration/integration.cfg). See the [Configuration documentation](super-sirius/configuration.md) for a full reference of all options.
+`gpu_execution` requires a config file in YAML format. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [byte suffixes](super-sirius/configuration.md#byte-suffixes). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Running
 
 ```bash
-export SIRIUS_CONFIG_FILE=/path/to/sirius.cfg
+export SIRIUS_CONFIG_FILE=/path/to/sirius.yaml
 ./build/release/duckdb
 ```
 
