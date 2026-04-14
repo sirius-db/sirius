@@ -45,7 +45,8 @@ class inspectable_mpsc {
    * \brief Pushes an item into the queue.
    * \return Returns false if the queue has been interrupted.
    */
-  [[nodiscard]] bool push(std::unique_ptr<T> item) {
+  [[nodiscard]] bool push(std::unique_ptr<T> item)
+  {
     std::unique_lock<std::mutex> lock(_mutex);
     if (!_active) { return false; }
     _queue.push_back(std::move(item));
@@ -59,7 +60,8 @@ class inspectable_mpsc {
    * \return Returns false if the queue has been interrupted.
    */
   template <typename... Args>
-  [[nodiscard]] bool emplace(Args&&... args) {
+  [[nodiscard]] bool emplace(Args&&... args)
+  {
     std::unique_lock<std::mutex> lock(_mutex);
     if (!_active) { return false; }
     _queue.push_back(std::make_unique<T>(std::forward<Args>(args)...));
@@ -76,7 +78,8 @@ class inspectable_mpsc {
    * before nullptr (drain remaining). Uses condition_variable::wait for true
    * blocking -- no polling.
    */
-  std::unique_ptr<T> pop() {
+  std::unique_ptr<T> pop()
+  {
     std::unique_lock<std::mutex> lock(_mutex);
     _cv.wait(lock, [this] { return !_queue.empty() || !_active; });
     if (_queue.empty()) { return nullptr; }
@@ -89,7 +92,8 @@ class inspectable_mpsc {
    * \brief Attempts to pop without blocking.
    * \return Returns nullptr if the queue is empty.
    */
-  std::unique_ptr<T> try_pop() {
+  std::unique_ptr<T> try_pop()
+  {
     std::unique_lock<std::mutex> lock(_mutex);
     if (_queue.empty()) { return nullptr; }
     auto item = std::move(_queue.front());
@@ -100,7 +104,8 @@ class inspectable_mpsc {
   /**
    * \brief Interrupts the queue, causing blocked pop() calls to return nullptr.
    */
-  void interrupt() {
+  void interrupt()
+  {
     {
       std::unique_lock<std::mutex> lock(_mutex);
       _active = false;
@@ -111,23 +116,32 @@ class inspectable_mpsc {
   /**
    * \brief Reactivates the queue after an interrupt, restoring normal operation.
    */
-  void reactivate() {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _active = true;
+  void reactivate()
+  {
+    {
+      std::unique_lock<std::mutex> lock(_mutex);
+      _active = true;
+    }
+    _cv.notify_all();
   }
 
   /**
    * \brief Removes all queued items.
    */
-  void drain() {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _queue.clear();
+  void drain()
+  {
+    {
+      std::unique_lock<std::mutex> lock(_mutex);
+      _queue.clear();
+    }
+    _cv.notify_all();
   }
 
   /**
    * \brief Returns true if the queue is active (not interrupted).
    */
-  [[nodiscard]] bool is_open() const noexcept {
+  [[nodiscard]] bool is_open() const noexcept
+  {
     std::unique_lock<std::mutex> lock(_mutex);
     return _active;
   }
@@ -135,7 +149,8 @@ class inspectable_mpsc {
   /**
    * \brief Returns true if the queue contains no items.
    */
-  [[nodiscard]] bool is_empty() const noexcept {
+  [[nodiscard]] bool is_empty() const noexcept
+  {
     std::unique_lock<std::mutex> lock(_mutex);
     return _queue.empty();
   }
@@ -143,7 +158,8 @@ class inspectable_mpsc {
   /**
    * \brief Returns the number of items currently in the queue.
    */
-  [[nodiscard]] std::size_t size() const noexcept {
+  [[nodiscard]] std::size_t size() const noexcept
+  {
     std::unique_lock<std::mutex> lock(_mutex);
     return _queue.size();
   }

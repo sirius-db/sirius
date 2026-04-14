@@ -21,6 +21,7 @@
   "project_code": null,
   "search_gitignored": false,
   "workflow": {
+    "_auto_chain_active": false,
     "auto_advance": false,
     "code_review": true,
     "code_review_depth": "standard",
