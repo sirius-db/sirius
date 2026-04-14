@@ -7,6 +7,9 @@ requires-pixi = ">=0.59"
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
 
+[activation.env]
+SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
+
 [dependencies]
 bc = "*"
 cmake = "4.1.*"
@@ -15,7 +18,7 @@ cuda-nvml-dev = "*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
-sccache = "*"
+sccache = ">=0.14"
 unzip = "*"
 clang = ">=21,<22"
 wget = "*"
