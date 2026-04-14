@@ -33,13 +33,24 @@ Validated in Phase 2: Predicate Inspection
 
 ### Active
 
-(All requirements validated — see above)
+<!-- Current scope for v1.1: Task Queue Refactor -->
+
+- [ ] Verify and remove dead queue code (gpu_pipeline_queue, pipeline_queue, duckdb_scan_task_queue, itask_queue)
+- [ ] Replace interruptible_mpmc with inspectable_mpsc in itask_executor and its implementations
 
 ### Out of Scope
 
 - Lock-free implementation — not needed; mutex+cv is appropriate for the inspection/iteration requirements
 - Shared mutex (reader-writer lock) — overhead not justified for MPSC use case where most operations are writes
 - Linked-list backing — worse cache locality during iteration outweighs O(1) mid-erase benefit
+
+## Current Milestone: v1.1 Task Queue Refactor
+
+**Goal:** Replace legacy queue infrastructure with inspectable_mpsc and remove dead queue code.
+
+**Target features:**
+- Verify and remove dead code: `gpu_pipeline_queue`, `pipeline_queue`, `duckdb_scan_task_queue`, `itask_queue`
+- Replace `interruptible_mpmc` usage in `itask_executor` (and its implementing classes) with `inspectable_mpsc`
 
 ## Context
 
@@ -91,4 +102,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after v1.0 milestone*
+*Last updated: 2026-04-14 after v1.1 milestone start*
