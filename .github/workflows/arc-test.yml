@@ -1,0 +1,22 @@
+name: ARC Runner Validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-cpu-xl:
+    runs-on: [arc-self-hosted, arc-ubuntu-22.04, arc-cuda-13, arc-cpu-xl]
+    steps:
+      - name: System info
+        run: |
+          echo "=== Runner info ==="
+          uname -a
+          id
+          echo "=== Docker ==="
+          docker info
+          echo "=== CUDA ==="
+          nvcc --version || echo "nvcc not found (expected for cpu-xl)"
+          echo "=== Disk ==="
+          df -h
+          echo "=== Memory ==="
+          free -h
