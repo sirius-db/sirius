@@ -42,7 +42,10 @@ Plans:
   2. get_if returns a raw pointer to the first matching element without removing it; the element remains in the queue
   3. mutable_pop_if and mutable_get_if behave identically to their const counterparts but the predicate receives a mutable reference, allowing state inspection that requires non-const access
   4. Setting front_to_back=true searches oldest-to-newest; front_to_back=false searches newest-to-oldest; both return the first match in their respective direction
-**Plans**: TBD
+**Plans:** 1 plan
+
+Plans:
+- [ ] 02-01-PLAN.md — TDD: Implement pop_if/get_if/mutable_pop_if/mutable_get_if with bidirectional search + 17 tests
 
 ## Progress
 
@@ -51,5 +54,5 @@ Phases execute in numeric order: 1 -> 2
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Queue | 0/2 | Planning complete | - |
-| 2. Predicate Inspection | 0/0 | Not started | - |
+| 1. Core Queue | 2/2 | Complete | 2026-04-14 |
+| 2. Predicate Inspection | 0/1 | Planning complete | - |
