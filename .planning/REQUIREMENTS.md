@@ -1,111 +1,52 @@
 # Requirements: inspectable_mpsc
 
-**Defined:** 2026-04-13
+**Defined:** 2026-04-14
 **Core Value:** Thread-safe queue with predicate-based element inspection and selective removal
 
-## v1 Requirements
+## v1.1 Requirements
 
-Requirements for initial release. Each maps to roadmap phases.
+Requirements for Task Queue Refactor milestone. Each maps to roadmap phases.
 
-### Core Queue Operations
+### Dead Code Removal
 
-- [ ] **CORE-01**: `bool push(std::unique_ptr<T> item)` enqueues an item; returns false if interrupted
-- [ ] **CORE-02**: `bool emplace(Args&&... args)` constructs item in-place and enqueues; returns false if interrupted
-- [ ] **CORE-03**: `std::unique_ptr<T> pop()` blocks via condition_variable until item available; returns nullptr on interrupt
-- [ ] **CORE-04**: `std::unique_ptr<T> try_pop()` non-blocking dequeue; returns nullptr if empty
-- [ ] **CORE-05**: FIFO ordering maintained for standard push/pop operations
+- [ ] **CLEAN-01**: Verify `gpu_pipeline_queue` is unused and remove its header, source, and any tests
+- [ ] **CLEAN-02**: Verify `pipeline_queue` is unused and remove its header, source, and any tests
+- [ ] **CLEAN-03**: Verify `duckdb_scan_task_queue` is unused and remove its header, source, and any tests
+- [ ] **CLEAN-04**: Verify `itask_queue` is unused and remove its header, source, and any tests
 
-### Lifecycle Management
+### Queue Integration
 
-- [ ] **LIFE-01**: `void interrupt()` sets active flag to false under lock, notifies condition_variable to unblock pop()
-- [ ] **LIFE-02**: `void reactivate()` resets active flag to true
-- [ ] **LIFE-03**: `void drain()` removes and destroys all queued items under lock
+- [ ] **INTG-01**: Replace `interruptible_mpmc` with `inspectable_mpsc` in the `itask_executor` interface
+- [ ] **INTG-02**: Update all `itask_executor` implementations to use `inspectable_mpsc`
 
-### State Queries
+## Future Requirements
 
-- [ ] **STAT-01**: `bool is_open() const noexcept` returns active state via atomic load (relaxed ordering)
-- [ ] **STAT-02**: `bool is_empty() const noexcept` returns whether deque is empty (exact under lock, point-in-time snapshot)
-- [ ] **STAT-03**: `size_t size() const noexcept` returns current element count; documented as racy (value not guaranteed under concurrent access)
-
-### Predicate-Based Inspection
-
-- [ ] **INSP-01**: `std::unique_ptr<T> pop_if(std::function<bool(const T&)> predicate, bool front_to_back)` removes and returns first element matching predicate; returns nullptr if none match
-- [ ] **INSP-02**: `T* get_if(std::function<bool(const T&)> predicate, bool front_to_back)` returns pointer to first matching element without removing; returns nullptr if none match
-- [ ] **INSP-03**: `std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate, bool front_to_back)` same as pop_if but predicate receives mutable reference
-- [ ] **INSP-04**: `T* mutable_get_if(std::function<bool(T&)> predicate, bool front_to_back)` same as get_if but predicate receives mutable reference
-- [ ] **INSP-05**: `front_to_back=true` iterates oldest-to-newest; `front_to_back=false` iterates newest-to-oldest
-
-### Thread Safety
-
-- [ ] **SAFE-01**: All public methods are thread-safe for concurrent access from multiple threads
-- [ ] **SAFE-02**: Internal synchronization via `std::mutex` + `std::condition_variable`
-- [ ] **SAFE-03**: Copy constructor, copy assignment, move constructor, and move assignment are deleted
-
-### Class Structure
-
-- [ ] **STRC-01**: Header-only template class `inspectable_mpsc<T>` in `sirius::exec` namespace
-- [ ] **STRC-02**: Located at `src/include/exec/inspectable_mpsc.hpp`
-- [ ] **STRC-03**: Internal backing store is `std::deque<std::unique_ptr<T>>`
-
-## v2 Requirements
-
-Deferred to future release. Tracked but not in current roadmap.
-
-### Extended Operations
-
-- **EXT-01**: `visit_if(predicate, callback)` -- callback-under-lock pattern as safer alternative to get_if for MPMC use
-- **EXT-02**: `size_approx()` -- explicitly-named approximate size for non-locking contexts
-- **EXT-03**: `pop_if` with `max_scan_depth` parameter to bound worst-case lock hold time
+None — milestone is self-contained.
 
 ## Out of Scope
 
-Explicitly excluded. Documented to prevent scope creep.
-
 | Feature | Reason |
 |---------|--------|
-| Lock-free implementation | Incompatible with iteration/inspection requirements |
-| Bounded capacity / backpressure | Deadlock risk in pipeline execution; memory managed at application layer |
-| Priority queue | `pop_if` predicates cover flexible priority logic without heap overhead |
-| `shared_ptr<T>` support | Unique ownership only; matches MPSC semantics |
-| Iterator / range access | Lock-lifetime hazard; predicate-based access encapsulates lock scope |
-| Timed pop (`pop_for`, `pop_until`) | `interrupt()` is the escape hatch; no use case in Sirius |
-| `pop_all()` / batch operations | `drain()` covers bulk removal; repeated `pop_if` for multiple matches |
-| `close()` / `open()` semantics | Keep `interrupt()` / `reactivate()` naming for consistency |
+| Replace interruptible_mpmc in non-itask_executor contexts | Scope limited to itask_executor and its implementations |
+| New integration tests | Existing tests must pass; no new tests required |
+| Lock-free inspectable_mpsc variant | Not needed; mutex+cv is appropriate for the inspection/iteration requirements |
 
 ## Traceability
 
-Which phases cover which requirements. Updated during roadmap creation.
-
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CORE-01 | Phase 1 | Pending |
-| CORE-02 | Phase 1 | Pending |
-| CORE-03 | Phase 1 | Pending |
-| CORE-04 | Phase 1 | Pending |
-| CORE-05 | Phase 1 | Pending |
-| LIFE-01 | Phase 1 | Pending |
-| LIFE-02 | Phase 1 | Pending |
-| LIFE-03 | Phase 1 | Pending |
-| STAT-01 | Phase 1 | Pending |
-| STAT-02 | Phase 1 | Pending |
-| STAT-03 | Phase 1 | Pending |
-| INSP-01 | Phase 2 | Pending |
-| INSP-02 | Phase 2 | Pending |
-| INSP-03 | Phase 2 | Pending |
-| INSP-04 | Phase 2 | Pending |
-| INSP-05 | Phase 2 | Pending |
-| SAFE-01 | Phase 1 | Pending |
-| SAFE-02 | Phase 1 | Pending |
-| SAFE-03 | Phase 1 | Pending |
-| STRC-01 | Phase 1 | Pending |
-| STRC-02 | Phase 1 | Pending |
-| STRC-03 | Phase 1 | Pending |
+| CLEAN-01 | TBD | Pending |
+| CLEAN-02 | TBD | Pending |
+| CLEAN-03 | TBD | Pending |
+| CLEAN-04 | TBD | Pending |
+| INTG-01 | TBD | Pending |
+| INTG-02 | TBD | Pending |
 
 **Coverage:**
-- v1 requirements: 22 total
-- Mapped to phases: 22
-- Unmapped: 0
+- v1.1 requirements: 6 total
+- Mapped to phases: 0
+- Unmapped: 6 (pending roadmap)
 
 ---
-*Requirements defined: 2026-04-13*
-*Last updated: 2026-04-13 after roadmap creation*
+*Requirements defined: 2026-04-14*
+*Last updated: 2026-04-14 after initial definition*
