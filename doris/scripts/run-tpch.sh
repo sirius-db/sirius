@@ -79,14 +79,14 @@ data_dir = sys.argv[2]
 shared = sys.argv[3]
 
 tables = {
-    'partsupp': data_dir + '/partsupp/*.parquet',
-    'lineitem': data_dir + '/lineitem/*.parquet',
-    'customer': data_dir + '/customer/*.parquet',
-    'supplier': data_dir + '/supplier/*.parquet',
-    'nation':   data_dir + '/nation/*.parquet',
-    'orders':   data_dir + '/orders/*.parquet',
-    'region':   data_dir + '/region/*.parquet',
-    'part':     data_dir + '/part/*.parquet',
+    'partsupp': data_dir + '/partsupp/**/*.parquet',
+    'lineitem': data_dir + '/lineitem/**/*.parquet',
+    'customer': data_dir + '/customer/**/*.parquet',
+    'supplier': data_dir + '/supplier/**/*.parquet',
+    'nation':   data_dir + '/nation/**/*.parquet',
+    'orders':   data_dir + '/orders/**/*.parquet',
+    'region':   data_dir + '/region/**/*.parquet',
+    'part':     data_dir + '/part/**/*.parquet',
 }
 
 # Replace longer names first to avoid partial matches (partsupp before part)
