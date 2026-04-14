@@ -195,7 +195,8 @@ void gpu_decode_fsst(
     uint8_t* d_chars,
     rmm::cuda_stream_view stream,
     void* d_scratch,
-    string_decode_temp* temp)
+    string_decode_temp* temp,
+    bool skip_block_copy)
 {
   const uint8_t* base = segment_data + block_offset;
 
@@ -225,8 +226,10 @@ void gpu_decode_fsst(
     cudaMallocAsync(&d_segment, segment_size, stream.value());
     own_segment = true;
   }
-  cudaMemcpyAsync(d_segment, segment_data, segment_size,
-                  cudaMemcpyHostToDevice, stream.value());
+  if (!skip_block_copy) {
+    cudaMemcpyAsync(d_segment, segment_data, segment_size,
+                    cudaMemcpyHostToDevice, stream.value());
+  }
 
   // --- Resolve temp buffers: use caller-provided or allocate ---
   uint8_t* d_decoder_len = nullptr;

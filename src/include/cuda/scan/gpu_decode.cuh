@@ -144,7 +144,8 @@ void gpu_decode_dictionary(
     void* d_scratch = nullptr,
     uint32_t max_string_length = 0,
     uint8_t* d_chars_preallocated = nullptr,
-    string_decode_temp* temp = nullptr);
+    string_decode_temp* temp = nullptr,
+    bool skip_block_copy = false);
 
 //===----------------------------------------------------------------------===//
 // Host-side API: decode an uncompressed string segment on GPU
@@ -176,7 +177,8 @@ void gpu_decode_uncompressed_string(
     int32_t* d_offsets,
     uint8_t* d_chars,
     rmm::cuda_stream_view stream,
-    void* d_scratch = nullptr);
+    void* d_scratch = nullptr,
+    bool skip_block_copy = false);
 
 //===----------------------------------------------------------------------===//
 // Host-side API: decode an FSST-compressed string segment on GPU
@@ -210,7 +212,8 @@ void gpu_decode_fsst(
     uint8_t* d_chars,
     rmm::cuda_stream_view stream,
     void* d_scratch = nullptr,
-    string_decode_temp* temp = nullptr);
+    string_decode_temp* temp = nullptr,
+    bool skip_block_copy = false);
 
 //===----------------------------------------------------------------------===//
 // Device functions: inline bitpacking extraction (for future operator fusion)

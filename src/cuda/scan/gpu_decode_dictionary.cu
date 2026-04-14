@@ -117,7 +117,8 @@ void gpu_decode_dictionary(
     void* d_scratch,
     uint32_t max_string_length,
     uint8_t* d_chars_preallocated,
-    string_decode_temp* temp)
+    string_decode_temp* temp,
+    bool skip_block_copy)
 {
   const uint8_t* base = segment_data + block_offset;
 
@@ -153,8 +154,10 @@ void gpu_decode_dictionary(
     cudaMallocAsync(&d_segment, segment_size, stream.value());
     own_segment = true;
   }
-  cudaMemcpyAsync(d_segment, segment_data, segment_size,
-                  cudaMemcpyHostToDevice, stream.value());
+  if (!skip_block_copy) {
+    cudaMemcpyAsync(d_segment, segment_data, segment_size,
+                    cudaMemcpyHostToDevice, stream.value());
+  }
 
   // 2. Resolve temp buffers: use caller-provided or allocate
   uint32_t* d_indices = nullptr;
@@ -327,7 +330,8 @@ void gpu_decode_uncompressed_string(
     int32_t* d_offsets,
     uint8_t* d_chars,
     rmm::cuda_stream_view stream,
-    void* d_scratch)
+    void* d_scratch,
+    bool skip_block_copy)
 {
   const uint8_t* base = segment_data + block_offset;
 
@@ -349,8 +353,10 @@ void gpu_decode_uncompressed_string(
     cudaMallocAsync(&d_segment, segment_size, stream.value());
     own_segment = true;
   }
-  cudaMemcpyAsync(d_segment, segment_data, segment_size,
-                  cudaMemcpyHostToDevice, stream.value());
+  if (!skip_block_copy) {
+    cudaMemcpyAsync(d_segment, segment_data, segment_size,
+                    cudaMemcpyHostToDevice, stream.value());
+  }
 
   // DuckDB offsets start at byte 8 within the segment
   const int32_t* d_duckdb_offsets =

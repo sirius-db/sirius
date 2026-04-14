@@ -447,8 +447,10 @@ std::unique_ptr<cudf::column> decode_string_column(
 
   // Phase 3: Decode each segment into final buffers using ACTUAL char positions.
   // Per-segment sync to read sentinel for contiguous char positioning.
+  // Block H2D dedup: skip copy when consecutive segments share the same 256KB block.
   constexpr uint32_t ADJ_THREADS = 256;
   size_t actual_cum_chars = 0;
+  const uint8_t* last_block_base = nullptr;
 
   for (size_t si = 0; si < col_scan.data.segments.size(); ++si) {
     auto& seg = col_scan.data.segments[si];
@@ -462,36 +464,38 @@ std::unique_ptr<cudf::column> decode_string_column(
         || seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
       cudaMemsetAsync(d_seg_offsets, 0,
                       (seg.row_count + 1) * sizeof(int32_t), stream.value());
-    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+    } else {
       const uint8_t* block_base = seg.data_ptr - seg.block_offset;
+      bool block_cached = (block_base == last_block_base);
+      if (!block_cached) last_block_base = block_base;
       uint8_t* d_seg_chars = d_chars_base + seg_char_start;
-      gpu_decode_uncompressed_string(
-          block_base, DUCKDB_BLOCK_SIZE,
-          static_cast<uint32_t>(seg.block_offset),
-          static_cast<uint32_t>(seg.row_count),
-          d_seg_offsets, d_seg_chars, stream, d_scratch);
-    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY) {
-      const uint8_t* block_base = seg.data_ptr - seg.block_offset;
-      uint8_t* d_seg_chars = d_chars_base + seg_char_start;
-      uint8_t* d_chars_out = nullptr;
-      size_t total_chars_out = 0;
-      gpu_decode_dictionary(
-          block_base, DUCKDB_BLOCK_SIZE,
-          static_cast<uint32_t>(seg.block_offset),
-          static_cast<uint32_t>(DUCKDB_BLOCK_SIZE),
-          static_cast<uint32_t>(seg.row_count),
-          d_seg_offsets, &d_chars_out, &total_chars_out,
-          stream, d_scratch, seg.max_string_length, d_seg_chars,
-          &temp);
-    } else if (seg.compression == duckdb::CompressionType::COMPRESSION_FSST) {
-      const uint8_t* block_base = seg.data_ptr - seg.block_offset;
-      uint8_t* d_seg_chars = d_chars_base + seg_char_start;
-      gpu_decode_fsst(
-          block_base, DUCKDB_BLOCK_SIZE,
-          static_cast<uint32_t>(seg.block_offset),
-          static_cast<uint32_t>(seg.row_count),
-          d_seg_offsets, d_seg_chars, stream, d_scratch,
-          &temp);
+
+      if (seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        gpu_decode_uncompressed_string(
+            block_base, DUCKDB_BLOCK_SIZE,
+            static_cast<uint32_t>(seg.block_offset),
+            static_cast<uint32_t>(seg.row_count),
+            d_seg_offsets, d_seg_chars, stream, d_scratch,
+            block_cached);
+      } else if (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY) {
+        uint8_t* d_chars_out = nullptr;
+        size_t total_chars_out = 0;
+        gpu_decode_dictionary(
+            block_base, DUCKDB_BLOCK_SIZE,
+            static_cast<uint32_t>(seg.block_offset),
+            static_cast<uint32_t>(DUCKDB_BLOCK_SIZE),
+            static_cast<uint32_t>(seg.row_count),
+            d_seg_offsets, &d_chars_out, &total_chars_out,
+            stream, d_scratch, seg.max_string_length, d_seg_chars,
+            &temp, block_cached);
+      } else if (seg.compression == duckdb::CompressionType::COMPRESSION_FSST) {
+        gpu_decode_fsst(
+            block_base, DUCKDB_BLOCK_SIZE,
+            static_cast<uint32_t>(seg.block_offset),
+            static_cast<uint32_t>(seg.row_count),
+            d_seg_offsets, d_seg_chars, stream, d_scratch,
+            &temp, block_cached);
+      }
     }
 
     // Read back sentinel to learn actual char count for this segment.
