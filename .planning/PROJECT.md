@@ -31,15 +31,15 @@ Validated in Phase 2: Predicate Inspection
 - [x] `std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate, bool front_to_back)` — pop_if with mutable access in predicate
 - [x] `T* mutable_get_if(std::function<bool(T&)> predicate, bool front_to_back)` — get_if with mutable access in predicate
 
-### Active
-
-<!-- Current scope for v1.1: Task Queue Refactor -->
-
-Validated in Phase 3: Dead Code Removal
+Validated in Phase 3: Dead Code Removal — v1.1
 - [x] Verify and remove dead queue code (gpu_pipeline_queue, pipeline_queue, duckdb_scan_task_queue, itask_queue)
 
-Validated in Phase 4: Queue Integration
+Validated in Phase 4: Queue Integration — v1.1
 - [x] Replace interruptible_mpmc with inspectable_mpsc in itask_executor and its implementations
+
+### Active
+
+(No active requirements — start next milestone with `/gsd-new-milestone`)
 
 ### Out of Scope
 
@@ -47,29 +47,23 @@ Validated in Phase 4: Queue Integration
 - Shared mutex (reader-writer lock) — overhead not justified for MPSC use case where most operations are writes
 - Linked-list backing — worse cache locality during iteration outweighs O(1) mid-erase benefit
 
-## Current Milestone: v1.1 Task Queue Refactor
+## Current State
 
-**Goal:** Replace legacy queue infrastructure with inspectable_mpsc and remove dead queue code.
-**Status:** All phases complete — ready for milestone completion.
+**v1.1 Task Queue Refactor** — SHIPPED 2026-04-14
 
-**Target features:**
-- ✅ Verify and remove dead code: `gpu_pipeline_queue`, `pipeline_queue`, `duckdb_scan_task_queue`, `itask_queue`
-- ✅ Replace `interruptible_mpmc` usage in `itask_executor` (and its implementing classes) with `inspectable_mpsc`
+All milestones complete. `inspectable_mpsc<T>` is fully implemented and integrated into the Sirius production task queue infrastructure.
 
 ## Context
 
-Shipped v1.0 with 1,153 LOC C++ (295 header + 858 tests).
+Shipped v1.0 (2026-04-14) with 1,153 LOC C++ (295 header + 858 tests). 3 plans, ~69 min.
+Shipped v1.1 (2026-04-14) with 2 plans, ~32 min. Removed 450 lines dead code, swapped queue type in itask_executor.
 Tech stack: C++20, header-only template, Catch2 test framework.
-35 tests passing (231 assertions): 14 single-threaded + 4 concurrency stress + 17 predicate inspection.
-All development completed 2026-04-14 in ~69 min active execution across 3 plans.
-Phase 3 complete — 4 legacy queue classes removed (450 lines), codebase clean for integration.
-Phase 4 complete — itask_executor base class now uses inspectable_mpsc; all 868 tests pass.
+35 inspectable_mpsc tests passing (231 assertions). Full Sirius suite: 868 tests, 78M+ assertions.
+`inspectable_mpsc<itask>` is the production task queue in `itask_executor`, inherited by `gpu_pipeline_executor` and `duckdb_scan_executor`.
 
 - Sirius is a GPU-native SQL engine that extends DuckDB
-- The existing `interruptible_mpmc` class (`src/include/exec/interruptible_mpmc.hpp`) uses a lock-free `BlockingConcurrentQueue` which does not support iteration
-- The new class needs iteration for predicate-based inspection, requiring a different internal data structure
-- The class will be used in the pipeline execution layer (referenced from `gpu_pipeline_executor.cpp`)
-- Header-only template class following the same pattern as `interruptible_mpmc`
+- `interruptible_mpmc` remains in use for non-itask_executor queues (pipeline_executor, downgrade_executor, task_creator)
+- Future work can leverage `pop_if`/`get_if` for predicate-based task scheduling in pipeline executors
 
 ## Constraints
 
@@ -89,6 +83,8 @@ Phase 4 complete — itask_executor base class now uses inspectable_mpsc; all 86
 | `std::next(rit).base()` for reverse erase | Standard idiom for converting reverse iterator to forward for deque::erase | Validated Phase 2 |
 | Mutex held for full predicate scan | Simple correctness over per-element locking; acceptable for MPSC | Validated Phase 2 |
 | Raw `T*` return from `get_if` | Avoids ownership transfer; documented invalidation rules; safe under MPSC | Validated Phase 2 |
+| Dead code removal before integration | Simplifies codebase before swapping queue types; reduces merge surface | Validated Phase 3 |
+| `static_cast<void>` for `[[nodiscard]]` discard | Standard C++ idiom; `schedule()` is fire-and-forget, matching prior semantics | Validated Phase 4 |
 
 ## Evolution
 
@@ -108,4 +104,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after Phase 4 completion*
+*Last updated: 2026-04-14 after v1.1 milestone*
