@@ -38,7 +38,8 @@ Validated in Phase 2: Predicate Inspection
 Validated in Phase 3: Dead Code Removal
 - [x] Verify and remove dead queue code (gpu_pipeline_queue, pipeline_queue, duckdb_scan_task_queue, itask_queue)
 
-- [ ] Replace interruptible_mpmc with inspectable_mpsc in itask_executor and its implementations
+Validated in Phase 4: Queue Integration
+- [x] Replace interruptible_mpmc with inspectable_mpsc in itask_executor and its implementations
 
 ### Out of Scope
 
@@ -49,10 +50,11 @@ Validated in Phase 3: Dead Code Removal
 ## Current Milestone: v1.1 Task Queue Refactor
 
 **Goal:** Replace legacy queue infrastructure with inspectable_mpsc and remove dead queue code.
+**Status:** All phases complete — ready for milestone completion.
 
 **Target features:**
-- Verify and remove dead code: `gpu_pipeline_queue`, `pipeline_queue`, `duckdb_scan_task_queue`, `itask_queue`
-- Replace `interruptible_mpmc` usage in `itask_executor` (and its implementing classes) with `inspectable_mpsc`
+- ✅ Verify and remove dead code: `gpu_pipeline_queue`, `pipeline_queue`, `duckdb_scan_task_queue`, `itask_queue`
+- ✅ Replace `interruptible_mpmc` usage in `itask_executor` (and its implementing classes) with `inspectable_mpsc`
 
 ## Context
 
@@ -61,6 +63,7 @@ Tech stack: C++20, header-only template, Catch2 test framework.
 35 tests passing (231 assertions): 14 single-threaded + 4 concurrency stress + 17 predicate inspection.
 All development completed 2026-04-14 in ~69 min active execution across 3 plans.
 Phase 3 complete — 4 legacy queue classes removed (450 lines), codebase clean for integration.
+Phase 4 complete — itask_executor base class now uses inspectable_mpsc; all 868 tests pass.
 
 - Sirius is a GPU-native SQL engine that extends DuckDB
 - The existing `interruptible_mpmc` class (`src/include/exec/interruptible_mpmc.hpp`) uses a lock-free `BlockingConcurrentQueue` which does not support iteration
@@ -105,4 +108,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after Phase 3 completion*
+*Last updated: 2026-04-14 after Phase 4 completion*
