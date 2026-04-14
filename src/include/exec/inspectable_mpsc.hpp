@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 
@@ -162,6 +163,132 @@ class inspectable_mpsc {
   {
     std::unique_lock<std::mutex> lock(_mutex);
     return _queue.size();
+  }
+
+  /**
+   * \brief Removes and returns the first element matching the predicate.
+   * \param predicate Callable receiving const T& and returning bool.
+   * \param front_to_back If true, searches oldest-to-newest; if false,
+   *        newest-to-oldest.
+   * \return The matching element, or nullptr if no match found.
+   *
+   * Holds the mutex for the entire scan. Predicate should be lightweight.
+   */
+  std::unique_ptr<T> pop_if(std::function<bool(const T&)> predicate,
+                             bool front_to_back)
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (front_to_back) {
+      for (auto it = _queue.begin(); it != _queue.end(); ++it) {
+        if (predicate(**it)) {
+          auto item = std::move(*it);
+          _queue.erase(it);
+          return item;
+        }
+      }
+    } else {
+      for (auto rit = _queue.rbegin(); rit != _queue.rend(); ++rit) {
+        if (predicate(**rit)) {
+          auto item = std::move(*rit);
+          _queue.erase(std::next(rit).base());
+          return item;
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  /**
+   * \brief Returns a pointer to the first element matching the predicate
+   *        without removing it.
+   * \param predicate Callable receiving const T& and returning bool.
+   * \param front_to_back If true, searches oldest-to-newest; if false,
+   *        newest-to-oldest.
+   * \return Raw pointer to the matching element, or nullptr if no match.
+   *
+   * The returned pointer is valid only while the caller holds no other
+   * mutating reference. It is invalidated by any subsequent pop(),
+   * pop_if(), drain(), or other mutating queue operation. Safe under
+   * MPSC: only the single consumer calls inspection methods.
+   */
+  T* get_if(std::function<bool(const T&)> predicate, bool front_to_back)
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (front_to_back) {
+      for (auto it = _queue.begin(); it != _queue.end(); ++it) {
+        if (predicate(**it)) { return it->get(); }
+      }
+    } else {
+      for (auto rit = _queue.rbegin(); rit != _queue.rend(); ++rit) {
+        if (predicate(**rit)) { return rit->get(); }
+      }
+    }
+    return nullptr;
+  }
+
+  /**
+   * \brief Removes and returns the first element matching the mutable
+   *        predicate.
+   * \param predicate Callable receiving T& (mutable) and returning bool.
+   * \param front_to_back If true, searches oldest-to-newest; if false,
+   *        newest-to-oldest.
+   * \return The matching element, or nullptr if no match found.
+   *
+   * Same as pop_if but the predicate receives a mutable reference,
+   * allowing state inspection that requires non-const access. Holds
+   * the mutex for the full scan duration.
+   */
+  std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate,
+                                     bool front_to_back)
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (front_to_back) {
+      for (auto it = _queue.begin(); it != _queue.end(); ++it) {
+        if (predicate(**it)) {
+          auto item = std::move(*it);
+          _queue.erase(it);
+          return item;
+        }
+      }
+    } else {
+      for (auto rit = _queue.rbegin(); rit != _queue.rend(); ++rit) {
+        if (predicate(**rit)) {
+          auto item = std::move(*rit);
+          _queue.erase(std::next(rit).base());
+          return item;
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  /**
+   * \brief Returns a pointer to the first element matching the mutable
+   *        predicate without removing it.
+   * \param predicate Callable receiving T& (mutable) and returning bool.
+   * \param front_to_back If true, searches oldest-to-newest; if false,
+   *        newest-to-oldest.
+   * \return Raw pointer to the matching element, or nullptr if no match.
+   *
+   * Same as get_if but the predicate receives a mutable reference.
+   * Returned pointer is invalidated by any subsequent pop(), pop_if(),
+   * drain(), or other mutating queue operation. Safe under MPSC
+   * single-consumer.
+   */
+  T* mutable_get_if(std::function<bool(T&)> predicate,
+                     bool front_to_back)
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (front_to_back) {
+      for (auto it = _queue.begin(); it != _queue.end(); ++it) {
+        if (predicate(**it)) { return it->get(); }
+      }
+    } else {
+      for (auto rit = _queue.rbegin(); rit != _queue.rend(); ++rit) {
+        if (predicate(**rit)) { return rit->get(); }
+      }
+    }
+    return nullptr;
   }
 };
 
