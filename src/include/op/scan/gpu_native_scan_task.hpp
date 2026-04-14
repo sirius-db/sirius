@@ -96,11 +96,15 @@ class gpu_native_scan_global_state : public pipeline::sirius_pipeline_task_globa
 
  private:
   /// @brief Walk all segments: verify GPU-decodable + measure decoded size per row group.
-  /// Sets viable_ and decoded_bytes_per_rg_.
+  /// Sets viable_ and fills rg_decoded_bytes_.
   void check_viability();
 
   /// @brief Walk row group tree, cache RowGroup pointers.
   void cache_row_groups();
+
+  /// @brief Prune row groups whose zonemaps prove no rows match filter predicates.
+  /// Computes decoded_bytes_per_rg_ from surviving row groups.
+  void prune_row_groups();
 
   /// @brief Compute row_groups_per_batch_ from decoded_bytes_per_rg_ vs config batch size.
   void compute_batch_size();
@@ -118,9 +122,10 @@ class gpu_native_scan_global_state : public pipeline::sirius_pipeline_task_globa
 
   // Row group management — pointers cached during construction
   std::vector<duckdb::RowGroup*> row_groups_;
+  std::vector<size_t> rg_decoded_bytes_;  // per-RG decoded bytes (construction-time only)
   std::atomic<size_t> next_claim_idx_{0};
   size_t row_groups_per_batch_ = 0;     // 0 = all in one batch
-  size_t decoded_bytes_per_rg_ = 0;     // measured during check_viability (average)
+  size_t decoded_bytes_per_rg_ = 0;     // average over surviving row groups
 
   // GPU memory
   cucascade::memory::memory_space* gpu_space_ = nullptr;

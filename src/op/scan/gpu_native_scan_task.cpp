@@ -13,14 +13,17 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <duckdb/storage/buffer_manager.hpp>
+#include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
 #include <duckdb/storage/table/row_group_collection.hpp>
+#include <duckdb/storage/table/scan_state.hpp>
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/execution/adaptive_filter.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 
 #include <chrono>
@@ -48,10 +51,22 @@ gpu_native_scan_global_state::gpu_native_scan_global_state(
   auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
   storage_        = &table.GetStorage();
 
-  // Build column indices and types from the scan operator's projected columns
-  for (size_t ci = 0; ci < op_.scanned_types.size(); ++ci) {
-    col_indices_.emplace_back(op_.column_ids[ci].GetPrimaryIndex());
-    col_types_.push_back(op_.scanned_types[ci]);
+  // Build column indices and types from the scan operator's projected columns.
+  // scanned_types is built using projection_ids (sorted), so col_indices_ must
+  // use the same mapping: col_indices_[i] = column_ids[projection_ids[i]].
+  // Without this, filter-only columns (in WHERE but not SELECT) cause a mismatch
+  // where we scan the wrong storage column for the declared type.
+  if (!op_.projection_ids.empty()) {
+    for (size_t i = 0; i < op_.projection_ids.size(); ++i) {
+      auto pid = op_.projection_ids[i];
+      col_indices_.emplace_back(op_.column_ids[pid].GetPrimaryIndex());
+      col_types_.push_back(op_.scanned_types[i]);
+    }
+  } else {
+    for (size_t ci = 0; ci < op_.scanned_types.size(); ++ci) {
+      col_indices_.emplace_back(op_.column_ids[ci].GetPrimaryIndex());
+      col_types_.push_back(op_.scanned_types[ci]);
+    }
   }
 
   // Resolve GPU memory space
@@ -66,6 +81,7 @@ gpu_native_scan_global_state::gpu_native_scan_global_state(
   check_viability();
 
   if (viable_) {
+    prune_row_groups();
     compute_batch_size();
 
     SIRIUS_LOG_INFO(
@@ -98,16 +114,16 @@ void gpu_native_scan_global_state::check_viability()
   // Walk all row groups → all segments for each projected column.
   // Two goals in one pass:
   //   1. Verify every segment has GPU-decodable compression
-  //   2. Compute the actual decoded GPU size per row group (for batch sizing)
+  //   2. Measure decoded GPU size per row group (for batch sizing after pruning)
   //
   // For fixed-width columns: decoded size = row_count × type_size
   // For VARCHAR columns: decoded size = row_count × (4 bytes offsets + max_string_length chars)
   //   max_string_length comes from segment stats — we already check it for DICTIONARY viability.
 
-  size_t total_decoded_bytes = 0;
-  size_t total_rows          = 0;
+  rg_decoded_bytes_.resize(row_groups_.size(), 0);
 
-  for (auto* rg : row_groups_) {
+  for (size_t rg_idx = 0; rg_idx < row_groups_.size(); ++rg_idx) {
+    auto* rg = row_groups_[rg_idx];
     for (size_t ci = 0; ci < col_indices_.size(); ++ci) {
       auto& col_data = rg->GetColumnDirect(col_indices_[ci]);
       auto& seg_tree = col_data.GetSegmentTree();
@@ -145,20 +161,16 @@ void gpu_native_scan_global_state::check_viability()
             return;
         }
 
-        // --- Decoded size calculation ---
+        // --- Decoded size calculation (per row group) ---
         if (is_varchar) {
-          // cudf STRING column: int32 offsets (row_count+1) + char data
           uint32_t max_len = 0;
           if (duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
             max_len = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
           }
-          total_decoded_bytes += row_count * (4 + max_len);  // offsets + chars upper bound
+          rg_decoded_bytes_[rg_idx] += row_count * (4 + max_len);
         } else {
-          total_decoded_bytes += row_count * duckdb::GetTypeIdSize(col_types_[ci].InternalType());
+          rg_decoded_bytes_[rg_idx] += row_count * duckdb::GetTypeIdSize(col_types_[ci].InternalType());
         }
-
-        // Count rows (only from first column to avoid double-counting)
-        if (ci == 0) { total_rows += row_count; }
 
         seg_node = seg_tree.GetNextSegment(*seg_node);
       }
@@ -166,10 +178,56 @@ void gpu_native_scan_global_state::check_viability()
   }
 
   viable_ = true;
+}
 
-  // Compute average decoded bytes per row group
-  if (!row_groups_.empty() && total_rows > 0) {
-    decoded_bytes_per_rg_ = total_decoded_bytes / row_groups_.size();
+void gpu_native_scan_global_state::prune_row_groups()
+{
+  size_t original_count = row_groups_.size();
+
+  // Prune row groups whose zonemaps prove no rows match the filter predicates
+  if (op_.table_filters && !op_.table_filters->filters.empty()) {
+    // Build StorageIndex vector for ALL column_ids (filter keys are positions in this vector)
+    duckdb::vector<duckdb::StorageIndex> all_col_ids;
+    all_col_ids.reserve(op_.column_ids.size());
+    for (auto& col_id : op_.column_ids) {
+      all_col_ids.emplace_back(col_id.GetPrimaryIndex());
+    }
+
+    duckdb::ScanFilterInfo filter_info;
+    filter_info.Initialize(client_ctx_, *op_.table_filters, all_col_ids);
+
+    std::vector<duckdb::RowGroup*> surviving_rgs;
+    std::vector<size_t> surviving_bytes;
+    surviving_rgs.reserve(row_groups_.size());
+    surviving_bytes.reserve(row_groups_.size());
+
+    for (size_t i = 0; i < row_groups_.size(); ++i) {
+      if (!row_groups_[i]->CheckZonemap(filter_info)) {
+        continue;
+      }
+      surviving_rgs.push_back(row_groups_[i]);
+      surviving_bytes.push_back(rg_decoded_bytes_[i]);
+    }
+
+    row_groups_ = std::move(surviving_rgs);
+    rg_decoded_bytes_ = std::move(surviving_bytes);
+  }
+
+  // Compute decoded_bytes_per_rg_ from surviving row groups
+  size_t total_bytes = 0;
+  for (auto bytes : rg_decoded_bytes_) {
+    total_bytes += bytes;
+  }
+  decoded_bytes_per_rg_ = row_groups_.empty() ? 0 : total_bytes / row_groups_.size();
+
+  // Free construction-time data
+  rg_decoded_bytes_.clear();
+  rg_decoded_bytes_.shrink_to_fit();
+
+  if (row_groups_.size() < original_count) {
+    SIRIUS_LOG_INFO(
+      "[gpu_native_scan] row group pruning: {}/{} pruned ({} remaining)",
+      original_count - row_groups_.size(), original_count, row_groups_.size());
   }
 }
 

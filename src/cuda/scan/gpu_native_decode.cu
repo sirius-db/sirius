@@ -407,8 +407,17 @@ std::unique_ptr<cudf::column> decode_string_column(
   rmm::device_buffer d_chars(total_chars_upper > 0 ? total_chars_upper : 1, stream, mr);
   auto* d_chars_base = static_cast<uint8_t*>(d_chars.data());
 
-  // Phase 3: Decode each segment directly into its slice of the final buffers
+  // Phase 3: Decode each segment into final buffers using ACTUAL char positions.
+  //
+  // Each segment's decode writes local offsets (0 to actual_chars) and a sentinel.
+  // We position chars contiguously using actual sizes (not upper-bound capacities)
+  // to avoid gaps that corrupt string boundaries between segments.
+  //
+  // After each segment's decode, we sync and read back the sentinel to learn the
+  // actual char count, then use it to position the next segment. This serializes
+  // GPU work per segment but avoids the capacity-gap corruption bug.
   constexpr uint32_t ADJ_THREADS = 256;
+  size_t actual_cum_chars = 0;
 
   for (size_t si = 0; si < col_scan.data.segments.size(); ++si) {
     auto& seg = col_scan.data.segments[si];
@@ -416,6 +425,7 @@ std::unique_ptr<cudf::column> decode_string_column(
     if (seg.row_count == 0) continue;
 
     int32_t* d_seg_offsets = d_offsets.data() + layout.row_start;
+    size_t seg_char_start = actual_cum_chars;
 
     if (!seg.persistent || !seg.data_ptr
         || seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
@@ -424,7 +434,7 @@ std::unique_ptr<cudf::column> decode_string_column(
                       (seg.row_count + 1) * sizeof(int32_t), stream.value());
     } else if (seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
       const uint8_t* block_base = seg.data_ptr - seg.block_offset;
-      uint8_t* d_seg_chars = d_chars_base + layout.char_start;
+      uint8_t* d_seg_chars = d_chars_base + seg_char_start;
 
       gpu_decode_uncompressed_string(
           block_base, DUCKDB_BLOCK_SIZE,
@@ -436,7 +446,7 @@ std::unique_ptr<cudf::column> decode_string_column(
           d_scratch);
     } else if (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY) {
       const uint8_t* block_base = seg.data_ptr - seg.block_offset;
-      uint8_t* d_seg_chars = d_chars_base + layout.char_start;
+      uint8_t* d_seg_chars = d_chars_base + seg_char_start;
 
       uint8_t* d_chars_out = nullptr;
       size_t total_chars_out = 0;
@@ -455,15 +465,23 @@ std::unique_ptr<cudf::column> decode_string_column(
           d_seg_chars);  // pre-allocated: write chars here
     }
 
-    // Adjust this segment's offsets by adding the char slice start.
+    // Read back sentinel to learn actual char count for this segment.
+    // This sync is needed to get the actual size before positioning the next segment.
+    int32_t seg_actual_chars = 0;
+    stream.synchronize();
+    cudaMemcpy(&seg_actual_chars, d_seg_offsets + seg.row_count,
+               sizeof(int32_t), cudaMemcpyDeviceToHost);
+    actual_cum_chars += seg_actual_chars;
+
+    // Adjust this segment's offsets by adding the actual char position.
     // For the last segment, also adjust the sentinel at d_offsets[total_rows].
-    if (layout.char_start > 0) {
+    if (seg_char_start > 0) {
       bool is_last = (layout.row_start + seg.row_count >= total_rows);
       uint32_t adj_count = static_cast<uint32_t>(seg.row_count) + (is_last ? 1 : 0);
       uint32_t adj_blocks = (adj_count + ADJ_THREADS - 1) / ADJ_THREADS;
       kernel_adjust_offsets<<<adj_blocks, ADJ_THREADS, 0, stream.value()>>>(
           d_seg_offsets,
-          static_cast<int32_t>(layout.char_start),
+          static_cast<int32_t>(seg_char_start),
           adj_count);
     }
   }
