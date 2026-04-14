@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cudf/column/column.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -32,12 +33,13 @@ namespace sirius::microbench {
                                                                   int permille_true,
                                                                   rmm::cuda_stream_view stream);
 
-/// Read up to `max_rows` from a single Parquet file column (first row group only if small).
-/// Returns nullopt if the file cannot be read or the column is missing.
-[[nodiscard]] std::optional<std::unique_ptr<cudf::column>> try_read_parquet_column(
-  std::string const& parquet_file,
-  std::string const& column_name,
-  cudf::size_type max_rows,
-  rmm::cuda_stream_view stream);
+/// Best-effort drop of clean page-cache pages for a file (Linux: `POSIX_FADV_DONTNEED`).
+/// No-op on non-Linux. Open/read handles held elsewhere may keep cache warm.
+void discard_os_page_cache_for_file(std::string const& parquet_path);
+
+/// Read the full Parquet file (all columns, all row groups) into a `cudf::table`.
+/// Returns nullopt if the file cannot be read.
+[[nodiscard]] std::optional<std::unique_ptr<cudf::table>> try_read_parquet_table(
+  std::string const& parquet_file, rmm::cuda_stream_view stream);
 
 }  // namespace sirius::microbench

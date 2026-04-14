@@ -5,15 +5,18 @@
  * use this file except in compliance with the License.
  *
  * libcudf GPU microbenchmarks (Google Benchmark). Timed regions mirror hot
- * operator paths: hash join, groupby sum, sort keys, boolean filter, optional Parquet read.
+ * operator paths: hash join, groupby sum, sort keys, boolean filter, optional
+ * full-table Parquet read (cold vs warm page cache).
+ *
+ * All benchmarks use wall-clock time (`UseRealTime`) in milliseconds.
  *
  * Run:
  *   sirius_gpu_microbench --benchmark_format=json
  *   sirius_gpu_microbench --benchmark_filter='BM_HashJoin|BM_GroupBySum'
  *
- * TPC-H–style Parquet column read (optional):
+ * Optional full Parquet table read (Linux cold mode uses POSIX_FADV_DONTNEED
+ * outside the timed section):
  *   export SIRIUS_MICROBENCH_PARQUET_FILE=$PWD/test_datasets/tpch_parquet_sf1/lineitem.parquet
- *   export SIRIUS_MICROBENCH_PARQUET_COLUMN=l_orderkey
  */
 
 #include "microbench_data.hpp"
@@ -121,20 +124,37 @@ void BM_FilterMask(benchmark::State& state)
   state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(n));
 }
 
-void BM_ParquetReadColumn(benchmark::State& state)
+void BM_ParquetReadTable_Cold(benchmark::State& state)
 {
   char const* path = std::getenv("SIRIUS_MICROBENCH_PARQUET_FILE");
-  char const* col  = std::getenv("SIRIUS_MICROBENCH_PARQUET_COLUMN");
-  if (path == nullptr || col == nullptr) {
-    state.SkipWithError("Set SIRIUS_MICROBENCH_PARQUET_FILE and SIRIUS_MICROBENCH_PARQUET_COLUMN");
+  if (path == nullptr || path[0] == '\0') {
+    state.SkipWithError("Set SIRIUS_MICROBENCH_PARQUET_FILE to a Parquet file path");
     return;
   }
 
   rmm::cuda_stream stream;
-  auto const max_rows = static_cast<cudf::size_type>(state.range(0));
-
   for (auto _ : state) {
-    auto opt = sirius::microbench::try_read_parquet_column(path, col, max_rows, stream);
+    state.PauseTiming();
+    sirius::microbench::discard_os_page_cache_for_file(path);
+    state.ResumeTiming();
+
+    auto opt = sirius::microbench::try_read_parquet_table(path, stream);
+    stream.synchronize();
+    benchmark::DoNotOptimize(opt);
+  }
+}
+
+void BM_ParquetReadTable_Warm(benchmark::State& state)
+{
+  char const* path = std::getenv("SIRIUS_MICROBENCH_PARQUET_FILE");
+  if (path == nullptr || path[0] == '\0') {
+    state.SkipWithError("Set SIRIUS_MICROBENCH_PARQUET_FILE to a Parquet file path");
+    return;
+  }
+
+  rmm::cuda_stream stream;
+  for (auto _ : state) {
+    auto opt = sirius::microbench::try_read_parquet_table(path, stream);
     stream.synchronize();
     benchmark::DoNotOptimize(opt);
   }
@@ -142,14 +162,14 @@ void BM_ParquetReadColumn(benchmark::State& state)
 
 }  // namespace
 
-// All parameter packs registered here; daily CI uses --benchmark_filter to run a subset.
 BENCHMARK(BM_HashJoin)
   ->Args({1 << 16, 1 << 20})
   ->Args({1 << 17, 1 << 21})
   ->Args({1 << 18, 1 << 22})
   ->Args({1 << 19, 1 << 23})
   ->ArgNames({"build_rows", "probe_rows"})
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 BENCHMARK(BM_GroupBySum)
   ->Args({1 << 20, 100000})
@@ -157,14 +177,16 @@ BENCHMARK(BM_GroupBySum)
   ->Args({1 << 21, 500000})
   ->Args({1 << 23, 800000})
   ->ArgNames({"rows", "num_groups"})
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 BENCHMARK(BM_SortKeys)
   ->Arg(1 << 20)
   ->Arg(1 << 22)
   ->Arg(1 << 23)
   ->ArgName("rows")
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 BENCHMARK(BM_FilterMask)
   ->Args({1 << 20, 50})
@@ -172,10 +194,10 @@ BENCHMARK(BM_FilterMask)
   ->Args({1 << 23, 100})
   ->Args({1 << 22, 200})
   ->ArgNames({"rows", "permille_true"})
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
-BENCHMARK(BM_ParquetReadColumn)
-  ->Arg(1 << 20)
-  ->Arg(1 << 22)
-  ->ArgName("max_rows")
-  ->Unit(benchmark::kMillisecond);
+// Full-file read; cold uses fadvise outside timed section. Few iterations — large I/O.
+BENCHMARK(BM_ParquetReadTable_Cold)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(1);
+
+BENCHMARK(BM_ParquetReadTable_Warm)->Unit(benchmark::kMillisecond)->UseRealTime();

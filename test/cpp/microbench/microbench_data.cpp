@@ -8,19 +8,23 @@
 #include "microbench_data.hpp"
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace sirius::microbench {
 
@@ -35,6 +39,19 @@ void throw_if_cuda_error(char const* ctx)
 }
 
 }  // namespace
+
+void discard_os_page_cache_for_file(std::string const& parquet_path)
+{
+#if defined(__linux__)
+  int const fd = ::open(parquet_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) { return; }
+  // len == 0 => from offset to EOF (Linux).
+  (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  ::close(fd);
+#else
+  (void)parquet_path;
+#endif
+}
 
 std::unique_ptr<cudf::column> make_modulo_int32_keys(cudf::size_type num_rows,
                                                      std::int32_t num_groups,
@@ -115,33 +132,20 @@ std::unique_ptr<cudf::column> make_sparse_bool_mask(cudf::size_type num_rows,
   return col;
 }
 
-std::optional<std::unique_ptr<cudf::column>> try_read_parquet_column(
-  std::string const& parquet_file,
-  std::string const& column_name,
-  cudf::size_type max_rows,
-  rmm::cuda_stream_view stream)
+std::optional<std::unique_ptr<cudf::table>> try_read_parquet_table(std::string const& parquet_file,
+                                                                   rmm::cuda_stream_view stream)
 {
-  if (max_rows <= 0) { return std::nullopt; }
   {
     std::ifstream f(parquet_file.c_str(), std::ios::binary);
     if (!f) { return std::nullopt; }
   }
   try {
-    cudf::io::parquet_reader_options opts =
-      cudf::io::parquet_reader_options::builder(cudf::io::source_info{parquet_file})
-        .column_names({column_name})
-        .build();
+    cudf::io::parquet_reader_options const opts =
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{parquet_file}).build();
     cudf::io::table_with_metadata tw = cudf::io::read_parquet(opts, stream);
     stream.synchronize();
     if (!tw.tbl || tw.tbl->num_columns() < 1 || tw.tbl->num_rows() == 0) { return std::nullopt; }
-    cudf::size_type const n = std::min(max_rows, tw.tbl->num_rows());
-    if (n <= 0) { return std::nullopt; }
-    if (tw.tbl->num_rows() == n) {
-      return std::make_unique<cudf::column>(tw.tbl->view().column(0), stream);
-    }
-    auto sliced = cudf::slice(tw.tbl->view(), {0, n}, stream);
-    if (sliced.empty()) { return std::nullopt; }
-    return std::make_unique<cudf::column>(sliced.front().column(0), stream);
+    return std::move(tw.tbl);
   } catch (...) {
     return std::nullopt;
   }

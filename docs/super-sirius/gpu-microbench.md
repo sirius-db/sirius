@@ -1,6 +1,8 @@
 # GPU microbench (`sirius_gpu_microbench`)
 
-libcudf-focused Google Benchmark binaries live next to the extension tests. They time hash join, group-by sum, sort keys, boolean filter, and an optional Parquet column read.
+libcudf-focused Google Benchmark binaries live next to the extension tests. They time hash join, group-by sum, sort keys, boolean filter, and an optional **full-table** Parquet read with **cold** vs **warm** OS page cache.
+
+**Timing:** all benchmarks use **wall-clock (real) time** in **milliseconds** (`UseRealTime`, `Unit(kMillisecond)`), not CPU time.
 
 ## Build
 
@@ -59,32 +61,42 @@ YAML is not parsed by the scripts; if you prefer YAML for hand-editing, mirror t
 
 ### Benchmark parameters (P0)
 
-| Benchmark            | Args / meaning |
-|----------------------|----------------|
-| `BM_HashJoin`        | `build_rows`, `probe_rows` |
-| `BM_GroupBySum`      | `rows`, `num_groups` (NDV) |
-| `BM_SortKeys`        | `rows` |
-| `BM_FilterMask`      | `rows`, `permille_true` (approximate selectivity ×1000) |
-| `BM_ParquetReadColumn` | `max_rows` |
+| Benchmark | Args / meaning |
+|-----------|----------------|
+| `BM_HashJoin` | `build_rows`, `probe_rows` |
+| `BM_GroupBySum` | `rows`, `num_groups` (NDV) |
+| `BM_SortKeys` | `rows` |
+| `BM_FilterMask` | `rows`, `permille_true` (approximate selectivity ×1000) |
+| `BM_ParquetReadTable_Cold` | none — full file, all columns; **fadvise** excluded from timed section |
+| `BM_ParquetReadTable_Warm` | none — full file, all columns; no cache drop |
 
-### Optional Parquet read
+### Optional Parquet table read
+
+Prepare TPC-H SF1 Parquet (same as CI / `test.yml`):
 
 ```bash
-export SIRIUS_MICROBENCH_PARQUET_FILE=/path/to/file.parquet
-export SIRIUS_MICROBENCH_PARQUET_COLUMN=column_name
+./setup_test_datasets.sh
+mkdir -p test_datasets/tpch_parquet_sf1
+./build/release/duckdb -f scripts/tpch_to_parquet.sql
+export SIRIUS_MICROBENCH_PARQUET_FILE=$PWD/test_datasets/tpch_parquet_sf1/lineitem.parquet
 ```
 
-The `full` profile runs all benchmarks (`--benchmark_filter=.*`), including `BM_ParquetReadColumn`; without the env vars that case may skip or error in the report.
+- **Cold:** before each timed read, the benchmark calls `posix_fadvise(..., POSIX_FADV_DONTNEED)` on the file **outside** the timed section (`PauseTiming` / `ResumeTiming`) to encourage dropping clean page-cache pages (Linux only; best-effort).
+- **Warm:** no fadvise; measures reads with whatever pages the kernel keeps cached.
+
+The `full` sweep profile runs all benchmarks, including the Parquet pair, when `SIRIUS_MICROBENCH_PARQUET_FILE` is set (CI sets it to `lineitem.parquet`).
 
 ## CI
 
 Workflow: `.github/workflows/gpu-microbench.yml`
 
+- **Data (full profile only):** `setup_test_datasets.sh` + `scripts/tpch_to_parquet.sql` → `test_datasets/tpch_parquet_sf1/lineitem.parquet`.
+- **Env:** for `full`, `SIRIUS_MICROBENCH_PARQUET_FILE` is set to that `lineitem.parquet` path before the sweep script runs (`daily` / `weekly` skip dataset prep and omit the env var).
 - **Schedule:** Mon–Sat `daily` profile; Sunday `weekly` profile (UTC).
 - **Manual:** `workflow_dispatch` with profile choice.
 - **Artifacts:** JSON under `runs/microbench/ci_<run_id>_<profile>/` (30-day retention).
-- **Summary:** Markdown table of benchmark real time written to the job summary.
+- **Summary:** Markdown table of benchmark **real** time written to the job summary.
 
 ## Interpreting artifacts
 
-Download the artifact zip and open `benchmark.json`. Google Benchmark's schema lists one object per row in `benchmarks` with `name`, `real_time`, `cpu_time`, `iterations`, and `time_unit`. Compare runs by matching `name` strings (they include argument packs).
+Download the artifact zip and open `benchmark.json`. With `UseRealTime` and millisecond units, `real_time` and `time_unit` are the primary wall-clock metrics. `cpu_time` may still appear in the schema; prefer **`real_time`** for these benchmarks.

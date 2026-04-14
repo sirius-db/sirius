@@ -61,12 +61,23 @@ jobs:
           CUDAARCHS: "75"
         run: pixi run make
 
+      - name: Prepare Parquet test data (TPC-H SF1)
+        if: steps.profile.outputs.name == 'full'
+        run: |
+          ./setup_test_datasets.sh
+          chmod -R a+r test_datasets/
+          mkdir -p test_datasets/tpch_parquet_sf1
+          ./build/release/duckdb -f scripts/tpch_to_parquet.sql
+
       - name: Run microbench
         id: run
         run: |
           chmod +x tools/microbench/run_microbench_sweep.sh
           OUT_DIR="$GITHUB_WORKSPACE/runs/microbench/ci_${{ github.run_id }}_${{ steps.profile.outputs.name }}"
           mkdir -p "$OUT_DIR"
+          if [ "${{ steps.profile.outputs.name }}" = "full" ]; then
+            export SIRIUS_MICROBENCH_PARQUET_FILE="$GITHUB_WORKSPACE/test_datasets/tpch_parquet_sf1/lineitem.parquet"
+          fi
           SIRIUS_MICROBENCH_RUN_DIR="$OUT_DIR" \
           SIRIUS_MICROBENCH_OUT="$OUT_DIR/benchmark.json" \
             ./tools/microbench/run_microbench_sweep.sh "${{ steps.profile.outputs.name }}"
