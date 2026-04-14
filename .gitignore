@@ -32,6 +32,8 @@ cufile.log
 envs/
 compile_commands.json
 .cache
+# Local GPU microbench sweep outputs
+runs/microbench/
 
 # Zed editor settings
 .zed

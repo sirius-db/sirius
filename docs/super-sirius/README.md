@@ -29,6 +29,7 @@ Super Sirius is the new task-based GPU execution engine in Sirius, invoked via `
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
+| [GPU microbench](gpu-microbench.md) | `sirius_gpu_microbench`: libcudf benches, sweep scripts, CI artifacts |
 
 ## Suggested Reading Order
 

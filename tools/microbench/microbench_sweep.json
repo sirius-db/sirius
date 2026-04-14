@@ -1,0 +1,30 @@
+{
+  "profiles": {
+    "daily": {
+      "benchmark_filter": "BM_HashJoin|BM_GroupBySum|BM_SortKeys|BM_FilterMask",
+      "extra_args": [
+        "--benchmark_format=json",
+        "--benchmark_out_format=json",
+        "--benchmark_min_time=0.05"
+      ]
+    },
+    "full": {
+      "benchmark_filter": ".*",
+      "extra_args": [
+        "--benchmark_format=json",
+        "--benchmark_out_format=json",
+        "--benchmark_min_time=0.05"
+      ]
+    },
+    "weekly": {
+      "benchmark_filter": "BM_HashJoin|BM_GroupBySum|BM_SortKeys|BM_FilterMask",
+      "extra_args": [
+        "--benchmark_format=json",
+        "--benchmark_out_format=json",
+        "--benchmark_min_time=0.1",
+        "--benchmark_repetitions=3",
+        "--benchmark_report_aggregates_only=true"
+      ]
+    }
+  }
+}

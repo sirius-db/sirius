@@ -34,6 +34,18 @@ spdlog = "1.8.*"
 sqlite = ">=3.52.0,<4"
 
 [tasks]
+# Full Sirius + DuckDB build (same as running `make` from this env).
+build = "make"
+
+# Build only the libcudf GPU microbench binary (after initial `pixi run build` configure).
+build-microbench = "bash -c 'cd \"$PIXI_PROJECT_ROOT/duckdb\" && cmake --build --preset release --target sirius_gpu_microbench'"
+
+# Run Google Benchmark binary; append args after `--`, e.g. `pixi run microbench -- --benchmark_filter=BM_HashJoin`.
+microbench = "./build/release/extension/sirius/test/cpp/sirius_gpu_microbench"
+
+# JSON sweep profiles from tools/microbench/microbench_sweep.json
+microbench-daily = "bash \"$PIXI_PROJECT_ROOT/tools/microbench/run_microbench_daily.sh\""
+microbench-sweep = "bash \"$PIXI_PROJECT_ROOT/tools/microbench/run_microbench_sweep.sh\""
 
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
 [feature.cuda13.system-requirements]

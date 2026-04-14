@@ -1,0 +1,115 @@
+# NOTICE - Actions permissions policy (see .github/workflows/test.yml header).
+# Pinned third-party actions must use full commit SHAs per org policy.
+name: GPU microbench
+
+on:
+  schedule:
+    # Daily Mon–Sat 06:15 UTC (Sundays use weekly only)
+    - cron: "15 6 * * 1-6"
+    # Weekly — Sundays 07:15 UTC (more repetitions in microbench_sweep.json)
+    - cron: "15 7 * * 0"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Sweep profile (daily / weekly / full)"
+        required: true
+        default: daily
+        type: choice
+        options:
+          - daily
+          - weekly
+          - full
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  microbench:
+    # Build and run on a GPU host (same pool as extension tests).
+    runs-on: [self-hosted, ubuntu-22.04, cuda-13, gpu-t4]
+    timeout-minutes: 120
+    env:
+      SCCACHE_GHA_ENABLED: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+        with:
+          cache: false
+          pixi-version: v0.65.0
+          activate-environment: true
+
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Select profile
+        id: profile
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.profile }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "schedule" ] && \
+               [ "${{ github.event.schedule }}" = "15 7 * * 0" ]; then
+            echo "name=weekly" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=daily" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          CUDAARCHS: "75"
+        run: pixi run make
+
+      - name: Run microbench
+        id: run
+        run: |
+          chmod +x tools/microbench/run_microbench_sweep.sh
+          OUT_DIR="$GITHUB_WORKSPACE/runs/microbench/ci_${{ github.run_id }}_${{ steps.profile.outputs.name }}"
+          mkdir -p "$OUT_DIR"
+          SIRIUS_MICROBENCH_RUN_DIR="$OUT_DIR" \
+          SIRIUS_MICROBENCH_OUT="$OUT_DIR/benchmark.json" \
+            ./tools/microbench/run_microbench_sweep.sh "${{ steps.profile.outputs.name }}"
+
+      - name: Step summary
+        if: success()
+        env:
+          BENCH_JSON: ${{ github.workspace }}/runs/microbench/ci_${{ github.run_id }}_${{ steps.profile.outputs.name }}/benchmark.json
+          PROFILE: ${{ steps.profile.outputs.name }}
+        run: |
+          python3 << 'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import os
+          path = os.environ.get("BENCH_JSON", "")
+          profile = os.environ.get("PROFILE", "?")
+          if not path or not os.path.isfile(path):
+              print("## GPU microbench")
+              print()
+              print("_No benchmark JSON found at `" + path + "`._")
+              raise SystemExit(0)
+          with open(path) as f:
+              doc = json.load(f)
+          benches = doc.get("benchmarks", [])
+          print(f"## GPU microbench ({profile})")
+          print()
+          print("| Benchmark | real time | iterations |")
+          print("|-----------|-----------|------------|")
+          for b in benches:
+              if not isinstance(b, dict):
+                  continue
+              name = str(b.get("name", "?")).replace("|", "\\|")
+              rt = b.get("real_time")
+              it = b.get("iterations")
+              unit = b.get("time_unit", "")
+              if rt is not None:
+                  print(f"| `{name}` | {rt:.3f} {unit} | {it} |")
+          PY
+
+      - name: Upload results
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gpu-microbench-${{ steps.profile.outputs.name }}-${{ github.run_id }}
+          path: runs/microbench/ci_${{ github.run_id }}_${{ steps.profile.outputs.name }}/
+          if-no-files-found: error
+          retention-days: 30
