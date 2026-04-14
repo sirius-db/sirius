@@ -45,7 +45,9 @@ Plans:
   2. All classes implementing itask_executor compile and link with inspectable_mpsc queues
   3. No references to interruptible_mpmc remain in itask_executor or any of its implementations
   4. The project builds successfully and all existing tests pass after the queue replacement
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 04-01-PLAN.md — Replace interruptible_mpmc with inspectable_mpsc in itask_executor, build and test
 
 ## Progress
 
@@ -56,7 +58,7 @@ Plans:
 | 1. Core Queue | v1.0 | 2/2 | Complete | 2026-04-14 |
 | 2. Predicate Inspection | v1.0 | 1/1 | Complete | 2026-04-14 |
 | 3. Dead Code Removal | v1.1 | 0/1 | Planned | - |
-| 4. Queue Integration | v1.1 | 0/0 | Not started | - |
+| 4. Queue Integration | v1.1 | 0/1 | Planned | - |
 
 ---
 *Full v1.0 details archived to `.planning/milestones/v1.0-ROADMAP.md`*
