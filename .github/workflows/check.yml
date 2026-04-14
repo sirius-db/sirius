@@ -60,7 +60,7 @@ jobs:
           - compiler: clang
             build-type: release
         include:
-          - arch: x64
+          - arch: arm64
             compiler: gcc
             build-type: release
             environment: vcpkg
@@ -72,10 +72,10 @@ jobs:
             cudf-channel: nightly
       fail-fast: false
     runs-on: >-
-      ${{ matrix.environment == 'vcpkg'
+      ${{ matrix.environment == 'vcpkg--'
         && fromJSON('["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"]')
         || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
-    timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
+    timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 360, 60) }}
     continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
