@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: MVP
-status: milestone_complete
-stopped_at: Milestone v1.0 archived
-last_updated: "2026-04-14T17:30:00.000Z"
+milestone: v1.1
+milestone_name: Task Queue Refactor
+status: defining_requirements
+stopped_at: Defining requirements
+last_updated: "2026-04-14T18:00:00.000Z"
 last_activity: 2026-04-14
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 3
-  completed_plans: 3
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -21,38 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-14)
 
 **Core value:** Thread-safe queue with predicate-based element inspection and selective removal
-**Current focus:** Milestone v1.0 complete — planning next milestone
+**Current focus:** Milestone v1.1 — Task Queue Refactor
 
 ## Current Position
 
-Phase: All complete
-Plan: All complete
-Status: Milestone v1.0 shipped
-Last activity: 2026-04-14
-
-Progress: [##########] 100%
-
-## Performance Metrics
-
-**Velocity:**
-
-- Total plans completed: 3
-- Average duration: ~23 min/plan
-- Total execution time: ~69 min
-
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 01 | 2 | 35 min | 17.5 min |
-| 02 | 1 | 34 min | 34 min |
-
-**Recent Trend:**
-
-- Last 3 plans: 24 min, 11 min, 34 min
-- Trend: Consistent
-
-*Updated after each plan completion*
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-04-14 — Milestone v1.1 started
 
 ## Accumulated Context
 
@@ -78,5 +54,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-04-14
-Stopped at: Milestone v1.0 archived
-Resume with: `/gsd-new-milestone` to start next milestone
+Stopped at: Defining requirements for v1.1
+Resume with: Continue milestone setup
