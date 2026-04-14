@@ -27,7 +27,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Calling interrupt() unblocks all waiting consumers and causes push/pop to return failure/nullptr; calling reactivate() restores normal operation
   4. drain() removes all queued items, and is_open()/is_empty()/size() accurately reflect queue state at the point of query
   5. The class compiles as a header-only template in the Sirius build system at `src/include/exec/inspectable_mpsc.hpp` within `sirius::exec` namespace
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — TDD: Implement inspectable_mpsc header + single-threaded unit tests
+- [ ] 01-02-PLAN.md — Multi-threaded MPSC concurrency stress tests (SAFE-01)
 
 ### Phase 2: Predicate Inspection
 **Goal**: Consumers can search the queue for specific elements by predicate and selectively remove or inspect them, with control over search direction
@@ -47,5 +51,5 @@ Phases execute in numeric order: 1 -> 2
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Queue | 0/0 | Not started | - |
+| 1. Core Queue | 0/2 | Planning complete | - |
 | 2. Predicate Inspection | 0/0 | Not started | - |
