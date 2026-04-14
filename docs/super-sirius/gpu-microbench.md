@@ -90,6 +90,17 @@ The `full` sweep profile runs all benchmarks, including the Parquet pair, when `
 
 Workflow: `.github/workflows/gpu-microbench.yml`
 
+### Reusing the Test workflow build
+
+- **`Test`** uploads **`sirius-build-release`** (`build.tar` of `build/release/`) from **self-hosted** `ubuntu-22.04` / **CUDA 13** with **`CUDAARCHS=75`** — aligned with the **gpu-t4** microbench runner. The artifact is kept **7 days** so **weekly** cron can still download it if `dev` was quiet for a few days.
+- **All** microbench triggers try reuse first:
+  - **`workflow_run`** (after **Test** on **`dev`**): uses that run's id directly; profile forced to **daily**.
+  - **Schedule** and **`workflow_dispatch`**: queries the GitHub API for a **successful** **Test** run on the **current branch** whose **`head_sha`** equals **`GITHUB_SHA`**, then downloads **`sirius-build-release`** from that run.
+- If **no** matching Test run exists, the **artifact expired**, or **download** fails → **`pixi run make`** on the GPU runner (fallback).
+- **`Check`** does not publish a GPU-aligned build; it is not used here.
+
+### Other CI notes
+
 - **Data (full profile only):** `setup_test_datasets.sh` + `scripts/tpch_to_parquet.sql` → `test_datasets/tpch_parquet_sf1/lineitem.parquet`.
 - **Env:** for `full`, `SIRIUS_MICROBENCH_PARQUET_FILE` is set to that `lineitem.parquet` path before the sweep script runs (`daily` / `weekly` skip dataset prep and omit the env var).
 - **Schedule:** Mon–Sat `daily` profile; Sunday `weekly` profile (UTC).

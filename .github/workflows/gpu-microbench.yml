@@ -6,8 +6,17 @@ name: GPU microbench
 permissions:
   contents: write
   pull-requests: write
+  actions: read
 
 on:
+  # Reuse `sirius-build-release` from the Test workflow (same self-hosted CUDA 13 / sm_75 build as gpu-t4).
+  workflow_run:
+    workflows:
+      - Test
+    types:
+      - completed
+    branches:
+      - dev
   schedule:
     # Daily Mon–Sat 06:15 UTC (Sundays use weekly only)
     - cron: "15 6 * * 1-6"
@@ -37,6 +46,7 @@ concurrency:
 jobs:
   microbench:
     # Build and run on a GPU host (same pool as extension tests).
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, ubuntu-22.04, cuda-13, gpu-t4]
     timeout-minutes: 120
     env:
@@ -45,6 +55,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
         with:
@@ -57,7 +68,9 @@ jobs:
       - name: Select profile
         id: profile
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "name=daily" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "name=${{ inputs.profile }}" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "schedule" ] && \
                [ "${{ github.event.schedule }}" = "15 7 * * 0" ]; then
@@ -66,7 +79,51 @@ jobs:
             echo "name=daily" >> "$GITHUB_OUTPUT"
           fi
 
+      # Reuse Test workflow artifact when it matches this checkout (same CUDA/sm_75 build as gpu-t4).
+      - name: Resolve Test workflow run for current commit
+        id: test_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "run_id=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BRANCH="${GITHUB_REF_NAME}"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/test.yml/runs?branch=${BRANCH}&status=success&per_page=50"
+          RUN_ID=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$API" | jq -r --arg sha "$GITHUB_SHA" \
+            '.workflow_runs[] | select(.head_sha==$sha) | .id' | head -1)
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "run_id=" >> "$GITHUB_OUTPUT"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No successful Test run with artifact for commit ${GITHUB_SHA} on ${BRANCH}; will compile."
+          else
+            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Using Test workflow run $RUN_ID for commit ${GITHUB_SHA}."
+          fi
+
+      - name: Download sirius-build-release
+        id: dl_test_build
+        if: steps.test_run.outputs.found == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sirius-build-release
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.test_run.outputs.run_id }}
+
+      - name: Extract Test build
+        if: steps.test_run.outputs.found == 'true' && steps.dl_test_build.outcome == 'success'
+        run: tar -xf build.tar
+
       - name: Build
+        if: steps.test_run.outputs.found != 'true' || steps.dl_test_build.outcome != 'success'
         env:
           CUDAARCHS: "75"
         run: pixi run make
