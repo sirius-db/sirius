@@ -12,25 +12,28 @@ Thread-safe queue with predicate-based element inspection and selective removal 
 
 ### Validated
 
-(None yet — ship to validate)
+Validated in Phase 1: Core Queue
+- [x] Class `inspectable_mpsc<T>` as a header-only template in `sirius::exec` namespace
+- [x] Internal container: `std::deque<std::unique_ptr<T>>` guarded by `std::mutex` + `std::condition_variable`
+- [x] `bool push(std::unique_ptr<T> item)` — enqueue an item; returns false if interrupted
+- [x] `bool emplace(Args&&... args)` — construct and enqueue in-place
+- [x] `std::unique_ptr<T> pop()` — blocking dequeue using condition_variable wait
+- [x] `std::unique_ptr<T> try_pop()` — non-blocking dequeue, returns nullptr if empty
+- [x] `void interrupt()` / `void reactivate()` — shutdown and restart semantics matching interruptible_mpmc
+- [x] `void drain()` — remove all queued items
+- [x] `bool is_open() const noexcept` / `bool is_empty() const noexcept` — state queries
+- [x] Thread-safe for MPMC access (designed for MPSC but safe under MPMC)
+- [x] Delete copy/move constructors and assignment operators
+
+Validated in Phase 2: Predicate Inspection
+- [x] `std::unique_ptr<T> pop_if(std::function<bool(const T&)> predicate, bool front_to_back)` — remove and return first element matching predicate
+- [x] `T* get_if(std::function<bool(const T&)> predicate, bool front_to_back)` — return pointer to first matching element without removing
+- [x] `std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate, bool front_to_back)` — pop_if with mutable access in predicate
+- [x] `T* mutable_get_if(std::function<bool(T&)> predicate, bool front_to_back)` — get_if with mutable access in predicate
 
 ### Active
 
-- [ ] Class `inspectable_mpsc<T>` as a header-only template in `sirius::exec` namespace
-- [ ] Internal container: `std::deque<std::unique_ptr<T>>` guarded by `std::mutex` + `std::condition_variable`
-- [ ] `bool push(std::unique_ptr<T> item)` — enqueue an item; returns false if interrupted
-- [ ] `bool emplace(Args&&... args)` — construct and enqueue in-place
-- [ ] `std::unique_ptr<T> pop()` — blocking dequeue using condition_variable wait
-- [ ] `std::unique_ptr<T> try_pop()` — non-blocking dequeue, returns nullptr if empty
-- [ ] `std::unique_ptr<T> pop_if(std::function<bool(const T&)> predicate, bool front_to_back)` — remove and return first element matching predicate
-- [ ] `T* get_if(std::function<bool(const T&)> predicate, bool front_to_back)` — return pointer to first matching element without removing
-- [ ] `std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate, bool front_to_back)` — pop_if with mutable access in predicate
-- [ ] `T* mutable_get_if(std::function<bool(T&)> predicate, bool front_to_back)` — get_if with mutable access in predicate
-- [ ] `void interrupt()` / `void reactivate()` — shutdown and restart semantics matching interruptible_mpmc
-- [ ] `void drain()` — remove all queued items
-- [ ] `bool is_open() const noexcept` / `bool is_empty() const noexcept` — state queries
-- [ ] Thread-safe for MPMC access (designed for MPSC but safe under MPMC)
-- [ ] Delete copy/move constructors and assignment operators
+(All requirements validated — see above)
 
 ### Out of Scope
 
@@ -57,9 +60,13 @@ Thread-safe queue with predicate-based element inspection and selective removal 
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| `std::deque` over `std::list` | Better cache locality for iteration; mid-erase O(n) is acceptable | -- Pending |
-| `std::mutex` + `std::condition_variable` over `std::shared_mutex` | MPSC workload is write-heavy; shared_mutex overhead not justified | -- Pending |
-| `std::unique_ptr<T>` ownership | Class owns elements exclusively; matches intended MPSC semantics | -- Pending |
+| `std::deque` over `std::list` | Better cache locality for iteration; mid-erase O(n) is acceptable | Validated Phase 1 |
+| `std::mutex` + `std::condition_variable` over `std::shared_mutex` | MPSC workload is write-heavy; shared_mutex overhead not justified | Validated Phase 1 |
+| `std::unique_ptr<T>` ownership | Class owns elements exclusively; matches intended MPSC semantics | Validated Phase 1 |
+| `std::function` for predicate params | Flexibility over template predicates; accepted overhead for internal use | Validated Phase 2 |
+| `std::next(rit).base()` for reverse erase | Standard idiom for converting reverse iterator to forward for deque::erase | Validated Phase 2 |
+| Mutex held for full predicate scan | Simple correctness over per-element locking; acceptable for MPSC | Validated Phase 2 |
+| Raw `T*` return from `get_if` | Avoids ownership transfer; documented invalidation rules; safe under MPSC | Validated Phase 2 |
 
 ## Evolution
 
@@ -79,4 +86,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-13 after initialization*
+*Last updated: 2026-04-14 after Phase 2 completion — all phases complete, milestone v1.0 delivered*
