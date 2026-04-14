@@ -88,7 +88,9 @@ void log_operator_data(const op::sirius_physical_operator& op,
                        const char* label,
                        const std::string& extra_info = "")
 {
-  auto& pipelineable_data = dynamic_cast<const op::pipelineable_operator_data&>(data);
+  auto* pipelineable_ptr = dynamic_cast<const op::pipelineable_operator_data*>(&data);
+  if (!pipelineable_ptr) { return; }
+  auto& pipelineable_data = *pipelineable_ptr;
   std::string batch_rows  = "";
   size_t total_bytes      = 0;
   for (auto& batch : pipelineable_data.get_data_batches()) {

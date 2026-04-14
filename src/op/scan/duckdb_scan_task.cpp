@@ -600,11 +600,13 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
         // Use exhausted flag as a mutex — first thread wins.
         bool expected = false;
         if (!g_state._op.exhausted.compare_exchange_strong(expected, true)) {
-          // Another thread already claimed this — return empty (not nullptr!
-          // because the scan executor dereferences the return value).
+          // Another thread already claimed this — return empty pipelineable_operator_data
+          // (not bare operator_data, which would cause std::bad_cast in publish_output
+          // when dynamic_cast<pipelineable_operator_data&> fails).
           l_state._local_state_drained = true;
           g_state.decrement_local_states();
-          return std::make_unique<op::operator_data>();
+          return std::make_unique<op::pipelineable_operator_data>(
+            std::vector<std::shared_ptr<cucascade::data_batch>>{});
         }
 
         SIRIUS_LOG_INFO("[duckdb_scan_task] table '{}' already GPU-resident ({} rows) — producing GPU batch directly",
