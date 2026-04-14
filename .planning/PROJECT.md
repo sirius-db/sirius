@@ -43,6 +43,11 @@ Validated in Phase 2: Predicate Inspection
 
 ## Context
 
+Shipped v1.0 with 1,153 LOC C++ (295 header + 858 tests).
+Tech stack: C++20, header-only template, Catch2 test framework.
+35 tests passing (231 assertions): 14 single-threaded + 4 concurrency stress + 17 predicate inspection.
+All development completed 2026-04-14 in ~69 min active execution across 3 plans.
+
 - Sirius is a GPU-native SQL engine that extends DuckDB
 - The existing `interruptible_mpmc` class (`src/include/exec/interruptible_mpmc.hpp`) uses a lock-free `BlockingConcurrentQueue` which does not support iteration
 - The new class needs iteration for predicate-based inspection, requiring a different internal data structure
@@ -86,4 +91,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after Phase 2 completion — all phases complete, milestone v1.0 delivered*
+*Last updated: 2026-04-14 after v1.0 milestone*
