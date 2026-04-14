@@ -35,7 +35,9 @@ Validated in Phase 2: Predicate Inspection
 
 <!-- Current scope for v1.1: Task Queue Refactor -->
 
-- [ ] Verify and remove dead queue code (gpu_pipeline_queue, pipeline_queue, duckdb_scan_task_queue, itask_queue)
+Validated in Phase 3: Dead Code Removal
+- [x] Verify and remove dead queue code (gpu_pipeline_queue, pipeline_queue, duckdb_scan_task_queue, itask_queue)
+
 - [ ] Replace interruptible_mpmc with inspectable_mpsc in itask_executor and its implementations
 
 ### Out of Scope
@@ -58,6 +60,7 @@ Shipped v1.0 with 1,153 LOC C++ (295 header + 858 tests).
 Tech stack: C++20, header-only template, Catch2 test framework.
 35 tests passing (231 assertions): 14 single-threaded + 4 concurrency stress + 17 predicate inspection.
 All development completed 2026-04-14 in ~69 min active execution across 3 plans.
+Phase 3 complete — 4 legacy queue classes removed (450 lines), codebase clean for integration.
 
 - Sirius is a GPU-native SQL engine that extends DuckDB
 - The existing `interruptible_mpmc` class (`src/include/exec/interruptible_mpmc.hpp`) uses a lock-free `BlockingConcurrentQueue` which does not support iteration
@@ -102,4 +105,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after v1.1 milestone start*
+*Last updated: 2026-04-14 after Phase 3 completion*
