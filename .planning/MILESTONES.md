@@ -1,5 +1,16 @@
 # Milestones
 
+## v1.1 Task Queue Refactor (Shipped: 2026-04-14)
+
+**Phases completed:** 2 phases, 2 plans, 4 tasks
+
+**Key accomplishments:**
+
+- Removed 4 legacy queue classes (gpu_pipeline_queue, pipeline_queue, duckdb_scan_task_queue, itask_queue) -- 6 files deleted, 450 lines removed, zero regressions
+- Replaced interruptible_mpmc with inspectable_mpsc in itask_executor base class -- all 868 tests pass with zero regressions
+
+---
+
 ## v1.0 MVP (Shipped: 2026-04-14)
 
 **Phases completed:** 2 phases, 3 plans, 5 tasks
