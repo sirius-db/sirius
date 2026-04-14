@@ -45,7 +45,7 @@ Plans:
 **Plans:** 1 plan
 
 Plans:
-- [ ] 02-01-PLAN.md — TDD: Implement pop_if/get_if/mutable_pop_if/mutable_get_if with bidirectional search + 17 tests
+- [x] 02-01-PLAN.md — TDD: Implement pop_if/get_if/mutable_pop_if/mutable_get_if with bidirectional search + 17 tests
 
 ## Progress
 
