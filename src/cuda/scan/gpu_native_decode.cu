@@ -703,4 +703,242 @@ std::unique_ptr<cudf::table> gpu_decode_table(
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+//===----------------------------------------------------------------------===//
+// Pipelined decode: fixed-width from pre-transferred device data
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
+    column_scan_result& col_scan, const duckdb::LogicalType& type,
+    const device_block_map& blocks, uint8_t* device_staging,
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr,
+    void* d_meta_scratch, size_t meta_scratch_size)
+{
+  auto cudf_type = to_cudf_type(type);
+  auto physical_type = type.InternalType();
+  uint32_t type_size = get_type_size(physical_type);
+  bool is_signed = is_signed_type(physical_type);
+  size_t total_rows = col_scan.data.total_rows;
+  if (type_size == 0 || total_rows == 0) return cudf::make_empty_column(cudf_type);
+
+  rmm::device_buffer data_buf(total_rows * type_size, stream, mr);
+  auto* d_output = static_cast<uint8_t*>(data_buf.data());
+  size_t row_offset = 0;
+
+  for (auto& seg : col_scan.data.segments) {
+    if (!seg.persistent || !seg.data_ptr || seg.row_count == 0) { row_offset += seg.row_count; continue; }
+    auto* d_dest = d_output + row_offset * type_size;
+    size_t seg_bytes = seg.row_count * type_size;
+
+    switch (seg.compression) {
+      case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED: {
+        auto it = blocks.offsets.find(seg.block_id);
+        if (it != blocks.offsets.end())
+          cudaMemcpyAsync(d_dest, device_staging + it->second + seg.block_offset, seg_bytes, cudaMemcpyDeviceToDevice, stream.value());
+        else
+          cudaMemcpyAsync(d_dest, seg.data_ptr, seg_bytes, cudaMemcpyHostToDevice, stream.value());
+        break;
+      }
+      case duckdb::CompressionType::COMPRESSION_CONSTANT: {
+        if (type_size == 4) { int32_t v; std::memcpy(&v, seg.data_ptr, 4); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int32_t*>(d_dest), v, seg.row_count); }
+        else if (type_size == 8) { int64_t v; std::memcpy(&v, seg.data_ptr, 8); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int64_t*>(d_dest), v, seg.row_count); }
+        else if (type_size == 2) { int16_t v; std::memcpy(&v, seg.data_ptr, 2); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int16_t*>(d_dest), v, seg.row_count); }
+        else if (type_size == 1) { int8_t v; std::memcpy(&v, seg.data_ptr, 1); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int8_t*>(d_dest), v, seg.row_count); }
+        break;
+      }
+      case duckdb::CompressionType::COMPRESSION_BITPACKING: {
+        auto it = blocks.offsets.find(seg.block_id);
+        void* d_block = (it != blocks.offsets.end()) ? static_cast<void*>(device_staging + it->second) : nullptr;
+        gpu_decode_bitpacking(seg.data_ptr - seg.block_offset, DUCKDB_BLOCK_SIZE,
+            seg.block_offset, seg.row_count, type_size, is_signed, d_dest, stream,
+            d_block ? d_block : nullptr, d_meta_scratch, meta_scratch_size, d_block != nullptr);
+        break;
+      }
+      default: throw std::runtime_error("unsupported compression in pipelined decode");
+    }
+    row_offset += seg.row_count;
+  }
+
+  // Validity
+  rmm::device_buffer null_mask{}; cudf::size_type null_count = 0;
+  if (col_scan.has_nulls) {
+    size_t mask_bytes = (total_rows+63)/64*sizeof(uint64_t);
+    null_mask = rmm::device_buffer(mask_bytes, stream, mr);
+    auto* d_mask = static_cast<uint64_t*>(null_mask.data());
+    uint32_t num_words = (total_rows+63)/64;
+    kernel_fill_valid<<<(num_words+255)/256,256,0,stream.value()>>>(d_mask, num_words);
+    size_t vo = 0;
+    for (auto& vs : col_scan.validity.segments) {
+      if (vs.row_count == 0) { vo += vs.row_count; continue; }
+      if (vs.persistent && vs.data_ptr && vs.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        size_t mb = (vs.row_count+7)/8;
+        if (vo%64==0) cudaMemcpyAsync(d_mask+vo/64, vs.data_ptr, mb, cudaMemcpyHostToDevice, stream.value());
+        else cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_mask)+vo/8, vs.data_ptr, mb, cudaMemcpyHostToDevice, stream.value());
+      }
+      vo += vs.row_count;
+    }
+    stream.synchronize();
+    std::vector<uint64_t> hm(num_words);
+    cudaMemcpy(hm.data(), d_mask, num_words*8, cudaMemcpyDeviceToHost);
+    size_t tb = total_rows%64; if (tb>0 && num_words>0) hm[num_words-1] &= (1ULL<<tb)-1;
+    size_t vc = 0; for (uint32_t w=0; w<num_words; ++w) vc += __builtin_popcountll(hm[w]);
+    null_count = static_cast<cudf::size_type>(total_rows-vc);
+  }
+  return std::make_unique<cudf::column>(cudf_type, static_cast<cudf::size_type>(total_rows),
+      std::move(data_buf), std::move(null_mask), null_count);
+}
+
+//===----------------------------------------------------------------------===//
+// Pipelined decode: string from pre-transferred device data (per-segment sync)
+//===----------------------------------------------------------------------===//
+
+std::unique_ptr<cudf::column> decode_string_column_from_device(
+    column_scan_result& col_scan, const device_block_map& blocks,
+    uint8_t* device_staging, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+{
+  // Same as serial decode_string_column but reads blocks from device staging.
+  // Uses per-segment sync — same proven-correct approach as the serial path.
+  size_t total_rows = col_scan.data.total_rows;
+  if (total_rows == 0) return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
+
+  struct seg_layout { size_t row_start, char_start, char_capacity; };
+  std::vector<seg_layout> layouts;
+  size_t cum_rows = 0, cum_chars = 0; uint32_t max_seg_rows = 0; bool has_fsst = false;
+  for (auto const& seg : col_scan.data.segments) {
+    seg_layout l{cum_rows, cum_chars, 0};
+    if (seg.row_count > 0 && seg.persistent && seg.data_ptr && is_gpu_decodable_string(seg.compression)) {
+      l.char_capacity = static_cast<size_t>(seg.row_count) * seg.max_string_length;
+      max_seg_rows = std::max(max_seg_rows, static_cast<uint32_t>(seg.row_count));
+      if (seg.compression == duckdb::CompressionType::COMPRESSION_FSST) has_fsst = true;
+    }
+    layouts.push_back(l); cum_rows += seg.row_count; cum_chars += l.char_capacity;
+  }
+
+  rmm::device_uvector<int32_t> d_offsets(total_rows+1, stream, mr);
+  rmm::device_buffer d_chars(cum_chars > 0 ? cum_chars : 1, stream, mr);
+  auto* d_chars_base = static_cast<uint8_t*>(d_chars.data());
+
+  string_decode_temp temp{};
+  if (max_seg_rows > 0) {
+    cudaMallocAsync(&temp.d_buf_a, max_seg_rows*4, stream.value());
+    cudaMallocAsync(&temp.d_buf_b, max_seg_rows*4, stream.value());
+    if (has_fsst) { cudaMallocAsync(&temp.d_buf_c, max_seg_rows*4, stream.value()); cudaMallocAsync(&temp.d_fsst_len, 255, stream.value()); cudaMallocAsync(&temp.d_fsst_sym, 255*sizeof(unsigned long long), stream.value()); }
+    size_t ci=0, ce=0;
+    cub::DeviceScan::InclusiveSum(nullptr,ci,(uint32_t*)nullptr,(uint32_t*)nullptr,max_seg_rows,stream.value());
+    cub::DeviceScan::ExclusiveSum(nullptr,ce,(uint32_t*)nullptr,(uint32_t*)nullptr,max_seg_rows,stream.value());
+    temp.cub_temp_bytes = std::max(ci,ce);
+    cudaMallocAsync(&temp.d_cub_temp, temp.cub_temp_bytes, stream.value());
+  }
+
+  constexpr uint32_t ADJ_THREADS = 256;
+  size_t actual_cum_chars = 0;
+  for (size_t si = 0; si < col_scan.data.segments.size(); ++si) {
+    auto& seg = col_scan.data.segments[si]; auto& layout = layouts[si];
+    if (seg.row_count == 0) continue;
+    int32_t* d_seg_offsets = d_offsets.data() + layout.row_start;
+    size_t seg_char_start = actual_cum_chars;
+
+    if (!seg.persistent || !seg.data_ptr || seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+      cudaMemsetAsync(d_seg_offsets, 0, (seg.row_count+1)*sizeof(int32_t), stream.value());
+    } else {
+      const uint8_t* block_base = seg.data_ptr - seg.block_offset;
+      uint8_t* d_seg_chars = d_chars_base + seg_char_start;
+      auto it = blocks.offsets.find(seg.block_id);
+      void* d_block = (it != blocks.offsets.end()) ? static_cast<void*>(device_staging + it->second) : nullptr;
+      bool fd = (d_block != nullptr);
+
+      if (seg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED)
+        gpu_decode_uncompressed_string(block_base, DUCKDB_BLOCK_SIZE, seg.block_offset, seg.row_count, d_seg_offsets, d_seg_chars, stream, fd?d_block:nullptr, fd);
+      else if (seg.compression == duckdb::CompressionType::COMPRESSION_DICTIONARY) {
+        uint8_t* co=nullptr; size_t tc=0;
+        gpu_decode_dictionary(block_base, DUCKDB_BLOCK_SIZE, seg.block_offset, DUCKDB_BLOCK_SIZE, seg.row_count, d_seg_offsets, &co, &tc, stream, fd?d_block:nullptr, seg.max_string_length, d_seg_chars, &temp, fd);
+      } else if (seg.compression == duckdb::CompressionType::COMPRESSION_FSST)
+        gpu_decode_fsst(block_base, DUCKDB_BLOCK_SIZE, seg.block_offset, seg.row_count, d_seg_offsets, d_seg_chars, stream, fd?d_block:nullptr, &temp, fd);
+    }
+
+    int32_t sac = 0; stream.synchronize();
+    cudaMemcpy(&sac, d_seg_offsets + seg.row_count, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    actual_cum_chars += sac;
+
+    if (seg_char_start > 0) {
+      bool is_last = (layout.row_start + seg.row_count >= total_rows);
+      uint32_t ac = seg.row_count + (is_last ? 1 : 0);
+      kernel_adjust_offsets<<<(ac+ADJ_THREADS-1)/ADJ_THREADS, ADJ_THREADS, 0, stream.value()>>>(d_seg_offsets, static_cast<int32_t>(seg_char_start), ac);
+    }
+  }
+  stream.synchronize();
+
+  if (max_seg_rows > 0) {
+    cudaFreeAsync(temp.d_buf_a, stream.value()); cudaFreeAsync(temp.d_buf_b, stream.value());
+    if (has_fsst) { cudaFreeAsync(temp.d_buf_c, stream.value()); cudaFreeAsync(temp.d_fsst_len, stream.value()); cudaFreeAsync(temp.d_fsst_sym, stream.value()); }
+    cudaFreeAsync(temp.d_cub_temp, stream.value());
+  }
+
+  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(total_rows+1), d_offsets.release(), rmm::device_buffer{0,stream,mr}, 0);
+
+  rmm::device_buffer null_mask{}; cudf::size_type null_count = 0;
+  if (col_scan.has_nulls) {
+    size_t mask_bytes = (total_rows+63)/64*sizeof(uint64_t);
+    null_mask = rmm::device_buffer(mask_bytes, stream, mr);
+    auto* dm = static_cast<uint64_t*>(null_mask.data());
+    uint32_t nw = (total_rows+63)/64;
+    kernel_fill_valid<<<(nw+255)/256,256,0,stream.value()>>>(dm, nw);
+    size_t vo = 0;
+    for (auto& vs : col_scan.validity.segments) {
+      if (vs.row_count == 0) { vo += vs.row_count; continue; }
+      if (vs.persistent && vs.data_ptr && vs.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        size_t mb = (vs.row_count+7)/8;
+        if (vo%64==0) cudaMemcpyAsync(dm+vo/64, vs.data_ptr, mb, cudaMemcpyHostToDevice, stream.value());
+        else cudaMemcpyAsync(reinterpret_cast<uint8_t*>(dm)+vo/8, vs.data_ptr, mb, cudaMemcpyHostToDevice, stream.value());
+      }
+      vo += vs.row_count;
+    }
+    stream.synchronize();
+    std::vector<uint64_t> hm(nw); cudaMemcpy(hm.data(), dm, nw*8, cudaMemcpyDeviceToHost);
+    size_t tb = total_rows%64; if (tb>0 && nw>0) hm[nw-1] &= (1ULL<<tb)-1;
+    size_t vc = 0; for (uint32_t w=0;w<nw;++w) vc += __builtin_popcountll(hm[w]);
+    null_count = static_cast<cudf::size_type>(total_rows-vc);
+  }
+  return cudf::make_strings_column(static_cast<cudf::size_type>(total_rows), std::move(offsets_col), std::move(d_chars), null_count, std::move(null_mask));
+}
+
+}  // anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Public API: pipelined decode from pre-transferred device data
+//===----------------------------------------------------------------------===//
+
+std::unique_ptr<cudf::table> gpu_decode_table_pipelined(
+    std::vector<column_scan_result>& col_scans,
+    const std::vector<duckdb::LogicalType>& col_types,
+    const device_block_map& blocks,
+    void* device_staging,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr)
+{
+  if (col_scans.size() != col_types.size())
+    throw std::invalid_argument("gpu_decode_table_pipelined: size mismatch");
+
+  auto* d_staging = static_cast<uint8_t*>(device_staging);
+  constexpr size_t META_SCRATCH_SIZE = 64 * 1024;
+  void* d_meta_scratch = nullptr;
+  cudaMallocAsync(&d_meta_scratch, META_SCRATCH_SIZE, stream.value());
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(col_scans.size());
+
+  for (size_t ci = 0; ci < col_scans.size(); ++ci) {
+    if (col_types[ci].id() == duckdb::LogicalTypeId::VARCHAR)
+      columns.push_back(decode_string_column_from_device(col_scans[ci], blocks, d_staging, stream, mr));
+    else
+      columns.push_back(decode_fixed_width_column_from_device(col_scans[ci], col_types[ci], blocks, d_staging, stream, mr, d_meta_scratch, META_SCRATCH_SIZE));
+  }
+
+  stream.synchronize();
+  cudaFreeAsync(d_meta_scratch, stream.value());
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 }  // namespace sirius::cuda::scan

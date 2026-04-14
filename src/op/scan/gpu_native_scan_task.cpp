@@ -12,6 +12,8 @@
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <unordered_set>
+
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/table/column_data.hpp>
@@ -338,9 +340,49 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
 
   auto t1_pin = clock::now();
 
-  // 3. GPU decode -> cudf::table
-  auto mr        = g.gpu_space()->get_default_allocator();
-  auto gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
+  // 3. Decode: bulk pre-transfer for large batches, serial for small ones.
+  // Bulk pre-transfer gathers unique blocks → one cudaMemcpyAsync per block to device →
+  // decode from device memory. Eliminates thousands of per-segment H2D API calls.
+  auto mr = g.gpu_space()->get_default_allocator();
+
+  std::unordered_set<int64_t> unique_blocks;
+  for (auto& cs : col_scans) {
+    for (auto& seg : cs.data.segments) {
+      if (seg.persistent && seg.data_ptr && seg.row_count > 0 && seg.block_id >= 0)
+        unique_blocks.insert(seg.block_id);
+    }
+  }
+
+  std::unique_ptr<cudf::table> gpu_table;
+
+  if (unique_blocks.size() >= 4) {
+    // Bulk pre-transfer: H2D all unique blocks, then decode from device
+    size_t buf_bytes = unique_blocks.size() * 262144;
+    void* d_staging = nullptr;
+    cudaMallocAsync(&d_staging, buf_bytes, stream.value());
+
+    sirius::cuda::scan::device_block_map block_map;
+    size_t offset = 0;
+    for (auto& cs : col_scans) {
+      for (auto& seg : cs.data.segments) {
+        if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0) continue;
+        if (block_map.offsets.count(seg.block_id)) continue;
+        cudaMemcpyAsync(static_cast<uint8_t*>(d_staging) + offset,
+                        seg.data_ptr - seg.block_offset, 262144,
+                        cudaMemcpyHostToDevice, stream.value());
+        block_map.offsets[seg.block_id] = offset;
+        offset += 262144;
+      }
+    }
+    block_map.total_bytes = offset;
+
+    gpu_table = sirius::cuda::scan::gpu_decode_table_pipelined(
+        col_scans, col_types, block_map, d_staging, stream, mr);
+    cudaFreeAsync(d_staging, stream.value());
+  } else {
+    // Serial: per-segment H2D (original path, for small batches)
+    gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
+  }
 
   auto t2_decode = clock::now();
 
@@ -352,17 +394,10 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
   };
 
   size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
-  size_t total_segs = 0, total_pinned_bytes = 0;
-  for (auto& cs : col_scans) {
-    total_segs += cs.data.segments.size();
-    total_pinned_bytes += cs.data.total_pinned_bytes;
-  }
-
   SIRIUS_LOG_INFO(
-    "[gpu_native_scan] task {}: {} rows, {} cols, {} segs, {:.1f}MB pinned | "
+    "[gpu_native_scan] task {}: {} rows, {} cols, {} blocks | "
     "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{})",
-    task_id_, total_rows, num_cols, total_segs,
-    total_pinned_bytes / (1024.0 * 1024.0),
+    task_id_, total_rows, num_cols, unique_blocks.size(),
     us(t0, t1_pin) / 1000.0,
     us(t1_pin, t2_decode) / 1000.0,
     us(t0, t2_decode) / 1000.0,

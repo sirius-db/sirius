@@ -13,9 +13,16 @@
 #include <rmm/resource_ref.hpp>
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::cuda::scan {
+
+/// @brief Map of DuckDB block_id → byte offset in device staging buffer.
+struct device_block_map {
+  std::unordered_map<int64_t, size_t> offsets;
+  size_t total_bytes = 0;
+};
 
 /// @brief Decode all columns from direct block scan results into a cudf::table on GPU.
 ///
@@ -31,6 +38,17 @@ namespace sirius::cuda::scan {
 std::unique_ptr<cudf::table> gpu_decode_table(
     std::vector<sirius::op::scan::column_scan_result>& column_scans,
     const std::vector<duckdb::LogicalType>& column_types,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// @brief Decode table from pre-transferred device data (bulk pre-transfer path).
+/// Like gpu_decode_table but reads compressed blocks from device_staging instead of
+/// doing per-segment H2D. Used after bulk H2D of all unique blocks.
+std::unique_ptr<cudf::table> gpu_decode_table_pipelined(
+    std::vector<sirius::op::scan::column_scan_result>& col_scans,
+    const std::vector<duckdb::LogicalType>& col_types,
+    const device_block_map& blocks,
+    void* device_staging,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
