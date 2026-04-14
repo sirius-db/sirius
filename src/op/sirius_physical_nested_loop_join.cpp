@@ -27,6 +27,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
@@ -210,9 +211,6 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
   sirius_physical_operator& op,
   bool build_rhs)
 {
-  op.op_state.reset();
-  op.sink_state.reset();
-
   auto& state = meta_pipeline.get_state();
   state.add_pipeline_operator(current, op);
 
@@ -245,11 +243,11 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
 
   switch (op.type) {
     case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
-      throw duckdb::NotImplementedException("POSITIONAL_JOIN is not implemented yet");
+      throw not_implemented_exception("POSITIONAL_JOIN is not implemented yet");
       meta_pipeline.create_child_pipeline(current, op, last_pipeline);
       return;
     case SiriusPhysicalOperatorType::CROSS_PRODUCT:
-      throw duckdb::NotImplementedException("CROSS_PRODUCT is not implemented yet");
+      throw not_implemented_exception("CROSS_PRODUCT is not implemented yet");
       return;
     default: break;
   }

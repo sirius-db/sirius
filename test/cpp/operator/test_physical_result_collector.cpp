@@ -248,8 +248,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(pipelineable_operator_data({batch}), cudf::get_default_stream());
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   size_t row_base = 0;
@@ -314,8 +313,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(pipelineable_operator_data({batch}), stream);
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   size_t row_base = 0;
@@ -450,8 +448,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     }
   }
 
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   std::vector<row_t> actual_rows;

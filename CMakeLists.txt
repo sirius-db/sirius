@@ -95,6 +95,7 @@ add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 set(EXTENSION_SOURCES
     src/config.cpp
     src/cpu_cache.cpp
+    src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
@@ -306,6 +307,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
+    test/cpp/debug/test_debug_utils.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
