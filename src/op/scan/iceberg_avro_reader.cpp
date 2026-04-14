@@ -28,6 +28,7 @@
 #include <op/scan/iceberg_avro_reader.hpp>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iterator>

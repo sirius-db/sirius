@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"

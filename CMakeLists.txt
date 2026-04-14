@@ -279,42 +279,6 @@ foreach(_target sirius_extension sirius_loadable_extension)
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
-# Precompiled headers for extension targets
-target_precompile_headers(
-  sirius_extension
-  PRIVATE
-  # STL headers (60+ combined inclusions)
-  <algorithm>
-  <memory>
-  <optional>
-  <string>
-  <string_view>
-  <vector>
-  # Logging (44/139 source files)
-  "src/include/log/logging.hpp"
-  # DuckDB planner (30+ files)
-  <duckdb/planner/expression/bound_reference_expression.hpp>)
-target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
-
-# CMake PCH doesn't apply to nvcc — skip PCH for CUDA sources
-set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
-                                                       ON)
-
-# The conda-forge GCC wrapper hard-codes -rpath <conda_prefix>/lib into every
-# link invocation. Strip it from the loadable extension so the binary only
-# depends on system libraries at runtime.
-if(VCPKG_BUILD)
-  find_program(_PATCHELF patchelf)
-  if(_PATCHELF)
-    add_custom_command(
-      TARGET sirius_loadable_extension
-      POST_BUILD
-      COMMAND ${_PATCHELF} --remove-rpath
-              $<TARGET_FILE:sirius_loadable_extension>
-      COMMENT "Stripping RPATH from sirius loadable extension")
-  endif()
-endif()
-
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
                       absl::any_invocable)
@@ -411,13 +375,6 @@ link_extension_libraries(sirius_unittest "")
 # that conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
-
-# Precompile Catch2 header (18K lines) once instead of in every test file
-target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
-# unittest.cpp defines CATCH_CONFIG_RUNNER before including catch.hpp, which is
-# incompatible with the PCH (compiled without that define). Exclude it.
-set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/unittest.cpp"
-                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 set_target_properties(
   sirius_unittest
