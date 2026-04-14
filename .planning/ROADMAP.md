@@ -32,7 +32,9 @@
   1. The four legacy queue classes (gpu_pipeline_queue, pipeline_queue, duckdb_scan_task_queue, itask_queue) no longer exist in the source tree
   2. No references to any of the removed classes remain anywhere in the codebase (headers, source, CMake)
   3. The project builds successfully and all existing tests pass after removal
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 03-01-PLAN.md — Delete legacy queue files, clean references, build and test
 
 ### Phase 4: Queue Integration
 **Goal**: itask_executor and all its implementations use inspectable_mpsc instead of interruptible_mpmc
@@ -53,7 +55,7 @@
 |-------|-----------|----------------|--------|-----------|
 | 1. Core Queue | v1.0 | 2/2 | Complete | 2026-04-14 |
 | 2. Predicate Inspection | v1.0 | 1/1 | Complete | 2026-04-14 |
-| 3. Dead Code Removal | v1.1 | 0/0 | Not started | - |
+| 3. Dead Code Removal | v1.1 | 0/1 | Planned | - |
 | 4. Queue Integration | v1.1 | 0/0 | Not started | - |
 
 ---
