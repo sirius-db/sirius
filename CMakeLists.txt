@@ -211,10 +211,8 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
-    src/pipeline/gpu_pipeline_queue.cpp
     src/pipeline/gpu_pipeline_task.cpp
     src/pipeline/pipeline_executor.cpp
-    src/pipeline/pipeline_queue.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
