@@ -484,9 +484,26 @@ __global__ void kernel_gather_fsst(const batched_seg_desc* __restrict__ descs,
       if (code < FSST_ESC) {
         unsigned long long sym = sh_sym[code];
         uint8_t sym_len        = sh_len[code];
-        for (uint8_t j = 0; j < sym_len; j++) {
-          d_chars[out_pos + j] = static_cast<uint8_t>(sym);
-          sym >>= 8;
+        // Adaptive write: use sized stores for common lengths (1-2 bytes
+        // dominate in practice per FSST paper). Avoids both the overhead
+        // of the byte loop AND the bandwidth waste of an 8-byte store.
+        switch (sym_len) {
+          case 1:
+            d_chars[out_pos] = static_cast<uint8_t>(sym);
+            break;
+          case 2:
+            memcpy(d_chars + out_pos, &sym, 2);
+            break;
+          case 3:
+            memcpy(d_chars + out_pos, &sym, 3);
+            break;
+          case 4:
+            memcpy(d_chars + out_pos, &sym, 4);
+            break;
+          default:
+            // 5-8 byte symbols (rare): use memcpy
+            memcpy(d_chars + out_pos, &sym, sym_len);
+            break;
         }
         out_pos += sym_len;
       } else {
