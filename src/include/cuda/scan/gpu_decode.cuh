@@ -185,6 +185,44 @@ void gpu_decode_uncompressed_string(
 // Host-side API: decode an FSST-compressed string segment on GPU
 //===----------------------------------------------------------------------===//
 
+/// @brief Decode an RLE-compressed fixed-width segment on GPU.
+///
+/// DuckDB RLE on-disk layout (within segment at block_offset):
+///   [0..7]                       uint64_t rle_count_offset
+///   [8 .. rle_count_offset-1]    Values: T[entry_count]
+///   [rle_count_offset ..]        Counts: uint16_t[entry_count]
+///
+/// Algorithm:
+///   1. Parse header on CPU, compute inclusive prefix sums of counts
+///   2. H2D segment block + prefix sums to GPU
+///   3. Per-output-row kernel: binary search prefix sums, copy value
+///
+/// Fully async — caller must sync the stream.
+///
+/// @param segment_data   Host pointer to segment block base
+/// @param segment_size   Size of the block (typically 262144 = 256KB)
+/// @param block_offset   Offset within the block to the segment start
+/// @param row_count      Total rows in the segment
+/// @param type_size      Size of the output type in bytes (1, 2, 4, 8, or 16)
+/// @param d_output       Pre-allocated device buffer (row_count * type_size bytes)
+/// @param stream         CUDA stream
+/// @param d_scratch      Optional pre-allocated device buffer (>= segment_size bytes)
+/// @param skip_block_copy If true, segment data is already on device at d_scratch
+void gpu_decode_rle(
+    const uint8_t* segment_data,
+    size_t segment_size,
+    uint32_t block_offset,
+    uint32_t row_count,
+    uint32_t type_size,
+    void* d_output,
+    rmm::cuda_stream_view stream,
+    void* d_scratch = nullptr,
+    bool skip_block_copy = false);
+
+//===----------------------------------------------------------------------===//
+// Host-side API: decode an FSST-compressed string segment on GPU
+//===----------------------------------------------------------------------===//
+
 /// @brief Decode an FSST-compressed string segment on GPU.
 ///
 /// FSST (Fast Static Symbol Table) maps 1-byte codes to 1-8 byte symbols.

@@ -19,11 +19,51 @@
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
+#include <duckdb/storage/statistics/numeric_stats.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 
 #include <chrono>
+#include <cstring>
 
 namespace sirius::op::scan {
+
+/// Extract a numeric constant value from segment stats into a byte buffer.
+/// For CONSTANT segments (block_id == INVALID_BLOCK), the value is stored
+/// only in statistics (min == max == the constant).
+static void extract_constant_from_stats(
+    const duckdb::ColumnSegment& segment, uint8_t* dest)
+{
+  auto pt    = segment.type.InternalType();
+  auto& stats = segment.stats.statistics;
+  switch (pt) {
+    case duckdb::PhysicalType::BOOL:
+    case duckdb::PhysicalType::INT8:
+      { auto v = duckdb::NumericStats::GetMin<int8_t>(stats);   std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::INT16:
+      { auto v = duckdb::NumericStats::GetMin<int16_t>(stats);  std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::INT32:
+      { auto v = duckdb::NumericStats::GetMin<int32_t>(stats);  std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::INT64:
+      { auto v = duckdb::NumericStats::GetMin<int64_t>(stats);  std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::UINT8:
+      { auto v = duckdb::NumericStats::GetMin<uint8_t>(stats);  std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::UINT16:
+      { auto v = duckdb::NumericStats::GetMin<uint16_t>(stats); std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::UINT32:
+      { auto v = duckdb::NumericStats::GetMin<uint32_t>(stats); std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::UINT64:
+      { auto v = duckdb::NumericStats::GetMin<uint64_t>(stats); std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::FLOAT:
+      { auto v = duckdb::NumericStats::GetMin<float>(stats);    std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::DOUBLE:
+      { auto v = duckdb::NumericStats::GetMin<double>(stats);   std::memcpy(dest, &v, sizeof(v)); break; }
+    case duckdb::PhysicalType::INT128:
+      { auto v = duckdb::NumericStats::GetMin<duckdb::hugeint_t>(stats); std::memcpy(dest, &v, sizeof(v)); break; }
+    default:
+      std::memset(dest, 0, 16);
+      break;
+  }
+}
 
 direct_block_scan_result direct_block_scan_column(
   duckdb::DataTable& storage,
@@ -67,9 +107,17 @@ direct_block_scan_result direct_block_scan_column(
 
         result.total_pinned_bytes += segment.SegmentSize();
       } else {
-        seg_info.data_ptr   = nullptr;
-        seg_info.persistent = false;
-        seg_info.compression = duckdb::CompressionType::COMPRESSION_AUTO;
+        auto compression = segment.GetCompressionType();
+        if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+          seg_info.compression = compression;
+          seg_info.persistent  = true;
+          seg_info.data_ptr    = nullptr;
+          extract_constant_from_stats(segment, seg_info.constant_data);
+        } else {
+          seg_info.data_ptr   = nullptr;
+          seg_info.persistent = false;
+          seg_info.compression = duckdb::CompressionType::COMPRESSION_AUTO;
+        }
       }
 
       result.segments.push_back(std::move(seg_info));
@@ -178,9 +226,19 @@ direct_block_scan_result scan_segment_tree(
         seg_info.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
       }
     } else {
-      seg_info.data_ptr   = nullptr;
-      seg_info.persistent = false;
-      seg_info.compression = duckdb::CompressionType::COMPRESSION_AUTO;
+      // No block — check for blockless CONSTANT segment (block_id == INVALID_BLOCK).
+      // DuckDB stores the constant value only in stats, not in a block.
+      auto compression = segment.GetCompressionType();
+      if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+        seg_info.compression = compression;
+        seg_info.persistent  = true;
+        seg_info.data_ptr    = nullptr;  // no block; value is in constant_data
+        extract_constant_from_stats(segment, seg_info.constant_data);
+      } else {
+        seg_info.data_ptr    = nullptr;
+        seg_info.persistent  = false;
+        seg_info.compression = duckdb::CompressionType::COMPRESSION_AUTO;
+      }
     }
 
     result.segments.push_back(std::move(seg_info));

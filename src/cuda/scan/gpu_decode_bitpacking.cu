@@ -70,13 +70,14 @@ __global__ void kernel_decode_segment(
   uint32_t width = meta.width;
   T frame = static_cast<T>(meta.frame_of_ref);
 
-  // Load packed data into shared memory (GPU-FOR insight: shared mem extraction)
+  // Load packed data into shared memory. Use memcpy to handle potentially
+  // misaligned packed data (e.g. int16 segments with 2-byte alignment).
   extern __shared__ uint32_t shmem[];
-  const uint32_t* packed = reinterpret_cast<const uint32_t*>(d_segment + meta.data_offset);
+  const uint8_t* packed_bytes = d_segment + meta.data_offset;
   uint32_t packed_words = (row_count * width + 31) / 32;
 
   for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
-    shmem[i] = packed[i];
+    memcpy(&shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
   }
   __syncthreads();
 
@@ -262,12 +263,13 @@ __global__ void kernel_parse_and_decode_segment_fused(
   T frame = sm_frame;
 
   extern __shared__ uint32_t shmem[];
-  const uint32_t* packed =
-      reinterpret_cast<const uint32_t*>(d_segment + sm_data_offset);
+  const uint8_t* packed_bytes = d_segment + sm_data_offset;
   uint32_t packed_words = (rc * width + 31) / 32;
 
+  // Use memcpy to handle potentially misaligned packed data (e.g. int16 segments
+  // where the packed data start is only 2-byte aligned, not 4-byte aligned).
   for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
-    shmem[i] = packed[i];
+    memcpy(&shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
   }
   __syncthreads();
 
@@ -383,6 +385,16 @@ void gpu_decode_bitpacking(
 {
   // Fully async — caller is responsible for stream synchronization.
   switch (type_size) {
+    case 1:
+      is_signed
+          ? decode_typed<int8_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy)
+          : decode_typed<uint8_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy);
+      break;
+    case 2:
+      is_signed
+          ? decode_typed<int16_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy)
+          : decode_typed<uint16_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy);
+      break;
     case 4:
       is_signed
           ? decode_typed<int32_t>(segment_data, segment_size, block_offset, row_count, d_output, stream, d_scratch, d_meta_scratch, meta_scratch_size, skip_block_copy)

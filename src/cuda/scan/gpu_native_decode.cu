@@ -168,7 +168,11 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
   const uint8_t* last_block_base = nullptr;
 
   for (auto& seg : col_scan.data.segments) {
-    if (!seg.persistent || !seg.data_ptr || seg.row_count == 0) {
+    if (seg.row_count == 0) { row_offset += seg.row_count; continue; }
+    // Skip non-decodable segments, but allow blockless CONSTANT segments
+    // (persistent=true, data_ptr=null, value in constant_data).
+    if (!seg.persistent || (!seg.data_ptr
+        && seg.compression != duckdb::CompressionType::COMPRESSION_CONSTANT)) {
       row_offset += seg.row_count;
       continue;
     }
@@ -185,30 +189,32 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
       }
 
       case duckdb::CompressionType::COMPRESSION_CONSTANT: {
+        // Blockless CONSTANT segments have data_ptr=null; value is in constant_data.
+        const uint8_t* val_src = seg.data_ptr ? seg.data_ptr : seg.constant_data;
         if (type_size == 4) {
-          int32_t val; std::memcpy(&val, seg.data_ptr, sizeof(val));
+          int32_t val; std::memcpy(&val, val_src, sizeof(val));
           uint32_t blocks = (seg.row_count + 255) / 256;
           kernel_fill_constant<<<blocks, 256, 0, stream.value()>>>(
               reinterpret_cast<int32_t*>(d_dest), val, seg.row_count);
         } else if (type_size == 8) {
-          int64_t val; std::memcpy(&val, seg.data_ptr, sizeof(val));
+          int64_t val; std::memcpy(&val, val_src, sizeof(val));
           uint32_t blocks = (seg.row_count + 255) / 256;
           kernel_fill_constant<<<blocks, 256, 0, stream.value()>>>(
               reinterpret_cast<int64_t*>(d_dest), val, seg.row_count);
         } else if (type_size == 2) {
-          int16_t val; std::memcpy(&val, seg.data_ptr, sizeof(val));
+          int16_t val; std::memcpy(&val, val_src, sizeof(val));
           uint32_t blocks = (seg.row_count + 255) / 256;
           kernel_fill_constant<<<blocks, 256, 0, stream.value()>>>(
               reinterpret_cast<int16_t*>(d_dest), val, seg.row_count);
         } else if (type_size == 1) {
-          int8_t val; std::memcpy(&val, seg.data_ptr, sizeof(val));
+          int8_t val; std::memcpy(&val, val_src, sizeof(val));
           uint32_t blocks = (seg.row_count + 255) / 256;
           kernel_fill_constant<<<blocks, 256, 0, stream.value()>>>(
               reinterpret_cast<int8_t*>(d_dest), val, seg.row_count);
         } else {
           std::vector<uint8_t> host_buf(seg_bytes);
           for (size_t r = 0; r < seg.row_count; ++r) {
-            std::memcpy(host_buf.data() + r * type_size, seg.data_ptr, type_size);
+            std::memcpy(host_buf.data() + r * type_size, val_src, type_size);
           }
           cudaMemcpyAsync(d_dest, host_buf.data(), seg_bytes,
                           cudaMemcpyHostToDevice, stream.value());
@@ -228,6 +234,22 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
             type_size, is_signed,
             d_dest, stream,
             d_scratch, nullptr, 0,
+            block_cached);
+        gpu_decoded_segs++;
+        break;
+      }
+
+      case duckdb::CompressionType::COMPRESSION_RLE: {
+        const uint8_t* block_base = seg.data_ptr - seg.block_offset;
+        bool block_cached = (block_base == last_block_base);
+        if (!block_cached) last_block_base = block_base;
+        gpu_decode_rle(
+            block_base, DUCKDB_BLOCK_SIZE,
+            static_cast<uint32_t>(seg.block_offset),
+            static_cast<uint32_t>(seg.row_count),
+            type_size,
+            d_dest, stream,
+            d_scratch,
             block_cached);
         gpu_decoded_segs++;
         break;
@@ -720,7 +742,11 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
   size_t row_offset = 0;
 
   for (auto& seg : col_scan.data.segments) {
-    if (!seg.persistent || !seg.data_ptr || seg.row_count == 0) { row_offset += seg.row_count; continue; }
+    if (seg.row_count == 0) { row_offset += seg.row_count; continue; }
+    if (!seg.persistent || (!seg.data_ptr
+        && seg.compression != duckdb::CompressionType::COMPRESSION_CONSTANT)) {
+      row_offset += seg.row_count; continue;
+    }
     auto* d_dest = d_output + row_offset * type_size;
     size_t seg_bytes = seg.row_count * type_size;
 
@@ -734,10 +760,11 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
         break;
       }
       case duckdb::CompressionType::COMPRESSION_CONSTANT: {
-        if (type_size == 4) { int32_t v; std::memcpy(&v, seg.data_ptr, 4); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int32_t*>(d_dest), v, seg.row_count); }
-        else if (type_size == 8) { int64_t v; std::memcpy(&v, seg.data_ptr, 8); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int64_t*>(d_dest), v, seg.row_count); }
-        else if (type_size == 2) { int16_t v; std::memcpy(&v, seg.data_ptr, 2); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int16_t*>(d_dest), v, seg.row_count); }
-        else if (type_size == 1) { int8_t v; std::memcpy(&v, seg.data_ptr, 1); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int8_t*>(d_dest), v, seg.row_count); }
+        const uint8_t* vs = seg.data_ptr ? seg.data_ptr : seg.constant_data;
+        if (type_size == 4) { int32_t v; std::memcpy(&v, vs, 4); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int32_t*>(d_dest), v, seg.row_count); }
+        else if (type_size == 8) { int64_t v; std::memcpy(&v, vs, 8); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int64_t*>(d_dest), v, seg.row_count); }
+        else if (type_size == 2) { int16_t v; std::memcpy(&v, vs, 2); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int16_t*>(d_dest), v, seg.row_count); }
+        else if (type_size == 1) { int8_t v; std::memcpy(&v, vs, 1); kernel_fill_constant<<<(seg.row_count+255)/256,256,0,stream.value()>>>(reinterpret_cast<int8_t*>(d_dest), v, seg.row_count); }
         break;
       }
       case duckdb::CompressionType::COMPRESSION_BITPACKING: {
@@ -746,6 +773,14 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
         gpu_decode_bitpacking(seg.data_ptr - seg.block_offset, DUCKDB_BLOCK_SIZE,
             seg.block_offset, seg.row_count, type_size, is_signed, d_dest, stream,
             d_block ? d_block : nullptr, nullptr, 0, d_block != nullptr);
+        break;
+      }
+      case duckdb::CompressionType::COMPRESSION_RLE: {
+        auto it = blocks.offsets.find(seg.block_id);
+        void* d_block = (it != blocks.offsets.end()) ? static_cast<void*>(device_staging + it->second) : nullptr;
+        gpu_decode_rle(seg.data_ptr - seg.block_offset, DUCKDB_BLOCK_SIZE,
+            seg.block_offset, seg.row_count, type_size,
+            d_dest, stream, d_block ? d_block : nullptr, d_block != nullptr);
         break;
       }
       default: throw std::runtime_error("unsupported compression in pipelined decode");

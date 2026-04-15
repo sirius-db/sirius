@@ -142,6 +142,7 @@ void gpu_native_scan_global_state::check_viability()
           case duckdb::CompressionType::COMPRESSION_BITPACKING:
           case duckdb::CompressionType::COMPRESSION_CONSTANT:
           case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
+          case duckdb::CompressionType::COMPRESSION_RLE:
             break;
 
           case duckdb::CompressionType::COMPRESSION_DICTIONARY:

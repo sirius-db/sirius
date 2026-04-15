@@ -240,6 +240,7 @@ set(CUDA_SOURCES
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_dictionary.cu
     src/cuda/scan/gpu_decode_fsst.cu
+    src/cuda/scan/gpu_decode_rle.cu
     src/cuda/scan/gpu_native_decode.cu
     src/cuda/utils.cu)
 # cmake-format: on
