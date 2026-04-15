@@ -612,6 +612,7 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   std::vector<fsst_decoder_compact> fsst_decoders;  // host-deserialized decoders
   uint32_t total_fsst_rows = 0;
   size_t cum_rows = 0;
+  size_t cum_chars_upper = 0;  // CPU upper-bound on total string bytes
 
   for (auto const& seg : col_scan.data.segments) {
     if (seg.row_count == 0) { cum_rows += seg.row_count; continue; }
@@ -621,6 +622,9 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       cum_rows += seg.row_count;
       continue;
     }
+
+    // Accumulate char upper bound from segment metadata
+    cum_chars_upper += static_cast<size_t>(seg.row_count) * seg.max_string_length;
 
     // Resolve device block pointer
     const uint8_t* block_base = seg.data_ptr - seg.block_offset;
@@ -772,37 +776,38 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       reinterpret_cast<uint32_t*>(d_offsets.data()) + total_rows,
       static_cast<uint32_t>(total_rows));
 
-  // ONE sync — read total_chars for exact allocation
-  stream.synchronize();
+  // Allocate char buffer using CPU upper bound — avoids inter-pass sync.
+  // The upper bound comes from sum(seg.row_count × seg.max_string_length).
+  // Pass 2 kernels write at offsets computed by CUB (exact), so only the
+  // leading portion of d_chars is used.  Excess is wasted but harmless.
+  //
+  // Safety: fall back to exact allocation (with sync) if upper bound
+  // exceeds 512MB to prevent OOM from pathological max_string_length.
+  constexpr size_t UPPER_BOUND_LIMIT = 512ULL * 1024 * 1024;
+  bool use_upper_bound = cum_chars_upper <= UPPER_BOUND_LIMIT;
 
-  // Check for CUDA errors from pass 1
-  auto err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    throw std::runtime_error(
-        std::string("batched string pass 1 CUDA error: ") + cudaGetErrorString(err));
+  size_t alloc_chars = 0;
+  if (use_upper_bound) {
+    alloc_chars = cum_chars_upper;
+  } else {
+    // Two-pass fallback: sync to get exact total_chars
+    stream.synchronize();
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("batched string pass 1 CUDA error: ") + cudaGetErrorString(err));
+    }
+    int32_t total_chars = 0;
+    cudaMemcpy(&total_chars, d_offsets.data() + total_rows,
+               sizeof(int32_t), cudaMemcpyDeviceToHost);
+    if (total_chars < 0) {
+      throw std::runtime_error(
+          "batched string decode: negative total_chars=" + std::to_string(total_chars));
+    }
+    alloc_chars = static_cast<size_t>(total_chars);
   }
 
-  int32_t total_chars = 0;
-  cudaMemcpy(&total_chars, d_offsets.data() + total_rows,
-             sizeof(int32_t), cudaMemcpyDeviceToHost);
-
-  SIRIUS_LOG_INFO(
-      "[batched_string] pass 1 done: {} rows, {} dict, {} fsst, {} uncomp segs, "
-      "{} unique blocks, total_chars={}",
-      total_rows, dict_descs.size(), fsst_descs.size(), uncomp_descs.size(),
-      block_map.size(), total_chars);
-
-  if (total_chars < 0) {
-    throw std::runtime_error(
-        "batched string decode: negative total_chars=" + std::to_string(total_chars) +
-        " — sentinel overflow or decode error");
-  }
-
-  //===--------------------------------------------------------------------===//
-  // Phase 6: Allocate exact chars buffer
-  //===--------------------------------------------------------------------===//
-
-  rmm::device_buffer d_chars(total_chars > 0 ? total_chars : 1, stream, mr);
+  rmm::device_buffer d_chars(alloc_chars > 0 ? alloc_chars : 1, stream, mr);
   auto* d_chars_ptr = static_cast<uint8_t*>(d_chars.data());
 
   //===--------------------------------------------------------------------===//
