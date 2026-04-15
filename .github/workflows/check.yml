@@ -114,3 +114,15 @@ jobs:
         run: |
           pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
           pixi run -e vcpkg cmake --build build/vcpkg-release
+
+  check:
+    runs-on: ubuntu-slim
+    needs: [lint, build]
+    if: always()
+    steps:
+      - name: All checks ok
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+      - name: Some checks failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1
