@@ -4,6 +4,7 @@
 #
 # Usage:
 #   ./doris/scripts/start-cluster.sh [NUM_BES]      # default: 2
+#   ./doris/scripts/start-cluster.sh --separate-physical-gpus  # pin each BE to its own GPU
 #   ./doris/scripts/start-cluster.sh --stop          # stop everything
 #   ./doris/scripts/start-cluster.sh --status        # show status
 #
@@ -80,19 +81,37 @@ show_status() {
 # Parse args
 NUM_BES=2
 EXTRA_BE_FLAGS=""
+SEPARATE_GPUS=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --stop)   stop_cluster; exit 0 ;;
         --status) show_status; exit 0 ;;
+        --separate-physical-gpus) SEPARATE_GPUS=true ;;
         --no-cpu-fallback|--nixl-only|--force-cpu) EXTRA_BE_FLAGS="$EXTRA_BE_FLAGS $1" ;;
         [0-9]*)   NUM_BES=$1 ;;
-        *)        echo "Usage: $0 [NUM_BES] [--stop|--status] [--no-cpu-fallback] [--nixl-only] [--force-cpu]"; exit 1 ;;
+        *)        echo "Usage: $0 [NUM_BES] [--stop|--status] [--separate-physical-gpus] [--no-cpu-fallback] [--nixl-only] [--force-cpu]"; exit 1 ;;
     esac
     shift
 done
 
+# ── Validate GPU count if --separate-physical-gpus ─────────────────────────
+if [ "$SEPARATE_GPUS" = true ]; then
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "ERROR: --separate-physical-gpus requires nvidia-smi but it's not in PATH"
+        exit 1
+    fi
+    NUM_GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+    if [ "$NUM_GPUS" -lt "$NUM_BES" ]; then
+        echo "ERROR: --separate-physical-gpus requires $NUM_BES GPUs but only $NUM_GPUS found"
+        nvidia-smi --query-gpu=index,name,memory.total --format=csv 2>/dev/null || true
+        exit 1
+    fi
+    echo "GPU pinning: $NUM_BES BEs → $NUM_BES separate physical GPUs (of $NUM_GPUS available)"
+fi
+
 echo "Starting cluster: 1 FE + $NUM_BES Sirius BEs"
 [ -n "$EXTRA_BE_FLAGS" ] && echo "    BE flags:$EXTRA_BE_FLAGS"
+[ "$SEPARATE_GPUS" = true ] && echo "    GPU mode: separate physical GPUs (CUDA_VISIBLE_DEVICES per BE)"
 echo ""
 
 # ── Step 1: Stop previous cluster ───────────────────────────────────────────
@@ -175,16 +194,27 @@ for n in $(seq 1 "$NUM_BES"); do
     host="127.0.0.$((n+1))"
     log_file="$LOG_DIR/be-$n.log"
 
-    echo "    BE $n: heartbeat=$hb_port brpc=$brpc_port host=$host log=$log_file"
-
-    # BE 1 uses default HOME, others use separate HOME to avoid lock conflicts
-    if [ "$n" -eq 1 ]; then
-        HOME_ENV=""
+    # Pin each BE to a separate physical GPU via CUDA_VISIBLE_DEVICES.
+    # With CUDA_VISIBLE_DEVICES=N, the process sees only physical GPU N
+    # remapped as device 0 — so the existing primary_ctx::retain(0) and
+    # cudaSetDevice(0) in the Rust code target the correct physical GPU.
+    gpu_idx=$((n-1))
+    if [ "$SEPARATE_GPUS" = true ]; then
+        echo "    BE $n: heartbeat=$hb_port brpc=$brpc_port host=$host gpu=$gpu_idx log=$log_file"
     else
-        HOME_ENV="HOME=$local_home"
+        echo "    BE $n: heartbeat=$hb_port brpc=$brpc_port host=$host log=$log_file"
     fi
 
-    env $HOME_ENV "$SIRIUS_BE" \
+    # BE 1 uses default HOME, others use separate HOME to avoid lock conflicts
+    BE_ENV_ARGS=""
+    if [ "$n" -gt 1 ]; then
+        BE_ENV_ARGS="HOME=$local_home"
+    fi
+    if [ "$SEPARATE_GPUS" = true ]; then
+        BE_ENV_ARGS="$BE_ENV_ARGS CUDA_VISIBLE_DEVICES=$gpu_idx"
+    fi
+
+    env $BE_ENV_ARGS "$SIRIUS_BE" \
         --heartbeat-port "$hb_port" \
         --be-port "$be_port" \
         --brpc-port "$brpc_port" \
