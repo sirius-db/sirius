@@ -307,7 +307,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
-    test/cpp/debug/test_debug_utils.cpp
+    test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
@@ -343,6 +343,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
+    test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
