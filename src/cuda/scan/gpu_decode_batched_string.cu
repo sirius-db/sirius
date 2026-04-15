@@ -524,7 +524,8 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     const std::unordered_map<int64_t, size_t>* device_blocks,
-    uint8_t* device_staging)
+    uint8_t* device_staging,
+    uint32_t* d_valid_count_out)
 {
   size_t total_rows = col_scan.data.total_rows;
   // Check for pre-existing CUDA errors
@@ -877,12 +878,20 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
 
     rmm::device_uvector<uint32_t> d_vc(1, stream, mr);
     cudaMemsetAsync(d_vc.data(), 0, sizeof(uint32_t), stream.value());
-    kernel_count_valid_bits_batched<<<1, 256, 0, stream.value()>>>(
-        d_mask, num_words, static_cast<uint32_t>(total_rows), d_vc.data());
-    stream.synchronize();
-    uint32_t vc;
-    cudaMemcpy(&vc, d_vc.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    null_count = static_cast<cudf::size_type>(total_rows - vc);
+    if (d_valid_count_out) {
+      // Deferred: write valid count to caller's slot, NO sync.
+      cudaMemsetAsync(d_valid_count_out, 0, sizeof(uint32_t), stream.value());
+      kernel_count_valid_bits_batched<<<1, 256, 0, stream.value()>>>(
+          d_mask, num_words, static_cast<uint32_t>(total_rows), d_valid_count_out);
+    } else {
+      // Legacy path: sync per column.
+      kernel_count_valid_bits_batched<<<1, 256, 0, stream.value()>>>(
+          d_mask, num_words, static_cast<uint32_t>(total_rows), d_vc.data());
+      stream.synchronize();
+      uint32_t vc;
+      cudaMemcpy(&vc, d_vc.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost);
+      null_count = static_cast<cudf::size_type>(total_rows - vc);
+    }
   }
 
   SIRIUS_LOG_INFO(

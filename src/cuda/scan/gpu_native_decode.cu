@@ -771,10 +771,13 @@ std::unique_ptr<cudf::table> gpu_decode_table(
 
 namespace {
 
+/// @param d_valid_count_out  If non-null, write valid bit count here (async)
+///        and skip stream.synchronize(). Caller must sync + compute null_count.
 std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
     column_scan_result& col_scan, const duckdb::LogicalType& type,
     const device_block_map& blocks, uint8_t* device_staging,
-    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr,
+    uint32_t* d_valid_count_out = nullptr)
 {
   auto cudf_type = to_cudf_type(type);
   auto physical_type = type.InternalType();
@@ -866,14 +869,23 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
       }
       vo += vs.row_count;
     }
-    uint32_t* d_vc; cudaMallocAsync(&d_vc, sizeof(uint32_t), stream.value());
-    cudaMemsetAsync(d_vc, 0, sizeof(uint32_t), stream.value());
-    kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
-        d_mask, num_words, static_cast<uint32_t>(total_rows), d_vc);
-    stream.synchronize();
-    uint32_t vc; cudaMemcpy(&vc, d_vc, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    cudaFreeAsync(d_vc, stream.value());
-    null_count = static_cast<cudf::size_type>(total_rows - vc);
+    if (d_valid_count_out) {
+      // Deferred: write valid count to caller's slot, NO sync.
+      cudaMemsetAsync(d_valid_count_out, 0, sizeof(uint32_t), stream.value());
+      kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
+          d_mask, num_words, static_cast<uint32_t>(total_rows), d_valid_count_out);
+      // Caller will sync once after all columns, then call set_null_count.
+    } else {
+      // Legacy path: sync per column.
+      uint32_t* d_vc; cudaMallocAsync(&d_vc, sizeof(uint32_t), stream.value());
+      cudaMemsetAsync(d_vc, 0, sizeof(uint32_t), stream.value());
+      kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
+          d_mask, num_words, static_cast<uint32_t>(total_rows), d_vc);
+      stream.synchronize();
+      uint32_t vc; cudaMemcpy(&vc, d_vc, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+      cudaFreeAsync(d_vc, stream.value());
+      null_count = static_cast<cudf::size_type>(total_rows - vc);
+    }
   }
   return std::make_unique<cudf::column>(cudf_type, static_cast<cudf::size_type>(total_rows),
       std::move(data_buf), std::move(null_mask), null_count);
@@ -1015,20 +1027,63 @@ std::unique_ptr<cudf::table> gpu_decode_table_pipelined(
     throw std::invalid_argument("gpu_decode_table_pipelined: size mismatch");
 
   auto* d_staging = static_cast<uint8_t*>(device_staging);
+  size_t num_cols = col_scans.size();
 
+  // Pre-allocate device slots for deferred null count readback.
+  // One slot per column with nulls — avoids N per-column syncs.
+  std::vector<size_t> null_col_indices;
+  for (size_t ci = 0; ci < num_cols; ++ci) {
+    if (col_scans[ci].has_nulls) null_col_indices.push_back(ci);
+  }
+  uint32_t* d_valid_counts = nullptr;
+  if (!null_col_indices.empty()) {
+    cudaMallocAsync(&d_valid_counts,
+                    null_col_indices.size() * sizeof(uint32_t), stream.value());
+  }
+
+  // Map column index → slot index in d_valid_counts
+  std::vector<int> col_to_slot(num_cols, -1);
+  for (size_t i = 0; i < null_col_indices.size(); ++i) {
+    col_to_slot[null_col_indices[i]] = static_cast<int>(i);
+  }
+
+  // Decode all columns — null count kernels launched but NOT synced.
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(col_scans.size());
+  columns.reserve(num_cols);
 
-  for (size_t ci = 0; ci < col_scans.size(); ++ci) {
+  for (size_t ci = 0; ci < num_cols; ++ci) {
+    uint32_t* nc_slot = (col_to_slot[ci] >= 0)
+                            ? d_valid_counts + col_to_slot[ci]
+                            : nullptr;
+
     if (col_types[ci].id() == duckdb::LogicalTypeId::VARCHAR)
       columns.push_back(decode_string_column_batched(
           col_scans[ci], stream, mr,
-          &blocks.offsets, static_cast<uint8_t*>(d_staging)));
+          &blocks.offsets, d_staging, nc_slot));
     else
-      columns.push_back(decode_fixed_width_column_from_device(col_scans[ci], col_types[ci], blocks, d_staging, stream, mr));
+      columns.push_back(decode_fixed_width_column_from_device(
+          col_scans[ci], col_types[ci], blocks, d_staging, stream, mr, nc_slot));
   }
 
+  // ONE sync for all columns — replaces N per-column syncs.
   stream.synchronize();
+
+  // Read back all valid counts and fix up null_count on each column.
+  if (!null_col_indices.empty()) {
+    std::vector<uint32_t> h_valid_counts(null_col_indices.size());
+    cudaMemcpy(h_valid_counts.data(), d_valid_counts,
+               null_col_indices.size() * sizeof(uint32_t),
+               cudaMemcpyDeviceToHost);
+    cudaFreeAsync(d_valid_counts, stream.value());
+
+    for (size_t i = 0; i < null_col_indices.size(); ++i) {
+      auto ci = null_col_indices[i];
+      auto total_rows = col_scans[ci].data.total_rows;
+      auto nc = static_cast<cudf::size_type>(total_rows - h_valid_counts[i]);
+      columns[ci]->set_null_count(nc);
+    }
+  }
+
   return std::make_unique<cudf::table>(std::move(columns));
 }
 

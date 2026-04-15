@@ -31,12 +31,14 @@ namespace sirius::cuda::scan {
 /// @param device_blocks   Optional: pre-transferred block map (from pipelined path).
 ///                        When non-null, blocks are read from device_staging instead of H2D.
 /// @param device_staging  Optional: device staging buffer (from pipelined path).
+/// @param d_valid_count_out  If non-null, write valid count here (async, no sync).
 /// @return cudf string column
 std::unique_ptr<cudf::column> decode_string_column_batched(
     sirius::op::scan::column_scan_result& col_scan,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     const std::unordered_map<int64_t, size_t>* device_blocks = nullptr,
-    uint8_t* device_staging = nullptr);
+    uint8_t* device_staging = nullptr,
+    uint32_t* d_valid_count_out = nullptr);
 
 }  // namespace sirius::cuda::scan
