@@ -23,39 +23,25 @@ namespace sirius::cuda::scan {
 //   [dict_end - dict_size .. dict_end]  dictionary data (strings, stored backwards)
 //===----------------------------------------------------------------------===//
 
-/// Step 1: Unpack bitpacked selection indices.
-/// Each thread unpacks one index from the selection buffer.
-__global__ void kernel_unpack_sel_indices(
-    const uint32_t* __restrict__ d_sel_buffer,  // Packed selection data
-    uint32_t* __restrict__ d_indices,            // Output: unpacked indices
+/// Fused step 1+2: Unpack bitpacked selection indices AND compute string
+/// lengths in a single pass.  Saves one kernel launch per segment (~17μs each)
+/// by combining what was previously two separate kernels.
+/// Each thread unpacks its index, writes it (needed by gather), and immediately
+/// looks up the string length from the index buffer.
+__global__ void kernel_unpack_and_compute_lengths(
+    const uint32_t* __restrict__ d_sel_buffer,    // Packed selection data
+    const uint32_t* __restrict__ d_index_buffer,  // Dictionary index buffer
+    uint32_t* __restrict__ d_indices,             // Output: unpacked indices (for gather)
+    uint32_t* __restrict__ d_lengths,             // Output: string lengths
     uint32_t num_rows,
     uint32_t width)
 {
   uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= num_rows) return;
 
-  // Standard horizontal bitpacking extraction (same as fastpforlib)
-  d_indices[tid] = unpack_value<uint32_t>(d_sel_buffer, tid, width);
-}
-
-/// Step 2: Compute string lengths from index buffer lookups.
-/// lengths[i] = index_buf[indices[i]] - index_buf[indices[i] - 1]
-/// Index 0 is null/empty (length 0).
-__global__ void kernel_compute_string_lengths(
-    const uint32_t* __restrict__ d_indices,      // Unpacked selection indices
-    const uint32_t* __restrict__ d_index_buffer,  // Dictionary index buffer
-    uint32_t* __restrict__ d_lengths,             // Output: string lengths
-    uint32_t num_rows)
-{
-  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= num_rows) return;
-
-  uint32_t sel = d_indices[tid];
-  if (sel == 0) {
-    d_lengths[tid] = 0;  // null/empty
-  } else {
-    d_lengths[tid] = d_index_buffer[sel] - d_index_buffer[sel - 1];
-  }
+  uint32_t sel = unpack_value<uint32_t>(d_sel_buffer, tid, width);
+  d_indices[tid] = sel;
+  d_lengths[tid] = (sel == 0) ? 0 : (d_index_buffer[sel] - d_index_buffer[sel - 1]);
 }
 
 /// Step 3: Gather string bytes from dictionary into contiguous output buffer.
@@ -176,18 +162,15 @@ void gpu_decode_dictionary(
     cudaMallocAsync(&d_lengths, row_count * sizeof(uint32_t), stream.value());
   }
 
-  // 3. Unpack selection indices
+  // 3+4. Fused: unpack selection indices AND compute string lengths in one pass
   constexpr uint32_t THREADS = 256;
   uint32_t blocks = (row_count + THREADS - 1) / THREADS;
 
   const uint32_t* d_sel_buf = reinterpret_cast<const uint32_t*>(d_segment + sel_buf_offset);
-  kernel_unpack_sel_indices<<<blocks, THREADS, 0, stream.value()>>>(
-      d_sel_buf, d_indices, row_count, header.bitpacking_width);
-
-  // 4. Compute string lengths
   const uint32_t* d_idx_buf = reinterpret_cast<const uint32_t*>(d_segment + idx_buf_offset);
-  kernel_compute_string_lengths<<<blocks, THREADS, 0, stream.value()>>>(
-      d_indices, d_idx_buf, d_lengths, row_count);
+  kernel_unpack_and_compute_lengths<<<blocks, THREADS, 0, stream.value()>>>(
+      d_sel_buf, d_idx_buf, d_indices, d_lengths, row_count,
+      header.bitpacking_width);
 
   // 5. Exclusive prefix sum of lengths -> offsets (using CUB)
   if (own_temp) {

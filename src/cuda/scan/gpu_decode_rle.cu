@@ -41,7 +41,13 @@ rle_upper_bound(const uint32_t* __restrict__ cumsum, uint32_t n, uint32_t key)
 
 //===----------------------------------------------------------------------===//
 // Device: expand kernel — one thread per output row
+// Loads cumsum into shared memory when it fits (entry_count <= 4096),
+// eliminating L2 cache pressure from 256 threads all binary-searching
+// the same global memory array.
 //===----------------------------------------------------------------------===//
+
+/// Max RLE entries that fit in shared memory (4096 × 4B = 16KB).
+static constexpr uint32_t RLE_SMEM_MAX_ENTRIES = 4096;
 
 template <typename T>
 __global__ void kernel_rle_expand(
@@ -51,10 +57,21 @@ __global__ void kernel_rle_expand(
     T* __restrict__              output,
     uint32_t                     row_count)
 {
+  // Load cumsum into shared memory for cache-friendly binary search
+  __shared__ uint32_t s_cumsum[RLE_SMEM_MAX_ENTRIES];
+  const bool use_smem = (entry_count <= RLE_SMEM_MAX_ENTRIES);
+  if (use_smem) {
+    for (uint32_t i = threadIdx.x; i < entry_count; i += blockDim.x) {
+      s_cumsum[i] = cumsum[i];
+    }
+    __syncthreads();
+  }
+
   uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= row_count) return;
 
-  uint32_t entry = rle_upper_bound(cumsum, entry_count, idx);
+  const uint32_t* search = use_smem ? s_cumsum : cumsum;
+  uint32_t entry = rle_upper_bound(search, entry_count, idx);
   output[idx] = values[entry];
 }
 
@@ -71,7 +88,9 @@ void gpu_decode_rle(
     void*          d_output,
     rmm::cuda_stream_view stream,
     void*          d_scratch,
-    bool           skip_block_copy)
+    bool           skip_block_copy,
+    uint32_t*      d_cumsum_scratch,
+    size_t         cumsum_scratch_capacity)
 {
   if (row_count == 0) return;
 
@@ -111,10 +130,16 @@ void gpu_decode_rle(
     owns_block = true;
   }
 
-  // ---- GPU: H2D prefix sums ---------------------------------------------
+  // ---- GPU: H2D prefix sums (reuse scratch if provided) -----------------
   uint32_t* d_cumsum;
   size_t cumsum_bytes = entry_count * sizeof(uint32_t);
-  cudaMallocAsync(&d_cumsum, cumsum_bytes, stream.value());
+  bool owns_cumsum = false;
+  if (d_cumsum_scratch && cumsum_bytes <= cumsum_scratch_capacity) {
+    d_cumsum = d_cumsum_scratch;
+  } else {
+    cudaMallocAsync(&d_cumsum, cumsum_bytes, stream.value());
+    owns_cumsum = true;
+  }
   cudaMemcpyAsync(d_cumsum, h_cumsum.data(), cumsum_bytes,
                    cudaMemcpyHostToDevice, stream.value());
 
@@ -153,14 +178,14 @@ void gpu_decode_rle(
           static_cast<ulonglong2*>(d_output), row_count);
       break;
     default:
-      cudaFreeAsync(d_cumsum, stream.value());
+      if (owns_cumsum) cudaFreeAsync(d_cumsum, stream.value());
       if (owns_block) cudaFreeAsync(d_block, stream.value());
       throw std::runtime_error(
           "gpu_decode_rle: unsupported type_size " + std::to_string(type_size));
   }
 
   // ---- Cleanup ----------------------------------------------------------
-  cudaFreeAsync(d_cumsum, stream.value());
+  if (owns_cumsum) cudaFreeAsync(d_cumsum, stream.value());
   if (owns_block) cudaFreeAsync(d_block, stream.value());
 }
 

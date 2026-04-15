@@ -136,6 +136,41 @@ __global__ void kernel_fill_valid(uint64_t* mask, uint32_t num_words)
   if (idx < num_words) { mask[idx] = ~0ULL; }
 }
 
+/// Count valid (set) bits in a validity mask entirely on GPU.
+/// Single block of 256 threads — each thread popcounts its share of words,
+/// then a shared-memory tree reduction produces the total.
+/// Replaces: sync + full mask D2H + CPU popcountll loop.
+__global__ void kernel_count_valid_bits(
+    const uint64_t* __restrict__ mask,
+    uint32_t num_words,
+    uint32_t total_rows,
+    uint32_t* __restrict__ d_valid_count)
+{
+  __shared__ uint32_t s_counts[256];
+
+  uint32_t valid = 0;
+  for (uint32_t i = threadIdx.x; i < num_words; i += blockDim.x) {
+    uint64_t word = mask[i];
+    // Mask off padding bits in the last word
+    if (i == num_words - 1) {
+      uint32_t tail = total_rows & 63;
+      if (tail > 0) word &= (1ULL << tail) - 1;
+    }
+    valid += __popcll(word);
+  }
+
+  s_counts[threadIdx.x] = valid;
+  __syncthreads();
+
+  // Tree reduction
+  for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) s_counts[threadIdx.x] += s_counts[threadIdx.x + s];
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) *d_valid_count = s_counts[0];
+}
+
 constexpr size_t DUCKDB_BLOCK_SIZE = 262144;  // 256KB
 
 //===----------------------------------------------------------------------===//
@@ -162,6 +197,21 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
   // Allocate output data buffer on GPU
   rmm::device_buffer data_buf(total_rows * type_size, stream, mr);
   auto* d_output = static_cast<uint8_t*>(data_buf.data());
+
+  // Pre-allocate RLE cumsum scratch buffer (reused across segments).
+  // 4096 entries covers typical RLE segments; larger ones fall back to alloc.
+  constexpr size_t RLE_CUMSUM_CAPACITY = 4096 * sizeof(uint32_t);
+  uint32_t* d_rle_cumsum = nullptr;
+  bool has_rle = false;
+  for (auto const& seg : col_scan.data.segments) {
+    if (seg.compression == duckdb::CompressionType::COMPRESSION_RLE) {
+      has_rle = true;
+      break;
+    }
+  }
+  if (has_rle) {
+    cudaMallocAsync(&d_rle_cumsum, RLE_CUMSUM_CAPACITY, stream.value());
+  }
 
   size_t row_offset = 0;
   size_t gpu_decoded_segs = 0;
@@ -250,7 +300,8 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
             type_size,
             d_dest, stream,
             d_scratch,
-            block_cached);
+            block_cached,
+            d_rle_cumsum, RLE_CUMSUM_CAPACITY);
         gpu_decoded_segs++;
         break;
       }
@@ -264,6 +315,11 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
     }
 
     row_offset += seg.row_count;
+  }
+
+  // Free RLE cumsum scratch
+  if (d_rle_cumsum) {
+    cudaFreeAsync(d_rle_cumsum, stream.value());
   }
 
   // Decode validity
@@ -314,24 +370,17 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
       val_row_offset += vseg.row_count;
     }
 
-    // Count nulls: sync and count on host (for column metadata).
-    // Mask off tail bits beyond total_rows in the last word to avoid
-    // counting padding bits as valid.
+    // Count nulls on GPU — avoids copying the entire mask to host.
+    uint32_t* d_valid_count;
+    cudaMallocAsync(&d_valid_count, sizeof(uint32_t), stream.value());
+    cudaMemsetAsync(d_valid_count, 0, sizeof(uint32_t), stream.value());
+    kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
+        d_mask, num_words, static_cast<uint32_t>(total_rows), d_valid_count);
     stream.synchronize();
-    std::vector<uint64_t> host_mask_copy(num_words);
-    cudaMemcpy(host_mask_copy.data(), d_mask, num_words * sizeof(uint64_t),
+    uint32_t valid_count;
+    cudaMemcpy(&valid_count, d_valid_count, sizeof(uint32_t),
                cudaMemcpyDeviceToHost);
-
-    size_t tail_bits = total_rows % 64;
-    if (tail_bits > 0 && num_words > 0) {
-      uint64_t tail_mask = (1ULL << tail_bits) - 1;
-      host_mask_copy[num_words - 1] &= tail_mask;
-    }
-
-    size_t valid_count = 0;
-    for (uint32_t w = 0; w < num_words; ++w) {
-      valid_count += __builtin_popcountll(host_mask_copy[w]);
-    }
+    cudaFreeAsync(d_valid_count, stream.value());
     null_count = static_cast<cudf::size_type>(total_rows - valid_count);
   }
 
@@ -602,21 +651,17 @@ std::unique_ptr<cudf::column> decode_string_column(
       val_row_offset += vseg.row_count;
     }
 
+    // Count nulls on GPU
+    uint32_t* d_valid_count;
+    cudaMallocAsync(&d_valid_count, sizeof(uint32_t), stream.value());
+    cudaMemsetAsync(d_valid_count, 0, sizeof(uint32_t), stream.value());
+    kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
+        d_mask, num_words, static_cast<uint32_t>(total_rows), d_valid_count);
     stream.synchronize();
-    std::vector<uint64_t> host_mask(num_words);
-    cudaMemcpy(host_mask.data(), d_mask, num_words * sizeof(uint64_t),
+    uint32_t valid_count;
+    cudaMemcpy(&valid_count, d_valid_count, sizeof(uint32_t),
                cudaMemcpyDeviceToHost);
-
-    size_t tail_bits = total_rows % 64;
-    if (tail_bits > 0 && num_words > 0) {
-      uint64_t tail_bitmask = (1ULL << tail_bits) - 1;
-      host_mask[num_words - 1] &= tail_bitmask;
-    }
-
-    size_t valid_count = 0;
-    for (uint32_t w = 0; w < num_words; ++w) {
-      valid_count += __builtin_popcountll(host_mask[w]);
-    }
+    cudaFreeAsync(d_valid_count, stream.value());
     null_count = static_cast<cudf::size_type>(total_rows - valid_count);
   }
 
@@ -741,6 +786,17 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
   auto* d_output = static_cast<uint8_t*>(data_buf.data());
   size_t row_offset = 0;
 
+  // Pre-allocate RLE cumsum scratch (reused across segments)
+  constexpr size_t RLE_CUMSUM_CAP = 4096 * sizeof(uint32_t);
+  uint32_t* d_rle_cumsum = nullptr;
+  bool has_rle = false;
+  for (auto const& seg : col_scan.data.segments) {
+    if (seg.compression == duckdb::CompressionType::COMPRESSION_RLE) {
+      has_rle = true; break;
+    }
+  }
+  if (has_rle) cudaMallocAsync(&d_rle_cumsum, RLE_CUMSUM_CAP, stream.value());
+
   for (auto& seg : col_scan.data.segments) {
     if (seg.row_count == 0) { row_offset += seg.row_count; continue; }
     if (!seg.persistent || (!seg.data_ptr
@@ -780,13 +836,16 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
         void* d_block = (it != blocks.offsets.end()) ? static_cast<void*>(device_staging + it->second) : nullptr;
         gpu_decode_rle(seg.data_ptr - seg.block_offset, DUCKDB_BLOCK_SIZE,
             seg.block_offset, seg.row_count, type_size,
-            d_dest, stream, d_block ? d_block : nullptr, d_block != nullptr);
+            d_dest, stream, d_block ? d_block : nullptr, d_block != nullptr,
+            d_rle_cumsum, RLE_CUMSUM_CAP);
         break;
       }
       default: throw std::runtime_error("unsupported compression in pipelined decode");
     }
     row_offset += seg.row_count;
   }
+
+  if (d_rle_cumsum) cudaFreeAsync(d_rle_cumsum, stream.value());
 
   // Validity
   rmm::device_buffer null_mask{}; cudf::size_type null_count = 0;
@@ -806,12 +865,14 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
       }
       vo += vs.row_count;
     }
+    uint32_t* d_vc; cudaMallocAsync(&d_vc, sizeof(uint32_t), stream.value());
+    cudaMemsetAsync(d_vc, 0, sizeof(uint32_t), stream.value());
+    kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
+        d_mask, num_words, static_cast<uint32_t>(total_rows), d_vc);
     stream.synchronize();
-    std::vector<uint64_t> hm(num_words);
-    cudaMemcpy(hm.data(), d_mask, num_words*8, cudaMemcpyDeviceToHost);
-    size_t tb = total_rows%64; if (tb>0 && num_words>0) hm[num_words-1] &= (1ULL<<tb)-1;
-    size_t vc = 0; for (uint32_t w=0; w<num_words; ++w) vc += __builtin_popcountll(hm[w]);
-    null_count = static_cast<cudf::size_type>(total_rows-vc);
+    uint32_t vc; cudaMemcpy(&vc, d_vc, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaFreeAsync(d_vc, stream.value());
+    null_count = static_cast<cudf::size_type>(total_rows - vc);
   }
   return std::make_unique<cudf::column>(cudf_type, static_cast<cudf::size_type>(total_rows),
       std::move(data_buf), std::move(null_mask), null_count);
@@ -923,11 +984,14 @@ std::unique_ptr<cudf::column> decode_string_column_from_device(
       }
       vo += vs.row_count;
     }
+    uint32_t* d_vc; cudaMallocAsync(&d_vc, sizeof(uint32_t), stream.value());
+    cudaMemsetAsync(d_vc, 0, sizeof(uint32_t), stream.value());
+    kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
+        dm, nw, static_cast<uint32_t>(total_rows), d_vc);
     stream.synchronize();
-    std::vector<uint64_t> hm(nw); cudaMemcpy(hm.data(), dm, nw*8, cudaMemcpyDeviceToHost);
-    size_t tb = total_rows%64; if (tb>0 && nw>0) hm[nw-1] &= (1ULL<<tb)-1;
-    size_t vc = 0; for (uint32_t w=0;w<nw;++w) vc += __builtin_popcountll(hm[w]);
-    null_count = static_cast<cudf::size_type>(total_rows-vc);
+    uint32_t vc; cudaMemcpy(&vc, d_vc, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaFreeAsync(d_vc, stream.value());
+    null_count = static_cast<cudf::size_type>(total_rows - vc);
   }
   return cudf::make_strings_column(static_cast<cudf::size_type>(total_rows), std::move(offsets_col), std::move(d_chars), null_count, std::move(null_mask));
 }

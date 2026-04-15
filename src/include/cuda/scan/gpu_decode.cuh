@@ -217,7 +217,9 @@ void gpu_decode_rle(
     void* d_output,
     rmm::cuda_stream_view stream,
     void* d_scratch = nullptr,
-    bool skip_block_copy = false);
+    bool skip_block_copy = false,
+    uint32_t* d_cumsum_scratch = nullptr,
+    size_t cumsum_scratch_capacity = 0);
 
 //===----------------------------------------------------------------------===//
 // Host-side API: decode an FSST-compressed string segment on GPU
