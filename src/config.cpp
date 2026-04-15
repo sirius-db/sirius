@@ -21,7 +21,8 @@ namespace duckdb {
 bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
 bool Config::USE_PIN_MEM_FOR_CACHING        = false;
 
-bool Config::USE_CUDF_EXPR = true;
+bool Config::USE_CUDF_EXPR                       = true;
+std::string Config::EXPRESSION_EXECUTOR_STRATEGY = "ast_interpret";
 
 bool Config::USE_CUSTOM_TOP_N = true;
 
