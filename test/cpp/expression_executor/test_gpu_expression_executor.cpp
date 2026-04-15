@@ -1686,7 +1686,8 @@ TEMPLATE_TEST_CASE("experimental select COMPARE_NOT_DISTINCT_FROM",
   auto* space             = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  // Actual values: {10, NULL, 30, NULL, 50} — nulls must be distinct from 30
+  // Input: {10, NULL, 30, NULL, 50}. Under null-safe equality NULL ≠ 30, so only
+  // the real 30 matches NOT_DISTINCT_FROM; the two NULLs are filtered out.
   std::vector<int32_t> values = {10, 99, 30, 99, 50};
   std::vector<bool> valids    = {true, false, true, false, true};
   auto input                  = make_int32_batch_with_nulls(*space, values, valids);
@@ -1714,7 +1715,8 @@ TEMPLATE_TEST_CASE("experimental select COMPARE_DISTINCT_FROM",
   auto* space             = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  // Actual values: {10, NULL, 30, NULL, 50} — nulls must be distinct from 30
+  // Input: {10, NULL, 30, NULL, 50}. Under null-safe equality NULL ≠ 30, so
+  // everything except the real 30 matches DISTINCT_FROM — both NULLs pass through.
   std::vector<int32_t> values = {10, 99, 30, 99, 50};
   std::vector<bool> valids    = {true, false, true, false, true};
   auto input                  = make_int32_batch_with_nulls(*space, values, valids);
