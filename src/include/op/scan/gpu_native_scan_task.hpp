@@ -8,7 +8,6 @@
 #include <config.hpp>
 #include <data/data_batch_utils.hpp>
 #include <op/scan/direct_block_scan.hpp>
-#include <op/scan/scan_ring_buffer.hpp>
 #include <op/sirius_physical_duckdb_scan.hpp>
 #include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
@@ -19,8 +18,6 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-#include <rmm/cuda_stream.hpp>
-
 #include <duckdb/common/types.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/data_table.hpp>
@@ -29,8 +26,6 @@
 
 #include <atomic>
 #include <cstddef>
-#include <memory>
-#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -99,21 +94,6 @@ class gpu_native_scan_global_state : public pipeline::sirius_pipeline_task_globa
   /// @brief Output consumers for downstream scheduling.
   [[nodiscard]] std::vector<sirius_physical_operator*> get_output_consumers() const noexcept;
 
-  /// @brief Whether H2D/compute pipelining is enabled for this scan.
-  [[nodiscard]] bool pipeline_enabled() const noexcept { return pipeline_chunk_rgs_ > 0; }
-
-  /// @brief Row groups per pipeline chunk (0 = disabled).
-  [[nodiscard]] size_t pipeline_chunk_rgs() const noexcept { return pipeline_chunk_rgs_; }
-
-  /// @brief Ring buffer for H2D staging (shared across tasks, mutex-protected).
-  [[nodiscard]] scan_ring_buffer& ring_buffer() { return *ring_buffer_; }
-
-  /// @brief Dedicated CUDA stream for H2D copies (separate from compute stream).
-  [[nodiscard]] rmm::cuda_stream_view copy_stream() { return copy_stream_->view(); }
-
-  /// @brief Mutex for serializing ring buffer access across concurrent tasks.
-  std::mutex& pipeline_mutex() { return pipeline_mutex_; }
-
  private:
   /// @brief Walk all segments: verify GPU-decodable + measure decoded size per row group.
   /// Sets viable_ and fills rg_decoded_bytes_.
@@ -128,9 +108,6 @@ class gpu_native_scan_global_state : public pipeline::sirius_pipeline_task_globa
 
   /// @brief Compute row_groups_per_batch_ from decoded_bytes_per_rg_ vs config batch size.
   void compute_batch_size();
-
-  /// @brief Initialize ring buffer + copy stream for H2D/compute overlap.
-  void initialize_pipeline();
 
   // --- Fields ---
   duckdb::DataTable* storage_;
@@ -152,12 +129,6 @@ class gpu_native_scan_global_state : public pipeline::sirius_pipeline_task_globa
 
   // GPU memory
   cucascade::memory::memory_space* gpu_space_ = nullptr;
-
-  // Pipeline: H2D/compute overlap via dual CUDA streams + ring buffer
-  std::unique_ptr<scan_ring_buffer> ring_buffer_;
-  std::unique_ptr<rmm::cuda_stream> copy_stream_;
-  std::mutex pipeline_mutex_;
-  size_t pipeline_chunk_rgs_ = 0;  // 0 = pipeline disabled
 
   // Lifecycle
   std::atomic<int64_t> active_tasks_{0};
