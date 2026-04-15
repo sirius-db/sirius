@@ -21,6 +21,7 @@
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
@@ -50,9 +51,7 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   rmm::device_async_resource_ref memory_resource)
 {
   if (limit == 0 || input.num_rows() == 0) { return duckdb::make_empty_like(input); }
-  if (orders.empty()) {
-    throw duckdb::InternalException("TopN requires at least one ordering key");
-  }
+  if (orders.empty()) { throw internal_exception("TopN requires at least one ordering key"); }
 
   auto const keep_rows =
     std::min<cudf::size_type>(input.num_rows(), static_cast<cudf::size_type>(offset + limit));
@@ -62,12 +61,12 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   if (orders.size() == 1) {
     auto const& ord = orders[0];
     if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw duckdb::NotImplementedException("TopN only supports bound reference expressions");
+      throw not_implemented_exception("TopN only supports bound reference expressions");
     }
     auto const idx =
       static_cast<cudf::size_type>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     if (idx < 0 || idx >= input.num_columns()) {
-      throw duckdb::InternalException("TopN order index out of range");
+      throw internal_exception("TopN order index out of range");
     }
 
     auto order =
@@ -96,12 +95,12 @@ std::unique_ptr<cudf::table> compute_top_n_table(
 
     for (auto const& ord : orders) {
       if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-        throw duckdb::NotImplementedException("TopN only supports bound reference expressions");
+        throw not_implemented_exception("TopN only supports bound reference expressions");
       }
       auto const idx = static_cast<cudf::size_type>(
         ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
       if (idx < 0 || idx >= input.num_columns()) {
-        throw duckdb::InternalException("TopN order index out of range");
+        throw internal_exception("TopN order index out of range");
       }
       key_views.push_back(input.column(idx));
       key_orders.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
@@ -161,7 +160,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
   for (auto const& batch : input_batches) {
     if (batch) {
       if (input_batch) {
-        throw duckdb::InternalException("TopN expects a single input batch per execution");
+        throw internal_exception("TopN expects a single input batch per execution");
       }
       input_batch = batch;
     }

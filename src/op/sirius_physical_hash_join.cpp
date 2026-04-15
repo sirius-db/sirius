@@ -30,8 +30,10 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "expression_executor/gpu_expression_translator.hpp"
+#include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -315,9 +317,6 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
                                                      sirius_physical_operator& op,
                                                      bool build_rhs)
 {
-  op.op_state.reset();
-  op.sink_state.reset();
-
   auto& state = meta_pipeline.get_state();
   state.add_pipeline_operator(current, op);
 
@@ -350,11 +349,11 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
 
   switch (op.type) {
     case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
-      throw duckdb::NotImplementedException("POSITIONAL_JOIN is not implemented yet");
+      throw not_implemented_exception("POSITIONAL_JOIN is not implemented yet");
       meta_pipeline.create_child_pipeline(current, op, last_pipeline);
       return;
     case SiriusPhysicalOperatorType::CROSS_PRODUCT:
-      throw duckdb::NotImplementedException("CROSS_PRODUCT is not implemented yet");
+      throw not_implemented_exception("CROSS_PRODUCT is not implemented yet");
       return;
     default: break;
   }

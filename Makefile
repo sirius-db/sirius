@@ -20,6 +20,7 @@ TEST_PATH_RELWITHDEBINFO ?= build/relwithdebinfo/test/unittest
 TEST_BUILD_TARGET ?= unittest
 
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
+	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug clean list-presets
@@ -60,6 +61,9 @@ relwithdebinfo: build/relwithdebinfo/build.ninja
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
 endif
+
+legacy-release: build/legacy-release/build.ninja
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset legacy-release
 
 clang-release: build/clang-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release
