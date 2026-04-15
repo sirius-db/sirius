@@ -151,7 +151,7 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
 TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk]")
 {
   // After a GPU->DISK->GPU round-trip the batch must still have the expected column count,
-  // column type, and row count. This validates data integrity through the pipeline backend.
+  // column type, row count, and actual cell values.
   auto [mgr, tmp_dir] = make_test_memory_manager_with_disk();
 
   auto* gpu_space  = get_space(*mgr, cucascade::memory::Tier::GPU);
@@ -166,7 +166,14 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
   auto batch            = make_gpu_batch(*gpu_space, num_rows);
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  // Record size before round-trip
+  // Snapshot column values before round-trip
+  auto table_before = sirius::get_cudf_table_view(*batch);
+  std::vector<int32_t> values_before(static_cast<size_t>(table_before.num_rows()));
+  cudaMemcpy(values_before.data(),
+             table_before.column(0).data<int32_t>(),
+             sizeof(int32_t) * values_before.size(),
+             cudaMemcpyDeviceToHost);
+
   const size_t size_before = batch->get_data()->get_size_in_bytes();
   REQUIRE(size_before > 0);
 
@@ -184,11 +191,19 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
   batch->try_to_release_in_transit();
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  // Verify data integrity: correct number of columns, correct column type, correct row count
-  auto table_view = sirius::get_cudf_table_view(*batch);
-  REQUIRE(table_view.num_columns() == 1);
-  REQUIRE(table_view.column(0).type() == cudf::data_type{cudf::type_id::INT32});
-  REQUIRE(static_cast<size_t>(table_view.num_rows()) == num_rows);
+  // Verify schema and shape
+  auto table_after = sirius::get_cudf_table_view(*batch);
+  REQUIRE(table_after.num_columns() == 1);
+  REQUIRE(table_after.column(0).type() == cudf::data_type{cudf::type_id::INT32});
+  REQUIRE(static_cast<size_t>(table_after.num_rows()) == num_rows);
+
+  // Verify actual cell values match
+  std::vector<int32_t> values_after(static_cast<size_t>(table_after.num_rows()));
+  cudaMemcpy(values_after.data(),
+             table_after.column(0).data<int32_t>(),
+             sizeof(int32_t) * values_after.size(),
+             cudaMemcpyDeviceToHost);
+  REQUIRE(values_before == values_after);
 
   // Size should be unchanged (same data, same GPU format)
   const size_t size_after = batch->get_data()->get_size_in_bytes();

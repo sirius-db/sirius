@@ -23,9 +23,35 @@
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 namespace sirius {
 namespace parallel {
+
+namespace {
+
+/// Non-blocking probe: try HOST spaces, then DISK spaces.
+/// Returns a reservation + the memory_space it came from, or nullptrs if nothing is available.
+std::pair<std::unique_ptr<cucascade::memory::reservation>, cucascade::memory::memory_space*>
+try_reserve_host_or_disk(sirius::memory::sirius_memory_reservation_manager& mgr, size_t size)
+{
+  // Try HOST tier first
+  for (auto* space : mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+    auto* ms  = const_cast<cucascade::memory::memory_space*>(space);
+    auto  res = ms->make_reservation_or_null(size);
+    if (res) { return {std::move(res), ms}; }
+  }
+  // Fall back to DISK tier
+  for (auto* space : mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK)) {
+    auto* ms  = const_cast<cucascade::memory::memory_space*>(space);
+    auto  res = ms->make_reservation_or_null(size);
+    if (res) { return {std::move(res), ms}; }
+  }
+  return {nullptr, nullptr};
+}
+
+}  // namespace
 
 bool downgrade_task::execute(rmm::cuda_stream_view stream)
 {
@@ -48,25 +74,19 @@ bool downgrade_task::execute(rmm::cuda_stream_view stream)
   }
 
   try {
-    auto data_size   = batch->get_data()->get_size_in_bytes();
-    // DG-01: Try HOST first, fall back to DISK
-    auto reservation = res_mgr.request_reservation(
-      cucascade::memory::any_memory_space_in_tiers{
-        {cucascade::memory::Tier::HOST, cucascade::memory::Tier::DISK}},
-      data_size);
-    if (\!reservation) {
+    auto data_size = batch->get_data()->get_size_in_bytes();
+
+    // Non-blocking probe: try HOST first, then DISK.
+    // We must not call request_reservation() here because it blocks forever
+    // when no candidate can satisfy the request, which would park the
+    // downgrade worker and deadlock GPU memory-pressure handling.
+    auto [reservation, mem_space] = try_reserve_host_or_disk(res_mgr, data_size);
+    if (!reservation) {
       batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
       return false;
     }
 
-    // Reservation identifies a memory_space (tier + device). Fetch its default allocator.
-    auto mem_space = res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
-    if (\!mem_space) {
-      batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-      return false;
-    }
-
-    // DG-02 + DG-03: Select representation type based on granted tier
+    // Select representation type based on granted tier
     auto& converter_registry = sirius::converter_registry::get();
     if (reservation->tier() == cucascade::memory::Tier::DISK) {
       SIRIUS_LOG_INFO(
