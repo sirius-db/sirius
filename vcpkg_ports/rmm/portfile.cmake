@@ -101,11 +101,8 @@ vcpkg_cmake_config_fixup(PACKAGE_NAME rmm CONFIG_PATH lib/cmake/rmm)
 # loadable extension alongside libcudart_static.a. Rewrite the exported target
 # to prefer the static CUDA runtime for vcpkg consumers.
 file(READ "${CURRENT_PACKAGES_DIR}/share/rmm/rmm-targets.cmake" _rmm_targets)
-string(
-  REGEX REPLACE "CUDA::cudart([;\">])"
-                "CUDA::cudart_static\\1"
-                _rmm_targets
-                "${_rmm_targets}")
+string(REGEX REPLACE "CUDA::cudart([;\">])" "CUDA::cudart_static\\1"
+                     _rmm_targets "${_rmm_targets}")
 file(WRITE "${CURRENT_PACKAGES_DIR}/share/rmm/rmm-targets.cmake"
      "${_rmm_targets}")
 

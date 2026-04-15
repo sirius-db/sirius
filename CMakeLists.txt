@@ -106,18 +106,18 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
 
       set(_patched_libs "${_libs}")
       list(TRANSFORM _patched_libs REPLACE "^CUDA::cudart$"
-                   "CUDA::cudart_static")
+                                           "CUDA::cudart_static")
       list(TRANSFORM _patched_libs REPLACE "^\\$<LINK_ONLY:CUDA::cudart>$"
-                   "$<LINK_ONLY:CUDA::cudart_static>")
+                                           "$<LINK_ONLY:CUDA::cudart_static>")
 
       if(NOT _patched_libs STREQUAL _libs)
         set_target_properties("${target_name}" PROPERTIES "${_prop}"
-                                                         "${_patched_libs}")
+                                                          "${_patched_libs}")
       endif()
     endforeach()
 
     set_target_properties("${target_name}" PROPERTIES CUDA_RUNTIME_LIBRARY
-                                                         Static)
+                                                      Static)
   endfunction()
 
   foreach(_target cucascade_objects cucascade_static cucascade_shared)
