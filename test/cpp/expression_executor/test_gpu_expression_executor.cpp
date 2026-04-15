@@ -280,6 +280,37 @@ TEST_CASE("gpu_expression_executor execute(data_batch) handles constants and com
   REQUIRE(output_col2 == expected_bool);
 }
 
+TEST_CASE("gpu_expression_executor execute(data_batch) handles tinyint constants",
+          "[expression_executor]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32}};
+  std::vector<std::optional<std::pair<int, int>>> ranges = {
+    std::optional<std::pair<int, int>>{std::pair<int, int>{0, 9}}};
+
+  auto input_batch = make_input_batch(*space, column_types, ranges);
+
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
+  exprs.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::TINYINT(1)));
+
+  GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
+  auto output_batch = executor.execute(input_batch, cudf::get_default_stream());
+
+  REQUIRE(output_batch != nullptr);
+
+  auto& output_repr = output_batch->get_data()->cast<gpu_table_representation>();
+  auto output_view  = output_repr.get_table().view();
+
+  REQUIRE(output_view.num_columns() == 1);
+  REQUIRE(output_view.num_rows() == 10);
+
+  std::vector<int8_t> expected(output_view.num_rows(), static_cast<int8_t>(1));
+  auto output_col0 = copy_column_to_host<int8_t>(output_view.column(0));
+  REQUIRE(output_col0 == expected);
+}
+
 TEST_CASE("gpu_expression_executor select(data_batch) filters rows", "[expression_executor]")
 {
   auto* space = get_default_gpu_space();

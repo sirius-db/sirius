@@ -1154,6 +1154,139 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_translate_expr_in_context_preserves_duplicate_join_side_columns() {
+        let desc_tbl = make_desc_table(
+            vec![(3, None), (1, None)],
+            vec![
+                (16, 3, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (17, 3, 1, "n_name", TPrimitiveType::VARCHAR),
+                (4, 1, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (5, 1, 1, "n_name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        let expr = binary_pred_expr(
+            TExprOpcode::EQ,
+            slot_ref_expr_in_tuple(17, 3, type_desc(TPrimitiveType::VARCHAR)),
+            slot_ref_expr_in_tuple(5, 1, type_desc(TPrimitiveType::VARCHAR)),
+        );
+
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr_in_context(&expr, &desc, &mut reg, &[3, 1]).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                let lhs = match &f.arguments[0].arg_type {
+                    Some(substrait::proto::function_argument::ArgType::Value(Expression {
+                        rex_type: Some(expression::RexType::Selection(field_ref)),
+                    })) => field_ref,
+                    other => panic!("expected lhs field ref, got {:?}", other),
+                };
+                let rhs = match &f.arguments[1].arg_type {
+                    Some(substrait::proto::function_argument::ArgType::Value(Expression {
+                        rex_type: Some(expression::RexType::Selection(field_ref)),
+                    })) => field_ref,
+                    other => panic!("expected rhs field ref, got {:?}", other),
+                };
+
+                let lhs_idx = match lhs.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected lhs StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected lhs DirectReference, got {:?}", other),
+                };
+                let rhs_idx = match rhs.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected rhs StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected rhs DirectReference, got {:?}", other),
+                };
+
+                assert_eq!(lhs_idx, 1);
+                assert_eq!(rhs_idx, 3);
+            }
+            other => panic!("expected ScalarFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_translate_expr_in_context_resolves_intermediate_join_tuple_duplicates() {
+        let desc_tbl = make_desc_table(
+            vec![(3, None), (1, None), (4, None)],
+            vec![
+                (12, 3, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (13, 3, 1, "n_name", TPrimitiveType::VARCHAR),
+                (14, 1, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (15, 1, 1, "n_name", TPrimitiveType::VARCHAR),
+                (16, 4, 0, "n_nationkey", TPrimitiveType::BIGINT),
+                (17, 4, 1, "n_name", TPrimitiveType::VARCHAR),
+                (18, 4, 2, "n_nationkey", TPrimitiveType::BIGINT),
+                (19, 4, 3, "n_name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let mut desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        desc.set_child_rel_column_names(vec![
+            "n_nationkey".into(),
+            "n_name".into(),
+            "n_nationkey".into(),
+            "n_name".into(),
+        ]);
+
+        let expr = binary_pred_expr(
+            TExprOpcode::EQ,
+            slot_ref_expr_in_tuple(17, 4, type_desc(TPrimitiveType::VARCHAR)),
+            slot_ref_expr_in_tuple(19, 4, type_desc(TPrimitiveType::VARCHAR)),
+        );
+
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr_in_context(&expr, &desc, &mut reg, &[3, 1]).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                let lhs = match &f.arguments[0].arg_type {
+                    Some(substrait::proto::function_argument::ArgType::Value(Expression {
+                        rex_type: Some(expression::RexType::Selection(field_ref)),
+                    })) => field_ref,
+                    other => panic!("expected lhs field ref, got {:?}", other),
+                };
+                let rhs = match &f.arguments[1].arg_type {
+                    Some(substrait::proto::function_argument::ArgType::Value(Expression {
+                        rex_type: Some(expression::RexType::Selection(field_ref)),
+                    })) => field_ref,
+                    other => panic!("expected rhs field ref, got {:?}", other),
+                };
+
+                let lhs_idx = match lhs.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected lhs StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected lhs DirectReference, got {:?}", other),
+                };
+                let rhs_idx = match rhs.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected rhs StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected rhs DirectReference, got {:?}", other),
+                };
+
+                assert_eq!(lhs_idx, 1);
+                assert_eq!(rhs_idx, 3);
+            }
+            other => panic!("expected ScalarFunction, got {:?}", other),
+        }
+    }
+
     // ---- BINARY_PRED tests ----
 
     #[test]

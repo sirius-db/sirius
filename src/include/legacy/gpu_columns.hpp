@@ -258,10 +258,10 @@ class GPUIntermediateRelation {
   vector<shared_ptr<GPUColumn>> columns;
   size_t column_count;
 
-  /// Pre-owned cudf::table from registerExternalTable (cudf::unpack'd data).
-  /// Raw pointer — ownership managed manually by the exchange lifecycle.
-  /// nullptr when not populated from packed nixl transfer.
-  cudf::table* packed_cudf_table = nullptr;
+  /// Finalized cudf::table for this exchange relation.
+  /// Shared ownership allows multiple scan operators in the same fragment to
+  /// reuse the same read-only GPU table without invalidating each other.
+  std::shared_ptr<cudf::table> packed_cudf_table;
 
   /// Pending table_views accumulated from multiple senders (zero-copy).
   /// Each view points into a packed/staging buffer that stays alive until
@@ -274,6 +274,7 @@ class GPUIntermediateRelation {
   std::vector<cudf::table_view> pending_views;
   std::vector<std::string> pending_metadata; // Keeps metadata buffers alive
   std::vector<uint8_t*> pending_gpu_ptrs;    // GPU data pointers for re-unpack
+  std::vector<std::vector<int32_t>> pending_projection_indices;
   size_t pending_total_rows = 0;
 
   /// Concatenate all pending views into a single owned cudf::table.
@@ -332,6 +333,14 @@ class GPUIntermediateRelation {
                         i, reinterpret_cast<uintptr_t>(pending_gpu_ptrs[i]),
                         static_cast<uint32_t>(first4));
         auto view = cudf::unpack(md_ptr, pending_gpu_ptrs[i]);
+        if (i < pending_projection_indices.size() && !pending_projection_indices[i].empty()) {
+          std::vector<cudf::column_view> projected_columns;
+          projected_columns.reserve(pending_projection_indices[i].size());
+          for (auto idx : pending_projection_indices[i]) {
+            projected_columns.push_back(view.column(idx));
+          }
+          view = cudf::table_view(projected_columns);
+        }
         pending_views.push_back(view);
       }
     }
@@ -375,7 +384,7 @@ class GPUIntermediateRelation {
     }
 
     auto merged = cudf::concatenate(pending_views, cudf::get_default_stream(), &cuda_mr);
-    packed_cudf_table = merged.release();
+    packed_cudf_table = std::shared_ptr<cudf::table>(merged.release());
     pending_views.clear();
     pending_metadata.clear(); // Metadata no longer needed after concatenation.
     if (packed_cudf_table) {

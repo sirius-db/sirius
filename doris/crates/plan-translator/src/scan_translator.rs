@@ -17,7 +17,7 @@ use substrait::proto::read_rel;
 use substrait::proto::read_rel::local_files::file_or_files::{FileFormat, ParquetReadOptions, PathType};
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::LocalFiles;
-use substrait::proto::{rel, NamedStruct, ReadRel, Rel};
+use substrait::proto::{rel, NamedStruct, ReadRel, Rel, Type};
 
 use crate::descriptor_table::DescriptorTable;
 use crate::{type_mapper, FileScanInfo};
@@ -128,6 +128,28 @@ pub fn build_exchange_schema(
     desc: &DescriptorTable,
 ) -> Result<NamedStruct> {
     build_schema_from_columns(columns, desc, 0)
+}
+
+/// Build a NamedStruct from exact column names and already-resolved Substrait types.
+pub fn build_schema_from_exact_types(
+    columns: &[String],
+    types: &[Type],
+) -> Result<NamedStruct> {
+    if columns.len() != types.len() {
+        anyhow::bail!(
+            "schema column/type count mismatch: {} names vs {} types",
+            columns.len(),
+            types.len()
+        );
+    }
+    Ok(NamedStruct {
+        names: columns.to_vec(),
+        r#struct: Some(r#type::Struct {
+            types: types.to_vec(),
+            type_variation_reference: 0,
+            nullability: r#type::Nullability::Unspecified as i32,
+        }),
+    })
 }
 
 /// Build a NamedStruct from DuckDB column names, resolving types from the descriptor table.

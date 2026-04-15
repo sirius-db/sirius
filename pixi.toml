@@ -96,6 +96,8 @@ substrait-build = { cmd = "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make release", cw
 doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris workspace" }
 nixl-build = { cmd = """bash -c 'set -e
   NIXL_SRC=$PIXI_PROJECT_ROOT/doris/thirdparty/nixl
+  # sbsa-linux = aarch64 SBSA (data center ARM, e.g. Grace Hopper); x86_64-linux = standard x86_64
+  CUDA_TARGET=$([ $(uname -m) = aarch64 ] && echo sbsa-linux || echo x86_64-linux)
 
   if [ -f "$CONDA_PREFIX/lib/libnixl.so" ]; then
     echo "nixl already installed in conda prefix"
@@ -112,9 +114,9 @@ nixl-build = { cmd = """bash -c 'set -e
   rm -rf builddir
   meson setup builddir --prefix="$CONDA_PREFIX" --libdir=lib --buildtype=release \
     -Ducx_path=$CONDA_PREFIX \
-    -Dcudapath_inc=$CONDA_PREFIX/targets/x86_64-linux/include \
-    -Dcudapath_lib=$CONDA_PREFIX/targets/x86_64-linux/lib \
-    -Dcudapath_stub=$CONDA_PREFIX/targets/x86_64-linux/lib/stubs \
+    -Dcudapath_inc=$CONDA_PREFIX/targets/$CUDA_TARGET/include \
+    -Dcudapath_lib=$CONDA_PREFIX/targets/$CUDA_TARGET/lib \
+    -Dcudapath_stub=$CONDA_PREFIX/targets/$CUDA_TARGET/lib/stubs \
     -Drust=false \
     -Denable_plugins=UCX \
     -Dbuild_tests=false \
@@ -126,11 +128,37 @@ nixl-build = { cmd = """bash -c 'set -e
   echo "==> nixl installed to $CONDA_PREFIX"
   ls "$CONDA_PREFIX/lib/"libnixl* 2>/dev/null || true
 '""", description = "Build nixl C++ library from submodule into conda prefix" }
-doris-build = { cmd = "NIXL_PREFIX=$CONDA_PREFIX NIXL_NO_STUBS_FALLBACK=1 cargo build --release", cwd = "doris", depends-on = ["nixl-build"], description = "Build doris workspace (with nixl)" }
+doris-build = { cmd = """bash -c '
+  LIB_ARCH=$([ $(uname -m) = aarch64 ] && echo aarch64-linux-gnu || echo x86_64-linux-gnu)
+  exec env NIXL_PREFIX="$CONDA_PREFIX" NIXL_NO_STUBS_FALLBACK=1 \
+    RUSTFLAGS="-L native=$CONDA_PREFIX/lib/$LIB_ARCH $RUSTFLAGS" \
+    cargo build --release
+'""", cwd = "doris", depends-on = ["nixl-build"], description = "Build doris workspace (with nixl)" }
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
 # Start Sirius GPU BEs with offset ports (for running alongside regular Doris BE)
-sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --gpu-cache-size 2GB --gpu-processing-size 2GB --fe 127.0.0.1:9030", env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/x86_64-linux-gnu" }, description = "Run Sirius GPU BE 1 (ports 19xxx/18xxx)" }
-sirius-be-2 = { cmd = "bash -c 'mkdir -p /tmp/sirius-be-2/.sirius && cp -n ~/.sirius/sirius.cfg /tmp/sirius-be-2/.sirius/ 2>/dev/null; HOME=/tmp/sirius-be-2 exec doris/target/release/sirius-doris-be --heartbeat-port 29050 --be-port 29060 --brpc-port 28060 --http-port 28040 --arrow-flight-port 28071 --gpu-cache-size 2GB --gpu-processing-size 2GB --advertise-host 127.0.0.3 --fe 127.0.0.1:9030'", env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/x86_64-linux-gnu" }, description = "Run Sirius GPU BE 2 (ports 29xxx/28xxx, separate HOME for lock)" }
+sirius-be = { cmd = """bash -c '
+  LIB_ARCH=$([ $(uname -m) = aarch64 ] && echo aarch64-linux-gnu || echo x86_64-linux-gnu)
+  exec env LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/$LIB_ARCH" \
+    doris/target/release/sirius-doris-be \
+    --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 \
+    --arrow-flight-port 18071 --gpu-cache-size 2GB --gpu-processing-size 2GB \
+    --fe 127.0.0.1:9030
+'""", description = "Run Sirius GPU BE 1 (ports 19xxx/18xxx)" }
+sirius-be-2 = { cmd = """bash -c '
+  LIB_ARCH=$([ $(uname -m) = aarch64 ] && echo aarch64-linux-gnu || echo x86_64-linux-gnu)
+  mkdir -p /tmp/sirius-be-2/.sirius && cp -n ~/.sirius/sirius.cfg /tmp/sirius-be-2/.sirius/ 2>/dev/null
+  HOME=/tmp/sirius-be-2 exec env LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/$LIB_ARCH" \
+    doris/target/release/sirius-doris-be \
+    --heartbeat-port 29050 --be-port 29060 --brpc-port 28060 --http-port 28040 \
+    --arrow-flight-port 28071 --gpu-cache-size 2GB --gpu-processing-size 2GB \
+    --advertise-host 127.0.0.3 --fe 127.0.0.1:9030
+'""", description = "Run Sirius GPU BE 2 (ports 29xxx/28xxx, separate HOME for lock)" }
+
+[feature.doris.target.linux-64.dependencies]
+sysroot_linux-64 = ">=2.32"
+
+[feature.doris.target.linux-aarch64.dependencies]
+sysroot_linux-aarch64 = ">=2.32"
 
 # Doris FE feature: build & run Doris Frontend from source for testing
 [feature.doris-fe.dependencies]

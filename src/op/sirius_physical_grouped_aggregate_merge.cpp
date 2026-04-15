@@ -19,6 +19,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "log/logging.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
@@ -287,6 +288,29 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
+  std::string slot_map;
+  for (std::size_t i = 0; i < aggregate_slots.size(); i++) {
+    if (i > 0) {
+      slot_map += ",";
+    }
+    auto const& slot = aggregate_slots[i];
+    slot_map += std::to_string(i) + ":";
+    if (slot.is_avg) {
+      slot_map += "avg@" + std::to_string(slot.cudf_idx);
+    } else if (slot.is_count_distinct) {
+      slot_map += "count_distinct@" + std::to_string(slot.cudf_idx);
+    } else {
+      slot_map += "agg@" + std::to_string(slot.cudf_idx);
+    }
+  }
+  SIRIUS_LOG_INFO(
+    "[grouped_aggregate_merge] output columns={} groups={} slots={} has_avg={} has_count_distinct={} slot_map=[{}]",
+    output_table->num_columns(),
+    group_idx.size(),
+    aggregate_slots.size(),
+    has_avg,
+    has_count_distinct,
+    slot_map);
   auto result       = sirius::make_data_batch(std::move(output_table), *space);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});

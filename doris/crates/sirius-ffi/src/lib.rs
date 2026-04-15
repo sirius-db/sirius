@@ -16,7 +16,20 @@ pub struct SiriusEngine {
     exchange_api: &'static ExchangeApi,
 }
 
-type BeginExchangeCaptureFn = unsafe extern "C" fn(u64, *const i32, usize) -> u64;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumnSchema {
+    pub name: String,
+    pub sql_type: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExchangeCaptureMode {
+    MaterializeAndCapture = 0,
+    ExchangeOnly = 1,
+}
+
+type BeginExchangeCaptureFn =
+    unsafe extern "C" fn(u64, *const i32, usize, *const i32, usize, u32) -> u64;
 type TakeExchangeArtifactFn = unsafe extern "C" fn() -> *mut c_void;
 type DestroyExchangeArtifactFn = unsafe extern "C" fn(*mut c_void);
 type ArtifactStagingBaseFn = unsafe extern "C" fn(*const c_void) -> u64;
@@ -535,6 +548,26 @@ impl SiriusEngine {
         Ok(columns)
     }
 
+    /// Get column names and SQL types of a registered DuckDB table, in ordinal order.
+    pub fn get_table_schema(&self, table_name: &str) -> Result<Vec<TableColumnSchema>, EngineError> {
+        let sql = format!("DESCRIBE \"{}\"", table_name);
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+            let name: String = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let sql_type: String =
+                row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            columns.push(TableColumnSchema { name, sql_type });
+        }
+        Ok(columns)
+    }
+
     /// Register exchange data as a DuckDB table.
     ///
     /// Creates a table from decoded PBlock column data so that the Substrait plan
@@ -793,17 +826,69 @@ impl SiriusEngine {
     pub fn begin_exchange_capture(
         &self,
         partition_spec: Option<(usize, &[i32])>,
+        projection_indices: Option<&[usize]>,
+        capture_mode: ExchangeCaptureMode,
     ) -> Result<u64, EngineError> {
         let (num_partitions, cols) = partition_spec
             .map(|(num, cols)| (num as u64, cols))
             .unwrap_or((0, &[][..]));
+        let projection_indices_i32 = projection_indices.map(|indices| {
+            indices
+                .iter()
+                .map(|&idx| i32::try_from(idx).expect("projection index fits in i32"))
+                .collect::<Vec<_>>()
+        });
+        let (projection_ptr, projection_len) = projection_indices_i32
+            .as_ref()
+            .map(|indices| (indices.as_ptr(), indices.len()))
+            .unwrap_or((std::ptr::null(), 0));
         let session_id = unsafe {
-            (self.exchange_api.begin_exchange_capture)(num_partitions, cols.as_ptr(), cols.len())
+            (self.exchange_api.begin_exchange_capture)(
+                num_partitions,
+                cols.as_ptr(),
+                cols.len(),
+                projection_ptr,
+                projection_len,
+                capture_mode as u32,
+            )
         };
         if session_id == 0 {
             return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
         }
         Ok(session_id)
+    }
+
+    pub fn execute_substrait_to_exchange_artifact(
+        &self,
+        plan_bytes: &[u8],
+        partition_spec: Option<(usize, &[i32])>,
+        projection_indices: Option<&[usize]>,
+    ) -> Result<ExchangeArtifact, EngineError> {
+        use arrow::record_batch::RecordBatch;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM gpu_execution_substrait(?::blob)")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        self.begin_exchange_capture(
+            partition_spec,
+            projection_indices,
+            ExchangeCaptureMode::ExchangeOnly,
+        )?;
+        let arrow_result = stmt
+            .query_arrow(duckdb::params![plan_bytes])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let schema = arrow_result.get_schema();
+        let batches: Vec<RecordBatch> = arrow_result.collect();
+        tracing::info!(
+            batch_count = batches.len(),
+            row_count = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            schema_fields = schema.fields().len(),
+            "exchange-only execute_substrait completed"
+        );
+        self.take_exchange_artifact()?.ok_or_else(|| {
+            EngineError::ExecFailed("exchange-only execution produced no artifact".to_string())
+        })
     }
 
     /// Move the active exchange capture into a Rust-owned artifact.
@@ -954,6 +1039,56 @@ impl SiriusEngine {
 
         // Step 2: Create schema-only DuckDB table on THIS connection.
         self.conn.execute_batch(&create_table_sql)
+            .map_err(|e| EngineError::ExecFailed(format!("CREATE TABLE for GPU exchange: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Register a packed GPU buffer and project/reorder its columns zero-copy.
+    pub fn register_projected_packed_table(
+        &self,
+        table_name: &str,
+        gpu_addr: usize,
+        gpu_size: usize,
+        cudf_metadata: &[u8],
+        projection_indices: &[usize],
+    ) -> Result<(), EngineError> {
+        let indices_sql = projection_indices
+            .iter()
+            .map(|idx| idx.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT * FROM sirius_register_projected_packed_table(?, ?, ?, ?, [{indices_sql}])"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt
+            .query(duckdb::params![
+                table_name,
+                gpu_addr as i64,
+                gpu_size as i64,
+                cudf_metadata,
+            ])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let row = rows
+            .next()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .ok_or_else(|| {
+                EngineError::ExecFailed(
+                    "register_projected_packed_table returned no rows".into(),
+                )
+            })?;
+        let create_table_sql: String = row
+            .get(2)
+            .map_err(|e| EngineError::ExecFailed(format!("get create_table_sql: {e}")))?;
+        drop(rows);
+        drop(stmt);
+
+        self.conn
+            .execute_batch(&create_table_sql)
             .map_err(|e| EngineError::ExecFailed(format!("CREATE TABLE for GPU exchange: {e}")))?;
 
         Ok(())
@@ -1128,16 +1263,35 @@ pub enum EngineError {
 
 #[cfg(test)]
 mod tests {
-    use super::SiriusEngine;
+    use super::{arrow_type_to_duckdb_sql, SiriusEngine};
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    fn normalize_sql_type(sql: &str) -> String {
+        sql.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_uppercase()
+    }
+
+    fn configure_test_runtime() {
+        let config_path = format!("{}/testdata/sirius-test.yaml", env!("CARGO_MANIFEST_DIR"));
+        unsafe {
+            std::env::set_var("SIRIUS_CONFIG_FILE", config_path);
+        }
+    }
 
     #[test]
     fn exchange_artifact_empty_roundtrip() {
+        configure_test_runtime();
         let Ok(engine) = SiriusEngine::new() else {
             return;
         };
 
         engine.finalize_exchange_tables_direct().unwrap();
-        let session_id = engine.begin_exchange_capture(None).unwrap();
+        let session_id = engine
+            .begin_exchange_capture(None, None, ExchangeCaptureMode::MaterializeAndCapture)
+            .unwrap();
         assert!(session_id > 0);
 
         let artifact = engine
@@ -1152,6 +1306,7 @@ mod tests {
     #[test]
     #[ignore]
     fn exchange_artifact_broadcast_gpu_roundtrip() {
+        configure_test_runtime();
         let engine = SiriusEngine::new().expect("engine");
         engine
             .conn
@@ -1174,7 +1329,9 @@ mod tests {
         engine
             .finalize_exchange_tables_direct()
             .expect("finalize_exchange_tables_direct");
-        let session_id = engine.begin_exchange_capture(None).expect("begin_exchange_capture");
+        let session_id = engine
+            .begin_exchange_capture(None, None, ExchangeCaptureMode::MaterializeAndCapture)
+            .expect("begin_exchange_capture");
         assert!(session_id > 0);
 
         let ipc = engine
@@ -1199,5 +1356,87 @@ mod tests {
                 .iter()
                 .any(|entry| entry.packed_size > 0 && !entry.metadata.is_empty())
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn exchange_artifact_matches_q1_logical_schema() {
+        configure_test_runtime();
+        let engine = SiriusEngine::new().expect("engine");
+        engine
+            .conn
+            .execute_batch("LOAD parquet")
+            .expect("load parquet");
+        engine
+            .init_gpu_buffers("1GB", "1GB")
+            .expect("init_gpu_buffers");
+        engine
+            .conn
+            .execute_batch("SET enable_fallback_check = true")
+            .expect("enable_fallback_check");
+
+        let staging_size = 64 * 1024 * 1024;
+        let staging_addr = engine.cuda_alloc(staging_size).expect("cuda_alloc staging");
+        engine
+            .set_staging_buffer(staging_addr, staging_size)
+            .expect("set_staging_buffer");
+
+        engine
+            .finalize_exchange_tables_direct()
+            .expect("finalize_exchange_tables_direct");
+        engine
+            .begin_exchange_capture(None, None, ExchangeCaptureMode::MaterializeAndCapture)
+            .expect("begin_exchange_capture");
+
+        let q1_like = "SELECT \
+                l_returnflag, \
+                l_linestatus, \
+                sum(l_quantity) AS sum_qty, \
+                sum(l_extendedprice) AS sum_base_price, \
+                sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, \
+                sum(l_extendedprice * (1 + l_tax) * (1 - l_discount)) AS sum_charge, \
+                avg(l_quantity) AS avg_qty, \
+                avg(l_extendedprice) AS avg_price, \
+                avg(l_discount) AS avg_disc, \
+                count(*) AS count_order \
+            FROM read_parquet('/data/tpch/sf1/p16/snappy/lineitem/*.parquet') \
+            GROUP BY l_returnflag, l_linestatus";
+        let ipc = engine.execute_gpu(q1_like).expect("execute_gpu q1-like");
+        let artifact = engine
+            .take_exchange_artifact()
+            .expect("take_exchange_artifact")
+            .expect("exchange artifact");
+
+        let entry = artifact
+            .packed_broadcast()
+            .iter()
+            .find(|entry| entry.packed_size > 0)
+            .expect("non-empty packed broadcast entry");
+        let gpu_addr = if entry.overflow_gpu_addr != 0 {
+            entry.overflow_gpu_addr
+        } else {
+            artifact.staging_base() + entry.staging_offset
+        };
+
+        engine
+            .register_packed_table("__ART_Q1_SCHEMA", gpu_addr, entry.packed_size, &entry.metadata)
+            .expect("register_packed_table");
+        let packed_schema = engine
+            .get_table_schema("__ART_Q1_SCHEMA")
+            .expect("get_table_schema");
+
+        let reader = StreamReader::try_new(Cursor::new(ipc), None).expect("ipc reader");
+        let ipc_schema = reader.schema();
+        let ipc_types: Vec<String> = ipc_schema
+            .fields()
+            .iter()
+            .map(|field| normalize_sql_type(&arrow_type_to_duckdb_sql(field.data_type())))
+            .collect();
+        let packed_types: Vec<String> = packed_schema
+            .iter()
+            .map(|col| normalize_sql_type(&col.sql_type))
+            .collect();
+
+        assert_eq!(packed_types, ipc_types);
     }
 }

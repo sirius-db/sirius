@@ -16,6 +16,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -47,10 +48,47 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalProjection& op)
       break;
     }
     if (omit_projection) {
+      std::string refs;
+      refs.reserve(op.expressions.size() * 4);
+      for (std::size_t i = 0; i < op.expressions.size(); i++) {
+        if (i > 0) {
+          refs += ",";
+        }
+        if (op.expressions[i]->type == duckdb::ExpressionType::BOUND_REF) {
+          auto& bound_ref = op.expressions[i]->Cast<duckdb::BoundReferenceExpression>();
+          refs += "#" + std::to_string(bound_ref.index);
+        } else {
+          refs += op.expressions[i]->GetName();
+        }
+      }
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_projection] omitting projection over child={} exprs=[{}] output_cols={}",
+        plan->get_name(),
+        refs,
+        op.types.size());
       // the projection only directly projects the child' columns: omit it entirely
       return plan;
     }
   }
+
+  std::string refs;
+  refs.reserve(op.expressions.size() * 4);
+  for (std::size_t i = 0; i < op.expressions.size(); i++) {
+    if (i > 0) {
+      refs += ",";
+    }
+    if (op.expressions[i]->type == duckdb::ExpressionType::BOUND_REF) {
+      auto& bound_ref = op.expressions[i]->Cast<duckdb::BoundReferenceExpression>();
+      refs += "#" + std::to_string(bound_ref.index);
+    } else {
+      refs += op.expressions[i]->GetName();
+    }
+  }
+  SIRIUS_LOG_INFO(
+    "[sirius_plan_projection] keeping projection over child={} exprs=[{}] output_cols={}",
+    plan->get_name(),
+    refs,
+    op.types.size());
 
   auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
     op.types, std::move(op.expressions), op.estimated_cardinality);

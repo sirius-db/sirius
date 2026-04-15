@@ -161,13 +161,22 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     output_batch = batch_ref;
   }
 
-  // After filtering, project away filter-only columns if the batch has more
-  // columns than the operator's output type list expects.
+  // After filtering, normalize the batch to the logical scan output shape.
+  //
+  // Normal DuckDB scan tasks already emit columns in projected scan order, so
+  // this is often a no-op. GPU-resident cached tables, however, arrive in raw
+  // table order; when that differs from projection_ids we must reorder even if
+  // the column count already matches the operator output.
   std::size_t expected_output_columns = types.size();
   auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
   auto& out_table = gpu_rep.get_table();
 
-  if (static_cast<std::size_t>(out_table.num_columns()) > expected_output_columns) {
+  bool needs_projection =
+    static_cast<std::size_t>(out_table.num_columns()) != expected_output_columns;
+  std::vector<std::size_t> selected_indices;
+  selected_indices.reserve(expected_output_columns);
+
+  if (!projection_ids.empty()) {
     SIRIUS_LOG_DEBUG(
       "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
       "column_ids.size()={}",
@@ -182,7 +191,35 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                     expected_output_columns,
                     projection_ids.size()));
     }
+  } else if (needs_projection) {
+    throw std::runtime_error(
+      std::format("TABLE_SCAN projection error: expected {} columns but batch has {} and no "
+                  "projection_ids are available",
+                  expected_output_columns,
+                  out_table.num_columns()));
+  }
 
+  for (std::size_t i = 0; i < expected_output_columns; i++) {
+    std::size_t batch_idx = i;
+    if (!projection_ids.empty()) {
+      batch_idx = batch_column_map[projection_ids[i]];
+    }
+    if (batch_idx == static_cast<std::size_t>(-1) ||
+        batch_idx >= static_cast<std::size_t>(out_table.num_columns())) {
+      throw std::runtime_error(
+        std::format("TABLE_SCAN projection OOB: output_idx={} batch_idx={} >= "
+                    "view.num_columns()={}",
+                    i,
+                    batch_idx,
+                    out_table.num_columns()));
+    }
+    selected_indices.push_back(batch_idx);
+    if (batch_idx != i) {
+      needs_projection = true;
+    }
+  }
+
+  if (needs_projection) {
     auto* space = output_batch->get_memory_space();
     if (!space) {
       throw std::runtime_error("TABLE_SCAN projection error: output batch has no memory space");
@@ -194,18 +231,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     std::vector<cudf::column_view> selected;
     selected.reserve(expected_output_columns);
     auto view = out_table.view();
-    for (std::size_t i = 0; i < expected_output_columns; i++) {
-      auto batch_idx = batch_column_map[projection_ids[i]];
-      if (batch_idx == static_cast<std::size_t>(-1) ||
-          batch_idx >= static_cast<std::size_t>(view.num_columns())) {
-        throw std::runtime_error(
-          std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
-                      "view.num_columns()={}",
-                      i,
-                      projection_ids[i],
-                      batch_idx,
-                      view.num_columns()));
-      }
+    for (auto batch_idx : selected_indices) {
       selected.push_back(view.column(batch_idx));
     }
 

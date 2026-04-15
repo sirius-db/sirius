@@ -18,6 +18,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cudf/cudf_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 #include <op/sirius_physical_result_collector.hpp>
@@ -54,9 +55,89 @@
 // standard library
 #include <algorithm>
 #include <cassert>
+#include <optional>
 
 namespace sirius {
 namespace op {
+
+namespace {
+
+struct normalized_exchange_view {
+  std::vector<std::unique_ptr<cudf::column>> owned_columns;
+  std::vector<cudf::column_view> columns;
+
+  cudf::table_view view() const { return cudf::table_view(columns); }
+};
+
+std::optional<normalized_exchange_view> build_normalized_exchange_view(
+  cudf::table_view input,
+  const duckdb::vector<duckdb::LogicalType>& expected_types,
+  rmm::cuda_stream_view stream)
+{
+  if (input.num_columns() != static_cast<cudf::size_type>(expected_types.size())) {
+    SIRIUS_LOG_WARN(
+      "[result_collector] exchange capture disabled: output column count {} != expected {}",
+      input.num_columns(),
+      expected_types.size());
+    return std::nullopt;
+  }
+
+  normalized_exchange_view normalized;
+  normalized.columns.reserve(input.num_columns());
+
+  try {
+    for (cudf::size_type col_idx = 0; col_idx < input.num_columns(); ++col_idx) {
+      auto col_view = input.column(col_idx);
+      auto expected_type = duckdb::GetCudfType(expected_types[col_idx]);
+      if (col_view.type() == expected_type) {
+        normalized.columns.push_back(col_view);
+        continue;
+      }
+
+      SIRIUS_LOG_INFO(
+        "[result_collector] normalizing exchange column {} from cudf type {} scale {} to {} scale {}",
+        col_idx,
+        static_cast<int>(col_view.type().id()),
+        static_cast<int>(col_view.type().scale()),
+        static_cast<int>(expected_type.id()),
+        static_cast<int>(expected_type.scale()));
+      auto casted = cudf::cast(col_view, expected_type, stream);
+      normalized.columns.push_back(casted->view());
+      normalized.owned_columns.push_back(std::move(casted));
+    }
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN(
+      "[result_collector] exchange capture disabled: failed to normalize output types: {}",
+      e.what());
+    return std::nullopt;
+  }
+
+  return normalized;
+}
+
+cudf::table_view apply_exchange_projection(
+  cudf::table_view input,
+  const std::vector<int>& projection_indices)
+{
+  if (projection_indices.empty()) {
+    return input;
+  }
+
+  std::vector<cudf::column_view> projected_columns;
+  projected_columns.reserve(projection_indices.size());
+  for (auto idx : projection_indices) {
+    if (idx < 0 || idx >= input.num_columns()) {
+      throw duckdb::InvalidInputException(
+        "[result_collector] exchange capture projection index out of range: {} for {} columns",
+        idx,
+        input.num_columns());
+    }
+    projected_columns.push_back(input.column(idx));
+  }
+  return cudf::table_view(projected_columns);
+}
+
+}  // namespace
 
 sirius_physical_result_collector::sirius_physical_result_collector(
   ::sirius::sirius_prepared_statement_data& data)
@@ -141,6 +222,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
   // Check if GPU buffer retention is requested (for nixl GPU-direct exchange).
   bool should_retain = duckdb::LastGPUBuffers::GetInstance().ShouldRetain();
+  auto capture_mode = duckdb::LastGPUBuffers::GetInstance().GetCaptureMode();
+  bool exchange_only = capture_mode == duckdb::ExchangeCaptureMode::ExchangeOnly;
   SIRIUS_LOG_INFO("[result_collector] sink called: {} batches, should_retain={}", input_batches.size(), should_retain);
 
   for (auto const& input_batch : input_batches) {
@@ -159,8 +242,20 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
       auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
       cudf::table_view view = gpu_rep.get_table().view();
+      std::optional<normalized_exchange_view> exchange_view_storage;
+      cudf::table_view exchange_view = view;
 
       if (should_retain) {
+        exchange_view_storage = build_normalized_exchange_view(view, types, stream);
+        if (exchange_view_storage) {
+          exchange_view = exchange_view_storage->view();
+        } else {
+          SIRIUS_LOG_WARN(
+            "[result_collector] retaining disabled for this batch; falling back to CPU exchange");
+        }
+      }
+
+      if (should_retain && exchange_view_storage) {
         auto& lgb = duckdb::LastGPUBuffers::GetInstance();
         // Keep the source GPU batch alive until exchange transfer completes.
         // The packed exchange path may still depend on buffers originating from
@@ -168,9 +263,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         lgb.RetainData(std::static_pointer_cast<void>(input_batch));
         auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
         auto [part_num, part_cols] = lgb.GetPartitionConfig();
+        auto projection_indices = lgb.GetProjectionIndices();
 
-        SIRIUS_LOG_INFO("[result_collector] retain path: part_num={} part_cols={} staging_addr=0x{:x}",
-                        part_num, part_cols.size(), staging_addr);
+        SIRIUS_LOG_INFO(
+          "[result_collector] retain path: part_num={} part_cols={} projection_cols={} staging_addr=0x{:x}",
+          part_num,
+          part_cols.size(),
+          projection_indices.size(),
+          staging_addr);
 
         if (part_num > 0 && !part_cols.empty() && staging_addr != 0) {
             // GPU hash partition + per-partition pack into staging.
@@ -179,19 +279,19 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             // partition to avoid unnecessary ownership churn on the partitioned
             // table.
             std::unique_ptr<cudf::table> partitioned_table;
-            cudf::table_view partitioned_view = view;
+            cudf::table_view partitioned_view = exchange_view;
             std::vector<cudf::size_type> offsets{0};
             if (part_num > 1) {
               std::vector<cudf::size_type> col_indices(part_cols.begin(), part_cols.end());
               auto partition_result = cudf::hash_partition(
-                  view, col_indices, part_num, cudf::hash_id::HASH_MURMUR3,
+                  exchange_view, col_indices, part_num, cudf::hash_id::HASH_MURMUR3,
                   cudf::DEFAULT_HASH_SEED, stream);
               partitioned_table = std::move(partition_result.first);
               offsets = std::move(partition_result.second);
               partitioned_view = partitioned_table->view();
 
               SIRIUS_LOG_INFO("[result_collector] GPU hash_partition: {} partitions, {} rows → offsets: [{}]",
-                              part_num, view.num_rows(),
+                              part_num, exchange_view.num_rows(),
                               [&]() { std::string s; for (auto o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); } return s; }());
 
               // Validate hash_partition output: check first INT32 value and STRING offsets.
@@ -213,8 +313,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
               }
             } else {
               SIRIUS_LOG_INFO("[result_collector] single-destination exchange: bypassing hash_partition for {} rows",
-                              view.num_rows());
+                              exchange_view.num_rows());
             }
+
+            auto projected_partitioned_view =
+              apply_exchange_projection(partitioned_view, projection_indices);
 
             std::vector<duckdb::PackedPartition> packed_parts;
 
@@ -225,9 +328,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             size_t exact_total = 0;
             for (int i = 0; i < part_num; i++) {
               auto start = offsets[i];
-              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_view.num_rows();
+              auto end =
+                (i + 1 < part_num) ? offsets[i + 1] : projected_partitioned_view.num_rows();
               if (end <= start) continue;
-              auto pslice = cudf::slice(partitioned_view, {start, end});
+              auto pslice = cudf::slice(projected_partitioned_view, {start, end});
               auto psz = cudf::chunked_pack::create(pslice[0], 1UL << 20, stream)->get_total_contiguous_size();
               exact_total += (psz + 255) & ~255UL;  // 256-byte align per partition
             }
@@ -237,13 +341,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
             for (int i = 0; i < part_num; i++) {
               auto start = offsets[i];
-              auto end = (i + 1 < part_num) ? offsets[i + 1] : partitioned_view.num_rows();
+              auto end =
+                (i + 1 < part_num) ? offsets[i + 1] : projected_partitioned_view.num_rows();
               auto num_rows = end - start;
               if (num_rows == 0) {
                 { duckdb::PackedPartition pp; pp.staging_offset = staging_offset; pp.packed_size = 0; pp.num_rows = 0; packed_parts.push_back(std::move(pp)); }
                 continue;
               }
-              auto slice = cudf::slice(partitioned_view, {start, end});
+              auto slice = cudf::slice(projected_partitioned_view, {start, end});
               auto total = cudf::chunked_pack::create(slice[0], 1UL << 20, stream)->get_total_contiguous_size();
               if (staging_offset + total > staging_size) {
                 // Overflow: pack into separate rmm::device_buffer instead of dropping data.
@@ -324,12 +429,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             }
             lgb.AccumulatePackedPartitions(std::move(packed_parts));
         } else if (staging_addr != 0 && staging_size > 0) {
+            auto projected_exchange_view =
+              apply_exchange_projection(exchange_view, projection_indices);
             // Broadcast path: accumulate each batch as a separate entry.
             // Reserve a staging region atomically BEFORE packing, to prevent
             // concurrent sink() calls from overlapping in the staging buffer.
             // Use cudf::pack (not chunked_pack) to get correct packed output,
             // then D2D copy to staging. chunked_pack has a bug with STRING columns.
-            auto packed_probe = cudf::pack(view, stream);
+            auto packed_probe = cudf::pack(projected_exchange_view, stream);
             auto total_size = packed_probe.gpu_data->size();
             size_t aligned_size = (total_size + 255) & ~255UL;
             size_t staging_offset = lgb.ReserveStagingRegion(aligned_size, staging_size);
@@ -341,31 +448,33 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                         cudaMemcpyDeviceToDevice);
               auto metadata = std::move(packed_probe.metadata);
               SIRIUS_LOG_INFO("[result_collector] broadcast batch: {} rows, {} bytes at staging+{}",
-                              view.num_rows(), total_size, staging_offset);
+                              projected_exchange_view.num_rows(), total_size, staging_offset);
               duckdb::PackedBroadcastEntry entry;
               entry.staging_offset = staging_offset;
               entry.packed_size = total_size;
               entry.metadata = std::move(metadata);
-              entry.num_rows = static_cast<int32_t>(view.num_rows());
+              entry.num_rows = static_cast<int32_t>(projected_exchange_view.num_rows());
               lgb.AccumulatePackedBroadcast(std::move(entry));
             } else {
               // Overflow: pack into separate rmm::device_buffer.
               SIRIUS_LOG_WARN("[result_collector] broadcast batch ({} bytes) overflows staging, using rmm::device_buffer", total_size);
-              auto packed = cudf::pack(view);
+              auto packed = cudf::pack(projected_exchange_view);
               auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
               auto gpu_size = packed.gpu_data->size();
               duckdb::PackedBroadcastEntry entry;
               entry.staging_offset = 0;
               entry.packed_size = gpu_size;
               entry.metadata = std::move(packed.metadata);
-              entry.num_rows = static_cast<int32_t>(view.num_rows());
+              entry.num_rows = static_cast<int32_t>(projected_exchange_view.num_rows());
               entry.overflow_gpu_addr = gpu_addr;
               entry.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
               lgb.AccumulatePackedBroadcast(std::move(entry));
             }
         } else {
+            auto projected_exchange_view =
+              apply_exchange_projection(exchange_view, projection_indices);
             // No staging buffer — pack into rmm::device_buffer.
-            auto packed = cudf::pack(view);
+            auto packed = cudf::pack(projected_exchange_view);
             auto gpu_addr = reinterpret_cast<uintptr_t>(packed.gpu_data->data());
             auto gpu_size = packed.gpu_data->size();
             SIRIUS_LOG_INFO("[result_collector] cudf::pack (no staging): {} bytes at 0x{:x}", gpu_size, gpu_addr);
@@ -373,11 +482,18 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
             entry.staging_offset = 0;
             entry.packed_size = gpu_size;
             entry.metadata = std::move(packed.metadata);
-            entry.num_rows = static_cast<int32_t>(view.num_rows());
+            entry.num_rows = static_cast<int32_t>(projected_exchange_view.num_rows());
             entry.overflow_gpu_addr = gpu_addr;
             entry.overflow_data = std::make_shared<rmm::device_buffer>(std::move(*packed.gpu_data));
             lgb.AccumulatePackedBroadcast(std::move(entry));
         }
+      }
+
+      if (should_retain && exchange_only && exchange_view_storage) {
+        SIRIUS_LOG_INFO(
+          "[result_collector] exchange-only capture: skipping host materialization for {} rows",
+          exchange_view.num_rows());
+        continue;
       }
 
       // Make the HOST memory reservation

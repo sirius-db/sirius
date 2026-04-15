@@ -319,6 +319,16 @@ impl DescriptorTable {
                     continue;
                 }
                 if slot.col_name.is_empty() {
+                    let synthetic_name = format!("col_{}", sid);
+                    if let Some((idx, _)) = child_cols
+                        .iter()
+                        .enumerate()
+                        .find(|(idx, name)| !used_child_cols[*idx] && *name == &synthetic_name)
+                    {
+                        slot_to_child_idx.insert(sid, idx);
+                        used_child_cols[idx] = true;
+                        continue;
+                    }
                     unnamed_slots.push(sid);
                     continue;
                 }
@@ -366,6 +376,16 @@ impl DescriptorTable {
                 continue;
             }
             if slot.col_name.is_empty() {
+                let synthetic_name = format!("col_{}", sid);
+                if let Some((idx, _)) = child_cols
+                    .iter()
+                    .enumerate()
+                    .find(|(idx, name)| !used_child_cols[*idx] && *name == &synthetic_name)
+                {
+                    slot_to_child_idx.insert(sid, idx);
+                    used_child_cols[idx] = true;
+                    continue;
+                }
                 unresolved_slots.push(sid);
                 continue;
             }
@@ -1248,6 +1268,47 @@ mod tests {
         assert_eq!(desc.slot_table_index(51).unwrap(), 1);
         assert_eq!(desc.slot_table_index(52).unwrap(), 2);
         assert_eq!(desc.slot_table_index(53).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_table_index_child_rel_mapping_prefers_synthetic_unnamed_slot_names() {
+        let desc_tbl = make_desc_table(
+            vec![(5, None)],
+            vec![
+                (49, 5, 0, "l_returnflag", TPrimitiveType::VARCHAR),
+                (50, 5, 1, "l_linestatus", TPrimitiveType::VARCHAR),
+                (51, 5, 2, "", TPrimitiveType::DOUBLE),
+                (52, 5, 3, "", TPrimitiveType::DOUBLE),
+                (53, 5, 4, "", TPrimitiveType::BIGINT),
+                (54, 5, 5, "", TPrimitiveType::DOUBLE),
+                (55, 5, 6, "", TPrimitiveType::DOUBLE),
+                (56, 5, 7, "", TPrimitiveType::DOUBLE),
+                (57, 5, 8, "", TPrimitiveType::DOUBLE),
+                (58, 5, 9, "", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        desc.set_child_rel_column_names(vec![
+            "l_returnflag".to_string(),
+            "l_linestatus".to_string(),
+            "col_51".to_string(),
+            "col_52".to_string(),
+            "col_54".to_string(),
+            "col_58".to_string(),
+            "col_57".to_string(),
+            "col_56".to_string(),
+            "col_55".to_string(),
+            "col_53".to_string(),
+        ]);
+
+        assert_eq!(desc.slot_table_index(51).unwrap(), 2);
+        assert_eq!(desc.slot_table_index(52).unwrap(), 3);
+        assert_eq!(desc.slot_table_index(54).unwrap(), 4);
+        assert_eq!(desc.slot_table_index(58).unwrap(), 5);
+        assert_eq!(desc.slot_table_index(57).unwrap(), 6);
+        assert_eq!(desc.slot_table_index(56).unwrap(), 7);
+        assert_eq!(desc.slot_table_index(55).unwrap(), 8);
+        assert_eq!(desc.slot_table_index(53).unwrap(), 9);
     }
 
     #[test]

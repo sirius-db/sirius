@@ -1239,15 +1239,18 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, cuda_alloc_info);
 
   // sirius_register_packed_table(table_name VARCHAR, gpu_addr BIGINT, gpu_size BIGINT, metadata BLOB)
+  // sirius_register_projected_packed_table(..., projection_indices INTEGER[])
   // Unpacks a cudf::pack()'d GPU buffer and registers it as a DuckDB table.
-  // This skips the PBlock→CPU→Arrow IPC→DuckDB roundtrip entirely.
+  // The projected variant reorders/selects columns zero-copy before DuckDB
+  // sees the exchange table, which lets same-process local exchange stay on GPU
+  // while still honoring the Doris exchange contract.
   {
     struct RegisterPackedData : public TableFunctionData {
       bool finished = false;
       int64_t num_rows = 0;
       string create_table_sql;
     };
-    auto bind = [](ClientContext& ctx, TableFunctionBindInput& input,
+    auto bind_plain = [](ClientContext& ctx, TableFunctionBindInput& input,
                     vector<LogicalType>& return_types, vector<string>& names)
       -> unique_ptr<FunctionData> {
       return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
@@ -1259,21 +1262,22 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
       auto gpu_size = static_cast<size_t>(input.inputs[2].GetValue<int64_t>());
       auto md_blob = input.inputs[3].GetValueUnsafe<string>();
       auto* gpu_ptr = reinterpret_cast<uint8_t*>(gpu_addr);
+      std::vector<int32_t> projection_indices;
 
-      SIRIUS_LOG_INFO("[register_packed_table] table={} gpu=0x{:x} size={} md_size={}",
-                      table_name, gpu_addr, gpu_size, md_blob.size());
+      SIRIUS_LOG_INFO("[register_packed_table] table={} gpu=0x{:x} size={} md_size={} projection_cols={}",
+                      table_name, gpu_addr, gpu_size, md_blob.size(), projection_indices.size());
 
-      // Register via GPUBufferManager. The metadata is stored first (stable pointer),
-      // then cudf::unpack runs from the stored copy. This ensures the table_view's
-      // internal references to the metadata buffer remain valid.
       int num_cols = 0, num_rows_out = 0;
       SiriusExtension::EnsureExchangeBufferManager();
       auto& mgr = GPUBufferManager::GetInstance();
-      mgr.registerExternalTablePacked(table_name, gpu_ptr, gpu_size, std::move(md_blob),
-                                      num_cols, num_rows_out);
+      mgr.registerExternalTablePacked(table_name,
+                                      gpu_ptr,
+                                      gpu_size,
+                                      std::move(md_blob),
+                                      projection_indices,
+                                      num_cols,
+                                      num_rows_out);
 
-      // Re-unpack locally for column type inspection (CREATE TABLE SQL).
-      // Use the original md_blob — wait, it was moved. Use stored copy from manager.
       cudf::table_view view;
       string up = table_name;
       transform(up.begin(), up.end(), up.begin(), ::toupper);
@@ -1283,8 +1287,84 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
         num_cols = view.num_columns();
       }
 
-      // Build CREATE TABLE SQL for the Rust caller to execute.
-      // Cannot run ctx.Query() here (deadlocks inside table function bind).
+      string col_defs;
+      for (int c = 0; c < num_cols; c++) {
+        if (c > 0) col_defs += ", ";
+        auto col = view.column(c);
+        string dtype;
+        switch (col.type().id()) {
+          case cudf::type_id::INT8: dtype = "TINYINT"; break;
+          case cudf::type_id::INT16: dtype = "SMALLINT"; break;
+          case cudf::type_id::INT32: dtype = "INTEGER"; break;
+          case cudf::type_id::INT64: dtype = "BIGINT"; break;
+          case cudf::type_id::FLOAT32: dtype = "FLOAT"; break;
+          case cudf::type_id::FLOAT64: dtype = "DOUBLE"; break;
+          case cudf::type_id::BOOL8: dtype = "BOOLEAN"; break;
+          case cudf::type_id::STRING: dtype = "VARCHAR"; break;
+          case cudf::type_id::TIMESTAMP_DAYS: dtype = "DATE"; break;
+          case cudf::type_id::TIMESTAMP_SECONDS:
+          case cudf::type_id::TIMESTAMP_MILLISECONDS:
+          case cudf::type_id::TIMESTAMP_MICROSECONDS:
+          case cudf::type_id::TIMESTAMP_NANOSECONDS: dtype = "TIMESTAMP"; break;
+          case cudf::type_id::DECIMAL32:
+          case cudf::type_id::DECIMAL64:
+          case cudf::type_id::DECIMAL128: {
+            int prec = (col.type().id() == cudf::type_id::DECIMAL32) ? 9 :
+                       (col.type().id() == cudf::type_id::DECIMAL64) ? 18 : 38;
+            dtype = "DECIMAL(" + std::to_string(prec) + "," + std::to_string(-col.type().scale()) + ")";
+            break;
+          }
+          default: dtype = "VARCHAR"; break;
+        }
+        col_defs += "\"col_" + std::to_string(c) + "\" " + dtype;
+      }
+      result->create_table_sql = "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
+      result->num_rows = static_cast<int64_t>(num_rows_out);
+
+      return std::move(result);
+    };
+    auto bind_projected = [](ClientContext& ctx, TableFunctionBindInput& input,
+                    vector<LogicalType>& return_types, vector<string>& names)
+      -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
+      names = {"status", "num_rows", "create_table_sql"};
+
+      auto result = make_uniq<RegisterPackedData>();
+      string table_name = input.inputs[0].GetValue<string>();
+      auto gpu_addr = static_cast<uintptr_t>(input.inputs[1].GetValue<int64_t>());
+      auto gpu_size = static_cast<size_t>(input.inputs[2].GetValue<int64_t>());
+      auto md_blob = input.inputs[3].GetValueUnsafe<string>();
+      auto* gpu_ptr = reinterpret_cast<uint8_t*>(gpu_addr);
+      std::vector<int32_t> projection_indices;
+      auto& children = ListValue::GetChildren(input.inputs[4]);
+      projection_indices.reserve(children.size());
+      for (auto& child : children) {
+        projection_indices.push_back(IntegerValue::Get(child));
+      }
+
+      SIRIUS_LOG_INFO("[register_packed_table] table={} gpu=0x{:x} size={} md_size={} projection_cols={}",
+                      table_name, gpu_addr, gpu_size, md_blob.size(), projection_indices.size());
+
+      int num_cols = 0, num_rows_out = 0;
+      SiriusExtension::EnsureExchangeBufferManager();
+      auto& mgr = GPUBufferManager::GetInstance();
+      mgr.registerExternalTablePacked(table_name,
+                                      gpu_ptr,
+                                      gpu_size,
+                                      std::move(md_blob),
+                                      projection_indices,
+                                      num_cols,
+                                      num_rows_out);
+
+      cudf::table_view view;
+      string up = table_name;
+      transform(up.begin(), up.end(), up.begin(), ::toupper);
+      auto it = mgr.tables.find(up);
+      if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
+        view = it->second->pending_views.back();
+        num_cols = view.num_columns();
+      }
+
       string col_defs;
       for (int c = 0; c < num_cols; c++) {
         if (c > 0) col_defs += ", ";
@@ -1332,9 +1412,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     };
     TableFunction reg_packed("sirius_register_packed_table",
                               {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BLOB},
-                              func, bind);
+                              func, bind_plain);
     CreateTableFunctionInfo reg_packed_info(reg_packed);
     catalog.CreateTableFunction(transaction, reg_packed_info);
+
+    TableFunction reg_projected_packed("sirius_register_projected_packed_table",
+                              {LogicalType::VARCHAR,
+                               LogicalType::BIGINT,
+                               LogicalType::BIGINT,
+                               LogicalType::BLOB,
+                               LogicalType::LIST(LogicalType::INTEGER)},
+                              func, bind_projected);
+    CreateTableFunctionInfo reg_projected_packed_info(reg_projected_packed);
+    catalog.CreateTableFunction(transaction, reg_projected_packed_info);
   }
 
   // sirius_set_staging_buffer(addr BIGINT, size BIGINT) — tells the result
