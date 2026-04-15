@@ -69,7 +69,10 @@ Plans:
   2. `convertible_gpu_pipeline_task_provider::get_next_convertible()` uses `mutable_pop_if` with `front_to_back=false`, matching tasks whose `gpu_pipeline_task_local_state` data_batches are in the target `memory_space` and `batch_state::task_created`
   3. On conversion failure or exception, all `data_batch` objects inside `operator_data` retain their original `idata_representation` and `batch_state`; the task is always returned to the queue via RAII destructor
   4. `bytes_in_space()` returns the total byte size across all data_batches in the task's operator_data for the given memory space
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 07-01-PLAN.md — Implement convertible_gpu_pipeline_task and convertible_gpu_pipeline_task_provider
+- [ ] 07-02-PLAN.md — GPU integration tests for task queue conversion
 
 ## Progress
 
@@ -84,7 +87,7 @@ Phases execute in numeric order: 5 -> 6 -> 7
 | 4. Queue Integration | v1.1 | 1/1 | Complete | 2026-04-14 |
 | 5. State Machine & Interfaces | v2.0 | 0/2 | Planning complete | - |
 | 6. Batch Conversion | v2.0 | 0/2 | Planning complete | - |
-| 7. Task Queue Conversion | v2.0 | 0/? | Not started | - |
+| 7. Task Queue Conversion | v2.0 | 0/2 | Planning complete | - |
 
 ---
 *Full v1.0 details archived to `.planning/milestones/v1.0-ROADMAP.md`*
