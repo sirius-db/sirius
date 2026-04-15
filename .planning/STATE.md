@@ -1,44 +1,42 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.1
-milestone_name: Task Queue Refactor
-status: executing
-stopped_at: Completed 04-01-PLAN.md
-last_updated: "2026-04-14T19:16:47.918Z"
-last_activity: 2026-04-14
+milestone: v2.0
+milestone_name: Convertible Data Abstraction
+status: defining_requirements
+stopped_at: null
+last_updated: "2026-04-15"
+last_activity: 2026-04-15
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 2
-  completed_plans: 2
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-14)
+See: .planning/PROJECT.md (updated 2026-04-15)
 
-**Core value:** Thread-safe queue with predicate-based element inspection and selective removal
-**Current focus:** Phase 04 — queue-integration
+**Core value:** Uniform, failure-safe data conversion across memory tiers
+**Current focus:** Defining requirements for v2.0
 
 ## Current Position
 
-Phase: 04
-Plan: Not started
-Status: Executing Phase 04
-Last activity: 2026-04-14
-
-Progress: [░░░░░░░░░░] 0%
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-04-15 — Milestone v2.0 started
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 5 (from v1.0)
-- Average duration: ~23 min
-- Total execution time: ~1.1 hours
+- Total plans completed: 5 (from v1.0) + 2 (from v1.1) = 7
+- Average duration: ~20 min
+- Total execution time: ~1.7 hours
 
 **By Phase:**
 
@@ -46,10 +44,8 @@ Progress: [░░░░░░░░░░] 0%
 |-------|-------|-------|----------|
 | 1. Core Queue | 2 | ~46 min | ~23 min |
 | 2. Predicate Inspection | 1 | ~23 min | ~23 min |
-| Phase 03 P01 | 16min | 2 tasks | 9 files |
-| 03 | 1 | - | - |
-| Phase 04 P01 | 16min | 2 tasks | 2 files |
-| 04 | 1 | - | - |
+| 3. Dead Code Removal | 1 | ~16 min | ~16 min |
+| 4. Queue Integration | 1 | ~16 min | ~16 min |
 
 ## Accumulated Context
 
@@ -58,10 +54,12 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- Dead code removal before integration (simplifies codebase first)
-- Existing tests must pass; no new tests required for v1.1
-- [Phase 03]: Removed only README CLI example for [pipeline_queue] tag, not the test itself -- tag tests pipeline_executor behavior via interruptible_mpmc
-- [Phase 04]: Used static_cast<void> for [[nodiscard]] push() discard in schedule() -- fire-and-forget semantics
+- memory_space* for all memory space parameters (non-copyable type)
+- Converter registry accessed via singleton internally
+- Return std::unique_ptr<convertible_data> from providers
+- convertible_gpu_pipeline_task uses RAII: mutable_pop_if to take ownership, destructor pushes back (back position — original order lost)
+- Extend data_batch state machine: task_created → in_transit transition
+- Failure safety: save/restore batch_state pattern from downgrade_task::execute applied to all conversion paths
 
 ### Pending Todos
 
@@ -73,6 +71,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-04-14T18:57:19.843Z
-Stopped at: Completed 04-01-PLAN.md
-Resume with: `/gsd-plan-phase 3`
+Last session: 2026-04-15
+Stopped at: Milestone v2.0 started, defining requirements
+Resume with: Continue requirements definition

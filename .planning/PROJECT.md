@@ -1,12 +1,24 @@
-# inspectable_mpsc
+# inspectable_mpsc & Convertible Data
 
 ## What This Is
 
-A new thread-safe queue class (`inspectable_mpsc<T>`) for the Sirius GPU SQL engine that supports multiple producers and a single consumer, with the ability to inspect and selectively remove elements by predicate. It lives alongside the existing `interruptible_mpmc` in `sirius::exec` and uses `std::unique_ptr<T>` ownership semantics.
+Thread-safe data infrastructure for the Sirius GPU SQL engine. Started as `inspectable_mpsc<T>` — a predicate-inspectable MPSC queue now integrated as the production task queue. Expanding to include `convertible_data` abstractions that enable uniform memory-space conversion across data batches and queued pipeline tasks.
 
 ## Core Value
 
-Thread-safe queue with predicate-based element inspection and selective removal (`pop_if`/`get_if`), enabling consumers to find specific items without draining the queue.
+Thread-safe queue with predicate-based element inspection and selective removal (`pop_if`/`get_if`), enabling consumers to find specific items without draining the queue. Extended by convertible_data interfaces that provide uniform, failure-safe data conversion across memory tiers.
+
+## Current Milestone: v2.0 Convertible Data Abstraction
+
+**Goal:** Create abstract interfaces and concrete implementations for memory-space-aware data conversion, enabling uniform conversion of data batches and queued pipeline tasks.
+
+**Target features:**
+- `convertible_data` abstract interface — uniform `convert()` + `bytes_in_space()` API
+- `convertible_data_provider` abstract interface — search/iterate convertible items by memory space
+- `convertible_data_batch` + `convertible_data_batch_provider` — wrap `data_batch` / `data_repository`
+- `convertible_gpu_pipeline_task` + `convertible_gpu_pipeline_task_provider` — wrap `gpu_pipeline_task` / `inspectable_mpsc<itask>`
+- Extend `data_batch` state machine: `task_created → in_transit` transition
+- Failure safety: all conversions restore original `batch_state` and `idata_representation` on failure
 
 ## Requirements
 
@@ -39,7 +51,14 @@ Validated in Phase 4: Queue Integration — v1.1
 
 ### Active
 
-(No active requirements — start next milestone with `/gsd-new-milestone`)
+- [ ] `convertible_data` abstract interface with `convert()` and `bytes_in_space()`
+- [ ] `convertible_data_provider` abstract interface with `get_next_convertible()`, `get_all_convertible()`, `get_bytes_in_space()`
+- [ ] `convertible_data_batch` wrapping `data_batch` with downgrade-style conversion
+- [ ] `convertible_data_batch_provider` wrapping `data_repository`
+- [ ] `convertible_gpu_pipeline_task` wrapping `gpu_pipeline_task` with RAII queue ownership
+- [ ] `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
+- [ ] Extend `data_batch` state machine: `task_created → in_transit` transition
+- [ ] Failure safety: conversions restore original `batch_state` and `idata_representation` on failure
 
 ### Out of Scope
 
@@ -49,9 +68,9 @@ Validated in Phase 4: Queue Integration — v1.1
 
 ## Current State
 
-**v1.1 Task Queue Refactor** — SHIPPED 2026-04-14
+**v2.0 Convertible Data Abstraction** — STARTED 2026-04-15
 
-All milestones complete. `inspectable_mpsc<T>` is fully implemented and integrated into the Sirius production task queue infrastructure.
+Building memory-space-aware data conversion interfaces on top of the `inspectable_mpsc<T>` foundation shipped in v1.1.
 
 ## Context
 
@@ -104,4 +123,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after v1.1 milestone*
+*Last updated: 2026-04-15 after v2.0 milestone start*
