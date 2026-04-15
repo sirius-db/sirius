@@ -43,8 +43,8 @@
   4. `convertible_data_provider` declares pure virtual `get_next_convertible()`, `get_all_convertible()`, and `get_bytes_in_space()` that compile and can be subclassed
 **Plans:** 2 plans
 Plans:
-- [ ] 05-01-PLAN.md — Formalize state machine transitions and add round-trip tests
-- [ ] 05-02-PLAN.md — Define convertible_data and convertible_data_provider abstract interfaces
+- [x] 05-01-PLAN.md — Formalize state machine transitions and add round-trip tests
+- [x] 05-02-PLAN.md — Define convertible_data and convertible_data_provider abstract interfaces
 
 ### Phase 6: Batch Conversion
 **Goal**: Data batches in a repository can be discovered by memory space and converted with failure safety
