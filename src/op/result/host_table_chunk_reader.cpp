@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <helper/type_conversions.hpp>
 #include <helper/utils.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 
@@ -221,8 +222,10 @@ void host_table_chunk_reader::column_reader::copy_string(
 host_table_chunk_reader::host_table_chunk_reader(
   duckdb::ClientContext& client_ctx,
   cucascade::host_data_representation const& host_table,
-  duckdb::vector<duckdb::LogicalType> const& types_p)
-  : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
+  duckdb::vector<sirius::logical_type> const& types_p)
+  : _client_ctx(client_ctx),
+    _allocation(host_table.get_host_table()->allocation),
+    _types(sirius::to_duckdb_vec(types_p))
 {
   if (!host_table.get_host_table().get()) {
     throw std::runtime_error(

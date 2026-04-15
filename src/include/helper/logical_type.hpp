@@ -1,0 +1,273 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace sirius {
+
+//===----------------------------------------------------------------------===//
+// type_id
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Sirius SQL type identifiers — independent of DuckDB and cuDF.
+ *
+ * Covers all SQL types currently supported by the Sirius GPU engine.
+ * For DECIMAL, precision and scale are carried separately in logical_type.
+ */
+enum class type_id : uint8_t {
+  INVALID = 0,
+  SQLNULL,
+  BOOLEAN,
+  TINYINT,
+  SMALLINT,
+  INTEGER,
+  BIGINT,
+  HUGEINT,
+  UTINYINT,
+  USMALLINT,
+  UINTEGER,
+  UBIGINT,
+  UHUGEINT,
+  FLOAT,
+  DOUBLE,
+  DATE,
+  TIMESTAMP_SEC,
+  TIMESTAMP_MS,
+  TIMESTAMP,  ///< microsecond precision (default SQL TIMESTAMP)
+  TIMESTAMP_NS,
+  VARCHAR,
+  STRUCT,
+  LIST,
+  DECIMAL,
+};
+
+//===----------------------------------------------------------------------===//
+// logical_type
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Sirius-native SQL type descriptor.
+ *
+ * A lightweight, copyable value type that carries:
+ * - The base SQL type via sirius::type_id
+ * - For DECIMAL: precision (total significant digits) and scale (fractional digits)
+ *
+ * No DuckDB or cuDF headers are required. Use type_conversions.hpp at the
+ * DuckDB boundaries (plan generator entry / result collector exit).
+ */
+class logical_type {
+ public:
+  //===--------------------------------------------------------------------===//
+  // Constructors / factories
+  //===--------------------------------------------------------------------===//
+
+  /// Default-constructs a SQLNULL type (used as a sentinel/placeholder).
+  logical_type() : _id(type_id::SQLNULL), _precision(0), _scale(0) {}
+
+  /**
+   * @brief Construct a non-DECIMAL logical type.
+   * @param id  The SQL type identifier (must not be DECIMAL).
+   */
+  static logical_type make(type_id id) { return logical_type(id, 0, 0); }
+
+  /**
+   * @brief Construct a DECIMAL logical type with full precision and scale.
+   * @param precision  Total significant digits (1–38).
+   * @param scale      Fractional digits (0–precision).
+   */
+  static logical_type make_decimal(uint8_t precision, uint8_t scale)
+  {
+    return logical_type(type_id::DECIMAL, precision, scale);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Type inspection
+  //===--------------------------------------------------------------------===//
+
+  /// Returns the base SQL type identifier.
+  type_id id() const noexcept { return _id; }
+
+  /// Returns true if this is a DECIMAL type.
+  bool is_decimal() const noexcept { return _id == type_id::DECIMAL; }
+
+  /// Returns true if this is a VARCHAR (variable-length string) type.
+  bool is_varchar() const noexcept { return _id == type_id::VARCHAR; }
+
+  /// Returns true if this is an integer type (signed or unsigned, including HUGEINT variants).
+  bool is_integer() const noexcept
+  {
+    switch (_id) {
+      case type_id::TINYINT:
+      case type_id::SMALLINT:
+      case type_id::INTEGER:
+      case type_id::BIGINT:
+      case type_id::HUGEINT:
+      case type_id::UTINYINT:
+      case type_id::USMALLINT:
+      case type_id::UINTEGER:
+      case type_id::UBIGINT:
+      case type_id::UHUGEINT: return true;
+      default: return false;
+    }
+  }
+
+  /// Returns true if this is a numeric type (integer, float, double, or decimal).
+  bool is_numeric() const noexcept
+  {
+    return is_integer() || _id == type_id::FLOAT || _id == type_id::DOUBLE ||
+           _id == type_id::DECIMAL;
+  }
+
+  /// Returns true if this is a date or timestamp type (any precision).
+  bool is_temporal() const noexcept
+  {
+    switch (_id) {
+      case type_id::DATE:
+      case type_id::TIMESTAMP_SEC:
+      case type_id::TIMESTAMP_MS:
+      case type_id::TIMESTAMP:
+      case type_id::TIMESTAMP_NS: return true;
+      default: return false;
+    }
+  }
+
+  /**
+   * @brief Returns true for types with a fixed, known storage size.
+   *
+   * All types except VARCHAR (variable-length), STRUCT (nested), SQLNULL, and INVALID.
+   * Unlike fixed_width_byte_size(), this does NOT throw — safe to use in predicates.
+   */
+  bool is_fixed_width() const noexcept
+  {
+    return _id != type_id::VARCHAR && _id != type_id::STRUCT && _id != type_id::LIST &&
+           _id != type_id::SQLNULL && _id != type_id::INVALID;
+  }
+
+  /**
+   * @brief Returns the total number of significant digits for a DECIMAL type.
+   * @note Only meaningful when is_decimal() == true.
+   */
+  uint8_t decimal_precision() const noexcept { return _precision; }
+
+  /**
+   * @brief Returns the number of fractional digits for a DECIMAL type.
+   * @note Only meaningful when is_decimal() == true.
+   */
+  uint8_t decimal_scale() const noexcept { return _scale; }
+
+  /**
+   * @brief Returns the storage size in bytes for fixed-width types.
+   *
+   * Replaces `duckdb::GetTypeIdSize(type.InternalType())` for fixed-width dispatch.
+   * Returns 0 for VARCHAR (variable-length). Throws for STRUCT, INVALID, and SQLNULL.
+   */
+  std::size_t fixed_width_byte_size() const
+  {
+    switch (_id) {
+      case type_id::BOOLEAN:
+      case type_id::TINYINT:
+      case type_id::UTINYINT: return 1;
+      case type_id::SMALLINT:
+      case type_id::USMALLINT: return 2;
+      case type_id::INTEGER:
+      case type_id::UINTEGER:
+      case type_id::FLOAT:
+      case type_id::DATE: return 4;
+      case type_id::BIGINT:
+      case type_id::UBIGINT:
+      case type_id::HUGEINT:   // cuDF maps HUGEINT → INT64
+      case type_id::UHUGEINT:  // cuDF maps UHUGEINT → UINT64
+      case type_id::DOUBLE:
+      case type_id::TIMESTAMP_SEC:
+      case type_id::TIMESTAMP_MS:
+      case type_id::TIMESTAMP:
+      case type_id::TIMESTAMP_NS: return 8;
+      case type_id::DECIMAL:
+        if (_precision <= 9) return 4;   // DECIMAL32
+        if (_precision <= 18) return 8;  // DECIMAL64
+        return 16;                       // DECIMAL128
+      case type_id::VARCHAR: return 0;   // variable-length
+      case type_id::LIST:
+      case type_id::STRUCT:
+      case type_id::SQLNULL:
+      case type_id::INVALID:
+      default:
+        throw std::runtime_error("fixed_width_byte_size: not applicable for type " + to_string());
+    }
+  }
+
+  /// Returns a human-readable name for the type (for error messages / logging).
+  std::string to_string() const
+  {
+    switch (_id) {
+      case type_id::INVALID: return "INVALID";
+      case type_id::SQLNULL: return "NULL";
+      case type_id::BOOLEAN: return "BOOLEAN";
+      case type_id::TINYINT: return "TINYINT";
+      case type_id::SMALLINT: return "SMALLINT";
+      case type_id::INTEGER: return "INTEGER";
+      case type_id::BIGINT: return "BIGINT";
+      case type_id::HUGEINT: return "HUGEINT";
+      case type_id::UTINYINT: return "UTINYINT";
+      case type_id::USMALLINT: return "USMALLINT";
+      case type_id::UINTEGER: return "UINTEGER";
+      case type_id::UBIGINT: return "UBIGINT";
+      case type_id::UHUGEINT: return "UHUGEINT";
+      case type_id::FLOAT: return "FLOAT";
+      case type_id::DOUBLE: return "DOUBLE";
+      case type_id::DATE: return "DATE";
+      case type_id::TIMESTAMP_SEC: return "TIMESTAMP_S";
+      case type_id::TIMESTAMP_MS: return "TIMESTAMP_MS";
+      case type_id::TIMESTAMP: return "TIMESTAMP";
+      case type_id::TIMESTAMP_NS: return "TIMESTAMP_NS";
+      case type_id::VARCHAR: return "VARCHAR";
+      case type_id::STRUCT: return "STRUCT";
+      case type_id::LIST: return "LIST";
+      case type_id::DECIMAL:
+        return "DECIMAL(" + std::to_string(_precision) + "," + std::to_string(_scale) + ")";
+      default: return "UNKNOWN";
+    }
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Comparison
+  //===--------------------------------------------------------------------===//
+
+  bool operator==(const logical_type& other) const noexcept
+  {
+    return _id == other._id && _precision == other._precision && _scale == other._scale;
+  }
+
+  bool operator!=(const logical_type& other) const noexcept { return !(*this == other); }
+
+ private:
+  explicit logical_type(type_id id, uint8_t precision, uint8_t scale)
+    : _id(id), _precision(precision), _scale(scale)
+  {
+  }
+
+  type_id _id;
+  uint8_t _precision{0};  ///< Meaningful only for DECIMAL: total significant digits (1–38)
+  uint8_t _scale{0};      ///< Meaningful only for DECIMAL: fractional digits (0–precision)
+};
+
+}  // namespace sirius
