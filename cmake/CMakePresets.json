@@ -25,6 +25,10 @@
       "name": "clang-relwithdebinfo"
     },
     {
+      "configurePreset": "legacy-release",
+      "name": "legacy-release"
+    },
+    {
       "configurePreset": "vcpkg-debug",
       "name": "vcpkg-debug"
     },
@@ -130,6 +134,14 @@
       "displayName": "Clang RelWithDebInfo",
       "inherits": "base-clang",
       "name": "clang-relwithdebinfo"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/legacy-release",
+      "cacheVariables": {
+        "ENABLE_LEGACY_SIRIUS": "ON"
+      },
+      "inherits": "release",
+      "name": "legacy-release"
     },
     {
       "cacheVariables": {
