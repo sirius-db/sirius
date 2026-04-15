@@ -55,7 +55,10 @@ Plans:
   2. `convertible_data_batch_provider` iterates a `shared_data_repository` partitions last-to-first, batches last-to-first, filtering by `idle` state and matching `memory_space`, returning wrapped `convertible_data_batch` instances
   3. On conversion failure or exception, the batch retains its original `idata_representation` and `batch_state` is restored via `try_to_release_in_transit(prev_state)` — never left in `in_transit`
   4. `bytes_in_space()` returns the correct byte size for a wrapped data_batch in the given memory space
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 06-01-PLAN.md — Implement convertible_data_batch and convertible_data_batch_provider
+- [ ] 06-02-PLAN.md — GPU integration tests for batch conversion and provider discovery
 
 ### Phase 7: Task Queue Conversion
 **Goal**: Queued pipeline tasks can be discovered by memory space, temporarily owned for conversion, and safely returned to the queue
@@ -71,7 +74,7 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 5 → 6 → 7
+Phases execute in numeric order: 5 -> 6 -> 7
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -80,7 +83,7 @@ Phases execute in numeric order: 5 → 6 → 7
 | 3. Dead Code Removal | v1.1 | 1/1 | Complete | 2026-04-14 |
 | 4. Queue Integration | v1.1 | 1/1 | Complete | 2026-04-14 |
 | 5. State Machine & Interfaces | v2.0 | 0/2 | Planning complete | - |
-| 6. Batch Conversion | v2.0 | 0/? | Not started | - |
+| 6. Batch Conversion | v2.0 | 0/2 | Planning complete | - |
 | 7. Task Queue Conversion | v2.0 | 0/? | Not started | - |
 
 ---
