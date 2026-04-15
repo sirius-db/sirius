@@ -21,7 +21,6 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
-#include "sirius/exception.hpp"
 
 #include <cudf/search.hpp>
 
@@ -41,8 +40,8 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(sirius_physical_o
 sirius_physical_sort_partition::sirius_physical_sort_partition(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
-  duckdb::vector<std::size_t> projections_p,
-  std::size_t estimated_cardinality)
+  duckdb::vector<duckdb::idx_t> projections_p,
+  duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_PARTITION, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
@@ -54,15 +53,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input_data.get_data_batches();
 
   // If no sample operator or only 1 partition, pass through
   if (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1) {
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<operator_data>(input_data);
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
@@ -80,7 +78,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
 
   for (auto const& ord : orders) {
     if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw not_implemented_exception("Sort partition only supports bound reference expressions");
+      throw duckdb::NotImplementedException(
+        "Sort partition only supports bound reference expressions");
     }
     auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     order_key_idx.push_back(idx);
@@ -162,7 +161,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     num_parts,
     duration.count() / 1000.0);
 
-  return std::make_unique<pipelineable_operator_data>(output_batches);
+  return std::make_unique<operator_data>(output_batches);
 }
 
 void sirius_physical_sort_partition::finalize_operator()

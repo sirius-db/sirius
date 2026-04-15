@@ -30,7 +30,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::SORT_SAMPLE;
 
-  static constexpr std::size_t DEFAULT_NUM_SAMPLE_BATCHES = 5;
+  static constexpr duckdb::idx_t DEFAULT_NUM_SAMPLE_BATCHES = 5;
 
   //! Maximum fraction of available GPU memory per partition (33%)
   static constexpr double MAX_PARTITION_MEMORY_FRACTION = 0.33;
@@ -39,23 +39,23 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   sirius_physical_sort_sample(duckdb::vector<duckdb::LogicalType> types,
                               duckdb::vector<duckdb::BoundOrderByNode> orders,
-                              std::size_t estimated_cardinality,
-                              std::size_t num_sample_batches = DEFAULT_NUM_SAMPLE_BATCHES);
+                              duckdb::idx_t estimated_cardinality,
+                              duckdb::idx_t num_sample_batches = DEFAULT_NUM_SAMPLE_BATCHES);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
 
   //! Number of batches to sample before computing partition boundaries
-  std::size_t num_sample_batches;
+  duckdb::idx_t num_sample_batches;
 
  public:
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }
 
-  sirius::OrderPreservationType source_order() const override
+  duckdb::OrderPreservationType source_order() const override
   {
-    return sirius::OrderPreservationType::FIXED_ORDER;
+    return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
@@ -71,7 +71,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   size_t get_num_partitions() const { return _num_partitions; }
 
   //! Whether boundaries have been computed
-  bool boundaries_computed() const { return _boundary_state.load(std::memory_order_acquire) == 2; }
+  bool boundaries_computed() const { return _boundaries_computed.load(); }
 
   //! Override the maximum bytes per partition (0 = use default GPU memory-based calculation)
   void set_max_partition_bytes(size_t bytes) { _max_partition_bytes_override = bytes; }
@@ -86,10 +86,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;
 
-  //! Boundary computation state: 0 = not started, 1 = computing, 2 = done.
-  //! compare_exchange on this elects exactly one task as the winner; all others
-  //! passthrough without blocking.
-  std::atomic<int> _boundary_state{0};
+  //! Whether partition boundaries have been computed
+  std::atomic<bool> _boundaries_computed{false};
 
   //! Override for max partition bytes (0 = use default GPU memory-based calculation)
   size_t _max_partition_bytes_override = 0;

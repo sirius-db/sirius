@@ -39,18 +39,18 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
   sirius_physical_column_data_scan(
     duckdb::vector<duckdb::LogicalType> types,
     SiriusPhysicalOperatorType op_type,
-    std::size_t estimated_cardinality,
+    duckdb::idx_t estimated_cardinality,
     duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection);
 
   sirius_physical_column_data_scan(duckdb::vector<duckdb::LogicalType> types,
                                    SiriusPhysicalOperatorType op_type,
-                                   std::size_t estimated_cardinality,
-                                   std::size_t cte_index);
+                                   duckdb::idx_t estimated_cardinality,
+                                   duckdb::idx_t cte_index);
 
   //! (optionally owned) column data collection to scan
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection;
 
-  std::size_t cte_index;
+  duckdb::idx_t cte_index;
 
   duckdb::optional_idx delim_index;
 

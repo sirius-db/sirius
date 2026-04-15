@@ -7,9 +7,6 @@ requires-pixi = ">=0.59"
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
 
-[activation.env]
-SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
-
 [dependencies]
 bc = "*"
 cmake = "4.1.*"
@@ -18,22 +15,21 @@ cuda-nvml-dev = "*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
-sccache = ">=0.14"
+sccache = "*"
 unzip = "*"
 clang = ">=21,<22"
 wget = "*"
-pre-commit = "*"
-clang-tools = ">=21.1.8,<22"
-pkg-config = "*"
-mold = "*"
-
-[feature.dev-libs.dependencies]
+libcudf = "26.02.*"
 librmm = "*"
 libcurand-dev = "*"
-yaml-cpp = "*"
+pre-commit = "*"
+libconfig = "*"
 libabseil = ">=20260107.0"
 duckdb = "=1.4.4"
+clang-tools = ">=21.1.8,<22"
 spdlog = "1.8.*"
+pkg-config = "*"
+mold = "*"
 sqlite = ">=3.52.0,<4"
 
 [tasks]
@@ -44,36 +40,20 @@ cuda = "13"
 
 [feature.cuda13.dependencies]
 cuda-version = "13.*"
-libcudf = "26.04.*"
 
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
 CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
-VCPKG_CUDA_VERSION = "13"
 
 [feature.cuda12.system-requirements]
 cuda = "12"
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
-libcudf = "26.04.*"
 
 [feature.cuda12.activation.env]
 # GPU architectures: Turing through Hopper (75, 80, 86, 90a)
 CUDAARCHS = "75-real;80-real;86-real;90a-real"
-VCPKG_CUDA_VERSION = "12"
-
-[feature.vcpkg.dependencies]
-bison = "*"
-libnvjitlink-dev = "*"
-cuda-nvrtc-dev = "*"
-libcurand-dev = "*"
-flex = "*"
-patchelf = "*"
-zip = "*"
-
-[feature.vcpkg.activation]
-scripts = ["scripts/vcpkg.sh"]
 
 [feature.duckdb-python.dependencies]
 pip = "*"
@@ -85,18 +65,7 @@ setuptools-scm = ">=8.0"
 [feature.duckdb-python.tasks]
 build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
 
-# Lightweight env for running nightly cudf builds (no build deps needed)
-[feature.nightly-runner.dependencies]
-pixi = "*"
-
-[feature.nightly-runner.tasks]
-nightly-shell = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi shell --manifest-path envs/nightly/pixi.toml"
-nightly-run = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi run --manifest-path envs/nightly/pixi.toml"
-
 [environments]
-default = ["dev-libs", "cuda13"]
-cuda12 = ["dev-libs", "cuda12"]
+default = ["cuda13"]
+cuda12 = ["cuda12"]
 duckdb-python = ["duckdb-python"]
-vcpkg = ["vcpkg", "cuda13"]
-vcpkg-cuda12 = ["vcpkg", "cuda12"]
-nightly-runner = { features = ["nightly-runner"], no-default-feature = true }

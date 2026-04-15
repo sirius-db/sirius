@@ -28,7 +28,6 @@
 using namespace duckdb;
 using namespace sirius::op;
 using sirius::op::operator_data;
-using sirius::op::pipelineable_operator_data;
 using namespace cucascade;
 using namespace cucascade::memory;
 
@@ -146,17 +145,15 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
     static_cast<int>(std::max(std::size_t(1), estimated_cardinality_bytes / partition_size));
   partitioner.set_num_partitions(num_partitions);
 
-  auto outputs = partitioner.execute(pipelineable_operator_data({input_batch}), default_stream());
+  auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
 
   std::size_t expected_num_partitions = static_cast<std::size_t>(num_partitions);
 
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() ==
-          expected_num_partitions);
+  REQUIRE(outputs->get_data_batches().size() == expected_num_partitions);
 
   // count the number of rows in each output and make sure it's the same and the initial inputs
   std::size_t total_num_rows = 0;
-  for (auto& output :
-       dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
+  for (auto& output : outputs->get_data_batches()) {
     total_num_rows += output->get_data()->cast<gpu_table_representation>().get_table().num_rows();
   }
   REQUIRE(total_num_rows == num_values);
@@ -279,17 +276,15 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
     static_cast<int>(std::max(std::size_t(1), estimated_cardinality_bytes / partition_size));
   partitioner.set_num_partitions(num_partitions);
 
-  auto outputs = partitioner.execute(pipelineable_operator_data({input_batch}), default_stream());
+  auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
 
   std::size_t expected_num_partitions = static_cast<std::size_t>(num_partitions);
 
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() ==
-          expected_num_partitions);
+  REQUIRE(outputs->get_data_batches().size() == expected_num_partitions);
 
   // count the number of rows in each output and make sure it's the same and the initial inputs
   std::size_t total_num_rows = 0;
-  for (auto& output :
-       dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
+  for (auto& output : outputs->get_data_batches()) {
     std::size_t num_rows_out =
       output->get_data()->cast<gpu_table_representation>().get_table().num_rows();
     REQUIRE(num_rows_out % prime_repeater ==
@@ -366,10 +361,9 @@ TEST_CASE(
     std::size_t(1), estimated_cardinality_bytes / sirius::config::DEFAULT_HASH_PARTITION_BYTES));
   partitioner.set_num_partitions(num_partitions);
 
-  auto outputs = partitioner.execute(pipelineable_operator_data({input_batch}), default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs)
-            .get_data_batches()[0]
+  auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches()[0]
             ->get_data()
             ->cast<gpu_table_representation>()
             .get_table()

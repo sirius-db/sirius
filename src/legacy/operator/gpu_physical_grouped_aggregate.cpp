@@ -24,7 +24,6 @@
 #include "utils.hpp"
 
 namespace duckdb {
-using sirius::AggregationType;
 
 template <typename T>
 shared_ptr<GPUColumn> ResolveTypeCombineColumns(shared_ptr<GPUColumn> column1,

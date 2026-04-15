@@ -715,20 +715,6 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
 
-static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto value = StringValue::Get(parameter);
-  if (value != "materialize" && value != "ast_interpret" && value != "ast_jit") {
-    throw InvalidInputException(
-      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
-      "ast_jit",
-      value);
-  }
-  Config::EXPRESSION_EXECUTOR_STRATEGY = std::move(value);
-  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
-                   Config::EXPRESSION_EXECUTOR_STRATEGY);
-}
-
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::USE_CUSTOM_TOP_N = BooleanValue::Get(parameter);
@@ -909,14 +895,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_CUDF_EXPR),
                             SetUseCudfExpr);
-
-  config.AddExtensionOption(
-    "expression_executor_strategy",
-    "Strategy for the experimental gpu_expression_executor: 'materialize', 'ast_interpret', or "
-    "'ast_jit'",
-    LogicalType::VARCHAR,
-    Value(Config::EXPRESSION_EXECUTOR_STRATEGY),
-    SetExpressionExecutorStrategy);
 
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",

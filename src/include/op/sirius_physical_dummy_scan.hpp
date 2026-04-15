@@ -28,7 +28,7 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
 
  public:
   explicit sirius_physical_dummy_scan(duckdb::vector<duckdb::LogicalType> types,
-                                      std::size_t estimated_cardinality)
+                                      duckdb::idx_t estimated_cardinality)
     : sirius_physical_operator(
         SiriusPhysicalOperatorType::DUMMY_SCAN, std::move(types), estimated_cardinality)
   {

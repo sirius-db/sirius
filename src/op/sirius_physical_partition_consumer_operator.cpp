@@ -24,7 +24,7 @@ sirius_physical_partition_consumer_operator::~sirius_physical_partition_consumer
 void sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
   std::string_view port_id,
   std::shared_ptr<::cucascade::data_batch> batch,
-  std::size_t partition_idx)
+  duckdb::idx_t partition_idx)
 {
   auto* p = get_port(port_id);
   if (p && p->repo) { p->repo->add_data_batch(batch, partition_idx); }

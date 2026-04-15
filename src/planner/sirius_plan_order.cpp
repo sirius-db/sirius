@@ -27,11 +27,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
 
   auto plan = create_plan(*op.children[0]);
   if (!op.orders.empty()) {
-    duckdb::vector<std::size_t> projection_map;
+    duckdb::vector<duckdb::idx_t> projection_map;
     if (op.HasProjectionMap()) {
       projection_map = std::move(op.projection_map);
     } else {
-      for (std::size_t i = 0; i < plan->types.size(); i++) {
+      for (duckdb::idx_t i = 0; i < plan->types.size(); i++) {
         projection_map.push_back(i);
       }
     }

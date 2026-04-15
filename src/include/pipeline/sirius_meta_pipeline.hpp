@@ -16,8 +16,7 @@
 
 #pragma once
 
-#include "common/optional_ptr.hpp"
-#include "common/reference_map.hpp"
+#include "duckdb/common/reference_map.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -56,7 +55,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! Create a sirius_meta_pipeline with the given sink
   sirius_meta_pipeline(sirius_engine& engine,
                        sirius_pipeline_build_state& state,
-                       sirius::optional_ptr<op::sirius_physical_operator> sink);
+                       duckdb::optional_ptr<op::sirius_physical_operator> sink);
 
  public:
   //! Get the gpu_executor for this sirius_meta_pipeline
@@ -64,9 +63,9 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! Get the pipeline_build_state for this sirius_meta_pipeline
   sirius_pipeline_build_state& get_state() const;
   //! Get the sink operator for this sirius_meta_pipeline
-  sirius::optional_ptr<op::sirius_physical_operator> get_sink() const;
+  duckdb::optional_ptr<op::sirius_physical_operator> get_sink() const;
   //! Get the parent pipeline
-  sirius::optional_ptr<sirius_pipeline> get_parent() const;
+  duckdb::optional_ptr<sirius_pipeline> get_parent() const;
 
   //! Get the initial pipeline of this sirius_meta_pipeline
   duckdb::shared_ptr<sirius_pipeline>& get_base_pipeline();
@@ -79,7 +78,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! Recursively gets the last child added
   sirius_meta_pipeline& get_last_child();
   //! Get the dependencies (within this sirius_meta_pipeline) of the given Pipeline
-  const duckdb::vector<std::reference_wrapper<sirius_pipeline>>* get_dependencies(
+  duckdb::optional_ptr<const duckdb::vector<duckdb::reference<sirius_pipeline>>> get_dependencies(
     sirius_pipeline& dependent) const;
   //! Whether the sink of this pipeline is a join build
   MetaPipelineType Type() const;
@@ -102,7 +101,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! Whether the pipeline needs its own PipelineFinishEvent
   bool has_finish_event(sirius_pipeline& pipeline) const;
   //! Whether this pipeline is part of a PipelineFinishEvent
-  sirius::optional_ptr<sirius_pipeline> get_finish_group(sirius_pipeline& pipeline) const;
+  duckdb::optional_ptr<sirius_pipeline> get_finish_group(sirius_pipeline& pipeline) const;
 
   void build_sirius_pipelines(op::sirius_physical_operator& node, sirius_pipeline& current);
 
@@ -131,9 +130,9 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! The pipeline_build_state for all MetaPipelines in the query plan
   sirius_pipeline_build_state& state;
   //! Parent pipeline (optional)
-  sirius::optional_ptr<sirius_pipeline> parent;
+  duckdb::optional_ptr<sirius_pipeline> parent;
   //! The sink of all pipelines within this sirius_meta_pipeline
-  sirius::optional_ptr<op::sirius_physical_operator> sink;
+  duckdb::optional_ptr<op::sirius_physical_operator> sink;
   //! The type of this MetaPipeline (regular, join build)
   MetaPipelineType type;
   //! Whether this sirius_meta_pipeline is a the recursive pipeline of a recursive CTE
@@ -141,17 +140,17 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //! All pipelines with a different source, but the same sink
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipelines;
   //! Dependencies within this sirius_meta_pipeline
-  sirius::reference_map_t<sirius_pipeline, duckdb::vector<std::reference_wrapper<sirius_pipeline>>>
+  duckdb::reference_map_t<sirius_pipeline, duckdb::vector<duckdb::reference<sirius_pipeline>>>
     dependencies;
   //! Other MetaPipelines that this sirius_meta_pipeline depends on
   duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> children;
   //! Next batch index
-  std::size_t next_batch_index;
+  duckdb::idx_t next_batch_index;
   //! Pipelines (other than the base pipeline) that need their own PipelineFinishEvent (e.g., for
   //! IEJoin)
-  sirius::reference_set_t<sirius_pipeline> finish_pipelines;
+  duckdb::reference_set_t<sirius_pipeline> finish_pipelines;
   //! Mapping from pipeline (e.g., child or union) to finish pipeline
-  sirius::reference_map_t<sirius_pipeline, sirius_pipeline&> finish_map;
+  duckdb::reference_map_t<sirius_pipeline, sirius_pipeline&> finish_map;
 };
 
 }  // namespace pipeline

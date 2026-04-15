@@ -42,23 +42,12 @@
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
-#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
 namespace sirius {
-
-/**
- * @brief Convert a cudf::ast::ast_operator to a human-readable string.
- */
-std::string ast_operator_to_string(cudf::ast::ast_operator op);
-
-/**
- * @brief Recursively produce a human-readable string for a cuDF AST expression.
- */
-std::string expression_to_string(cudf::ast::expression const& expr);
 
 /**
  * @brief Class for translating (a subset of) DuckDB expressions and join conditions into cuDF ASTs
@@ -72,15 +61,6 @@ std::string expression_to_string(cudf::ast::expression const& expr);
 class gpu_expression_translator {
  public:
   /**
-   * @brief A function that maps a BoundReferenceExpression column index to a column name.
-   *
-   * This is needed for translating expressions that reference columns by name (e.g., parquet with
-   * filter pushdown), since the default translator uses column index references to a cuDF table in
-   * the AST.
-   */
-  using column_name_resolver_fxn = std::function<std::string(duckdb::idx_t)>;
-
-  /**
    * @brief Owning result of translation.
    *
    * cuDF AST literals keep references to cudf::scalar objects. This type co-owns those scalars
@@ -92,8 +72,7 @@ class gpu_expression_translator {
 
     [[nodiscard]] cudf::ast::expression const& back() const { return tree.back(); }
     [[nodiscard]] cudf::ast::expression const& front() const { return tree.front(); }
-    [[nodiscard]] std::size_t size() const { return tree.size(); }
-    [[nodiscard]] std::string to_string() const;
+    [[nodiscard]] size_t size() const { return tree.size(); }
   };
 
   /**
@@ -123,23 +102,6 @@ class gpu_expression_translator {
   std::optional<translated_expression> translate_expression(
     duckdb::Expression const& expr,
     cudf::ast::table_reference const table_src = cudf::ast::table_reference::LEFT);
-
-  /**
-   * @brief Try to translate a DuckDB expression into a cuDF AST, using column name references
-   * instead of column index references.
-   *
-   * This is needed for cudf's parquet predicate pushdown (e.g. hybrid scan), which expects
-   * filter expressions to use cudf::ast::column_name_reference (by name) rather than
-   * cudf::ast::column_reference (by index).
-   *
-   * @param expr The DuckDB expression to translate.
-   * @param column_name_resolver A function mapping BoundReferenceExpression::index to a column
-   * name string.
-   * @return An optional containing the translated expression, or std::nullopt if translation
-   * failed.
-   */
-  std::optional<translated_expression> translate_expression_with_names(
-    duckdb::Expression const& expr, column_name_resolver_fxn column_name_resolver);
 
   /**
    * @brief Try to translate a DuckDB join condition into a cuDF AST.
@@ -254,8 +216,6 @@ class gpu_expression_translator {
   rmm::device_async_resource_ref
     _resource_ref;  ///< The RMM resource reference to use for any operations performed by the
                     ///< translator (e.g. in constructing literals).
-  column_name_resolver_fxn
-    _column_name_resolver{};  ///> Optional resolver for column name references in the AST
 };
 
 }  // namespace sirius

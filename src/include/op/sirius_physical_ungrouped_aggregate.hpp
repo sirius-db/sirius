@@ -35,7 +35,7 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   sirius_physical_ungrouped_aggregate(
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-    std::size_t estimated_cardinality,
+    duckdb::idx_t estimated_cardinality,
     duckdb::TupleDataValidityType distinct_validity);
 
   //! The aggregates that have to be computed

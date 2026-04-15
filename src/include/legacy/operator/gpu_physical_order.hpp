@@ -21,7 +21,6 @@
 #include "gpu_physical_operator.hpp"
 
 namespace duckdb {
-using sirius::OrderByType;
 void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
                   vector<shared_ptr<GPUColumn>>& projection,
                   uint64_t num_keys,

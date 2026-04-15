@@ -24,7 +24,6 @@
 #include "gpu_physical_operator.hpp"
 
 namespace duckdb {
-using sirius::AggregationType;
 
 void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
                     uint64_t num_aggregates,

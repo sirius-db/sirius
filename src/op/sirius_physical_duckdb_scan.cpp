@@ -57,10 +57,10 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
   duckdb::vector<duckdb::LogicalType> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
-  duckdb::vector<std::size_t> projection_ids_p,
+  duckdb::vector<duckdb::idx_t> projection_ids_p,
   duckdb::vector<std::string> names_p,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters_p,
-  std::size_t estimated_cardinality,
+  duckdb::idx_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p)
@@ -107,7 +107,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     }
   } else {
     auto num_cols = column_ids.size();
-    for (std::size_t i = 0; i < num_cols; i++) {
+    for (duckdb::idx_t i = 0; i < num_cols; i++) {
       auto col_idx = column_ids[i].GetPrimaryIndex();
       if (column_ids[i].IsRowIdColumn()) {
         scanned_types.push_back(duckdb::LogicalType::BIGINT);

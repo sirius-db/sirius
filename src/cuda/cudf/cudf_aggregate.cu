@@ -21,7 +21,6 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 
 namespace duckdb {
-using sirius::AggregationType;
 
 template <cudf::reduce_aggregation::Kind kind>
 static std::unique_ptr<cudf::reduce_aggregation> make_reduce_aggregation()

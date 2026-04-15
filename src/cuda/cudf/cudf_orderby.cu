@@ -28,7 +28,6 @@
 #include <algorithm>
 
 namespace duckdb {
-using sirius::OrderByType;
 
 // =================================================================================================
 // 1. Debug Macros & Common Structs

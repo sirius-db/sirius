@@ -41,10 +41,10 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
                               duckdb::unique_ptr<duckdb::FunctionData> bind_data,
                               duckdb::vector<duckdb::LogicalType> returned_types,
                               duckdb::vector<duckdb::ColumnIndex> column_ids,
-                              duckdb::vector<std::size_t> projection_ids,
+                              duckdb::vector<duckdb::idx_t> projection_ids,
                               duckdb::vector<std::string> names,
                               duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
-                              std::size_t estimated_cardinality,
+                              duckdb::idx_t estimated_cardinality,
                               duckdb::ExtraOperatorInfo extra_info,
                               duckdb::vector<duckdb::Value> parameters,
                               duckdb::virtual_column_map_t virtual_columns);
@@ -64,7 +64,7 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
   //! The column ids used within the table function
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   //! The projected-out column ids
-  duckdb::vector<std::size_t> projection_ids;
+  duckdb::vector<duckdb::idx_t> projection_ids;
   //! The names of the columns
   duckdb::vector<std::string> names;
   //! The table filters

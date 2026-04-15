@@ -56,7 +56,7 @@ struct expected_table_data {
 
 std::filesystem::path get_test_config_path()
 {
-  return std::filesystem::path(__FILE__).parent_path() / "result.yaml";
+  return std::filesystem::path(__FILE__).parent_path() / "result.cfg";
 }
 
 memory_space* get_default_gpu_space(duckdb::shared_ptr<duckdb::SiriusContext>& sirius_ctx)

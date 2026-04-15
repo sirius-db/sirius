@@ -30,8 +30,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
   auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
     op.types,
     std::move(op.orders),
-    duckdb::NumericCast<std::size_t>(op.limit),
-    duckdb::NumericCast<std::size_t>(op.offset),
+    duckdb::NumericCast<duckdb::idx_t>(op.limit),
+    duckdb::NumericCast<duckdb::idx_t>(op.offset),
     std::move(op.dynamic_filter),
     op.estimated_cardinality);
 

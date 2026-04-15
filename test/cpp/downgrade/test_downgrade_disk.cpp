@@ -19,6 +19,7 @@
 // sirius
 #include "downgrade/downgrade_task.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "parallel/task_executor.hpp"
 
 // data utilities
 #include <data/data_batch_utils.hpp>
@@ -28,6 +29,7 @@
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -98,6 +100,17 @@ std::vector<std::unique_ptr<cucascade::memory::reservation>> exhaust_host_capaci
   return held;
 }
 
+/// Helper: construct a downgrade_task using dev's local_state + global_state API.
+downgrade_task make_downgrade_task(std::shared_ptr<cucascade::data_batch> batch,
+                                   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                                   cucascade::shared_data_repository_manager& repo_mgr,
+                                   sirius::task_completion_message_queue& msg_queue)
+{
+  auto global_state = std::make_shared<downgrade_task_global_state>(mem_mgr, repo_mgr, msg_queue);
+  auto local_state  = std::make_unique<downgrade_task_local_state>(0, 0, std::move(batch));
+  return downgrade_task(std::move(local_state), std::move(global_state));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -142,7 +155,9 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
   auto batch = make_gpu_batch(*gpu_space);
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  downgrade_task task{batch, *mem_mgr};
+  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::task_completion_message_queue msg_queue;
+  auto task = make_downgrade_task(batch, *mem_mgr, repo_mgr, msg_queue);
 
   rmm::cuda_stream stream;
   REQUIRE_NOTHROW(task.execute(stream));
@@ -182,7 +197,9 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
   auto batch = make_gpu_batch(*gpu_space);
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  downgrade_task task{batch, *mem_mgr};
+  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::task_completion_message_queue msg_queue;
+  auto task = make_downgrade_task(batch, *mem_mgr, repo_mgr, msg_queue);
 
   rmm::cuda_stream stream;
   REQUIRE_NOTHROW(task.execute(stream));
@@ -225,13 +242,14 @@ TEST_CASE("Downgrade task returns false when HOST full and no DISK tier", "[down
   auto batch = make_gpu_batch(*gpu_space);
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  downgrade_task task{batch, *mem_mgr};
+  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::task_completion_message_queue msg_queue;
+  auto task = make_downgrade_task(batch, *mem_mgr, repo_mgr, msg_queue);
 
   rmm::cuda_stream stream;
-  bool downgraded = task.execute(stream);
+  // execute() returns void on dev; if it can't downgrade, it should not throw
+  REQUIRE_NOTHROW(task.execute(stream));
 
-  // Must return false (skipped), not hang or throw
-  REQUIRE_FALSE(downgraded);
-  // Batch must remain on GPU
+  // Batch must remain on GPU (no HOST/DISK available)
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 }

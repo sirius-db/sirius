@@ -27,14 +27,4 @@ struct thread_pool_config {
   std::vector<int> cpu_affinity_list;
 };
 
-/// Configuration for the downgrade executor.
-/// Embeds the thread pool config plus downgrade-specific settings.
-struct downgrade_executor_config {
-  exec::thread_pool_config thread_pool{.num_threads = 4, .thread_name_prefix = "downgrade"};
-
-  /// Period in milliseconds for the memory pressure monitor loop.
-  /// Set to 0 to disable the monitor loop entirely.
-  uint64_t monitor_period_ms{10};
-};
-
 }  // namespace sirius::exec

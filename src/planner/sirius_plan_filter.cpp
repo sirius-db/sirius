@@ -38,7 +38,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
   if (op.HasProjectionMap()) {
     // there is a projection map, generate a physical projection
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
-    for (std::size_t i = 0; i < op.projection_map.size(); i++) {
+    for (duckdb::idx_t i = 0; i < op.projection_map.size(); i++) {
       select_list.push_back(
         duckdb::make_uniq<duckdb::BoundReferenceExpression>(op.types[i], op.projection_map[i]));
     }

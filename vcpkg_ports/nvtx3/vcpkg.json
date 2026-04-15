@@ -1,7 +1,0 @@
-{
-  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "license": "Apache-2.0",
-  "name": "nvtx3",
-  "supports": "linux",
-  "version": "3.2.0"
-}

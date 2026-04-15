@@ -42,7 +42,7 @@ class sirius_physical_delim_join : public sirius_physical_operator {
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::unique_ptr<sirius_physical_operator> original_join,
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-    std::size_t estimated_cardinality,
+    duckdb::idx_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
 
   duckdb::unique_ptr<sirius_physical_operator> join;
@@ -56,9 +56,9 @@ class sirius_physical_delim_join : public sirius_physical_operator {
 
   bool is_sink() const override { return true; }
 
-  sirius::OrderPreservationType source_order() const override
+  duckdb::OrderPreservationType source_order() const override
   {
-    return sirius::OrderPreservationType::NO_ORDER;
+    return duckdb::OrderPreservationType::NO_ORDER;
   }
   bool sink_order_dependent() const override { return false; }
 };
@@ -75,7 +75,7 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::unique_ptr<sirius_physical_operator> original_join,
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-    std::size_t estimated_cardinality,
+    duckdb::idx_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
   sirius_physical_partition* partition_join;
 
@@ -101,7 +101,7 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::unique_ptr<sirius_physical_operator> original_join,
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-    std::size_t estimated_cardinality,
+    duckdb::idx_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
   sirius_physical_column_data_scan* column_data_scan;
 

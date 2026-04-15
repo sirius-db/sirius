@@ -65,7 +65,7 @@ constexpr size_t kDefaultVarcharSize = 256;
 
 std::filesystem::path get_test_config_path()
 {
-  return std::filesystem::path(__FILE__).parent_path() / "memory.yaml";
+  return std::filesystem::path(__FILE__).parent_path() / "memory.cfg";
 }
 
 memory_space* get_memory_space(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,

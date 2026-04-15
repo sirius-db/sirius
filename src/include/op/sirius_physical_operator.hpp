@@ -19,12 +19,16 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
+#include "duckdb/common/enums/order_preservation_type.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/execution_context.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
-#include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -34,7 +38,6 @@
 #include <memory>
 #include <optional>
 #include <string_view>
-#include <vector>
 
 namespace sirius {
 
@@ -59,40 +62,23 @@ struct task_creation_hint {
 };
 
 /**
- * @brief Generic base class for operator input/output data.
+ * @brief Container for operator data batches.
  *
- * This is an intentionally minimal base class with no opinion on what the
- * data should be. Derived classes define the concrete data representation.
+ * Wraps a collection of data batches that can be passed between operators.
  */
 class operator_data {
  public:
-  operator_data()          = default;
-  virtual ~operator_data() = default;
-
-  operator_data(const operator_data&)            = default;
-  operator_data& operator=(const operator_data&) = default;
-  operator_data(operator_data&&)                 = default;
-  operator_data& operator=(operator_data&&)      = default;
-};
-
-/**
- * @brief Operator data carrying a collection of data batches for pipeline execution.
- *
- * This is the standard data container used by pipeline operators. It wraps a
- * vector of data batches that flow between operators in a pipeline.
- */
-class pipelineable_operator_data : public operator_data {
- public:
-  pipelineable_operator_data() = default;
-  explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+  operator_data() = default;
+  explicit operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))
   {
   }
 
+  virtual ~operator_data() = default;
+
   /**
-   * @brief Get the data batches.
-   * @return Const reference to vector of data batch pointers
+   * @brief Get mutable data batches.
+   * @return Mutable reference to vector of data batch pointers
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const
@@ -112,17 +98,8 @@ class pipelineable_operator_data : public operator_data {
   /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
-   * Iterates over all batches and locks (or converts then locks) each one into the
-   * requested memory space. Returns the processing handles that keep the batches locked
-   * until they go out of scope.
-   *
    * Returns std::nullopt if any batch fails to lock (triggers a retry/reschedule).
    * Propagates rmm::out_of_memory so the caller can record metrics and reschedule.
-   *
-   * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
-   *                                current space.
-   * @param stream                  CUDA stream used for any data-movement kernels.
-   * @return Processing handles for all batches, or std::nullopt on lock failure.
    */
   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
   prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
@@ -132,18 +109,20 @@ class pipelineable_operator_data : public operator_data {
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
 };
 
+//! Alias for backward compatibility — pipeline operators use this name.
+using pipelineable_operator_data = operator_data;
+
 /**
- * @brief Operator data with partition index for partitioned pipeline execution.
+ * @brief Container for partitioned operator data.
  *
- * Extends pipelineable_operator_data to include partition index information,
- * used by partition-aware operators (partition, concat, etc.).
+ * Extends operator_data to include partition index information.
  */
-class partitioned_operator_data : public pipelineable_operator_data {
+class partitioned_operator_data : public operator_data {
  public:
   partitioned_operator_data() = default;
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx)
-    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+    : operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
   }
 
@@ -168,7 +147,7 @@ class sirius_physical_operator {
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
                            duckdb::vector<duckdb::LogicalType> types,
-                           std::size_t estimated_cardinality)
+                           duckdb::idx_t estimated_cardinality)
     : type(type),
       types(std::move(types)),
       estimated_cardinality(estimated_cardinality),
@@ -185,11 +164,15 @@ class sirius_physical_operator {
   //! The types returned by this physical operator
   duckdb::vector<duckdb::LogicalType> types;
   //! The estimated cardinality of this physical operator
-  std::size_t estimated_cardinality;
+  duckdb::idx_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
   size_t operator_id;
 
-  //! Lock for concurrent access to operator state
+  //! The global sink state of this operator
+  duckdb::unique_ptr<duckdb::GlobalSinkState> sink_state;
+  //! The global state of this operator
+  duckdb::unique_ptr<duckdb::GlobalOperatorState> op_state;
+  //! Lock for (re)setting any of the operator states
   std::mutex lock;
 
  public:
@@ -215,27 +198,45 @@ class sirius_physical_operator {
 
  public:
   // Operator interface
+  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(
+    duckdb::ExecutionContext& context) const;
+
+  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
+    duckdb::ClientContext& context) const;
+
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
-  virtual sirius::OrderPreservationType operator_order() const
+  virtual duckdb::OrderPreservationType operator_order() const
   {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
+    return duckdb::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Source interface
+  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
+    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const;
+
+  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
+    duckdb::ClientContext& context) const;
+
   virtual bool is_source() const { return false; }
 
   //! The type of order emitted by the operator (as a source)
-  virtual sirius::OrderPreservationType source_order() const
+  virtual duckdb::OrderPreservationType source_order() const
   {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
+    return duckdb::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Sink interface
+  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
+    duckdb::ExecutionContext& context) const;
+
+  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
+    duckdb::ClientContext& context) const;
+
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }
@@ -261,7 +262,7 @@ class sirius_physical_operator {
   {
     // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw internal_exception(
+      throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<TARGET&>(*this);
@@ -271,7 +272,7 @@ class sirius_physical_operator {
   const TARGET& Cast() const
   {
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw internal_exception(
+      throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<const TARGET&>(*this);
@@ -336,7 +337,7 @@ class sirius_physical_operator {
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
-  [[nodiscard]] virtual bool all_ports_empty();
+  bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
 

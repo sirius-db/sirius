@@ -38,7 +38,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalProjection& op)
     // this happens if a projection simply emits the columns in the same order
     // e.g. PROJECTION(#0, #1, #2, #3, ...)
     bool omit_projection = true;
-    for (std::size_t i = 0; i < op.types.size(); i++) {
+    for (duckdb::idx_t i = 0; i < op.types.size(); i++) {
       if (op.expressions[i]->type == duckdb::ExpressionType::BOUND_REF) {
         auto& bound_ref = op.expressions[i]->Cast<duckdb::BoundReferenceExpression>();
         if (bound_ref.index == i) { continue; }

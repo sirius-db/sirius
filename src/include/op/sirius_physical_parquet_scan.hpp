@@ -21,7 +21,6 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "expression_executor/gpu_expression_translator.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
@@ -45,14 +44,13 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
                                duckdb::unique_ptr<duckdb::FunctionData> bind_data,
                                duckdb::vector<duckdb::LogicalType> returned_types,
                                duckdb::vector<duckdb::ColumnIndex> column_ids,
-                               duckdb::vector<std::size_t> projection_ids,
+                               duckdb::vector<duckdb::idx_t> projection_ids,
                                duckdb::vector<std::string> names,
                                duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
-                               std::size_t estimated_cardinality,
+                               duckdb::idx_t estimated_cardinality,
                                duckdb::ExtraOperatorInfo extra_info,
                                duckdb::vector<duckdb::Value> parameters,
-                               duckdb::virtual_column_map_t virtual_columns,
-                               sirius_physical_table_scan* physical_table_scan);
+                               duckdb::virtual_column_map_t virtual_columns);
 
   std::optional<task_creation_hint> get_next_task_hint() override
   {
@@ -69,7 +67,7 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
   //! The column ids used within the table function
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   //! The projected-out column ids
-  duckdb::vector<std::size_t> projection_ids;
+  duckdb::vector<duckdb::idx_t> projection_ids;
   //! The names of the columns
   duckdb::vector<std::string> names;
   //! The table filters
@@ -97,7 +95,7 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
 
   duckdb::vector<duckdb::LogicalType> scanned_types;
 
-  duckdb::vector<std::size_t> scanned_ids;
+  duckdb::vector<duckdb::idx_t> scanned_ids;
 
   duckdb::unique_ptr<duckdb::TableFilterSet> fake_table_filters;
 
@@ -107,11 +105,6 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
   std::atomic<bool> exhausted{false};
 
   std::atomic<bool> has_more_partitions{true};
-
-  //! The translated filter expression, if translation from duckdb expression to cuDF AST was
-  //! successful. We need to maintain this here so that translation failures can be detected during
-  //! the execution of the table scan operator, in which case the filter can be applied there.
-  std::optional<gpu_expression_translator::translated_expression> translated_filter;
 
  public:
   bool is_source() const override { return true; }

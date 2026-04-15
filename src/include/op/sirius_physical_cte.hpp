@@ -37,18 +37,18 @@ class sirius_physical_cte : public sirius_physical_operator {
 
  public:
   sirius_physical_cte(std::string ctename,
-                      std::size_t table_index,
+                      duckdb::idx_t table_index,
                       duckdb::vector<duckdb::LogicalType> types,
                       duckdb::unique_ptr<sirius_physical_operator> top,
                       duckdb::unique_ptr<sirius_physical_operator> bottom,
-                      std::size_t estimated_cardinality);
+                      duckdb::idx_t estimated_cardinality);
   ~sirius_physical_cte() override;
 
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> cte_scans;
 
   duckdb::shared_ptr<duckdb::ColumnDataCollection> working_table;
 
-  std::size_t table_index;
+  duckdb::idx_t table_index;
   std::string ctename;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,

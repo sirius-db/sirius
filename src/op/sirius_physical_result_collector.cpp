@@ -31,10 +31,8 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-// sirius exceptions
-#include "sirius/exception.hpp"
-
 // duckdb
+#include <duckdb/common/exception.hpp>
 #include <duckdb/main/materialized_query_result.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 
@@ -61,8 +59,7 @@ std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
-  return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+  return std::make_unique<operator_data>(input_data);
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -75,6 +72,8 @@ void sirius_physical_result_collector::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   // operator is a sink, build a pipeline
+  sink_state.reset();
+
   D_ASSERT(children.empty());
 
   // single operator: the operator becomes the data source of the current pipeline
@@ -94,8 +93,11 @@ sirius_physical_materialized_collector::sirius_physical_materialized_collector(
 {
 }
 
-duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::get_result()
+duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::get_result(
+  duckdb::GlobalSinkState& state)
 {
+  (void)state;  // Silence unused parameter warning
+
   auto props = _client_ctx.GetClientProperties();
 
   std::lock_guard<std::mutex> guard(lock);
@@ -112,12 +114,12 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_materialized_collector::sink"};
-  auto& pipelineable_input      = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches     = pipelineable_input.get_data_batches();
+  const auto& input_batches     = input_data.get_data_batches();
   using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
 
   if (input_batches.empty()) {
     return;  // todo(kevin) we should handle this case properly
+    throw duckdb::InvalidInputException("[GPUPhysicalMaterializedCollector] input_batches is null");
   }
 
   auto sink_single_batch = [this,
@@ -125,7 +127,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     auto* data = input_batch->get_data();
     std::shared_ptr<cucascade::data_batch> clone_batch;
     if (!data) {
-      throw invalid_input_exception(
+      throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
     }
     if (data->get_size_in_bytes() == 0) { return; }
@@ -140,7 +142,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         data->get_size_in_bytes());
       if (!reservation) {
-        throw internal_exception(
+        throw duckdb::InternalException(
           "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
       }
 
@@ -155,7 +157,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       data = clone_batch->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
-      throw invalid_input_exception(
+      throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }
 
@@ -168,12 +170,12 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
     auto const* ht = host_table.get_host_table().get();
     if (!ht) {
-      throw invalid_input_exception(
+      throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] host_data_representation has null "
         "get_host_table()");
     }
     if (!ht->allocation) {
-      throw invalid_input_exception(
+      throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
     }
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);

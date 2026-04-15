@@ -18,7 +18,6 @@
 
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
-#include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
 
 #include <cudf/concatenate.hpp>
@@ -29,12 +28,13 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
+#include <algorithm>
 #include <format>
 
 namespace sirius {
 namespace op {
 
-uint64_t get_chunk_data_byte_size(duckdb::LogicalType type, std::size_t cardinality)
+uint64_t get_chunk_data_byte_size(duckdb::LogicalType type, duckdb::idx_t cardinality)
 {
   auto physical_size = duckdb::GetTypeIdSize(type.InternalType());
   return cardinality * physical_size;
@@ -46,10 +46,10 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
   duckdb::vector<duckdb::LogicalType> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
-  duckdb::vector<std::size_t> projection_ids_p,
+  duckdb::vector<duckdb::idx_t> projection_ids_p,
   duckdb::vector<std::string> names_p,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters_p,
-  std::size_t estimated_cardinality,
+  duckdb::idx_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p)
@@ -66,6 +66,104 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     parameters(std::move(parameters_p)),
     virtual_columns(std::move(virtual_columns_p))
 {
+}
+
+/// Build a mapping from column_ids index to batch column position.
+///
+/// The parquet scan (make_selected_column_indices) produces batch columns in
+/// column_ids order, but only for indices present in projection_ids.
+/// For example, if column_ids has 5 entries and projection_ids = {1, 3}:
+///   batch position 0 → column_ids[1]
+///   batch position 1 → column_ids[3]
+///
+/// Returns a vector of size column_ids_count where:
+///   result[i] = batch position of column_ids[i], or idx_t(-1) if not projected.
+///
+/// When projection_ids is empty, every column_ids entry maps to its own index.
+static std::vector<duckdb::idx_t> build_batch_column_map(
+  const duckdb::vector<duckdb::idx_t>& projection_ids, duckdb::idx_t column_ids_count)
+{
+  constexpr auto NOT_PROJECTED = static_cast<duckdb::idx_t>(-1);
+  std::vector<duckdb::idx_t> map(column_ids_count, NOT_PROJECTED);
+
+  if (projection_ids.empty()) {
+    for (duckdb::idx_t i = 0; i < column_ids_count; i++) {
+      map[i] = i;
+    }
+    return map;
+  }
+
+  // Sort projected indices — this matches the iteration order in
+  // make_selected_column_indices which walks column_ids[0..N) and
+  // includes only indices present in the projected set.
+  std::vector<duckdb::idx_t> sorted(projection_ids.begin(), projection_ids.end());
+  std::sort(sorted.begin(), sorted.end());
+
+  for (duckdb::idx_t batch_pos = 0; batch_pos < sorted.size(); batch_pos++) {
+    if (sorted[batch_pos] < column_ids_count) { map[sorted[batch_pos]] = batch_pos; }
+  }
+  return map;
+}
+
+duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<duckdb::LogicalType>& returned_types,
+  const std::vector<duckdb::idx_t>& batch_column_map)
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
+
+  for (auto& [column_index, filter] : filters.filters) {
+    // Skip optional and IS_NOT_NULL filters
+    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+      continue;
+    }
+
+    if (column_index >= column_ids.size()) {
+      throw std::runtime_error(
+        std::format("TABLE_SCAN filter: column_index ({}) >= column_ids.size() ({})",
+                    column_index,
+                    column_ids.size()));
+    }
+    auto primary_idx = column_ids[column_index].GetPrimaryIndex();
+    if (primary_idx >= returned_types.size()) {
+      throw std::runtime_error(
+        std::format("TABLE_SCAN filter: primary_idx ({}) >= returned_types.size() ({})",
+                    primary_idx,
+                    returned_types.size()));
+    }
+    auto col_type = returned_types[primary_idx];
+
+    SIRIUS_LOG_DEBUG("TABLE_SCAN filter: column_index={}, primary_idx={}, type={}, filter_type={}",
+                     column_index,
+                     primary_idx,
+                     col_type.ToString(),
+                     static_cast<int>(filter->filter_type));
+
+    auto batch_column_index = batch_column_map[column_index];
+    if (batch_column_index == static_cast<duckdb::idx_t>(-1)) {
+      throw std::runtime_error(
+        std::format("TABLE_SCAN filter: column_index ({}) not in projected batch", column_index));
+    }
+
+    SIRIUS_LOG_DEBUG("TABLE_SCAN filter: batch_column_index={}", batch_column_index);
+
+    auto column_ref =
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(col_type, batch_column_index);
+    auto expr = filter->ToExpression(*column_ref);
+    filter_expressions.push_back(std::move(expr));
+  }
+
+  if (filter_expressions.empty()) { return nullptr; }
+  if (filter_expressions.size() == 1) { return std::move(filter_expressions[0]); }
+
+  auto conjunction =
+    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+  for (auto& expr : filter_expressions) {
+    conjunction->children.push_back(std::move(expr));
+  }
+  return conjunction;
 }
 
 std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_data()
@@ -96,21 +194,14 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  return std::make_unique<operator_data>(input_batch);
 }
 
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
-  auto& input                   = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& raw_input_batches = input.get_data_batches();
-
-  // For parquet scan pipelines, filter and projection are already applied in
-  // parquet_scan_task and the host_parquet_representation converters.
-  // Also, only parquet file tails are small due to the partitioning logic, so batch concatenation
-  // is not needed.
-  if (passthrough) { return std::make_unique<pipelineable_operator_data>(raw_input_batches); }
+  const auto& raw_input_batches = input_data.get_data_batches();
 
   // Build the column_ids index → batch position mapping once.
   // Both filter expression construction and post-filter projection use this.
@@ -141,9 +232,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After concatenation (or if only one batch), work with a single batch.
   const auto& batch_ref =
     single_batch ? single_batch : (!raw_input_batches.empty() ? raw_input_batches[0] : nullptr);
-  if (!batch_ref || !batch_ref->get_data()) {
-    return std::make_unique<pipelineable_operator_data>();
-  }
+  if (!batch_ref || !batch_ref->get_data()) { return std::make_unique<operator_data>(); }
 
   // Apply table filters as a GPU expression if present.
   std::shared_ptr<cucascade::data_batch> output_batch;
@@ -156,18 +245,18 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (filter_expr != nullptr) {
     duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
     output_batch = gpu_expression_executor.select(batch_ref, stream);
-    if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
+    if (!output_batch) { return std::make_unique<operator_data>(); }
   } else {
     output_batch = batch_ref;
   }
 
   // After filtering, project away filter-only columns if the batch has more
   // columns than the operator's output type list expects.
-  std::size_t expected_output_columns = types.size();
+  duckdb::idx_t expected_output_columns = types.size();
   auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
   auto& out_table = gpu_rep.get_table();
 
-  if (static_cast<std::size_t>(out_table.num_columns()) > expected_output_columns) {
+  if (static_cast<duckdb::idx_t>(out_table.num_columns()) > expected_output_columns) {
     SIRIUS_LOG_DEBUG(
       "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
       "column_ids.size()={}",
@@ -191,9 +280,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     // in the order the downstream operator expects.
     std::vector<std::unique_ptr<cudf::column>> selected;
     selected.reserve(expected_output_columns);
-    for (std::size_t i = 0; i < expected_output_columns; i++) {
+    for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
       auto batch_idx = batch_column_map[projection_ids[i]];
-      if (batch_idx == static_cast<std::size_t>(-1) || batch_idx >= columns.size()) {
+      if (batch_idx == static_cast<duckdb::idx_t>(-1) || batch_idx >= columns.size()) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
                       "columns.size()={}",
@@ -215,7 +304,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.push_back(std::move(output_batch));
-  return std::make_unique<pipelineable_operator_data>(output_batches);
+  return std::make_unique<operator_data>(output_batches);
 }
 
 }  // namespace op

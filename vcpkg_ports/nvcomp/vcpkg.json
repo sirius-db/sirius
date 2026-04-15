@@ -1,7 +1,0 @@
-{
-  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "license": "LicenseRef-Proprietary",
-  "name": "nvcomp",
-  "supports": "linux",
-  "version": "5.1.0.21"
-}

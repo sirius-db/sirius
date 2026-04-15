@@ -206,13 +206,12 @@ stub_operator::execute_fn make_allocating_execute_fn(cucascade::memory::memory_s
     REQUIRE(mr != nullptr);
     void* scratch = mr->allocate(s, exec_size);
 
-    auto& pipelineable_input = dynamic_cast<const sirius::op::pipelineable_operator_data&>(input);
     std::vector<std::shared_ptr<cucascade::data_batch>> pass_through;
-    pass_through.reserve(pipelineable_input.get_data_batches().size());
-    for (auto const& batch : pipelineable_input.get_data_batches()) {
+    pass_through.reserve(input.get_data_batches().size());
+    for (auto const& batch : input.get_data_batches()) {
       if (batch) { pass_through.push_back(batch); }
     }
-    auto out = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(pass_through));
+    auto out = std::make_unique<sirius::op::operator_data>(std::move(pass_through));
     s.synchronize();
     mr->deallocate(s, scratch, exec_size);
     s.synchronize();
@@ -233,7 +232,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
 {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
-  auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
+  auto op_data = std::make_unique<sirius::op::operator_data>(std::move(batches));
 
   auto local_state =
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));

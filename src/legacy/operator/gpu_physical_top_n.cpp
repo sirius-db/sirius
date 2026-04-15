@@ -26,7 +26,6 @@
 #include <algorithm>
 
 namespace duckdb {
-using sirius::OrderByType;
 
 GPUPhysicalTopN::GPUPhysicalTopN(vector<LogicalType> types_p,
                                  vector<BoundOrderByNode> orders,

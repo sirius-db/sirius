@@ -21,7 +21,6 @@
 #include "operator/gpu_materialize.hpp"
 
 namespace duckdb {
-using sirius::AggregationType;
 
 void HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>>& aggregate_keys,
                                    GPUBufferManager* gpuBufferManager,

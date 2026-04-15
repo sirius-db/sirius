@@ -22,7 +22,6 @@
 #include "operator/gpu_materialize.hpp"
 
 namespace duckdb {
-using sirius::OrderByType;
 
 void HandleOrderBy(vector<shared_ptr<GPUColumn>>& order_by_keys,
                    vector<shared_ptr<GPUColumn>>& projection_columns,

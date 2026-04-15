@@ -34,13 +34,13 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
 
   sirius_physical_merge_sort(duckdb::vector<duckdb::LogicalType> types,
                              duckdb::vector<duckdb::BoundOrderByNode> orders,
-                             duckdb::vector<std::size_t> projections_p,
-                             std::size_t estimated_cardinality,
+                             duckdb::vector<duckdb::idx_t> projections_p,
+                             duckdb::idx_t estimated_cardinality,
                              bool is_index_sort_p = false);
 
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  duckdb::vector<std::size_t> projections;
+  duckdb::vector<duckdb::idx_t> projections;
   bool is_index_sort;
 
   sirius_physical_operator* child_op;
@@ -50,9 +50,9 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   // Source interface
   bool is_source() const override { return true; }
 
-  sirius::OrderPreservationType source_order() const override
+  duckdb::OrderPreservationType source_order() const override
   {
-    return sirius::OrderPreservationType::FIXED_ORDER;
+    return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
  public:
@@ -67,7 +67,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
   //! Set the final output projection (applied after merge, to remove sort-key-only columns)
-  void set_final_projections(duckdb::vector<std::size_t> proj,
+  void set_final_projections(duckdb::vector<duckdb::idx_t> proj,
                              duckdb::vector<duckdb::LogicalType> output_types)
   {
     _final_projections = std::move(proj);
@@ -76,7 +76,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
 
  private:
   //! Final projection to apply after merge (empty = no extra projection)
-  duckdb::vector<std::size_t> _final_projections;
+  duckdb::vector<duckdb::idx_t> _final_projections;
   //! Guards concurrent calls to get_next_task_input_data().
   std::mutex _drain_mutex;
   //! Tracks which partition to drain next (one task per partition).

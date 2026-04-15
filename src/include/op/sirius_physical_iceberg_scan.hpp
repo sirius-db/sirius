@@ -51,10 +51,10 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
                                duckdb::unique_ptr<duckdb::FunctionData> bind_data,
                                duckdb::vector<duckdb::LogicalType> returned_types,
                                duckdb::vector<duckdb::ColumnIndex> column_ids,
-                               duckdb::vector<std::size_t> projection_ids,
+                               duckdb::vector<duckdb::idx_t> projection_ids,
                                duckdb::vector<std::string> names,
                                duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
-                               std::size_t estimated_cardinality,
+                               duckdb::idx_t estimated_cardinality,
                                duckdb::ExtraOperatorInfo extra_info,
                                duckdb::vector<duckdb::Value> parameters,
                                duckdb::virtual_column_map_t virtual_columns);

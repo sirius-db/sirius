@@ -93,10 +93,10 @@ std::unique_ptr<cudf::table> make_count_distinct_expected(const std::vector<int3
 std::shared_ptr<data_batch> run_local(sirius_physical_grouped_aggregate& local_op,
                                       std::shared_ptr<data_batch> input)
 {
-  auto out = local_op.execute(
-    pipelineable_operator_data(std::vector<std::shared_ptr<data_batch>>{input}), default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
-  return dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0];
+  auto out = local_op.execute(operator_data(std::vector<std::shared_ptr<data_batch>>{input}),
+                              default_stream());
+  REQUIRE(out->get_data_batches().size() == 1);
+  return out->get_data_batches()[0];
 }
 
 }  // namespace
@@ -148,15 +148,11 @@ TEST_CASE("count distinct: single batch, basic correctness",
 
   // Merge post-processes LIST → INT64 count, even for a single batch
   auto final_out = merge_op.execute(
-    pipelineable_operator_data(std::vector<std::shared_ptr<data_batch>>{local_out}),
-    default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches().size() ==
-          1);
+    operator_data(std::vector<std::shared_ptr<data_batch>>{local_out}), default_stream());
+  REQUIRE(final_out->get_data_batches().size() == 1);
 
   bool match = sirius::test::expect_data_batch_equivalent_to_table(
-    dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches()[0],
-    expected_table->view(),
-    true /*sort*/);
+    final_out->get_data_batches()[0], expected_table->view(), true /*sort*/);
   REQUIRE(match);
 }
 
@@ -239,14 +235,11 @@ TEMPLATE_TEST_CASE("count distinct: multiple batches, randomly striped",
   }
 
   // Merge all local results
-  auto final_out = merge_op.execute(pipelineable_operator_data(local_results), default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches().size() ==
-          1);
+  auto final_out = merge_op.execute(operator_data(local_results), default_stream());
+  REQUIRE(final_out->get_data_batches().size() == 1);
 
   bool match = sirius::test::expect_data_batch_equivalent_to_table(
-    dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches()[0],
-    expected_table->view(),
-    true /*sort*/);
+    final_out->get_data_batches()[0], expected_table->view(), true /*sort*/);
   REQUIRE(match);
 }
 
@@ -313,14 +306,11 @@ TEST_CASE("count distinct: cross-batch duplicate deduplication within a partitio
   local_results.push_back(run_local(local_op, batch2));
   local_results.push_back(run_local(local_op, batch3));
 
-  auto final_out = merge_op.execute(pipelineable_operator_data(local_results), default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches().size() ==
-          1);
+  auto final_out = merge_op.execute(operator_data(local_results), default_stream());
+  REQUIRE(final_out->get_data_batches().size() == 1);
 
   bool match = sirius::test::expect_data_batch_equivalent_to_table(
-    dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches()[0],
-    expected_table->view(),
-    true /*sort*/);
+    final_out->get_data_batches()[0], expected_table->view(), true /*sort*/);
   REQUIRE(match);
 }
 
@@ -439,15 +429,11 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   auto local2 = run_local(local_op, batch2);
 
   auto final_out = merge_op.execute(
-    pipelineable_operator_data(std::vector<std::shared_ptr<data_batch>>{local1, local2}),
-    default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches().size() ==
-          1);
+    operator_data(std::vector<std::shared_ptr<data_batch>>{local1, local2}), default_stream());
+  REQUIRE(final_out->get_data_batches().size() == 1);
 
   bool match = sirius::test::expect_data_batch_equivalent_to_table(
-    dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches()[0],
-    expected_table->view(),
-    true /*sort*/);
+    final_out->get_data_batches()[0], expected_table->view(), true /*sort*/);
   REQUIRE(match);
 }
 
@@ -523,30 +509,24 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
   for (auto& split : splits0) {
     local_p0.push_back(run_local(local_op, sirius::make_data_batch(std::move(split), *space)));
   }
-  auto result_p0 = merge_op.execute(pipelineable_operator_data(local_p0), default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result_p0).get_data_batches().size() ==
-          1);
+  auto result_p0 = merge_op.execute(operator_data(local_p0), default_stream());
+  REQUIRE(result_p0->get_data_batches().size() == 1);
 
   auto expected_p0 = make_count_distinct_expected({0, 1, 2}, {4, 4, 4}, stream, mr);
   REQUIRE(sirius::test::expect_data_batch_equivalent_to_table(
-    dynamic_cast<const pipelineable_operator_data&>(*result_p0).get_data_batches()[0],
-    expected_p0->view(),
-    true /*sort*/));
+    result_p0->get_data_batches()[0], expected_p0->view(), true /*sort*/));
 
   // --- Process partition 1 (separate execute() call) ---
   std::vector<std::shared_ptr<data_batch>> local_p1;
   for (auto& split : splits1) {
     local_p1.push_back(run_local(local_op, sirius::make_data_batch(std::move(split), *space)));
   }
-  auto result_p1 = merge_op.execute(pipelineable_operator_data(local_p1), default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result_p1).get_data_batches().size() ==
-          1);
+  auto result_p1 = merge_op.execute(operator_data(local_p1), default_stream());
+  REQUIRE(result_p1->get_data_batches().size() == 1);
 
   auto expected_p1 = make_count_distinct_expected({3, 4}, {4, 4}, stream, mr);
   REQUIRE(sirius::test::expect_data_batch_equivalent_to_table(
-    dynamic_cast<const pipelineable_operator_data&>(*result_p1).get_data_batches()[0],
-    expected_p1->view(),
-    true /*sort*/));
+    result_p1->get_data_batches()[0], expected_p1->view(), true /*sort*/));
 }
 
 // ===========================================================================
@@ -618,13 +598,9 @@ TEST_CASE("count distinct: multi-column struct expression",
   auto local2 = run_local(local_op, batch2);
 
   auto final_out = merge_op.execute(
-    pipelineable_operator_data(std::vector<std::shared_ptr<data_batch>>{local1, local2}),
-    default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches().size() ==
-          1);
+    operator_data(std::vector<std::shared_ptr<data_batch>>{local1, local2}), default_stream());
+  REQUIRE(final_out->get_data_batches().size() == 1);
 
   REQUIRE(sirius::test::expect_data_batch_equivalent_to_table(
-    dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches()[0],
-    expected_table->view(),
-    true /*sort*/));
+    final_out->get_data_batches()[0], expected_table->view(), true /*sort*/));
 }

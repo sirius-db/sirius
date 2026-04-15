@@ -26,7 +26,7 @@ namespace sirius::planner {
 // #else
 // 	// we only use batch limit when we are computing a small amount of values
 // 	// as the batch limit materializes this many rows PER thread
-// 	static constexpr const std::size_t BATCH_LIMIT_THRESHOLD = 10000;
+// 	static constexpr const duckdb::idx_t BATCH_LIMIT_THRESHOLD = 10000;
 
 // 	if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
 // 		return false;
@@ -34,7 +34,7 @@ namespace sirius::planner {
 // 	if (offset_val.Type() == duckdb::LimitNodeType::EXPRESSION_VALUE) {
 // 		return false;
 // 	}
-// 	std::size_t total_offset = limit_val.GetConstantValue();
+// 	duckdb::idx_t total_offset = limit_val.GetConstantValue();
 // 	if (offset_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
 // 		total_offset += offset_val.GetConstantValue();
 // 	}
