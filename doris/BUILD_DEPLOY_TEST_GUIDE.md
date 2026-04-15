@@ -168,36 +168,27 @@ The FE doesn't know or care whether the BE is using GPU or CPU — the protocol 
 
 ### TPC-H data setup
 
-You need TPC-H parquet data. Generate it with DuckDB:
+You need TPC-H parquet data. [tpchgen-rs](https://github.com/sirius-db/tpchgen-rs) is a fast Rust-based TPC-H data generator that outputs parquet directly. The `doris` pixi environment includes `uv`, which runs it via `uvx` (no separate install step — the binary is fetched and cached on first use):
 
+**Single file per table** (for manual queries and `run-host-test.sh`):
 ```bash
-pixi run duckdb <<'SQL'
-INSTALL tpch; LOAD tpch; CALL dbgen(sf=1);
-COPY lineitem TO '/data/tpch/sf1/snappy/lineitem.parquet' (FORMAT PARQUET);
-COPY orders TO '/data/tpch/sf1/snappy/orders.parquet' (FORMAT PARQUET);
-COPY customer TO '/data/tpch/sf1/snappy/customer.parquet' (FORMAT PARQUET);
-COPY supplier TO '/data/tpch/sf1/snappy/supplier.parquet' (FORMAT PARQUET);
-COPY nation TO '/data/tpch/sf1/snappy/nation.parquet' (FORMAT PARQUET);
-COPY region TO '/data/tpch/sf1/snappy/region.parquet' (FORMAT PARQUET);
-COPY part TO '/data/tpch/sf1/snappy/part.parquet' (FORMAT PARQUET);
-COPY partsupp TO '/data/tpch/sf1/snappy/partsupp.parquet' (FORMAT PARQUET);
-SQL
+pixi run -e doris -- uvx tpchgen-cli --scale-factor 1 --format parquet --parquet-compression SNAPPY --output-dir /data/tpch/sf1/snappy
 ```
+Produces: `/data/tpch/sf1/snappy/lineitem.parquet`, `orders.parquet`, etc.
 
-For partitioned data (used by `run-tpch.sh`), export to directories:
+**Partitioned data** (used by `run-tpch.sh`, 16 files per table):
 ```bash
-mkdir -p /data/tpch/sf1/p16/snappy
-pixi run duckdb <<'SQL'
-INSTALL tpch; LOAD tpch; CALL dbgen(sf=1);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM lineitem) TO '/data/tpch/sf1/p16/snappy/lineitem' (FORMAT PARQUET, PARTITION_BY part);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM orders) TO '/data/tpch/sf1/p16/snappy/orders' (FORMAT PARQUET, PARTITION_BY part);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM customer) TO '/data/tpch/sf1/p16/snappy/customer' (FORMAT PARQUET, PARTITION_BY part);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM supplier) TO '/data/tpch/sf1/p16/snappy/supplier' (FORMAT PARQUET, PARTITION_BY part);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM nation) TO '/data/tpch/sf1/p16/snappy/nation' (FORMAT PARQUET, PARTITION_BY part);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM region) TO '/data/tpch/sf1/p16/snappy/region' (FORMAT PARQUET, PARTITION_BY part);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM part) TO '/data/tpch/sf1/p16/snappy/part' (FORMAT PARQUET, PARTITION_BY part);
-COPY (SELECT *, (row_number() OVER ()) % 16 AS part FROM partsupp) TO '/data/tpch/sf1/p16/snappy/partsupp' (FORMAT PARQUET, PARTITION_BY part);
-SQL
+pixi run -e doris -- uvx tpchgen-cli --scale-factor 1 --format parquet --parquet-compression SNAPPY --parts 16 --output-dir /data/tpch/sf1/p16/snappy
+```
+Produces: `/data/tpch/sf1/p16/snappy/lineitem/lineitem.1.parquet` through `lineitem.16.parquet`, etc.
+
+**Larger scale factors:**
+```bash
+# SF10, 16 partitions
+pixi run -e doris -- uvx tpchgen-cli --scale-factor 10 --format parquet --parquet-compression SNAPPY --parts 16 --output-dir /data/tpch/sf10/p16/snappy
+
+# SF100, single files, ZSTD compression
+pixi run -e doris -- uvx tpchgen-cli --scale-factor 100 --format parquet --parquet-compression "ZSTD(1)" --output-dir /data/tpch/sf100/snappy
 ```
 
 ### Manual query testing
@@ -334,14 +325,18 @@ pixi run -e doris substrait-build  # Substrait extension
 pixi run -e doris doris-build      # NIXL + Rust BE
 pixi run -e doris-fe doris-fe-build  # Doris FE
 
-# 4. Start (3 terminals)
+# 4. Generate TPC-H data (single-file for manual queries, partitioned for run-tpch.sh)
+pixi run -e doris -- uvx tpchgen-cli --scale-factor 1 --format parquet --parquet-compression SNAPPY --output-dir /data/tpch/sf1/snappy
+pixi run -e doris -- uvx tpchgen-cli --scale-factor 1 --format parquet --parquet-compression SNAPPY --parts 16 --output-dir /data/tpch/sf1/p16/snappy
+
+# 5. Start (3 terminals)
 pixi run -e doris-fe doris-fe      # Terminal 1: FE
 pixi run -e doris sirius-be        # Terminal 2: GPU BE
 
-# 5. Test
+# 6. Test
 pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root -e "SELECT 1"
 
-# 6. Run TPC-H
+# 7. Run TPC-H
 pixi run -e doris-fe -- mysql -h 127.0.0.1 -P 9030 -u root -e "
 SELECT l_returnflag, SUM(l_quantity), COUNT(*)
 FROM local(\"file_path\"=\"/data/tpch/sf1/snappy/lineitem.parquet\",
@@ -349,5 +344,5 @@ FROM local(\"file_path\"=\"/data/tpch/sf1/snappy/lineitem.parquet\",
 WHERE l_shipdate <= DATE '1998-09-02'
 GROUP BY l_returnflag ORDER BY l_returnflag"
 
-# 7. Compare GPU vs CPU: restart BE with --force-cpu and re-run
+# 8. Compare GPU vs CPU: restart BE with --force-cpu and re-run
 ```

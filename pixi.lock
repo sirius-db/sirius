@@ -799,6 +799,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.20.0-hf72d326_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ukkonen-1.1.0-py314h9891dd4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/unzip-6.0-hb03c661_4.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/uv-0.11.6-h0f56927_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.2.1-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/wget-1.25.0-h653f8fd_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/yaml-0.2.5-h280c20c_3.conda
@@ -970,6 +971,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.20.0-h62a42b4_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ukkonen-1.1.0-py314hd7d8586_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/unzip-6.0-he30d5cf_4.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/uv-0.11.6-he5ca43f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.2.1-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/wget-1.25.0-h4f42960_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/yaml-0.2.5-h80f16a2_3.conda
@@ -8355,6 +8357,29 @@ packages:
   license: LicenseRef-BSD-like
   size: 162036
   timestamp: 1754913052303
+- conda: https://conda.anaconda.org/conda-forge/linux-64/uv-0.11.6-h0f56927_0.conda
+  sha256: b4e119c6776d5f752f7f10a1e4810dcbcfe0a6b32cc23689b0009f93af76bf6c
+  md5: f78bab5fcaf462a4309c88c18def5574
+  depends:
+  - libstdcxx >=14
+  - libgcc >=14
+  - __glibc >=2.17,<3.0.a0
+  constrains:
+  - __glibc >=2.17
+  license: Apache-2.0 OR MIT
+  size: 19227106
+  timestamp: 1775743419931
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/uv-0.11.6-he5ca43f_0.conda
+  sha256: b7b66dd4df2136c3a46356a305a4551395ad37876d98bfd9a875e28b095e7bc2
+  md5: 715e0297fa0da008adcf6c451391c2b7
+  depends:
+  - libstdcxx >=14
+  - libgcc >=14
+  constrains:
+  - __glibc >=2.17
+  license: Apache-2.0 OR MIT
+  size: 18607561
+  timestamp: 1775743431499
 - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.2.1-pyhcf101f3_0.conda
   sha256: a3b38bb79ebbb830574b6e0ba1303f103601b5ed658ac400a3f9e43806e8e4fe
   md5: fa76df129efc4550f272d8668acbe658

@@ -82,12 +82,14 @@ doris-fe = ["doris-fe"]
 doris-be = ["doris-be"]
 duckdb-python = ["duckdb-python"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }
+
 [feature.doris.dependencies]
 rust = ">=1.85"
 libprotobuf = ">=5"
 thrift-compiler = ">=0.22"
 clangdev = "*"
 sysroot_linux-64 = ">=2.32"
+uv = "*"
 
 [feature.doris.tasks]
 substrait-build = { cmd = "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make release", cwd = "substrait", description = "Build DuckDB substrait extension" }
