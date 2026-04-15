@@ -5,6 +5,7 @@
 
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "log/logging.hpp"
 
 #include <cudf/column/column.hpp>
@@ -720,7 +721,7 @@ std::unique_ptr<cudf::table> gpu_decode_table(
     auto col_start = clock::now();
 
     if (col_type.id() == duckdb::LogicalTypeId::VARCHAR) {
-      columns.push_back(decode_string_column(col_scan, stream, mr, d_scratch));
+      columns.push_back(decode_string_column_batched(col_scan, stream, mr));
       auto col_end = clock::now();
       us_string += std::chrono::duration_cast<std::chrono::microseconds>(col_end - col_start).count();
       n_string++;
@@ -1020,7 +1021,9 @@ std::unique_ptr<cudf::table> gpu_decode_table_pipelined(
 
   for (size_t ci = 0; ci < col_scans.size(); ++ci) {
     if (col_types[ci].id() == duckdb::LogicalTypeId::VARCHAR)
-      columns.push_back(decode_string_column_from_device(col_scans[ci], blocks, d_staging, stream, mr));
+      columns.push_back(decode_string_column_batched(
+          col_scans[ci], stream, mr,
+          &blocks.offsets, static_cast<uint8_t*>(d_staging)));
     else
       columns.push_back(decode_fixed_width_column_from_device(col_scans[ci], col_types[ci], blocks, d_staging, stream, mr));
   }
