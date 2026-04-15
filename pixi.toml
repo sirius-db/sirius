@@ -88,7 +88,6 @@ rust = ">=1.85"
 libprotobuf = ">=5"
 thrift-compiler = ">=0.22"
 clangdev = "*"
-sysroot_linux-64 = ">=2.32"
 uv = "*"
 
 [feature.doris.tasks]
