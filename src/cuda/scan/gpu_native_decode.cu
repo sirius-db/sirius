@@ -147,9 +147,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
     const duckdb::LogicalType& type,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
-    void* d_scratch,
-    void* d_meta_scratch,
-    size_t meta_scratch_size)
+    void* d_scratch)
 {
   auto cudf_type     = to_cudf_type(type);
   auto physical_type = type.InternalType();
@@ -229,7 +227,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
             static_cast<uint32_t>(seg.row_count),
             type_size, is_signed,
             d_dest, stream,
-            d_scratch, d_meta_scratch, meta_scratch_size,
+            d_scratch, nullptr, 0,
             block_cached);
         gpu_decoded_segs++;
         break;
@@ -634,13 +632,11 @@ std::unique_ptr<cudf::table> gpu_decode_table(
 
   size_t total_rows = column_scans.empty() ? 0 : column_scans[0].data.total_rows;
 
-  // Pre-allocate scratch buffers — reused across all segments and columns.
-  // One block-sized buffer for H2D segment data, one for bitpacking metadata.
-  constexpr size_t META_SCRATCH_SIZE = 64 * 1024;  // 64KB, enough for ~1300 groups
+  // Pre-allocate scratch buffer — reused across all segments and columns.
+  // Block-sized buffer for H2D segment data.  Bitpacking metadata is now
+  // parsed on GPU directly from block data (no separate scratch needed).
   void* d_scratch = nullptr;
-  void* d_meta_scratch = nullptr;
   cudaMallocAsync(&d_scratch, DUCKDB_BLOCK_SIZE, stream.value());
-  cudaMallocAsync(&d_meta_scratch, META_SCRATCH_SIZE, stream.value());
 
   auto t_alloc = clock::now();
 
@@ -663,8 +659,7 @@ std::unique_ptr<cudf::table> gpu_decode_table(
       n_string++;
     } else {
       columns.push_back(decode_fixed_width_column(
-          col_scan, col_type, stream, mr,
-          d_scratch, d_meta_scratch, META_SCRATCH_SIZE));
+          col_scan, col_type, stream, mr, d_scratch));
       auto col_end = clock::now();
       us_fixed += std::chrono::duration_cast<std::chrono::microseconds>(col_end - col_start).count();
       n_fixed++;
@@ -678,9 +673,8 @@ std::unique_ptr<cudf::table> gpu_decode_table(
 
   auto t_sync = clock::now();
 
-  // Free scratch buffers
+  // Free scratch buffer
   cudaFreeAsync(d_scratch, stream.value());
-  cudaFreeAsync(d_meta_scratch, stream.value());
 
   auto t_end = clock::now();
 
@@ -712,8 +706,7 @@ namespace {
 std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
     column_scan_result& col_scan, const duckdb::LogicalType& type,
     const device_block_map& blocks, uint8_t* device_staging,
-    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr,
-    void* d_meta_scratch, size_t meta_scratch_size)
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
 {
   auto cudf_type = to_cudf_type(type);
   auto physical_type = type.InternalType();
@@ -752,7 +745,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
         void* d_block = (it != blocks.offsets.end()) ? static_cast<void*>(device_staging + it->second) : nullptr;
         gpu_decode_bitpacking(seg.data_ptr - seg.block_offset, DUCKDB_BLOCK_SIZE,
             seg.block_offset, seg.row_count, type_size, is_signed, d_dest, stream,
-            d_block ? d_block : nullptr, d_meta_scratch, meta_scratch_size, d_block != nullptr);
+            d_block ? d_block : nullptr, nullptr, 0, d_block != nullptr);
         break;
       }
       default: throw std::runtime_error("unsupported compression in pipelined decode");
@@ -922,9 +915,6 @@ std::unique_ptr<cudf::table> gpu_decode_table_pipelined(
     throw std::invalid_argument("gpu_decode_table_pipelined: size mismatch");
 
   auto* d_staging = static_cast<uint8_t*>(device_staging);
-  constexpr size_t META_SCRATCH_SIZE = 64 * 1024;
-  void* d_meta_scratch = nullptr;
-  cudaMallocAsync(&d_meta_scratch, META_SCRATCH_SIZE, stream.value());
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(col_scans.size());
@@ -933,11 +923,10 @@ std::unique_ptr<cudf::table> gpu_decode_table_pipelined(
     if (col_types[ci].id() == duckdb::LogicalTypeId::VARCHAR)
       columns.push_back(decode_string_column_from_device(col_scans[ci], blocks, d_staging, stream, mr));
     else
-      columns.push_back(decode_fixed_width_column_from_device(col_scans[ci], col_types[ci], blocks, d_staging, stream, mr, d_meta_scratch, META_SCRATCH_SIZE));
+      columns.push_back(decode_fixed_width_column_from_device(col_scans[ci], col_types[ci], blocks, d_staging, stream, mr));
   }
 
   stream.synchronize();
-  cudaFreeAsync(d_meta_scratch, stream.value());
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
