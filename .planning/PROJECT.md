@@ -51,13 +51,17 @@ Validated in Phase 4: Queue Integration — v1.1
 
 ### Active
 
-- [ ] `convertible_data` abstract interface with `convert()` and `bytes_in_space()`
-- [ ] `convertible_data_provider` abstract interface with `get_next_convertible()`, `get_all_convertible()`, `get_bytes_in_space()`
+Validated in Phase 5: State Machine & Interfaces
+- [x] `convertible_data` abstract interface with `convert()` and `bytes_in_space()`
+- [x] `convertible_data_provider` abstract interface with `get_next_convertible()`, `get_all_convertible()`, `get_bytes_in_space()`
+- [x] Extend `data_batch` state machine: `task_created → in_transit` transition (documentation formalized, tests added)
+
+### Active
+
 - [ ] `convertible_data_batch` wrapping `data_batch` with downgrade-style conversion
 - [ ] `convertible_data_batch_provider` wrapping `data_repository`
 - [ ] `convertible_gpu_pipeline_task` wrapping `gpu_pipeline_task` with RAII queue ownership
 - [ ] `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
-- [ ] Extend `data_batch` state machine: `task_created → in_transit` transition
 - [ ] Failure safety: conversions restore original `batch_state` and `idata_representation` on failure
 
 ### Out of Scope
@@ -68,9 +72,9 @@ Validated in Phase 4: Queue Integration — v1.1
 
 ## Current State
 
-**v2.0 Convertible Data Abstraction** — STARTED 2026-04-15
+**v2.0 Convertible Data Abstraction** — Phase 5 complete 2026-04-15
 
-Building memory-space-aware data conversion interfaces on top of the `inspectable_mpsc<T>` foundation shipped in v1.1.
+Phase 5 shipped: state machine documentation formalized (`task_created <-> in_transit` transitions), abstract `convertible_data` and `convertible_data_provider` interfaces defined. Next: Phase 6 (concrete batch conversion).
 
 ## Context
 
@@ -123,4 +127,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-15 after v2.0 milestone start*
+*Last updated: 2026-04-15 after Phase 5 completion*
