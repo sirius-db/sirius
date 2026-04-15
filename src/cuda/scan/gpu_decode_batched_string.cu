@@ -49,6 +49,72 @@ struct alignas(8) batched_seg_desc {
 };
 
 //===----------------------------------------------------------------------===//
+// Adaptive chunking — expand segment descriptors to fill GPU SMs
+//===----------------------------------------------------------------------===//
+
+/// Expand segment descriptors into smaller chunk descriptors so that the
+/// kernel grid is large enough to utilize all GPU SMs.  Each chunk descriptor
+/// has the same d_block and block_offset as its parent segment, but covers
+/// a subset of rows (chunk_row_count ≤ rows per chunk).
+///
+/// The target_ctas parameter is computed from cudaDeviceProp::multiProcessorCount
+/// to ensure the GPU is fully utilized regardless of hardware.
+static std::vector<batched_seg_desc> expand_to_chunks(
+  const std::vector<batched_seg_desc>& seg_descs,
+  uint32_t target_ctas)
+{
+  // Count total rows across all segments
+  uint32_t total_rows = 0;
+  for (auto const& d : seg_descs) total_rows += d.row_count;
+
+  // If we already have enough CTAs, don't split
+  if (seg_descs.size() >= target_ctas || total_rows == 0) {
+    return seg_descs;
+  }
+
+  // Compute chunk size: target enough CTAs to fill the GPU
+  uint32_t chunk_size = total_rows / target_ctas;
+  // Clamp: at least 64 rows (below this, CTA overhead dominates)
+  chunk_size = std::max(chunk_size, 64u);
+  // Round down to warp size for coalescing
+  chunk_size = (chunk_size / 32) * 32;
+  if (chunk_size == 0) chunk_size = 32;
+
+  std::vector<batched_seg_desc> chunks;
+  chunks.reserve(target_ctas + seg_descs.size());
+
+  for (auto const& seg : seg_descs) {
+    uint32_t remaining = seg.row_count;
+    uint32_t offset    = 0;
+    while (remaining > 0) {
+      uint32_t n = std::min(remaining, chunk_size);
+      chunks.push_back({seg.d_block,
+                        seg.block_offset,
+                        n,
+                        seg.global_row_start + offset});
+      offset += n;
+      remaining -= n;
+    }
+  }
+
+  return chunks;
+}
+
+/// Query GPU SM count (cached after first call).
+static uint32_t get_target_ctas()
+{
+  static uint32_t cached = 0;
+  if (cached == 0) {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    // Target: fill all SMs with 2 waves of 8-way occupancy (256-thread blocks)
+    int occupancy_blocks = prop.maxThreadsPerMultiProcessor / 256;
+    cached = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
+  }
+  return cached;
+}
+
+//===----------------------------------------------------------------------===//
 // Constants
 //===----------------------------------------------------------------------===//
 
@@ -735,13 +801,27 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   //===--------------------------------------------------------------------===//
 
   constexpr uint32_t THREADS = 256;
+  uint32_t target_ctas       = get_target_ctas();
 
-  if (!dict_descs.empty()) {
-    kernel_compute_lengths_dict<<<static_cast<uint32_t>(dict_descs.size()),
+  // Expand dict descriptors to chunks for better SM utilization.
+  // With 17 segments on 132 SMs, only 13% of SMs are active.
+  // Chunking to ~2K CTAs fills all SMs with 2 waves.
+  auto dict_chunks     = expand_to_chunks(dict_descs, target_ctas);
+  auto dict_chunks_buf = make_device_copy(
+    dict_chunks.data(), dict_chunks.size() * sizeof(batched_seg_desc));
+  auto* d_dict_chunks  = static_cast<batched_seg_desc*>(dict_chunks_buf.data());
+
+  auto uncomp_chunks     = expand_to_chunks(uncomp_descs, target_ctas);
+  auto uncomp_chunks_buf = make_device_copy(
+    uncomp_chunks.data(), uncomp_chunks.size() * sizeof(batched_seg_desc));
+  auto* d_uncomp_chunks  = static_cast<batched_seg_desc*>(uncomp_chunks_buf.data());
+
+  if (!dict_chunks.empty()) {
+    kernel_compute_lengths_dict<<<static_cast<uint32_t>(dict_chunks.size()),
                                   THREADS,
                                   0,
                                   stream.value()>>>(
-      d_dict_descs, d_lengths.data(), static_cast<uint32_t>(dict_descs.size()));
+      d_dict_chunks, d_lengths.data(), static_cast<uint32_t>(dict_chunks.size()));
   }
 
   if (!fsst_descs.empty()) {
@@ -756,12 +836,12 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
                                                     static_cast<uint32_t>(fsst_descs.size()));
   }
 
-  if (!uncomp_descs.empty()) {
-    kernel_compute_lengths_uncompressed<<<static_cast<unsigned>(uncomp_descs.size()),
+  if (!uncomp_chunks.empty()) {
+    kernel_compute_lengths_uncompressed<<<static_cast<unsigned>(uncomp_chunks.size()),
                                           THREADS,
                                           0,
                                           stream.value()>>>(
-      d_uncomp_descs, d_lengths.data(), static_cast<uint32_t>(uncomp_descs.size()));
+      d_uncomp_chunks, d_lengths.data(), static_cast<uint32_t>(uncomp_chunks.size()));
   }
 
   //===--------------------------------------------------------------------===//
@@ -831,9 +911,9 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   // Phase 7: Pass 2 — gather strings (batched)
   //===--------------------------------------------------------------------===//
 
-  if (!dict_descs.empty()) {
-    kernel_gather_dict<<<dict_descs.size(), THREADS, 0, stream.value()>>>(
-      d_dict_descs, d_offsets.data(), d_chars_ptr, static_cast<uint32_t>(dict_descs.size()));
+  if (!dict_chunks.empty()) {
+    kernel_gather_dict<<<dict_chunks.size(), THREADS, 0, stream.value()>>>(
+      d_dict_chunks, d_offsets.data(), d_chars_ptr, static_cast<uint32_t>(dict_chunks.size()));
   }
 
   if (!fsst_descs.empty()) {
@@ -847,9 +927,9 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       static_cast<uint32_t>(fsst_descs.size()));
   }
 
-  if (!uncomp_descs.empty()) {
-    kernel_gather_uncompressed<<<uncomp_descs.size(), THREADS, 0, stream.value()>>>(
-      d_uncomp_descs, d_offsets.data(), d_chars_ptr, static_cast<uint32_t>(uncomp_descs.size()));
+  if (!uncomp_chunks.empty()) {
+    kernel_gather_uncompressed<<<uncomp_chunks.size(), THREADS, 0, stream.value()>>>(
+      d_uncomp_chunks, d_offsets.data(), d_chars_ptr, static_cast<uint32_t>(uncomp_chunks.size()));
   }
 
   //===--------------------------------------------------------------------===//
