@@ -82,6 +82,39 @@ void gpu_decode_bitpacking(const uint8_t* segment_data,
                            bool skip_block_copy = false);
 
 //===----------------------------------------------------------------------===//
+// Batched bitpacking decode
+//===----------------------------------------------------------------------===//
+
+/// Descriptor for batched bitpacking decode — one entry per metadata group.
+/// The batched kernel launches one CTA per group (matching the original
+/// per-segment kernel's parallelism) while eliminating launch overhead.
+struct alignas(8) batched_bp_seg_desc {
+  const uint8_t* d_block;     ///< Device pointer to 256KB block data
+  uint32_t block_offset;       ///< Offset within block to segment start
+  uint32_t group_idx;          ///< Metadata group index within the segment (0-based)
+  uint32_t group_row_count;    ///< Rows in this group (last group may be < 2048)
+  uint32_t global_row_offset;  ///< Output offset in elements for this group
+};
+
+/// @brief Decode multiple bitpacked segments in a single kernel launch.
+///
+/// Replaces N per-segment gpu_decode_bitpacking() calls with one batched launch.
+/// Descriptor d_block pointers must be valid device (or GH200 host) pointers.
+///
+/// @param descs         Host array of segment descriptors (uploaded internally)
+/// @param num_segments  Number of segments to decode
+/// @param d_output      Pre-allocated device buffer (total_rows * type_size bytes)
+/// @param type_size     Size of the output type in bytes (1, 2, 4, or 8)
+/// @param is_signed     Whether the type is signed
+/// @param stream        CUDA stream
+void gpu_decode_bitpacking_batched(const batched_bp_seg_desc* descs,
+                                   uint32_t num_segments,
+                                   void* d_output,
+                                   uint32_t type_size,
+                                   bool is_signed,
+                                   rmm::cuda_stream_view stream);
+
+//===----------------------------------------------------------------------===//
 // Pre-allocated temp buffers for string segment decode
 //===----------------------------------------------------------------------===//
 

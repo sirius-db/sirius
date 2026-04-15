@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -240,12 +241,18 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
   }
   if (has_rle) { cudaMallocAsync(&d_rle_cumsum, RLE_CUMSUM_CAPACITY, stream.value()); }
 
+  // Collect bitpacking segments for batched decode (one kernel launch for all).
+  struct bp_collect_info {
+    const uint8_t* host_block_base;
+    uint32_t block_offset;
+    uint32_t row_count;
+    size_t output_row_offset;
+  };
+  std::vector<bp_collect_info> bp_segments;
+
   size_t row_offset       = 0;
   size_t gpu_decoded_segs = 0;
-  // Tracks last block base to skip redundant H2D when consecutive segments
-  // share the same 256KB DuckDB block. This is safe because DuckDB's segment
-  // tree is ordered by row offset within a column, so segments from the same
-  // block always appear consecutively.
+  // Tracks last block base to skip redundant H2D for RLE segments.
   const uint8_t* last_block_base = nullptr;
 
   for (auto& seg : col_scan.data.segments) {
@@ -279,19 +286,10 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
       }
 
       case duckdb::CompressionType::COMPRESSION_BITPACKING: {
-        const uint8_t* block_base = seg.data_ptr - seg.block_offset;
-        bool block_cached         = (block_base == last_block_base);
-        if (!block_cached) last_block_base = block_base;
-        gpu_decode_bitpacking(block_base,
-                              DUCKDB_BLOCK_SIZE,
-                              static_cast<uint32_t>(seg.block_offset),
-                              static_cast<uint32_t>(seg.row_count),
-                              type_size,
-                              is_signed,
-                              d_dest,
-                              stream,
-                              d_scratch,
-                              block_cached);
+        bp_segments.push_back({seg.data_ptr - seg.block_offset,
+                               static_cast<uint32_t>(seg.block_offset),
+                               static_cast<uint32_t>(seg.row_count),
+                               row_offset});
         gpu_decoded_segs++;
         break;
       }
@@ -323,6 +321,53 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
     }
 
     row_offset += seg.row_count;
+  }
+
+  // Batch decode all bitpacking segments in a single kernel launch.
+  // Replaces N per-segment launches (48K+ at SF100) with 1 launch.
+  if (!bp_segments.empty()) {
+    // Collect unique block base addresses
+    std::unordered_map<const uint8_t*, size_t> unique_blocks;
+    for (auto& bp : bp_segments) {
+      if (unique_blocks.find(bp.host_block_base) == unique_blocks.end()) {
+        unique_blocks[bp.host_block_base] = unique_blocks.size() * DUCKDB_BLOCK_SIZE;
+      }
+    }
+
+    // Allocate staging and copy all unique blocks to device
+    size_t staging_bytes    = unique_blocks.size() * DUCKDB_BLOCK_SIZE;
+    uint8_t* d_bp_staging   = nullptr;
+    cudaMallocAsync(&d_bp_staging, staging_bytes, stream.value());
+    for (auto& [host_base, dev_offset] : unique_blocks) {
+      cudaMemcpyAsync(d_bp_staging + dev_offset, host_base, DUCKDB_BLOCK_SIZE,
+                      cudaMemcpyHostToDevice, stream.value());
+    }
+
+    // Build per-group descriptors (one CTA per 2048-row metadata group)
+    std::vector<batched_bp_seg_desc> descs;
+    for (auto& bp : bp_segments) {
+      uint32_t num_groups =
+        (bp.row_count + BP_META_GROUP_SIZE - 1) / BP_META_GROUP_SIZE;
+      for (uint32_t g = 0; g < num_groups; ++g) {
+        uint32_t group_rows =
+          (g < num_groups - 1) ? BP_META_GROUP_SIZE : bp.row_count - g * BP_META_GROUP_SIZE;
+        descs.push_back({d_bp_staging + unique_blocks[bp.host_block_base],
+                         bp.block_offset,
+                         g,
+                         group_rows,
+                         static_cast<uint32_t>(bp.output_row_offset + g * BP_META_GROUP_SIZE)});
+      }
+    }
+
+    // One kernel launch for all metadata groups across all segments
+    gpu_decode_bitpacking_batched(descs.data(),
+                                  static_cast<uint32_t>(descs.size()),
+                                  d_output,
+                                  type_size,
+                                  is_signed,
+                                  stream);
+
+    cudaFreeAsync(d_bp_staging, stream.value());
   }
 
   // Free RLE cumsum scratch
@@ -533,6 +578,16 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
   }
   if (has_rle) cudaMallocAsync(&d_rle_cumsum, RLE_CUMSUM_CAP, stream.value());
 
+  // Collect bitpacking segments for batched decode.
+  struct bp_pipe_info {
+    duckdb::block_id_t block_id;
+    const uint8_t* host_block_base;
+    uint32_t block_offset;
+    uint32_t row_count;
+    size_t output_row_offset;
+  };
+  std::vector<bp_pipe_info> bp_segments;
+
   for (auto& seg : col_scan.data.segments) {
     if (seg.row_count == 0) {
       row_offset += seg.row_count;
@@ -565,19 +620,11 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
         break;
       }
       case duckdb::CompressionType::COMPRESSION_BITPACKING: {
-        auto it = blocks.offsets.find(seg.block_id);
-        void* d_block =
-          (it != blocks.offsets.end()) ? static_cast<void*>(device_staging + it->second) : nullptr;
-        gpu_decode_bitpacking(seg.data_ptr - seg.block_offset,
-                              DUCKDB_BLOCK_SIZE,
-                              seg.block_offset,
-                              seg.row_count,
-                              type_size,
-                              is_signed,
-                              d_dest,
-                              stream,
-                              d_block ? d_block : nullptr,
-                              d_block != nullptr);
+        bp_segments.push_back({seg.block_id,
+                               seg.data_ptr - seg.block_offset,
+                               static_cast<uint32_t>(seg.block_offset),
+                               static_cast<uint32_t>(seg.row_count),
+                               row_offset});
         break;
       }
       case duckdb::CompressionType::COMPRESSION_RLE: {
@@ -600,6 +647,58 @@ std::unique_ptr<cudf::column> decode_fixed_width_column_from_device(
       default: throw std::runtime_error("unsupported compression in pipelined decode");
     }
     row_offset += seg.row_count;
+  }
+
+  // Batch decode all bitpacking segments in a single kernel launch.
+  if (!bp_segments.empty()) {
+    // Separate segments by whether their block is on device or needs H2D
+    std::unordered_map<const uint8_t*, size_t> fallback_blocks;
+    for (auto& bp : bp_segments) {
+      auto it = blocks.offsets.find(bp.block_id);
+      if (it == blocks.offsets.end()) {
+        if (fallback_blocks.find(bp.host_block_base) == fallback_blocks.end()) {
+          fallback_blocks[bp.host_block_base] = fallback_blocks.size() * DUCKDB_BLOCK_SIZE;
+        }
+      }
+    }
+
+    // Copy any blocks not already on device
+    uint8_t* d_fb_staging = nullptr;
+    if (!fallback_blocks.empty()) {
+      size_t fb_bytes = fallback_blocks.size() * DUCKDB_BLOCK_SIZE;
+      cudaMallocAsync(&d_fb_staging, fb_bytes, stream.value());
+      for (auto& [host_base, offset] : fallback_blocks) {
+        cudaMemcpyAsync(d_fb_staging + offset, host_base, DUCKDB_BLOCK_SIZE,
+                        cudaMemcpyHostToDevice, stream.value());
+      }
+    }
+
+    // Build per-group descriptors
+    std::vector<batched_bp_seg_desc> descs;
+    for (auto& bp : bp_segments) {
+      auto it = blocks.offsets.find(bp.block_id);
+      const uint8_t* d_block =
+        (it != blocks.offsets.end())
+          ? device_staging + it->second
+          : d_fb_staging + fallback_blocks[bp.host_block_base];
+      uint32_t num_groups =
+        (bp.row_count + BP_META_GROUP_SIZE - 1) / BP_META_GROUP_SIZE;
+      for (uint32_t g = 0; g < num_groups; ++g) {
+        uint32_t group_rows =
+          (g < num_groups - 1) ? BP_META_GROUP_SIZE : bp.row_count - g * BP_META_GROUP_SIZE;
+        descs.push_back({d_block, bp.block_offset, g, group_rows,
+                         static_cast<uint32_t>(bp.output_row_offset + g * BP_META_GROUP_SIZE)});
+      }
+    }
+
+    gpu_decode_bitpacking_batched(descs.data(),
+                                  static_cast<uint32_t>(descs.size()),
+                                  d_output,
+                                  type_size,
+                                  is_signed,
+                                  stream);
+
+    if (d_fb_staging) cudaFreeAsync(d_fb_staging, stream.value());
   }
 
   if (d_rle_cumsum) cudaFreeAsync(d_rle_cumsum, stream.value());
