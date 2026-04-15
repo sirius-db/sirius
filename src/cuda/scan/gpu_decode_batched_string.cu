@@ -385,9 +385,7 @@ __global__ void kernel_gather_dict(const batched_seg_desc* __restrict__ descs,
     int32_t out_pos      = d_offsets[desc.global_row_start + i];
 
     const uint8_t* src = d_dict_end - dict_offset;
-    for (uint32_t b = 0; b < str_len; b++) {
-      d_chars[out_pos + b] = src[b];
-    }
+    memcpy(d_chars + out_pos, src, str_len);
   }
 }
 
@@ -530,9 +528,7 @@ __global__ void kernel_gather_uncompressed(const batched_seg_desc* __restrict__ 
 
     int32_t out_pos    = d_offsets[desc.global_row_start + i];
     const uint8_t* src = dict_end - abs_cur;
-    for (uint32_t b = 0; b < str_len; b++) {
-      d_chars[out_pos + b] = src[b];
-    }
+    memcpy(d_chars + out_pos, src, str_len);
   }
 }
 
