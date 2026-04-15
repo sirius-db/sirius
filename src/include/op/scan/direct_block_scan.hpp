@@ -21,16 +21,16 @@ namespace sirius::op::scan {
 
 struct direct_block_scan_result {
   struct segment_info {
-    duckdb::BufferHandle handle;              // Keeps block pinned
-    duckdb::data_ptr_t data_ptr = nullptr;    // Raw pointer to segment data
-    duckdb::idx_t block_offset  = 0;
-    duckdb::idx_t row_count     = 0;
-    duckdb::idx_t segment_size  = 0;
-    duckdb::block_id_t block_id = -1;
-    bool persistent             = false;
+    duckdb::BufferHandle handle;                    // Keeps block pinned
+    duckdb::data_ptr_t data_ptr         = nullptr;  // Raw pointer to segment data
+    duckdb::idx_t block_offset          = 0;
+    duckdb::idx_t row_count             = 0;
+    duckdb::idx_t segment_size          = 0;
+    duckdb::block_id_t block_id         = -1;
+    bool persistent                     = false;
     duckdb::CompressionType compression = duckdb::CompressionType::COMPRESSION_AUTO;
-    uint32_t max_string_length  = 0;   // From segment stats (VARCHAR only, 0 = unknown)
-    uint8_t constant_data[16]   = {};  // Inline storage for blockless CONSTANT segments
+    uint32_t max_string_length          = 0;   // From segment stats (VARCHAR only, 0 = unknown)
+    uint8_t constant_data[16]           = {};  // Inline storage for blockless CONSTANT segments
   };
 
   std::vector<segment_info> segments;
@@ -46,33 +46,10 @@ struct column_scan_result {
   bool has_nulls = false;  // True if any data segment reports HasNull()
 };
 
-/// @brief Walk segment tree, pin all blocks for a column.
-/// Returns raw data pointers ready for cudaMemcpy or GPU decode.
-direct_block_scan_result direct_block_scan_column(
-  duckdb::DataTable& storage,
-  duckdb::StorageIndex col_idx,
-  duckdb::ClientContext& context);
-
-/// @brief Copy uncompressed fixed-width segments directly via memcpy.
-/// Returns total bytes copied. Skips compressed segments.
-size_t direct_copy_fixed_column(
-  direct_block_scan_result& scan_result,
-  uint8_t* dest_buffer,
-  size_t type_size);
-
-/// @brief Walk segment tree for both data and validity, pin all blocks.
-/// Returns data segments + validity segments ready for GPU decode.
-column_scan_result direct_block_scan_column_full(
-  duckdb::DataTable& storage,
-  duckdb::StorageIndex col_idx,
-  duckdb::ClientContext& context);
-
 /// @brief Pin data and validity segments for a specific subset of row groups.
-/// Like direct_block_scan_column_full but only visits the given row groups.
-column_scan_result direct_block_scan_column_range(
-  duckdb::DataTable& storage,
-  duckdb::StorageIndex col_idx,
-  duckdb::ClientContext& context,
-  const std::vector<duckdb::RowGroup*>& row_groups);
+column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
+                                                  duckdb::StorageIndex col_idx,
+                                                  duckdb::ClientContext& context,
+                                                  const std::vector<duckdb::RowGroup*>& row_groups);
 
 }  // namespace sirius::op::scan

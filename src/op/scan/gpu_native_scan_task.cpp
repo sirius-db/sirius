@@ -5,18 +5,16 @@
 
 #include "op/scan/gpu_native_scan_task.hpp"
 
+#include <cuda/scan/gpu_decode.cuh>
 #include <cuda/scan/gpu_native_decode.cuh>
-#include <log/logging.hpp>
-#include <sirius_config.hpp>
 
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <cstring>
-#include <unordered_set>
-
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/execution/adaptive_filter.hpp>
+#include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
-#include <duckdb/storage/buffer_manager.hpp>
+#include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
@@ -24,12 +22,12 @@
 #include <duckdb/storage/table/scan_state.hpp>
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
-#include <duckdb/storage/statistics/string_stats.hpp>
-#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
-#include <duckdb/execution/adaptive_filter.hpp>
-#include <duckdb/function/table/table_scan.hpp>
+#include <log/logging.hpp>
+#include <sirius_config.hpp>
 
 #include <chrono>
+#include <cstring>
+#include <unordered_set>
 
 namespace sirius::op::scan {
 
@@ -73,7 +71,7 @@ gpu_native_scan_global_state::gpu_native_scan_global_state(
   }
 
   // Resolve GPU memory space
-  auto& mem_mgr  = sirius_ctx_->get_memory_manager();
+  auto& mem_mgr   = sirius_ctx_->get_memory_manager();
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   gpu_space_      = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
 
@@ -86,9 +84,10 @@ gpu_native_scan_global_state::gpu_native_scan_global_state(
   if (viable_) {
     prune_row_groups();
     compute_batch_size();
-    SIRIUS_LOG_INFO(
-      "[gpu_native_scan] viable: {} row groups, {} cols, batch_size={}",
-      row_groups_.size(), col_types_.size(), row_groups_per_batch_);
+    SIRIUS_LOG_INFO("[gpu_native_scan] viable: {} row groups, {} cols, batch_size={}",
+                    row_groups_.size(),
+                    col_types_.size(),
+                    row_groups_per_batch_);
   } else {
     SIRIUS_LOG_INFO("[gpu_native_scan] not viable — will fall back to duckdb_scan_task");
   }
@@ -127,9 +126,9 @@ void gpu_native_scan_global_state::check_viability()
   for (size_t rg_idx = 0; rg_idx < row_groups_.size(); ++rg_idx) {
     auto* rg = row_groups_[rg_idx];
     for (size_t ci = 0; ci < col_indices_.size(); ++ci) {
-      auto& col_data = rg->GetColumnDirect(col_indices_[ci]);
-      auto& seg_tree = col_data.GetSegmentTree();
-      auto seg_node  = seg_tree.GetRootSegment();
+      auto& col_data  = rg->GetColumnDirect(col_indices_[ci]);
+      auto& seg_tree  = col_data.GetSegmentTree();
+      auto seg_node   = seg_tree.GetRootSegment();
       bool is_varchar = col_types_[ci].id() == duckdb::LogicalTypeId::VARCHAR;
 
       while (seg_node) {
@@ -142,13 +141,11 @@ void gpu_native_scan_global_state::check_viability()
           case duckdb::CompressionType::COMPRESSION_BITPACKING:
           case duckdb::CompressionType::COMPRESSION_CONSTANT:
           case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
-          case duckdb::CompressionType::COMPRESSION_RLE:
-            break;
+          case duckdb::CompressionType::COMPRESSION_RLE: break;
 
           case duckdb::CompressionType::COMPRESSION_DICTIONARY:
           case duckdb::CompressionType::COMPRESSION_FSST:
-            if (is_varchar &&
-                !duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+            if (is_varchar && !duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
               SIRIUS_LOG_INFO(
                 "[gpu_native_scan] not viable: col {} segment missing max_string_length",
                 col_indices_[ci].GetPrimaryIndex());
@@ -158,9 +155,9 @@ void gpu_native_scan_global_state::check_viability()
             break;
 
           default:
-            SIRIUS_LOG_INFO(
-              "[gpu_native_scan] not viable: col {} has unsupported compression {}",
-              col_indices_[ci].GetPrimaryIndex(), static_cast<int>(compression));
+            SIRIUS_LOG_INFO("[gpu_native_scan] not viable: col {} has unsupported compression {}",
+                            col_indices_[ci].GetPrimaryIndex(),
+                            static_cast<int>(compression));
             viable_ = false;
             return;
         }
@@ -173,7 +170,8 @@ void gpu_native_scan_global_state::check_viability()
           }
           rg_decoded_bytes_[rg_idx] += row_count * (4 + max_len);
         } else {
-          rg_decoded_bytes_[rg_idx] += row_count * duckdb::GetTypeIdSize(col_types_[ci].InternalType());
+          rg_decoded_bytes_[rg_idx] +=
+            row_count * duckdb::GetTypeIdSize(col_types_[ci].InternalType());
         }
 
         seg_node = seg_tree.GetNextSegment(*seg_node);
@@ -206,14 +204,12 @@ void gpu_native_scan_global_state::prune_row_groups()
     surviving_bytes.reserve(row_groups_.size());
 
     for (size_t i = 0; i < row_groups_.size(); ++i) {
-      if (!row_groups_[i]->CheckZonemap(filter_info)) {
-        continue;
-      }
+      if (!row_groups_[i]->CheckZonemap(filter_info)) { continue; }
       surviving_rgs.push_back(row_groups_[i]);
       surviving_bytes.push_back(rg_decoded_bytes_[i]);
     }
 
-    row_groups_ = std::move(surviving_rgs);
+    row_groups_       = std::move(surviving_rgs);
     rg_decoded_bytes_ = std::move(surviving_bytes);
   }
 
@@ -229,9 +225,10 @@ void gpu_native_scan_global_state::prune_row_groups()
   rg_decoded_bytes_.shrink_to_fit();
 
   if (row_groups_.size() < original_count) {
-    SIRIUS_LOG_INFO(
-      "[gpu_native_scan] row group pruning: {}/{} pruned ({} remaining)",
-      original_count - row_groups_.size(), original_count, row_groups_.size());
+    SIRIUS_LOG_INFO("[gpu_native_scan] row group pruning: {}/{} pruned ({} remaining)",
+                    original_count - row_groups_.size(),
+                    original_count,
+                    row_groups_.size());
   }
 }
 
@@ -244,7 +241,7 @@ void gpu_native_scan_global_state::compute_batch_size()
     return;
   }
 
-  size_t rgs_per_batch  = target_bytes / decoded_bytes_per_rg_;
+  size_t rgs_per_batch = target_bytes / decoded_bytes_per_rg_;
   if (rgs_per_batch == 0) { rgs_per_batch = 1; }
 
   row_groups_per_batch_ = std::min(rgs_per_batch, row_groups_.size());
@@ -273,8 +270,8 @@ void gpu_native_scan_global_state::decrement_tasks()
   }
 }
 
-std::vector<sirius_physical_operator*>
-gpu_native_scan_global_state::get_output_consumers() const noexcept
+std::vector<sirius_physical_operator*> gpu_native_scan_global_state::get_output_consumers()
+  const noexcept
 {
   std::vector<sirius_physical_operator*> consumers;
   auto ports = op_.get_next_port_after_sink();
@@ -292,9 +289,7 @@ gpu_native_scan_task::gpu_native_scan_task(
   uint64_t task_id,
   shared_data_repository* data_repo,
   std::shared_ptr<gpu_native_scan_global_state> global_state)
-  : sirius_pipeline_itask(
-      std::make_unique<gpu_native_scan_task_local_state>(),
-      global_state),
+  : sirius_pipeline_itask(std::make_unique<gpu_native_scan_task_local_state>(), global_state),
     data_repo_(data_repo),
     task_id_(task_id)
 {
@@ -304,9 +299,7 @@ gpu_native_scan_task::gpu_native_scan_task(
 gpu_native_scan_task::~gpu_native_scan_task()
 {
   auto& g = _global_state->cast<gpu_native_scan_global_state>();
-  if (auto* pipeline = g.get_pipeline()) {
-    pipeline->mark_task_completed();
-  }
+  if (auto* pipeline = g.get_pipeline()) { pipeline->mark_task_completed(); }
 }
 
 //===----------------------------------------------------------------------===//
@@ -326,22 +319,21 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
   }
 
   using clock = std::chrono::steady_clock;
-  auto t0 = clock::now();
+  auto t0     = clock::now();
 
   auto& row_groups  = g.row_groups();
   auto& col_indices = g.col_indices();
   auto& col_types   = g.col_types();
   size_t num_cols   = col_indices.size();
-  auto mr = g.gpu_space()->get_default_allocator();
+  auto mr           = g.gpu_space()->get_default_allocator();
 
   // 2. Pin segments for the claimed row groups
   std::vector<column_scan_result> col_scans(num_cols);
   for (size_t ci = 0; ci < num_cols; ++ci) {
-    std::vector<duckdb::RowGroup*> batch_rgs(
-        row_groups.begin() + range->start_idx,
-        row_groups.begin() + range->start_idx + range->count);
-    col_scans[ci] = direct_block_scan_column_range(
-        g.storage(), col_indices[ci], g.context(), batch_rgs);
+    std::vector<duckdb::RowGroup*> batch_rgs(row_groups.begin() + range->start_idx,
+                                             row_groups.begin() + range->start_idx + range->count);
+    col_scans[ci] =
+      direct_block_scan_column_range(g.storage(), col_indices[ci], g.context(), batch_rgs);
   }
 
   auto t1_pin = clock::now();
@@ -356,12 +348,15 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
   }
 
   // 4. Bulk H2D → decode from device
+  //    When enough unique blocks are present, staging them all on GPU first
+  //    and decoding from device memory avoids redundant per-segment H2D copies.
+  constexpr size_t BULK_H2D_MIN_BLOCKS = 4;
   std::unique_ptr<cudf::table> gpu_table;
   size_t total_blocks = unique_blocks.size();
 
-  if (unique_blocks.size() >= 4) {
-    size_t buf_bytes = unique_blocks.size() * 262144;
-    void* d_staging = nullptr;
+  if (unique_blocks.size() >= BULK_H2D_MIN_BLOCKS) {
+    size_t buf_bytes = unique_blocks.size() * sirius::cuda::scan::DUCKDB_BLOCK_SIZE;
+    void* d_staging  = nullptr;
     cudaMallocAsync(&d_staging, buf_bytes, stream.value());
 
     sirius::cuda::scan::device_block_map block_map;
@@ -371,45 +366,50 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
         if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0) continue;
         if (block_map.offsets.count(seg.block_id)) continue;
         cudaMemcpyAsync(static_cast<uint8_t*>(d_staging) + offset,
-                        seg.data_ptr - seg.block_offset, 262144,
-                        cudaMemcpyHostToDevice, stream.value());
+                        seg.data_ptr - seg.block_offset,
+                        sirius::cuda::scan::DUCKDB_BLOCK_SIZE,
+                        cudaMemcpyHostToDevice,
+                        stream.value());
         block_map.offsets[seg.block_id] = offset;
-        offset += 262144;
+        offset += sirius::cuda::scan::DUCKDB_BLOCK_SIZE;
       }
     }
     block_map.total_bytes = offset;
 
     gpu_table = sirius::cuda::scan::gpu_decode_table_pipelined(
-        col_scans, col_types, block_map, d_staging, stream, mr);
+      col_scans, col_types, block_map, d_staging, stream, mr);
     cudaFreeAsync(d_staging, stream.value());
   } else {
-    gpu_table = sirius::cuda::scan::gpu_decode_table(
-        col_scans, col_types, stream, mr);
+    gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
   }
 
   auto t2_decode = clock::now();
 
   size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
-  auto batch = sirius::make_data_batch(std::move(gpu_table), *g.gpu_space());
+  auto batch        = sirius::make_data_batch(std::move(gpu_table), *g.gpu_space());
 
   auto us = [](clock::time_point a, clock::time_point b) {
     return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
   };
   SIRIUS_LOG_INFO(
-      "[gpu_native_scan] task {}: {} rows, {} cols, {} blocks | "
-      "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{})",
-      task_id_, total_rows, num_cols, total_blocks,
-      us(t0, t1_pin) / 1000.0,
-      us(t1_pin, t2_decode) / 1000.0,
-      us(t0, t2_decode) / 1000.0,
-      range->start_idx, range->start_idx + range->count - 1);
+    "[gpu_native_scan] task {}: {} rows, {} cols, {} blocks | "
+    "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{})",
+    task_id_,
+    total_rows,
+    num_cols,
+    total_blocks,
+    us(t0, t1_pin) / 1000.0,
+    us(t1_pin, t2_decode) / 1000.0,
+    us(t0, t2_decode) / 1000.0,
+    range->start_idx,
+    range->start_idx + range->count - 1);
 
   // Schedule continuation if more row groups remain
   if (!g.all_claimed()) {
     auto next_task = std::make_unique<gpu_native_scan_task>(
-        g.sirius_ctx()->get_task_creator().get_next_task_id(),
-        data_repo_,
-        std::static_pointer_cast<gpu_native_scan_global_state>(_global_state));
+      g.sirius_ctx()->get_task_creator().get_next_task_id(),
+      data_repo_,
+      std::static_pointer_cast<gpu_native_scan_global_state>(_global_state));
     g.get_pipeline()->mark_task_created();
     g.executor().schedule(std::move(next_task));
   }
@@ -417,7 +417,7 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
   g.decrement_tasks();
 
   return std::make_unique<op::pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
+    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
 }
 
 void gpu_native_scan_task::publish_output(op::operator_data& output_data,

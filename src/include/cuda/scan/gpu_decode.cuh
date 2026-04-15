@@ -5,11 +5,12 @@
 
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
-#include <rmm/cuda_stream_view.hpp>
+
+#include <cstddef>
+#include <cstdint>
 
 namespace sirius::cuda::scan {
 
@@ -26,24 +27,27 @@ static constexpr uint32_t BP_META_GROUP_SIZE = 2048;
 /// Number of algorithm groups per metadata group.
 static constexpr uint32_t BP_ALGO_GROUPS_PER_META = BP_META_GROUP_SIZE / BP_GROUP_SIZE;  // 64
 
+/// DuckDB storage block size (256KB).
+static constexpr size_t DUCKDB_BLOCK_SIZE = 262144;
+
 /// DuckDB BitpackingMode enum values (matches duckdb::BitpackingMode).
 enum class BitpackingMode : uint8_t {
-  INVALID = 0,
-  AUTO = 1,
-  CONSTANT = 2,
+  INVALID        = 0,
+  AUTO           = 1,
+  CONSTANT       = 2,
   CONSTANT_DELTA = 3,
-  DELTA_FOR = 4,
-  FOR = 5
+  DELTA_FOR      = 4,
+  FOR            = 5
 };
 
 /// Decoded metadata for one 2048-value group.
 struct bp_group_meta {
   BitpackingMode mode;
-  uint32_t data_offset;     ///< Byte offset from segment base to compressed data
-  uint32_t width;           ///< Bitpacking width (only for FOR/DELTA_FOR)
-  int64_t frame_of_ref;     ///< Frame of reference value
-  int64_t constant_or_delta;///< Constant value (CONSTANT) or delta (CONSTANT_DELTA/DELTA_FOR)
-  uint32_t row_count;       ///< Number of rows in this group (last group may be < 2048)
+  uint32_t data_offset;       ///< Byte offset from segment base to compressed data
+  uint32_t width;             ///< Bitpacking width (only for FOR/DELTA_FOR)
+  int64_t frame_of_ref;       ///< Frame of reference value
+  int64_t constant_or_delta;  ///< Constant value (CONSTANT) or delta (CONSTANT_DELTA/DELTA_FOR)
+  uint32_t row_count;         ///< Number of rows in this group (last group may be < 2048)
 };
 
 //===----------------------------------------------------------------------===//
@@ -65,22 +69,17 @@ struct bp_group_meta {
 /// @param stream         CUDA stream
 /// @param d_scratch      Optional pre-allocated device buffer (>= segment_size bytes).
 ///                       If non-null, used instead of cudaMallocAsync for the block copy.
-/// @param d_meta_scratch Optional pre-allocated device buffer for metadata.
-///                       If non-null, used instead of cudaMallocAsync.
-/// @param meta_scratch_size Size of d_meta_scratch in bytes (0 if not provided).
-void gpu_decode_bitpacking(
-    const uint8_t* segment_data,
-    size_t segment_size,
-    uint32_t block_offset,
-    uint32_t row_count,
-    uint32_t type_size,
-    bool is_signed,
-    void* d_output,
-    rmm::cuda_stream_view stream,
-    void* d_scratch = nullptr,
-    void* d_meta_scratch = nullptr,
-    size_t meta_scratch_size = 0,
-    bool skip_block_copy = false);
+/// @param skip_block_copy If true, block data is already on device at d_scratch.
+void gpu_decode_bitpacking(const uint8_t* segment_data,
+                           size_t segment_size,
+                           uint32_t block_offset,
+                           uint32_t row_count,
+                           uint32_t type_size,
+                           bool is_signed,
+                           void* d_output,
+                           rmm::cuda_stream_view stream,
+                           void* d_scratch      = nullptr,
+                           bool skip_block_copy = false);
 
 //===----------------------------------------------------------------------===//
 // Pre-allocated temp buffers for string segment decode
@@ -93,9 +92,9 @@ struct string_decode_temp {
   uint32_t* d_buf_a;               ///< Temp uint32 (max_seg_rows): indices / compressed_lengths
   uint32_t* d_buf_b;               ///< Temp uint32 (max_seg_rows): lengths / compressed_offsets
   uint32_t* d_buf_c;               ///< Temp uint32 (max_seg_rows): decompressed_lengths (FSST)
-  void*     d_cub_temp;            ///< CUB scratch space
-  size_t    cub_temp_bytes;        ///< Size of d_cub_temp
-  uint8_t*  d_fsst_len;            ///< FSST decoder len[255] on GPU
+  void* d_cub_temp;                ///< CUB scratch space
+  size_t cub_temp_bytes;           ///< Size of d_cub_temp
+  uint8_t* d_fsst_len;             ///< FSST decoder len[255] on GPU
   unsigned long long* d_fsst_sym;  ///< FSST decoder symbol[255] on GPU
 };
 
@@ -105,9 +104,9 @@ struct string_decode_temp {
 
 /// Result of dictionary string decode — raw buffers for cuDF string column.
 struct dict_decode_result {
-  int32_t* d_offsets;     ///< Device: int32 offsets array (num_rows + 1 elements)
-  uint8_t* d_chars;       ///< Device: contiguous char buffer
-  size_t total_chars;     ///< Total bytes in char buffer
+  int32_t* d_offsets;  ///< Device: int32 offsets array (num_rows + 1 elements)
+  uint8_t* d_chars;    ///< Device: contiguous char buffer
+  size_t total_chars;  ///< Total bytes in char buffer
 };
 
 /// @brief Decode a dictionary-compressed string segment on GPU.
@@ -132,21 +131,20 @@ struct dict_decode_result {
 /// @param d_chars_preallocated  Optional pre-allocated char output buffer. When non-null,
 ///                              chars are written here instead of internally allocated.
 ///                              Caller owns the buffer. *d_chars_out is set to nullptr.
-void gpu_decode_dictionary(
-    const uint8_t* segment_data,
-    size_t segment_size,
-    uint32_t block_offset,
-    uint32_t block_size,
-    uint32_t row_count,
-    int32_t* d_offsets,
-    uint8_t** d_chars_out,
-    size_t* total_chars_out,
-    rmm::cuda_stream_view stream,
-    void* d_scratch = nullptr,
-    uint32_t max_string_length = 0,
-    uint8_t* d_chars_preallocated = nullptr,
-    string_decode_temp* temp = nullptr,
-    bool skip_block_copy = false);
+void gpu_decode_dictionary(const uint8_t* segment_data,
+                           size_t segment_size,
+                           uint32_t block_offset,
+                           uint32_t block_size,
+                           uint32_t row_count,
+                           int32_t* d_offsets,
+                           uint8_t** d_chars_out,
+                           size_t* total_chars_out,
+                           rmm::cuda_stream_view stream,
+                           void* d_scratch               = nullptr,
+                           uint32_t max_string_length    = 0,
+                           uint8_t* d_chars_preallocated = nullptr,
+                           string_decode_temp* temp      = nullptr,
+                           bool skip_block_copy          = false);
 
 //===----------------------------------------------------------------------===//
 // Host-side API: decode an uncompressed string segment on GPU
@@ -170,19 +168,18 @@ void gpu_decode_dictionary(
 /// @param d_chars            Pre-allocated device char output buffer
 /// @param stream             CUDA stream
 /// @param d_scratch          Optional pre-allocated device buffer (>= segment_size bytes)
-void gpu_decode_uncompressed_string(
-    const uint8_t* segment_data,
-    size_t segment_size,
-    uint32_t block_offset,
-    uint32_t row_count,
-    int32_t* d_offsets,
-    uint8_t* d_chars,
-    rmm::cuda_stream_view stream,
-    void* d_scratch = nullptr,
-    bool skip_block_copy = false);
+void gpu_decode_uncompressed_string(const uint8_t* segment_data,
+                                    size_t segment_size,
+                                    uint32_t block_offset,
+                                    uint32_t row_count,
+                                    int32_t* d_offsets,
+                                    uint8_t* d_chars,
+                                    rmm::cuda_stream_view stream,
+                                    void* d_scratch      = nullptr,
+                                    bool skip_block_copy = false);
 
 //===----------------------------------------------------------------------===//
-// Host-side API: decode an FSST-compressed string segment on GPU
+// Host-side API: decode an RLE-compressed fixed-width segment on GPU
 //===----------------------------------------------------------------------===//
 
 /// @brief Decode an RLE-compressed fixed-width segment on GPU.
@@ -208,18 +205,17 @@ void gpu_decode_uncompressed_string(
 /// @param stream         CUDA stream
 /// @param d_scratch      Optional pre-allocated device buffer (>= segment_size bytes)
 /// @param skip_block_copy If true, segment data is already on device at d_scratch
-void gpu_decode_rle(
-    const uint8_t* segment_data,
-    size_t segment_size,
-    uint32_t block_offset,
-    uint32_t row_count,
-    uint32_t type_size,
-    void* d_output,
-    rmm::cuda_stream_view stream,
-    void* d_scratch = nullptr,
-    bool skip_block_copy = false,
-    uint32_t* d_cumsum_scratch = nullptr,
-    size_t cumsum_scratch_capacity = 0);
+void gpu_decode_rle(const uint8_t* segment_data,
+                    size_t segment_size,
+                    uint32_t block_offset,
+                    uint32_t row_count,
+                    uint32_t type_size,
+                    void* d_output,
+                    rmm::cuda_stream_view stream,
+                    void* d_scratch                = nullptr,
+                    bool skip_block_copy           = false,
+                    uint32_t* d_cumsum_scratch     = nullptr,
+                    size_t cumsum_scratch_capacity = 0);
 
 //===----------------------------------------------------------------------===//
 // Host-side API: decode an FSST-compressed string segment on GPU
@@ -244,17 +240,16 @@ void gpu_decode_rle(
 /// @param d_chars            Pre-allocated device char output buffer
 /// @param stream             CUDA stream
 /// @param d_scratch          Optional pre-allocated device buffer (>= segment_size bytes)
-void gpu_decode_fsst(
-    const uint8_t* segment_data,
-    size_t segment_size,
-    uint32_t block_offset,
-    uint32_t row_count,
-    int32_t* d_offsets,
-    uint8_t* d_chars,
-    rmm::cuda_stream_view stream,
-    void* d_scratch = nullptr,
-    string_decode_temp* temp = nullptr,
-    bool skip_block_copy = false);
+void gpu_decode_fsst(const uint8_t* segment_data,
+                     size_t segment_size,
+                     uint32_t block_offset,
+                     uint32_t row_count,
+                     int32_t* d_offsets,
+                     uint8_t* d_chars,
+                     rmm::cuda_stream_view stream,
+                     void* d_scratch          = nullptr,
+                     string_decode_temp* temp = nullptr,
+                     bool skip_block_copy     = false);
 
 //===----------------------------------------------------------------------===//
 // Device functions: inline bitpacking extraction (for future operator fusion)
@@ -264,22 +259,17 @@ void gpu_decode_fsst(
 /// GPU-FOR style: horizontal layout, 32-value groups.
 /// Each value occupies bits [idx*width, (idx+1)*width) in the packed stream.
 template <typename T>
-__device__ __forceinline__ T unpack_value(
-    const uint32_t* packed,
-    uint32_t idx,
-    uint32_t width)
+__device__ __forceinline__ T unpack_value(const uint32_t* packed, uint32_t idx, uint32_t width)
 {
   if (width == 0) return T(0);
 
-  uint64_t bit_pos = static_cast<uint64_t>(idx) * width;
+  uint64_t bit_pos  = static_cast<uint64_t>(idx) * width;
   uint32_t word_idx = static_cast<uint32_t>(bit_pos / 32);
-  uint32_t bit_off = static_cast<uint32_t>(bit_pos & 31);
+  uint32_t bit_off  = static_cast<uint32_t>(bit_pos & 31);
 
   // Load two consecutive 32-bit words and combine into 64-bit
   uint64_t combined = static_cast<uint64_t>(packed[word_idx]);
-  if (bit_off + width > 32) {
-    combined |= static_cast<uint64_t>(packed[word_idx + 1]) << 32;
-  }
+  if (bit_off + width > 32) { combined |= static_cast<uint64_t>(packed[word_idx + 1]) << 32; }
 
   uint64_t mask = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
   return static_cast<T>((combined >> bit_off) & mask);

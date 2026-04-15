@@ -25,8 +25,9 @@ static constexpr uint32_t RLE_HEADER_SIZE = 8;
 ///
 /// cumsum[i] = sum(counts[0..i])  (inclusive prefix sum of run lengths).
 /// For output row `r`, upper_bound gives the RLE entry that owns that row.
-__device__ __forceinline__ uint32_t
-rle_upper_bound(const uint32_t* __restrict__ cumsum, uint32_t n, uint32_t key)
+__device__ __forceinline__ uint32_t rle_upper_bound(const uint32_t* __restrict__ cumsum,
+                                                    uint32_t n,
+                                                    uint32_t key)
 {
   uint32_t lo = 0, hi = n;
   while (lo < hi) {
@@ -49,48 +50,59 @@ rle_upper_bound(const uint32_t* __restrict__ cumsum, uint32_t n, uint32_t key)
 /// Max RLE entries that fit in shared memory (4096 × 4B = 16KB).
 static constexpr uint32_t RLE_SMEM_MAX_ENTRIES = 4096;
 
+/// Shared-memory variant: cumsum loaded into dynamic smem for cache-friendly
+/// binary search. Only launched when entry_count <= RLE_SMEM_MAX_ENTRIES.
 template <typename T>
-__global__ void kernel_rle_expand(
-    const T* __restrict__       values,
-    const uint32_t* __restrict__ cumsum,
-    uint32_t                     entry_count,
-    T* __restrict__              output,
-    uint32_t                     row_count)
+__global__ void kernel_rle_expand_smem(const T* __restrict__ values,
+                                       const uint32_t* __restrict__ cumsum,
+                                       uint32_t entry_count,
+                                       T* __restrict__ output,
+                                       uint32_t row_count)
 {
-  // Load cumsum into shared memory for cache-friendly binary search
-  __shared__ uint32_t s_cumsum[RLE_SMEM_MAX_ENTRIES];
-  const bool use_smem = (entry_count <= RLE_SMEM_MAX_ENTRIES);
-  if (use_smem) {
-    for (uint32_t i = threadIdx.x; i < entry_count; i += blockDim.x) {
-      s_cumsum[i] = cumsum[i];
-    }
-    __syncthreads();
+  extern __shared__ uint32_t s_cumsum[];
+  for (uint32_t i = threadIdx.x; i < entry_count; i += blockDim.x) {
+    s_cumsum[i] = cumsum[i];
   }
+  __syncthreads();
 
   uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= row_count) return;
 
-  const uint32_t* search = use_smem ? s_cumsum : cumsum;
-  uint32_t entry = rle_upper_bound(search, entry_count, idx);
-  output[idx] = values[entry];
+  uint32_t entry = rle_upper_bound(s_cumsum, entry_count, idx);
+  output[idx]    = values[entry];
+}
+
+/// Global-memory variant: binary search directly in global memory.
+/// Used when entry_count > RLE_SMEM_MAX_ENTRIES. No smem reservation.
+template <typename T>
+__global__ void kernel_rle_expand_gmem(const T* __restrict__ values,
+                                       const uint32_t* __restrict__ cumsum,
+                                       uint32_t entry_count,
+                                       T* __restrict__ output,
+                                       uint32_t row_count)
+{
+  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= row_count) return;
+
+  uint32_t entry = rle_upper_bound(cumsum, entry_count, idx);
+  output[idx]    = values[entry];
 }
 
 //===----------------------------------------------------------------------===//
 // Host API
 //===----------------------------------------------------------------------===//
 
-void gpu_decode_rle(
-    const uint8_t* segment_data,
-    size_t         segment_size,
-    uint32_t       block_offset,
-    uint32_t       row_count,
-    uint32_t       type_size,
-    void*          d_output,
-    rmm::cuda_stream_view stream,
-    void*          d_scratch,
-    bool           skip_block_copy,
-    uint32_t*      d_cumsum_scratch,
-    size_t         cumsum_scratch_capacity)
+void gpu_decode_rle(const uint8_t* segment_data,
+                    size_t segment_size,
+                    uint32_t block_offset,
+                    uint32_t row_count,
+                    uint32_t type_size,
+                    void* d_output,
+                    rmm::cuda_stream_view stream,
+                    void* d_scratch,
+                    bool skip_block_copy,
+                    uint32_t* d_cumsum_scratch,
+                    size_t cumsum_scratch_capacity)
 {
   if (row_count == 0) return;
 
@@ -102,8 +114,7 @@ void gpu_decode_rle(
 
   // Scan counts to find entry_count and build inclusive prefix sums.
   // Counts are uint16_t, stored at seg_base + rle_count_offset.
-  const uint16_t* h_counts =
-      reinterpret_cast<const uint16_t*>(seg_base + rle_count_offset);
+  const uint16_t* h_counts = reinterpret_cast<const uint16_t*>(seg_base + rle_count_offset);
 
   std::vector<uint32_t> h_cumsum;
   h_cumsum.reserve(256);  // typical entry counts are small
@@ -120,69 +131,67 @@ void gpu_decode_rle(
   if (d_scratch) {
     d_block = static_cast<uint8_t*>(d_scratch);
     if (!skip_block_copy) {
-      cudaMemcpyAsync(d_block, segment_data, segment_size,
-                       cudaMemcpyHostToDevice, stream.value());
+      cudaMemcpyAsync(d_block, segment_data, segment_size, cudaMemcpyHostToDevice, stream.value());
     }
   } else {
     cudaMallocAsync(&d_block, segment_size, stream.value());
-    cudaMemcpyAsync(d_block, segment_data, segment_size,
-                     cudaMemcpyHostToDevice, stream.value());
+    cudaMemcpyAsync(d_block, segment_data, segment_size, cudaMemcpyHostToDevice, stream.value());
     owns_block = true;
   }
 
   // ---- GPU: H2D prefix sums (reuse scratch if provided) -----------------
   uint32_t* d_cumsum;
   size_t cumsum_bytes = entry_count * sizeof(uint32_t);
-  bool owns_cumsum = false;
+  bool owns_cumsum    = false;
   if (d_cumsum_scratch && cumsum_bytes <= cumsum_scratch_capacity) {
     d_cumsum = d_cumsum_scratch;
   } else {
     cudaMallocAsync(&d_cumsum, cumsum_bytes, stream.value());
     owns_cumsum = true;
   }
-  cudaMemcpyAsync(d_cumsum, h_cumsum.data(), cumsum_bytes,
-                   cudaMemcpyHostToDevice, stream.value());
+  cudaMemcpyAsync(d_cumsum, h_cumsum.data(), cumsum_bytes, cudaMemcpyHostToDevice, stream.value());
 
   // Device pointer to values within the block
-  const uint8_t* d_seg    = d_block + block_offset;
-  const void*    d_values = d_seg + RLE_HEADER_SIZE;
+  const uint8_t* d_seg = d_block + block_offset;
+  const void* d_values = d_seg + RLE_HEADER_SIZE;
 
   // ---- GPU: launch expand kernel ----------------------------------------
   constexpr uint32_t kThreads = 256;
-  uint32_t blocks = (row_count + kThreads - 1) / kThreads;
+  uint32_t num_blocks         = (row_count + kThreads - 1) / kThreads;
+  bool use_smem               = (entry_count <= RLE_SMEM_MAX_ENTRIES);
+  size_t smem_bytes           = use_smem ? entry_count * sizeof(uint32_t) : 0;
+
+  // Macro dispatches both smem/gmem variants for a given type.
+#define LAUNCH_RLE(T)                                                                         \
+  if (use_smem) {                                                                             \
+    kernel_rle_expand_smem<T>                                                                 \
+      <<<num_blocks, kThreads, smem_bytes, stream.value()>>>(static_cast<const T*>(d_values), \
+                                                             d_cumsum,                        \
+                                                             entry_count,                     \
+                                                             static_cast<T*>(d_output),       \
+                                                             row_count);                      \
+  } else {                                                                                    \
+    kernel_rle_expand_gmem<T>                                                                 \
+      <<<num_blocks, kThreads, 0, stream.value()>>>(static_cast<const T*>(d_values),          \
+                                                    d_cumsum,                                 \
+                                                    entry_count,                              \
+                                                    static_cast<T*>(d_output),                \
+                                                    row_count);                               \
+  }
 
   switch (type_size) {
-    case 1:
-      kernel_rle_expand<uint8_t><<<blocks, kThreads, 0, stream.value()>>>(
-          static_cast<const uint8_t*>(d_values), d_cumsum, entry_count,
-          static_cast<uint8_t*>(d_output), row_count);
-      break;
-    case 2:
-      kernel_rle_expand<uint16_t><<<blocks, kThreads, 0, stream.value()>>>(
-          static_cast<const uint16_t*>(d_values), d_cumsum, entry_count,
-          static_cast<uint16_t*>(d_output), row_count);
-      break;
-    case 4:
-      kernel_rle_expand<uint32_t><<<blocks, kThreads, 0, stream.value()>>>(
-          static_cast<const uint32_t*>(d_values), d_cumsum, entry_count,
-          static_cast<uint32_t*>(d_output), row_count);
-      break;
-    case 8:
-      kernel_rle_expand<uint64_t><<<blocks, kThreads, 0, stream.value()>>>(
-          static_cast<const uint64_t*>(d_values), d_cumsum, entry_count,
-          static_cast<uint64_t*>(d_output), row_count);
-      break;
-    case 16:
-      kernel_rle_expand<ulonglong2><<<blocks, kThreads, 0, stream.value()>>>(
-          static_cast<const ulonglong2*>(d_values), d_cumsum, entry_count,
-          static_cast<ulonglong2*>(d_output), row_count);
-      break;
+    case 1: LAUNCH_RLE(uint8_t); break;
+    case 2: LAUNCH_RLE(uint16_t); break;
+    case 4: LAUNCH_RLE(uint32_t); break;
+    case 8: LAUNCH_RLE(uint64_t); break;
+    case 16: LAUNCH_RLE(ulonglong2); break;
     default:
       if (owns_cumsum) cudaFreeAsync(d_cumsum, stream.value());
       if (owns_block) cudaFreeAsync(d_block, stream.value());
-      throw std::runtime_error(
-          "gpu_decode_rle: unsupported type_size " + std::to_string(type_size));
+      throw std::runtime_error("gpu_decode_rle: unsupported type_size " +
+                               std::to_string(type_size));
   }
+#undef LAUNCH_RLE
 
   // ---- Cleanup ----------------------------------------------------------
   if (owns_cumsum) cudaFreeAsync(d_cumsum, stream.value());
