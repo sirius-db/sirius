@@ -77,7 +77,8 @@ uint64_t sirius_begin_exchange_capture(
   const int32_t* column_indices,
   size_t num_columns,
   const int32_t* projection_indices,
-  size_t num_projection_indices) {
+  size_t num_projection_indices,
+  uint32_t capture_mode) {
   return with_error_boundary([&]() -> uint64_t {
     auto& lgb = duckdb::LastGPUBuffers::GetInstance();
     auto session_id = lgb.BeginSession();
@@ -97,12 +98,17 @@ uint64_t sirius_begin_exchange_capture(
       }
       lgb.SetProjectionIndices(std::move(projection));
     }
+    lgb.SetCaptureMode(
+      capture_mode == static_cast<uint32_t>(duckdb::ExchangeCaptureMode::ExchangeOnly)
+        ? duckdb::ExchangeCaptureMode::ExchangeOnly
+        : duckdb::ExchangeCaptureMode::MaterializeAndCapture);
     SIRIUS_LOG_INFO(
-      "[sirius_begin_exchange_capture] session={} num_partitions={} partition_cols={} projection_cols={}",
+      "[sirius_begin_exchange_capture] session={} num_partitions={} partition_cols={} projection_cols={} capture_mode={}",
       session_id,
       num_partitions,
       num_columns,
-      num_projection_indices);
+      num_projection_indices,
+      capture_mode);
     return session_id;
   });
 }

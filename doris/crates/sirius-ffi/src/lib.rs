@@ -22,8 +22,14 @@ pub struct TableColumnSchema {
     pub sql_type: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExchangeCaptureMode {
+    MaterializeAndCapture = 0,
+    ExchangeOnly = 1,
+}
+
 type BeginExchangeCaptureFn =
-    unsafe extern "C" fn(u64, *const i32, usize, *const i32, usize) -> u64;
+    unsafe extern "C" fn(u64, *const i32, usize, *const i32, usize, u32) -> u64;
 type TakeExchangeArtifactFn = unsafe extern "C" fn() -> *mut c_void;
 type DestroyExchangeArtifactFn = unsafe extern "C" fn(*mut c_void);
 type ArtifactStagingBaseFn = unsafe extern "C" fn(*const c_void) -> u64;
@@ -821,6 +827,7 @@ impl SiriusEngine {
         &self,
         partition_spec: Option<(usize, &[i32])>,
         projection_indices: Option<&[usize]>,
+        capture_mode: ExchangeCaptureMode,
     ) -> Result<u64, EngineError> {
         let (num_partitions, cols) = partition_spec
             .map(|(num, cols)| (num as u64, cols))
@@ -842,12 +849,46 @@ impl SiriusEngine {
                 cols.len(),
                 projection_ptr,
                 projection_len,
+                capture_mode as u32,
             )
         };
         if session_id == 0 {
             return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
         }
         Ok(session_id)
+    }
+
+    pub fn execute_substrait_to_exchange_artifact(
+        &self,
+        plan_bytes: &[u8],
+        partition_spec: Option<(usize, &[i32])>,
+        projection_indices: Option<&[usize]>,
+    ) -> Result<ExchangeArtifact, EngineError> {
+        use arrow::record_batch::RecordBatch;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM gpu_execution_substrait(?::blob)")
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        self.begin_exchange_capture(
+            partition_spec,
+            projection_indices,
+            ExchangeCaptureMode::ExchangeOnly,
+        )?;
+        let arrow_result = stmt
+            .query_arrow(duckdb::params![plan_bytes])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let schema = arrow_result.get_schema();
+        let batches: Vec<RecordBatch> = arrow_result.collect();
+        tracing::info!(
+            batch_count = batches.len(),
+            row_count = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            schema_fields = schema.fields().len(),
+            "exchange-only execute_substrait completed"
+        );
+        self.take_exchange_artifact()?.ok_or_else(|| {
+            EngineError::ExecFailed("exchange-only execution produced no artifact".to_string())
+        })
     }
 
     /// Move the active exchange capture into a Rust-owned artifact.
@@ -1248,7 +1289,9 @@ mod tests {
         };
 
         engine.finalize_exchange_tables_direct().unwrap();
-        let session_id = engine.begin_exchange_capture(None, None).unwrap();
+        let session_id = engine
+            .begin_exchange_capture(None, None, ExchangeCaptureMode::MaterializeAndCapture)
+            .unwrap();
         assert!(session_id > 0);
 
         let artifact = engine
@@ -1287,7 +1330,7 @@ mod tests {
             .finalize_exchange_tables_direct()
             .expect("finalize_exchange_tables_direct");
         let session_id = engine
-            .begin_exchange_capture(None, None)
+            .begin_exchange_capture(None, None, ExchangeCaptureMode::MaterializeAndCapture)
             .expect("begin_exchange_capture");
         assert!(session_id > 0);
 
@@ -1342,7 +1385,7 @@ mod tests {
             .finalize_exchange_tables_direct()
             .expect("finalize_exchange_tables_direct");
         engine
-            .begin_exchange_capture(None, None)
+            .begin_exchange_capture(None, None, ExchangeCaptureMode::MaterializeAndCapture)
             .expect("begin_exchange_capture");
 
         let q1_like = "SELECT \
