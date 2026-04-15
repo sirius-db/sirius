@@ -56,13 +56,15 @@ Validated in Phase 5: State Machine & Interfaces
 - [x] `convertible_data_provider` abstract interface with `get_next_convertible()`, `get_all_convertible()`, `get_bytes_in_space()`
 - [x] Extend `data_batch` state machine: `task_created → in_transit` transition (documentation formalized, tests added)
 
+Validated in Phase 6: Batch Conversion
+- [x] `convertible_data_batch` wrapping `data_batch` with downgrade-style conversion
+- [x] `convertible_data_batch_provider` wrapping `data_repository`
+- [x] Failure safety: batch conversions restore original `batch_state` and `idata_representation` on failure
+
 ### Active
 
-- [ ] `convertible_data_batch` wrapping `data_batch` with downgrade-style conversion
-- [ ] `convertible_data_batch_provider` wrapping `data_repository`
 - [ ] `convertible_gpu_pipeline_task` wrapping `gpu_pipeline_task` with RAII queue ownership
 - [ ] `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
-- [ ] Failure safety: conversions restore original `batch_state` and `idata_representation` on failure
 
 ### Out of Scope
 
@@ -72,9 +74,9 @@ Validated in Phase 5: State Machine & Interfaces
 
 ## Current State
 
-**v2.0 Convertible Data Abstraction** — Phase 5 complete 2026-04-15
+**v2.0 Convertible Data Abstraction** — Phase 6 complete 2026-04-15
 
-Phase 5 shipped: state machine documentation formalized (`task_created <-> in_transit` transitions), abstract `convertible_data` and `convertible_data_provider` interfaces defined. Next: Phase 6 (concrete batch conversion).
+Phase 6 shipped: `convertible_data_batch` and `convertible_data_batch_provider` concrete implementations with failure-safe conversion generalizing the downgrade_task pattern. 8 GPU integration tests passing. Next: Phase 7 (task queue conversion).
 
 ## Context
 
