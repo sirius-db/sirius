@@ -57,8 +57,8 @@ Plans:
   4. `bytes_in_space()` returns the correct byte size for a wrapped data_batch in the given memory space
 **Plans:** 2 plans
 Plans:
-- [ ] 06-01-PLAN.md — Implement convertible_data_batch and convertible_data_batch_provider
-- [ ] 06-02-PLAN.md — GPU integration tests for batch conversion and provider discovery
+- [x] 06-01-PLAN.md — Implement convertible_data_batch and convertible_data_batch_provider
+- [x] 06-02-PLAN.md — GPU integration tests for batch conversion and provider discovery
 
 ### Phase 7: Task Queue Conversion
 **Goal**: Queued pipeline tasks can be discovered by memory space, temporarily owned for conversion, and safely returned to the queue
