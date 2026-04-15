@@ -41,7 +41,10 @@
   2. `try_to_release_in_transit(prev_state)` can restore a batch to `task_created` state
   3. `convertible_data` declares pure virtual `convert()` and `bytes_in_space()` that compile and can be subclassed
   4. `convertible_data_provider` declares pure virtual `get_next_convertible()`, `get_all_convertible()`, and `get_bytes_in_space()` that compile and can be subclassed
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 05-01-PLAN.md — Formalize state machine transitions and add round-trip tests
+- [ ] 05-02-PLAN.md — Define convertible_data and convertible_data_provider abstract interfaces
 
 ### Phase 6: Batch Conversion
 **Goal**: Data batches in a repository can be discovered by memory space and converted with failure safety
@@ -76,7 +79,7 @@ Phases execute in numeric order: 5 → 6 → 7
 | 2. Predicate Inspection | v1.0 | 1/1 | Complete | 2026-04-14 |
 | 3. Dead Code Removal | v1.1 | 1/1 | Complete | 2026-04-14 |
 | 4. Queue Integration | v1.1 | 1/1 | Complete | 2026-04-14 |
-| 5. State Machine & Interfaces | v2.0 | 0/? | Not started | - |
+| 5. State Machine & Interfaces | v2.0 | 0/2 | Planning complete | - |
 | 6. Batch Conversion | v2.0 | 0/? | Not started | - |
 | 7. Task Queue Conversion | v2.0 | 0/? | Not started | - |
 
