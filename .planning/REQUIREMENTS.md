@@ -20,8 +20,8 @@ Requirements for Convertible Data Abstraction milestone. Each maps to roadmap ph
 
 ### Task Queue Conversion
 
-- [ ] **TASK-01**: `convertible_gpu_pipeline_task` wraps `unique_ptr<itask>` with RAII ownership — constructor takes `(unique_ptr<itask>, inspectable_mpsc<itask>*)`, destructor pushes task back to queue
-- [ ] **TASK-02**: `convertible_gpu_pipeline_task_provider` wraps `inspectable_mpsc<itask>*`, `get_next_convertible` uses `mutable_pop_if` with `front_to_back=false`, predicate inspects `gpu_pipeline_task_local_state` data_batches for matching memory_space and `batch_state::task_created`
+- [ ] **TASK-01**: `convertible_gpu_pipeline_task` wraps `unique_ptr<itask>` with RAII ownership — constructor takes `(unique_ptr<itask>, inspectable_mpsc<itask>&)`, destructor pushes task back to queue
+- [ ] **TASK-02**: `convertible_gpu_pipeline_task_provider` wraps `inspectable_mpsc<itask>&`, `get_next_convertible` uses `mutable_pop_if` with `front_to_back=false`, predicate inspects `gpu_pipeline_task_local_state` data_batches for matching memory_space and `batch_state::task_created`
 - [ ] **TASK-03**: On conversion failure or exception in `convertible_gpu_pipeline_task::convert()`, all `data_batch` objects inside `operator_data` retain original `idata_representation` and `batch_state`; task is always returned to queue via destructor
 
 ### State Machine Extension
