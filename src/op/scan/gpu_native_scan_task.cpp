@@ -12,6 +12,7 @@
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cstring>
 #include <unordered_set>
 
 #include <duckdb/storage/buffer_manager.hpp>
@@ -85,10 +86,12 @@ gpu_native_scan_global_state::gpu_native_scan_global_state(
   if (viable_) {
     prune_row_groups();
     compute_batch_size();
+    initialize_pipeline();
 
     SIRIUS_LOG_INFO(
-      "[gpu_native_scan] viable: {} row groups, {} cols, batch_size={}",
-      row_groups_.size(), col_types_.size(), row_groups_per_batch_);
+      "[gpu_native_scan] viable: {} row groups, {} cols, batch_size={}, pipeline={}",
+      row_groups_.size(), col_types_.size(), row_groups_per_batch_,
+      pipeline_enabled() ? std::to_string(pipeline_chunk_rgs_) + "rg/chunk" : "off");
   } else {
     SIRIUS_LOG_INFO("[gpu_native_scan] not viable — will fall back to duckdb_scan_task");
   }
@@ -250,6 +253,42 @@ void gpu_native_scan_global_state::compute_batch_size()
   row_groups_per_batch_ = std::min(rgs_per_batch, row_groups_.size());
 }
 
+void gpu_native_scan_global_state::initialize_pipeline()
+{
+  // Need at least 3 row groups per batch for pipelining to help:
+  // 2 slots pre-filled + 1 decoding = minimum for overlap.
+  if (row_groups_per_batch_ < 3) {
+    pipeline_chunk_rgs_ = 0;
+    return;
+  }
+
+  // Target 4-8 chunks per batch for good H2D/compute overlap.
+  pipeline_chunk_rgs_ = std::max<size_t>(1, row_groups_per_batch_ / 4);
+
+  // Slot size: enough for all unique 256KB blocks in one chunk.
+  // Each column has data + validity segments, each potentially backed by
+  // a separate block.  Use 2× col count as conservative per-RG estimate,
+  // plus 20% headroom for boundary blocks shared across row groups.
+  size_t blocks_per_chunk = pipeline_chunk_rgs_ * col_types_.size() * 2;
+  size_t slot_bytes = static_cast<size_t>(blocks_per_chunk * 262144 * 1.2);
+  slot_bytes = std::max<size_t>(slot_bytes, 16UL * 1024 * 1024);  // min 16MB
+  slot_bytes = std::min<size_t>(slot_bytes, 128UL * 1024 * 1024); // max 128MB
+
+  constexpr size_t NUM_SLOTS = 2;
+
+  try {
+    ring_buffer_ = std::make_unique<scan_ring_buffer>(NUM_SLOTS, slot_bytes);
+    copy_stream_ = std::make_unique<rmm::cuda_stream>();
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN(
+        "[gpu_native_scan] pipeline init failed: {} — falling back to serial",
+        e.what());
+    ring_buffer_.reset();
+    copy_stream_.reset();
+    pipeline_chunk_rgs_ = 0;
+  }
+}
+
 std::optional<gpu_native_scan_global_state::row_group_range>
 gpu_native_scan_global_state::claim_next_batch()
 {
@@ -309,6 +348,44 @@ gpu_native_scan_task::~gpu_native_scan_task()
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Helper: gather unique blocks from col_scans into a pinned host buffer
+// and build a device_block_map with offsets into that buffer.
+//===----------------------------------------------------------------------===//
+
+static void gather_blocks_to_pinned(
+    const std::vector<column_scan_result>& col_scans,
+    void* host_pinned, size_t slot_bytes,
+    sirius::cuda::scan::device_block_map& block_map)
+{
+  block_map.offsets.clear();
+  auto* host_buf = static_cast<uint8_t*>(host_pinned);
+  size_t offset = 0;
+
+  for (auto& cs : col_scans) {
+    for (auto& seg : cs.data.segments) {
+      if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0)
+        continue;
+      if (block_map.offsets.count(seg.block_id))
+        continue;
+      if (offset + 262144 > slot_bytes) {
+        SIRIUS_LOG_WARN("[pipeline] chunk exceeds slot size ({} + 256K > {})",
+                        offset, slot_bytes);
+        break;
+      }
+      const uint8_t* block_base = seg.data_ptr - seg.block_offset;
+      std::memcpy(host_buf + offset, block_base, 262144);
+      block_map.offsets[seg.block_id] = offset;
+      offset += 262144;
+    }
+  }
+  block_map.total_bytes = offset;
+}
+
+//===----------------------------------------------------------------------===//
+// gpu_native_scan_task::compute_task
+//===----------------------------------------------------------------------===//
+
 std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_stream_view stream)
 {
   auto& g = _global_state->cast<gpu_native_scan_global_state>();
@@ -322,102 +399,197 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
   }
 
   using clock = std::chrono::steady_clock;
-  auto t0     = clock::now();
+  auto t0 = clock::now();
 
-  // 2. Pin segments for the claimed row groups
   auto& row_groups  = g.row_groups();
   auto& col_indices = g.col_indices();
   auto& col_types   = g.col_types();
   size_t num_cols   = col_indices.size();
-
-  std::vector<column_scan_result> col_scans(num_cols);
-  for (size_t ci = 0; ci < num_cols; ++ci) {
-    std::vector<duckdb::RowGroup*> batch_rgs(
-      row_groups.begin() + range->start_idx,
-      row_groups.begin() + range->start_idx + range->count);
-    col_scans[ci] = direct_block_scan_column_range(
-      g.storage(), col_indices[ci], g.context(), batch_rgs);
-  }
-
-  auto t1_pin = clock::now();
-
-  // 3. Decode: bulk pre-transfer for large batches, serial for small ones.
-  // Bulk pre-transfer gathers unique blocks → one cudaMemcpyAsync per block to device →
-  // decode from device memory. Eliminates thousands of per-segment H2D API calls.
   auto mr = g.gpu_space()->get_default_allocator();
 
-  std::unordered_set<int64_t> unique_blocks;
-  for (auto& cs : col_scans) {
-    for (auto& seg : cs.data.segments) {
-      if (seg.persistent && seg.data_ptr && seg.row_count > 0 && seg.block_id >= 0)
-        unique_blocks.insert(seg.block_id);
+  // Decide pipelined vs serial path
+  bool use_pipeline = g.pipeline_enabled() && range->count >= 3;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  size_t total_rows = 0;
+  size_t total_blocks = 0;
+
+  if (use_pipeline) {
+    //=== PIPELINED PATH: overlap H2D with decode via dual streams ===
+    std::lock_guard<std::mutex> lk(g.pipeline_mutex());
+
+    auto& ring = g.ring_buffer();
+    auto copy_stream = g.copy_stream();
+    auto compute_stream = stream;  // caller's stream = our compute stream
+
+    size_t chunk_rgs = g.pipeline_chunk_rgs();
+    size_t num_chunks = (range->count + chunk_rgs - 1) / chunk_rgs;
+
+    // Per-chunk state: col_scans, ring slot, device block map
+    struct chunk_state {
+      std::vector<column_scan_result> col_scans;
+      scan_ring_buffer::slot* slot = nullptr;
+      sirius::cuda::scan::device_block_map block_map;
+    };
+    std::vector<chunk_state> chunks(num_chunks);
+
+    auto pin_and_enqueue = [&](size_t ci) {
+      auto& chunk = chunks[ci];
+      size_t rg_start = range->start_idx + ci * chunk_rgs;
+      size_t rg_count = std::min(chunk_rgs, range->count - ci * chunk_rgs);
+
+      // Pin segments for this chunk's row groups
+      chunk.col_scans.resize(num_cols);
+      for (size_t col = 0; col < num_cols; ++col) {
+        std::vector<duckdb::RowGroup*> rgs(
+            row_groups.begin() + rg_start,
+            row_groups.begin() + rg_start + rg_count);
+        chunk.col_scans[col] = direct_block_scan_column_range(
+            g.storage(), col_indices[col], g.context(), rgs);
+      }
+
+      // Gather blocks to pinned host buf
+      chunk.slot = &ring.acquire();
+      gather_blocks_to_pinned(
+          chunk.col_scans, chunk.slot->host_pinned,
+          ring.slot_bytes(), chunk.block_map);
+      chunk.slot->used_bytes = chunk.block_map.total_bytes;
+
+      // Async H2D on copy_stream (truly async — source is page-locked)
+      if (chunk.slot->used_bytes > 0) {
+        cudaMemcpyAsync(
+            chunk.slot->device_staging, chunk.slot->host_pinned,
+            chunk.slot->used_bytes, cudaMemcpyHostToDevice,
+            copy_stream.value());
+      }
+      cudaEventRecord(chunk.slot->h2d_done, copy_stream.value());
+      chunk.slot->state = scan_ring_buffer::slot_state::TRANSFERRING;
+    };
+
+    // Pre-fill: enqueue H2D for first num_slots chunks
+    size_t enqueued = 0;
+    for (size_t ci = 0; ci < std::min(num_chunks, ring.num_slots()); ++ci) {
+      pin_and_enqueue(ci);
+      enqueued++;
     }
-  }
 
-  std::unique_ptr<cudf::table> gpu_table;
+    // Steady state: decode chunk, then enqueue next H2D
+    for (size_t ci = 0; ci < num_chunks; ++ci) {
+      auto& chunk = chunks[ci];
 
-  if (unique_blocks.size() >= 4) {
-    // Bulk pre-transfer: H2D all unique blocks, then decode from device
-    size_t buf_bytes = unique_blocks.size() * 262144;
-    void* d_staging = nullptr;
-    cudaMallocAsync(&d_staging, buf_bytes, stream.value());
+      // GPU-side wait: compute_stream waits for this chunk's H2D
+      cudaStreamWaitEvent(compute_stream.value(), chunk.slot->h2d_done);
 
-    sirius::cuda::scan::device_block_map block_map;
-    size_t offset = 0;
-    for (auto& cs : col_scans) {
-      for (auto& seg : cs.data.segments) {
-        if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0) continue;
-        if (block_map.offsets.count(seg.block_id)) continue;
-        cudaMemcpyAsync(static_cast<uint8_t*>(d_staging) + offset,
-                        seg.data_ptr - seg.block_offset, 262144,
-                        cudaMemcpyHostToDevice, stream.value());
-        block_map.offsets[seg.block_id] = offset;
-        offset += 262144;
+      // Decode from device staging
+      auto gpu_table = sirius::cuda::scan::gpu_decode_table_pipelined(
+          chunk.col_scans, col_types, chunk.block_map,
+          chunk.slot->device_staging, compute_stream, mr);
+
+      // Record compute completion for backpressure
+      cudaEventRecord(chunk.slot->compute_done, compute_stream.value());
+      chunk.slot->state = scan_ring_buffer::slot_state::COMPUTING;
+
+      // Track stats
+      size_t chunk_rows = chunk.col_scans.empty()
+                              ? 0 : chunk.col_scans[0].data.total_rows;
+      total_rows += chunk_rows;
+      total_blocks += chunk.block_map.offsets.size();
+
+      // Wrap in data_batch
+      output_batches.push_back(
+          sirius::make_data_batch(std::move(gpu_table), *g.gpu_space()));
+
+      // Enqueue next chunk's H2D (overlaps with current decode)
+      if (enqueued < num_chunks) {
+        pin_and_enqueue(enqueued);
+        enqueued++;
       }
     }
-    block_map.total_bytes = offset;
 
-    gpu_table = sirius::cuda::scan::gpu_decode_table_pipelined(
-        col_scans, col_types, block_map, d_staging, stream, mr);
-    cudaFreeAsync(d_staging, stream.value());
+    // Drain: wait for last compute to finish
+    cudaEventSynchronize(
+        ring.get_slot(ring.last_acquired_idx()).compute_done);
+
   } else {
-    // Serial: per-segment H2D (original path, for small batches)
-    gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
+    //=== SERIAL PATH: pin all → bulk H2D → decode (existing behavior) ===
+    std::vector<column_scan_result> col_scans(num_cols);
+    for (size_t ci = 0; ci < num_cols; ++ci) {
+      std::vector<duckdb::RowGroup*> batch_rgs(
+          row_groups.begin() + range->start_idx,
+          row_groups.begin() + range->start_idx + range->count);
+      col_scans[ci] = direct_block_scan_column_range(
+          g.storage(), col_indices[ci], g.context(), batch_rgs);
+    }
+
+    std::unordered_set<int64_t> unique_blocks;
+    for (auto& cs : col_scans) {
+      for (auto& seg : cs.data.segments) {
+        if (seg.persistent && seg.data_ptr && seg.row_count > 0 && seg.block_id >= 0)
+          unique_blocks.insert(seg.block_id);
+      }
+    }
+
+    std::unique_ptr<cudf::table> gpu_table;
+
+    if (unique_blocks.size() >= 4) {
+      size_t buf_bytes = unique_blocks.size() * 262144;
+      void* d_staging = nullptr;
+      cudaMallocAsync(&d_staging, buf_bytes, stream.value());
+
+      sirius::cuda::scan::device_block_map block_map;
+      size_t offset = 0;
+      for (auto& cs : col_scans) {
+        for (auto& seg : cs.data.segments) {
+          if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0) continue;
+          if (block_map.offsets.count(seg.block_id)) continue;
+          cudaMemcpyAsync(static_cast<uint8_t*>(d_staging) + offset,
+                          seg.data_ptr - seg.block_offset, 262144,
+                          cudaMemcpyHostToDevice, stream.value());
+          block_map.offsets[seg.block_id] = offset;
+          offset += 262144;
+        }
+      }
+      block_map.total_bytes = offset;
+      total_blocks = block_map.offsets.size();
+
+      gpu_table = sirius::cuda::scan::gpu_decode_table_pipelined(
+          col_scans, col_types, block_map, d_staging, stream, mr);
+      cudaFreeAsync(d_staging, stream.value());
+    } else {
+      gpu_table = sirius::cuda::scan::gpu_decode_table(
+          col_scans, col_types, stream, mr);
+    }
+
+    total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
+    output_batches.push_back(
+        sirius::make_data_batch(std::move(gpu_table), *g.gpu_space()));
   }
 
-  auto t2_decode = clock::now();
-
-  // 4. Wrap in data_batch
-  auto batch = sirius::make_data_batch(std::move(gpu_table), *g.gpu_space());
-
+  auto t_end = clock::now();
   auto us = [](clock::time_point a, clock::time_point b) {
     return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
   };
-
-  size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
   SIRIUS_LOG_INFO(
-    "[gpu_native_scan] task {}: {} rows, {} cols, {} blocks | "
-    "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{})",
-    task_id_, total_rows, num_cols, unique_blocks.size(),
-    us(t0, t1_pin) / 1000.0,
-    us(t1_pin, t2_decode) / 1000.0,
-    us(t0, t2_decode) / 1000.0,
-    range->start_idx, range->start_idx + range->count - 1);
+      "[gpu_native_scan] task {}: {} rows, {} cols, {} blocks, {} batches | "
+      "total={:.1f}ms {} (rg {}-{})",
+      task_id_, total_rows, num_cols, total_blocks, output_batches.size(),
+      us(t0, t_end) / 1000.0,
+      use_pipeline ? "PIPELINED" : "serial",
+      range->start_idx, range->start_idx + range->count - 1);
 
-  // 5. Schedule continuation if more row groups remain
+  // Schedule continuation if more row groups remain
   if (!g.all_claimed()) {
     auto next_task = std::make_unique<gpu_native_scan_task>(
-      g.sirius_ctx()->get_task_creator().get_next_task_id(),
-      data_repo_,
-      std::static_pointer_cast<gpu_native_scan_global_state>(_global_state));
+        g.sirius_ctx()->get_task_creator().get_next_task_id(),
+        data_repo_,
+        std::static_pointer_cast<gpu_native_scan_global_state>(_global_state));
     g.get_pipeline()->mark_task_created();
     g.executor().schedule(std::move(next_task));
   }
 
   g.decrement_tasks();
 
-  return std::make_unique<op::pipelineable_operator_data>(
-    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
+  return std::make_unique<op::pipelineable_operator_data>(std::move(output_batches));
 }
 
 void gpu_native_scan_task::publish_output(op::operator_data& output_data,
