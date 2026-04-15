@@ -45,22 +45,22 @@ None currently deferred.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| IFACE-01 | — | Pending |
-| IFACE-02 | — | Pending |
-| BATCH-01 | — | Pending |
-| BATCH-02 | — | Pending |
-| BATCH-03 | — | Pending |
-| TASK-01 | — | Pending |
-| TASK-02 | — | Pending |
-| TASK-03 | — | Pending |
-| STATE-01 | — | Pending |
-| STATE-02 | — | Pending |
+| STATE-01 | Phase 5 | Pending |
+| STATE-02 | Phase 5 | Pending |
+| IFACE-01 | Phase 5 | Pending |
+| IFACE-02 | Phase 5 | Pending |
+| BATCH-01 | Phase 6 | Pending |
+| BATCH-02 | Phase 6 | Pending |
+| BATCH-03 | Phase 6 | Pending |
+| TASK-01 | Phase 7 | Pending |
+| TASK-02 | Phase 7 | Pending |
+| TASK-03 | Phase 7 | Pending |
 
 **Coverage:**
 - v2.0 requirements: 10 total
-- Mapped to phases: 0
-- Unmapped: 10 ⚠️
+- Mapped to phases: 10
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-15*
-*Last updated: 2026-04-15 after initial definition*
+*Last updated: 2026-04-15 — traceability updated after roadmap creation*
