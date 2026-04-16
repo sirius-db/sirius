@@ -71,8 +71,8 @@ Plans:
   4. `bytes_in_space()` returns the total byte size across all data_batches in the task's operator_data for the given memory space
 **Plans:** 2 plans
 Plans:
-- [ ] 07-01-PLAN.md — Implement convertible_gpu_pipeline_task and convertible_gpu_pipeline_task_provider
-- [ ] 07-02-PLAN.md — GPU integration tests for task queue conversion
+- [x] 07-01-PLAN.md — Implement convertible_gpu_pipeline_task and convertible_gpu_pipeline_task_provider
+- [x] 07-02-PLAN.md — GPU integration tests for task queue conversion
 
 ## Progress
 
