@@ -39,6 +39,10 @@
 
 namespace sirius {
 
+namespace memory {
+class sirius_memory_reservation_manager;
+}  // namespace memory
+
 namespace op {
 class sirius_physical_operator;
 }  // namespace op
@@ -127,7 +131,8 @@ class pipelineable_operator_data : public operator_data {
    */
   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
   prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                         rmm::cuda_stream_view stream);
+                         rmm::cuda_stream_view stream,
+                         sirius::memory::sirius_memory_reservation_manager& res_mgr);
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;

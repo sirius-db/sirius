@@ -25,6 +25,12 @@
 #include <memory>
 
 namespace sirius {
+namespace memory {
+class sirius_memory_reservation_manager;
+}  // namespace memory
+}  // namespace sirius
+
+namespace sirius {
 namespace pipeline {
 
 /**
@@ -70,9 +76,35 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   pipeline_memory_history& get_memory_history() { return _memory_history; }
   const pipeline_memory_history& get_memory_history() const { return _memory_history; }
 
+  /**
+   * @brief Set the memory reservation manager for this pipeline's tasks.
+   *
+   * The reservation manager is used by lock_or_prepare_batch to perform polite
+   * reservation checks when converting data between memory tiers.
+   *
+   * @param mgr Non-owning pointer to the reservation manager (must outlive all tasks).
+   */
+  void set_memory_reservation_manager(sirius::memory::sirius_memory_reservation_manager* mgr)
+  {
+    _res_mgr = mgr;
+  }
+
+  /**
+   * @brief Get the memory reservation manager, if set.
+   *
+   * @return Non-owning pointer to the reservation manager, or nullptr if not set.
+   */
+  [[nodiscard]] sirius::memory::sirius_memory_reservation_manager* get_memory_reservation_manager()
+    const
+  {
+    return _res_mgr;
+  }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
   pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
+  sirius::memory::sirius_memory_reservation_manager* _res_mgr =
+    nullptr;  ///< Non-owning ptr to reservation manager
 };
 
 /**

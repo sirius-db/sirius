@@ -16,18 +16,18 @@
 
 #pragma once
 
+#include "data/convertible_data_batch.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <data/sirius_converter_registry.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -36,19 +36,23 @@ namespace pipeline {
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
  *
  * If the batch is already in the requested memory space it is locked in place. If it resides
- * elsewhere the batch is first converted (moved) to the requested space and then locked.
+ * elsewhere the batch is first converted (moved) to the requested space via
+ * convertible_data_batch::convert() and then locked.
  *
  * @param batch                   The batch to lock/prepare.
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
  * @param stream                  CUDA stream used for any data-movement kernels.
+ * @param res_mgr                 Reservation manager for polite reservation checks during
+ *                                conversion.
  * @return A processing handle that keeps the batch locked, or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion.
  */
 inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  sirius::memory::sirius_memory_reservation_manager& res_mgr)
 {
   using status = cucascade::lock_for_processing_status;
   const auto* target_space =
@@ -67,53 +71,26 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
   };
 
   while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
-    try {
-      auto& registry = sirius::converter_registry::get();
-      switch (target_space->get_tier()) {
-        case cucascade::memory::Tier::GPU: {
-          auto prev_state = batch->get_state();
-          if (!batch->try_to_lock_for_in_transit()) {
-            auto current_state = batch->get_state();
-            if (current_state == cucascade::batch_state::in_transit) {
-              // If another thread has taken the in_transit lock, wait to acquire the processing
-              // lock.
-              lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
-              continue;
-            }
-            cancel_task_if_needed();
-            return std::nullopt;
-          }
-          try {
-            batch->convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
-          } catch (...) {
-            batch->try_to_release_in_transit();
-            throw;
-          }
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-          break;
-        }
-        case cucascade::memory::Tier::HOST: {
-          auto prev_state = batch->get_state();
-          if (!batch->try_to_lock_for_in_transit()) {
-            cancel_task_if_needed();
-            return std::nullopt;
-          }
-          try {
-            batch->convert_to<cucascade::host_data_representation>(registry, target_space, stream);
-          } catch (...) {
-            batch->try_to_release_in_transit();
-            throw;
-          }
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-          break;
-        }
-        default: cancel_task_if_needed(); return std::nullopt;
-      }
+    // Delegate tier-switching conversion to convertible_data_batch::convert().
+    // This unifies the forward-path conversion with the downgrade path, ensuring
+    // both benefit from the same failure-safety guarantees (state restore on error).
+    sirius::convertible_data_batch convertible(batch);
+    auto* mutable_space = const_cast<cucascade::memory::memory_space*>(target_space);
+    bool converted =
+      convertible.convert(std::vector<cucascade::memory::memory_space*>{mutable_space},
+                          stream,
+                          res_mgr);
 
-      lock_result = batch->try_to_lock_for_processing(target_space->get_id());
-    } catch (...) {
-      throw;
+    if (!converted) {
+      // convert() returns false if another thread holds the in_transit lock or no
+      // reservation is available. Re-attempt wait_to_lock_for_processing which
+      // blocks until the batch is available again, matching the original contention
+      // handling.
+      lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
+      continue;
     }
+
+    lock_result = batch->try_to_lock_for_processing(target_space->get_id());
   }
 
   if (!lock_result.success) {
