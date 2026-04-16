@@ -19,8 +19,10 @@
 #include "downgrade/downgrade_task.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
+#include "exec/inspectable_mpsc.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "parallel/task.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -48,7 +50,6 @@ namespace parallel {
  * Thread safety of the predicate function is the responsibility of the caller.
  */
 struct downgrade_request {
-  size_t target_bytes{0};
   std::function<bool()> predicate;
   std::promise<size_t> result;
   std::atomic<size_t> bytes_freed{0};
@@ -85,13 +86,17 @@ class downgrade_executor {
    * @param memory_space Pointer to the memory space (for pressure queries; nullptr disables
    * monitor)
    * @param reservation_manager Reference to the memory reservation manager
+   * @param gpu_task_queue Optional pointer to GPU task queue for tiered fallback
+   * @param pipeline_task_queue Optional pointer to pipeline task queue for tiered fallback
    */
   explicit downgrade_executor(
     exec::downgrade_executor_config config,
     cucascade::shared_data_repository_manager& data_repo_mgr,
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
-    sirius::memory::sirius_memory_reservation_manager& reservation_manager);
+    sirius::memory::sirius_memory_reservation_manager& reservation_manager,
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue = nullptr,
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue = nullptr);
 
   ~downgrade_executor();
 
@@ -134,15 +139,13 @@ class downgrade_executor {
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
-   * Collects up to target_bytes worth of candidates and dispatches batch
-   * downgrades until the predicate returns true or candidates are exhausted.
-   * In-flight batches finish naturally.
+   * Dispatches batch downgrades until the predicate returns true or candidates
+   * are exhausted. In-flight batches finish naturally.
    *
-   * @param target_bytes Approximate bytes to collect as candidates
    * @param predicate Callable returning true when the caller's condition is met
    * @return std::future<size_t> Resolves to total bytes freed
    */
-  std::future<size_t> request_downgrade(size_t target_bytes, std::function<bool()> predicate);
+  std::future<size_t> request_downgrade(std::function<bool()> predicate);
 
  private:
   void processing_loop();
@@ -177,6 +180,8 @@ class downgrade_executor {
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _gpu_task_queue{nullptr};
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };
 
 }  // namespace parallel
