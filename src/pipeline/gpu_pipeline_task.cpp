@@ -338,7 +338,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();
-    auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
     SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
@@ -396,7 +395,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
         if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
       }
     }
-    auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
     SIRIUS_LOG_TRACE(
       "Pipeline {}: memory history record - input_basis={}, output_bytes={}, reservation_bytes={}, "
