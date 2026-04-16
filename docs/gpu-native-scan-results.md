@@ -108,17 +108,20 @@ reuse across all batch iterations, free once after. Currently each batch iterati
 does `cudaMallocAsync` (line 363) and `cudaFreeAsync` (line 384) in
 `gpu_native_scan_task.cpp`.
 
-### B. H2D / decode overlap with dual streams
-**Impact:** Hides H2D latency by copying batch N+1 while decoding batch N.
-**Implementation:** Each scan task uses one CUDA stream from the pool. Could acquire
-a second stream for H2D pipelining. While decode kernels run on stream A for batch N,
-enqueue H2D copies on stream B for batch N+1. Requires careful event-based sync.
-**Note:** Was attempted before (commit `1e7c6c6`, reverted in `e3e2719`) with
-per-segment interleaving — net regression at SF10 because overhead > benefit at small
-scale. Should re-attempt with per-BATCH interleaving at 1GB batch sizes where H2D
-is ~350ms and decode is ~540ms — enough latency to hide.
-**Risk:** Medium. The previous revert was with 100MB batches (per-segment granularity).
-Per-batch granularity at 1GB should have better overlap-to-overhead ratio.
+### B. Batch contiguous H2D copies (HIGHEST IMPACT)
+**Impact:** nsys shows 2,102 individual cudaMemcpyAsync calls (253KB each = one DuckDB
+block). Each call has ~150us CPU-side enqueue overhead → 315ms of just API overhead
+for 545MB of data. The actual NVLink transfer at 368 GB/s takes only 1.5ms.
+Decode kernels take only 8.3ms (2% of scan time). H2D API overhead is 97%.
+**Implementation:** DuckDB blocks are stored sequentially in the .duckdb file. Since
+we already mmap the file, contiguous blocks within a column can be copied as one large
+region. Instead of 2,102 × 253KB copies, group into ~20 × 27MB copies.
+Expected: 20 × 150us + 1.5ms = ~5ms total (vs 352ms now = **70x faster**).
+**File:** `src/op/scan/gpu_native_scan_task.cpp` lines 364-376 (the per-block copy loop).
+Need to sort blocks by file offset, merge contiguous ranges, issue fewer copies.
+**Note:** H2D/decode overlap (previously attempted, commit `1e7c6c6` reverted `e3e2719`)
+is NOT helpful — decode is only 8ms, nothing to overlap with. The bottleneck is API
+call count, not transfer bandwidth or decode compute.
 
 ### C. Reduce stream.synchronize() count
 **Impact:** Currently 2-4 syncs per table decode in `gpu_native_decode.cu` (lines 438,
