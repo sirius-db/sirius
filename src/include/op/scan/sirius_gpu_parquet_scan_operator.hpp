@@ -35,31 +35,48 @@ namespace sirius::op::scan {
 
 /**
  * @brief Operator that reads parquet byte ranges for a batch of row groups and produces
- *        host_parquet_representation data batches for downstream GPU operators.
+ *        gpu_table_representation data batches for downstream GPU operators.
  *
- * This operator plays two roles in the two-pipeline parquet execution model:
+ * This operator is the source of the GPU parquet scan pipeline. It is paired with a
+ * sirius_parquet_metadata_scan_operator, which runs as a separate upstream pipeline and
+ * pushes parsed metadata directly into this operator — not through the data-batch / port
+ * channel, since partitioned_parquet_metadata is not a data_batch.
  *
- *  Pipeline 1 (metadata scan):
- *    - Acts as the sink.  sirius_parquet_metadata_scan_operator::execute() produces
- *      partitioned_parquet_metadata objects that are delivered here via sink().
- *    - The operator accumulates the partitioned_parquet_metadata objects.
+ * Lifecycle:
  *
- *  Pipeline 2 (GPU parquet scan):
- *    - Acts as the source.
- *    - Once finalize_metadata() has been called (after all sink() calls complete),
- *      a flat partition index is built and get_next_task_input_data() can atomically
- *      claim partitions.  Each partition maps 1:1 to a row_group_range — the metadata
- *      scan operator is responsible for sizing partitions to the target batch size.
- *    - execute(parquet_scan_data) reads the actual byte ranges from disk.
+ *   1. Metadata accumulation (upstream pipeline, CPU-only):
+ *      - sirius_parquet_metadata_scan_operator::execute() parses parquet footers and
+ *        produces partitioned_parquet_metadata.
+ *      - Its sink() forwards each result here via accumulate_metadata().
+ *      - When the upstream pipeline finishes, its finalize_operator() calls
+ *        finalize_partitions() on this operator, which freezes the accumulated metadata
+ *        into a flat partition index and releases _finalized.
+ *
+ *   2. Scan (this pipeline, GPU):
+ *      - get_next_task_hint() / all_ports_empty() block on _finalized so this pipeline
+ *        cannot begin until accumulation is complete.
+ *      - get_next_task_input_data() atomically claims one partition from the index and
+ *        returns it as parquet_scan_data. Each partition maps 1:1 to a row_group_range —
+ *        the metadata scan operator is responsible for sizing partitions to the target
+ *        batch size.
+ *      - execute(parquet_scan_data) reads the byte ranges, optionally applies a
+ *        fallback filter expression, and emits a gpu_table_representation data batch.
+ *
+ * Scheduling coupling:
+ *   The upstream → downstream pipeline edge is expressed via a null-repo
+ *   "gpu_parquet_scan" port on this operator. setup_pipeline_parents() uses that port
+ *   to discover the dependency so this pipeline is not scheduled until the metadata
+ *   pipeline completes. No data flows through the port.
  *
  * Thread-safety:
- *   - sink() is called from pipeline 1 worker threads and protects _accumulated_metadata
- *     with _metadata_mutex.
- *   - finalize_metadata() must be called exactly once, after ALL sink() calls have
- *     completed (i.e., after pipeline 1 has fully finished).  It builds the partition
- *     index and sets _finalized, after which all source-side methods become usable.
- *   - get_next_task_input_data() / get_next_task_hint() / all_ports_empty() are called
- *     from pipeline 2 worker threads and only proceed after _finalized is set.
+ *   - accumulate_metadata() is called from upstream worker threads; _metadata_mutex
+ *     protects _accumulated_metadata.
+ *   - finalize_partitions() must be called exactly once, after ALL accumulate_metadata()
+ *     calls have completed. It builds the partition index and sets _finalized with
+ *     release semantics; source-side methods read _finalized with acquire semantics
+ *     before accessing the index.
+ *   - get_next_task_input_data() / get_next_task_hint() / all_ports_empty() are safe to
+ *     call from multiple worker threads and return no-op results until _finalized.
  */
 class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
  public:
@@ -73,80 +90,81 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   sirius_gpu_parquet_scan_operator(duckdb::vector<duckdb::LogicalType> types,
                                    duckdb::idx_t estimated_cardinality);
 
-  //===----------Sink interface (pipeline 1)----------===//
-  bool is_sink() const override { return true; }
+  //===----------Metadata handoff (called by metadata_scan)----------===//
+  /**
+   * @brief Accumulate one partitioned_parquet_metadata produced by the metadata scan pipeline.
+   *
+   * Invoked from metadata_scan.sink().
+   *
+   * @param metadata The metadata scan output.
+   */
+  void accumulate_metadata(const partitioned_parquet_metadata& metadata);
 
   /**
-   * @brief Receive partitioned_parquet_metadata produced by pipeline 1 and accumulate it.
+   * @brief Freeze metadata and build the partition index.
    *
-   * @param input_data  Should be a partitioned_parquet_metadata instance.
-   * @param stream      Unused; metadata handling is CPU-only.
+   * Must be called exactly once after ALL accumulate_metadata() calls complete. Invoked from
+   * metadata_scan.finalize_operator().
    */
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  void finalize_partitions();
 
-  //===----------Pipeline 1 → Pipeline 2 transition----------===//
-  /**
-   * @brief Signal that pipeline 1 has fully finished, freeze metadata, and build partition index.
-   *
-   * Must be called exactly once after ALL sink() calls have completed.  After this call,
-   * the source-side methods (get_next_task_hint, all_ports_empty, get_next_task_input_data)
-   * become usable.
-   */
-  void finalize_metadata();
-
-  //===----------Source interface (pipeline 2)----------===//
+  //===----------Source interface----------===//
   bool is_source() const override { return true; }
 
   /**
-   * @brief Returns READY while there are unconsumed partitions, or nullopt when all
-   *        partitions have been dispatched or metadata has not yet been finalized.
+   * @return READY while there are unconsumed partitions; nullopt when all
+   *         partitions have been dispatched or metadata has not yet been finalized.
    */
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   /**
-   * @brief Returns true once all partitions have been dispatched.
-   *
-   * Returns false if metadata has not yet been finalized.
+   * @return true once all partitions have been dispatched;
+   *         false if metadata has not yet been finalized.
    */
   [[nodiscard]] bool all_ports_empty() override;
 
   /**
    * @brief Claims and returns the next parquet_scan_data for a single row_group_range.
    *
-   * Returns nullptr when all partitions have been consumed or metadata is not yet finalized.
+   * @return the claimed parquet_scan_data or nullptr when all partitions have been consumed or
+   *         metadata is not yet finalized.
    */
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  //===----------Execution (pipeline 2)----------===//
+  //===----------Execution----------===//
   /**
    * @brief Read the byte ranges described by @p input_data from disk and produce a
-   *        host_parquet_representation data batch.
+   *        gpu_table_representation data batch.
    *
    * @param input_data  Must be a parquet_scan_data instance.
-   * @param stream      CUDA stream (passed through for consistency; I/O is CPU-side).
+   * @param stream      CUDA stream.
+   * @return gpu_table_representation data batch wrapped as pipelineable_operator_data
+   * @throws std::runtime_error if the input_data is not parquet_scan_data, or the parquet_scan_data
+   *         does not have an associated gpu memory space
    */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
   //===----------Accessors----------===//
   /**
-   * @brief Return the total number of partitions (tasks) that will be created.
+   * @brief Return the total number of partitions (i.e., tasks) that will be created.
    *
-   * Returns an estimate from accumulated partition counts before finalization,
-   * and the exact count after finalize_metadata().
+   * @pre finalize_partitions() has been called.
+   * @return The total number of row group partitions (i.e., tasks).
+   * @throws std::runtime_error if called before finalize_partitions().
    */
   [[nodiscard]] std::size_t get_total_partitions() const;
 
  private:
   // ===----------------------------------------------------------------------===//
-  // Accumulation phase (pipeline 1).
-  //   _metadata_mutex protects _accumulated_metadata during concurrent sink() calls.
+  // Accumulation phase
+  //   _metadata_mutex protects _accumulated_metadata during concurrent accumulate_metadata() calls.
   // ===----------------------------------------------------------------------===//
-  mutable std::mutex _metadata_mutex;
+  std::mutex _metadata_mutex;
   std::vector<partitioned_parquet_metadata> _accumulated_metadata;
 
   // ===----------------------------------------------------------------------===//
-  // Partition index — built once by finalize_metadata(), then read-only.
+  // Partition index — built once by finalize_partitions(), then read-only.
   //
   //   _finalized          — set by finalize_metadata() with release semantics after
   //                          the partition index is fully written.  Source-side methods

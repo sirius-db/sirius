@@ -19,6 +19,7 @@
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
 #include <op/scan/scan_utils.hpp>
+#include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 
 // cudf
@@ -35,7 +36,9 @@ namespace sirius::op::scan {
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
+  sirius_gpu_parquet_scan_operator* gpu_scan,
   duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::LogicalType> const& returned_types,
   duckdb::idx_t estimated_cardinality,
   std::vector<std::string> const& file_paths,
   duckdb::vector<duckdb::ColumnIndex> const& column_ids,
@@ -50,7 +53,8 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
     _is_projected(!projection_ids.empty()),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
-    _total_files(file_paths.size())
+    _total_files(file_paths.size()),
+    _gpu_scan(gpu_scan)
 {
   _selected_column_indices = detail::make_selected_column_indices(column_ids, projection_ids);
 
@@ -60,7 +64,7 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   if (table_filter_set && !table_filter_set->filters.empty()) {
     auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
     auto duckdb_expression = convert_table_filters_to_expression(
-      *table_filter_set, column_ids, this->types, batch_column_map);
+      *table_filter_set, column_ids, returned_types, batch_column_map);
     if (duckdb_expression) {
       _has_filter               = true;
       _duckdb_filter_expression = std::move(duckdb_expression);
@@ -303,6 +307,26 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     result->row_group_partitions.size());
 
   return result;
+}
+
+//===----------------------------------------------------------------------===//
+// Sink interface — forward accumulated metadata to the paired GPU scan
+//===----------------------------------------------------------------------===//
+void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data,
+                                                 rmm::cuda_stream_view /*stream*/)
+{
+  auto const* metadata = dynamic_cast<const partitioned_parquet_metadata*>(&input_data);
+  if (!metadata) {
+    throw std::runtime_error(
+      "[sirius_parquet_metadata_scan_operator] sink() received unexpected operator_data type; "
+      "expected partitioned_parquet_metadata.");
+  }
+  _gpu_scan->accumulate_metadata(*metadata);
+}
+
+void sirius_parquet_metadata_scan_operator::finalize_operator()
+{
+  _gpu_scan->finalize_partitions();
 }
 
 }  // namespace sirius::op::scan

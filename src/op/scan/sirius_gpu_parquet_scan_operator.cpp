@@ -47,34 +47,23 @@ sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
 }
 
 //===----------------------------------------------------------------------===//
-// Sink interface (pipeline 1)
+// Metadata handoff (invoked from metadata_scan pipeline)
 //===----------------------------------------------------------------------===//
-void sirius_gpu_parquet_scan_operator::sink(const operator_data& input_data,
-                                            rmm::cuda_stream_view /*stream*/)
+void sirius_gpu_parquet_scan_operator::accumulate_metadata(
+  const partitioned_parquet_metadata& metadata)
 {
-  auto const* metadata = dynamic_cast<const partitioned_parquet_metadata*>(&input_data);
-  if (!metadata) {
-    SIRIUS_LOG_WARN(
-      "[sirius_gpu_parquet_scan_operator] sink() received unexpected operator_data type "
-      "(typeid: {}); ignoring.",
-      typeid(input_data).name());
-    return;
-  }
-
   {
     std::lock_guard<std::mutex> lock(_metadata_mutex);
-    _accumulated_metadata.push_back(*metadata);  // Copy unavoidable but relatively cheap
+    _accumulated_metadata.push_back(metadata);  // Copy unavoidable but relatively cheap
   }
 
   SIRIUS_LOG_DEBUG(
-    "[sirius_gpu_parquet_scan_operator] Received partitioned_parquet_metadata with {} partitions",
-    metadata->row_group_partitions.size());
+    "[sirius_gpu_parquet_scan_operator] Accumulated partitioned_parquet_metadata with {} "
+    "partitions",
+    metadata.row_group_partitions.size());
 }
 
-//===----------------------------------------------------------------------===//
-// Pipeline 1 → Pipeline 2 transition
-//===----------------------------------------------------------------------===//
-void sirius_gpu_parquet_scan_operator::finalize_metadata()
+void sirius_gpu_parquet_scan_operator::finalize_partitions()
 {
   std::lock_guard<std::mutex> lock(_metadata_mutex);
 
@@ -84,28 +73,27 @@ void sirius_gpu_parquet_scan_operator::finalize_metadata()
       _partition_index.push_back(partition_entry{&meta, i});
     }
   }
-
-  // Release store: all writes to _partition_index happen-before this store.
   _finalized.store(true, std::memory_order_release);
 
   SIRIUS_LOG_DEBUG(
-    "[sirius_gpu_parquet_scan_operator] Finalized {} partitions from {} metadata objects",
+    "[sirius_gpu_parquet_scan_operator] finalize_partitions() — {} partitions from {} "
+    "metadata objects",
     _partition_index.size(),
     _accumulated_metadata.size());
 }
 
 //===----------------------------------------------------------------------===//
-// Source interface (pipeline 2)
+// Source interface
 //===----------------------------------------------------------------------===//
 std::size_t sirius_gpu_parquet_scan_operator::get_total_partitions() const
 {
-  if (_finalized.load(std::memory_order_acquire)) { return _partition_index.size(); }
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-  std::size_t total = 0;
-  for (auto const& meta : _accumulated_metadata) {
-    total += meta.row_group_partitions.size();
+  if (!_finalized.load(std::memory_order_acquire)) {
+    throw std::runtime_error(
+      "[sirius_gpu_parquet_scan_operator] get_total_partitions() called before "
+      "finalize_partitions(); the partition count is not known until metadata accumulation "
+      "completes.");
   }
-  return total;
+  return _partition_index.size();
 }
 
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
@@ -114,6 +102,7 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
   if (_next_partition_idx.load(std::memory_order_relaxed) < _partition_index.size()) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
+  // All partitions have been dispatched.
   return std::nullopt;
 }
 

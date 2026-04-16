@@ -17,12 +17,11 @@
 #pragma once
 
 // sirius
-#include "sirius_config.hpp"
-
 #include <config.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
+#include <sirius_config.hpp>
 
 // duckdb
 #include <duckdb/common/column_index.hpp>
@@ -41,11 +40,6 @@ namespace sirius::op::scan {
 
 /**
  * @brief Operator that parses parquet file metadata and produces row-group partitions.
- *
- * This operator replaces the metadata-parsing work that was previously performed
- * in parquet_scan_task_global_state's constructor, moving it into the execute()
- * method as required by the design principle that no compute should be done in
- * global or local task state.
  *
  * Pipeline role:
  *   - Source of the metadata-scan pipeline (pipeline 1).
@@ -82,6 +76,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    *        physical parquet scan node (or equivalent source).
    *
    * @param types                   Output column types.
+   * @param returned_types          The types of all columns in the source file.
    * @param estimated_cardinality   Estimated output row count.
    * @param file_paths              The list of parquet files to scan.
    * @param column_ids              Column ids exposed by the table function (used for column
@@ -100,7 +95,9 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    *         (column names are required for both projection and filter pushdown).
    */
   sirius_parquet_metadata_scan_operator(
+    sirius_gpu_parquet_scan_operator* gpu_scan,
     duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::LogicalType> const& returned_types,
     duckdb::idx_t estimated_cardinality,
     std::vector<std::string> const& file_paths,
     duckdb::vector<duckdb::ColumnIndex> const& column_ids,
@@ -114,16 +111,15 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   bool is_source() const override { return true; }
 
   /**
-   * @brief Returns READY (pointing to itself) while there are unprocessed files,
-   *        or nullopt when all files have been dispatched.
+   * @return READY (pointing to itself) while there are unprocessed files,
+   *         or nullopt when all files have been dispatched.
    */
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   /**
    * @brief Returns true once all files have been dispatched to metadata tasks.
    *
-   * @pre  Called only from pipeline scheduling logic; no external ordering required.
-   * @post Returns true iff _next_file_idx >= _total_files (all files dispatched).
+   * @return true iff _next_file_idx >= _total_files (all files dispatched).
    * @note Overrides the default port-based check since this is a source operator with
    *       no input ports.
    */
@@ -133,7 +129,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    * @brief Creates a parquet_metadata_input for the next batch of unprocessed files.
    *
    * Atomically advances the file-index counter and returns up to max_file_processed
-   * file paths.  Returns nullptr when all files have been consumed.
+   * file paths. Returns nullptr when all files have been consumed.
    */
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -155,6 +151,34 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+  //===----------Sink interface (forwarding to gpu_scan)----------===//
+  bool is_sink() const override { return true; }
+
+  /**
+   * @brief Forward a partitioned_parquet_metadata produced by execute() into the paired
+   *        sirius_gpu_parquet_scan_operator.
+   *
+   * Invoked by the pipeline framework once per completed metadata task, from worker threads.
+   * Delegates to gpu_scan::accumulate_metadata(), which is thread-safe; no ordering between
+   * concurrent sink() calls is required or observed.
+   *
+   * @param input_data  Must dynamic_cast to partitioned_parquet_metadata.
+   * @param stream      Unused; metadata accumulation is CPU-only.
+   * @throws std::runtime_error if @p input_data is not a partitioned_parquet_metadata.
+   */
+  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+
+  /**
+   * @brief Finalize the paired gpu_scan's partition index, unblocking the downstream pipeline.
+   *
+   * Invoked by the pipeline framework exactly once, after every sink() call for this pipeline
+   * has returned. Delegates to gpu_scan::finalize_partitions(), which freezes the accumulated
+   * metadata into a flat partition index and publishes it with release semantics. Until this
+   * call completes, gpu_scan's source methods report "not ready" and the downstream scan
+   * pipeline cannot begin dispatching tasks.
+   */
+  void finalize_operator() override;
 
   //===----------Accessors----------===//
   [[nodiscard]] std::size_t get_total_files() const { return _total_files; }
@@ -191,6 +215,11 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
 
   /// Atomic file-batch counter; incremented by get_next_task_input_data().
   std::atomic<std::size_t> _next_file_idx{0};
+
+  /// Paired GPU parquet scan operator — the source of the downstream pipeline. sink() forwards
+  /// accumulated metadata into it; finalize_operator() freezes its partition index. Set at
+  /// construction; never null.
+  sirius_gpu_parquet_scan_operator* _gpu_scan;
 };
 
 }  // namespace sirius::op::scan

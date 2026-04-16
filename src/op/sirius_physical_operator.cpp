@@ -214,6 +214,14 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
     for (auto& [port_name, port_ptr] : ports) {
       ports_string += port_name + ", ";
     }
+    std::fprintf(stderr,
+                 "[get_port_miss] op=%s op_id=%zu port='%s' existing='%s' op_ptr=%p\n",
+                 get_name().c_str(),
+                 operator_id,
+                 std::string(port_id).c_str(),
+                 ports_string.c_str(),
+                 static_cast<void*>(this));
+    std::fflush(stderr);
     throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
                                     get_name() + " existing ports are: " + ports_string);
   }
@@ -225,6 +233,11 @@ void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_
   auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
   for (auto& batch : pipelineable_output.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
+      std::fprintf(stderr, "[sink_debug] from %s push -> %s port='%s'\n",
+                   get_name().c_str(),
+                   next_port_info.next_operator->get_name().c_str(),
+                   std::string(next_port_info.next_operator_port_name).c_str());
+      std::fflush(stderr);
       next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name, batch);
     }
   }
