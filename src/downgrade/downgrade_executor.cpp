@@ -16,12 +16,12 @@
 
 #include "downgrade/downgrade_executor.hpp"
 
+#include "data/convertible_data.hpp"
+#include "data/convertible_data_batch.hpp"
+#include "data/convertible_gpu_pipeline_task.hpp"
 #include "log/logging.hpp"
 
-#include <algorithm>
 #include <chrono>
-#include <limits>
-#include <optional>
 #include <thread>
 
 namespace sirius {
@@ -117,77 +117,135 @@ void downgrade_executor::processing_loop()
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
-    auto& req    = request;  // unique_ptr<downgrade_request>
+    auto& req    = request;
     auto t_start = std::chrono::steady_clock::now();
 
-    // 1. Collect repos
-    std::vector<downgrade_repository_info> repos;
-    _data_repo_mgr.for_each_repository(
-      [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
+    // Per-tier tracking for LOG-01
+    struct tier_stats {
+      std::atomic<size_t> batches{0};
+      std::atomic<size_t> bytes{0};
+    };
+    tier_stats repo_stats, gpu_queue_stats, pipeline_queue_stats;
 
-    // 2. Collect candidates
-    auto candidates =
-      collect_all_candidates(repos, std::numeric_limits<size_t>::max());
+    // Resolve the source memory space for filtering candidates
+    auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-    // 3. Incremental dispatch with predicate checking
-    for (auto& weak_batch : candidates) {
-      if (req->satisfied.load()) break;
+    // Build target spaces list: for GPU->HOST downgrade, target is HOST tier
+    std::vector<cucascade::memory::memory_space*> target_spaces;
+    auto host_spaces =
+      _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    for (auto* hs : host_spaces) {
+      target_spaces.push_back(const_cast<cucascade::memory::memory_space*>(hs));
+    }
 
-      auto batch = weak_batch.lock();
-      if (!batch) continue;  // batch was freed elsewhere — skip
+    // Helper lambda: dispatch a single convertible_data to the thread pool.
+    // Returns false if the pool is interrupted.
+    auto dispatch_candidate =
+      [&](std::unique_ptr<convertible_data> candidate, tier_stats& stats) -> bool {
+      if (req->satisfied.load()) return true;  // already done
+
+      auto candidate_bytes = candidate->bytes_in_space(source_space);
 
       auto slot = _pool->reserve();
-      if (!slot) break;  // interrupted
-
-      // Re-check after reserve() returns — the previous batch's callback may have
-      // set satisfied while we were blocked waiting for a thread.
-      if (req->satisfied.load()) break;
-
-      auto batch_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
+      if (!slot) return false;  // interrupted
 
       auto exc_stream = _stream_pool->acquire_stream(
         cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
 
       _pool->dispatch(std::move(slot),
-                      [batch      = std::move(batch),
+                      [cand       = std::move(candidate),
                        req_ptr    = req.get(),
                        &res_mgr   = _reservation_manager,
+                       &targets   = target_spaces,
                        exc_stream = std::move(exc_stream),
-                       batch_size]() mutable {
-                        downgrade_task task{batch, res_mgr};
+                       candidate_bytes,
+                       &stats]() mutable {
                         try {
-                          if (task.execute(exc_stream)) {
-                            req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
+                          if (cand->convert(targets, exc_stream, res_mgr)) {
+                            req_ptr->bytes_freed.fetch_add(candidate_bytes,
+                                                           std::memory_order_relaxed);
                             req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                            stats.batches.fetch_add(1, std::memory_order_relaxed);
+                            stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                            // D-08: Check predicate after each convert
                             if (req_ptr->predicate && req_ptr->predicate()) {
                               req_ptr->satisfied.store(true);
                             }
                           }
                         } catch (const std::exception& e) {
-                          SIRIUS_LOG_ERROR("[downgrade] batch downgrade failed: {}", e.what());
+                          SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
                         }
                       });
+      return true;
+    };
+
+    // === TIER 1: Data repositories (D-01, LOOP-01) ===
+    // Create a convertible_data_batch_provider per repo and fetch lazily
+    _data_repo_mgr.for_each_repository(
+      [&](cucascade::shared_data_repository* repo) {
+        if (req->satisfied.load()) return;
+
+        convertible_data_batch_provider provider(repo);
+        // Iterate lazily: get one candidate at a time, dispatch, check predicate
+        while (!req->satisfied.load()) {
+          auto candidate =
+            provider.get_next_convertible(source_space, /*front_to_back=*/false);
+          if (!candidate) break;  // this repo exhausted
+          if (!dispatch_candidate(std::move(candidate), repo_stats)) return;
+        }
+      });
+
+    // === TIER 2: gpu_pipeline_executor task queue (D-06, LOOP-02) ===
+    if (!req->satisfied.load() && _gpu_task_queue) {
+      convertible_gpu_pipeline_task_provider gpu_provider(*_gpu_task_queue);
+      while (!req->satisfied.load()) {
+        auto candidate =
+          gpu_provider.get_next_convertible(source_space, /*front_to_back=*/false);
+        if (!candidate) break;
+        if (!dispatch_candidate(std::move(candidate), gpu_queue_stats)) break;
+      }
     }
 
-    // 4. Let in-flight batches finish
+    // === TIER 3: pipeline_executor task queue (D-06, LOOP-03) ===
+    if (!req->satisfied.load() && _pipeline_task_queue) {
+      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
+      while (!req->satisfied.load()) {
+        auto candidate =
+          pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
+        if (!candidate) break;
+        if (!dispatch_candidate(std::move(candidate), pipeline_queue_stats)) break;
+      }
+    }
+
+    // Wait for all in-flight work to finish (D-08: predicate also checked in workers)
     _pool->wait_all();
 
+    // === Logging (D-09, LOG-01) ===
     auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);
     auto total_batches = req->batches_downgraded.load(std::memory_order_relaxed);
     auto duration_ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start)
+        .count();
     double throughput_mbs =
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
-    std::string is_monitor_request = req->is_monitor_request ? "from monitor " : "";
+    std::string source_label = req->is_monitor_request ? "monitor " : "";
+
     SIRIUS_LOG_DEBUG(
-      "[downgrade] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s)",
-      is_monitor_request,
+      "[downgrade] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
+      "repos: {}/{} batches/bytes, gpu_queue: {}/{}, pipeline_queue: {}/{}",
+      source_label,
       total_batches,
       total_bytes,
       duration_ms,
-      throughput_mbs);
+      throughput_mbs,
+      repo_stats.batches.load(std::memory_order_relaxed),
+      repo_stats.bytes.load(std::memory_order_relaxed),
+      gpu_queue_stats.batches.load(std::memory_order_relaxed),
+      gpu_queue_stats.bytes.load(std::memory_order_relaxed),
+      pipeline_queue_stats.batches.load(std::memory_order_relaxed),
+      pipeline_queue_stats.bytes.load(std::memory_order_relaxed));
 
-    // 5. Fulfill the promise with total bytes freed
+    // Fulfill the promise
     req->result.set_value(total_bytes);
   }
 }
@@ -224,130 +282,6 @@ void downgrade_executor::cancel_pending_requests()
       // Promise may already be fulfilled — safe to ignore
     }
   }
-}
-
-// --- Static helpers ---
-
-size_t downgrade_executor::get_repo_data_size_on_tier(cucascade::shared_data_repository* repo,
-                                                      cucascade::memory::Tier tier)
-{
-  size_t total = 0;
-  for (size_t p = 0; p < repo->num_partitions(); ++p) {
-    auto batch_ids = repo->get_batch_ids(p);
-    for (auto id : batch_ids) {
-      auto batch = repo->get_data_batch_by_id(id, std::nullopt, p);
-      if (!batch || !batch->get_data()) continue;
-      auto* ms = batch->get_memory_space();
-      if (!ms) continue;
-      if (ms->get_tier() == tier) { total += batch->get_data()->get_size_in_bytes(); }
-    }
-  }
-  return total;
-}
-
-bool downgrade_executor::is_partition_active(cucascade::shared_data_repository* repo,
-                                             size_t partition_idx)
-{
-  auto batch_ids = repo->get_batch_ids(partition_idx);
-  for (auto id : batch_ids) {
-    auto batch = repo->get_data_batch_by_id(id, std::nullopt, partition_idx);
-    if (!batch) continue;
-    auto state = batch->get_state();
-    if (state == cucascade::batch_state::task_created ||
-        state == cucascade::batch_state::processing) {
-      return true;
-    }
-  }
-  return false;
-}
-
-std::vector<std::weak_ptr<cucascade::data_batch>>
-downgrade_executor::collect_candidates_from_partition(
-  cucascade::shared_data_repository* repo,
-  size_t partition_idx,
-  cucascade::memory::memory_space_id source_space,
-  size_t max_bytes,
-  size_t& collected_bytes)
-{
-  std::vector<std::weak_ptr<cucascade::data_batch>> candidates;
-  auto batch_ids = repo->get_batch_ids(partition_idx);
-  for (auto id : batch_ids) {
-    if (max_bytes > 0 && collected_bytes >= max_bytes) break;
-    auto batch = repo->get_data_batch_by_id(id, std::nullopt, partition_idx);
-    if (!batch || !batch->get_data()) continue;
-    if (batch->get_state() != cucascade::batch_state::idle) continue;
-    auto* ms = batch->get_memory_space();
-    if (!ms || ms->get_id() != source_space) continue;
-
-    collected_bytes += batch->get_data()->get_size_in_bytes();
-    candidates.emplace_back(batch);
-  }
-  return candidates;
-}
-
-// --- Candidate collection helper ---
-
-std::vector<std::weak_ptr<cucascade::data_batch>> downgrade_executor::collect_all_candidates(
-  const std::vector<downgrade_repository_info>& repositories, size_t amount_to_downgrade)
-{
-  auto source_tier = _space_id.tier;
-
-  struct scored_repo {
-    cucascade::shared_data_repository* repo;
-    size_t tier_data_size;
-    bool is_partitioned;
-  };
-
-  std::vector<scored_repo> scored_repos;
-  for (auto& info : repositories) {
-    if (!info.repo) continue;
-    size_t tier_size = get_repo_data_size_on_tier(info.repo, source_tier);
-    if (tier_size == 0) continue;
-    scored_repos.push_back({info.repo, tier_size, info.repo->num_partitions() > 1});
-  }
-
-  std::sort(
-    scored_repos.begin(), scored_repos.end(), [](const scored_repo& a, const scored_repo& b) {
-      if (a.is_partitioned != b.is_partitioned) return a.is_partitioned > b.is_partitioned;
-      return a.tier_data_size > b.tier_data_size;
-    });
-
-  std::vector<std::weak_ptr<cucascade::data_batch>> all_candidates;
-  size_t collected_bytes = 0;
-
-  // Pass 1: Non-active partitions (last to first)
-  for (auto& sr : scored_repos) {
-    if (collected_bytes >= amount_to_downgrade) break;
-    for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-      if (collected_bytes >= amount_to_downgrade) break;
-      size_t pidx = i - 1;
-      if (is_partition_active(sr.repo, pidx)) continue;
-      auto candidates = collect_candidates_from_partition(
-        sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
-      for (auto& c : candidates) {
-        all_candidates.push_back(std::move(c));
-      }
-    }
-  }
-
-  // Pass 2: Active partitions (last to first)
-  if (collected_bytes < amount_to_downgrade) {
-    for (auto& sr : scored_repos) {
-      if (collected_bytes >= amount_to_downgrade) break;
-      for (size_t i = sr.repo->num_partitions(); i > 0; --i) {
-        if (collected_bytes >= amount_to_downgrade) break;
-        size_t pidx = i - 1;
-        if (!is_partition_active(sr.repo, pidx)) continue;
-        auto candidates = collect_candidates_from_partition(
-          sr.repo, pidx, _space_id, amount_to_downgrade, collected_bytes);
-        for (auto& c : candidates) {
-          all_candidates.push_back(std::move(c));
-        }
-      }
-    }
-  }
-
-  return all_candidates;
 }
 
 // --- Public request API ---
