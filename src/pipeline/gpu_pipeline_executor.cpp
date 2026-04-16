@@ -97,7 +97,7 @@ void gpu_pipeline_executor::manager_loop()
     auto const res_end   = std::chrono::high_resolution_clock::now();
     auto const res_us =
       std::chrono::duration_cast<std::chrono::microseconds>(res_end - res_start).count();
-    SIRIUS_LOG_INFO(
+    SIRIUS_LOG_DEBUG(
       "[gpu_executor] reservation: pipeline={} task={} requested_mb={:.1f} "
       "available_mb={:.1f} reserved_mb={:.1f} max_mb={:.1f} time_us={}",
       gpu_task->get_pipeline_id(),

@@ -16,6 +16,7 @@
 
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_decode_batched_string.cuh"
+#include "cuda/scan/gpu_decode_validity.cuh"
 #include "log/logging.hpp"
 
 #include <cudf/column/column.hpp>
@@ -677,39 +678,8 @@ __global__ void kernel_gather_uncompressed(const batched_seg_desc* __restrict__ 
 }
 
 //===----------------------------------------------------------------------===//
-// Validity + null count kernel (shared with gpu_native_decode.cu)
-//===----------------------------------------------------------------------===//
-
-__global__ void kernel_fill_valid_batched(uint64_t* mask, uint32_t num_words)
-{
-  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_words) mask[idx] = ~0ULL;
-}
-
-__global__ void kernel_count_valid_bits_batched(const uint64_t* __restrict__ mask,
-                                                uint32_t num_words,
-                                                uint32_t total_rows,
-                                                uint32_t* __restrict__ d_valid_count)
-{
-  __shared__ uint32_t s_counts[256];
-  uint32_t valid = 0;
-  for (uint32_t i = threadIdx.x; i < num_words; i += blockDim.x) {
-    uint64_t word = mask[i];
-    if (i == num_words - 1) {
-      uint32_t tail = total_rows & 63;
-      if (tail > 0) word &= (1ULL << tail) - 1;
-    }
-    valid += __popcll(word);
-  }
-  s_counts[threadIdx.x] = valid;
-  __syncthreads();
-  for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) s_counts[threadIdx.x] += s_counts[threadIdx.x + s];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) *d_valid_count = s_counts[0];
-}
-
+// Validity + null count kernels are shared with gpu_native_decode.cu
+// via gpu_decode_validity.cuh — do not duplicate them here.
 //===----------------------------------------------------------------------===//
 // Host-side orchestrator
 //===----------------------------------------------------------------------===//
@@ -873,7 +843,7 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   // Phase 3: Allocate work buffers
   //===--------------------------------------------------------------------===//
 
-  SIRIUS_LOG_INFO(
+  SIRIUS_LOG_DEBUG(
     "[batched_string] phase 3: {} total rows, {} dict, {} fsst, {} uncomp segs, "
     "{} blocks, staging_ptr={}, reuse={}",
     total_rows,
@@ -1154,8 +1124,7 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     auto* d_mask      = static_cast<uint64_t*>(null_mask.data());
 
     uint32_t num_words = static_cast<uint32_t>((total_rows + 63) / 64);
-    kernel_fill_valid_batched<<<(num_words + 255) / 256, 256, 0, stream.value()>>>(d_mask,
-                                                                                   num_words);
+    kernel_fill_valid<<<(num_words + 255) / 256, 256, 0, stream.value()>>>(d_mask, num_words);
 
     size_t val_row_offset = 0;
     for (auto& vseg : col_scan.validity.segments) {
@@ -1188,11 +1157,11 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     if (d_valid_count_out) {
       // Deferred: write valid count to caller's slot, NO sync.
       cudaMemsetAsync(d_valid_count_out, 0, sizeof(uint32_t), stream.value());
-      kernel_count_valid_bits_batched<<<1, 256, 0, stream.value()>>>(
+      kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
         d_mask, num_words, static_cast<uint32_t>(total_rows), d_valid_count_out);
     } else {
       // Legacy path: sync per column.
-      kernel_count_valid_bits_batched<<<1, 256, 0, stream.value()>>>(
+      kernel_count_valid_bits<<<1, 256, 0, stream.value()>>>(
         d_mask, num_words, static_cast<uint32_t>(total_rows), d_vc.data());
       stream.synchronize();
       uint32_t vc;

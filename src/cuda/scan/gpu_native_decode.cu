@@ -5,6 +5,7 @@
 
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_decode_batched_string.cuh"
+#include "cuda/scan/gpu_decode_validity.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "log/logging.hpp"
 
@@ -162,6 +163,8 @@ void launch_fill_constant(uint8_t* d_dest,
   }
 }
 
+}  // anonymous namespace
+
 /// CUDA kernel to set all validity bits to 1 (all valid).
 __global__ void kernel_fill_valid(uint64_t* mask, uint32_t num_words)
 {
@@ -202,6 +205,8 @@ __global__ void kernel_count_valid_bits(const uint64_t* __restrict__ mask,
 
   if (threadIdx.x == 0) *d_valid_count = s_counts[0];
 }
+
+namespace {
 
 //===----------------------------------------------------------------------===//
 // Bulk block transfer: stage every unique block referenced by any column

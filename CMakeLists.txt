@@ -129,7 +129,6 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/direct_block_scan.cpp
     src/op/scan/gpu_native_scan_task.cpp
-    src/op/scan/scan_ring_buffer.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp

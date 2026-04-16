@@ -142,7 +142,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
       out_rows += view.num_rows();
     }
   }
-  SIRIUS_LOG_INFO(
+  SIRIUS_LOG_DEBUG(
     "[gpu_op] pipeline={} op={} (id={}) time_us={} rows_out={} peak_mb={:.1f}",
     pipeline->get_pipeline_id(),
     op.get_name(),

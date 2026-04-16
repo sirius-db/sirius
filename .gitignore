@@ -35,3 +35,5 @@ compile_commands.json
 
 # Zed editor settings
 .zed
+result_*.txt
+timings_*.csv
