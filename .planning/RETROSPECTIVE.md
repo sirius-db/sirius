@@ -78,6 +78,50 @@
 
 ---
 
+## Milestone: v2.0 — Convertible Data Abstraction
+
+**Shipped:** 2026-04-16
+**Phases:** 3 | **Plans:** 6 | **Sessions:** ~4
+
+### What Was Built
+- `convertible_data` and `convertible_data_provider` abstract interfaces for uniform memory-tier conversion
+- `convertible_data_batch` + provider wrapping `data_batch`/`shared_data_repository` with failure-safe GPU-to-HOST conversion
+- `convertible_gpu_pipeline_task` + provider wrapping `gpu_pipeline_task`/`inspectable_mpsc<itask>` with RAII queue ownership
+- Extended `data_batch` state machine with `task_created ↔ in_transit` round-trip documentation and tests
+- 19 GPU integration tests (8 batch + 11 task) with 66 assertions using real cuCascade data and converter registry
+
+### What Worked
+- Abstract-first design (Phase 5 interfaces before Phase 6-7 concrete implementations) gave stable compilation targets — zero interface changes needed
+- Phase 6 and 7 followed identical patterns (implementation then GPU tests) — plans were highly predictable
+- Reusing the `downgrade_task::execute()` save/lock/convert/restore pattern for `convertible_data_batch` leveraged proven production code
+- Code review after each phase caught quality issues (e.g., missing move assignment delete, extractable static helper) without blocking execution
+- RAII ownership pattern for `convertible_gpu_pipeline_task` elegantly solved the "extract-convert-return" problem
+
+### What Was Inefficient
+- Worktree submodule issues recurred in Phase 7 (cucascade git alternates needed manual setup) — still no automated fix
+- REQUIREMENTS.md traceability table stayed "Pending" throughout execution (same issue as v1.0) — CLI fixed it during archive
+- Phase 5 state machine plan was documentation-only (code already worked) — could have been a single task instead of a full plan
+
+### Patterns Established
+- Abstract interface pattern: pure virtuals in `sirius` namespace with forward-declared cucascade types
+- Save/lock/convert/restore failure safety pattern generalized from `downgrade_task` to `convertible_data_batch`
+- RAII queue ownership: `mutable_pop_if` extracts, destructor pushes back — task never lost
+- `rmm::cuda_stream` (non-default) required for cuCascade `cudaMemcpyBatchAsync` in tests
+- `test_env` singleton pattern with lazy initialization for GPU integration test fixtures
+
+### Key Lessons
+1. When code already handles a state transition, a documentation+test plan is sufficient — no need to modify implementation
+2. The abstract-then-concrete phase ordering pays off: interfaces stabilize early, implementations can run in parallel
+3. GPU integration tests are 10-20x slower to write than unit tests (36 min for 8 tests vs 3 min for implementation) — budget accordingly
+4. `dynamic_cast` chains in predicates work well for heterogeneous queues but must stay lightweight (no I/O, no allocation)
+
+### Cost Observations
+- Model mix: quality profile (opus for execution, sonnet for review)
+- Sessions: ~4 (discuss+plan+execute Phase 5, execute Phase 6, discuss+plan+execute Phase 7, code reviews)
+- Notable: ~65 min active execution for 1,499 LOC — consistent with v1.0 efficiency (~45 LOC/min)
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -86,6 +130,7 @@
 |-----------|----------|--------|------------|
 | v1.0 | 3 | 2 | Initial milestone — TDD, coarse granularity |
 | v1.1 | 2 | 2 | Refactor milestone — dead code removal then type swap |
+| v2.0 | ~4 | 3 | Abstract-first design — interfaces then concrete implementations |
 
 ### Cumulative Quality
 
@@ -93,9 +138,12 @@
 |-----------|-------|------------|-----------|
 | v1.0 | 35 | 231 | +1,153 |
 | v1.1 | 868 (full suite) | 78M+ | -445 (net deletion) |
+| v2.0 | 54 (data infra) | 297 | +1,499 |
 
 ### Top Lessons (Verified Across Milestones)
 
-1. TDD with atomic commits keeps plans focused and review simple
-2. Coarse granularity (1-2 plans per phase) is sufficient for focused library work
-3. Detailed API interfaces in plans eliminate executor exploration — zero deviations across 5 plans in both milestones
+1. TDD with atomic commits keeps plans focused and review simple (v1.0, v1.1, v2.0)
+2. Coarse granularity (1-2 plans per phase) is sufficient for focused library work (v1.0, v1.1, v2.0)
+3. Detailed API interfaces in plans eliminate executor exploration — zero deviations across 11 plans in all milestones (v1.0, v1.1, v2.0)
+4. Worktree submodule initialization is recurring friction — needs automated fix (v1.0, v2.0)
+5. REQUIREMENTS.md traceability table not updated during execution — rely on archive to reconcile (v1.0, v2.0)

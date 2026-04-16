@@ -2,23 +2,17 @@
 
 ## What This Is
 
-Thread-safe data infrastructure for the Sirius GPU SQL engine. Started as `inspectable_mpsc<T>` — a predicate-inspectable MPSC queue now integrated as the production task queue. Expanding to include `convertible_data` abstractions that enable uniform memory-space conversion across data batches and queued pipeline tasks.
+Thread-safe data infrastructure for the Sirius GPU SQL engine. Includes `inspectable_mpsc<T>` — a predicate-inspectable MPSC queue integrated as the production task queue — and `convertible_data` abstractions that enable uniform, failure-safe memory-space conversion across data batches and queued pipeline tasks.
 
 ## Core Value
 
-Thread-safe queue with predicate-based element inspection and selective removal (`pop_if`/`get_if`), enabling consumers to find specific items without draining the queue. Extended by convertible_data interfaces that provide uniform, failure-safe data conversion across memory tiers.
+Thread-safe queue with predicate-based element inspection and selective removal (`pop_if`/`get_if`), enabling consumers to find specific items without draining the queue. Complemented by convertible_data interfaces providing uniform, failure-safe data conversion across GPU/HOST/DISK memory tiers.
 
-## Current Milestone: v2.0 Convertible Data Abstraction
+## Shipped Milestones
 
-**Goal:** Create abstract interfaces and concrete implementations for memory-space-aware data conversion, enabling uniform conversion of data batches and queued pipeline tasks.
-
-**Target features:**
-- `convertible_data` abstract interface — uniform `convert()` + `bytes_in_space()` API
-- `convertible_data_provider` abstract interface — search/iterate convertible items by memory space
-- `convertible_data_batch` + `convertible_data_batch_provider` — wrap `data_batch` / `data_repository`
-- `convertible_gpu_pipeline_task` + `convertible_gpu_pipeline_task_provider` — wrap `gpu_pipeline_task` / `inspectable_mpsc<itask>`
-- Extend `data_batch` state machine: `task_created → in_transit` transition
-- Failure safety: all conversions restore original `batch_state` and `idata_representation` on failure
+- **v1.0 MVP** — inspectable_mpsc core queue + predicate inspection (2026-04-14)
+- **v1.1 Task Queue Refactor** — dead code removal + production queue integration (2026-04-14)
+- **v2.0 Convertible Data Abstraction** — abstract interfaces, batch conversion, task queue conversion (2026-04-16)
 
 ## Requirements
 
@@ -49,21 +43,24 @@ Validated in Phase 3: Dead Code Removal — v1.1
 Validated in Phase 4: Queue Integration — v1.1
 - [x] Replace interruptible_mpmc with inspectable_mpsc in itask_executor and its implementations
 
+Validated in Phase 5: State Machine & Interfaces — v2.0
+- ✓ `convertible_data` abstract interface with `convert()` and `bytes_in_space()`
+- ✓ `convertible_data_provider` abstract interface with `get_next_convertible()`, `get_all_convertible()`, `get_bytes_in_space()`
+- ✓ Extend `data_batch` state machine: `task_created → in_transit` transition
+
+Validated in Phase 6: Batch Conversion — v2.0
+- ✓ `convertible_data_batch` wrapping `data_batch` with downgrade-style conversion
+- ✓ `convertible_data_batch_provider` wrapping `data_repository`
+- ✓ Failure safety: batch conversions restore original `batch_state` and `idata_representation` on failure
+
+Validated in Phase 7: Task Queue Conversion — v2.0
+- ✓ `convertible_gpu_pipeline_task` wrapping `gpu_pipeline_task` with RAII queue ownership
+- ✓ `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
+- ✓ Failure safety: task conversions restore original state; task always returned to queue via RAII
+
 ### Active
 
-Validated in Phase 5: State Machine & Interfaces
-- [x] `convertible_data` abstract interface with `convert()` and `bytes_in_space()`
-- [x] `convertible_data_provider` abstract interface with `get_next_convertible()`, `get_all_convertible()`, `get_bytes_in_space()`
-- [x] Extend `data_batch` state machine: `task_created → in_transit` transition (documentation formalized, tests added)
-
-Validated in Phase 6: Batch Conversion
-- [x] `convertible_data_batch` wrapping `data_batch` with downgrade-style conversion
-- [x] `convertible_data_batch_provider` wrapping `data_repository`
-- [x] Failure safety: batch conversions restore original `batch_state` and `idata_representation` on failure
-
-Validated in Phase 7: Task Queue Conversion
-- [x] `convertible_gpu_pipeline_task` wrapping `gpu_pipeline_task` with RAII queue ownership
-- [x] `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
+(None — all requirements shipped through v2.0)
 
 ### Out of Scope
 
@@ -73,20 +70,22 @@ Validated in Phase 7: Task Queue Conversion
 
 ## Current State
 
-**v2.0 Convertible Data Abstraction** — Phase 7 complete 2026-04-16
+**v2.0 Convertible Data Abstraction** — Shipped 2026-04-16
 
-Phase 7 shipped: `convertible_gpu_pipeline_task` and `convertible_gpu_pipeline_task_provider` concrete implementations with RAII queue ownership and predicate-based task discovery. 11 GPU integration tests passing. All v2.0 milestone phases complete.
+All three milestones complete (v1.0, v1.1, v2.0). 7 phases, 11 plans, ~165 min total execution.
 
 ## Context
 
 Shipped v1.0 (2026-04-14) with 1,153 LOC C++ (295 header + 858 tests). 3 plans, ~69 min.
 Shipped v1.1 (2026-04-14) with 2 plans, ~32 min. Removed 450 lines dead code, swapped queue type in itask_executor.
-Tech stack: C++20, header-only template, Catch2 test framework.
-35 inspectable_mpsc tests passing (231 assertions). Full Sirius suite: 868 tests, 78M+ assertions.
+Shipped v2.0 (2026-04-16) with 6 plans, ~65 min. Added 1,499 LOC across 6 files: abstract interfaces, batch conversion, task queue conversion, and 19 GPU integration tests.
+Tech stack: C++20, header-only templates, Catch2 test framework.
+54 data infrastructure tests passing (297 assertions). Full Sirius suite: 868+ tests, 78M+ assertions.
 `inspectable_mpsc<itask>` is the production task queue in `itask_executor`, inherited by `gpu_pipeline_executor` and `duckdb_scan_executor`.
 
 - Sirius is a GPU-native SQL engine that extends DuckDB
 - `interruptible_mpmc` remains in use for non-itask_executor queues (pipeline_executor, downgrade_executor, task_creator)
+- `convertible_data` abstractions ready for integration into downgrade executor and memory pressure handling
 - Future work can leverage `pop_if`/`get_if` for predicate-based task scheduling in pipeline executors
 
 ## Constraints
@@ -109,6 +108,14 @@ Tech stack: C++20, header-only template, Catch2 test framework.
 | Raw `T*` return from `get_if` | Avoids ownership transfer; documented invalidation rules; safe under MPSC | Validated Phase 2 |
 | Dead code removal before integration | Simplifies codebase before swapping queue types; reduces merge surface | Validated Phase 3 |
 | `static_cast<void>` for `[[nodiscard]]` discard | Standard C++ idiom; `schedule()` is fire-and-forget, matching prior semantics | Validated Phase 4 |
+| Documentation-only state machine change | Code already handles task_created↔in_transit; formalize with docs+tests | ✓ Good — Phase 5 |
+| Both interfaces in single header | Provider depends on convertible_data; co-location avoids circular includes | ✓ Good — Phase 5 |
+| Forward declarations for cucascade types | Minimize header dependencies; memory_space and reservation_manager forward-declared | ✓ Good — Phase 5 |
+| `memory_space*` for all memory space params | Non-copyable type; pointer semantics throughout | ✓ Good — Phase 6 |
+| Converter registry via singleton | Internal access pattern consistent with existing downgrade_task usage | ✓ Good — Phase 6 |
+| `get_bytes_in_space` returns 0 on provider | inspectable_mpsc lacks const iteration; callers use get_all + bytes_in_space | ✓ Good — Phase 7 |
+| RAII destructor pushes task back to queue | Guarantees task is never lost even on exception; follows unique_ptr ownership | ✓ Good — Phase 7 |
+| Lightweight dynamic_cast predicate | No I/O or allocation in mutable_pop_if predicate; satisfies mpsc contract | ✓ Good — Phase 7 |
 
 ## Evolution
 
@@ -128,4 +135,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-16 after Phase 7 completion*
+*Last updated: 2026-04-16 after v2.0 milestone*
