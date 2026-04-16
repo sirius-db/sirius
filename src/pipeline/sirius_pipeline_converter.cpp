@@ -989,6 +989,15 @@ void sirius_pipeline_converter::wire_data_repositories()
       // Metadata pipeline is a self-loop that hands off partitioned_parquet_metadata to
       // gpu_scan_op via the null-repo dependency port installed in split_parquet_scan_source().
       // No data-flow wiring is needed here.
+    } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
+      // gpu_scan is both source and sink of its own pipeline. Wire its output port to
+      // downstream pipelines, but skip the self-entry: source_to_pipelines[gpu_scan]
+      // includes this pipeline itself (since gpu_scan is also its source), and wiring a
+      // port whose src_pipeline == dest_pipeline would deadlock is_source_pipeline_finished().
+      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
+        if (dependent_pipeline.get() == scheduled_[i].get()) { continue; }
+        engine_.insert_repository("default", scheduled_[i], dependent_pipeline);
+      }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // No action needed for RESULT_COLLECTOR sinks
     } else {
@@ -1074,30 +1083,6 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
 
 void sirius_pipeline_converter::link_join_partition_siblings()
 {
-  // Diagnostic: dump scheduled pipelines layout before linking
-  for (size_t i = 0; i < scheduled_.size(); i++) {
-    auto p = scheduled_[i];
-    std::fprintf(stderr,
-                 "[ljps] pipeline[%zu] src=%s sink=%s deps=%zu ops=%zu\n",
-                 i,
-                 p->source ? p->source->get_name().c_str() : "(null)",
-                 p->sink ? p->sink->get_name().c_str() : "(null)",
-                 p->dependencies.size(),
-                 p->operators.size());
-    for (size_t k = 0; k < p->operators.size(); k++) {
-      std::fprintf(stderr, "[ljps]   op[%zu]=%s\n", k, p->operators[k].get().get_name().c_str());
-    }
-    for (size_t d = 0; d < p->dependencies.size(); d++) {
-      auto dep = p->dependencies[d];
-      std::fprintf(stderr,
-                   "[ljps]   dep[%zu] src=%s sink=%s\n",
-                   d,
-                   dep->source ? dep->source->get_name().c_str() : "(null)",
-                   dep->sink ? dep->sink->get_name().c_str() : "(null)");
-    }
-  }
-  std::fflush(stderr);
-
   for (size_t i = 0; i < scheduled_.size(); i++) {
     // for each hash join as a source, get the dependencies (concat) and get the dependencies of
     // concat (partition)
@@ -1106,17 +1091,6 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
       auto probe_concat_pipeline    = scheduled_[i]->dependencies[1];
       auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
-      std::fprintf(
-        stderr,
-        "[ljps] HJ@%zu build_concat=%s build_part=%s probe_concat=%s probe_part=%s\n",
-        i,
-        build_concat_pipeline->sink ? build_concat_pipeline->sink->get_name().c_str() : "(null)",
-        build_partition_pipeline->sink ? build_partition_pipeline->sink->get_name().c_str()
-                                       : "(null)",
-        probe_concat_pipeline->sink ? probe_concat_pipeline->sink->get_name().c_str() : "(null)",
-        probe_partition_pipeline->sink ? probe_partition_pipeline->sink->get_name().c_str()
-                                       : "(null)");
-      std::fflush(stderr);
       // change probe partition barrier to partial
       probe_partition_pipeline->get_source()->get_port("default")->type =
         op::MemoryBarrierType::PARTIAL;
