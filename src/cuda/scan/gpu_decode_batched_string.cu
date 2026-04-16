@@ -287,12 +287,49 @@ __global__ void kernel_compute_lengths_fsst(
   }
   __syncthreads();
 
-  // Phase C: Compute decompressed lengths using compressed offsets
-  const uint8_t* d_dict_end = base + sh_dict_end;
+  // Phase C is split into a separate chunked kernel below
+  // (kernel_compute_lengths_fsst_phase_c) for SM-filling grids.
+}
 
-  for (uint32_t i = threadIdx.x; i < row_count; i += blockDim.x) {
-    uint32_t cum      = my_comp[i];
-    uint32_t prev     = (i > 0) ? my_comp[i - 1] : 0;
+/// FSST Phase C: compute decompressed lengths from precomputed compressed
+/// offsets.  Separated from Phase A+B to enable chunking — this phase does
+/// the expensive serial byte scan and benefits from more CTAs.
+__global__ void kernel_compute_lengths_fsst_phase_c(
+  const batched_fsst_chunk_desc* __restrict__ descs,
+  uint32_t* __restrict__ d_lengths,
+  const uint32_t* __restrict__ d_comp_offsets,
+  const fsst_decoder_compact* __restrict__ d_decoders,
+  uint32_t num_chunks)
+{
+  uint32_t chunk_idx = blockIdx.x;
+  if (chunk_idx >= num_chunks) return;
+
+  const auto& desc    = descs[chunk_idx];
+  const uint8_t* base = desc.d_block + desc.block_offset;
+
+  __shared__ uint32_t sh_dict_end;
+  __shared__ uint8_t sh_len[255];
+
+  if (threadIdx.x == 0) {
+    fsst_header_t hdr;
+    memcpy(&hdr, base, sizeof(hdr));
+    sh_dict_end = hdr.dict_end;
+  }
+  __syncthreads();
+
+  const fsst_decoder_compact& dec = d_decoders[desc.seg_decoder_idx];
+  for (uint32_t i = threadIdx.x; i < 255; i += blockDim.x) {
+    sh_len[i] = dec.len[i];
+  }
+  __syncthreads();
+
+  const uint8_t* d_dict_end_ptr = base + sh_dict_end;
+  const uint32_t* my_comp       = d_comp_offsets + desc.fsst_row_start;
+
+  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    uint32_t cum  = my_comp[i];
+    uint32_t prev = (i > 0) ? my_comp[i - 1]
+                             : (desc.is_first_chunk ? 0 : *(my_comp - 1));
     uint32_t comp_len = cum - prev;
 
     if (comp_len == 0) {
@@ -300,7 +337,7 @@ __global__ void kernel_compute_lengths_fsst(
       continue;
     }
 
-    const uint8_t* comp_ptr = d_dict_end - cum;
+    const uint8_t* comp_ptr = d_dict_end_ptr - cum;
     uint32_t decomp_len     = 0;
     uint32_t pos            = 0;
     while (pos < comp_len) {
@@ -921,7 +958,13 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       d_dict_chunks, d_lengths.data(), static_cast<uint32_t>(dict_chunks.size()));
   }
 
+  // Build chunked FSST descriptors once — reused for both lengths Phase C and gather.
+  std::vector<batched_fsst_chunk_desc> fsst_chunks;
+  rmm::device_buffer fsst_chunks_buf_dev(0, stream, mr);
+  batched_fsst_chunk_desc* d_fsst_chunks = nullptr;
+
   if (!fsst_descs.empty()) {
+    // Phase A+B: unpack compressed lengths + prefix sum (per-segment, unchunkable)
     kernel_compute_lengths_fsst<<<static_cast<unsigned>(fsst_descs.size()),
                                   THREADS,
                                   0,
@@ -931,6 +974,53 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
                                                     d_fsst_row_starts,
                                                     d_fsst_decoders,
                                                     static_cast<uint32_t>(fsst_descs.size()));
+
+    // Build FSST chunk descriptors for Phase C and later gather
+    uint32_t chunk_size_fsst = 0;
+    {
+      uint32_t total_fsst = 0;
+      for (auto const& d : fsst_descs) total_fsst += d.row_count;
+      if (fsst_descs.size() < target_ctas && total_fsst > 0) {
+        chunk_size_fsst = std::max(total_fsst / target_ctas, 64u);
+        chunk_size_fsst = (chunk_size_fsst / 32) * 32;
+        if (chunk_size_fsst == 0) chunk_size_fsst = 32;
+      }
+    }
+
+    for (size_t si = 0; si < fsst_descs.size(); ++si) {
+      auto const& seg = fsst_descs[si];
+      uint32_t fsst_base_row = fsst_row_starts[si];
+      if (chunk_size_fsst == 0) {
+        fsst_chunks.push_back({seg.d_block, seg.block_offset, seg.row_count,
+                               seg.global_row_start, fsst_base_row,
+                               static_cast<uint32_t>(si), 1});
+      } else {
+        uint32_t remaining = seg.row_count;
+        uint32_t offset = 0;
+        bool first = true;
+        while (remaining > 0) {
+          uint32_t n = std::min(remaining, chunk_size_fsst);
+          fsst_chunks.push_back({seg.d_block, seg.block_offset, n,
+                                 seg.global_row_start + offset,
+                                 fsst_base_row + offset,
+                                 static_cast<uint32_t>(si),
+                                 first ? 1u : 0u});
+          offset += n;
+          remaining -= n;
+          first = false;
+        }
+      }
+    }
+
+    fsst_chunks_buf_dev = make_device_copy(
+      fsst_chunks.data(), fsst_chunks.size() * sizeof(batched_fsst_chunk_desc));
+    d_fsst_chunks = static_cast<batched_fsst_chunk_desc*>(fsst_chunks_buf_dev.data());
+
+    // Phase C: compute decompressed lengths (chunked, SM-filling grid)
+    kernel_compute_lengths_fsst_phase_c<<<static_cast<uint32_t>(fsst_chunks.size()),
+                                          THREADS, 0, stream.value()>>>(
+      d_fsst_chunks, d_lengths.data(), d_comp_offsets, d_fsst_decoders,
+      static_cast<uint32_t>(fsst_chunks.size()));
   }
 
   if (!uncomp_chunks.empty()) {
@@ -1013,52 +1103,8 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       d_dict_chunks, d_offsets.data(), d_chars_ptr, static_cast<uint32_t>(dict_chunks.size()));
   }
 
-  if (!fsst_descs.empty()) {
-    // Build chunked FSST descriptors for SM-filling grid.
-    // Uses precomputed d_comp_offsets from pass 1 (no re-computation needed).
-    std::vector<batched_fsst_chunk_desc> fsst_chunks;
-    uint32_t chunk_size_fsst = 0;
-    {
-      uint32_t total_fsst = 0;
-      for (auto const& d : fsst_descs) total_fsst += d.row_count;
-      if (fsst_descs.size() < target_ctas && total_fsst > 0) {
-        chunk_size_fsst = std::max(total_fsst / target_ctas, 64u);
-        chunk_size_fsst = (chunk_size_fsst / 32) * 32;
-        if (chunk_size_fsst == 0) chunk_size_fsst = 32;
-      }
-    }
-
-    for (size_t si = 0; si < fsst_descs.size(); ++si) {
-      auto const& seg = fsst_descs[si];
-      uint32_t fsst_base_row = fsst_row_starts[si];
-
-      if (chunk_size_fsst == 0) {
-        // No chunking needed — one CTA per segment
-        fsst_chunks.push_back({seg.d_block, seg.block_offset, seg.row_count,
-                               seg.global_row_start, fsst_base_row,
-                               static_cast<uint32_t>(si), 1});
-      } else {
-        uint32_t remaining = seg.row_count;
-        uint32_t offset = 0;
-        bool first = true;
-        while (remaining > 0) {
-          uint32_t n = std::min(remaining, chunk_size_fsst);
-          fsst_chunks.push_back({seg.d_block, seg.block_offset, n,
-                                 seg.global_row_start + offset,
-                                 fsst_base_row + offset,
-                                 static_cast<uint32_t>(si),
-                                 first ? 1u : 0u});
-          offset += n;
-          remaining -= n;
-          first = false;
-        }
-      }
-    }
-
-    auto fsst_chunks_buf = make_device_copy(
-      fsst_chunks.data(), fsst_chunks.size() * sizeof(batched_fsst_chunk_desc));
-    auto* d_fsst_chunks = static_cast<batched_fsst_chunk_desc*>(fsst_chunks_buf.data());
-
+  if (!fsst_chunks.empty()) {
+    // Reuse chunked FSST descriptors built during Phase 4.
     kernel_gather_fsst_chunked<<<static_cast<uint32_t>(fsst_chunks.size()),
                                  THREADS, 0, stream.value()>>>(
       d_fsst_chunks,
