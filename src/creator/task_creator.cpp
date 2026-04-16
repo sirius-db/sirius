@@ -325,12 +325,20 @@ void task_creator::manager_loop()
           auto gpu_it = _gpu_native_scan_global_state_map.find(operator_id);
           if (gpu_it != _gpu_native_scan_global_state_map.end()) {
             auto& gpu_state = gpu_it->second;
-            auto scan_task  = std::make_unique<op::scan::gpu_native_scan_task>(
-              get_next_task_id(),
-              destination_data_repositories[0],
-              gpu_state);
-            pipeline->mark_task_created();
-            _pipeline_executor->schedule(std::move(scan_task));
+            // Launch multiple initial scan tasks to fill scan thread pool.
+            // Each task claims a batch atomically, so concurrent tasks are safe.
+            int num_initial = _pipeline_executor->get_scan_executor_num_threads();
+            num_initial = std::min(num_initial,
+              static_cast<int>(gpu_state->total_row_groups()));
+            num_initial = std::max(num_initial, 1);
+            for (int i = 0; i < num_initial; ++i) {
+              auto scan_task = std::make_unique<op::scan::gpu_native_scan_task>(
+                get_next_task_id(),
+                destination_data_repositories[0],
+                gpu_state);
+              pipeline->mark_task_created();
+              _pipeline_executor->schedule(std::move(scan_task));
+            }
           } else {
             // Fall back to standard DuckDB scan task
             auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
