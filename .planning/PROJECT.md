@@ -65,12 +65,15 @@ Validated in Phase 8: API Cleanup + Processing Loop Refactor — v3.0
 - ✓ Per-tier breakdown logging (repos/gpu_queue/pipeline_queue batches and bytes)
 - ✓ Predicate checked both in dispatch loop and after each convert() in workers
 
+Validated in Phase 9: Batch Lock Exploration — v3.0
+- ✓ `lock_or_prepare_batch` refactored to delegate to `convertible_data_batch::convert()`
+- ✓ `sirius_memory_reservation_manager&` threaded through prepare_for_processing call chain
+
 ### Active
 
 #### Current Milestone: v3.0 Downgrade Executor Integration
 
-**Remaining:**
-- Explore refactoring `lock_or_prepare_batch` in `batch_lock_utils.hpp` to use `convertible_data_batch::convert()`
+**Status:** Complete. All planned work delivered across Phases 8-9.
 
 ### Out of Scope
 
@@ -80,10 +83,10 @@ Validated in Phase 8: API Cleanup + Processing Loop Refactor — v3.0
 
 ## Current State
 
-**v3.0 Downgrade Executor Integration** — Phase 8 complete, Phase 9 remaining
+**v3.0 Downgrade Executor Integration** — Complete
 
-Previous milestones shipped (v1.0, v1.1, v2.0). 8 phases, 13 plans executed.
-Phase 8 completed: removed target_bytes from API, rewrote processing loop with tiered providers, eliminated downgrade_task. Phase 9 (batch_lock exploration) remaining.
+Previous milestones shipped (v1.0, v1.1, v2.0). 9 phases, 14 plans executed.
+Phase 8 completed: removed target_bytes from API, rewrote processing loop with tiered providers, eliminated downgrade_task. Phase 9 completed: refactored lock_or_prepare_batch to delegate to convertible_data_batch::convert(), unifying forward and downgrade conversion paths.
 
 ## Context
 
@@ -127,6 +130,8 @@ Tech stack: C++20, header-only templates, Catch2 test framework.
 | `get_bytes_in_space` returns 0 on provider | inspectable_mpsc lacks const iteration; callers use get_all + bytes_in_space | ✓ Good — Phase 7 |
 | RAII destructor pushes task back to queue | Guarantees task is never lost even on exception; follows unique_ptr ownership | ✓ Good — Phase 7 |
 | Lightweight dynamic_cast predicate | No I/O or allocation in mutable_pop_if predicate; satisfies mpsc contract | ✓ Good — Phase 7 |
+| `lock_or_prepare_batch` delegates to `convertible_data_batch::convert()` | Eliminates ~40 lines of duplicated conversion logic; single conversion path for both forward and downgrade paths; adds polite reservation checks to forward path | Validated Phase 9 |
+| `res_mgr` stored on `gpu_pipeline_task_global_state` | Shared state already accessible to all pipeline tasks; cleaner than threading through DuckDB ClientContext chain; testable with mock managers | ✓ Good — Phase 9 |
 
 ## Evolution
 
