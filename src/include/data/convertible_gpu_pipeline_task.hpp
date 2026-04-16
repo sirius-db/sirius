@@ -203,7 +203,6 @@ class convertible_gpu_pipeline_task : public convertible_data {
     return total;
   }
 
- private:
   /**
    * @brief Navigate the dynamic_cast chain to reach pipelineable_operator_data.
    *
@@ -211,10 +210,17 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * gpu_pipeline_task_local_state -> _input_data -> pipelineable_operator_data.
    * Returns nullptr at any point if the cast fails (e.g., the task is not a
    * gpu_pipeline_task, or has no pipelineable input data).
+   *
+   * Public and static so that both the wrapper and the provider can share this
+   * logic without duplicating the dynamic_cast chain.
+   *
+   * @param task The task to inspect.
+   * @return Pointer to pipelineable_operator_data, or nullptr if unreachable.
    */
-  sirius::op::pipelineable_operator_data* get_pipelineable_data() const
+  static sirius::op::pipelineable_operator_data* get_pipelineable_data(
+    sirius::parallel::itask& task)
   {
-    auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(_task.get());
+    auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(&task);
     if (!gpt) { return nullptr; }
 
     auto* ls = gpt->local_state();
@@ -224,6 +230,13 @@ class convertible_gpu_pipeline_task : public convertible_data {
     if (!gpt_ls) { return nullptr; }
 
     return dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
+  }
+
+ private:
+  /// @brief Convenience overload for the owned task.
+  sirius::op::pipelineable_operator_data* get_pipelineable_data() const
+  {
+    return _task ? get_pipelineable_data(*_task) : nullptr;
   }
 
   std::unique_ptr<sirius::parallel::itask> _task;
@@ -333,17 +346,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   static bool has_matching_batches(sirius::parallel::itask& task,
                                    cucascade::memory::memory_space* space)
   {
-    auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(&task);
-    if (!gpt) { return false; }
-
-    auto* ls = gpt->local_state();
-    if (!ls) { return false; }
-
-    auto* gpt_ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
-    if (!gpt_ls) { return false; }
-
-    auto* pipelineable =
-      dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
+    auto* pipelineable = convertible_gpu_pipeline_task::get_pipelineable_data(task);
     if (!pipelineable) { return false; }
 
     for (const auto& batch : pipelineable->get_data_batches()) {
