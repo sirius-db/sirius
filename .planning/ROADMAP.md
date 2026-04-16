@@ -5,7 +5,7 @@
 - ✅ **v1.0 MVP** — Phases 1-2 (shipped 2026-04-14)
 - ✅ **v1.1 Task Queue Refactor** — Phases 3-4 (shipped 2026-04-14)
 - ✅ **v2.0 Convertible Data Abstraction** — Phases 5-7 (shipped 2026-04-16)
-- 🚧 **v3.0 Downgrade Executor Integration** — Phases 8-10 (in progress)
+- 🚧 **v3.0 Downgrade Executor Integration** — Phases 8-9 (in progress)
 
 ## Phases
 
@@ -38,39 +38,29 @@
 
 **Milestone Goal:** Refactor the downgrade executor to use convertible_data abstractions with lazy, tiered candidate fetching and simplified API.
 
-- [ ] **Phase 8: API Cleanup** - Remove target_bytes from downgrade request path and gpu_pipeline_executor calculation
-- [ ] **Phase 9: Processing Loop Refactor** - Replace downgrade_executor processing loop with convertible_data providers and tiered fallback
-- [ ] **Phase 10: Batch Lock Exploration** - Analyze and conditionally refactor batch_lock_utils to use convertible_data_batch
+- [ ] **Phase 8: API Cleanup + Processing Loop Refactor** - Remove target_bytes, replace processing loop with convertible_data providers and tiered fallback
+- [ ] **Phase 9: Batch Lock Exploration** - Analyze and conditionally refactor batch_lock_utils to use convertible_data_batch
 
 ## Phase Details
 
-### Phase 8: API Cleanup
-**Goal**: Downgrade requests no longer carry or compute target_bytes, simplifying the interface before the processing loop refactor
+### Phase 8: API Cleanup + Processing Loop Refactor
+**Goal**: Remove target_bytes from downgrade API, replace processing loop with convertible_data providers using tiered candidate fetching (repos → gpu_pipeline_executor queue → pipeline_executor queue) and convert()-based conversion
 **Depends on**: Phase 7
-**Requirements**: DAPI-01, DAPI-02
+**Requirements**: DAPI-01, DAPI-02, LOOP-01, LOOP-02, LOOP-03, LOOP-04, LOOP-05, LOG-01
 **Success Criteria** (what must be TRUE):
   1. `request_downgrade` accepts no `target_bytes` parameter and `downgrade_request` has no `target_bytes` member
   2. `gpu_pipeline_executor` contains no target_bytes calculation logic for downgrade requests
-  3. All existing tests pass with the simplified downgrade API (zero regressions)
-**Plans:** 1 plan
-Plans:
-- [ ] 08-01-PLAN.md — Remove target_bytes from downgrade API and gpu_pipeline_executor
-
-### Phase 9: Processing Loop Refactor
-**Goal**: Downgrade executor uses convertible_data providers with tiered candidate fetching (repos, then gpu_pipeline_executor queue, then pipeline_executor queue) and convert()-based conversion
-**Depends on**: Phase 8
-**Requirements**: LOOP-01, LOOP-02, LOOP-03, LOOP-04, LOOP-05, LOG-01
-**Success Criteria** (what must be TRUE):
-  1. Processing loop iterates data_repositories lazily via `convertible_data_batch_provider`, one repository at a time
-  2. When data_repositories are exhausted, processing loop fetches candidates from gpu_pipeline_executor task queue via `convertible_gpu_pipeline_task_provider`
-  3. When gpu_pipeline_executor queue is exhausted, processing loop fetches candidates from pipeline_executor task queue via `convertible_gpu_pipeline_task_provider`
-  4. Each candidate is converted via `convertible_data::convert()` and `downgrade_task` struct is eliminated (or justified if retained)
-  5. Trace logging reports downgrade counts per source tier (data_repositories, gpu_pipeline_executor queue, pipeline_executor queue)
+  3. Processing loop iterates data_repositories lazily via `convertible_data_batch_provider`, one repository at a time
+  4. When data_repositories are exhausted, processing loop fetches candidates from gpu_pipeline_executor task queue via `convertible_gpu_pipeline_task_provider`
+  5. When gpu_pipeline_executor queue is exhausted, processing loop fetches candidates from pipeline_executor task queue via `convertible_gpu_pipeline_task_provider`
+  6. Each candidate is converted via `convertible_data::convert()` and `downgrade_task` struct is eliminated
+  7. Trace logging reports downgrade counts per source tier (data_repositories, gpu_pipeline_executor queue, pipeline_executor queue)
+  8. All existing tests pass with the simplified downgrade API (zero regressions)
 **Plans**: TBD
 
-### Phase 10: Batch Lock Exploration
+### Phase 9: Batch Lock Exploration
 **Goal**: Determine whether batch_lock_utils can benefit from convertible_data_batch and apply the refactor if analysis supports it
-**Depends on**: Phase 9
+**Depends on**: Phase 8
 **Requirements**: LOCK-01, LOCK-02
 **Success Criteria** (what must be TRUE):
   1. A functional diff analysis of `lock_or_prepare_batch` vs `convertible_data_batch::convert()` is documented with a clear go/no-go decision
@@ -81,7 +71,7 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 8 → 9 → 10
+Phases execute in numeric order: 8 → 9
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -92,9 +82,8 @@ Phases execute in numeric order: 8 → 9 → 10
 | 5. State Machine & Interfaces | v2.0 | 2/2 | Complete | 2026-04-15 |
 | 6. Batch Conversion | v2.0 | 2/2 | Complete | 2026-04-15 |
 | 7. Task Queue Conversion | v2.0 | 2/2 | Complete | 2026-04-16 |
-| 8. API Cleanup | v3.0 | 0/1 | Planned | - |
-| 9. Processing Loop Refactor | v3.0 | 0/0 | Not started | - |
-| 10. Batch Lock Exploration | v3.0 | 0/0 | Not started | - |
+| 8. API Cleanup + Processing Loop | v3.0 | 0/0 | Planning | - |
+| 9. Batch Lock Exploration | v3.0 | 0/0 | Not started | - |
 
 ---
 *Full v1.0 details archived to `.planning/milestones/v1.0-ROADMAP.md`*
