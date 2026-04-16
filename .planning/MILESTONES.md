@@ -1,5 +1,20 @@
 # Milestones
 
+## v2.0 Convertible Data Abstraction (Shipped: 2026-04-16)
+
+**Phases completed:** 3 phases, 6 plans, 9 tasks
+
+**Key accomplishments:**
+
+- Formalized data_batch state machine to document task_created<->in_transit transitions with task_created_count preservation tests
+- convertible_data and convertible_data_provider abstract interfaces with pure virtual convert/inspect contracts for uniform memory-tier conversion
+- Failure-safe convertible_data_batch wrapping data_batch with per-tier conversion and repository-based batch discovery by memory space
+- 8 Catch2 GPU integration tests validating GPU-to-HOST conversion, provider discovery with multi-partition iteration, failure safety, and bytes_in_space accuracy using real cuCascade data batches and converter registry
+- RAII convertible_gpu_pipeline_task wrapper and mutable_pop_if-based provider for inspectable_mpsc queue task discovery and memory-tier conversion
+- 11 Catch2 GPU integration tests validating RAII queue return, predicate filtering, GPU-to-HOST conversion, bytes accounting, and interrupted-queue safety for convertible_gpu_pipeline_task
+
+---
+
 ## v1.1 Task Queue Refactor (Shipped: 2026-04-14)
 
 **Phases completed:** 2 phases, 2 plans, 4 tasks
