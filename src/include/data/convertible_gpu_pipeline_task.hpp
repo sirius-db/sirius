@@ -24,6 +24,8 @@
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -32,8 +34,6 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -62,20 +62,17 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @param task The task to wrap (exclusive ownership taken).
    * @param queue The originating queue (task is returned here on destruction).
    */
-  convertible_gpu_pipeline_task(
-    std::unique_ptr<sirius::parallel::itask> task,
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
+  convertible_gpu_pipeline_task(std::unique_ptr<sirius::parallel::itask> task,
+                                sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
     : _task(std::move(task)), _queue(queue)
   {
   }
 
-  // Non-copyable (unique_ptr member)
+  // Non-copyable, move-constructible only (reference member prevents move assignment)
   convertible_gpu_pipeline_task(const convertible_gpu_pipeline_task&)            = delete;
   convertible_gpu_pipeline_task& operator=(const convertible_gpu_pipeline_task&) = delete;
-
-  // Movable (unique_ptr transfers naturally)
-  convertible_gpu_pipeline_task(convertible_gpu_pipeline_task&&)            = default;
-  convertible_gpu_pipeline_task& operator=(convertible_gpu_pipeline_task&&) = default;
+  convertible_gpu_pipeline_task(convertible_gpu_pipeline_task&&)                 = default;
+  convertible_gpu_pipeline_task& operator=(convertible_gpu_pipeline_task&&)      = delete;
 
   /**
    * @brief Destructor: returns the task to the queue via RAII.
@@ -88,8 +85,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
   {
     if (_task) {
       if (!_queue.push(std::move(_task))) {
-        SIRIUS_LOG_WARN(
-          "convertible_gpu_pipeline_task: queue interrupted, task destroyed");
+        SIRIUS_LOG_WARN("convertible_gpu_pipeline_task: queue interrupted, task destroyed");
       }
     }
   }
@@ -117,13 +113,13 @@ class convertible_gpu_pipeline_task : public convertible_data {
     if (!pipelineable) { return false; }
 
     const auto& batches = pipelineable->get_data_batches();
-    bool any_converted = false;
+    bool any_converted  = false;
 
     for (const auto& batch : batches) {
       if (!batch) { continue; }
 
       // Skip batches already at a target space — no conversion needed
-      auto* batch_space = batch->get_memory_space();
+      auto* batch_space      = batch->get_memory_space();
       bool already_at_target = false;
       for (auto* ts : target_spaces) {
         if (batch_space == ts) {
@@ -141,49 +137,42 @@ class convertible_gpu_pipeline_task : public convertible_data {
       if (!batch->try_to_lock_for_in_transit()) { continue; }
 
       try {
-        auto data_size = batch->get_data()->get_size_in_bytes();
+        auto data_size       = batch->get_data()->get_size_in_bytes();
         bool space_succeeded = false;
 
         for (auto* space : target_spaces) {
           auto reservation = res_mgr.request_reservation(
-            cucascade::memory::specific_memory_space{space->get_tier(),
-                                                     space->get_id().device_id},
+            cucascade::memory::specific_memory_space{space->get_tier(), space->get_id().device_id},
             data_size);
           if (!reservation) { continue; }
 
-          auto* mem_space =
-            res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
+          auto* mem_space = res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
           if (!mem_space) { continue; }
 
           auto& registry = sirius::converter_registry::get();
 
           switch (space->get_tier()) {
             case cucascade::memory::Tier::HOST:
-              batch->convert_to<cucascade::host_data_representation>(
-                registry, mem_space, stream);
+              batch->convert_to<cucascade::host_data_representation>(registry, mem_space, stream);
               break;
             case cucascade::memory::Tier::GPU:
-              batch->convert_to<cucascade::gpu_table_representation>(
-                registry, mem_space, stream);
+              batch->convert_to<cucascade::gpu_table_representation>(registry, mem_space, stream);
               break;
             default: continue;
           }
 
-          batch->try_to_release_in_transit(
-            std::optional<cucascade::batch_state>{prev_state});
-          any_converted = true;
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+          any_converted   = true;
           space_succeeded = true;
           break;
         }
 
         if (!space_succeeded) {
           // No target space succeeded for this batch — restore state
-          batch->try_to_release_in_transit(
-            std::optional<cucascade::batch_state>{prev_state});
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
         }
       } catch (...) {
-        batch->try_to_release_in_transit(
-          std::optional<cucascade::batch_state>{prev_state});
+        batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
         throw;
       }
     }
@@ -231,12 +220,10 @@ class convertible_gpu_pipeline_task : public convertible_data {
     auto* ls = gpt->local_state();
     if (!ls) { return nullptr; }
 
-    auto* gpt_ls =
-      dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
+    auto* gpt_ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
     if (!gpt_ls) { return nullptr; }
 
-    return dynamic_cast<sirius::op::pipelineable_operator_data*>(
-      gpt_ls->_input_data.get());
+    return dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
   }
 
   std::unique_ptr<sirius::parallel::itask> _task;
@@ -277,18 +264,15 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    * @param front_to_back   Iteration direction.
    * @return A convertible_gpu_pipeline_task wrapping the matching task, or nullptr.
    */
-  std::unique_ptr<convertible_data> get_next_convertible(
-    cucascade::memory::memory_space* space, bool front_to_back) override
+  std::unique_ptr<convertible_data> get_next_convertible(cucascade::memory::memory_space* space,
+                                                         bool front_to_back) override
   {
     auto result = _queue.mutable_pop_if(
-      [space](sirius::parallel::itask& task) {
-        return has_matching_batches(task, space);
-      },
+      [space](sirius::parallel::itask& task) { return has_matching_batches(task, space); },
       front_to_back);
 
     if (!result) { return nullptr; }
-    return std::make_unique<convertible_gpu_pipeline_task>(
-      std::move(result), _queue);
+    return std::make_unique<convertible_gpu_pipeline_task>(std::move(result), _queue);
   }
 
   /**
@@ -309,14 +293,11 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
 
     while (true) {
       auto result = _queue.mutable_pop_if(
-        [space](sirius::parallel::itask& task) {
-          return has_matching_batches(task, space);
-        },
+        [space](sirius::parallel::itask& task) { return has_matching_batches(task, space); },
         front_to_back);
 
       if (!result) { break; }
-      results.push_back(std::make_unique<convertible_gpu_pipeline_task>(
-        std::move(result), _queue));
+      results.push_back(std::make_unique<convertible_gpu_pipeline_task>(std::move(result), _queue));
     }
 
     return results;
@@ -332,8 +313,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    * @param space The memory space to query.
    * @return Always 0 (see rationale above).
    */
-  std::size_t get_bytes_in_space(
-    cucascade::memory::memory_space* /*space*/) const override
+  std::size_t get_bytes_in_space(cucascade::memory::memory_space* /*space*/) const override
   {
     return 0;
   }
@@ -359,13 +339,11 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     auto* ls = gpt->local_state();
     if (!ls) { return false; }
 
-    auto* gpt_ls =
-      dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
+    auto* gpt_ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
     if (!gpt_ls) { return false; }
 
     auto* pipelineable =
-      dynamic_cast<sirius::op::pipelineable_operator_data*>(
-        gpt_ls->_input_data.get());
+      dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
     if (!pipelineable) { return false; }
 
     for (const auto& batch : pipelineable->get_data_batches()) {
