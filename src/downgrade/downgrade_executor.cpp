@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <optional>
 #include <thread>
 
@@ -125,7 +126,8 @@ void downgrade_executor::processing_loop()
       [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
 
     // 2. Collect candidates
-    auto candidates = collect_all_candidates(repos, 0);
+    auto candidates =
+      collect_all_candidates(repos, std::numeric_limits<size_t>::max());
 
     // 3. Incremental dispatch with predicate checking
     for (auto& weak_batch : candidates) {
@@ -136,6 +138,10 @@ void downgrade_executor::processing_loop()
 
       auto slot = _pool->reserve();
       if (!slot) break;  // interrupted
+
+      // Re-check after reserve() returns — the previous batch's callback may have
+      // set satisfied while we were blocked waiting for a thread.
+      if (req->satisfied.load()) break;
 
       auto batch_size = batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
 

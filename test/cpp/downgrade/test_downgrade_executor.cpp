@@ -425,7 +425,7 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
   executor.start();
 
   // Predicate returns true on first call — should stop after ~1 batch
-  auto future = executor.request_downgrade(1024 * 1024, [&call_count]() {
+  auto future = executor.request_downgrade([&call_count]() {
     call_count.fetch_add(1, std::memory_order_relaxed);
     return true;  // satisfied immediately after first batch
   });
