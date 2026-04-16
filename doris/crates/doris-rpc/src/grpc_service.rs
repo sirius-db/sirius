@@ -4417,7 +4417,11 @@ impl PBackendService for PBackendServiceHandler {
                         ) {
                             Ok(plan) => {
                                 let exec = if plan.force_cpu_substrait || !all_exchange_tables_gpu {
-                                    info!("exchange fragment using CPU Substrait path");
+                                    info!(
+                                        force_cpu = plan.force_cpu_substrait,
+                                        all_gpu = all_exchange_tables_gpu,
+                                        "exchange fragment using CPU Substrait path",
+                                    );
                                     ExecPlan::SubstraitCpuOnly {
                                         bytes: plan.substrait_bytes,
                                         sort_limit_sql: plan.sort_limit_sql,
@@ -4577,12 +4581,13 @@ impl PBackendService for PBackendServiceHandler {
                     // mistakenly detected as the current result's location.
                     let is_cpu_only = !exec_plan_uses_gpu(&exec_plan);
 
-                    // If this exchange fragment has destinations and nixl is available,
-                    // retain GPU buffers so nixl can use them after query cleanup.
+                    // Capture GPU exchange artifact when the plan uses GPU.
+                    // Local exchange doesn't need nixl — the artifact stays in-process.
+                    let all_local_exch = exchange_infos_are_all_local(&exchange_infos, &local_brpc_addr);
                     let should_retain_exch = should_capture_exchange_artifact(
                         &exchange_infos,
                         &exec_plan,
-                        nixl_agent.is_some(),
+                        nixl_agent.is_some() || all_local_exch,
                     ) && !is_cpu_only;
                     let hash_partition_info_exch = exchange_hash_partition_info(&exchange_infos);
                     let exchange_capture_projection_exch = exchange_capture_projection_for_sender(
@@ -5134,18 +5139,15 @@ impl PBackendService for PBackendServiceHandler {
             // artifact so local exchange can move an owned GPU artifact instead
             // of falling back to PBlock. Hash still only uses the artifact path
             // for the current single-destination all-local case.
+            //
+            // Local exchange doesn't need nixl — the artifact stays in-process.
+            // Only remote exchange transport requires a nixl agent.
             let should_retain = all_local_exchange
                 && should_capture_exchange_artifact(
                     &exchange_infos_with_local,
                     &exec_plan,
-                    self.nixl_agent.is_some(),
-                )
-                && self.nixl_agent.is_some();
-            let nixl_agent_for_blocking = if should_retain {
-                self.nixl_agent.clone()
-            } else {
-                None
-            };
+                    self.nixl_agent.is_some() || all_local_exchange,
+                );
 
             let exchange_output_count = exchange_infos.len();
             let hash_partition_info: Option<(usize, Vec<i32>)> = if is_hash_partitioned {
