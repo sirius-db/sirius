@@ -8,6 +8,7 @@
 #include <log/logging.hpp>
 
 // duckdb
+#include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/data_table.hpp>
@@ -23,19 +24,11 @@
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <chrono>
 #include <cstring>
-#include <mutex>
-#include <unordered_map>
 
 namespace sirius::op::scan {
 
-/// Extract a numeric constant value from segment stats into a byte buffer.
 template <typename T>
 static void extract_typed_constant(const duckdb::BaseStatistics& stats, uint8_t* dest)
 {
@@ -66,62 +59,17 @@ static void extract_constant_from_stats(const duckdb::ColumnSegment& segment, ui
 }
 
 //===----------------------------------------------------------------------===//
-// Direct mmap — bypass BufferManager::Pin() for read-only databases
+// DuckDB GetDirectBlockPointer() — zero-copy mmap bypass
 //
-// Uses a lazy MAP_SHARED mmap of the .duckdb file. No MADV_POPULATE_READ:
-// CUDA's internal copy engine does a CPU-side memcpy from pageable memory
-// into a pinned staging buffer before DMA, and that CPU memcpy handles page
-// faults normally. On unified-memory systems (GH200), CUDA faults pages via
-// ATS without any staging buffer at all.
+// Uses SingleFileBlockManager::GetDirectBlockPointer(block_id) which does a
+// lazy MAP_SHARED mmap (no MADV_POPULATE_READ) and returns a pointer directly
+// to block data past the block header. Thread-safe: atomic fast path avoids
+// lock contention once initialized (unlike the old g_mmap_mutex per-call lock).
 //
 // SIRIUS_DISABLE_MMAP=1 forces Pin() for benchmarking.
 //===----------------------------------------------------------------------===//
 
-struct mmap_file_state {
-  uint8_t* base = nullptr;
-  size_t   size = 0;
-};
-
-static std::mutex g_mmap_mutex;
-static std::unordered_map<std::string, mmap_file_state> g_mmap_cache;
-
-struct block_layout_info {
-  size_t alloc_size  = 0;
-  size_t hdr_size    = 0;
-  size_t block_start = 0;
-  bool   valid       = false;
-};
-
-static std::once_flag    g_layout_once;
-static block_layout_info g_layout;
-
-static mmap_file_state* get_or_create_mmap(const std::string& path)
-{
-  std::lock_guard<std::mutex> lock(g_mmap_mutex);
-  auto it = g_mmap_cache.find(path);
-  if (it != g_mmap_cache.end()) return &it->second;
-
-  int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) return nullptr;
-
-  struct stat st;
-  if (::fstat(fd, &st) < 0) { ::close(fd); return nullptr; }
-
-  auto file_size = static_cast<size_t>(st.st_size);
-  void* mapped = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-  ::close(fd);
-  if (mapped == MAP_FAILED) return nullptr;
-
-  auto& state = g_mmap_cache[path];
-  state.base = static_cast<uint8_t*>(mapped);
-  state.size = file_size;
-
-  SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — lazy faults",
-                  path, file_size / 1e6);
-  return &state;
-}
-
-static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
+static duckdb::BlockManager* try_get_block_manager(duckdb::DataTable& storage)
 {
   if (const char* env = std::getenv("SIRIUS_DISABLE_MMAP")) {
     if (env[0] != '0') return nullptr;
@@ -129,57 +77,9 @@ static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
   try {
     auto& db   = storage.GetAttached();
     auto& smgr = db.GetStorageManager();
-    auto  path = smgr.GetDBPath();
-    if (!path.empty()) return get_or_create_mmap(path);
+    return &smgr.GetBlockManager();
   } catch (...) {}
   return nullptr;
-}
-
-static void discover_block_layout(duckdb::ColumnSegment& segment,
-                                  duckdb::BufferManager& buffer_manager,
-                                  const mmap_file_state& mmap_state)
-{
-  if (!segment.block) return;
-
-  g_layout.alloc_size = segment.block->GetBlockAllocSize();
-  g_layout.hdr_size   = segment.block->GetBlockHeaderSize();
-  if (g_layout.alloc_size == 0) return;
-
-  auto pin_handle = buffer_manager.Pin(segment.block);
-  auto block_id   = segment.GetBlockId();
-  auto block_off  = segment.GetBlockOffset();
-  auto* pin_ptr   = pin_handle.Ptr() + block_off;
-
-  constexpr size_t CANDIDATE_BLOCK_START = 4096 * 3;  // 12288
-  size_t byte_offset = CANDIDATE_BLOCK_START
-                     + static_cast<size_t>(block_id) * g_layout.alloc_size
-                     + g_layout.hdr_size + block_off;
-
-  if (byte_offset + 64 > mmap_state.size) return;
-  auto* mmap_ptr = mmap_state.base + byte_offset;
-
-  if (std::memcmp(mmap_ptr, pin_ptr, std::min<size_t>(64, segment.SegmentSize())) != 0) {
-    SIRIUS_LOG_ERROR("[direct_block_scan] mmap validation FAILED — disabling mmap bypass.");
-    return;
-  }
-
-  g_layout.block_start = CANDIDATE_BLOCK_START;
-  g_layout.valid       = true;
-  SIRIUS_LOG_INFO("[direct_block_scan] block layout ok: alloc={} hdr={} start={}",
-                  g_layout.alloc_size, g_layout.hdr_size, g_layout.block_start);
-}
-
-static inline uint8_t* mmap_block_data_ptr(const mmap_file_state& mmap_state,
-                                           duckdb::block_id_t block_id,
-                                           size_t block_offset,
-                                           size_t& out_block_offset)
-{
-  size_t block_file_offset = g_layout.block_start
-                           + static_cast<size_t>(block_id) * g_layout.alloc_size;
-  size_t data_file_offset  = block_file_offset + g_layout.hdr_size + block_offset;
-  if (data_file_offset >= mmap_state.size) return nullptr;
-  out_block_offset = g_layout.hdr_size + block_offset;
-  return mmap_state.base + data_file_offset;
 }
 
 //===----------------------------------------------------------------------===//
@@ -189,7 +89,7 @@ static inline uint8_t* mmap_block_data_ptr(const mmap_file_state& mmap_state,
 direct_block_scan_result scan_segment_tree(duckdb::ColumnData& col_data,
                                            duckdb::BufferManager& buffer_manager,
                                            bool* has_nulls_out,
-                                           mmap_file_state* mmap_state)
+                                           duckdb::BlockManager* block_manager)
 {
   direct_block_scan_result result;
   auto& seg_tree = col_data.GetSegmentTree();
@@ -210,23 +110,15 @@ direct_block_scan_result scan_segment_tree(duckdb::ColumnData& col_data,
       seg_info.compression  = segment.GetCompressionType();
       result.total_pinned_bytes += segment.SegmentSize();
 
-      if (mmap_state) {
-        std::call_once(g_layout_once, discover_block_layout,
-                       std::ref(segment), std::ref(buffer_manager), std::cref(*mmap_state));
-      }
-
-      bool used_mmap = false;
-      if (mmap_state && g_layout.valid && seg_info.block_id >= 0) {
-        size_t adjusted_offset = 0;
-        auto* mmap_ptr = mmap_block_data_ptr(*mmap_state, seg_info.block_id,
-                                             seg_info.block_offset, adjusted_offset);
-        if (mmap_ptr) {
-          seg_info.data_ptr     = mmap_ptr;
-          seg_info.block_offset = adjusted_offset;
-          used_mmap = true;
+      bool used_direct = false;
+      if (block_manager && seg_info.block_id >= 0) {
+        auto* block_base = block_manager->GetDirectBlockPointer(seg_info.block_id);
+        if (block_base) {
+          seg_info.data_ptr = block_base + seg_info.block_offset;
+          used_direct = true;
         }
       }
-      if (!used_mmap) {
+      if (!used_direct) {
         seg_info.handle   = buffer_manager.Pin(segment.block);
         seg_info.data_ptr = seg_info.handle.Ptr() + seg_info.block_offset;
       }
@@ -264,7 +156,7 @@ column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
                                                   const std::vector<duckdb::RowGroup*>& row_groups)
 {
   auto& buffer_manager = duckdb::BufferManager::GetBufferManager(context);
-  auto* mmap_state = try_get_mmap_for_table(storage);
+  auto* block_manager  = try_get_block_manager(storage);
 
   column_scan_result result;
   result.data.total_rows     = 0;
@@ -275,7 +167,7 @@ column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
   for (auto* rg : row_groups) {
     auto& col_data = rg->GetColumnDirect(col_idx);
 
-    auto data_scan = scan_segment_tree(col_data, buffer_manager, &result.has_nulls, mmap_state);
+    auto data_scan = scan_segment_tree(col_data, buffer_manager, &result.has_nulls, block_manager);
     result.data.total_pinned_bytes += data_scan.total_pinned_bytes;
     for (auto& s : data_scan.segments) {
       result.data.total_rows += s.row_count;
@@ -287,7 +179,7 @@ column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
       auto& val_data = std_col.GetValidityData();
 
       if (result.has_nulls) {
-        auto val_scan = scan_segment_tree(val_data, buffer_manager, nullptr, mmap_state);
+        auto val_scan = scan_segment_tree(val_data, buffer_manager, nullptr, block_manager);
         result.validity.total_pinned_bytes += val_scan.total_pinned_bytes;
         for (auto& s : val_scan.segments) {
           result.validity.segments.push_back(std::move(s));
