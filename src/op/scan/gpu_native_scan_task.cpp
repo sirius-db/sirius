@@ -25,6 +25,9 @@
 #include <log/logging.hpp>
 #include <sirius_config.hpp>
 
+#include <rmm/device_buffer.hpp>
+
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <unordered_set>
@@ -321,14 +324,29 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
     return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
   };
 
-  // Loop: claim and process batches until no more work.
-  // Multiple initial tasks run this loop concurrently on separate CUDA streams,
-  // achieving N-way scan parallelism without task over-creation.
+  // Process up to MAX_BATCHES_PER_TASK before returning and self-scheduling
+  // a continuation. Multiple initial tasks (N = scan_threads) run concurrently,
+  // each replacing itself when done, maintaining N-way parallelism while
+  // bounding peak scan memory to ~N × MAX_BATCHES_PER_TASK batches at any time.
+  //
+  // Choosing this value trades off per-task scheduling overhead vs memory peak:
+  //   - 1: lowest memory, highest scheduling overhead (bad for TPC-H joins)
+  //   - ALL: minimum overhead, highest memory (OOMs on ClickBench single-session)
+  //   - 4: bounded memory, amortizes scheduling — works for both workloads
+  constexpr size_t MAX_BATCHES_PER_TASK = 4;
+
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
 
-  while (true) {
-    auto range = g.claim_next_batch();
-    if (!range) break;
+  auto first_range = g.claim_next_batch();
+  if (!first_range) {
+    g.decrement_tasks();
+    return std::make_unique<op::pipelineable_operator_data>(std::move(batches));
+  }
+
+  std::optional<decltype(first_range)::value_type> current_range = first_range;
+  size_t batches_this_task = 0;
+  while (current_range && batches_this_task < MAX_BATCHES_PER_TASK) {
+    auto& range = current_range;
 
     auto t0 = clock::now();
 
@@ -343,45 +361,71 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
 
     auto t1_pin = clock::now();
 
-    // Collect unique blocks
-    std::unordered_set<int64_t> unique_blocks;
+    // Collect unique blocks with their host base pointers
+    constexpr size_t BLK = sirius::cuda::scan::DUCKDB_BLOCK_SIZE;
+    struct block_entry {
+      int64_t block_id;
+      const uint8_t* host_base;
+    };
+    std::unordered_map<int64_t, const uint8_t*> seen_blocks;
     for (auto& cs : col_scans) {
       for (auto& seg : cs.data.segments) {
-        if (seg.persistent && seg.data_ptr && seg.row_count > 0 && seg.block_id >= 0)
-          unique_blocks.insert(seg.block_id);
+        if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0) continue;
+        if (seen_blocks.count(seg.block_id)) continue;
+        seen_blocks[seg.block_id] = seg.data_ptr - seg.block_offset;
       }
     }
 
     // Bulk H2D → decode from device
     constexpr size_t BULK_H2D_MIN_BLOCKS = 4;
     std::unique_ptr<cudf::table> gpu_table;
-    size_t total_blocks = unique_blocks.size();
+    size_t total_blocks = seen_blocks.size();
 
-    if (unique_blocks.size() >= BULK_H2D_MIN_BLOCKS) {
-      size_t buf_bytes = unique_blocks.size() * sirius::cuda::scan::DUCKDB_BLOCK_SIZE;
-      void* d_staging  = nullptr;
-      cudaMallocAsync(&d_staging, buf_bytes, stream.value());
+    if (seen_blocks.size() >= BULK_H2D_MIN_BLOCKS) {
+      size_t buf_bytes = seen_blocks.size() * BLK;
+      rmm::device_buffer staging_buf(buf_bytes, stream, mr);
+      auto* d_staging = staging_buf.data();
+
+      // Sort blocks by block_id to detect contiguous runs in the mmap'd file.
+      // Consecutive block_ids have host pointers exactly BLK bytes apart, so
+      // runs can be copied with a single cudaMemcpyAsync instead of one per block.
+      std::vector<block_entry> sorted_blocks;
+      sorted_blocks.reserve(seen_blocks.size());
+      for (auto& [id, ptr] : seen_blocks) {
+        sorted_blocks.push_back({id, ptr});
+      }
+      std::sort(sorted_blocks.begin(), sorted_blocks.end(),
+                [](const block_entry& a, const block_entry& b) { return a.block_id < b.block_id; });
 
       sirius::cuda::scan::device_block_map block_map;
       size_t offset = 0;
-      for (auto& cs : col_scans) {
-        for (auto& seg : cs.data.segments) {
-          if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0) continue;
-          if (block_map.offsets.count(seg.block_id)) continue;
-          cudaMemcpyAsync(static_cast<uint8_t*>(d_staging) + offset,
-                          seg.data_ptr - seg.block_offset,
-                          sirius::cuda::scan::DUCKDB_BLOCK_SIZE,
-                          cudaMemcpyHostToDevice,
-                          stream.value());
-          block_map.offsets[seg.block_id] = offset;
-          offset += sirius::cuda::scan::DUCKDB_BLOCK_SIZE;
+      size_t i      = 0;
+      while (i < sorted_blocks.size()) {
+        size_t run_start = i;
+        while (i + 1 < sorted_blocks.size() &&
+               sorted_blocks[i + 1].block_id == sorted_blocks[i].block_id + 1 &&
+               sorted_blocks[i + 1].host_base == sorted_blocks[i].host_base + BLK) {
+          ++i;
+        }
+        ++i;
+        size_t run_len = i - run_start;
+
+        cudaMemcpyAsync(static_cast<uint8_t*>(d_staging) + offset,
+                        sorted_blocks[run_start].host_base,
+                        run_len * BLK,
+                        cudaMemcpyHostToDevice,
+                        stream.value());
+
+        for (size_t j = run_start; j < i; ++j) {
+          block_map.offsets[sorted_blocks[j].block_id] = offset;
+          offset += BLK;
         }
       }
       block_map.total_bytes = offset;
 
       gpu_table = sirius::cuda::scan::gpu_decode_table_pipelined(
         col_scans, col_types, block_map, d_staging, stream, mr);
-      cudaFreeAsync(d_staging, stream.value());
+      // staging_buf freed by RAII at end of this scope
     } else {
       gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
     }
@@ -403,6 +447,53 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
       us(t0, t2_decode) / 1000.0,
       range->start_idx,
       range->start_idx + range->count - 1);
+
+    ++batches_this_task;
+    if (batches_this_task < MAX_BATCHES_PER_TASK) {
+      current_range = g.claim_next_batch();
+    } else {
+      current_range.reset();
+    }
+  }  // end multi-batch loop
+
+  // Self-continuation: if more batches remain, schedule a replacement task.
+  // This maintains N-way parallelism (N initial tasks launched by task_creator,
+  // each self-replacing when it finishes) while keeping peak memory bounded
+  // to ~1 batch per concurrent task.
+  //
+  // Counter balance (all atomic via std::atomic):
+  //   - active_tasks_: continuation's constructor calls increment_tasks();
+  //     our decrement_tasks() below balances our own constructor's increment.
+  //     Net: active_tasks_ is unchanged across the task replacement, so
+  //     `remaining == 0` in decrement_tasks() only triggers when the LAST
+  //     task (no continuation) decrements — correct shutdown detection.
+  //   - tasks_created/completed: we call mark_task_created() for the
+  //     continuation AFTER successful construction and scheduling, so an
+  //     exception in either path won't leak an unmatched created count.
+  //     Our own mark_task_completed runs in the destructor.
+  //   - next_claim_idx_: atomic fetch_add in claim_next_batch(), and
+  //     all_claimed() is a monotonic load — once true, stays true.
+  if (!g.all_claimed()) {
+    auto global_state_shared = _global_state;  // shared_ptr, safe to share
+    try {
+      auto continuation = std::make_unique<gpu_native_scan_task>(
+        task_id_ + 1,
+        data_repo_,
+        std::static_pointer_cast<gpu_native_scan_global_state>(global_state_shared));
+      // Constructor already incremented active_tasks_. Register with pipeline
+      // only after successful construction, and before scheduling (so that
+      // completion accounting is balanced even if schedule() throws).
+      if (auto* pipeline = g.get_pipeline()) { pipeline->mark_task_created(); }
+      g.executor().schedule(std::move(continuation));
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "[gpu_native_scan] failed to schedule continuation task: {}. "
+        "Remaining batches will be picked up by other in-flight tasks.",
+        e.what());
+      // If schedule() threw after mark_task_created, the continuation's
+      // destructor runs as unique_ptr unwinds → mark_task_completed balances.
+      // If construction threw, no task was created → no counters touched.
+    }
   }
 
   g.decrement_tasks();
