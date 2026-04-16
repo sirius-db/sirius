@@ -291,6 +291,11 @@ void gpu_decode_fsst(const uint8_t* segment_data,
 /// @brief Extract one bitpacked value from a packed buffer.
 /// GPU-FOR style: horizontal layout, 32-value groups.
 /// Each value occupies bits [idx*width, (idx+1)*width) in the packed stream.
+///
+/// For types wider than 32 bits (int64/uint64), a value can span 3 uint32
+/// words when bit_off > 0 and width > 32.  E.g. width=50, bit_off=20 needs
+/// bits 20..69, spanning words [word_idx, word_idx+1, word_idx+2].
+/// Callers must ensure packed[] has one extra guard word beyond the packed data.
 template <typename T>
 __device__ __forceinline__ T unpack_value(const uint32_t* packed, uint32_t idx, uint32_t width)
 {
@@ -304,8 +309,17 @@ __device__ __forceinline__ T unpack_value(const uint32_t* packed, uint32_t idx, 
   uint64_t combined = static_cast<uint64_t>(packed[word_idx]);
   if (bit_off + width > 32) { combined |= static_cast<uint64_t>(packed[word_idx + 1]) << 32; }
 
+  uint64_t result = combined >> bit_off;
+
+  // For 64-bit types, the value can span a third word when bit_off + width > 64
+  if constexpr (sizeof(T) > 4) {
+    if (bit_off > 0 && bit_off + width > 64) {
+      result |= static_cast<uint64_t>(packed[word_idx + 2]) << (64 - bit_off);
+    }
+  }
+
   uint64_t mask = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
-  return static_cast<T>((combined >> bit_off) & mask);
+  return static_cast<T>(result & mask);
 }
 
 }  // namespace sirius::cuda::scan
