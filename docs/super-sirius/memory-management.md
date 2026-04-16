@@ -170,8 +170,7 @@ On allocation failure:
 |------|---------|
 | `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory manager, tier configuration |
 | `src/include/downgrade/downgrade_executor.hpp` | Downgrade executor interface |
-| `src/downgrade/downgrade_executor.cpp` | Monitor loop, candidate selection |
-| `src/include/downgrade/downgrade_task.hpp` | Downgrade task definition |
+| `src/downgrade/downgrade_executor.cpp` | Processing loop, tiered candidate fetching |
 | `src/include/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
 | `src/memory/defragmenter_oom_policy.cpp` | Fragmentation detection and trimming |
 | `src/include/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |
