@@ -58,19 +58,18 @@ Validated in Phase 7: Task Queue Conversion — v2.0
 - ✓ `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
 - ✓ Failure safety: task conversions restore original state; task always returned to queue via RAII
 
+Validated in Phase 8: API Cleanup + Processing Loop Refactor — v3.0
+- ✓ Removed `target_bytes` from `downgrade_request` struct and `request_downgrade` API
+- ✓ Rewrote `processing_loop` with tiered `convertible_data_batch_provider` (repos → gpu queue → pipeline queue)
+- ✓ Eliminated `downgrade_task` struct — all conversion via `convertible_data::convert()`
+- ✓ Per-tier breakdown logging (repos/gpu_queue/pipeline_queue batches and bytes)
+- ✓ Predicate checked both in dispatch loop and after each convert() in workers
+
 ### Active
 
 #### Current Milestone: v3.0 Downgrade Executor Integration
 
-**Goal:** Refactor the downgrade executor to use convertible_data abstractions with lazy, tiered candidate fetching and optional batch_lock_utils simplification.
-
-**Target features:**
-- Refactor `downgrade_executor::processing_loop` with `convertible_data_batch_provider` (lazy, one repo at a time)
-- Tiered fallback: data_repositories → gpu_pipeline_executor task queue → pipeline_executor task queue
-- Eliminate `downgrade_task` struct if `convert()` makes it trivial
-- Replace direct downgrade logic with `convertible_data::convert()` calls
-- Remove `target_bytes` from `request_downgrade`/`downgrade_request` and calculation logic from `gpu_pipeline_executor`
-- Add trace logging for downgrade counts per source tier
+**Remaining:**
 - Explore refactoring `lock_or_prepare_batch` in `batch_lock_utils.hpp` to use `convertible_data_batch::convert()`
 
 ### Out of Scope
@@ -81,10 +80,10 @@ Validated in Phase 7: Task Queue Conversion — v2.0
 
 ## Current State
 
-**v3.0 Downgrade Executor Integration** — In progress
+**v3.0 Downgrade Executor Integration** — Phase 8 complete, Phase 9 remaining
 
-Previous milestones shipped (v1.0, v1.1, v2.0). 7 phases, 11 plans, ~165 min total execution.
-Now integrating convertible_data abstractions into the downgrade executor production path.
+Previous milestones shipped (v1.0, v1.1, v2.0). 8 phases, 13 plans executed.
+Phase 8 completed: removed target_bytes from API, rewrote processing loop with tiered providers, eliminated downgrade_task. Phase 9 (batch_lock exploration) remaining.
 
 ## Context
 
