@@ -219,27 +219,13 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   // metadata_pipeline: single-op self-pipeline. metadata_scan_op is both the task-emitting
   // source and the sink.
   auto metadata_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
-  metadata_pipeline->source = metadata_scan_ptr;
+  metadata_pipeline->source = nullptr;
   metadata_pipeline->sink   = metadata_scan_ptr;
 
   // current_pipeline: gpu_scan_op becomes the new source. finalize_pipeline_structure() will
   // later set current_pipeline->source = &operators[0] and push the existing sink on the end.
-  current_pipeline->source = gpu_scan_ptr;
+  current_pipeline->source = metadata_scan_ptr;
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
-
-  // Scheduling-only dependency port. The metadata handoff itself happens through
-  // accumulate_metadata() / finalize_partitions(); no data batches flow through this port
-  // (repo is null). setup_pipeline_parents() walks metadata_scan's next_port_after_sink list
-  // and reads this port's dest_pipeline to register current_pipeline as a parent of
-  // metadata_pipeline.
-  std::string_view handoff_port_id = "dependency";
-  gpu_scan_ptr->add_port(
-    handoff_port_id,
-    std::make_unique<op::sirius_physical_operator::port>(op::MemoryBarrierType::PIPELINE,
-                                                         /*repo=*/nullptr,
-                                                         metadata_pipeline,
-                                                         current_pipeline));
-  metadata_scan_ptr->add_next_port_after_sink({gpu_scan_ptr, handoff_port_id});
 
   scheduled_.push_back(std::move(metadata_pipeline));
   pipeline_breakers_.push_back(std::move(metadata_scan_op));
@@ -357,14 +343,6 @@ void sirius_pipeline_converter::split_intermediate_joins(
         // set the sink to the operator before the join
         new_pipeline->sink   = current_pipeline->operators[join_pos - 1].get();
         new_pipeline->source = prev_concat_ptr;
-      }
-
-      // If the sink is GPU_PARQUET_SCAN, the metadata handoff port's dest_pipeline was set to
-      // current_pipeline in split_parquet_scan_source, but the gpu scan has now been moved to
-      // new_pipeline. Re-point dest_pipeline so setup_pipeline_parents walks the correct edge.
-      if (new_pipeline->sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
-        auto* handoff_port          = new_pipeline->sink->get_port("dependency");
-        handoff_port->dest_pipeline = new_pipeline;
       }
 
       scheduled_.push_back(new_pipeline);
@@ -985,21 +963,28 @@ void sirius_pipeline_converter::wire_data_repositories()
                             dependent_pipeline));
         scheduled_[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
       }
-    } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN) {
-      // Metadata pipeline is a self-loop that hands off partitioned_parquet_metadata to
-      // gpu_scan_op via the null-repo dependency port installed in split_parquet_scan_source().
-      // No data-flow wiring is needed here.
-    } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
-      // gpu_scan is both source and sink of its own pipeline. Wire its output port to
-      // downstream pipelines, but skip the self-entry: source_to_pipelines[gpu_scan]
-      // includes this pipeline itself (since gpu_scan is also its source), and wiring a
-      // port whose src_pipeline == dest_pipeline would deadlock is_source_pipeline_finished().
-      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
-        if (dependent_pipeline.get() == scheduled_[i].get()) { continue; }
-        engine_.insert_repository("default", scheduled_[i], dependent_pipeline);
-      }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // No action needed for RESULT_COLLECTOR sinks
+    } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN) {
+      // Scheduling-only dependency port. The metadata handoff itself happens through
+      // accumulate_metadata() / finalize_partitions(); no data batches flow through this port
+      // (repo is null). setup_pipeline_parents() walks metadata_scan's next_port_after_sink list
+      // and reads this port's dest_pipeline to register current_pipeline as a parent of
+      // metadata_pipeline.
+      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
+        auto next_op             = dependent_pipeline->get_operators().size() == 0
+                                     ? dependent_pipeline->get_sink().get()
+                                     : &dependent_pipeline->get_operators()[0].get();
+        size_t op_id             = next_op->operator_id;
+        std::string_view port_id = "handoff";
+        next_op->add_port(port_id,
+                          std::make_unique<op::sirius_physical_operator::port>(
+                            op::MemoryBarrierType::PARTIAL,
+                            nullptr,
+                            scheduled_[i],
+                            dependent_pipeline));
+        scheduled_[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
+      }
     } else {
       // Intermediate operators acting as pipeline sinks (e.g., filter, projection, join
       // placed as sink before a PARTITION pipeline). Use the base class sink() which
@@ -1172,9 +1157,9 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
-        auto const* handoff_port = first_op.get_port("dependency");
+        auto const* handoff_port = first_op.get_port("handoff");
         if (handoff_port) {
-          SIRIUS_LOG_INFO("    Port 'dependency': barrier_type={}, repo=NONE",
+          SIRIUS_LOG_INFO("    Port 'handoff': barrier_type={}, repo=NONE",
                           static_cast<int>(handoff_port->type));
         }
       } else if (first_op.type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
@@ -1218,9 +1203,9 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
-        auto const* handoff_port = sink->get_port("dependency");
+        auto const* handoff_port = sink->get_port("handoff");
         if (handoff_port) {
-          SIRIUS_LOG_INFO("    Port 'dependency': barrier_type={}, repo=NONE",
+          SIRIUS_LOG_INFO("    Port 'handoff': barrier_type={}, repo=NONE",
                           static_cast<int>(handoff_port->type));
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
