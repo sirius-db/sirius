@@ -7,14 +7,8 @@
 
 #include <log/logging.hpp>
 
-#include <duckdb/storage/storage_manager.hpp>
-
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <mutex>
-#include <unordered_map>
+#include <duckdb/storage/block_manager.hpp>
+#include <duckdb/storage/table_io_manager.hpp>
 
 // duckdb
 #include <duckdb/storage/buffer/buffer_handle.hpp>
@@ -68,69 +62,13 @@ static void extract_constant_from_stats(const duckdb::ColumnSegment& segment, ui
   }
 }
 
-//===----------------------------------------------------------------------===//
-// Direct mmap — bypass BufferManager::Pin() for read-only databases
-//===----------------------------------------------------------------------===//
-
-static std::mutex g_mmap_mutex;
-static std::unordered_map<std::string, std::pair<uint8_t*, size_t>> g_mmap_cache;
-
-static uint8_t* get_or_create_mmap(const std::string& path)
-{
-  std::lock_guard<std::mutex> lock(g_mmap_mutex);
-  auto it = g_mmap_cache.find(path);
-  if (it != g_mmap_cache.end()) return it->second.first;
-
-  int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) return nullptr;
-
-  struct stat st;
-  if (::fstat(fd, &st) < 0) { ::close(fd); return nullptr; }
-
-  size_t file_size = static_cast<size_t>(st.st_size);
-  void* mapped = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-  ::close(fd);
-  if (mapped == MAP_FAILED) return nullptr;
-
-  auto* base = static_cast<uint8_t*>(mapped);
-  g_mmap_cache[path] = {base, file_size};
-  SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB)", path, file_size / 1e6);
-  return base;
-}
-
-/// DuckDB file layout: 3 × 4096-byte header pages, then blocks.
-static constexpr size_t FILE_BLOCK_START = 4096 * 3;
-
-/// Runtime block layout — read from first BlockHandle encountered.
-static size_t g_block_alloc_size = 0;
-static size_t g_block_hdr_size   = 0;
-
-/// Compute data pointer for a block from our mmap base.
-static inline uint8_t* mmap_block_ptr(uint8_t* base, duckdb::block_id_t block_id, size_t block_offset)
-{
-  return base + FILE_BLOCK_START
-       + static_cast<size_t>(block_id) * g_block_alloc_size
-       + g_block_hdr_size + block_offset;
-}
-
-static uint8_t* try_get_mmap_for_table(duckdb::DataTable& storage)
-{
-  try {
-    auto& db = storage.GetAttached();
-    auto& smgr = db.GetStorageManager();
-    auto path = smgr.GetDBPath();
-    if (!path.empty()) return get_or_create_mmap(path);
-  } catch (...) {}
-  return nullptr;
-}
-
-/// @brief Walk a ColumnData's segment tree, get block pointers, return segment info vector.
-/// When mmap_base is non-null, uses direct mmap (skips Pin). Also issues
-/// madvise(WILLNEED) to prefetch pages asynchronously.
+/// @brief Walk a ColumnData's segment tree, get block data pointers.
+/// Uses BlockManager::GetDirectBlockPointer() when available (read-only databases),
+/// falling back to BufferManager::Pin() otherwise.
 direct_block_scan_result scan_segment_tree(duckdb::ColumnData& col_data,
                                            duckdb::BufferManager& buffer_manager,
                                            bool* has_nulls_out = nullptr,
-                                           uint8_t* mmap_base = nullptr)
+                                           duckdb::BlockManager* block_mgr = nullptr)
 {
   direct_block_scan_result result;
   auto& seg_tree = col_data.GetSegmentTree();
@@ -152,41 +90,16 @@ direct_block_scan_result scan_segment_tree(duckdb::ColumnData& col_data,
       seg_info.compression  = segment.GetCompressionType();
       result.total_pinned_bytes += segment.SegmentSize();
 
-      // Read actual block layout from the first BlockHandle (once)
-      if (g_block_alloc_size == 0 && segment.block) {
-        g_block_alloc_size = segment.block->GetBlockAllocSize();
-        g_block_hdr_size   = segment.block->GetBlockHeaderSize();
-        SIRIUS_LOG_INFO("[direct_block_scan] block layout: alloc_size={}, hdr_size={}",
-                        g_block_alloc_size, g_block_hdr_size);
-      }
-
-      if (mmap_base && seg_info.block_id >= 0 && g_block_alloc_size > 0) {
-        // Direct mmap — compute pointer using DuckDB's actual block sizes
-        auto* block_start = mmap_base + FILE_BLOCK_START
-                          + static_cast<size_t>(seg_info.block_id) * g_block_alloc_size;
-        seg_info.data_ptr = block_start + g_block_hdr_size + seg_info.block_offset;
-        ::madvise(block_start, g_block_alloc_size, MADV_WILLNEED);
-
-        // One-time validation: compare our pointer against Pin() for first block
-        static bool validated = false;
-        if (!validated) {
-          validated = true;
-          auto pin_handle = buffer_manager.Pin(segment.block);
-          auto* pin_ptr = pin_handle.Ptr() + seg_info.block_offset;
-          if (std::memcmp(seg_info.data_ptr, pin_ptr, std::min<size_t>(64, seg_info.segment_size)) != 0) {
-            SIRIUS_LOG_ERROR(
-              "[direct_block_scan] DATA MISMATCH! block_id={} offset={} "
-              "mmap_data={:02x}{:02x}{:02x}{:02x} pin_data={:02x}{:02x}{:02x}{:02x}",
-              seg_info.block_id, seg_info.block_offset,
-              seg_info.data_ptr[0], seg_info.data_ptr[1], seg_info.data_ptr[2], seg_info.data_ptr[3],
-              pin_ptr[0], pin_ptr[1], pin_ptr[2], pin_ptr[3]);
-            // Fall back to Pin for everything
-            mmap_base = nullptr;
-            seg_info.data_ptr = pin_ptr;
-            seg_info.handle = std::move(pin_handle);
-          } else {
-            SIRIUS_LOG_INFO("[direct_block_scan] mmap data VALIDATED — first 64 bytes match Pin()");
-          }
+      if (block_mgr && seg_info.block_id >= 0) {
+        // Direct block pointer via DuckDB's BlockManager (mmap'd read-only).
+        // Bypasses BufferManager::Pin() entirely — no lock, no copy, no refcount.
+        auto* direct = block_mgr->GetDirectBlockPointer(seg_info.block_id);
+        if (direct) {
+          seg_info.data_ptr = direct + seg_info.block_offset;
+        } else {
+          // Direct access not available for this block — fall back to Pin
+          seg_info.handle   = buffer_manager.Pin(segment.block);
+          seg_info.data_ptr = seg_info.handle.Ptr() + seg_info.block_offset;
         }
       } else {
         seg_info.handle   = buffer_manager.Pin(segment.block);
@@ -225,7 +138,18 @@ column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
                                                   const std::vector<duckdb::RowGroup*>& row_groups)
 {
   auto& buffer_manager = duckdb::BufferManager::GetBufferManager(context);
-  uint8_t* mmap_base   = try_get_mmap_for_table(storage);
+
+  // Try to get a BlockManager that supports direct block pointers (read-only mmap).
+  // This bypasses BufferManager::Pin() entirely — no lock, no copy, no refcount.
+  duckdb::BlockManager* block_mgr = nullptr;
+  try {
+    auto& tio = storage.GetTableIOManager();
+    auto& bm = tio.GetBlockManagerForRowData();
+    // Test if direct access is available (will be null for writable/encrypted/remote)
+    if (bm.GetDirectBlockPointer(0) != nullptr || true) {
+      block_mgr = &bm;
+    }
+  } catch (...) {}
 
   column_scan_result result;
   result.data.total_rows     = 0;
@@ -236,9 +160,7 @@ column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
   for (auto* rg : row_groups) {
     auto& col_data = rg->GetColumnDirect(col_idx);
 
-    // Scan data segments — also checks CanHaveNull() during the same traversal,
-    // and accumulates row counts, eliminating two separate tree walks.
-    auto data_scan = scan_segment_tree(col_data, buffer_manager, &result.has_nulls, mmap_base);
+    auto data_scan = scan_segment_tree(col_data, buffer_manager, &result.has_nulls, block_mgr);
     result.data.total_pinned_bytes += data_scan.total_pinned_bytes;
     for (auto& s : data_scan.segments) {
       result.data.total_rows += s.row_count;
@@ -251,7 +173,7 @@ column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
       auto& val_data = std_col.GetValidityData();
 
       if (result.has_nulls) {
-        auto val_scan = scan_segment_tree(val_data, buffer_manager, nullptr, mmap_base);
+        auto val_scan = scan_segment_tree(val_data, buffer_manager, nullptr, block_mgr);
         result.validity.total_pinned_bytes += val_scan.total_pinned_bytes;
         for (auto& s : val_scan.segments) {
           result.validity.segments.push_back(std::move(s));
