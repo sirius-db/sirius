@@ -59,8 +59,8 @@
 **Plans:** 2 plans
 
 Plans:
-- [ ] 08-01-PLAN.md — API surface cleanup: remove target_bytes from struct/signature/callers, extend constructor with task queue refs
-- [ ] 08-02-PLAN.md — Processing loop rewrite with tiered providers, downgrade_task elimination, dead code removal, docs update
+- [x] 08-01-PLAN.md — API surface cleanup: remove target_bytes from struct/signature/callers, extend constructor with task queue refs
+- [x] 08-02-PLAN.md — Processing loop rewrite with tiered providers, downgrade_task elimination, dead code removal, docs update
 
 ### Phase 9: Batch Lock Exploration
 **Goal**: Determine whether batch_lock_utils can benefit from convertible_data_batch and apply the refactor if analysis supports it
