@@ -73,22 +73,22 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| LOOP-01 | — | Pending |
-| LOOP-02 | — | Pending |
-| LOOP-03 | — | Pending |
-| LOOP-04 | — | Pending |
-| LOOP-05 | — | Pending |
-| DAPI-01 | — | Pending |
-| DAPI-02 | — | Pending |
-| LOG-01 | — | Pending |
-| LOCK-01 | — | Pending |
-| LOCK-02 | — | Pending |
+| DAPI-01 | Phase 8 | Pending |
+| DAPI-02 | Phase 8 | Pending |
+| LOOP-01 | Phase 9 | Pending |
+| LOOP-02 | Phase 9 | Pending |
+| LOOP-03 | Phase 9 | Pending |
+| LOOP-04 | Phase 9 | Pending |
+| LOOP-05 | Phase 9 | Pending |
+| LOG-01 | Phase 9 | Pending |
+| LOCK-01 | Phase 10 | Pending |
+| LOCK-02 | Phase 10 | Pending |
 
 **Coverage:**
 - v3.0 requirements: 10 total
-- Mapped to phases: 0
-- Unmapped: 10 ⚠️
+- Mapped to phases: 10
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-16*
-*Last updated: 2026-04-16 after initial definition*
+*Last updated: 2026-04-16 after v3.0 roadmap creation*
