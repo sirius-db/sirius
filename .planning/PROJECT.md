@@ -61,10 +61,9 @@ Validated in Phase 6: Batch Conversion
 - [x] `convertible_data_batch_provider` wrapping `data_repository`
 - [x] Failure safety: batch conversions restore original `batch_state` and `idata_representation` on failure
 
-### Active
-
-- [ ] `convertible_gpu_pipeline_task` wrapping `gpu_pipeline_task` with RAII queue ownership
-- [ ] `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
+Validated in Phase 7: Task Queue Conversion
+- [x] `convertible_gpu_pipeline_task` wrapping `gpu_pipeline_task` with RAII queue ownership
+- [x] `convertible_gpu_pipeline_task_provider` wrapping `inspectable_mpsc<itask>`
 
 ### Out of Scope
 
@@ -74,9 +73,9 @@ Validated in Phase 6: Batch Conversion
 
 ## Current State
 
-**v2.0 Convertible Data Abstraction** — Phase 6 complete 2026-04-15
+**v2.0 Convertible Data Abstraction** — Phase 7 complete 2026-04-16
 
-Phase 6 shipped: `convertible_data_batch` and `convertible_data_batch_provider` concrete implementations with failure-safe conversion generalizing the downgrade_task pattern. 8 GPU integration tests passing. Next: Phase 7 (task queue conversion).
+Phase 7 shipped: `convertible_gpu_pipeline_task` and `convertible_gpu_pipeline_task_provider` concrete implementations with RAII queue ownership and predicate-based task discovery. 11 GPU integration tests passing. All v2.0 milestone phases complete.
 
 ## Context
 
@@ -129,4 +128,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-15 after Phase 5 completion*
+*Last updated: 2026-04-16 after Phase 7 completion*
