@@ -56,7 +56,11 @@
   6. Each candidate is converted via `convertible_data::convert()` and `downgrade_task` struct is eliminated
   7. Trace logging reports downgrade counts per source tier (data_repositories, gpu_pipeline_executor queue, pipeline_executor queue)
   8. All existing tests pass with the simplified downgrade API (zero regressions)
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 08-01-PLAN.md — API surface cleanup: remove target_bytes from struct/signature/callers, extend constructor with task queue refs
+- [ ] 08-02-PLAN.md — Processing loop rewrite with tiered providers, downgrade_task elimination, dead code removal, docs update
 
 ### Phase 9: Batch Lock Exploration
 **Goal**: Determine whether batch_lock_utils can benefit from convertible_data_batch and apply the refactor if analysis supports it
@@ -82,7 +86,7 @@ Phases execute in numeric order: 8 → 9
 | 5. State Machine & Interfaces | v2.0 | 2/2 | Complete | 2026-04-15 |
 | 6. Batch Conversion | v2.0 | 2/2 | Complete | 2026-04-15 |
 | 7. Task Queue Conversion | v2.0 | 2/2 | Complete | 2026-04-16 |
-| 8. API Cleanup + Processing Loop | v3.0 | 0/0 | Planning | - |
+| 8. API Cleanup + Processing Loop | v3.0 | 0/2 | Planned | - |
 | 9. Batch Lock Exploration | v3.0 | 0/0 | Not started | - |
 
 ---
