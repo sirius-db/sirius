@@ -29,3 +29,6 @@
 	path = .claude/claude-tools
 	url = https://github.com/sirius-db/claude-tools.git
 	branch = main
+[submodule "vcpkg"]
+	path = vcpkg
+	url = https://github.com/Microsoft/vcpkg.git

@@ -98,9 +98,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   // Source interface
   bool is_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::NO_ORDER;
+    return sirius::OrderPreservationType::NO_ORDER;
   }
 
   // Sink interface
