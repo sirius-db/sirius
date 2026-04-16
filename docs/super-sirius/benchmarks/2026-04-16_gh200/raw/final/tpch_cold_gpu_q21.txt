@@ -1,0 +1,50 @@
+┌────────────────────┬─────────┐
+│       s_name       │ numwait │
+│      varchar       │  int64  │
+├────────────────────┼─────────┤
+│ Supplier#000195216 │      23 │
+│ Supplier#000195353 │      23 │
+│ Supplier#000321238 │      23 │
+│ Supplier#000747969 │      23 │
+│ Supplier#000899551 │      23 │
+│ Supplier#000915590 │      23 │
+│ Supplier#000055153 │      22 │
+│ Supplier#000180759 │      22 │
+│ Supplier#000227250 │      22 │
+│ Supplier#000278765 │      22 │
+│ Supplier#000362609 │      22 │
+│ Supplier#000384050 │      22 │
+│ Supplier#000532666 │      22 │
+│ Supplier#000551650 │      22 │
+│ Supplier#000896599 │      22 │
+│ Supplier#000083914 │      21 │
+│ Supplier#000111112 │      21 │
+│ Supplier#000142593 │      21 │
+│ Supplier#000225561 │      21 │
+│ Supplier#000238625 │      21 │
+│         ·          │       · │
+│         ·          │       · │
+│         ·          │       · │
+│ Supplier#000435940 │      20 │
+│ Supplier#000444902 │      20 │
+│ Supplier#000532668 │      20 │
+│ Supplier#000552183 │      20 │
+│ Supplier#000596205 │      20 │
+│ Supplier#000633454 │      20 │
+│ Supplier#000661988 │      20 │
+│ Supplier#000720862 │      20 │
+│ Supplier#000732109 │      20 │
+│ Supplier#000733274 │      20 │
+│ Supplier#000738376 │      20 │
+│ Supplier#000756415 │      20 │
+│ Supplier#000774426 │      20 │
+│ Supplier#000785288 │      20 │
+│ Supplier#000798105 │      20 │
+│ Supplier#000804625 │      20 │
+│ Supplier#000818446 │      20 │
+│ Supplier#000824573 │      20 │
+│ Supplier#000831289 │      20 │
+│ Supplier#000877402 │      20 │
+└────────────────────┴─────────┘
+  100 rows (40 shown)2 columns
+Run Time (s): real 16.545 user 20.907554 sys 0.715345

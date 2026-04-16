@@ -1,0 +1,50 @@
+┌──────────┬──────────────────────────┬────────┬──────────────┐
+│ p_brand  │          p_type          │ p_size │ supplier_cnt │
+│ varchar  │         varchar          │ int32  │    int64     │
+├──────────┼──────────────────────────┼────────┼──────────────┤
+│ Brand#11 │ PROMO BURNISHED STEEL    │      8 │          580 │
+│ Brand#32 │ STANDARD ANODIZED COPPER │     14 │          576 │
+│ Brand#14 │ LARGE BRUSHED STEEL      │     24 │          575 │
+│ Brand#23 │ ECONOMY BRUSHED BRASS    │      2 │          572 │
+│ Brand#35 │ STANDARD BRUSHED TIN     │     24 │          572 │
+│ Brand#51 │ PROMO ANODIZED TIN       │      8 │          572 │
+│ Brand#55 │ PROMO BURNISHED NICKEL   │      2 │          572 │
+│ Brand#55 │ SMALL PLATED COPPER      │      8 │          572 │
+│ Brand#12 │ ECONOMY BURNISHED TIN    │     14 │          568 │
+│ Brand#13 │ ECONOMY BURNISHED STEEL  │     38 │          568 │
+│ Brand#14 │ LARGE POLISHED STEEL     │     38 │          568 │
+│ Brand#32 │ LARGE POLISHED BRASS     │      8 │          568 │
+│ Brand#32 │ SMALL ANODIZED BRASS     │     31 │          568 │
+│ Brand#35 │ STANDARD ANODIZED COPPER │     31 │          568 │
+│ Brand#34 │ MEDIUM BRUSHED STEEL     │      5 │          567 │
+│ Brand#44 │ SMALL PLATED COPPER      │      2 │          566 │
+│ Brand#11 │ LARGE BRUSHED TIN        │     14 │          565 │
+│ Brand#14 │ ECONOMY PLATED STEEL     │     14 │          564 │
+│ Brand#43 │ SMALL POLISHED TIN       │     44 │          564 │
+│ Brand#45 │ LARGE POLISHED NICKEL    │     14 │          564 │
+│    ·     │           ·              │      · │           ·  │
+│    ·     │           ·              │      · │           ·  │
+│    ·     │           ·              │      · │           ·  │
+│ Brand#55 │ PROMO BURNISHED STEEL    │     44 │          304 │
+│ Brand#34 │ STANDARD BRUSHED NICKEL  │      2 │          303 │
+│ Brand#44 │ PROMO BRUSHED BRASS      │     24 │          303 │
+│ Brand#23 │ LARGE POLISHED BRASS     │      8 │          300 │
+│ Brand#24 │ PROMO ANODIZED TIN       │     31 │          300 │
+│ Brand#14 │ MEDIUM BRUSHED NICKEL    │      5 │          299 │
+│ Brand#15 │ ECONOMY ANODIZED NICKEL  │      2 │          296 │
+│ Brand#23 │ SMALL ANODIZED COPPER    │      5 │          296 │
+│ Brand#34 │ SMALL BRUSHED STEEL      │      8 │          296 │
+│ Brand#44 │ ECONOMY BRUSHED COPPER   │     44 │          296 │
+│ Brand#45 │ MEDIUM BRUSHED NICKEL    │      2 │          296 │
+│ Brand#33 │ PROMO PLATED STEEL       │     24 │          295 │
+│ Brand#22 │ ECONOMY PLATED STEEL     │     31 │          292 │
+│ Brand#33 │ PROMO BURNISHED TIN      │     31 │          291 │
+│ Brand#14 │ SMALL PLATED COPPER      │      8 │          288 │
+│ Brand#34 │ PROMO PLATED TIN         │      2 │          288 │
+│ Brand#55 │ STANDARD BURNISHED BRASS │      8 │          288 │
+│ Brand#23 │ PROMO ANODIZED NICKEL    │      5 │          284 │
+│ Brand#54 │ STANDARD PLATED COPPER   │     44 │          275 │
+│ Brand#14 │ LARGE BURNISHED NICKEL   │      2 │          267 │
+└──────────┴──────────────────────────┴────────┴──────────────┘
+  27840 rows (40 shown)                             4 columns
+Run Time (s): real 0.203 user 7.452816 sys 0.815319

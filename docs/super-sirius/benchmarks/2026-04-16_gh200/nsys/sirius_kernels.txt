@@ -1,0 +1,7 @@
+kernel                                                                  total_ms      calls       avg_us      
+----------------------------------------------------------------------  ------------  ----------  ------------
+void sirius::cuda::scan::kernel_decode_bitpacking_batched<long>(const   96.9 ms       2304        42.1 us     
+sirius::cuda::scan::kernel_gather_dict(const sirius::cuda::scan::batch  30.5 ms       1152        26.5 us     
+void sirius::cuda::scan::kernel_decode_bitpacking_batched<int>(const s  21.7 ms       576         37.6 us     
+sirius::cuda::scan::kernel_compute_lengths_dict(const sirius::cuda::sc  21.2 ms       1152        18.4 us     
+sirius::cuda::scan::kernel_write_sentinel(const unsigned int *, const   4.7 ms        1152        4.1 us      

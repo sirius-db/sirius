@@ -1,0 +1,50 @@
+┌────────────────────┬──────────────────────────────────────────┐
+│       s_name       │                s_address                 │
+│      varchar       │                 varchar                  │
+├────────────────────┼──────────────────────────────────────────┤
+│ Supplier#000000006 │ zaux5FTzToEg                             │
+│ Supplier#000000131 │ yXE7jfKpo,uh7fxM ,Z7yjiEKMFa63x          │
+│ Supplier#000000181 │ UKSQN2a33xkq2NC7ffn5h29ypKNNNkB2HTBfswQ  │
+│ Supplier#000000228 │ Ct72ryCOQ8Rzi6FAj6Ppwe0 0                │
+│ Supplier#000000307 │ YvfR2kliwNOusJXFvtU89 BLEtgwvqlE3g       │
+│ Supplier#000000433 │ ryZ,XBt305JOidhloc6V,EatLO2ppWXoK,8      │
+│ Supplier#000000441 │ MwE8oGoud7jmzBzCwQ                       │
+│ Supplier#000000482 │ gG5 QXC eo                               │
+│ Supplier#000000492 │ TvmxFn2erslwe3LoddmvXp                   │
+│ Supplier#000000514 │ bWm 31dd01Z6nb                           │
+│ Supplier#000000882 │ WCBZvSW0hMAdEcGubLq5H1myPU               │
+│ Supplier#000000924 │ ,Xid54fdHB7RM7zDOWNfNIN                  │
+│ Supplier#000001044 │ JEjjs6EMdi1cvCvMufKVGhsacacA7            │
+│ Supplier#000001050 │ nxVm77Jeyi                               │
+│ Supplier#000001204 │ M9ccAaKpb kQKjJcRqR3xke48FRIcdGF         │
+│ Supplier#000001216 │ holdaBLpEOqTGGYHQIgr3MLQ2EgwpPNIQBl6lc a │
+│ Supplier#000001255 │ jX2sp4pG8k3m5WNjmyTUlef4JjbYUq5A LEJp6m  │
+│ Supplier#000001299 │ YfMZJS,nSAci4,L7Q7Z1C8eVwiYSlpYQ         │
+│ Supplier#000001369 │ e4c5879DzaWyL2iZozqizCN3WOk              │
+│ Supplier#000001465 │ NxpnisVTLZ8jZM                           │
+│         ·          │       ·                                  │
+│         ·          │       ·                                  │
+│         ·          │       ·                                  │
+│ Supplier#000998648 │ 7GalTQJ0BZIwbaLyKXk1scBr Ondb            │
+│ Supplier#000998686 │ UwIX6,BokM fCawfXF73yd                   │
+│ Supplier#000998744 │ tCycw1REmYN1H6                           │
+│ Supplier#000998817 │ VTM4c7wn9WC                              │
+│ Supplier#000998913 │ 2FwGVBG,cTMZkCs LKRr5SVS5ph              │
+│ Supplier#000998978 │ 3ND C13Lh6v8Dwvy5dbMB8EpQ                │
+│ Supplier#000999085 │ NKlvOqwV7Gk                              │
+│ Supplier#000999105 │ ,og2zhgiuAf                              │
+│ Supplier#000999107 │ 2j7u4HZoe0AoT13LyZYyjRqO1hWDfB           │
+│ Supplier#000999319 │ KGOVfj yqsSOFGYnNsSmeDKDWcNJO8o,Y29vd    │
+│ Supplier#000999347 │ g0ob ZOFcCcKRZK3uAozJMTndM               │
+│ Supplier#000999362 │ 4Tr9uAzyS,TfMji,z2F5j4V6zBx              │
+│ Supplier#000999394 │ 81DY1dz1oufE4,R                          │
+│ Supplier#000999684 │ 9vE5cidMhv8NnhOn,                        │
+│ Supplier#000999698 │ psIkusCWEgyfPBOBjsxmn                    │
+│ Supplier#000999735 │ AXH2i YoE3q0fqFa6SqfJbNVmmfBgCg          │
+│ Supplier#000999785 │ GdMHqih0LyglWmH3WcSTN8                   │
+│ Supplier#000999869 │ gLlO9SdNl9GUlRSNYtMvEmcPSOuhoG4XKmO6G97r │
+│ Supplier#000999902 │ oW3wLr2xCOFI6le,d0m8PKqjaPl              │
+│ Supplier#000999969 │ 0vj2PLzOa9nDOEP2sIQeYNuKV,Hq0bhJt qb     │
+└────────────────────┴──────────────────────────────────────────┘
+  17690 rows (40 shown)                               2 columns
+Run Time (s): real 0.788 user 8.924438 sys 3.092668
