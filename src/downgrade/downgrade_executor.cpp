@@ -31,12 +31,16 @@ downgrade_executor::downgrade_executor(
   cucascade::shared_data_repository_manager& data_repo_mgr,
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
-  sirius::memory::sirius_memory_reservation_manager& reservation_manager)
+  sirius::memory::sirius_memory_reservation_manager& reservation_manager,
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue,
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue)
   : _config(std::move(config)),
     _data_repo_mgr(data_repo_mgr),
     _space_id(space_id),
     _memory_space(memory_space),
-    _reservation_manager(reservation_manager)
+    _reservation_manager(reservation_manager),
+    _gpu_task_queue(gpu_task_queue),
+    _pipeline_task_queue(pipeline_task_queue)
 {
 }
 
@@ -121,7 +125,7 @@ void downgrade_executor::processing_loop()
       [&repos](cucascade::shared_data_repository* repo) { repos.push_back({repo}); });
 
     // 2. Collect candidates
-    auto candidates = collect_all_candidates(repos, req->target_bytes);
+    auto candidates = collect_all_candidates(repos, 0);
 
     // 3. Incremental dispatch with predicate checking
     for (auto& weak_batch : candidates) {
@@ -170,10 +174,8 @@ void downgrade_executor::processing_loop()
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
     std::string is_monitor_request = req->is_monitor_request ? "from monitor " : "";
     SIRIUS_LOG_DEBUG(
-      "[downgrade] request {}done: {} target_bytes, {} batches, {} bytes in {:.2f} ms ({:.1f} "
-      "MB/s)",
+      "[downgrade] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s)",
       is_monitor_request,
-      req->target_bytes,
       total_batches,
       total_bytes,
       duration_ms,
@@ -193,7 +195,6 @@ void downgrade_executor::monitor_loop()
       size_t amount = _memory_space->get_amount_to_downgrade();
       if (amount > 0) {
         auto req                = std::make_unique<downgrade_request>();
-        req->target_bytes       = amount;
         req->is_monitor_request = true;
         req->predicate          = [&freed = req->bytes_freed, amount]() {
           return freed.load(std::memory_order_relaxed) >= amount;
@@ -347,9 +348,8 @@ std::vector<std::weak_ptr<cucascade::data_batch>> downgrade_executor::collect_al
 
 std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 {
-  auto req          = std::make_unique<downgrade_request>();
-  req->target_bytes = bytes;
-  req->predicate    = [&freed = req->bytes_freed, bytes]() {
+  auto req       = std::make_unique<downgrade_request>();
+  req->predicate = [&freed = req->bytes_freed, bytes]() {
     return freed.load(std::memory_order_relaxed) >= bytes;
   };
   auto future = req->result.get_future();
@@ -365,16 +365,13 @@ size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
   return request_free_memory(bytes).get();
 }
 
-std::future<size_t> downgrade_executor::request_downgrade(size_t target_bytes,
-                                                          std::function<bool()> predicate)
+std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
-  auto req          = std::make_unique<downgrade_request>();
-  req->target_bytes = target_bytes;
-  req->predicate    = std::move(predicate);
-  auto future       = req->result.get_future();
+  auto req       = std::make_unique<downgrade_request>();
+  req->predicate = std::move(predicate);
+  auto future    = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
-    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request for {} bytes",
-                    target_bytes);
+    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
     req->result.set_value(0);
     return future;
   }
