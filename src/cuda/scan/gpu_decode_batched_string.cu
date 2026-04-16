@@ -45,7 +45,8 @@ struct alignas(8) batched_seg_desc {
   const uint8_t* d_block;  // Device pointer to 256KB block
   uint32_t block_offset;   // Offset within block to segment start
   uint32_t row_count;
-  uint32_t global_row_start;  // Prefix sum of row counts
+  uint32_t global_row_start;  // Prefix sum of row counts (output indexing)
+  uint32_t seg_row_start;     // Offset within segment (input indexing for chunked)
 };
 
 /// Extended descriptor for chunked FSST gather — includes the FSST-local
@@ -103,7 +104,8 @@ static std::vector<batched_seg_desc> expand_to_chunks(
       chunks.push_back({seg.d_block,
                         seg.block_offset,
                         n,
-                        seg.global_row_start + offset});
+                        seg.global_row_start + offset,
+                        offset});  // seg_row_start: offset within segment
       offset += n;
       remaining -= n;
     }
@@ -203,7 +205,8 @@ __global__ void kernel_compute_lengths_dict(const batched_seg_desc* __restrict__
   const uint32_t* d_idx_buf = reinterpret_cast<const uint32_t*>(desc.d_block + sh_idx_buf_off);
 
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    uint32_t sel                         = unpack_value<uint32_t>(d_sel_buf, i, sh_width);
+    uint32_t seg_i                       = desc.seg_row_start + i;
+    uint32_t sel                         = unpack_value<uint32_t>(d_sel_buf, seg_i, sh_width);
     uint32_t len                         = (sel == 0) ? 0 : (d_idx_buf[sel] - d_idx_buf[sel - 1]);
     d_lengths[desc.global_row_start + i] = len;
   }
@@ -370,8 +373,9 @@ __global__ void kernel_compute_lengths_uncompressed(const batched_seg_desc* __re
   const int32_t* duck_offsets = reinterpret_cast<const int32_t*>(base + 8);
 
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    int32_t cur                          = duck_offsets[i];
-    int32_t prev                         = (i > 0) ? duck_offsets[i - 1] : 0;
+    uint32_t seg_i                       = desc.seg_row_start + i;
+    int32_t cur                          = duck_offsets[seg_i];
+    int32_t prev                         = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
     uint32_t abs_cur                     = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
     uint32_t abs_prev                    = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
     d_lengths[desc.global_row_start + i] = abs_cur - abs_prev;
@@ -426,7 +430,8 @@ __global__ void kernel_gather_dict(const batched_seg_desc* __restrict__ descs,
   const uint8_t* d_dict_end = desc.d_block + sh_dict_end_off;
 
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    uint32_t sel = unpack_value<uint32_t>(d_sel_buf, i, sh_width);
+    uint32_t seg_i = desc.seg_row_start + i;
+    uint32_t sel   = unpack_value<uint32_t>(d_sel_buf, seg_i, sh_width);
     if (sel == 0) continue;
 
     uint32_t dict_offset = d_idx_buf[sel];
@@ -658,8 +663,9 @@ __global__ void kernel_gather_uncompressed(const batched_seg_desc* __restrict__ 
   const uint8_t* dict_end     = base + sh_dict_end;
 
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    int32_t cur       = duck_offsets[i];
-    int32_t prev      = (i > 0) ? duck_offsets[i - 1] : 0;
+    uint32_t seg_i    = desc.seg_row_start + i;
+    int32_t cur       = duck_offsets[seg_i];
+    int32_t prev      = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
     uint32_t abs_cur  = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
     uint32_t abs_prev = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
     uint32_t str_len  = abs_cur - abs_prev;
@@ -834,6 +840,7 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     desc.block_offset     = static_cast<uint32_t>(seg.block_offset);
     desc.row_count        = static_cast<uint32_t>(seg.row_count);
     desc.global_row_start = static_cast<uint32_t>(cum_rows);
+    desc.seg_row_start    = 0;
 
     switch (seg.compression) {
       case duckdb::CompressionType::COMPRESSION_DICTIONARY: dict_descs.push_back(desc); break;
