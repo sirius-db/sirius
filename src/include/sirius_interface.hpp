@@ -18,6 +18,7 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "sirius_engine.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 namespace sirius {
 
@@ -64,6 +65,8 @@ class sirius_interface {
   sirius_interface(duckdb::ClientContext& client_context);
   //! The client context
   duckdb::ClientContext& client_context;
+  //! Telemetry context (engine + worker lifetime)
+  telemetry::telemetry_context telemetry;
   //! The currently active query context
   duckdb::unique_ptr<sirius_active_query_context> sirius_active_query;
   //! The current query progress

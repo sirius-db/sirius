@@ -23,6 +23,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/types.hpp"
+#include "instrumentation-bridge/gen/uuid.rs.h"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
 
@@ -282,6 +283,8 @@ class sirius_physical_operator {
     ::cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
+    //! Unique telemetry ID for this source port
+    ::uuid::UUID source_port_uuid{::uuid::now_v7()};
   };
 
   /// Describes a downstream operator's port to which data is pushed
@@ -290,6 +293,8 @@ class sirius_physical_operator {
     sirius_physical_operator* next_operator;
     //! The port name on the downstream operator to push data into
     std::string_view next_operator_port_name;
+    //! Unique telemetry ID for this pseudo-sink port (assigned by add_next_port_after_sink)
+    ::uuid::UUID pseudo_sink_port_uuid;
   };
 
   // source pipeline pushed to repo of the ports
@@ -344,6 +349,9 @@ class sirius_physical_operator {
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
 
   void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
+
+  //! Get the pipeline UUID for telemetry
+  const ::uuid::UUID& get_pipeline_uuid() const;
 
  protected:
   duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;

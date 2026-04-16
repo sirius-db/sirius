@@ -16,12 +16,19 @@
 
 #include "planner/query.hpp"
 
+#include "sirius_engine.hpp"
+#include "sirius_interface.hpp"
+#include "telemetry/telemetry_context.hpp"
+
 namespace sirius::planner {
 
-query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines)
-  : _pipelines(std::move(pipelines))
+query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
+             sirius_engine& engine)
+  : _plan_id(::uuid::now_v7()), _pipelines(std::move(pipelines))
 {
   build_indices();
+  telemetry::emit_plan_telemetry(
+    engine.sirius_iface.telemetry, _pipelines, _plan_id, engine.query_handle->uuid());
 }
 
 void query::build_indices()

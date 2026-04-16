@@ -29,6 +29,10 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include "instrumentation-bridge/gen/query.rs.h"
+#include "instrumentation-bridge/gen/query_group.rs.h"
+#include "instrumentation-bridge/gen/uuid.rs.h"
+
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,9 +56,8 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
-    : context(context), sirius_iface(sirius_iface) {};
-  ~sirius_engine() {}
+  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface);
+  ~sirius_engine();
 
   duckdb::ClientContext& context;
   sirius_interface& sirius_iface;
@@ -126,6 +129,13 @@ class sirius_engine {
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
+
+  // ---------------------------------------------------------------------------
+  // Telemetry
+  // ---------------------------------------------------------------------------
+  ::uuid::UUID query_group_uuid;
+  ::rust::Box<::quent::query_group::QueryGroupObserver> query_group_observer;
+  ::rust::Box<::quent::query::QueryHandle> query_handle;
 };
 
 }  // namespace sirius

@@ -1,0 +1,12 @@
+[package]
+name = "instrumentation-model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+quent-attributes  = { path = "/home/dvats/repos/quent/crates/attributes" }
+quent-model  = { path = "/home/dvats/repos/quent/crates/model" }
+quent-query-engine-model = { path = "/home/dvats/repos/quent/domains/query_engine/model" }
+quent-stdlib = { path = "/home/dvats/repos/quent/crates/stdlib" }
+serde.workspace = true
+uuid = { workspace = true, features = ["serde", "v7"] }

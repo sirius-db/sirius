@@ -351,10 +351,11 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
 }
 
 void SiriusContext::create_query(
-  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines)
+  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+  sirius::sirius_engine& engine)
 {
   throw_if_not_initialized();
-  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
+  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), engine);
   pipeline_executor_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
 }

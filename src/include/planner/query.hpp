@@ -17,8 +17,13 @@
 #pragma once
 
 #include "duckdb/common/unordered_map.hpp"
+#include "instrumentation-bridge/gen/uuid.rs.h"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+
+namespace sirius {
+class sirius_engine;
+}  // namespace sirius
 
 namespace sirius::planner {
 
@@ -35,8 +40,10 @@ class query {
    * @brief Construct a new query object.
    *
    * @param pipelines The ordered pipelines required to execute this query.
+   * @param engine The engine executing this query (provides telemetry context).
    */
-  explicit query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines);
+  query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
+        sirius_engine& engine);
 
   ~query() = default;
 
@@ -76,6 +83,8 @@ class query {
   //! Builds the internal data structures from the pipelines
   void build_indices();
 
+  //! Unique telemetry ID for this plan
+  ::uuid::UUID _plan_id;
   //! Pipelines and the order in which they must be executed in order to successfully complete the
   // query.
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> _pipelines;

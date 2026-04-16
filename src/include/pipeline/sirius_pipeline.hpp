@@ -26,6 +26,7 @@
 #include "common/optional_ptr.hpp"
 #include "common/reference_map.hpp"
 #include "duckdb/parallel/pipeline.hpp"
+#include "instrumentation-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
 namespace sirius {
@@ -89,6 +90,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
  public:
   explicit sirius_pipeline(sirius_engine& engine);
   virtual ~sirius_pipeline() = default;
+
+  //! Unique telemetry UUID for this pipeline (one per pipeline instance)
+  ::uuid::UUID pipeline_uuid{::uuid::now_v7()};
 
  public:
   duckdb::ClientContext& get_client_context();

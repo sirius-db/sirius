@@ -40,6 +40,10 @@ namespace cucascade::memory {
 class small_pinned_host_memory_resource;
 }  // namespace cucascade::memory
 
+namespace sirius {
+class sirius_engine;
+}  // namespace sirius
+
 namespace duckdb {
 
 /// \brief Manages the lifetime of the sirius_context within a DuckDB ClientContext.
@@ -142,8 +146,10 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
+  /// \param engine The engine executing this query (provides telemetry context).
   void create_query(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines);
+    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+    sirius::sirius_engine& engine);
 
   /// \brief Get the current query.
   [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();

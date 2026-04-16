@@ -26,6 +26,11 @@ pre-commit = "*"
 clang-tools = ">=21.1.8,<22"
 pkg-config = "*"
 mold = "*"
+libprotobuf = "*"
+rust = "1.94.*"
+rust-src = "1.94.*"
+nodejs = ">=24"
+pnpm = "*"
 
 [feature.dev-libs.dependencies]
 librmm = "*"

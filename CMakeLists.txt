@@ -91,6 +91,9 @@ set(WARNINGS_AS_ERRORS
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
+# Rust telemetry instrumentation (C++ FFI via Corrosion)
+add_subdirectory(rust/crates/telemetry/bridge)
+
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
@@ -197,6 +200,7 @@ set(EXTENSION_SOURCES
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp
+    src/telemetry_context.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
     src/util/stream_check_wrapper.cpp
@@ -274,7 +278,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   endif()
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-                        cuCascade::cucascade)
+                        cuCascade::cucascade instrumentation_bridge)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -284,9 +288,9 @@ target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
                       absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
-# cucascade_static)
+# cucascade_static / instrumentation_bridge)
 install(
-  TARGETS sirius_extension cucascade_static
+  TARGETS sirius_extension cucascade_static instrumentation_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

@@ -1,0 +1,17 @@
+[package]
+name = "instrumentation-bridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "instrumentation_bridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1"
+instrumentation-model = { path = "../model" }
+
+[build-dependencies]
+quent-codegen  = { path = "/home/dvats/repos/quent/crates/codegen" }
+cxx-build = "1"
+instrumentation-model = { path = "../model" }
