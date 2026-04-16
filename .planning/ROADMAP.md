@@ -73,7 +73,7 @@ Plans:
 **Plans:** 1 plan
 
 Plans:
-- [ ] 09-01-PLAN.md — Refactor lock_or_prepare_batch to delegate conversion to convertible_data_batch::convert(), thread res_mgr through call chain, document functional diff
+- [x] 09-01-PLAN.md — Refactor lock_or_prepare_batch to delegate conversion to convertible_data_batch::convert(), thread res_mgr through call chain, document functional diff
 
 ## Progress
 
