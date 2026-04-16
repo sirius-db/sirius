@@ -135,6 +135,9 @@ class pipeline_executor {
 
   [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
 
+  /// @brief Number of threads in the scan executor thread pool.
+  [[nodiscard]] int32_t get_scan_executor_num_threads() const noexcept;
+
   /**
    * @brief Configure scan result caching level
    *

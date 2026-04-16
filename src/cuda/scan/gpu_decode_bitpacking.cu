@@ -150,6 +150,8 @@ __global__ void kernel_parse_and_decode_segment_fused(const uint8_t* __restrict_
   for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
     memcpy(&shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
   }
+  // Zero guard word so 3-word unpack_value reads don't get garbage
+  if (threadIdx.x == 0) shmem[packed_words] = 0;
   __syncthreads();
 
   if (mode == BitpackingMode::FOR) {
@@ -226,8 +228,9 @@ static void decode_typed(const uint8_t* segment_data,
   uint32_t num_groups          = (row_count + BP_META_GROUP_SIZE - 1) / BP_META_GROUP_SIZE;
   constexpr uint32_t BLOCK_DIM = 256;
   // Conservative upper bound: max bitpacking width is sizeof(T)*8 bits.
+  // +1 guard word for 3-word unpack_value reads on 64-bit types.
   constexpr uint32_t max_width        = sizeof(T) * 8;
-  constexpr uint32_t max_packed_words = (BP_META_GROUP_SIZE * max_width + 31) / 32;
+  constexpr uint32_t max_packed_words = (BP_META_GROUP_SIZE * max_width + 31) / 32 + 1;
   constexpr size_t shmem_bytes        = max_packed_words * sizeof(uint32_t);
 
   kernel_parse_and_decode_segment_fused<T><<<num_groups, BLOCK_DIM, shmem_bytes, stream.value()>>>(
@@ -451,6 +454,8 @@ __global__ void kernel_decode_bitpacking_batched(
   for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
     memcpy(&shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
   }
+  // Zero guard word so 3-word unpack_value reads don't get garbage
+  if (threadIdx.x == 0) shmem[packed_words] = 0;
   __syncthreads();
 
   if (mode == BitpackingMode::FOR) {
@@ -512,7 +517,8 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
 
   constexpr uint32_t BLOCK_DIM       = 256;
   constexpr uint32_t max_width       = sizeof(T) * 8;
-  constexpr uint32_t max_packed_words = (BP_META_GROUP_SIZE * max_width + 31) / 32;
+  // +1 guard word for 3-word unpack_value reads on 64-bit types.
+  constexpr uint32_t max_packed_words = (BP_META_GROUP_SIZE * max_width + 31) / 32 + 1;
   constexpr size_t shmem_bytes       = max_packed_words * sizeof(uint32_t);
 
   kernel_decode_bitpacking_batched<T>

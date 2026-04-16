@@ -1,0 +1,27 @@
+kernel                                                             total_ms      calls       avg_us      
+-----------------------------------------------------------------  ------------  ----------  ------------
+cudf::groupby::detail::hash::<unnamed>::single_pass_shmem_aggs_ke  811.6 ms      148         5483.8 us   
+void cudf::groupby::detail::hash::mapping_indices_kernel<cuco::st  173.6 ms      148         1172.8 us   
+void sirius::cuda::scan::kernel_decode_bitpacking_batched<long>(c  96.9 ms       2304        42.1 us     
+void cub::detail::batch_memcpy::BatchMemcpyKernel<cub::detail::ba  57.0 ms       292         195.1 us    
+void cub::detail::scan::DeviceScanKernel<cub::detail::scan::polic  30.9 ms       588         52.6 us     
+sirius::cuda::scan::kernel_gather_dict(const sirius::cuda::scan::  30.5 ms       1152        26.5 us     
+void cub::detail::transform::transform_kernel<cub::detail::transf  30.3 ms       584         51.8 us     
+void cudf::strings::detail::fused_concatenate_string_offset_kerne  27.9 ms       294         94.7 us     
+void cub::detail::for_each::static_kernel<cub::detail::for_each::  27.2 ms       292         93.1 us     
+void sirius::cuda::scan::kernel_decode_bitpacking_batched<int>(co  21.7 ms       576         37.6 us     
+sirius::cuda::scan::kernel_compute_lengths_dict(const sirius::cud  21.2 ms       1152        18.4 us     
+void cub::detail::scan::DeviceScanKernel<cub::detail::scan::polic  20.5 ms       1152        17.8 us     
+void cub::detail::for_each::static_kernel<cub::detail::for_each::  14.9 ms       146         101.8 us    
+void cub::detail::for_each::static_kernel<cub::detail::for_each::  14.0 ms       146         96.1 us     
+void cub::detail::for_each::static_kernel<cub::detail::for_each::  11.4 ms       146         78.2 us     
+void cub::detail::select::DeviceSelectSweepKernel<cub::detail::se  8.0 ms        146         54.7 us     
+void cub::detail::select::DeviceSelectSweepKernel<cub::detail::se  6.8 ms        148         45.8 us     
+void cub::detail::transform::transform_kernel<cub::detail::transf  6.6 ms        146         44.9 us     
+sirius::cuda::scan::kernel_write_sentinel(const unsigned int *, c  4.7 ms        1152        4.1 us      
+void cub::detail::scan::DeviceScanInitKernel<cub::ScanTileState<u  4.3 ms        1152        3.7 us      
+void cub::detail::transform::transform_kernel<cub::detail::transf  3.9 ms        1022        3.8 us      
+void cub::detail::transform::transform_kernel<cub::detail::transf  3.4 ms        1030        3.3 us      
+void cub::detail::scan::DeviceScanKernel<cub::detail::scan::polic  3.1 ms        294         10.6 us     
+void cudf::detail::<unnamed>::fused_concatenate_kernel<long, (int  2.9 ms        26          111.2 us    
+void cudf::strings::detail::gather_chars_fn_char_parallel<(int)32  2.3 ms        296         7.7 us      

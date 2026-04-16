@@ -142,6 +142,11 @@ pipeline_executor::get_scan_executor() noexcept
   return *_scan_executor;
 }
 
+int32_t pipeline_executor::get_scan_executor_num_threads() const noexcept
+{
+  return _scan_executor ? _scan_executor->get_num_threads() : 1;
+}
+
 void pipeline_executor::set_scan_caching_config(sirius::op::scan::cache_level level)
 {
   _scan_executor->set_scan_caching_enabled(level);

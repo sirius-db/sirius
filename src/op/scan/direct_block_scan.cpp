@@ -24,7 +24,9 @@
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 
+#include <cuda_runtime.h>
 #include <sys/mman.h>
+#include <cstdlib>
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22  // Linux 5.14+, may not be in older glibc headers
 #endif
@@ -118,21 +120,51 @@ static mmap_file_state* get_or_create_mmap(const std::string& path)
   state.base = static_cast<uint8_t*>(mapped);
   state.size = file_size;
 
-  // Force all pages into RAM so cudaMemcpyAsync never hits a page fault.
-  // CUDA's internal staging thread segfaults on lazy mmap page faults (PCIe systems).
-  // MADV_POPULATE_READ (Linux 5.14+) faults in all pages synchronously.
-  if (::madvise(mapped, file_size, MADV_POPULATE_READ) != 0) {
-    // Fallback: touch every page manually
-    volatile uint8_t sink = 0;
-    auto* p = static_cast<uint8_t*>(mapped);
-    for (size_t off = 0; off < file_size; off += 4096) {
-      sink = p[off];
+  // Whether to prefault pages. Default: auto-detect.
+  //   - PCIe systems (RTX 6000 etc.): MUST prefault — CUDA's internal staging
+  //     thread segfaults on lazy mmap page faults during cudaMemcpyAsync.
+  //   - Unified-memory systems (GH200): prefault is unnecessary — ATS handles
+  //     page faults via the GPU's copy engine transparently. Skipping prefault
+  //     saves ~16-19s per cold query (the time to read the whole DB file).
+  //
+  // Auto-detection uses cudaDeviceProp::pageableMemoryAccessUsesHostPageTables
+  // (TRUE on GH200, FALSE on PCIe). Override via SIRIUS_MMAP_PREFAULT=0/1.
+  auto should_prefault = []() {
+    if (const char* env = std::getenv("SIRIUS_MMAP_PREFAULT")) {
+      return env[0] != '0';
     }
-    (void)sink;
-    SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — pages populated (fallback)",
-                    path, file_size / 1e6);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int uses_host_pt = 0;
+    if (cudaDeviceGetAttribute(&uses_host_pt,
+                               cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) {
+      return true;  // Safe default: prefault
+    }
+    return uses_host_pt == 0;  // PCIe (0) → prefault; unified memory (1) → skip
+  };
+
+  if (should_prefault()) {
+    // Force all pages into RAM so cudaMemcpyAsync never hits a page fault.
+    // MADV_POPULATE_READ (Linux 5.14+) faults in all pages synchronously.
+    if (::madvise(mapped, file_size, MADV_POPULATE_READ) != 0) {
+      // Fallback: touch every page manually
+      volatile uint8_t sink = 0;
+      auto* p = static_cast<uint8_t*>(mapped);
+      for (size_t off = 0; off < file_size; off += 4096) {
+        sink = p[off];
+      }
+      (void)sink;
+      SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — pages populated (fallback)",
+                      path, file_size / 1e6);
+    } else {
+      SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — pages populated",
+                      path, file_size / 1e6);
+    }
   } else {
-    SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — pages populated",
+    // Lazy page faults — suitable for unified-memory systems (GH200).
+    // Hint sequential access so the kernel can prefetch on demand.
+    ::madvise(mapped, file_size, MADV_SEQUENTIAL);
+    SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — lazy faults (unified memory)",
                     path, file_size / 1e6);
   }
   return &state;
@@ -140,6 +172,11 @@ static mmap_file_state* get_or_create_mmap(const std::string& path)
 
 static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
 {
+  // SIRIUS_DISABLE_MMAP=1 forces the Pin() path (DuckDB buffer manager).
+  // Used to measure the cost of mmap vs DuckDB-managed block access.
+  if (const char* env = std::getenv("SIRIUS_DISABLE_MMAP")) {
+    if (env[0] != '0') return nullptr;
+  }
   try {
     auto& db   = storage.GetAttached();
     auto& smgr = db.GetStorageManager();

@@ -1,0 +1,17 @@
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬───────────┐
+│                                                                                                  URL                                                                                                  │ PageViews │
+│                                                                                                varchar                                                                                                │   int64   │
+├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────┤
+│ http://guid=6&pw=0&price_ot=&price_do=&currency=RUR/page                                                                                                                                              │         2 │
+│ http://kinopoisk.ru/index.ru/hotel/bazarevka-dlia-zhie/31974870/meningline=&int[225686.htm?from]=&int[215938/photo/dent                                                                               │         2 │
+│ http://nbprice=140003615f3830346331663386                                                                                                                                                             │         2 │
+│ http:%2F%2Fwwww.bonprix.ru/bana/count=0&vip=0&cost_newcom                                                                                                                                             │         2 │
+│ http://lib.ru/exp?sid=3205&bt=7&bn=1&body.mp3.ucoze.ru/sale/secondary                                                                                                                                 │         2 │
+│ http://maps#ru_5_ru_22106.37766/men.aspx#location/topic.php?razdnuyu-komnatalog/27017363_ru_240,bonprix.ru/uln/plata.ru/news/detail9436940/?date_id=0&qid=400361453.116 Safari%2F5.0 (Windows NT 6.1; │         2 │
+│ http://maps#ru_5_ru_22106.37766/men.aspx#location/topic.php?razdnuyu-komnatalog/27017339/0/&&puid2=24142/photos/274255&op_categoriya                                                                  │         2 │
+│ http://video.yandex.ru/air/novosibirsk.ru/jobinmoscow                                                                                                                                                 │         2 │
+│ http://maps#ru_5_ru_22106.37766/men.aspx#location/topic.php?razdnuyu-komnatalog/27017339/0/&&puid2=240&lo                                                                                             │         2 │
+│ http://orenburg/details/?category/3578/2                                                                                                                                                              │         2 │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴───────────┘
+  10 rows                                                                                                                                                                                                 2 columns
+Run Time (s): real 0.033 user 0.051558 sys 0.076576

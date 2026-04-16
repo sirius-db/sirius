@@ -1,0 +1,10 @@
+category    bytes       time     bandwidth   calls
+----------  ----------  -------  ----------  -----
+H2D_copies  11619.2 MB  76.9 ms  151.1 GB/s  11854
+D2H_copies  0.0 MB      1.6 ms   0.0 GB/s    440  
+category          time       calls
+----------------  ---------  -----
+GPU_kernel_total  1451.0 ms  17744
+category        time       calls  avg_us  
+--------------  ---------  -----  --------
+cudaStreamSync  4313.4 ms  16895  255.3 us

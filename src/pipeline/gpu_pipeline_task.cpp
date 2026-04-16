@@ -143,7 +143,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
     }
   }
   SIRIUS_LOG_INFO(
-    "[gpu_op] pipeline={} op={} (id={}) submit_us={} rows_out={} peak_mb={:.1f}",
+    "[gpu_op] pipeline={} op={} (id={}) time_us={} rows_out={} peak_mb={:.1f}",
     pipeline->get_pipeline_id(),
     op.get_name(),
     op.get_operator_id(),
