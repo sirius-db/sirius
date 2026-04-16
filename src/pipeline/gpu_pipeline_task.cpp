@@ -125,12 +125,9 @@ std::unique_ptr<op::operator_data> run_one_operator(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
 
-  // No stream.synchronize() between operators — GPU work on the same
-  // stream is already serialized by CUDA.  The per-operator sync was
-  // the single largest overhead (19K+ calls × 33µs = 644ms on Q1 SF100).
-  // For accurate per-operator GPU timing, use nsys with the NVTX ranges above.
   auto start                = std::chrono::high_resolution_clock::now();
   auto operator_output_data = op.execute(operator_input_data, stream);
+  stream.synchronize();
   auto end                  = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
