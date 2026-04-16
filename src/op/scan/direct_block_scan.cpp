@@ -7,8 +7,6 @@
 
 #include <log/logging.hpp>
 
-#include <duckdb/storage/storage_manager.hpp>
-
 // duckdb
 #include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
@@ -16,6 +14,7 @@
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/column_segment_tree.hpp>
@@ -24,12 +23,7 @@
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 
-#include <cuda_runtime.h>
 #include <sys/mman.h>
-#include <cstdlib>
-#ifndef MADV_POPULATE_READ
-#define MADV_POPULATE_READ 22  // Linux 5.14+, may not be in older glibc headers
-#endif
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -74,29 +68,31 @@ static void extract_constant_from_stats(const duckdb::ColumnSegment& segment, ui
 //===----------------------------------------------------------------------===//
 // Direct mmap — bypass BufferManager::Pin() for read-only databases
 //
-// Thread-safe: mmap cache uses a mutex, block layout is discovered once
-// via std::call_once and published atomically.
+// Uses a lazy MAP_SHARED mmap of the .duckdb file. No MADV_POPULATE_READ:
+// CUDA's internal copy engine does a CPU-side memcpy from pageable memory
+// into a pinned staging buffer before DMA, and that CPU memcpy handles page
+// faults normally. On unified-memory systems (GH200), CUDA faults pages via
+// ATS without any staging buffer at all.
+//
+// SIRIUS_DISABLE_MMAP=1 forces Pin() for benchmarking.
 //===----------------------------------------------------------------------===//
 
-/// Per-file mmap state.
 struct mmap_file_state {
   uint8_t* base = nullptr;
-  size_t size   = 0;
+  size_t   size = 0;
 };
 
 static std::mutex g_mmap_mutex;
 static std::unordered_map<std::string, mmap_file_state> g_mmap_cache;
 
-/// Block layout discovered at runtime from the first segment's BlockHandle.
-/// Immutable after initialization — safe to read from any thread.
 struct block_layout_info {
-  size_t alloc_size    = 0;   // e.g. 262144 (256KB)
-  size_t hdr_size      = 0;   // e.g. 8
-  size_t block_start   = 0;   // file offset where block 0 begins (discovered, not hardcoded)
-  bool   valid         = false;
+  size_t alloc_size  = 0;
+  size_t hdr_size    = 0;
+  size_t block_start = 0;
+  bool   valid       = false;
 };
 
-static std::once_flag g_layout_once;
+static std::once_flag    g_layout_once;
 static block_layout_info g_layout;
 
 static mmap_file_state* get_or_create_mmap(const std::string& path)
@@ -120,75 +116,25 @@ static mmap_file_state* get_or_create_mmap(const std::string& path)
   state.base = static_cast<uint8_t*>(mapped);
   state.size = file_size;
 
-  // Whether to prefault pages. Default: auto-detect.
-  //   - PCIe systems (RTX 6000 etc.): MUST prefault — CUDA's internal staging
-  //     thread segfaults on lazy mmap page faults during cudaMemcpyAsync.
-  //   - Unified-memory systems (GH200): prefault is unnecessary — ATS handles
-  //     page faults via the GPU's copy engine transparently. Skipping prefault
-  //     saves ~16-19s per cold query (the time to read the whole DB file).
-  //
-  // Auto-detection uses cudaDeviceProp::pageableMemoryAccessUsesHostPageTables
-  // (TRUE on GH200, FALSE on PCIe). Override via SIRIUS_MMAP_PREFAULT=0/1.
-  auto should_prefault = []() {
-    if (const char* env = std::getenv("SIRIUS_MMAP_PREFAULT")) {
-      return env[0] != '0';
-    }
-    int dev = 0;
-    cudaGetDevice(&dev);
-    int uses_host_pt = 0;
-    if (cudaDeviceGetAttribute(&uses_host_pt,
-                               cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) {
-      return true;  // Safe default: prefault
-    }
-    return uses_host_pt == 0;  // PCIe (0) → prefault; unified memory (1) → skip
-  };
-
-  if (should_prefault()) {
-    // Force all pages into RAM so cudaMemcpyAsync never hits a page fault.
-    // MADV_POPULATE_READ (Linux 5.14+) faults in all pages synchronously.
-    if (::madvise(mapped, file_size, MADV_POPULATE_READ) != 0) {
-      // Fallback: touch every page manually
-      volatile uint8_t sink = 0;
-      auto* p = static_cast<uint8_t*>(mapped);
-      for (size_t off = 0; off < file_size; off += 4096) {
-        sink = p[off];
-      }
-      (void)sink;
-      SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — pages populated (fallback)",
-                      path, file_size / 1e6);
-    } else {
-      SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — pages populated",
-                      path, file_size / 1e6);
-    }
-  } else {
-    // Lazy page faults — suitable for unified-memory systems (GH200).
-    // Hint sequential access so the kernel can prefetch on demand.
-    ::madvise(mapped, file_size, MADV_SEQUENTIAL);
-    SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — lazy faults (unified memory)",
-                    path, file_size / 1e6);
-  }
+  SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — lazy faults",
+                  path, file_size / 1e6);
   return &state;
 }
 
 static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
 {
-  // SIRIUS_DISABLE_MMAP=1 forces the Pin() path (DuckDB buffer manager).
-  // Used to measure the cost of mmap vs DuckDB-managed block access.
   if (const char* env = std::getenv("SIRIUS_DISABLE_MMAP")) {
     if (env[0] != '0') return nullptr;
   }
   try {
     auto& db   = storage.GetAttached();
     auto& smgr = db.GetStorageManager();
-    auto path  = smgr.GetDBPath();
+    auto  path = smgr.GetDBPath();
     if (!path.empty()) return get_or_create_mmap(path);
   } catch (...) {}
   return nullptr;
 }
 
-/// Discover block layout by comparing one Pin() pointer against the mmap base.
-/// Called exactly once via std::call_once. If anything fails, g_layout.valid stays false
-/// and we fall back to Pin() for everything.
 static void discover_block_layout(duckdb::ColumnSegment& segment,
                                   duckdb::BufferManager& buffer_manager,
                                   const mmap_file_state& mmap_state)
@@ -197,71 +143,32 @@ static void discover_block_layout(duckdb::ColumnSegment& segment,
 
   g_layout.alloc_size = segment.block->GetBlockAllocSize();
   g_layout.hdr_size   = segment.block->GetBlockHeaderSize();
-
   if (g_layout.alloc_size == 0) return;
 
-  // Pin the block to get the canonical host pointer
-  auto pin_handle  = buffer_manager.Pin(segment.block);
-  auto block_id    = segment.GetBlockId();
-  auto block_off   = segment.GetBlockOffset();
-  auto* pin_ptr    = pin_handle.Ptr() + block_off;
+  auto pin_handle = buffer_manager.Pin(segment.block);
+  auto block_id   = segment.GetBlockId();
+  auto block_off  = segment.GetBlockOffset();
+  auto* pin_ptr   = pin_handle.Ptr() + block_off;
 
-  // Reverse-engineer BLOCK_START:
-  //   pin_ptr == mmap_base + BLOCK_START + block_id * alloc_size + hdr_size + block_off
-  // So:
-  //   BLOCK_START = (pin_ptr - mmap_base) - block_id * alloc_size - hdr_size - block_off
-  //
-  // But pin_ptr is a DuckDB buffer pool pointer, NOT an mmap pointer.
-  // We can't subtract them directly. Instead, compute the expected mmap pointer
-  // and validate that the data matches.
-
-  // DuckDB file layout: 3 header pages × FILE_HEADER_SIZE, then blocks.
-  // FILE_HEADER_SIZE is 4096 in all known DuckDB versions.
-  // Try the known value and validate.
   constexpr size_t CANDIDATE_BLOCK_START = 4096 * 3;  // 12288
-
   size_t byte_offset = CANDIDATE_BLOCK_START
                      + static_cast<size_t>(block_id) * g_layout.alloc_size
                      + g_layout.hdr_size + block_off;
 
-  if (byte_offset + 64 > mmap_state.size) return;  // OOB
-
+  if (byte_offset + 64 > mmap_state.size) return;
   auto* mmap_ptr = mmap_state.base + byte_offset;
 
-  // Validate: first 64 bytes must match Pin() data
   if (std::memcmp(mmap_ptr, pin_ptr, std::min<size_t>(64, segment.SegmentSize())) != 0) {
-    SIRIUS_LOG_ERROR(
-      "[direct_block_scan] mmap validation FAILED — block_id={} offset={} "
-      "mmap_data={:02x}{:02x}{:02x}{:02x} pin_data={:02x}{:02x}{:02x}{:02x}. "
-      "Disabling mmap bypass.",
-      block_id, block_off,
-      mmap_ptr[0], mmap_ptr[1], mmap_ptr[2], mmap_ptr[3],
-      pin_ptr[0], pin_ptr[1], pin_ptr[2], pin_ptr[3]);
-    return;  // g_layout.valid stays false
+    SIRIUS_LOG_ERROR("[direct_block_scan] mmap validation FAILED — disabling mmap bypass.");
+    return;
   }
 
   g_layout.block_start = CANDIDATE_BLOCK_START;
   g_layout.valid       = true;
-  SIRIUS_LOG_INFO(
-    "[direct_block_scan] block layout discovered: alloc_size={}, hdr_size={}, "
-    "block_start={} — mmap data VALIDATED",
-    g_layout.alloc_size, g_layout.hdr_size, g_layout.block_start);
+  SIRIUS_LOG_INFO("[direct_block_scan] block layout ok: alloc={} hdr={} start={}",
+                  g_layout.alloc_size, g_layout.hdr_size, g_layout.block_start);
 }
 
-/// Compute mmap pointer for a segment's data within a block.
-/// Returns the data pointer (after header + block_offset), or nullptr if OOB.
-///
-/// IMPORTANT: The bulk H2D in compute_task does `data_ptr - block_offset` to get
-/// the block base, then copies DUCKDB_BLOCK_SIZE (= alloc_size) bytes.
-/// With Pin(), this base is Ptr() which is `heap_buf + hdr_size`, and the heap
-/// buffer has alloc_size bytes from Ptr() due to allocator padding.
-/// With mmap, there's NO padding — the file is packed. To avoid overreading
-/// by hdr_size bytes, we set data_ptr and out_block_offset so that:
-///   data_ptr - out_block_offset = block_start (BEFORE header)
-///   copy of alloc_size bytes from block_start stays within the block
-///
-/// We achieve this by pointing data_ptr to `block_start + (hdr_size + block_offset)`
-/// and setting out_block_offset to `hdr_size + block_offset`.
 static inline uint8_t* mmap_block_data_ptr(const mmap_file_state& mmap_state,
                                            duckdb::block_id_t block_id,
                                            size_t block_offset,
@@ -271,7 +178,6 @@ static inline uint8_t* mmap_block_data_ptr(const mmap_file_state& mmap_state,
                            + static_cast<size_t>(block_id) * g_layout.alloc_size;
   size_t data_file_offset  = block_file_offset + g_layout.hdr_size + block_offset;
   if (data_file_offset >= mmap_state.size) return nullptr;
-  // Adjust block_offset to include header so that (data_ptr - block_offset) = block_start
   out_block_offset = g_layout.hdr_size + block_offset;
   return mmap_state.base + data_file_offset;
 }
@@ -304,7 +210,6 @@ direct_block_scan_result scan_segment_tree(duckdb::ColumnData& col_data,
       seg_info.compression  = segment.GetCompressionType();
       result.total_pinned_bytes += segment.SegmentSize();
 
-      // Discover block layout once (thread-safe)
       if (mmap_state) {
         std::call_once(g_layout_once, discover_block_layout,
                        std::ref(segment), std::ref(buffer_manager), std::cref(*mmap_state));
@@ -317,7 +222,7 @@ direct_block_scan_result scan_segment_tree(duckdb::ColumnData& col_data,
                                              seg_info.block_offset, adjusted_offset);
         if (mmap_ptr) {
           seg_info.data_ptr     = mmap_ptr;
-          seg_info.block_offset = adjusted_offset;  // includes hdr_size for safe bulk H2D
+          seg_info.block_offset = adjusted_offset;
           used_mmap = true;
         }
       }
