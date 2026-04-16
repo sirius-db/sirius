@@ -325,7 +325,6 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
-    return true;
   }
 
   /// \brief check if all tasks have been processed
@@ -333,7 +332,6 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
-    return true;
   }
 
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
@@ -343,8 +341,6 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
-  //! Check if the pipeline is finished
-  bool check_pipeline_finished();
 
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
