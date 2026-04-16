@@ -95,14 +95,19 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     case type_id::TINYINT: return cudf::data_type(cudf::type_id::INT8);
     case type_id::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case type_id::INTEGER: return cudf::data_type(cudf::type_id::INT32);
-    case type_id::BIGINT:
-    case type_id::HUGEINT:  // FIXME: unsafe conversion from HUGEINT to INT64 (no INT128 in cuDF)
+    case type_id::BIGINT: return cudf::data_type(cudf::type_id::INT64);
+    case type_id::HUGEINT:
+      // FIXME: unsafe 128→64-bit narrowing: DuckDB HUGEINT is INT128 but cuDF has no INT128.
+      // Values outside INT64 range are silently corrupted. Matches legacy duckdb::GetCudfType().
       return cudf::data_type(cudf::type_id::INT64);
     case type_id::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case type_id::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case type_id::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
-    case type_id::UBIGINT:
-    case type_id::UHUGEINT: return cudf::data_type(cudf::type_id::UINT64);
+    case type_id::UBIGINT: return cudf::data_type(cudf::type_id::UINT64);
+    case type_id::UHUGEINT:
+      // FIXME: unsafe 128→64-bit narrowing: DuckDB UHUGEINT is UINT128 but cuDF has no UINT128.
+      // Values outside UINT64 range are silently corrupted. Matches legacy duckdb::GetCudfType().
+      return cudf::data_type(cudf::type_id::UINT64);
     case type_id::FLOAT: return cudf::data_type(cudf::type_id::FLOAT32);
     case type_id::DOUBLE: return cudf::data_type(cudf::type_id::FLOAT64);
     case type_id::BOOLEAN: return cudf::data_type(cudf::type_id::BOOL8);
@@ -121,8 +126,15 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     case type_id::DECIMAL: {
       // cuDF uses negative scale convention; precision determines the storage width.
       auto const neg_scale = static_cast<int32_t>(-t.decimal_scale());
-      if (t.decimal_precision() <= 9) return cudf::data_type(cudf::type_id::DECIMAL32, neg_scale);
-      if (t.decimal_precision() <= 18) return cudf::data_type(cudf::type_id::DECIMAL64, neg_scale);
+      if (t.decimal_precision() <= logical_type::decimal_max_precision_int16)
+        throw duckdb::InvalidInputException(
+          "sirius::get_cudf_type: DECIMAL with precision <= %d is stored as INT16 in DuckDB "
+          "and has no direct cuDF equivalent — use DuckDB CPU fallback",
+          logical_type::decimal_max_precision_int16);
+      if (t.decimal_precision() <= logical_type::decimal_max_precision_int32)
+        return cudf::data_type(cudf::type_id::DECIMAL32, neg_scale);
+      if (t.decimal_precision() <= logical_type::decimal_max_precision_int64)
+        return cudf::data_type(cudf::type_id::DECIMAL64, neg_scale);
       return cudf::data_type(cudf::type_id::DECIMAL128, neg_scale);
     }
     default:

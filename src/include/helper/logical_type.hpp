@@ -77,6 +77,20 @@ enum class type_id : uint8_t {
 class logical_type {
  public:
   //===--------------------------------------------------------------------===//
+  // DECIMAL precision thresholds
+  //
+  // Maximum number of decimal digits representable in each signed integer width.
+  // These mirror duckdb::Decimal::MAX_WIDTH_INT{16,32,64,128} and determine
+  // the physical storage type (INT16/32/64/128) for a given DECIMAL precision.
+  //===--------------------------------------------------------------------===//
+  static constexpr uint8_t decimal_max_precision_int16 =
+    4;  ///< INT16  (2B): up to 4 digits (max 9,999)
+  static constexpr uint8_t decimal_max_precision_int32 =
+    9;  ///< INT32  (4B): up to 9 digits (max 999,999,999)
+  static constexpr uint8_t decimal_max_precision_int64  = 18;  ///< INT64  (8B): up to 18 digits
+  static constexpr uint8_t decimal_max_precision_int128 = 38;  ///< INT128 (16B): up to 38 digits
+
+  //===--------------------------------------------------------------------===//
   // Constructors / factories
   //===--------------------------------------------------------------------===//
 
@@ -202,10 +216,10 @@ class logical_type {
       case type_id::TIMESTAMP:
       case type_id::TIMESTAMP_NS: return 8;
       case type_id::DECIMAL:
-        if (_precision <= 9) return 4;   // DECIMAL32
-        if (_precision <= 18) return 8;  // DECIMAL64
-        return 16;                       // DECIMAL128
-      case type_id::VARCHAR: return 0;   // variable-length
+        if (_precision <= decimal_max_precision_int32) return 4;  // DECIMAL32
+        if (_precision <= decimal_max_precision_int64) return 8;  // DECIMAL64
+        return 16;                                                // DECIMAL128
+      case type_id::VARCHAR: return 0;                            // variable-length
       case type_id::LIST:
       case type_id::STRUCT:
       case type_id::SQLNULL:

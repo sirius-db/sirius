@@ -80,7 +80,9 @@ duckdb::LogicalType to_duckdb(const logical_type& t)
     case type_id::TIMESTAMP_NS: return LogicalType::TIMESTAMP_NS;
     case type_id::VARCHAR: return LogicalType::VARCHAR;
     case type_id::STRUCT: return LogicalType::STRUCT({});
-    case type_id::LIST: return LogicalType::LIST(LogicalType::SQLNULL);
+    case type_id::LIST:
+      throw duckdb::InvalidInputException(
+        "to_duckdb: LIST conversion requires nested element metadata and is not supported");
     case type_id::INVALID:
       throw duckdb::InvalidInputException("to_duckdb: INVALID type has no DuckDB equivalent");
     case type_id::DECIMAL: return LogicalType::DECIMAL(t.decimal_precision(), t.decimal_scale());

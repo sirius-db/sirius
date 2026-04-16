@@ -32,8 +32,9 @@ using sirius::logical_type;
 using sirius::type_id;
 
 // ============================================================================
-// Helpers — full list of every GPU-processable sirius type_id (excludes
-// INVALID / SQLNULL / LIST which are meta / unsupported-GPU types).
+// Helpers — all type_id values except DECIMAL (precision/scale tested
+// separately via make_decimal()). Includes INVALID, SQLNULL, LIST, and STRUCT
+// so predicate edge-cases (e.g. is_fixed_width()) are exercised for them too.
 // ============================================================================
 
 static const std::vector<type_id> k_all_type_ids = {
@@ -409,9 +410,12 @@ TEST_CASE("type_conversions - to_duckdb round-trip for all GPU-processable types
   }
 }
 
-TEST_CASE("type_conversions - to_duckdb throws for INVALID", "[logical_type]")
+TEST_CASE("type_conversions - to_duckdb throws for non-GPU types", "[logical_type]")
 {
   REQUIRE_THROWS(sirius::to_duckdb(logical_type::make(type_id::INVALID)));
+  REQUIRE_THROWS(sirius::to_duckdb(logical_type::make(type_id::LIST)));
+  // STRUCT maps to LogicalType::STRUCT({}) — cuDF supports STRUCT columns
+  REQUIRE_NOTHROW(sirius::to_duckdb(logical_type::make(type_id::STRUCT)));
 }
 
 TEST_CASE("type_conversions - from_duckdb_vec / to_duckdb_vec round-trip", "[logical_type]")
