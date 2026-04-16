@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -323,10 +324,17 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
+  auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+  auto* res_mgr = global.get_memory_reservation_manager();
+  if (!res_mgr) {
+    throw std::runtime_error(
+      "gpu_pipeline_task::execute: memory reservation manager not set on global state");
+  }
+
   std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
   try {
     handles_opt =
-      local_state._input_data.get()->prepare_for_processing(requested_memory_space, stream);
+      local_state._input_data.get()->prepare_for_processing(requested_memory_space, stream, *res_mgr);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();
