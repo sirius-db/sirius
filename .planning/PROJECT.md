@@ -60,7 +60,18 @@ Validated in Phase 7: Task Queue Conversion — v2.0
 
 ### Active
 
-(None — all requirements shipped through v2.0)
+#### Current Milestone: v3.0 Downgrade Executor Integration
+
+**Goal:** Refactor the downgrade executor to use convertible_data abstractions with lazy, tiered candidate fetching and optional batch_lock_utils simplification.
+
+**Target features:**
+- Refactor `downgrade_executor::processing_loop` with `convertible_data_batch_provider` (lazy, one repo at a time)
+- Tiered fallback: data_repositories → gpu_pipeline_executor task queue → pipeline_executor task queue
+- Eliminate `downgrade_task` struct if `convert()` makes it trivial
+- Replace direct downgrade logic with `convertible_data::convert()` calls
+- Remove `target_bytes` from `request_downgrade`/`downgrade_request` and calculation logic from `gpu_pipeline_executor`
+- Add trace logging for downgrade counts per source tier
+- Explore refactoring `lock_or_prepare_batch` in `batch_lock_utils.hpp` to use `convertible_data_batch::convert()`
 
 ### Out of Scope
 
@@ -70,9 +81,10 @@ Validated in Phase 7: Task Queue Conversion — v2.0
 
 ## Current State
 
-**v2.0 Convertible Data Abstraction** — Shipped 2026-04-16
+**v3.0 Downgrade Executor Integration** — In progress
 
-All three milestones complete (v1.0, v1.1, v2.0). 7 phases, 11 plans, ~165 min total execution.
+Previous milestones shipped (v1.0, v1.1, v2.0). 7 phases, 11 plans, ~165 min total execution.
+Now integrating convertible_data abstractions into the downgrade executor production path.
 
 ## Context
 
@@ -135,4 +147,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-16 after v2.0 milestone*
+*Last updated: 2026-04-16 after v3.0 milestone started*

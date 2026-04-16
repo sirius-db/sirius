@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.0
-milestone_name: Convertible Data Abstraction
-status: completed
-stopped_at: Milestone v2.0 shipped
+milestone: v3.0
+milestone_name: Downgrade Executor Integration
+status: defining_requirements
+stopped_at: Defining requirements
 last_updated: "2026-04-16"
 last_activity: 2026-04-16
 progress:
-  total_phases: 3
-  completed_phases: 3
-  total_plans: 6
-  completed_plans: 6
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -21,15 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-16)
 
 **Core value:** Thread-safe queue with predicate-based inspection; uniform, failure-safe data conversion across memory tiers
-**Current focus:** Planning next milestone
+**Current focus:** Defining requirements for v3.0
 
 ## Current Position
 
-Milestone: v2.0 Convertible Data Abstraction — SHIPPED 2026-04-16
-All phases complete (5-7), all plans complete (6/6).
-Last activity: 2026-04-16
-
-Progress: [████████████████████] 100% (7/7 phases complete across all milestones)
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-04-16 — Milestone v3.0 started
 
 ## Performance Metrics
 
@@ -68,5 +67,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-04-16
-Stopped at: Milestone v2.0 shipped
-Resume with: `/gsd-new-milestone`
+Stopped at: Defining requirements for v3.0
+Resume with: Continue `/gsd-new-milestone` workflow
