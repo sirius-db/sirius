@@ -314,14 +314,13 @@ foreach(_target sirius_extension sirius_loadable_extension)
   endif()
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-                        cuCascade::cucascade)
+                        cuCascade::cucascade yaml-cpp::yaml-cpp)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
-                      absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
