@@ -70,7 +70,10 @@ Plans:
   1. A functional diff analysis of `lock_or_prepare_batch` vs `convertible_data_batch::convert()` is documented with a clear go/no-go decision
   2. If go: `lock_or_prepare_batch` uses `convertible_data_batch::convert()` and all existing tests pass
   3. If no-go: rationale is documented in PROJECT.md Key Decisions with specific behavioral differences that prevent unification
-**Plans**: TBD
+**Plans:** 1 plan
+
+Plans:
+- [ ] 09-01-PLAN.md — Refactor lock_or_prepare_batch to delegate conversion to convertible_data_batch::convert(), thread res_mgr through call chain, document functional diff
 
 ## Progress
 
@@ -87,7 +90,7 @@ Phases execute in numeric order: 8 → 9
 | 6. Batch Conversion | v2.0 | 2/2 | Complete | 2026-04-15 |
 | 7. Task Queue Conversion | v2.0 | 2/2 | Complete | 2026-04-16 |
 | 8. API Cleanup + Processing Loop | v3.0 | 0/2 | Planned | - |
-| 9. Batch Lock Exploration | v3.0 | 0/0 | Not started | - |
+| 9. Batch Lock Exploration | v3.0 | 0/1 | Planned | - |
 
 ---
 *Full v1.0 details archived to `.planning/milestones/v1.0-ROADMAP.md`*
