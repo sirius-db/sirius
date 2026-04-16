@@ -75,9 +75,8 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
     // This unifies the forward-path conversion with the downgrade path, ensuring
     // both benefit from the same failure-safety guarantees (state restore on error).
     sirius::convertible_data_batch convertible(batch);
-    auto* mutable_space = const_cast<cucascade::memory::memory_space*>(target_space);
     bool converted =
-      convertible.convert(std::vector<cucascade::memory::memory_space*>{mutable_space},
+      convertible.convert(std::vector<const cucascade::memory::memory_space*>{target_space},
                           stream,
                           res_mgr);
 

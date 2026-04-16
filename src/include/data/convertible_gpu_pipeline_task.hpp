@@ -105,7 +105,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
    * @return true if at least one batch was converted, false otherwise.
    */
-  bool convert(const std::vector<cucascade::memory::memory_space*>& target_spaces,
+  bool convert(const std::vector<const cucascade::memory::memory_space*>& target_spaces,
                rmm::cuda_stream_view stream,
                sirius::memory::sirius_memory_reservation_manager& res_mgr) override
   {
@@ -121,7 +121,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
       // Skip batches already at a target space — no conversion needed
       auto* batch_space      = batch->get_memory_space();
       bool already_at_target = false;
-      for (auto* ts : target_spaces) {
+      for (const auto* ts : target_spaces) {
         if (batch_space == ts) {
           already_at_target = true;
           break;
@@ -140,7 +140,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
         auto data_size       = batch->get_data()->get_size_in_bytes();
         bool space_succeeded = false;
 
-        for (auto* space : target_spaces) {
+        for (const auto* space : target_spaces) {
           auto reservation = res_mgr.request_reservation(
             cucascade::memory::specific_memory_space{space->get_tier(), space->get_id().device_id},
             data_size);

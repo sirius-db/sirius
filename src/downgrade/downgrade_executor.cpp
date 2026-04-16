@@ -131,11 +131,11 @@ void downgrade_executor::processing_loop()
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
     // Build target spaces list: for GPU->HOST downgrade, target is HOST tier
-    std::vector<cucascade::memory::memory_space*> target_spaces;
+    std::vector<const cucascade::memory::memory_space*> target_spaces;
     auto host_spaces =
       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     for (auto* hs : host_spaces) {
-      target_spaces.push_back(const_cast<cucascade::memory::memory_space*>(hs));
+      target_spaces.push_back(hs);
     }
 
     // Helper lambda: dispatch a single convertible_data to the thread pool.

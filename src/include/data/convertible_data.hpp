@@ -67,7 +67,7 @@ class convertible_data {
    * @return true if the conversion succeeded, false if no target space was available.
    * @throws std::exception on unrecoverable conversion errors (state is still restored).
    */
-  virtual bool convert(const std::vector<cucascade::memory::memory_space*>& target_spaces,
+  virtual bool convert(const std::vector<const cucascade::memory::memory_space*>& target_spaces,
                        rmm::cuda_stream_view stream,
                        sirius::memory::sirius_memory_reservation_manager& res_mgr) = 0;
 
