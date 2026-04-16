@@ -1,33 +1,57 @@
 # Requirements: inspectable_mpsc & Convertible Data
 
-**Defined:** 2026-04-15
-**Core Value:** Uniform, failure-safe data conversion across memory tiers
+**Defined:** 2026-04-16
+**Core Value:** Thread-safe queue with predicate-based inspection; uniform, failure-safe data conversion across memory tiers
 
-## v2.0 Requirements
+## v3.0 Requirements
 
-Requirements for Convertible Data Abstraction milestone. Each maps to roadmap phases.
+Requirements for Downgrade Executor Integration. Each maps to roadmap phases.
+
+### Processing Loop
+
+- [ ] **LOOP-01**: Processing loop creates a `convertible_data_batch_provider` per `data_repository` and fetches downgrade candidates lazily via `get_all_convertible`
+- [ ] **LOOP-02**: Processing loop falls back to `gpu_pipeline_executor` task queue via `convertible_gpu_pipeline_task_provider` when data_repositories are exhausted
+- [ ] **LOOP-03**: Processing loop falls back to `pipeline_executor` task queue via `convertible_gpu_pipeline_task_provider` when gpu_pipeline_executor queue is exhausted
+- [ ] **LOOP-04**: Each downgrade candidate is converted via `convertible_data::convert()` — `downgrade_task` struct eliminated if trivial
+- [ ] **LOOP-05**: Processing loop stops when existing memory pressure predicate is satisfied
+
+### API Cleanup
+
+- [ ] **DAPI-01**: `target_bytes` parameter removed from `downgrade_executor::request_downgrade` and `target_bytes` member removed from `downgrade_request`
+- [ ] **DAPI-02**: `target_bytes` calculation logic removed from `gpu_pipeline_executor`
+
+### Observability
+
+- [ ] **LOG-01**: Trace logging reports downgrade counts per source tier (data_repositories, gpu_pipeline_executor queue, pipeline_executor queue)
+
+### Batch Lock Exploration
+
+- [ ] **LOCK-01**: Functional diff analysis of `lock_or_prepare_batch` vs `convertible_data_batch::convert()` completed during discussion phase
+- [ ] **LOCK-02**: Conditional refactor of `lock_or_prepare_batch` to use `convertible_data_batch::convert()` (go/no-go based on LOCK-01 analysis)
+
+## v2.0 Requirements (Shipped)
 
 ### Abstract Interfaces
 
-- [ ] **IFACE-01**: `convertible_data` abstract interface with `bool convert(const std::vector<memory_space*>&, rmm::cuda_stream_view, sirius_memory_reservation_manager&)` and `size_t bytes_in_space(memory_space*)`
-- [ ] **IFACE-02**: `convertible_data_provider` abstract interface with `std::unique_ptr<convertible_data> get_next_convertible(memory_space*, bool)`, `std::vector<std::unique_ptr<convertible_data>> get_all_convertible(memory_space*, bool)`, and `size_t get_bytes_in_space(memory_space*)`
+- [x] **IFACE-01**: `convertible_data` abstract interface — Shipped Phase 5
+- [x] **IFACE-02**: `convertible_data_provider` abstract interface — Shipped Phase 5
 
 ### Batch Conversion
 
-- [ ] **BATCH-01**: `convertible_data_batch` wraps `shared_ptr<data_batch>`, `convert()` emulates `downgrade_task::execute` — locks for in_transit, requests HOST reservation, converts via converter registry singleton, restores prev_state
-- [ ] **BATCH-02**: `convertible_data_batch_provider` wraps `shared_data_repository*`, iterates partitions last-to-first and within each partition iterates data_batches last-to-first, filters by `idle` state and matching `memory_space`, returns batches wrapped as `convertible_data_batch`
-- [ ] **BATCH-03**: On conversion failure or exception in `convertible_data_batch::convert()`, batch retains original `idata_representation` and `batch_state` is restored via `try_to_release_in_transit(prev_state)` — never left in `in_transit`
+- [x] **BATCH-01**: `convertible_data_batch` wrapping `data_batch` — Shipped Phase 6
+- [x] **BATCH-02**: `convertible_data_batch_provider` wrapping `data_repository` — Shipped Phase 6
+- [x] **BATCH-03**: Failure safety for batch conversion — Shipped Phase 6
 
 ### Task Queue Conversion
 
-- [ ] **TASK-01**: `convertible_gpu_pipeline_task` wraps `unique_ptr<itask>` with RAII ownership — constructor takes `(unique_ptr<itask>, inspectable_mpsc<itask>&)`, destructor pushes task back to queue
-- [ ] **TASK-02**: `convertible_gpu_pipeline_task_provider` wraps `inspectable_mpsc<itask>&`, `get_next_convertible` uses `mutable_pop_if` with `front_to_back=false`, predicate inspects `gpu_pipeline_task_local_state` data_batches for matching memory_space and `batch_state::task_created`
-- [ ] **TASK-03**: On conversion failure or exception in `convertible_gpu_pipeline_task::convert()`, all `data_batch` objects inside `operator_data` retain original `idata_representation` and `batch_state`; task is always returned to queue via destructor
+- [x] **TASK-01**: `convertible_gpu_pipeline_task` with RAII ownership — Shipped Phase 7
+- [x] **TASK-02**: `convertible_gpu_pipeline_task_provider` with `mutable_pop_if` — Shipped Phase 7
+- [x] **TASK-03**: Failure safety for task conversion — Shipped Phase 7
 
 ### State Machine Extension
 
-- [ ] **STATE-01**: Extend `data_batch::try_to_lock_for_in_transit()` to allow transition from `task_created` state (currently only `idle` is permitted)
-- [ ] **STATE-02**: `try_to_release_in_transit()` can restore to `task_created` via the existing `prev_state` optional parameter
+- [x] **STATE-01**: `task_created → in_transit` transition — Shipped Phase 5
+- [x] **STATE-02**: `try_to_release_in_transit()` restore to `task_created` — Shipped Phase 5
 
 ## Future Requirements
 
@@ -37,30 +61,34 @@ None currently deferred.
 
 | Feature | Reason |
 |---------|--------|
+| Lock-free downgrade queue | Mutex+cv is appropriate for the downgrade executor's workload |
+| Refactoring interruptible_mpmc in pipeline_executor/task_creator | Out of scope — only the downgrade path is being refactored |
+| Changing the memory pressure predicate logic | Existing predicate stays; only the candidate fetching changes |
 | Lock-free conversion | Mutex+cv is appropriate for inspection/iteration requirements |
 | Async conversion pipeline | Adds complexity beyond what's needed; synchronous convert() is sufficient |
-| Converting data in `processing` state | Batches being actively processed should not be interrupted for conversion |
 
 ## Traceability
 
+Which phases cover which requirements. Updated during roadmap creation.
+
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| STATE-01 | Phase 5 | Pending |
-| STATE-02 | Phase 5 | Pending |
-| IFACE-01 | Phase 5 | Pending |
-| IFACE-02 | Phase 5 | Pending |
-| BATCH-01 | Phase 6 | Pending |
-| BATCH-02 | Phase 6 | Pending |
-| BATCH-03 | Phase 6 | Pending |
-| TASK-01 | Phase 7 | Pending |
-| TASK-02 | Phase 7 | Pending |
-| TASK-03 | Phase 7 | Pending |
+| LOOP-01 | — | Pending |
+| LOOP-02 | — | Pending |
+| LOOP-03 | — | Pending |
+| LOOP-04 | — | Pending |
+| LOOP-05 | — | Pending |
+| DAPI-01 | — | Pending |
+| DAPI-02 | — | Pending |
+| LOG-01 | — | Pending |
+| LOCK-01 | — | Pending |
+| LOCK-02 | — | Pending |
 
 **Coverage:**
-- v2.0 requirements: 10 total
-- Mapped to phases: 10
-- Unmapped: 0
+- v3.0 requirements: 10 total
+- Mapped to phases: 0
+- Unmapped: 10 ⚠️
 
 ---
-*Requirements defined: 2026-04-15*
-*Last updated: 2026-04-15 — traceability updated after roadmap creation*
+*Requirements defined: 2026-04-16*
+*Last updated: 2026-04-16 after initial definition*
