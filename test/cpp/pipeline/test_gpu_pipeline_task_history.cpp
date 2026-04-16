@@ -190,7 +190,6 @@ pipeline_context create_pipeline_context()
   ctx.engine = std::make_unique<sirius::sirius_engine>(*ctx.con->context, *ctx.iface);
   static sirius::pipeline::pipeline_build_context build_ctx{true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
-  ctx.pipeline->set_client_context(*ctx.con->context);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_op = std::make_unique<stub_operator>();
 

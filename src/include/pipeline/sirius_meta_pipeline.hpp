@@ -59,7 +59,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
 
  public:
   //! Get the pipeline build context for this sirius_meta_pipeline
-  pipeline_build_context& get_build_context() const;
+  const pipeline_build_context& get_build_context() const;
   //! Get the pipeline_build_state for this sirius_meta_pipeline
   sirius_pipeline_build_state& get_state() const;
   //! Get the sink operator for this sirius_meta_pipeline

@@ -50,6 +50,7 @@ struct pipeline_conversion_result {
 //! 4. Set up parent-child pipeline dependencies
 //! 5. Finalize pipeline structure (merge sink into operators vector)
 //! 6. Link hash join sibling partition operators
+
 //! Construct a Sirius-specific operator (scan, merge) from a generic physical operator.
 //! This is a pure factory function with no engine/context dependency.
 duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(

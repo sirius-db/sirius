@@ -359,11 +359,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   new_pipeline_breakers = std::move(result.pipeline_breakers);
   total_pipelines       = result.meta_pipeline_count;
 
-  // Set client context on all pipelines for runtime methods
-  for (auto& pipeline : new_scheduled) {
-    pipeline->set_client_context(context);
-  }
-
   // NOTE: dead code preserved for operator ID numbering stability
   auto invalid_op = make_uniq<op::sirius_physical_operator>(
     op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<sirius::logical_type>{}, 0);
