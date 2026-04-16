@@ -19,6 +19,7 @@
 // sirius
 #include <config.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
+#include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 #include <sirius_config.hpp>
@@ -42,17 +43,19 @@ namespace sirius::op::scan {
  * @brief Operator that parses parquet file metadata and produces row-group partitions.
  *
  * Pipeline role:
- *   - Source of the metadata-scan pipeline (pipeline 1).
+ *   - Both source and sink of the metadata-scan pipeline (pipeline 1), which is a
+ *     single-op pipeline containing only this operator.
  *   - get_next_task_input_data() returns parquet_metadata_input (up to
  *     max_file_processed files per task).
  *   - execute() parses parquet footers, builds partitioned_parquet_metadata.
- *   - The sink of pipeline 1 is sirius_gpu_parquet_scan_operator, which
- *     accumulates the produced partitioned_parquet_metadata objects.
- *
- * This operator intentionally has no dependency on sirius_physical_parquet_scan so
- * that it can be placed before that operator in the physical plan.  The caller
- * is responsible for extracting all required fields from the scan operator (or
- * other plan nodes) and passing them here directly.
+ *   - sink() forwards each produced partitioned_parquet_metadata into the paired
+ *     sirius_gpu_parquet_scan_operator via its accumulate_metadata() entry point.
+ *     This is a direct handoff — no inter-pipeline port or data repository is
+ *     involved; the metadata never flows through the generic pipeline data path.
+ *   - finalize_operator() (invoked once after pipeline 1 completes) calls
+ *     gpu_scan::finalize_partitions(), which freezes the partition index and
+ *     unblocks the downstream scan pipeline (pipeline 2), where gpu_scan serves
+ *     as the source.
  *
  * @pre The caller must validate before construction that:
  *   - The table function is NOT an in-out function (in_out_function == false).
@@ -75,6 +78,8 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    * @brief Construct the metadata scan operator from the individual fields extracted from the
    *        physical parquet scan node (or equivalent source).
    *
+   * @param gpu_scan                The downstream gpu scan operator into which to push partition
+   *                                metadata.
    * @param types                   Output column types.
    * @param returned_types          The types of all columns in the source file.
    * @param estimated_cardinality   Estimated output row count.

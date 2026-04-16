@@ -336,7 +336,7 @@ class sirius_physical_operator {
 
   struct port {
     MemoryBarrierType type;
-    /// May be NULL for dependency-only ports that carry no data flow (e.g., "gpu_parquet_scan").
+    /// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").
     /// Null repos are treated as "empty, not data-gating" by the base-class port handling methods
     /// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).
     ::cucascade::shared_data_repository* repo;

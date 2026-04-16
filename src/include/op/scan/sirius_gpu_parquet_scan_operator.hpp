@@ -64,7 +64,7 @@ namespace sirius::op::scan {
  *
  * Scheduling coupling:
  *   The upstream → downstream pipeline edge is expressed via a null-repo
- *   "gpu_parquet_scan" port on this operator. setup_pipeline_parents() uses that port
+ *   "dependency" port on this operator. setup_pipeline_parents() uses that port
  *   to discover the dependency so this pipeline is not scheduled until the metadata
  *   pipeline completes. No data flows through the port.
  *
@@ -165,7 +165,6 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
 
   // ===----------------------------------------------------------------------===//
   // Partition index — built once by finalize_partitions(), then read-only.
-  //
   //   _finalized          — set by finalize_metadata() with release semantics after
   //                          the partition index is fully written.  Source-side methods
   //                          check this with acquire semantics before accessing the index.
