@@ -137,7 +137,6 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/downgrade/downgrade_task.cpp
     src/expression/expression.cpp
     src/expression/join_condition.cpp
     src/expression_executor/expression_executor_strategy.cpp

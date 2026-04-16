@@ -149,6 +149,10 @@ void downgrade_executor::processing_loop()
       auto slot = _pool->reserve();
       if (!slot) return false;  // interrupted
 
+      // Re-check after reserve() returns -- the previous candidate's worker may
+      // have set satisfied while we were blocked waiting for a thread slot.
+      if (req->satisfied.load()) return true;
+
       auto exc_stream = _stream_pool->acquire_stream(
         cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
 
@@ -180,17 +184,18 @@ void downgrade_executor::processing_loop()
     };
 
     // === TIER 1: Data repositories (D-01, LOOP-01) ===
-    // Create a convertible_data_batch_provider per repo and fetch lazily
+    // Create a convertible_data_batch_provider per repo and collect candidates.
+    // We use get_all_convertible() to snapshot eligible batches once per repo,
+    // avoiding re-scanning the same batch before its state changes from idle.
     _data_repo_mgr.for_each_repository(
       [&](cucascade::shared_data_repository* repo) {
         if (req->satisfied.load()) return;
 
         convertible_data_batch_provider provider(repo);
-        // Iterate lazily: get one candidate at a time, dispatch, check predicate
-        while (!req->satisfied.load()) {
-          auto candidate =
-            provider.get_next_convertible(source_space, /*front_to_back=*/false);
-          if (!candidate) break;  // this repo exhausted
+        auto candidates =
+          provider.get_all_convertible(source_space, /*front_to_back=*/false);
+        for (auto& candidate : candidates) {
+          if (req->satisfied.load()) break;
           if (!dispatch_candidate(std::move(candidate), repo_stats)) return;
         }
       });
