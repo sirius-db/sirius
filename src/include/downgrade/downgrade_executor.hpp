@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "downgrade/downgrade_task.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
@@ -56,13 +55,6 @@ struct downgrade_request {
   std::atomic<size_t> batches_downgraded{0};
   std::atomic<bool> satisfied{false};
   bool is_monitor_request{false};
-};
-
-/**
- * @brief Information about a repository to consider for downgrade candidate selection.
- */
-struct downgrade_repository_info {
-  cucascade::shared_data_repository* repo;
 };
 
 /**
@@ -151,21 +143,6 @@ class downgrade_executor {
   void processing_loop();
   void monitor_loop();
   void cancel_pending_requests();
-
-  std::vector<std::weak_ptr<cucascade::data_batch>> collect_all_candidates(
-    const std::vector<downgrade_repository_info>& repositories, size_t amount_to_downgrade);
-
-  static size_t get_repo_data_size_on_tier(cucascade::shared_data_repository* repo,
-                                           cucascade::memory::Tier tier);
-
-  static bool is_partition_active(cucascade::shared_data_repository* repo, size_t partition_idx);
-
-  static std::vector<std::weak_ptr<cucascade::data_batch>> collect_candidates_from_partition(
-    cucascade::shared_data_repository* repo,
-    size_t partition_idx,
-    cucascade::memory::memory_space_id source_space,
-    size_t max_bytes,
-    size_t& collected_bytes);
 
  private:
   exec::downgrade_executor_config _config;
