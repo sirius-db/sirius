@@ -113,18 +113,16 @@ void gpu_pipeline_executor::manager_loop()
     } else if (reservation->size() < bytes_needs && _downgrade_executor) {
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
-      size_t target_bytes = std::max(shortfall + shortfall / 4, bytes_needs / 4);
 
       SIRIUS_LOG_DEBUG(
         "GPU Pipeline Executor: requested reservation size {} but only got {} bytes, reservation "
         "shortfall {} bytes for pipeline {} "
-        "task {}, requesting predicate-based downgrade (target_bytes={})",
+        "task {}, requesting predicate-based downgrade",
         bytes_needs,
         partial_size,
         shortfall,
         gpu_task->get_pipeline_id(),
-        gpu_task->get_task_id(),
-        target_bytes);
+        gpu_task->get_task_id());
 
       reservation.reset();  // release partial reservation before downgrade
 
@@ -135,8 +133,7 @@ void gpu_pipeline_executor::manager_loop()
       try {
         freed =
           _downgrade_executor
-            ->request_downgrade(target_bytes,
-                                [mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
+            ->request_downgrade([mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
                                   std::lock_guard<std::mutex> lock(reservation_mutex);
                                   if (new_reservation) { return true; }
                                   auto res = mem_space->make_reservation_or_null(bytes_needs);
