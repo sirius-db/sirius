@@ -5,7 +5,6 @@
 
 #include "op/scan/gpu_native_scan_task.hpp"
 
-#include <cuda/scan/gpu_decode.cuh>
 #include <cuda/scan/gpu_native_decode.cuh>
 
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -25,12 +24,8 @@
 #include <log/logging.hpp>
 #include <sirius_config.hpp>
 
-#include <rmm/device_buffer.hpp>
-
 #include <algorithm>
 #include <chrono>
-#include <cstring>
-#include <unordered_set>
 
 namespace sirius::op::scan {
 
@@ -350,7 +345,7 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
 
     auto t0 = clock::now();
 
-    // Pin segments for the claimed row groups
+    // Pin segments for the claimed row groups.
     std::vector<column_scan_result> col_scans(num_cols);
     for (size_t ci = 0; ci < num_cols; ++ci) {
       std::vector<duckdb::RowGroup*> batch_rgs(row_groups.begin() + range->start_idx,
@@ -361,74 +356,8 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
 
     auto t1_pin = clock::now();
 
-    // Collect unique blocks with their host base pointers
-    constexpr size_t BLK = sirius::cuda::scan::DUCKDB_BLOCK_SIZE;
-    struct block_entry {
-      int64_t block_id;
-      const uint8_t* host_base;
-    };
-    std::unordered_map<int64_t, const uint8_t*> seen_blocks;
-    for (auto& cs : col_scans) {
-      for (auto& seg : cs.data.segments) {
-        if (!seg.persistent || !seg.data_ptr || seg.row_count == 0 || seg.block_id < 0) continue;
-        if (seen_blocks.count(seg.block_id)) continue;
-        seen_blocks[seg.block_id] = seg.data_ptr - seg.block_offset;
-      }
-    }
-
-    // Bulk H2D → decode from device
-    constexpr size_t BULK_H2D_MIN_BLOCKS = 4;
-    std::unique_ptr<cudf::table> gpu_table;
-    size_t total_blocks = seen_blocks.size();
-
-    if (seen_blocks.size() >= BULK_H2D_MIN_BLOCKS) {
-      size_t buf_bytes = seen_blocks.size() * BLK;
-      rmm::device_buffer staging_buf(buf_bytes, stream, mr);
-      auto* d_staging = staging_buf.data();
-
-      // Sort blocks by block_id to detect contiguous runs in the mmap'd file.
-      // Consecutive block_ids have host pointers exactly BLK bytes apart, so
-      // runs can be copied with a single cudaMemcpyAsync instead of one per block.
-      std::vector<block_entry> sorted_blocks;
-      sorted_blocks.reserve(seen_blocks.size());
-      for (auto& [id, ptr] : seen_blocks) {
-        sorted_blocks.push_back({id, ptr});
-      }
-      std::sort(sorted_blocks.begin(), sorted_blocks.end(),
-                [](const block_entry& a, const block_entry& b) { return a.block_id < b.block_id; });
-
-      sirius::cuda::scan::device_block_map block_map;
-      size_t offset = 0;
-      size_t i      = 0;
-      while (i < sorted_blocks.size()) {
-        size_t run_start = i;
-        while (i + 1 < sorted_blocks.size() &&
-               sorted_blocks[i + 1].block_id == sorted_blocks[i].block_id + 1 &&
-               sorted_blocks[i + 1].host_base == sorted_blocks[i].host_base + BLK) {
-          ++i;
-        }
-        ++i;
-        size_t run_len = i - run_start;
-
-        cudaMemcpyAsync(static_cast<uint8_t*>(d_staging) + offset,
-                        sorted_blocks[run_start].host_base,
-                        run_len * BLK,
-                        cudaMemcpyHostToDevice,
-                        stream.value());
-
-        for (size_t j = run_start; j < i; ++j) {
-          block_map.offsets[sorted_blocks[j].block_id] = offset;
-          offset += BLK;
-        }
-      }
-      block_map.total_bytes = offset;
-
-      gpu_table = sirius::cuda::scan::gpu_decode_table_pipelined(
-        col_scans, col_types, block_map, d_staging, stream, mr);
-      // staging_buf freed by RAII at end of this scope
-    } else {
-      gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
-    }
+    // Decode — bulk H2D + per-segment kernels + single sync are all inside.
+    auto gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
 
     auto t2_decode = clock::now();
 
@@ -436,12 +365,11 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
     batches.push_back(sirius::make_data_batch(std::move(gpu_table), *g.gpu_space()));
 
     SIRIUS_LOG_INFO(
-      "[gpu_native_scan] task {}: {} rows, {} cols, {} blocks | "
+      "[gpu_native_scan] task {}: {} rows, {} cols | "
       "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{})",
       task_id_,
       total_rows,
       num_cols,
-      total_blocks,
       us(t0, t1_pin) / 1000.0,
       us(t1_pin, t2_decode) / 1000.0,
       us(t0, t2_decode) / 1000.0,
