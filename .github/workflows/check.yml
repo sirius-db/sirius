@@ -122,7 +122,7 @@ jobs:
         if: matrix.environment == 'vcpkg'
         run: |
           pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
-          pixi run -e vcpkg cmake --build build/vcpkg-release
+          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest
 
   check:
     runs-on: ubuntu-slim
