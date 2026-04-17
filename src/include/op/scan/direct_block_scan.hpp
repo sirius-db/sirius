@@ -31,6 +31,12 @@ struct direct_block_scan_result {
     duckdb::CompressionType compression = duckdb::CompressionType::COMPRESSION_AUTO;
     uint32_t max_string_length          = 0;   // From segment stats (VARCHAR only, 0 = unknown)
     uint8_t constant_data[16]           = {};  // Inline storage for blockless CONSTANT segments
+    // For compressions we decode on the host (e.g. ROARING validity). When
+    // non-empty, data_ptr points into this buffer and compression is
+    // reported as COMPRESSION_UNCOMPRESSED so downstream decoders treat it
+    // as raw bytes. std::vector move preserves the heap buffer address,
+    // so data_ptr remains valid across segment_info moves.
+    std::vector<uint8_t> owned_decoded;
   };
 
   std::vector<segment_info> segments;

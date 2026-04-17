@@ -8,9 +8,12 @@
 #include <log/logging.hpp>
 
 // duckdb
+#include <duckdb/common/types/validity_mask.hpp>
+#include <duckdb/common/types/vector.hpp>
 #include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
+#include <duckdb/storage/compression/roaring/roaring.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
@@ -219,6 +222,68 @@ static inline uint8_t* mmap_block_data_ptr(const mmap_file_state& mmap_state,
 }
 
 //===----------------------------------------------------------------------===//
+// Host-side ROARING validity decode.
+//
+// DuckDB writes validity bitmaps with ROARING compression when the null
+// distribution is sparse enough that container-based encoding beats raw bits.
+// Our GPU validity decoders only know how to read an UNCOMPRESSED bitmap, so
+// we decode ROARING on the host into a raw uint64-aligned bitmap that matches
+// DuckDB's (and cuDF's) LSB-first layout, then let downstream code memcpy it
+// to GPU exactly like an UNCOMPRESSED segment.
+//
+// Correctness of direct memcpy layout: DuckDB validity_t == uint64_t, bit i
+// of word w covers row (w*64 + i), set = valid. cuDF's null mask uses the
+// same bit order (bit set = valid). So a verbatim byte copy is correct.
+//===----------------------------------------------------------------------===//
+
+static std::vector<uint8_t> decode_roaring_validity_to_bitmap(duckdb::ColumnSegment& segment)
+{
+  const auto row_count = segment.count.load();
+  const size_t words   = (row_count + 63) / 64;
+  // Pre-fill all-valid so chunks whose ValidityMask ends up "AllValid"
+  // (no allocation inside ScanPartial) contribute 1-bits without us having
+  // to explicitly copy anything.
+  std::vector<uint8_t> out(words * sizeof(uint64_t), 0xff);
+  if (row_count == 0) return out;
+
+  // RoaringScanState pins the underlying block in its constructor and
+  // releases on destruction — no external pinning needed.
+  duckdb::roaring::RoaringScanState rs(segment);
+
+  // Containers cover 2048 rows each and STANDARD_VECTOR_SIZE is 2048.
+  // Scan one container-sized chunk per iteration — keeps the Vector's
+  // validity mask sized to STANDARD_VECTOR_SIZE, matching how DuckDB itself
+  // drives the scan.
+  constexpr duckdb::idx_t CHUNK =
+    static_cast<duckdb::idx_t>(duckdb::roaring::ROARING_CONTAINER_SIZE);
+  duckdb::Vector tmp(duckdb::LogicalType::BOOLEAN, CHUNK);
+
+  for (duckdb::idx_t scanned = 0; scanned < row_count; scanned += CHUNK) {
+    const auto to_scan = std::min<duckdb::idx_t>(CHUNK, row_count - scanned);
+    // Each call must start with all-valid bits: RUN/ARRAY container decoders
+    // assume this invariant and only flip bits to invalid. BITSET overwrites,
+    // so the all-valid init is a no-op on that path.
+    auto& vm = duckdb::FlatVector::Validity(tmp);
+    vm.SetAllValid(CHUNK);
+
+    rs.ScanPartial(scanned, tmp, /*offset=*/0, to_scan);
+
+    // AllValid()==true means ValidityMask never allocated its backing array
+    // (no bits were flipped to invalid) → this chunk is all-valid, and our
+    // 0xff pre-fill is already correct. Skip the copy.
+    if (!vm.AllValid()) {
+      // scanned is a multiple of 2048 → multiple of 64 → aligned byte copy.
+      const size_t byte_offset   = scanned / 8;
+      const size_t bytes_to_copy = (to_scan + 7) / 8;
+      std::memcpy(out.data() + byte_offset,
+                  reinterpret_cast<const uint8_t*>(vm.GetData()),
+                  bytes_to_copy);
+    }
+  }
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
 // Segment tree scan
 //===----------------------------------------------------------------------===//
 
@@ -239,36 +304,53 @@ direct_block_scan_result scan_segment_tree(duckdb::ColumnData& col_data,
     if (has_nulls_out && segment.stats.statistics.CanHaveNull()) { *has_nulls_out = true; }
 
     if (segment.block) {
-      seg_info.block_offset = segment.GetBlockOffset();
-      seg_info.segment_size = segment.SegmentSize();
-      seg_info.block_id     = segment.GetBlockId();
-      seg_info.persistent   = true;
-      seg_info.compression  = segment.GetCompressionType();
-      result.total_pinned_bytes += segment.SegmentSize();
+      auto compression = segment.GetCompressionType();
 
-      if (mmap_state) {
-        std::call_once(mmap_state->layout_once, discover_block_layout,
-                       std::ref(segment), std::ref(buffer_manager), std::ref(*mmap_state));
-      }
+      // ROARING is registered by DuckDB only for PhysicalType::BIT (validity
+      // and bool data). Host-decode into an owned bitmap so downstream sees
+      // a regular UNCOMPRESSED bitmap.
+      if (compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+        seg_info.owned_decoded = decode_roaring_validity_to_bitmap(segment);
+        seg_info.data_ptr      = seg_info.owned_decoded.data();
+        seg_info.block_offset  = 0;
+        seg_info.block_id      = -1;  // synthesized bytes; not staged via data blocks
+        seg_info.segment_size  = seg_info.owned_decoded.size();
+        seg_info.persistent    = true;
+        seg_info.compression   = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
+        result.total_pinned_bytes += segment.SegmentSize();
+      } else {
+        seg_info.block_offset = segment.GetBlockOffset();
+        seg_info.segment_size = segment.SegmentSize();
+        seg_info.block_id     = segment.GetBlockId();
+        seg_info.persistent   = true;
+        seg_info.compression  = compression;
+        result.total_pinned_bytes += segment.SegmentSize();
 
-      bool used_mmap = false;
-      if (mmap_state && mmap_state->layout.valid && seg_info.block_id >= 0) {
-        size_t adjusted_offset = 0;
-        auto* mmap_ptr = mmap_block_data_ptr(*mmap_state, seg_info.block_id,
-                                             seg_info.block_offset, adjusted_offset);
-        if (mmap_ptr) {
-          seg_info.data_ptr     = mmap_ptr;
-          seg_info.block_offset = adjusted_offset;
-          used_mmap = true;
+        if (mmap_state) {
+          std::call_once(mmap_state->layout_once, discover_block_layout,
+                         std::ref(segment), std::ref(buffer_manager), std::ref(*mmap_state));
         }
-      }
-      if (!used_mmap) {
-        seg_info.handle   = buffer_manager.Pin(segment.block);
-        seg_info.data_ptr = seg_info.handle.Ptr() + seg_info.block_offset;
-      }
 
-      if (duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
-        seg_info.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+        bool used_mmap = false;
+        if (mmap_state && mmap_state->layout.valid && seg_info.block_id >= 0) {
+          size_t adjusted_offset = 0;
+          auto* mmap_ptr = mmap_block_data_ptr(*mmap_state, seg_info.block_id,
+                                               seg_info.block_offset, adjusted_offset);
+          if (mmap_ptr) {
+            seg_info.data_ptr     = mmap_ptr;
+            seg_info.block_offset = adjusted_offset;
+            used_mmap = true;
+          }
+        }
+        if (!used_mmap) {
+          seg_info.handle   = buffer_manager.Pin(segment.block);
+          seg_info.data_ptr = seg_info.handle.Ptr() + seg_info.block_offset;
+        }
+
+        if (duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+          seg_info.max_string_length =
+            duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+        }
       }
     } else {
       auto compression = segment.GetCompressionType();

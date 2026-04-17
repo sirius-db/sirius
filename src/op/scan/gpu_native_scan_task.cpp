@@ -127,12 +127,17 @@ void gpu_native_scan_global_state::check_viability()
 
   // Walk all row groups → all segments for each projected column.
   // Two goals in one pass:
-  //   1. Verify every segment has GPU-decodable compression
+  //   1. Verify every DATA AND VALIDITY segment has GPU-decodable compression
   //   2. Measure decoded GPU size per row group (for batch sizing after pruning)
   //
   // For fixed-width columns: decoded size = row_count × type_size
   // For VARCHAR columns: decoded size = row_count × (4 bytes offsets + max_string_length chars)
   //   max_string_length comes from segment stats — we already check it for DICTIONARY viability.
+  //
+  // Validity compression is orthogonal to data compression: a BITPACKING data
+  // segment may sit next to a ROARING validity segment. Silently ignoring a
+  // non-UNCOMPRESSED validity segment would leave rows that should be NULL
+  // mis-reported as non-NULL, so we have to walk validity too.
 
   rg_decoded_bytes_.resize(row_groups_.size(), 0);
 
@@ -149,7 +154,7 @@ void gpu_native_scan_global_state::check_viability()
         auto compression = segment.GetCompressionType();
         auto row_count   = segment.count.load();
 
-        // --- Viability check ---
+        // --- Data compression viability check ---
         switch (compression) {
           case duckdb::CompressionType::COMPRESSION_BITPACKING:
           case duckdb::CompressionType::COMPRESSION_CONSTANT:
@@ -168,7 +173,7 @@ void gpu_native_scan_global_state::check_viability()
             break;
 
           default:
-            SIRIUS_LOG_INFO("[gpu_native_scan] not viable: col {} has unsupported compression {}",
+            SIRIUS_LOG_INFO("[gpu_native_scan] not viable: col {} data compression {} unsupported",
                             col_indices_[ci].GetPrimaryIndex(),
                             static_cast<int>(compression));
             viable_ = false;
@@ -188,6 +193,41 @@ void gpu_native_scan_global_state::check_viability()
         }
 
         seg_node = seg_tree.GetNextSegment(*seg_node);
+      }
+
+      // --- Validity compression viability check ---
+      // Only StandardColumnData exposes a validity tree; types without one
+      // (e.g. struct parents) simply have no validity segments to check here.
+      try {
+        auto& std_col  = col_data.Cast<duckdb::StandardColumnData>();
+        auto& val_data = std_col.GetValidityData();
+        auto& vtree    = val_data.GetSegmentTree();
+        auto vnode     = vtree.GetRootSegment();
+        while (vnode) {
+          auto& vseg = vnode->GetNode();
+          auto vcomp = vseg.GetCompressionType();
+          switch (vcomp) {
+            // UNCOMPRESSED raw bitmap: existing direct memcpy path.
+            case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
+            // EMPTY = no nulls in this range: the decoder's all-valid
+            // pre-fill is exactly correct, no overlay needed.
+            case duckdb::CompressionType::COMPRESSION_EMPTY:
+            // ROARING: host-decoded into an owned bitmap in direct_block_scan
+            // and handed to the decoder as UNCOMPRESSED bytes.
+            case duckdb::CompressionType::COMPRESSION_ROARING:
+              break;
+            default:
+              SIRIUS_LOG_INFO(
+                "[gpu_native_scan] not viable: col {} validity compression {} unsupported",
+                col_indices_[ci].GetPrimaryIndex(),
+                static_cast<int>(vcomp));
+              viable_ = false;
+              return;
+          }
+          vnode = vtree.GetNextSegment(*vnode);
+        }
+      } catch (const std::exception&) {
+        // Column type without a StandardColumnData validity tree: nothing to check.
       }
     }
   }
