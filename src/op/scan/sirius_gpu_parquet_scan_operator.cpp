@@ -82,9 +82,9 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
 
   // 2. No work right now. If metadata pipeline is still running, defer to it.
   if (!_finalized.load(std::memory_order_acquire)) {
-    auto* dep_port = get_port("handoff");
-    if (dep_port && dep_port->src_pipeline) {
-      if (auto upstream = dep_port->src_pipeline->get_source()) {
+    auto it = ports.find("handoff");
+    if (it != ports.end() && it->second && it->second->src_pipeline) {
+      if (auto upstream = it->second->src_pipeline->get_source()) {
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, upstream.get()};
       }
     }
