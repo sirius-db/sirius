@@ -43,6 +43,7 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
@@ -169,14 +170,12 @@ bool sirius_engine::has_result_collector()
 duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 {
   D_ASSERT(has_result_collector());
-  if (!sirius_physical_plan) throw duckdb::InvalidInputException("sirius_physical_plan is NULL");
+  if (!sirius_physical_plan) throw invalid_input_exception("sirius_physical_plan is NULL");
   if (sirius_physical_plan.get() == NULL)
-    throw duckdb::InvalidInputException("sirius_physical_plan is NULL");
+    throw invalid_input_exception("sirius_physical_plan is NULL");
   auto& result_collector =
     sirius_physical_plan.get()->Cast<op::sirius_physical_materialized_collector>();
-  result_collector.sink_state = result_collector.get_global_sink_state(context);
-  duckdb::unique_ptr<duckdb::QueryResult> res =
-    result_collector.get_result(*(result_collector.sink_state));
+  duckdb::unique_ptr<duckdb::QueryResult> res = result_collector.get_result();
   return res;
 }
 
@@ -199,7 +198,7 @@ void sirius_engine::execute()
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
-    throw duckdb::InvalidInputException("Sirius context is not initialized.");
+    throw invalid_input_exception("Sirius context is not initialized.");
   }
 
   // Create the query with the pipelines
@@ -248,9 +247,9 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
     return duckdb::make_uniq<op::sirius_physical_ungrouped_aggregate_merge>(
       &ungrouped_agg_physical_op);
   } else {
-    throw duckdb::InternalException("Unsupported operator type" +
-                                    SiriusPhysicalOperatorToString(op->type) +
-                                    " for constructing sirius specific operator.");
+    throw internal_exception("Unsupported operator type" +
+                             SiriusPhysicalOperatorToString(op->type) +
+                             " for constructing sirius specific operator.");
   }
 }
 
@@ -314,7 +313,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 {
   auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx_ptr) {
-    throw duckdb::InvalidInputException(
+    throw invalid_input_exception(
       "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
       "and review extension loading logs for errors.");
   }

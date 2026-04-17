@@ -20,6 +20,7 @@
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
+#include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
 
 // cudf
@@ -98,7 +99,20 @@ std::size_t sirius_gpu_parquet_scan_operator::get_total_partitions() const
 
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
-  if (!_finalized.load(std::memory_order_acquire)) { return std::nullopt; }
+  if (!_finalized.load(std::memory_order_acquire)) {
+    // Metadata hasn't been finalized yet — surface the upstream metadata scan to
+    // task_creator::get_operator_for_next_task so its walker can schedule it. The
+    // metadata handoff is via side channel (accumulate_metadata / finalize_partitions),
+    // so the walker cannot discover the metadata scan through the data-repo graph.
+    auto* dep_port = get_port("handoff");
+    if (dep_port != nullptr && dep_port->src_pipeline) {
+      auto upstream_source = dep_port->src_pipeline->get_source();
+      if (upstream_source) {
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, upstream_source.get()};
+      }
+    }
+    return std::nullopt;
+  }
   if (_next_partition_idx.load(std::memory_order_relaxed) < _partition_index.size()) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }

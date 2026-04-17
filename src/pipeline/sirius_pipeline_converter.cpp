@@ -239,7 +239,7 @@ void sirius_pipeline_converter::split_table_scan_source(
 
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
 
-  /// If parquet scan, route to metadata scan + gpu scan operator pipeline
+  // If parquet scan, route to metadata scan + gpu scan operator pipeline
   if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet") {
     split_parquet_scan_source(current_pipeline);
     return;

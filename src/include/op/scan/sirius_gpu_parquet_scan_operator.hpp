@@ -112,8 +112,12 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   bool is_source() const override { return true; }
 
   /**
-   * @return READY while there are unconsumed partitions; nullopt when all
-   *         partitions have been dispatched or metadata has not yet been finalized.
+   * @return READY pointing at this operator while there are unconsumed partitions;
+   *         WAITING_FOR_INPUT_DATA pointing at the upstream metadata scan while
+   *         metadata has not yet been finalized (surfaces the upstream dependency
+   *         to task_creator::get_operator_for_next_task, which otherwise cannot
+   *         discover it — the metadata handoff is a side channel, not a data repo);
+   *         nullopt once all partitions have been dispatched.
    */
   std::optional<task_creation_hint> get_next_task_hint() override;
 
