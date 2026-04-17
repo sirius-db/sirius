@@ -200,10 +200,10 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
 }
 
 std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
-                                                             const std::vector<int32_t>& values_a,
-                                                             const std::vector<bool>& valids_a,
-                                                             const std::vector<int32_t>& values_b,
-                                                             const std::vector<bool>& valids_b)
+                                                            const std::vector<int32_t>& values_a,
+                                                            const std::vector<bool>& valids_a,
+                                                            const std::vector<int32_t>& values_b,
+                                                            const std::vector<bool>& valids_b)
 {
   auto mr     = get_resource_ref(space);
   auto stream = cudf::get_default_stream();
@@ -1755,8 +1755,8 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
     std::vector<bool> valids    = {true, false, true, false, true};
     auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                               LogicalType{LogicalTypeId::INTEGER});
     coalesce->children.push_back(
       duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
@@ -1789,8 +1789,8 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
     std::vector<bool> valids_b    = {false, true, false, true, false};
     auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                               LogicalType{LogicalTypeId::INTEGER});
     coalesce->children.push_back(
       duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     coalesce->children.push_back(
@@ -1804,9 +1804,9 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
     REQUIRE(ov.num_rows() == iv.num_rows());
     REQUIRE(ov.column(0).null_count() == 1);
 
-    auto out_vals                 = copy_column_to_host<int32_t>(ov.column(0));
-    auto out_valids               = copy_valids_to_host(ov.column(0));
-    std::vector<int32_t> expected = {10, 200, 30, 400, 0};
+    auto out_vals                     = copy_column_to_host<int32_t>(ov.column(0));
+    auto out_valids                   = copy_valids_to_host(ov.column(0));
+    std::vector<int32_t> expected     = {10, 200, 30, 400, 0};
     std::vector<bool> expected_valids = {true, true, true, true, false};
     REQUIRE(out_valids == expected_valids);
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -1822,8 +1822,8 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
     std::vector<bool> valids_b    = {false, true, false, false};
     auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                               LogicalType{LogicalTypeId::INTEGER});
     coalesce->children.push_back(
       duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     coalesce->children.push_back(
@@ -1848,8 +1848,8 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
     std::vector<bool> valids_b    = {false, true, false, false};
     auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                               LogicalType{LogicalTypeId::INTEGER});
     coalesce->children.push_back(
       duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
     coalesce->children.push_back(
@@ -1891,8 +1891,8 @@ TEMPLATE_TEST_CASE("experimental select COALESCE nested in predicate",
   std::vector<bool> valids    = {true, false, true, false, true};
   auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-  auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+  auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                             LogicalType{LogicalTypeId::INTEGER});
   coalesce->children.push_back(
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
   coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));

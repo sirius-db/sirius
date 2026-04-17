@@ -193,10 +193,10 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpr
     // Otherwise, execute the THEN and selectively copy to the output
     auto current_then = Execute(*case_check.then_expr, then_state);
     current_output    = cudf::copy_if_else(current_then->view(),
-                                           current_output->view(),
-                                           current_mask->view(),
-                                           execution_stream,
-                                           resource_ref);
+                                        current_output->view(),
+                                        current_mask->view(),
+                                        execution_stream,
+                                        resource_ref);
   }
   return current_output;
 }
