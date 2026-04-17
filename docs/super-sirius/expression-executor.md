@@ -6,14 +6,14 @@ This document covers the GPU expression execution subsystem used by FILTER and P
 
 **File:** `src/include/expression_executor/gpu_expression_executor.hpp`
 
-`GpuExpressionExecutor` evaluates DuckDB expressions on the GPU. It provides two execution modes:
+`gpu_expression_executor` evaluates DuckDB expressions on the GPU. It provides two execution modes:
 
 | Method | Purpose | Used By |
 |--------|---------|---------|
-| `execute(batch, stream)` | Projects: evaluates expressions and returns result columns with all rows | PROJECTION |
-| `select(batch, stream)` | Filters: evaluates a boolean expression and returns only rows that pass | FILTER |
+| `execute(batch)` | Projects: evaluates expressions and returns result columns with all rows | PROJECTION |
+| `select(batch)` | Filters: evaluates a boolean expression and returns only rows that pass | FILTER |
 
-Both methods accept a `data_batch` and return a new `data_batch` with the result.
+Both methods accept a `data_batch` and return a new `data_batch` with the result. The `rmm::cuda_stream_view` and memory resource are passed to the constructor and stored as members — they are not per-call arguments.
 
 ## Supported Expression Types
 
@@ -28,28 +28,6 @@ Both methods accept a `data_batch` and return a new `data_batch` with the result
 | Type cast | `BoundCastExpression` | `CAST(x AS DOUBLE)` |
 | CASE/WHEN | `BoundCaseExpression` | `CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END` |
 | BETWEEN | `BoundBetweenExpression` | `x BETWEEN 10 AND 20` |
-
-## State Management
-
-**File:** `src/include/expression_executor/gpu_expression_executor_state.hpp`
-
-Expression evaluation maintains a state tree that mirrors the expression tree:
-
-```
-GpuExpressionExecutorState
-└── GpuExpressionState (root)
-    ├── GpuExpressionState (child 0)
-    │   └── GpuExpressionState (leaf)
-    └── GpuExpressionState (child 1)
-        └── GpuExpressionState (leaf)
-```
-
-Each `GpuExpressionState` holds:
-- Reference to the `Expression` being evaluated
-- `child_states` — recursively mirrors expression tree structure
-- `types` — cuDF data types for child results
-
-States are initialized once and reused across batches within the same operator.
 
 ## GPU Expression Translator
 
@@ -103,6 +81,5 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass inequalit
 |------|---------|
 | `src/include/expression_executor/gpu_expression_executor.hpp` | Main executor class |
 | `src/expression_executor/gpu_expression_executor.cpp` | Implementation |
-| `src/include/expression_executor/gpu_expression_executor_state.hpp` | State tree |
 | `src/include/expression_executor/gpu_expression_translator.hpp` | DuckDB → cuDF AST |
 | `src/expression_executor/gpu_expression_translator.cpp` | Translator implementation |

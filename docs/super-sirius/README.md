@@ -21,7 +21,7 @@ Super Sirius is the new task-based GPU execution engine in Sirius, invoked via `
 | [Execution Flow](execution-flow.md) | End-to-end query trace with file:line references |
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
-| [Expression Executor](expression-executor.md) | GpuExpressionExecutor, GPU expression translator, cuDF AST |
+| [Expression Executor](expression-executor.md) | gpu_expression_executor, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
 | [Scan](scan.md) | Scan subsystem: parquet scan, DuckDB scan, caching, prefetched data source |
