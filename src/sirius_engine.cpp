@@ -45,7 +45,6 @@
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
 #include "sirius/exception.hpp"
-
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
