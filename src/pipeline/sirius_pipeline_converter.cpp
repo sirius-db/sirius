@@ -945,7 +945,6 @@ void sirius_pipeline_converter::wire_data_repositories()
         scheduled_[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
       for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
         auto next_op             = dependent_pipeline->get_operators().size() == 0
@@ -1162,7 +1161,6 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
         }
       } else if (first_op.type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                 first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
         // ignore operators that don't have ports
@@ -1208,7 +1206,6 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
         // ignore DUCKDB_SCAN, PARQUET_SCAN, ICEBERG_SCAN, PARQUET_METADATA_SCAN
         // (they don't have ports)

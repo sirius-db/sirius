@@ -154,9 +154,7 @@ void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeli
 
 duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>>
 sirius_pipeline::get_operators()
-{
-  return operators;
-}
+{ return operators; }
 
 duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>>
 sirius_pipeline::get_operators() const
@@ -243,34 +241,24 @@ void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipelin
 
 sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(
   sirius_pipeline& pipeline)
-{
-  return pipeline.source;
-}
+{ return pipeline.source; }
 
 sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(
   sirius_pipeline& pipeline)
-{
-  return pipeline.sink;
-}
+{ return pipeline.sink; }
 
 void sirius_pipeline_build_state::set_pipeline_operators(
   sirius_pipeline& pipeline,
   duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators)
-{
-  pipeline.operators = std::move(operators);
-}
+{ pipeline.operators = std::move(operators); }
 
 duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
   sirius_engine& engine, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
-{
-  return engine.create_child_pipeline(pipeline, op);
-}
+{ return engine.create_child_pipeline(pipeline, op); }
 
 duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>>
 sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
-{
-  return pipeline.operators;
-}
+{ return pipeline.operators; }
 
 bool sirius_pipeline::is_pipeline_finished() const
 {
@@ -316,16 +304,6 @@ void sirius_pipeline::update_pipeline_status()
       notify_downstream_pipelines();
       return;
     }
-  } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-    auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
-    if (!parquet_scan.has_more_partitions) {
-      if (tasks_created.load() == tasks_completed.load()) {
-        pipeline_finished = true;
-        end_nvtx_range_if_finished();
-        notify_downstream_pipelines();
-      }
-      return;
-    }
   } else {
     op::sirius_physical_operator* first_node =
       operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
@@ -368,9 +346,9 @@ void sirius_pipeline::mark_task_created()
     attr.size               = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
     attr.messageType        = NVTX_MESSAGE_TYPE_ASCII;
     auto label              = std::format("Pipeline {}: {} -> {}",
-                             pipeline_id,
-                             source ? source->get_name() : "?",
-                             sink ? sink->get_name() : "?");
+                                          pipeline_id,
+                                          source ? source->get_name() : "?",
+                                          sink ? sink->get_name() : "?");
     attr.message.ascii      = label.c_str();
     _nvtx_pipeline_range_id = nvtxRangeStartEx(&attr);
   }
