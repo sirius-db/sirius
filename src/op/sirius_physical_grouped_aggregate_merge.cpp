@@ -15,6 +15,7 @@
  */
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
@@ -94,7 +95,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   std::vector<int> group_idx,
   std::vector<cudf::aggregation::Kind> cudf_aggregates,
   std::vector<int> cudf_aggregate_idx,
@@ -117,7 +118,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   std::size_t estimated_cardinality)
@@ -142,7 +143,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
@@ -249,9 +250,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       auto count_view = merged_cols[count_col_idx]->view();
 
       std::unique_ptr<cudf::column> avg_col;
-      bool is_decimal = (slot.output_type.id() == cudf::type_id::DECIMAL32 ||
-                         slot.output_type.id() == cudf::type_id::DECIMAL64 ||
-                         slot.output_type.id() == cudf::type_id::DECIMAL128);
+      bool is_decimal = sirius::IsCudfTypeDecimal(slot.output_type);
       if (is_decimal) {
         // DECIMAL: divide directly in fixed-point to preserve precision
         avg_col = cudf::binary_operation(

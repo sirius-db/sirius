@@ -22,6 +22,7 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -86,8 +87,9 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::vector<duckdb::JoinCondition> cond,
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality)
-  : sirius_physical_partition_consumer_operator(
-      SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
+  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
+                                                sirius::from_duckdb_vec(op.types),
+                                                estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond))
 {
@@ -115,8 +117,9 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
-  : sirius_physical_partition_consumer_operator(
-      SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
+  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
+                                                sirius::from_duckdb_vec(op.types),
+                                                estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond))
 {
@@ -145,8 +148,9 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   std::size_t estimated_cardinality,
   duckdb::vector<std::size_t> left_projection_map,
   duckdb::vector<std::size_t> right_projection_map)
-  : sirius_physical_partition_consumer_operator(
-      SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
+  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
+                                                sirius::from_duckdb_vec(op.types),
+                                                estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond))
 {
@@ -192,11 +196,11 @@ bool sirius_physical_nested_loop_join::is_supported(
   return true;
 }
 
-duckdb::vector<duckdb::LogicalType> sirius_physical_nested_loop_join::get_join_types() const
+duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_types() const
 {
-  duckdb::vector<duckdb::LogicalType> result;
+  duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
-    result.push_back(op.right->return_type);
+    result.push_back(sirius::from_duckdb(op.right->return_type));
   }
   return result;
 }

@@ -27,7 +27,7 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DUMMY_SCAN;
 
  public:
-  explicit sirius_physical_dummy_scan(duckdb::vector<duckdb::LogicalType> types,
+  explicit sirius_physical_dummy_scan(duckdb::vector<sirius::logical_type> types,
                                       std::size_t estimated_cardinality)
     : sirius_physical_operator(
         SiriusPhysicalOperatorType::DUMMY_SCAN, std::move(types), estimated_cardinality)

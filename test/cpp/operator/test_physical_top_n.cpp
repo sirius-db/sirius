@@ -19,6 +19,7 @@
 #include <catch.hpp>
 #include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <helper/type_conversions.hpp>
 #include <op/sirius_physical_top_n.hpp>
 #include <op/sirius_physical_top_n_merge.hpp>
 
@@ -80,7 +81,7 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
-  sirius_physical_top_n topn(std::move(types),
+  sirius_physical_top_n topn(sirius::from_duckdb_vec(types),
                              std::move(orders),
                              /*limit=*/3,
                              /*offset=*/0,
@@ -124,7 +125,7 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
   orders.push_back(make_order(1, duckdb::OrderType::ASCENDING));
 
-  sirius_physical_top_n topn(std::move(types),
+  sirius_physical_top_n topn(sirius::from_duckdb_vec(types),
                              std::move(orders),
                              /*limit=*/4,
                              /*offset=*/0,
@@ -168,7 +169,7 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
-  sirius_physical_top_n_merge topn_merge(std::move(types),
+  sirius_physical_top_n_merge topn_merge(sirius::from_duckdb_vec(types),
                                          std::move(orders),
                                          /*limit=*/5,
                                          /*offset=*/3,
@@ -210,7 +211,7 @@ TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_to
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
-  sirius_physical_top_n_merge topn_merge(std::move(types),
+  sirius_physical_top_n_merge topn_merge(sirius::from_duckdb_vec(types),
                                          std::move(orders),
                                          /*limit=*/0,
                                          /*offset=*/2,
@@ -237,7 +238,7 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
-  sirius_physical_top_n_merge topn_merge(std::move(types),
+  sirius_physical_top_n_merge topn_merge(sirius::from_duckdb_vec(types),
                                          std::move(orders),
                                          /*limit=*/3,
                                          /*offset=*/0,

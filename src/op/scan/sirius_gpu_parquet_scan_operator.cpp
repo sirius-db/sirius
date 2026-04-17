@@ -40,7 +40,7 @@ namespace sirius::op::scan {
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   cucascade::memory::memory_space& gpu_memory_space)
   : sirius_physical_operator(
