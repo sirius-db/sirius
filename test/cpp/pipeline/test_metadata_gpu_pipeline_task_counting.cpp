@@ -249,14 +249,13 @@ std::size_t simulate_task_creator_loop(sirius::pipeline::sirius_pipeline& pipe,
 // Tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE(
-  "pipeline task counting - single file, default max_file_processed (one metadata task)",
-  "[pipeline_task_counting][shared_context]")
+TEST_CASE("pipeline task counting - single file, default max_file_processed (one metadata task)",
+          "[pipeline_task_counting][shared_context]")
 {
   pipeline_task_counting_fixture fixture;
 
-  constexpr std::size_t NUM_ROWS    = 2000;
-  constexpr std::size_t ROW_GROUP   = 500;  // → 4 row groups, so ~4 partitions
+  constexpr std::size_t NUM_ROWS  = 2000;
+  constexpr std::size_t ROW_GROUP = 500;  // → 4 row groups, so ~4 partitions
   create_synthetic_table(fixture.con, "task_count_single", NUM_ROWS);
   auto path = write_parquet(fixture.con, "task_count_single", ROW_GROUP);
   parquet_file_cleanup cleanup{{path}};
@@ -291,8 +290,8 @@ TEST_CASE(
   metadata_op.finalize_operator();
 
   // ----------- pipeline 2: gpu parquet scan -----------
-  std::size_t gpu_tasks = simulate_task_creator_loop(
-    *gpu_pipeline, gpu_op, [&](sirius::op::operator_data& input) {
+  std::size_t gpu_tasks =
+    simulate_task_creator_loop(*gpu_pipeline, gpu_op, [&](sirius::op::operator_data& input) {
       input.prepare_for_processing(fixture.gpu_space, cudf::get_default_stream());
       auto output = gpu_op.execute(input, cudf::get_default_stream());
       REQUIRE(output);
@@ -304,9 +303,8 @@ TEST_CASE(
   REQUIRE(gpu_pipeline->is_pipeline_finished());
 }
 
-TEST_CASE(
-  "pipeline task counting - multi-file metadata scan with max_file_processed = 1",
-  "[pipeline_task_counting][multi_file][shared_context]")
+TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_processed = 1",
+          "[pipeline_task_counting][multi_file][shared_context]")
 {
   pipeline_task_counting_fixture fixture;
 
@@ -314,9 +312,9 @@ TEST_CASE(
   // max_file_processed = 1 the metadata scan has to emit one task per file,
   // so task_creator's loop should call get_next_task_input_data() 4 times
   // successfully (plus one trailing null once all_ports_empty()).
-  constexpr std::size_t NUM_FILES   = 4;
-  constexpr std::size_t ROWS_PER    = 300;
-  constexpr std::size_t ROW_GROUP   = 100;
+  constexpr std::size_t NUM_FILES = 4;
+  constexpr std::size_t ROWS_PER  = 300;
+  constexpr std::size_t ROW_GROUP = 100;
   std::vector<std::filesystem::path> paths;
   std::vector<std::string> files;
   for (std::size_t i = 0; i < NUM_FILES; ++i) {
@@ -356,13 +354,12 @@ TEST_CASE(
   // all_ports_empty() flips true and the loop exits, leaving
   // tasks_created == tasks_completed == NUM_FILES.
   std::size_t observed_max_created = 0;
-  auto metadata_tasks               = simulate_task_creator_loop(
+  auto metadata_tasks              = simulate_task_creator_loop(
     *metadata_pipeline, metadata_op, [&](sirius::op::operator_data& input) {
       auto output = metadata_op.execute(input, cudf::get_default_stream());
       REQUIRE(output);
       metadata_op.sink(*output, cudf::get_default_stream());
-      observed_max_created =
-        std::max(observed_max_created, metadata_pipeline->get_tasks_created());
+      observed_max_created = std::max(observed_max_created, metadata_pipeline->get_tasks_created());
     });
 
   REQUIRE(metadata_tasks == NUM_FILES);
@@ -380,8 +377,8 @@ TEST_CASE(
   REQUIRE(gpu_op.is_source_pipeline_finished());
 
   // ----------- pipeline 2: gpu scan over all accumulated partitions -----------
-  std::size_t gpu_tasks = simulate_task_creator_loop(
-    *gpu_pipeline, gpu_op, [&](sirius::op::operator_data& input) {
+  std::size_t gpu_tasks =
+    simulate_task_creator_loop(*gpu_pipeline, gpu_op, [&](sirius::op::operator_data& input) {
       input.prepare_for_processing(fixture.gpu_space, cudf::get_default_stream());
       auto output = gpu_op.execute(input, cudf::get_default_stream());
       REQUIRE(output);

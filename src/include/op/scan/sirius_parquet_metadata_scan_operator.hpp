@@ -215,7 +215,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   std::vector<std::size_t> _post_filter_projection_ids;
   /// The set of column indices corresponding to columns that will be pruned after filtering.
   /// For the metadata scan operator, this is used to prune bytes from the accumulated uncompressed
-  /// byte count for paritioning purposes.
+  /// byte count for partitioning purposes.
   std::unordered_set<std::size_t> _pure_filter_column_indices;
 
   std::size_t _approximate_batch_size;

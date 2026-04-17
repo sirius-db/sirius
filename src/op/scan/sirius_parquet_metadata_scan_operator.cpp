@@ -125,7 +125,9 @@ std::optional<task_creation_hint> sirius_parquet_metadata_scan_operator::get_nex
 }
 
 bool sirius_parquet_metadata_scan_operator::all_ports_empty()
-{ return _next_file_idx.load(std::memory_order_relaxed) >= _total_files; }
+{
+  return _next_file_idx.load(std::memory_order_relaxed) >= _total_files;
+}
 
 std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::get_next_task_input_data()
 {
@@ -319,6 +321,8 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
 }
 
 void sirius_parquet_metadata_scan_operator::finalize_operator()
-{ _gpu_scan->finalize_partitions(); }
+{
+  _gpu_scan->finalize_partitions();
+}
 
 }  // namespace sirius::op::scan

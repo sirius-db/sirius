@@ -111,7 +111,9 @@ class operator_data {
   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
   prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                          rmm::cuda_stream_view stream)
-  { return std::vector<::cucascade::data_batch_processing_handle>{}; };
+  {
+    return std::vector<::cucascade::data_batch_processing_handle>{};
+  };
 };
 
 /**
@@ -135,14 +137,18 @@ class pipelineable_operator_data : public operator_data {
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const
-  { return _data_batches; }
+  {
+    return _data_batches;
+  }
 
   /**
    * @brief Move the data batches out of this container, leaving it empty.
    * @return Vector of data batch pointers (moved out).
    */
   std::vector<std::shared_ptr<::cucascade::data_batch>> release_data_batches()
-  { return std::move(_data_batches); }
+  {
+    return std::move(_data_batches);
+  }
 
   /**
    * @brief Lock all data batches for processing in the requested memory space.

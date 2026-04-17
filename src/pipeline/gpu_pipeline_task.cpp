@@ -178,7 +178,9 @@ gpu_pipeline_task::~gpu_pipeline_task()
 uint64_t gpu_pipeline_task::get_task_id() const { return _task_id; }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
-{ return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline(); }
+{
+  return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+}
 
 std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
 {

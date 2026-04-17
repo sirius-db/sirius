@@ -111,10 +111,10 @@ void sirius_engine::insert_repository(
 {
   auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_data_repository_manager();
-  auto next_op            = dependent_pipeline->get_operators().size() == 0
-                              ? dependent_pipeline->get_sink().get()
-                              : &dependent_pipeline->get_operators()[0].get();
-  size_t op_id            = next_op->operator_id;
+  auto next_op = dependent_pipeline->get_operators().size() == 0
+                   ? dependent_pipeline->get_sink().get()
+                   : &dependent_pipeline->get_operators()[0].get();
+  size_t op_id = next_op->operator_id;
   data_repo_manager.add_new_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
   next_op->add_port(port_id,
@@ -165,7 +165,9 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_engine::create_child_pipeli
 }
 
 bool sirius_engine::has_result_collector()
-{ return sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR; }
+{
+  return sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
+}
 
 duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 {
