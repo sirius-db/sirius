@@ -404,6 +404,26 @@ column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
       auto& std_col  = col_data.Cast<duckdb::StandardColumnData>();
       auto& val_data = std_col.GetValidityData();
 
+      // CONSTANT data segments hide the fact that the column has nulls
+      // (segment stats reflect the data values, not the validity mask).
+      // Peek at the validity tree: any UNCOMPRESSED or ROARING validity
+      // segment means real nulls live in that row group, so we must scan
+      // and overlay them. Without this, CONSTANT-compressed columns with
+      // nulls return all-valid on the GPU.
+      if (!result.has_nulls) {
+        auto& vtree = val_data.GetSegmentTree();
+        auto vnode  = vtree.GetRootSegment();
+        while (vnode) {
+          auto vcomp = vnode->GetNode().GetCompressionType();
+          if (vcomp == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED ||
+              vcomp == duckdb::CompressionType::COMPRESSION_ROARING) {
+            result.has_nulls = true;
+            break;
+          }
+          vnode = vtree.GetNextSegment(*vnode);
+        }
+      }
+
       if (result.has_nulls) {
         auto val_scan = scan_segment_tree(val_data, buffer_manager, nullptr, mmap_state);
         result.validity.total_pinned_bytes += val_scan.total_pinned_bytes;
