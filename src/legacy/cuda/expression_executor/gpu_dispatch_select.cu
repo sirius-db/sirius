@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "expression_executor/gpu_dispatcher.hpp"
+#include "legacy/expression_executor/gpu_dispatcher.hpp"
 #include "gpu_buffer_manager.hpp"
 
 #include <cub/cub.cuh>

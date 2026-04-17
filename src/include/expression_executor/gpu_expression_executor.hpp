@@ -18,9 +18,7 @@
 
 // sirius
 #include <config.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
-#include <gpu_buffer_manager.hpp>
-#include <gpu_columns.hpp>
+#include <expression_executor/expression_executor_strategy.hpp>
 
 // duckdb
 #include <duckdb/planner/expression.hpp>
@@ -51,11 +49,10 @@
 #include <array>
 #include <memory>
 #include <string_view>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
-namespace sirius::experimental {
+namespace sirius {
 
 // The currently supported CAST return types for cuDF ASTs
 static std::array<duckdb::LogicalTypeId, 3> constexpr supported_ast_cast_types{
@@ -64,40 +61,11 @@ static std::array<std::string_view, 6> constexpr supported_ast_functions{
   "+", "-", "*", "/", "//", "%"};
 
 /**
- * @brief The expression_executor_strategy defines how the gpu_expression_executor executes.
- * MATERIALIZE: Executes by materializing intermediate results as cudf::columns (every expression
- *              node is a single kernel).
- * AST_INTERPRET: Executes by constructing a cudf::ast::tree and interpreting it with cudf::compute
- *                (monolithic kernel with large switch statement).
- * AST_JIT: Executes by constructing a cudf::ast::tree and compiling it with cudf::compute_jit.
- *
- * @note Not all expression nodes have cuDF AST equivalents ('AST breakers'), so the AST-based
- * strategies build ASTs for as many nodes as they can before encountering AST breakers. The result
- * is a tree whose nodes are AST trees and whose edges are AST breakers.
+ * @brief Returns the current default expression_executor_strategy configured via
+ * `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
  */
-enum class expression_executor_strategy {
-  MATERIALIZE,
-  AST_INTERPRET,
-  AST_JIT,
-};
-
-/**
- * @brief Parse a string into an expression_executor_strategy.
- * Accepts "materialize", "ast_interpret", "ast_jit".
- * @return true on success; false on unrecognized input.
- */
-inline bool string_to_strategy(std::string_view sv, expression_executor_strategy& out)
-{
-  static std::unordered_map<std::string_view, expression_executor_strategy> const map = {
-    {"materialize", expression_executor_strategy::MATERIALIZE},
-    {"ast_interpret", expression_executor_strategy::AST_INTERPRET},
-    {"ast_jit", expression_executor_strategy::AST_JIT},
-  };
-  auto it = map.find(sv);
-  if (it == map.end()) { return false; }
-  out = it->second;
-  return true;
-}
+inline expression_executor_strategy strategy_from_config()
+{ return duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY; }
 
 /**
  * @brief The gpu_expression_executor is responsible for evaluating DuckDB expressions on the GPU
@@ -221,21 +189,15 @@ class gpu_expression_executor {
 
     /// @brief Returns true if the payload holds a cudf::scalar.
     [[nodiscard]] bool is_scalar() const
-    {
-      return std::holds_alternative<std::unique_ptr<cudf::scalar>>(payload);
-    }
+    { return std::holds_alternative<std::unique_ptr<cudf::scalar>>(payload); }
 
     /// @brief Returns true if the payload holds a cudf::column_view.
     [[nodiscard]] bool is_column_view() const
-    {
-      return std::holds_alternative<cudf::column_view>(payload);
-    }
+    { return std::holds_alternative<cudf::column_view>(payload); }
 
     /// @brief Returns true if the payload holds an owned cudf::column.
     [[nodiscard]] bool is_owned_column() const
-    {
-      return std::holds_alternative<std::unique_ptr<cudf::column>>(payload);
-    }
+    { return std::holds_alternative<std::unique_ptr<cudf::column>>(payload); }
 
     /**
      * @brief Returns the AST expression reference from the payload.
@@ -305,10 +267,10 @@ class gpu_expression_executor {
    * operators).
    *
    * @param expressions The expressions to execute.
-   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE).
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
    * @param stream The rmm::cuda_stream_view in which to execute any cuDF operations.
+   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
+   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
@@ -317,19 +279,19 @@ class gpu_expression_executor {
    */
   gpu_expression_executor(
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
-    expression_executor_strategy strategy,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
     std::size_t min_ast_size                    = 2);
 
   /**
    * @brief Construct a gpu_expression_executor with the given expression (for FILTER operators).
    *
    * @param expression The expressions to execute.
-   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE).
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
    * @param stream The rmm::cuda_stream_view in which to execute any cuDF operations.
+   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
+   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
@@ -338,9 +300,9 @@ class gpu_expression_executor {
    */
   gpu_expression_executor(
     duckdb::Expression const* expression,
-    expression_executor_strategy strategy,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
     std::size_t min_ast_size                    = 2);
 
   /**
@@ -423,160 +385,4 @@ class gpu_expression_executor {
   [[nodiscard]] std::size_t count_ast_ops(duckdb::Expression const& expr) const;
 };
 
-}  // namespace sirius::experimental
-
-namespace duckdb {
-namespace sirius {
-
-//===----------------------------------------------------------------------===//
-// GpuExpressionExecutor
-//===----------------------------------------------------------------------===//
-
-/**
- * @brief The GpuExpressionExecutor is responsible for evaluating expressions on the GPU.
- */
-struct GpuExpressionExecutor {
-  using data_batch              = cucascade::data_batch;
-  using data_repository_manager = cucascade::data_repository_manager<std::shared_ptr<data_batch>>;
-
-  //===----------Constructor/Destructor(s)----------===//
-  /**
-   * @brief Constructs an expression executor with a single expression
-   *
-   * @param expr The expression to evaluate
-   * @param resource_ref The rmm::device_async_resource_ref to pass to cudf APIs for allocations
-   */
-  GpuExpressionExecutor(
-    const Expression& expr,
-    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref());
-
-  /**
-   * @brief Constructs an expression executor with a set of expressions
-   *
-   * @param expressions The expressions to evaluate
-   * @param resource_ref The rmm::device_async_resource_ref to pass to cudf APIs for allocations
-   */
-  GpuExpressionExecutor(
-    const vector<unique_ptr<Expression>>& expressions,
-    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref());
-
-  //===----------Fields----------===//
-  std::vector<const Expression*> expressions;  ///< The expressions to execute
-  std::vector<std::unique_ptr<GpuExpressionExecutorState>>
-    states;  ///< The execution states associated with each expression to execute
-  std::vector<shared_ptr<GPUColumn>>
-    input_columns;                              ///< The input columns for expression evaluation
-  rmm::device_async_resource_ref resource_ref;  ///< The allocator to pass to cudf APIs
-  cudf::size_type input_count;                  ///< The row count of the input table
-  bool has_null_input_column;                   ///< Whether some input column is null
-  rmm::cuda_stream_view execution_stream;       ///< THe stream in which to execute operations
-
-  //===----------Fields for New Execution Model----------===//
-  bool use_data_batch_apis =
-    false;  ///< Whether to use the data_batch APIs in executing bound references
-  std::vector<std::unique_ptr<cudf::column>>
-    output_columns;              ///< The columns generated by the executed expressions
-  cudf::table_view input_table;  ///< The input table
-
-  //===----------Methods----------===//
-  void AddExpression(const Expression& expr);
-  void ClearExpressions();
-
-  // Set the root state of the executor to the given expression
-  void Initialize(const Expression& expr, GpuExpressionExecutorState& state);
-
-  // Set the input count and columns for the expression executor
-  void SetInputColumns(const GPUIntermediateRelation& input_relation);
-
-  // Before evaluating an expression, check the leaves for nullptrs
-  // (Assumes the input columns have already been set)
-  [[nodiscard]] bool HasNullLeaf(const Expression& expr) const;
-  template <typename ExpressionT>
-  bool HasNullLeafLoop(const ExpressionT& expr) const;
-
-  // Execute the set of expressions with the given input relation and store the result in the
-  // output relation (Provides the main interface with client code for Projections).
-  void Execute(const GPUIntermediateRelation& input_relation,
-               GPUIntermediateRelation& output_relation,
-               rmm::cuda_stream_view stream = rmm::cuda_stream_default);
-
-  // Execute the set of expressions with the given input relation and compact into the output
-  // relation based on the resulting selection vector (Provides the main interface with client
-  // code for Filters).
-  void Select(GPUIntermediateRelation& input_relation,
-              GPUIntermediateRelation& output_relation,
-              rmm::cuda_stream_view stream = rmm::cuda_stream_default);
-
-  /**
-   * @brief Executes the current set of expressions against the given input batch and emits a new
-   * output batch holding the results.
-   *
-   * @param input_batch The input batch against which to evaluate expressions
-   * @param stream The stream in which to execute the operations in the expression tree
-   *
-   * @return std::shared_ptr<cucascade::data_batch> The result of the evaluated expressions
-   *
-   * @note It is required that there is only one boolean expression in the current expression set.
-   */
-  std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
-                                      rmm::cuda_stream_view stream);
-
-  /**
-   * @brief Evaluates a boolean expression and filters the input batch according to the result.
-   *
-   * @param input_batch The input batch against which to evaluate the expression
-   * @param stream The stream in which to execute the operations in the expression tree
-   *
-   * @return std::shared_ptr<cucascade::data_batch> The input batch filtered by the boolean
-   * expression
-   */
-  std::shared_ptr<cucascade::data_batch> select(std::shared_ptr<data_batch> input_batch,
-                                                rmm::cuda_stream_view stream);
-
-  // Execute the expression at the given index and return the result
-  std::unique_ptr<cudf::column> ExecuteExpression(idx_t expression_idx);
-
-  //----------Execute + Specializations----------//
-  std::unique_ptr<cudf::column> Execute(const Expression& expr, GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundBetweenExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundCaseExpression& expr, GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundCastExpression& expr, GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundComparisonExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundConjunctionExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundConstantExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundFunctionExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundOperatorExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundReferenceExpression& expr,
-                                        GpuExpressionState* state);
-
-  //===----------Initialize State + Specializations----------===//
-  static std::unique_ptr<GpuExpressionState> InitializeState(const Expression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundBetweenExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundCaseExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundCastExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundComparisonExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundConjunctionExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundConstantExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundFunctionExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundOperatorExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundReferenceExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-};
-
 }  // namespace sirius
-}  // namespace duckdb

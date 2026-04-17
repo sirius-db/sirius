@@ -22,7 +22,6 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -261,9 +260,7 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
 
 void sirius_physical_nested_loop_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
-{
-  sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
-}
+{ sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this); }
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
 {
@@ -496,8 +493,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       expr_to_idx[cond_hash]           = join_input_index;
       cudf::size_type source_idx       = 0;
       if (!get_column_index(expr, source_idx)) {
-        duckdb::sirius::GpuExpressionExecutor executor(expr, mr);
-        auto expr_result_batch = executor.execute(batch, stream);
+        sirius::gpu_expression_executor executor(&expr, mr, stream);
+        auto expr_result_batch = executor.execute(batch);
         auto& expr_table =
           expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
         auto expr_view = expr_table.view();
