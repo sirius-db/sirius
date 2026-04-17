@@ -1,7 +1,7 @@
 [submodule "duckdb"]
 	path = duckdb
-	url = https://github.com/duckdb/duckdb
-	branch = main
+	url = https://github.com/ducndh/duckdb
+	branch = sirius-public-accessors
 	ignore = dirty
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
