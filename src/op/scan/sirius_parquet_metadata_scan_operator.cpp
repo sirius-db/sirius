@@ -114,7 +114,7 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
 }
 
 //===----------------------------------------------------------------------===//
-// Source interface
+// Scheduling interface
 //===----------------------------------------------------------------------===//
 std::optional<task_creation_hint> sirius_parquet_metadata_scan_operator::get_next_task_hint()
 {
@@ -161,13 +161,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     cudf::io::parquet_reader_options::builder().build());
 
   // Projections
-  if (_is_projected) {
-#if CUDF_VERSION_NUM >= 2604
-    result->reader_options->set_column_names(_projected_column_names);
-#else
-    result->reader_options->set_columns(_projected_column_names);
-#endif
-  }
+  if (_is_projected) { result->reader_options->set_column_names(_projected_column_names); }
 
   // Filter
   std::shared_ptr<translated_expression> ast_filter;
@@ -325,8 +319,6 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
 }
 
 void sirius_parquet_metadata_scan_operator::finalize_operator()
-{
-  _gpu_scan->finalize_partitions();
-}
+{ _gpu_scan->finalize_partitions(); }
 
 }  // namespace sirius::op::scan

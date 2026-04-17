@@ -694,15 +694,17 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
 
   REQUIRE(op.is_source());
 
-  // Before finalization, source methods should indicate not ready.
-  REQUIRE_FALSE(op.all_ports_empty());
+  // With no metadata accumulated and no "handoff" port wired to an upstream
+  // pipeline, the gpu scan operator has nothing to claim and nothing to defer
+  // to — all_ports_empty() is true and get_next_task_hint() returns nullopt.
+  REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_hint() == std::nullopt);
   REQUIRE(op.get_next_task_input_data() == nullptr);
 
-  // Finalize with no metadata → no partitions.
+  // Finalize with no metadata → no partitions, still idle.
   op.finalize_partitions();
   REQUIRE(op.all_ports_empty());
-  REQUIRE(op.get_total_partitions() == 0);
+  REQUIRE(op.get_next_task_hint() == std::nullopt);
 }
 
 TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",

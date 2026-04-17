@@ -79,7 +79,10 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    *        physical parquet scan node (or equivalent source).
    *
    * @param gpu_scan                The downstream gpu scan operator into which to push partition
-   *                                metadata.
+   *                                metadata. This is necessary in order to avoid the gpu scan
+   *                                serving as sink operator in both the metadatascan pipeline and
+   *                                in a subsequent standalone pipeline for which it is the source
+   *                                operator.
    * @param types                   Output column types.
    * @param returned_types          The types of all columns in the source file.
    * @param estimated_cardinality   Estimated output row count.
@@ -115,6 +118,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
 
+  //===----------Scheduling interface----------===//
   /**
    * @return READY (pointing to itself) while there are unprocessed files,
    *         or nullopt when all files have been dispatched.
