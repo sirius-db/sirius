@@ -1174,7 +1174,7 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     "[gpu_native_decode] batched string col: {} rows, {} chars, "
     "{} dict segs, {} fsst segs, {} uncomp segs",
     total_rows,
-    total_chars,
+    alloc_chars,
     dict_descs.size(),
     fsst_descs.size(),
     uncomp_descs.size());

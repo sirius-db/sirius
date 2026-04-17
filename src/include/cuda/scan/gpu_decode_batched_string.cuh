@@ -11,6 +11,8 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <unordered_map>
+
 namespace sirius::cuda::scan {
 
 /// @brief Decode a string column using batched two-pass approach.

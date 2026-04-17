@@ -668,38 +668,9 @@ static std::unique_ptr<operator_data> gather_join_output(
     left_oob = cudf::out_of_bounds_policy::NULLIFY;
   }
 
-  // Validate string column offsets before gather — corrupt offsets cause cudf
-  // to compute negative buffer sizes that wrap to huge allocations.
-  auto validate_string_cols = [&stream](cudf::table_view const& tv, char const* label) {
-    stream.synchronize();
-    for (cudf::size_type c = 0; c < tv.num_columns(); c++) {
-      auto col = tv.column(c);
-      if (col.type().id() != cudf::type_id::STRING || col.size() == 0) continue;
-      auto offsets_col = col.child(0);
-      // Copy first and last offset to host to validate
-      std::vector<int32_t> host_offsets(offsets_col.size());
-      cudaMemcpy(host_offsets.data(), offsets_col.head<int32_t>(),
-                 offsets_col.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
-      auto first = host_offsets.front();
-      auto last  = host_offsets.back();
-      auto total_chars = last - first;
-      bool monotonic = true;
-      for (size_t i = 1; i < host_offsets.size(); i++) {
-        if (host_offsets[i] < host_offsets[i-1]) { monotonic = false; break; }
-      }
-      SIRIUS_LOG_INFO("[gather_validate] {} col[{}] STRING: rows={} offsets=[{}..{}] "
-                      "total_chars={} monotonic={}",
-                      label, c, col.size(), first, last, total_chars, monotonic);
-      if (!monotonic || first < 0 || total_chars < 0) {
-        SIRIUS_LOG_ERROR("[gather_validate] CORRUPT offsets in {} col[{}]!", label, c);
-      }
-    }
-  };
-
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   if (collect_left) {
     cudf::table_view left_cols_to_gather = left_full.select(lhs_col_idxs);
-    validate_string_cols(left_cols_to_gather, "left");
     cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
                                     left_indices->size(),
                                     left_indices->data(),
@@ -712,7 +683,6 @@ static std::unique_ptr<operator_data> gather_join_output(
   }
   if (collect_right) {
     cudf::table_view right_cols_to_gather = right_full.select(rhs_col_idxs);
-    validate_string_cols(right_cols_to_gather, "right");
     cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
                                      right_indices->size(),
                                      right_indices->data(),
