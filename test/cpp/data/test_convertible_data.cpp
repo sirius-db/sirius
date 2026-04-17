@@ -39,7 +39,7 @@ namespace {
 // Minimal concrete subclass to verify convertible_data compiles and can be subclassed
 class stub_convertible_data : public sirius::convertible_data {
  public:
-  bool convert(const std::vector<cucascade::memory::memory_space*>& /*target_spaces*/,
+  bool convert(const std::vector<const cucascade::memory::memory_space*>& /*target_spaces*/,
                rmm::cuda_stream_view /*stream*/,
                sirius::memory::sirius_memory_reservation_manager& /*res_mgr*/) override
   {
