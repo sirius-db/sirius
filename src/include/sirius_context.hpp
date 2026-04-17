@@ -18,6 +18,7 @@
 
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "exchange_memory_manager.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -140,6 +141,9 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
+  [[nodiscard]] ExchangeMemoryManager& get_exchange_manager();
+  [[nodiscard]] const ExchangeMemoryManager& get_exchange_manager() const;
+
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
   void create_query(
@@ -164,6 +168,7 @@ class SiriusContext : public ClientContextState {
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Destroyed before memory_manager_ (declared after it — reverse destruction order).
+  std::unique_ptr<ExchangeMemoryManager> exchange_manager_;
   std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
   // Previous cuDF pinned resource and threshold — restored in terminate() before
   // small_pinned_allocator_ is destroyed to prevent dangling references.

@@ -36,7 +36,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/bit.hpp>
 
-// sirius GPU cache
+// sirius GPU cache and exchange
+#include <exchange_memory_manager.hpp>
 #include <gpu_buffer_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
@@ -675,12 +676,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // Check if the table is already GPU-resident in GPUBufferManager::tables.
+  // Check if the table is already GPU-resident in ExchangeMemoryManager.
   // This happens when exchange data was received via nixl and registered via
-  // cudf::unpack + registerExternalTable (zero-copy from staging buffer).
+  // cudf::unpack + registerExternalTablePacked (zero-copy from staging buffer).
   // In this case, skip the DuckDB scan entirely — the data is already on GPU.
   {
-    auto& bm = duckdb::GPUBufferManager::GetInstance();
+    auto& emgr = g_state._sirius_ctx->get_exchange_manager();
     duckdb::TableFunctionToStringInput tf_input(g_state._op.function, g_state._op.bind_data.get());
     auto to_string = g_state._op.function.to_string(tf_input);
     std::string table_name;
@@ -695,15 +696,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
       if (last_dot != std::string::npos) {
         up = up.substr(last_dot + 1);
       }
-      auto it = bm.tables.find(up);
-      SIRIUS_LOG_INFO("[duckdb_scan_task] GPU-resident check: table='{}' found={} cols={} len={}",
-                      up, it != bm.tables.end(),
-                      (it != bm.tables.end() && it->second) ? it->second->columns.size() : 0,
-                      (it != bm.tables.end() && it->second && !it->second->columns.empty() && it->second->columns[0])
-                        ? it->second->columns[0]->column_length : 0);
-      if (it != bm.tables.end() && !it->second->columns.empty() &&
-          it->second->columns[0]->column_length > 0) {
-        auto num_cached_rows = it->second->columns[0]->column_length;
+      auto exchange_table = emgr.findTable(up);
+      SIRIUS_LOG_INFO("[duckdb_scan_task] GPU-resident check: table='{}' found={} rows={}",
+                      up, exchange_table != nullptr,
+                      exchange_table ? exchange_table->num_rows() : 0);
+      if (exchange_table && exchange_table->has_data()) {
+        auto num_cached_rows = exchange_table->num_rows();
 
         // Only one thread should produce the cached batch for this scan
         // operator. Multiple scan operators may still read the same cached
@@ -722,16 +720,16 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
                         table_name, num_cached_rows);
 
         // Finalize pending views (concatenate multi-sender data) if not yet done.
-        if (!it->second->pending_views.empty()) {
+        if (!exchange_table->pending_views.empty()) {
           try {
-            it->second->finalize_pending_views();
+            exchange_table->finalize_pending_views();
           } catch (const std::exception& e) {
             SIRIUS_LOG_ERROR("[duckdb_scan_task] finalize_pending_views failed: {}", e.what());
           }
         }
-        auto cached_table = it->second->packed_cudf_table;
+        auto cached_table = exchange_table->finalized;
         if (!cached_table) {
-          SIRIUS_LOG_WARN("[duckdb_scan_task] no packed_cudf_table — returning empty cached scan result");
+          SIRIUS_LOG_WARN("[duckdb_scan_task] no finalized exchange table — returning empty cached scan result");
           l_state._local_state_drained = true;
           l_state._defer_drain_until_publish = true;
           return std::make_unique<op::pipelineable_operator_data>(
@@ -762,7 +760,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
 
           // Instead of creating a gpu_table_representation directly (which causes
           // same-device GPU→GPU conversion assertion failures), we populate the
-          // GPUBufferManager cache and let the normal DuckDB scan produce dummy rows.
+          // exchange table cache and let the normal DuckDB scan produce dummy rows.
           // The TABLE_SCAN will find columns cached (via checkIfColumnCached) and skip H2D.
           //
           // This means we DO need the DuckDB table to have rows. Since it's schema-only,
@@ -772,7 +770,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
           // returns 0 rows → pipeline hangs. We need real rows in DuckDB.
           //
           // For now: just log and fall through — the exchange table registration
-          // already put data in GPUBufferManager. We need to also populate DuckDB.
+          // already put data in the exchange table. We need to also populate DuckDB.
           // Ensure CUDA context on this thread (needed to access RMM-allocated GPU data).
           cudaSetDevice(0);
 
@@ -782,8 +780,11 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
             gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
               std::move(owned_table), *gpu_space);
           } else {
+            // cached_table is shared — create a deep copy as unique_ptr for gpu_table_representation.
+            auto owned_copy = std::make_unique<cudf::table>(
+              cached_table->view(), stream, gpu_space->get_default_allocator());
             gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
-              std::move(cached_table), *gpu_space);
+              std::move(owned_copy), *gpu_space);
           }
           static std::atomic<int64_t> cached_batch_id{1000000};
           auto batch = std::make_shared<cucascade::data_batch>(

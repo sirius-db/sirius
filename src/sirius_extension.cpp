@@ -1231,12 +1231,58 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_allocate_buffers_info(gpu_allocate_buffers);
   catalog.CreateTableFunction(transaction, gpu_allocate_buffers_info);
 
+  // Keep sirius_cuda_alloc for backward compat (legacy callers).
   TableFunction cuda_alloc("sirius_cuda_alloc",
                             {LogicalType::BIGINT},
                             CudaAllocFunction,
                             CudaAllocBind);
   CreateTableFunctionInfo cuda_alloc_info(cuda_alloc);
   catalog.CreateTableFunction(transaction, cuda_alloc_info);
+
+  // sirius_get_exchange_staging(role VARCHAR) — returns pre-allocated staging address.
+  // role is "send" or "recv". Staging is allocated by ExchangeMemoryManager in SiriusContext.
+  {
+    struct ExchStagingData : public TableFunctionData {
+      uintptr_t addr = 0;
+      size_t size = 0;
+      bool finished = false;
+    };
+    auto bind = [](ClientContext& ctx, TableFunctionBindInput& input,
+                    vector<LogicalType>& return_types, vector<string>& names)
+      -> unique_ptr<FunctionData> {
+      return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+      names = {"addr", "size"};
+      auto result = make_uniq<ExchStagingData>();
+      auto role = input.inputs[0].GetValue<string>();
+      auto sirius_ctx = ctx.registered_state->Get<SiriusContext>("sirius_state");
+      auto& emgr = sirius_ctx->get_exchange_manager();
+      if (role == "send") {
+        auto [addr, sz] = emgr.GetSendStaging();
+        result->addr = addr;
+        result->size = sz;
+      } else if (role == "recv") {
+        auto [addr, sz] = emgr.GetRecvStaging();
+        result->addr = addr;
+        result->size = sz;
+      } else {
+        throw IOException("sirius_get_exchange_staging: role must be 'send' or 'recv', got '%s'", role);
+      }
+      SIRIUS_LOG_INFO("[sirius_get_exchange_staging] role={} addr=0x{:x} size={}", role, result->addr, result->size);
+      return std::move(result);
+    };
+    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+      auto& data = data_p.bind_data->CastNoConst<ExchStagingData>();
+      if (data.finished) { output.SetCardinality(0); return; }
+      output.SetCardinality(1);
+      output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(data.addr)));
+      output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(data.size)));
+      data.finished = true;
+    };
+    TableFunction exch_staging("sirius_get_exchange_staging",
+                                {LogicalType::VARCHAR}, func, bind);
+    CreateTableFunctionInfo exch_staging_info(exch_staging);
+    catalog.CreateTableFunction(transaction, exch_staging_info);
+  }
 
   // sirius_register_packed_table(table_name VARCHAR, gpu_addr BIGINT, gpu_size BIGINT, metadata BLOB)
   // sirius_register_projected_packed_table(..., projection_indices INTEGER[])
@@ -1268,22 +1314,22 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                       table_name, gpu_addr, gpu_size, md_blob.size(), projection_indices.size());
 
       int num_cols = 0, num_rows_out = 0;
-      SiriusExtension::EnsureExchangeBufferManager();
-      auto& mgr = GPUBufferManager::GetInstance();
-      mgr.registerExternalTablePacked(table_name,
-                                      gpu_ptr,
-                                      gpu_size,
-                                      std::move(md_blob),
-                                      projection_indices,
-                                      num_cols,
-                                      num_rows_out);
+      auto sirius_ctx = ctx.registered_state->Get<SiriusContext>("sirius_state");
+      auto& emgr = sirius_ctx->get_exchange_manager();
+      emgr.registerExternalTablePacked(table_name,
+                                       gpu_ptr,
+                                       gpu_size,
+                                       std::move(md_blob),
+                                       projection_indices,
+                                       num_cols,
+                                       num_rows_out);
 
       cudf::table_view view;
       string up = table_name;
       transform(up.begin(), up.end(), up.begin(), ::toupper);
-      auto it = mgr.tables.find(up);
-      if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
-        view = it->second->pending_views.back();
+      auto exch_table = emgr.findTable(up);
+      if (exch_table && !exch_table->pending_views.empty()) {
+        view = exch_table->pending_views.back();
         num_cols = view.num_columns();
       }
 
@@ -1346,22 +1392,22 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                       table_name, gpu_addr, gpu_size, md_blob.size(), projection_indices.size());
 
       int num_cols = 0, num_rows_out = 0;
-      SiriusExtension::EnsureExchangeBufferManager();
-      auto& mgr = GPUBufferManager::GetInstance();
-      mgr.registerExternalTablePacked(table_name,
-                                      gpu_ptr,
-                                      gpu_size,
-                                      std::move(md_blob),
-                                      projection_indices,
-                                      num_cols,
-                                      num_rows_out);
+      auto sirius_ctx = ctx.registered_state->Get<SiriusContext>("sirius_state");
+      auto& emgr = sirius_ctx->get_exchange_manager();
+      emgr.registerExternalTablePacked(table_name,
+                                       gpu_ptr,
+                                       gpu_size,
+                                       std::move(md_blob),
+                                       projection_indices,
+                                       num_cols,
+                                       num_rows_out);
 
       cudf::table_view view;
       string up = table_name;
       transform(up.begin(), up.end(), up.begin(), ::toupper);
-      auto it = mgr.tables.find(up);
-      if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
-        view = it->second->pending_views.back();
+      auto exch_table = emgr.findTable(up);
+      if (exch_table && !exch_table->pending_views.empty()) {
+        view = exch_table->pending_views.back();
         num_cols = view.num_columns();
       }
 
@@ -1469,12 +1515,12 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
       result->table_name = input.inputs[0].GetValue<string>();
       return std::move(result);
     };
-    auto func = [](ClientContext&, TableFunctionInput& data_p, DataChunk& output) {
+    auto func = [](ClientContext& ctx, TableFunctionInput& data_p, DataChunk& output) {
       auto& data = data_p.bind_data->CastNoConst<FinalizeOneData>();
       if (data.finished) { output.SetCardinality(0); return; }
       data.finished = true;
-      SiriusExtension::EnsureExchangeBufferManager();
-      GPUBufferManager::GetInstance().finalizeExchangeTable(data.table_name);
+      auto sirius_ctx = ctx.registered_state->Get<SiriusContext>("sirius_state");
+      sirius_ctx->get_exchange_manager().finalizeExchangeTable(data.table_name);
       output.SetValue(0, 0, Value("finalized"));
       output.SetCardinality(1);
     };

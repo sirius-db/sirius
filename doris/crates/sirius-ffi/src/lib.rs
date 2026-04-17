@@ -1112,6 +1112,26 @@ impl SiriusEngine {
         let addr: i64 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         Ok(addr as usize)
     }
+
+    /// Get a pre-allocated exchange staging buffer address.
+    ///
+    /// Staging buffers are allocated from cuCascade's GPU pool during SiriusContext
+    /// initialization. This function returns the address and size for the specified
+    /// role ("send" or "recv").
+    pub fn get_exchange_staging(&self, role: &str) -> Result<(usize, usize), EngineError> {
+        let sql = format!("SELECT * FROM sirius_get_exchange_staging('{}')", role);
+        let mut stmt = self.conn
+            .prepare(&sql)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let mut rows = stmt.query([])
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let row = rows.next()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+            .ok_or_else(|| EngineError::ExecFailed("sirius_get_exchange_staging: no result".into()))?;
+        let addr: i64 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let size: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        Ok((addr as usize, size as usize))
+    }
 }
 
 /// Owned exchange result artifact returned by the modern GPU exchange path.

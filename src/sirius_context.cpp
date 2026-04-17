@@ -169,6 +169,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
+  // Allocate exchange staging buffers from the cuCascade GPU pool.
+  // Must be after memory_manager_ creation (which sets cudf device resource).
+  exchange_manager_ = std::make_unique<ExchangeMemoryManager>(config_.get_exchange_params());
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -300,6 +304,9 @@ void SiriusContext::terminate()
   }
   spdlog::info("SiriusContext::terminate: query and repositories reset");
 
+  // Release exchange staging before shutting down the memory pool.
+  exchange_manager_.reset();
+
   spdlog::info("SiriusContext::terminate: shutting down memory manager");
   memory_manager_->shutdown();
   memory_manager_.reset();
@@ -319,6 +326,18 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
 {
   throw_if_not_initialized();
   return *memory_manager_;
+}
+
+ExchangeMemoryManager& SiriusContext::get_exchange_manager()
+{
+  throw_if_not_initialized();
+  return *exchange_manager_;
+}
+
+const ExchangeMemoryManager& SiriusContext::get_exchange_manager() const
+{
+  throw_if_not_initialized();
+  return *exchange_manager_;
 }
 
 cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager()

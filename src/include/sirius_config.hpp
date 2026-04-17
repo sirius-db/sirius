@@ -35,7 +35,17 @@ constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
 
+constexpr uint64_t DEFAULT_EXCHANGE_SEND_STAGING_SIZE = 1ULL << 30;  // 1 GB
+constexpr uint64_t DEFAULT_EXCHANGE_RECV_STAGING_SIZE = 1ULL << 30;  // 1 GB
+
 }  // namespace config
+
+/// Parameters controlling exchange staging buffer sizes.
+/// Set via the .yaml file under the sirius.exchange section.
+struct exchange_params {
+  uint64_t send_staging_size = config::DEFAULT_EXCHANGE_SEND_STAGING_SIZE;
+  uint64_t recv_staging_size = config::DEFAULT_EXCHANGE_RECV_STAGING_SIZE;
+};
 
 /// Parameters controlling operator-level resource sizing.
 /// These can be set via the .yaml file under the sirius.operator_params section
@@ -111,6 +121,11 @@ struct sirius_config {
 
   [[nodiscard]] operator_params& get_operator_params() noexcept { return _operator_params; }
 
+  [[nodiscard]] const exchange_params& get_exchange_params() const noexcept
+  {
+    return _exchange_params;
+  }
+
  private:
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
@@ -121,6 +136,7 @@ struct sirius_config {
   exec::downgrade_executor_config _downgrade_executor_config;
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
+  exchange_params _exchange_params;
 };
 
 }  // namespace sirius

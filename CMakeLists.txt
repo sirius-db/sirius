@@ -71,6 +71,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_constant.cpp
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
+    src/exchange_memory_manager.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/fallback.cpp
     src/gpu_buffer_manager.cpp

@@ -156,49 +156,44 @@ fn main() {
         )
             .map(|a| std::sync::Arc::new(a))
     };
-    // Allocate TWO staging buffers via C++ cudaMalloc:
+    // Get pre-allocated exchange staging buffers from cuCascade (allocated during SiriusContext init).
     // 1. Send staging: used by C++ cudf::chunked_pack to pack outgoing GPU data
     // 2. Receive staging: registered with nixl, used for incoming GPU transfers
     // They must be separate because the receiver's exchange table data (in receive
     // staging) is read by the GPU scan while the sender packs new data (in send staging).
-    if let (Some(ref agent), Some(ref eng), Some(size)) = (&nixl_agent, &engine, staging_size) {
-        let half = size / 2;
+    if let (Some(ref agent), Some(ref eng)) = (&nixl_agent, &engine) {
         let eng_guard = eng.lock().unwrap();
 
         // Send staging: C++ packs outgoing data here via cudf::chunked_pack.
         // Registered with nixl so it can transfer to remote BEs.
-        let send_ok = match eng_guard.cuda_alloc(half) {
-            Ok(addr) => {
-                info!(addr = format_args!("0x{addr:x}"), size_mb = half / (1024 * 1024),
-                      "allocated SEND staging via C++ cudaMalloc");
-                if let Err(e) = eng_guard.set_staging_buffer(addr, half) {
-                    warn!(error = %e, "failed to set send staging");
-                }
-                // Register send buffer with nixl (sender reads from here).
-                if let Err(e) = agent.register_send_staging(addr, half) {
+        let send_ok = match eng_guard.get_exchange_staging("send") {
+            Ok((addr, size)) => {
+                info!(addr = format_args!("0x{addr:x}"), size_mb = size / (1024 * 1024),
+                      "got SEND staging from cuCascade");
+                if let Err(e) = agent.register_send_staging(addr, size) {
                     warn!(error = %e, "failed to register send staging with nixl");
                 }
                 true
             }
-            Err(e) => { warn!(error = %e, "send staging alloc failed"); false }
+            Err(e) => { warn!(error = %e, "send staging get failed"); false }
         };
 
         // Receive staging: nixl writes incoming transfers here.
-        // Exchange tables point into this buffer (via registerExternalTable).
-        let recv_ok = match eng_guard.cuda_alloc(half) {
-            Ok(addr) => {
-                info!(addr = format_args!("0x{addr:x}"), size_mb = half / (1024 * 1024),
-                      "allocated RECV staging via C++ cudaMalloc");
-                match agent.register_staging_from_addr(addr, half) {
+        // Exchange tables point into this buffer (via registerExternalTablePacked).
+        let recv_ok = match eng_guard.get_exchange_staging("recv") {
+            Ok((addr, size)) => {
+                info!(addr = format_args!("0x{addr:x}"), size_mb = size / (1024 * 1024),
+                      "got RECV staging from cuCascade");
+                match agent.register_staging_from_addr(addr, size) {
                     Ok(()) => { info!("recv staging registered with nixl"); true }
                     Err(e) => { warn!(error = %e, "recv staging nixl registration failed"); false }
                 }
             }
-            Err(e) => { warn!(error = %e, "recv staging alloc failed"); false }
+            Err(e) => { warn!(error = %e, "recv staging get failed"); false }
         };
 
         if send_ok && recv_ok {
-            info!("dual staging buffers ready (send + recv, {}MB each)", half / (1024 * 1024));
+            info!("dual staging buffers ready (send + recv)");
         }
 
         drop(eng_guard);

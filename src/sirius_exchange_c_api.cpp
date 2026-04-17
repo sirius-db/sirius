@@ -14,10 +14,9 @@
  * limitations under the License.
  */
 
-#include <gpu_buffer_manager.hpp>
+#include <exchange_memory_manager.hpp>
 #include <last_gpu_buffers.hpp>
 #include <sirius_exchange_c_api.hpp>
-#include <sirius_extension.hpp>
 
 #include <exception>
 #include <memory>
@@ -66,8 +65,9 @@ const char* sirius_exchange_last_error() {
 
 int sirius_finalize_exchange_tables_direct() {
   return with_error_boundary([]() -> int {
-    duckdb::SiriusExtension::EnsureExchangeBufferManager();
-    duckdb::GPUBufferManager::GetInstance().finalizeExchangeTables();
+    auto* emgr = duckdb::ExchangeMemoryManager::GetActive();
+    if (!emgr) { throw std::runtime_error("exchange manager not initialized"); }
+    emgr->finalizeExchangeTables();
     return 1;
   });
 }
