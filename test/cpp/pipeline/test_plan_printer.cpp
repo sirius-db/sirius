@@ -87,7 +87,7 @@ void set_test_config_env()
   if (!env_set) {
     std::source_location loc = std::source_location::current();
     auto cfg_path = std::filesystem::path(loc.file_name()).parent_path().parent_path() / "config" /
-                    "data" / "minimal.cfg";
+                    "data" / "minimal.yaml";
     setenv("SIRIUS_CONFIG_FILE", cfg_path.string().c_str(), 1);
     env_set = true;
   }
@@ -413,7 +413,8 @@ engine_test_state setup_and_initialize(const std::string& query)
   engine_test_state state;
   set_test_config_env();
   Config::MODIFIED_PIPELINE = true;
-  state.db                  = duckdb::make_uniq<DuckDB>(nullptr);
+  unsetenv("SIRIUS_DISABLE");
+  state.db = duckdb::make_uniq<DuckDB>(nullptr);
   safe_load_extension(*state.db);
   state.con = duckdb::make_uniq<Connection>(*state.db);
   safe_init_gpu_buffer(*state.con);
