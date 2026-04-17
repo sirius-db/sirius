@@ -26,7 +26,6 @@ concurrency:
 
 jobs:
   cuda-13:
-    name: CUDA 13
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
@@ -44,12 +43,11 @@ jobs:
       vcpkg_overlay_ports: 'vcpkg_ports'
       vcpkg_overlay_triplets: 'vcpkg_triplets'
       cuda_archs: '75-real;80-real;86-real;90a-real;100f-real;120a-real;120'
-      cuda_version: '13'
+      cuda_version: '13.2'
       artifact_postfix: '-cuda13'
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "cuda-13", "arm-xl"]}'
 
   cuda-12:
-    name: CUDA 12
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
@@ -67,6 +65,6 @@ jobs:
       vcpkg_overlay_ports: 'vcpkg_ports'
       vcpkg_overlay_triplets: 'vcpkg_triplets'
       cuda_archs: '75-real;80-real;86-real;90a-real'
-      cuda_version: '12'
+      cuda_version: '12.9'
       artifact_postfix: '-cuda12'
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "cuda-13", "arm-xl"]}'
