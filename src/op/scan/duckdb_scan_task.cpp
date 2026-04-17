@@ -18,8 +18,8 @@
 #include "cucascade/memory/memory_space.hpp"
 #include "op/sirius_physical_operator.hpp"
 
-#include <cudf/cudf_utils.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/cudf_utils.hpp>
 
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
@@ -37,9 +37,8 @@
 #include <cudf/utilities/bit.hpp>
 
 // sirius GPU cache
-#include <gpu_buffer_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-
+#include <gpu_buffer_manager.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -62,7 +61,7 @@ std::unique_ptr<cudf::table> maybe_append_row_id_column(std::unique_ptr<cudf::ta
   if (static_cast<std::size_t>(input->num_columns()) >= expected_columns) { return input; }
   if (static_cast<std::size_t>(input->num_columns()) + 1 != expected_columns) { return input; }
 
-  auto row_count = input->num_rows();
+  auto row_count  = input->num_rows();
   auto row_id_col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, row_count, cudf::mask_state::UNALLOCATED, stream, mr);
   std::vector<int64_t> row_ids(row_count);
@@ -644,7 +643,7 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
   auto estimated_bytes = get_estimated_reservation_size();
-  auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
+  auto& l_state        = this->_local_state->cast<duckdb_scan_task_local_state>();
 
   // Record memory metrics for future reservation estimates.
   // Scan tasks don't have peak memory tracking, so use output size as proxy.
@@ -662,7 +661,7 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 
     publish_output(*output_data, stream);
     if (l_state._defer_drain_until_publish) {
-      auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
+      auto& g_state                      = _global_state->cast<duckdb_scan_task_global_state>();
       l_state._defer_drain_until_publish = false;
       g_state.decrement_local_states();
     }
@@ -685,22 +684,26 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
     auto to_string = g_state._op.function.to_string(tf_input);
     std::string table_name;
     for (auto& [k, v] : to_string) {
-      if (k == "Table") { table_name = v; break; }
+      if (k == "Table") {
+        table_name = v;
+        break;
+      }
     }
     if (!table_name.empty()) {
       std::string up = table_name;
       std::transform(up.begin(), up.end(), up.begin(), ::toupper);
       // Strip schema prefix (e.g. "MEMORY.MAIN.__EXCH_..." → "__EXCH_...").
       auto last_dot = up.rfind('.');
-      if (last_dot != std::string::npos) {
-        up = up.substr(last_dot + 1);
-      }
+      if (last_dot != std::string::npos) { up = up.substr(last_dot + 1); }
       auto it = bm.tables.find(up);
       SIRIUS_LOG_INFO("[duckdb_scan_task] GPU-resident check: table='{}' found={} cols={} len={}",
-                      up, it != bm.tables.end(),
+                      up,
+                      it != bm.tables.end(),
                       (it != bm.tables.end() && it->second) ? it->second->columns.size() : 0,
-                      (it != bm.tables.end() && it->second && !it->second->columns.empty() && it->second->columns[0])
-                        ? it->second->columns[0]->column_length : 0);
+                      (it != bm.tables.end() && it->second && !it->second->columns.empty() &&
+                       it->second->columns[0])
+                        ? it->second->columns[0]->column_length
+                        : 0);
       if (it != bm.tables.end() && !it->second->columns.empty() &&
           it->second->columns[0]->column_length > 0) {
         auto num_cached_rows = it->second->columns[0]->column_length;
@@ -712,14 +715,17 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
         if (!g_state._op.exhausted.compare_exchange_strong(expected, true)) {
           // Another thread already claimed this — return an empty pipelineable
           // result so publish_output() still sees the expected concrete type.
-          l_state._local_state_drained = true;
+          l_state._local_state_drained       = true;
           l_state._defer_drain_until_publish = true;
           return std::make_unique<op::pipelineable_operator_data>(
             std::vector<std::shared_ptr<cucascade::data_batch>>{});
         }
 
-        SIRIUS_LOG_INFO("[duckdb_scan_task] table '{}' already GPU-resident ({} rows) — producing GPU batch directly",
-                        table_name, num_cached_rows);
+        SIRIUS_LOG_INFO(
+          "[duckdb_scan_task] table '{}' already GPU-resident ({} rows) — producing GPU batch "
+          "directly",
+          table_name,
+          num_cached_rows);
 
         // Finalize pending views (concatenate multi-sender data) if not yet done.
         if (!it->second->pending_views.empty()) {
@@ -731,23 +737,23 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
         }
         auto cached_table = it->second->packed_cudf_table;
         if (!cached_table) {
-          SIRIUS_LOG_WARN("[duckdb_scan_task] no packed_cudf_table — returning empty cached scan result");
-          l_state._local_state_drained = true;
+          SIRIUS_LOG_WARN(
+            "[duckdb_scan_task] no packed_cudf_table — returning empty cached scan result");
+          l_state._local_state_drained       = true;
           l_state._defer_drain_until_publish = true;
           return std::make_unique<op::pipelineable_operator_data>(
             std::vector<std::shared_ptr<cucascade::data_batch>>{});
         } else {
           auto* gpu_space = g_state._sirius_ctx->get_memory_manager().get_memory_space(
-              cucascade::memory::Tier::GPU, 0);
+            cucascade::memory::Tier::GPU, 0);
           std::unique_ptr<cudf::table> owned_table;
           auto source_indices =
             cached_scan_source_indices(g_state._op.column_ids, g_state._op.projection_ids);
           owned_table = project_cached_table_for_scan(
             *cached_table, source_indices, stream, gpu_space->get_default_allocator());
           if (g_state._op.gen_row_id_column) {
-            if (!owned_table &&
-                static_cast<std::size_t>(cached_table->num_columns()) <
-                  g_state._op.scanned_types.size()) {
+            if (!owned_table && static_cast<std::size_t>(cached_table->num_columns()) <
+                                  g_state._op.scanned_types.size()) {
               owned_table = std::make_unique<cudf::table>(
                 cached_table->view(), stream, gpu_space->get_default_allocator());
             }
@@ -758,7 +764,8 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
                                                      gpu_space->get_default_allocator());
           }
           SIRIUS_LOG_INFO("[duckdb_scan_task] using cached cudf::table ({} cols, {} rows)",
-                          cached_table->num_columns(), cached_table->num_rows());
+                          cached_table->num_columns(),
+                          cached_table->num_rows());
 
           // Instead of creating a gpu_table_representation directly (which causes
           // same-device GPU→GPU conversion assertion failures), we populate the
@@ -779,19 +786,19 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
           // Create GPU data_batch and publish to the pipeline.
           std::unique_ptr<cucascade::gpu_table_representation> gpu_rep;
           if (owned_table) {
-            gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
-              std::move(owned_table), *gpu_space);
+            gpu_rep = std::make_unique<cucascade::gpu_table_representation>(std::move(owned_table),
+                                                                            *gpu_space);
           } else {
             auto table_copy = std::make_unique<cudf::table>(
               cached_table->view(), stream, gpu_space->get_default_allocator());
-            gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
-              std::move(table_copy), *gpu_space);
+            gpu_rep = std::make_unique<cucascade::gpu_table_representation>(std::move(table_copy),
+                                                                            *gpu_space);
           }
           static std::atomic<int64_t> cached_batch_id{1000000};
-          auto batch = std::make_shared<cucascade::data_batch>(
-              cached_batch_id.fetch_add(1), std::move(gpu_rep));
+          auto batch = std::make_shared<cucascade::data_batch>(cached_batch_id.fetch_add(1),
+                                                               std::move(gpu_rep));
 
-          l_state._local_state_drained = true;
+          l_state._local_state_drained       = true;
           l_state._defer_drain_until_publish = true;
 
           // Return via normal operator_data path (publish_output handles data_repo publish).
