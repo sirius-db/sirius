@@ -329,7 +329,14 @@ Both Parquet and Iceberg scans flow through the same 2 datasource creation call 
 
 ## 9. Integration with the `sirius_datasource` Abstraction
 
-An in-flight WIP branch (`aminaramoon/add_sirius_datasource`) introduces a lower-level IO abstraction layer that this proposal should build on top of rather than parallel to. The two efforts are complementary: that branch answers **how** to read bytes efficiently (io_uring reactors, O_DIRECT, pinned bounce buffers, batched range reads); this proposal answers **where** the bytes live (local FS, NVMe-GDS, S3, S3-over-RDMA) and how URIs route to the right backend.
+An in-flight WIP branch (`aminaramoon/add_sirius_datasource`, rebased into `feature-newdatasourcesupport`) introduces a lower-level IO abstraction layer that this proposal should build on top of rather than parallel to. The two efforts are complementary: that branch answers **how** to read bytes efficiently (io_uring reactors, O_DIRECT, pinned bounce buffers, batched range reads); this proposal answers **where** the bytes live (local FS, NVMe-GDS, S3, S3-over-RDMA) and how URIs route to the right backend.
+
+**Decisions locked in for this integration:**
+
+1. **ioctx registry**. Multi-instance. `datasource_registry` owns a `map<scheme, shared_ptr<sirius_ioctx>>`, constructed once at engine startup in [`src/sirius_engine.cpp`](src/sirius_engine.cpp) and injected into the factory.
+2. **GDS backend**. Use **KvikIO in a dedicated `gds_ioctx`**, not an extension of `uring_reactor`. KvikIO is already in the libcudf 26.04 dep tree and provides built-in POSIX fallback.
+3. **Configuration wiring**. `sirius_config.object_store_config` lives at the factory level. `SET s3_transport='rdma'` updates this field; the factory consults it during scheme dispatch. Individual `ioctx` instances stay stateless w.r.t. runtime-mutable settings.
+4. **Iceberg direct-read paths**. The Iceberg V2 delete file reads (`read_positional_delete_file`, `read_equality_delete_file`) and Avro manifest reads — flagged out-of-scope in §5 — will also route through the factory. The interface is already uniform, so there is no reason to keep a second direct-IO path.
 
 ### 9.1 What the abstraction already provides
 
@@ -357,8 +364,7 @@ Rather than introducing a parallel `datasource_factory` hierarchy, the factory f
 datasource_factory::create(uri, registry, config)
         │
         ├─ /path or file://          → uring_ioctx   + uring_io_object(path)
-        ├─ file:// + GDS available   → uring_ioctx   + uring_io_object(path, device_read=cuFile)
-        │                              (or gds_ioctx + gds_io_object)
+        ├─ file:// + NVMe + GDS      → gds_ioctx     + gds_io_object(path)        [KvikIO / cuFile]
         ├─ s3://                     → s3_ioctx      + s3_io_object(url, creds)
         └─ s3:// + transport=RDMA    → rdma_s3_ioctx + rdma_s3_io_object(url, creds, nic)
 ```
@@ -391,12 +397,22 @@ This promotes the "Multi-range S3 reads" item from §10 (formerly §9) to a core
 
 ### 9.5 GPU Direct inside this layering
 
-The branch's `uring_reactor` currently implements `device_read_async` via O_DIRECT → pinned bounce buffer → `cudaMemcpyAsync`. This is CPU-mediated. True NVMe-to-GPU DMA still requires `cuFile`. Two options:
+The branch's `uring_reactor` currently implements `device_read_async` via O_DIRECT → pinned bounce buffer → `cudaMemcpyAsync`. This is CPU-mediated; it is **not** true GDS. True NVMe-to-GPU DMA goes through `cuFile`.
 
-1. **Extend `uring_reactor`**: keep the existing path as the fallback, add a `cuFile` branch when `CU_FILE_RDMA_REG_MASK` succeeds on the fd. Same `uring_ioctx`, minimal churn.
-2. **Separate `gds_ioctx`**: a dedicated context with `KvikIO::FileHandle`-based reactor. Cleaner isolation; extra ioctx to instantiate.
+**Decision**: introduce a **separate `gds_ioctx`** built on `KvikIO::FileHandle`, rather than bolting a cuFile branch onto the existing uring reactor. Rationale:
 
-Option 1 is the smaller delta; option 2 is easier to reason about per-backend. Either way, `is_device_read_preferred()` must be tightened — today it unconditionally returns `true`, which is only correct once a real GDS path exists.
+- KvikIO is already in the libcudf 26.04 dependency tree — no new third-party dependency.
+- KvikIO internally wraps `cuFile` and provides automatic POSIX fallback when GDS hardware or the cuFile driver is unavailable, so a single `gds_ioctx` covers both the fast path (NVMe + cuFile) and the fallback (pread) without extra branching.
+- The uring reactor and cuFile have very different submission / completion models; keeping them in one reactor would force awkward unions of state. Two `ioctx`es are simpler to reason about and each can tune its own thread / pool sizing independently.
+- The factory already dispatches by scheme + config, so picking `gds_ioctx` vs `uring_ioctx` for a local path is a one-line decision in the factory — no cost at the scan-task layer.
+
+Concrete shape:
+
+- `gds_io_object(path)` — opens the file via `kvikio::FileHandle`, exposes `size()` and the `FileHandle` itself to the reactor.
+- `gds_ioctx` — implements the `sirius_ioctx` interface. `device_read_async` → `FileHandle::pread` into GPU memory (cuFile DMA when available). `host_read_*` still supported for footer / metadata reads.
+- `supports_device_read()` / `is_device_read_preferred()` report truthfully based on `kvikio::defaults::compat_mode()`. The existing `uring_ioctx` should tighten these to `false` on `device_read_preferred` since its device path is just a bounce-buffer `cudaMemcpyAsync`.
+
+Factory dispatch for local paths becomes: if the path lives on an NVMe block device and KvikIO reports GDS is available → `gds_ioctx`; otherwise → `uring_ioctx`.
 
 ### 9.6 Configuration wiring
 
@@ -408,7 +424,7 @@ To land this without a single mega-PR:
 
 1. **PR1** — Introduce `datasource_factory` + `datasource_registry`; populate with only the `uring_ioctx` backend; replace the 3 call sites. Behavior is identical to today, but all IO now flows through the factory.
 2. **PR2** — Replace the `read_range_into_allocation` loop with `host_read_ranges_async`. Benchmark locally to confirm io_uring batching wins.
-3. **PR3** — Add a real cuFile device-read path (option 1 or 2 above). Fix `is_device_read_preferred()` semantics.
+3. **PR3** — Add `gds_io_object` + `gds_ioctx` (KvikIO `FileHandle`). Tighten `is_device_read_preferred()` in `uring_ioctx` to `false`. Factory picks `gds_ioctx` for local paths on NVMe when KvikIO reports GDS available.
 4. **PR4** — Add `s3_io_object` + `s3_ioctx` (libcurl + SigV4). Enable `s3://` URIs end-to-end.
 5. **PR5** — Add `rdma_s3_io_object` + `rdma_s3_ioctx` for on-prem GPU Direct object stores.
 6. **PR6** — Migrate Iceberg delete file and Avro manifest reads to the factory (closes the §5 out-of-scope note).
