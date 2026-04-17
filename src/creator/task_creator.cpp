@@ -58,7 +58,9 @@ void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 }
 
 void task_creator::set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor)
-{ _pipeline_executor = &pipeline_executor; }
+{
+  _pipeline_executor = &pipeline_executor;
+}
 
 void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
