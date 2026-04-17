@@ -19,6 +19,8 @@
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -28,8 +30,6 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -83,13 +83,11 @@ class convertible_data_batch : public convertible_data {
 
       for (const auto* space : target_spaces) {
         auto reservation = res_mgr.request_reservation(
-          cucascade::memory::specific_memory_space{space->get_tier(),
-                                                   space->get_id().device_id},
+          cucascade::memory::specific_memory_space{space->get_tier(), space->get_id().device_id},
           data_size);
         if (!reservation) { continue; }
 
-        auto* mem_space =
-          res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
+        auto* mem_space = res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
         if (!mem_space) { continue; }
 
         auto& converter_registry = sirius::converter_registry::get();
@@ -106,18 +104,15 @@ class convertible_data_batch : public convertible_data {
           default: continue;
         }
 
-        _batch->try_to_release_in_transit(
-          std::optional<cucascade::batch_state>{prev_state});
+        _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
         return true;
       }
 
       // No target space succeeded
-      _batch->try_to_release_in_transit(
-        std::optional<cucascade::batch_state>{prev_state});
+      _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
       return false;
     } catch (...) {
-      _batch->try_to_release_in_transit(
-        std::optional<cucascade::batch_state>{prev_state});
+      _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
       throw;
     }
   }
@@ -130,9 +125,7 @@ class convertible_data_batch : public convertible_data {
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    if (_batch->get_memory_space() == space) {
-      return _batch->get_data()->get_size_in_bytes();
-    }
+    if (_batch->get_memory_space() == space) { return _batch->get_data()->get_size_in_bytes(); }
     return 0;
   }
 
@@ -147,6 +140,8 @@ class convertible_data_batch : public convertible_data {
  * state and matching memory_space. The default iteration order is last-to-first
  * (back-to-front) for both partitions and batches, matching the downgrade eviction
  * pattern of preferring the most recently added data.
+ * NOTE: We can technically convert data_batches that have had a task created, but those
+ * data_batches should be pulled form the task queue
  */
 class convertible_data_batch_provider : public convertible_data_provider {
  public:
@@ -154,10 +149,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @brief Construct from a raw pointer to a shared_data_repository.
    * @param repo The repository to iterate (non-owning; caller ensures lifetime).
    */
-  explicit convertible_data_batch_provider(cucascade::shared_data_repository* repo)
-    : _repo(repo)
-  {
-  }
+  explicit convertible_data_batch_provider(cucascade::shared_data_repository* repo) : _repo(repo) {}
 
   /**
    * @brief Get the next convertible batch matching the given memory space.
@@ -171,8 +163,8 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @param front_to_back   Iteration direction.
    * @return A convertible_data_batch wrapping the matching batch, or nullptr.
    */
-  std::unique_ptr<convertible_data> get_next_convertible(
-    cucascade::memory::memory_space* space, bool front_to_back) override
+  std::unique_ptr<convertible_data> get_next_convertible(cucascade::memory::memory_space* space,
+                                                         bool front_to_back) override
   {
     auto num_parts = _repo->num_partitions();
     if (num_parts == 0) { return nullptr; }
@@ -246,8 +238,8 @@ class convertible_data_batch_provider : public convertible_data_provider {
    */
   std::size_t get_bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    std::size_t total    = 0;
-    auto        num_parts = _repo->num_partitions();
+    std::size_t total = 0;
+    auto num_parts    = _repo->num_partitions();
 
     for (std::size_t p = 0; p < num_parts; ++p) {
       auto batch_ids = _repo->get_batch_ids(p);
@@ -271,16 +263,14 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @param space          The target memory space to match.
    * @return A convertible_data_batch if the batch matches, nullptr otherwise.
    */
-  std::unique_ptr<convertible_data> try_get_batch(
-    uint64_t batch_id,
-    std::size_t partition_idx,
-    cucascade::memory::memory_space* space) const
+  std::unique_ptr<convertible_data> try_get_batch(uint64_t batch_id,
+                                                  std::size_t partition_idx,
+                                                  cucascade::memory::memory_space* space) const
   {
     auto batch = _repo->get_data_batch_by_id(batch_id, std::nullopt, partition_idx);
     if (!batch) { return nullptr; }
 
-    if (batch->get_state() == cucascade::batch_state::idle &&
-        batch->get_memory_space() == space) {
+    if (batch->get_state() == cucascade::batch_state::idle && batch->get_memory_space() == space) {
       return std::make_unique<convertible_data_batch>(std::move(batch));
     }
 

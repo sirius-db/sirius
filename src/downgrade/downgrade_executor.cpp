@@ -138,76 +138,99 @@ void downgrade_executor::processing_loop()
       target_spaces.push_back(hs);
     }
 
-    // Helper lambda: dispatch a single convertible_data to the thread pool.
-    // Returns false if the pool is interrupted.
-    auto dispatch_candidate =
-      [&](std::unique_ptr<convertible_data> candidate, tier_stats& stats) -> bool {
-      if (req->satisfied.load()) return true;  // already done
-
-      auto candidate_bytes = candidate->bytes_in_space(source_space);
-
-      auto slot = _pool->reserve();
-      if (!slot) return false;  // interrupted
-
-      // Re-check after reserve() returns -- the previous candidate's worker may
-      // have set satisfied while we were blocked waiting for a thread slot.
-      if (req->satisfied.load()) return true;
-
-      auto exc_stream = _stream_pool->acquire_stream(
-        cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-
-      _pool->dispatch(std::move(slot),
-                      [cand       = std::move(candidate),
-                       req_ptr    = req.get(),
-                       &res_mgr   = _reservation_manager,
-                       &targets   = target_spaces,
-                       exc_stream = std::move(exc_stream),
-                       candidate_bytes,
-                       &stats]() mutable {
-                        try {
-                          if (cand->convert(targets, exc_stream, res_mgr)) {
-                            req_ptr->bytes_freed.fetch_add(candidate_bytes,
-                                                           std::memory_order_relaxed);
-                            req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
-                            stats.batches.fetch_add(1, std::memory_order_relaxed);
-                            stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                            // D-08: Check predicate after each convert
-                            if (req_ptr->predicate && req_ptr->predicate()) {
-                              req_ptr->satisfied.store(true);
-                            }
-                          }
-                        } catch (const std::exception& e) {
-                          SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
-                        }
-                      });
-      return true;
-    };
-
     // === TIER 1: Data repositories (D-01, LOOP-01) ===
-    // Create a convertible_data_batch_provider per repo and collect candidates.
+    // Collect all repositories first so we can iterate (and later sort by priority).
     // We use get_all_convertible() to snapshot eligible batches once per repo,
     // avoiding re-scanning the same batch before its state changes from idle.
-    _data_repo_mgr.for_each_repository(
-      [&](cucascade::shared_data_repository* repo) {
-        if (req->satisfied.load()) return;
+    bool pool_interrupted = false;
+    auto repos            = _data_repo_mgr.get_repositories();
+    for (auto* repo : repos) {
+      if (req->satisfied.load()) break;
 
-        convertible_data_batch_provider provider(repo);
-        auto candidates =
-          provider.get_all_convertible(source_space, /*front_to_back=*/false);
-        for (auto& candidate : candidates) {
-          if (req->satisfied.load()) break;
-          if (!dispatch_candidate(std::move(candidate), repo_stats)) return;
+      convertible_data_batch_provider provider(repo);
+      auto candidates = provider.get_all_convertible(source_space, /*front_to_back=*/false);
+      for (auto& candidate : candidates) {
+        if (req->satisfied.load()) break;
+
+        auto candidate_bytes = candidate->bytes_in_space(source_space);
+
+        auto slot = _pool->reserve();
+        if (!slot) {
+          pool_interrupted = true;
+          break;
         }
-      });
+
+        // Re-check after reserve() returns -- the previous candidate's worker may
+        // have set satisfied while we were blocked waiting for a thread slot.
+        if (req->satisfied.load()) break;
+
+        auto exc_stream = _stream_pool->acquire_stream(
+          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+
+        _pool->dispatch(
+          std::move(slot),
+          [cand       = std::move(candidate),
+           req_ptr    = req.get(),
+           &res_mgr   = _reservation_manager,
+           &targets   = target_spaces,
+           exc_stream = std::move(exc_stream),
+           candidate_bytes,
+           &repo_stats]() mutable {
+            try {
+              if (cand->convert(targets, exc_stream, res_mgr)) {
+                req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                // D-08: Check predicate after each convert
+                if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
+              }
+            } catch (const std::exception& e) {
+              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+            }
+          });
+      }
+      if (pool_interrupted) break;
+    }
 
     // === TIER 2: gpu_pipeline_executor task queue (D-06, LOOP-02) ===
     if (!req->satisfied.load() && _gpu_task_queue) {
       convertible_gpu_pipeline_task_provider gpu_provider(*_gpu_task_queue);
       while (!req->satisfied.load()) {
-        auto candidate =
-          gpu_provider.get_next_convertible(source_space, /*front_to_back=*/false);
+        auto candidate = gpu_provider.get_next_convertible(source_space, /*front_to_back=*/false);
         if (!candidate) break;
-        if (!dispatch_candidate(std::move(candidate), gpu_queue_stats)) break;
+
+        auto candidate_bytes = candidate->bytes_in_space(source_space);
+
+        auto slot = _pool->reserve();
+        if (!slot) break;  // interrupted
+
+        if (req->satisfied.load()) break;
+
+        auto exc_stream = _stream_pool->acquire_stream(
+          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+
+        _pool->dispatch(
+          std::move(slot),
+          [cand       = std::move(candidate),
+           req_ptr    = req.get(),
+           &res_mgr   = _reservation_manager,
+           &targets   = target_spaces,
+           exc_stream = std::move(exc_stream),
+           candidate_bytes,
+           &gpu_queue_stats]() mutable {
+            try {
+              if (cand->convert(targets, exc_stream, res_mgr)) {
+                req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                gpu_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                gpu_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
+              }
+            } catch (const std::exception& e) {
+              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+            }
+          });
       }
     }
 
@@ -218,7 +241,38 @@ void downgrade_executor::processing_loop()
         auto candidate =
           pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
         if (!candidate) break;
-        if (!dispatch_candidate(std::move(candidate), pipeline_queue_stats)) break;
+
+        auto candidate_bytes = candidate->bytes_in_space(source_space);
+
+        auto slot = _pool->reserve();
+        if (!slot) break;  // interrupted
+
+        if (req->satisfied.load()) break;
+
+        auto exc_stream = _stream_pool->acquire_stream(
+          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+
+        _pool->dispatch(
+          std::move(slot),
+          [cand       = std::move(candidate),
+           req_ptr    = req.get(),
+           &res_mgr   = _reservation_manager,
+           &targets   = target_spaces,
+           exc_stream = std::move(exc_stream),
+           candidate_bytes,
+           &pipeline_queue_stats]() mutable {
+            try {
+              if (cand->convert(targets, exc_stream, res_mgr)) {
+                req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
+              }
+            } catch (const std::exception& e) {
+              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+            }
+          });
       }
     }
 
@@ -229,8 +283,7 @@ void downgrade_executor::processing_loop()
     auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);
     auto total_batches = req->batches_downgraded.load(std::memory_order_relaxed);
     auto duration_ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start)
-        .count();
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     double throughput_mbs =
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
     std::string source_label = req->is_monitor_request ? "monitor " : "";
