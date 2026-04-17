@@ -11,6 +11,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
@@ -295,8 +296,14 @@ std::pair<rmm::device_buffer, cudf::size_type> decode_validity_mask(
   cudf::size_type null_count = 0;
   if (!col_scan.has_nulls || total_rows == 0) return {std::move(null_mask), null_count};
 
-  size_t mask_bytes  = (total_rows + 63) / 64 * sizeof(uint64_t);
-  null_mask          = rmm::device_buffer(mask_bytes, stream, mr);
+  // cuDF (Arrow spec) expects the null_mask buffer to be 64-byte padded.
+  // If we only allocate the (rows+63)/64*8 bytes we need for the bits,
+  // cuDF's subsequent deep-copy will try to memcpy the Arrow-sized buffer
+  // (up to 63 bytes larger) and fail with cudaErrorInvalidValue. Always
+  // allocate the full Arrow-aligned size.
+  size_t mask_bytes =
+    cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(total_rows));
+  null_mask = rmm::device_buffer(mask_bytes, stream, mr);
   auto* d_mask       = static_cast<uint64_t*>(null_mask.data());
   uint32_t num_words = static_cast<uint32_t>((total_rows + 63) / 64);
 

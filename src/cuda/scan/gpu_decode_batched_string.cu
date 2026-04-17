@@ -21,6 +21,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -1119,9 +1120,14 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   cudf::size_type null_count = 0;
 
   if (col_scan.has_nulls) {
-    size_t mask_bytes = (total_rows + 63) / 64 * sizeof(uint64_t);
-    null_mask         = rmm::device_buffer(mask_bytes, stream, mr);
-    auto* d_mask      = static_cast<uint64_t*>(null_mask.data());
+    // Match cuDF's Arrow-spec 64-byte padded null_mask size. Using the bit-tight
+    // (rows+63)/64*8 size causes cudf::column deep-copy to memcpy past the end
+    // of the buffer and fail with cudaErrorInvalidValue for non-aligned row
+    // counts (see gpu_native_decode.cu::decode_validity_mask).
+    size_t mask_bytes =
+      cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(total_rows));
+    null_mask    = rmm::device_buffer(mask_bytes, stream, mr);
+    auto* d_mask = static_cast<uint64_t*>(null_mask.data());
 
     uint32_t num_words = static_cast<uint32_t>((total_rows + 63) / 64);
     kernel_fill_valid<<<(num_words + 255) / 256, 256, 0, stream.value()>>>(d_mask, num_words);
