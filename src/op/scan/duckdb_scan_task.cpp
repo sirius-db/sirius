@@ -782,8 +782,10 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
             gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
               std::move(owned_table), *gpu_space);
           } else {
+            auto table_copy = std::make_unique<cudf::table>(
+              cached_table->view(), stream, gpu_space->get_default_allocator());
             gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
-              std::move(cached_table), *gpu_space);
+              std::move(table_copy), *gpu_space);
           }
           static std::atomic<int64_t> cached_batch_id{1000000};
           auto batch = std::make_shared<cucascade::data_batch>(
