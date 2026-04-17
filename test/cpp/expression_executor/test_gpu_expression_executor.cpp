@@ -132,6 +132,25 @@ std::vector<std::string> copy_string_column_to_host(const cudf::column_view& col
   return host;
 }
 
+std::vector<bool> copy_valids_to_host(const cudf::column_view& col)
+{
+  std::vector<bool> valids(col.size(), true);
+  if (!col.nullable() || col.null_count() == 0) { return valids; }
+  auto const num_words = cudf::num_bitmask_words(col.size());
+  std::vector<cudf::bitmask_type> host_mask(num_words);
+  cudaMemcpy(host_mask.data(),
+             col.null_mask(),
+             num_words * sizeof(cudf::bitmask_type),
+             cudaMemcpyDeviceToHost);
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
+  for (cudf::size_type i = 0; i < col.size(); ++i) {
+    auto word = host_mask[i / bits_per_word];
+    auto bit  = i % bits_per_word;
+    valids[i] = ((word >> bit) & 1U) != 0U;
+  }
+  return valids;
+}
+
 std::shared_ptr<data_batch> make_input_batch(
   memory_space& space,
   const std::vector<cudf::data_type>& column_types,
@@ -173,6 +192,45 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
+  auto batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+}
+
+std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
+                                                             const std::vector<int32_t>& values_a,
+                                                             const std::vector<bool>& valids_a,
+                                                             const std::vector<int32_t>& values_b,
+                                                             const std::vector<bool>& valids_b)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+  auto size   = static_cast<cudf::size_type>(values_a.size());
+
+  auto make_col = [&](const std::vector<int32_t>& values, const std::vector<bool>& valids) {
+    auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
+    auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+    cudf::size_type null_count = 0;
+    for (cudf::size_type i = 0; i < size; ++i) {
+      if (!valids[i]) {
+        cudf::set_null_mask(mask_ptr, i, i + 1, false, stream);
+        ++null_count;
+      }
+    }
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, size, std::move(null_mask), null_count, stream, mr);
+    cudaMemcpy(col->mutable_view().data<int32_t>(),
+               values.data(),
+               sizeof(int32_t) * values.size(),
+               cudaMemcpyHostToDevice);
+    return col;
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(make_col(values_a, valids_a));
+  cols.push_back(make_col(values_b, valids_b));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
@@ -1675,6 +1733,181 @@ TEMPLATE_TEST_CASE("experimental select IS NULL and IS NOT NULL",
     auto out_vals = copy_column_to_host<int32_t>(ov.column(0));
     REQUIRE(out_vals == std::vector<int32_t>{10, 30, 50});
   }
+}
+
+// ---------------------------------------------------------------------------
+// COALESCE — AST breaker, always materialized, exercised across all strategies
+// ---------------------------------------------------------------------------
+
+TEMPLATE_TEST_CASE("experimental execute COALESCE",
+                   "[expression_executor][experimental]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  SECTION("col + scalar fallback fills every null")
+  {
+    std::vector<int32_t> values = {10, 99, 30, 99, 50};
+    std::vector<bool> valids    = {true, false, true, false, true};
+    auto input                  = make_int32_batch_with_nulls(*space, values, valids);
+
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
+      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(std::move(coalesce));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    REQUIRE(ov.num_columns() == 1);
+    REQUIRE(ov.num_rows() == iv.num_rows());
+    REQUIRE(ov.column(0).null_count() == 0);
+
+    std::vector<int32_t> expected;
+    for (size_t i = 0; i < values.size(); ++i) {
+      expected.push_back(valids[i] ? values[i] : -1);
+    }
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
+  }
+
+  SECTION("col + col leaves residual nulls where both are null")
+  {
+    // Row 0: col_a valid   → 10
+    // Row 1: col_b valid   → 200
+    // Row 2: col_a valid   → 30
+    // Row 3: col_b valid   → 400
+    // Row 4: both null     → null (residual)
+    std::vector<int32_t> values_a = {10, 99, 30, 99, 99};
+    std::vector<bool> valids_a    = {true, false, true, false, false};
+    std::vector<int32_t> values_b = {99, 200, 99, 400, 99};
+    std::vector<bool> valids_b    = {false, true, false, true, false};
+    auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
+
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
+      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(std::move(coalesce));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    REQUIRE(ov.num_columns() == 1);
+    REQUIRE(ov.num_rows() == iv.num_rows());
+    REQUIRE(ov.column(0).null_count() == 1);
+
+    auto out_vals                 = copy_column_to_host<int32_t>(ov.column(0));
+    auto out_valids               = copy_valids_to_host(ov.column(0));
+    std::vector<int32_t> expected = {10, 200, 30, 400, 0};
+    std::vector<bool> expected_valids = {true, true, true, true, false};
+    REQUIRE(out_valids == expected_valids);
+    for (size_t i = 0; i < expected.size(); ++i) {
+      if (expected_valids[i]) { REQUIRE(out_vals[i] == expected[i]); }
+    }
+  }
+
+  SECTION("col + col + scalar chain fills every null")
+  {
+    std::vector<int32_t> values_a = {10, 99, 99, 99};
+    std::vector<bool> valids_a    = {true, false, false, false};
+    std::vector<int32_t> values_b = {99, 200, 99, 99};
+    std::vector<bool> valids_b    = {false, true, false, false};
+    auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
+
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
+      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(-7)));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(std::move(coalesce));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    REQUIRE(ov.column(0).null_count() == 0);
+    std::vector<int32_t> expected = {10, 200, -7, -7};
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
+  }
+
+  SECTION("col + col + col leaves residual nulls where all three are null")
+  {
+    // Only the last row has no valid value anywhere.
+    std::vector<int32_t> values_a = {10, 99, 99, 99};
+    std::vector<bool> valids_a    = {true, false, false, false};
+    std::vector<int32_t> values_b = {99, 200, 99, 99};
+    std::vector<bool> valids_b    = {false, true, false, false};
+    auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
+
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
+      ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    // Third child is col_a again (same column still has the same nulls) — drives the
+    // column-replacement branch a second time with residual nulls surviving.
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(std::move(coalesce));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    REQUIRE(ov.column(0).null_count() == 2);
+
+    auto out_vals                     = copy_column_to_host<int32_t>(ov.column(0));
+    auto out_valids                   = copy_valids_to_host(ov.column(0));
+    std::vector<bool> expected_valids = {true, true, false, false};
+    REQUIRE(out_valids == expected_valids);
+    REQUIRE(out_vals[0] == 10);
+    REQUIRE(out_vals[1] == 200);
+  }
+}
+
+TEMPLATE_TEST_CASE("experimental select COALESCE nested in predicate",
+                   "[expression_executor][experimental]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // WHERE COALESCE(col0, 0) > 20 — exercises COALESCE as an AST-capable parent's child.
+  // With col0 = {10, NULL, 30, NULL, 50}, nulls default to 0 and are filtered out; the
+  // predicate keeps {30, 50}.
+  std::vector<int32_t> values = {10, 99, 30, 99, 50};
+  std::vector<bool> valids    = {true, false, true, false, true};
+  auto input                  = make_int32_batch_with_nulls(*space, values, valids);
+
+  auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(
+    ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+  coalesce->children.push_back(
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+  coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+
+  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_GREATERTHAN,
+    std::move(coalesce),
+    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(20)));
+
+  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  exprs.push_back(std::move(cmp));
+
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  REQUIRE(ov.num_rows() == 2);
+  REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 50});
 }
 
 TEMPLATE_TEST_CASE("experimental select COMPARE_NOT_DISTINCT_FROM",

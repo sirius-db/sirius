@@ -150,13 +150,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   // If the caller requested AST mode but we fell through (unsupported function for AST),
   // materialize the result and wrap it as a temp column for the parent's AST tree.
   if (mode == execution_mode::AST) {
+    // Re-enter execute with MATERIALIZE mode to get the result as a column, then add to the AST
+    // tree.
     auto result = execute(expr, execution_mode::MATERIALIZE);
-    if (result.is_scalar()) {
-      return materialize_as_ast_column(
-        cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
-    }
-    return materialize_as_ast_column(
-      std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+    D_ASSERT(result.is_owned_column());
+    return materialize_as_ast_column(std::move(result.release_column()));
   }
   auto const output_type = GetCudfType(expr.return_type);
 
