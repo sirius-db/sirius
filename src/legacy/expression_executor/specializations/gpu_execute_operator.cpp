@@ -126,7 +126,6 @@ struct ExecuteStringIn {
 
 }  // namespace duckdb::sirius
 
-
 namespace duckdb {
 namespace sirius {
 

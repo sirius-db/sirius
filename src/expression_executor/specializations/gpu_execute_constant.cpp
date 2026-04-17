@@ -58,7 +58,6 @@ execute_result make_execute_result_from_scalar(
 
 }  // namespace
 
-
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 

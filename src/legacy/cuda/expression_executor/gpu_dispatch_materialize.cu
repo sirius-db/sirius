@@ -15,8 +15,8 @@
  */
 
 #include "duckdb/common/exception.hpp"
-#include "legacy/expression_executor/gpu_dispatcher.hpp"
 #include "gpu_columns.hpp"
+#include "legacy/expression_executor/gpu_dispatcher.hpp"
 
 #include <rmm/device_uvector.hpp>
 

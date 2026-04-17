@@ -65,7 +65,9 @@ static std::array<std::string_view, 6> constexpr supported_ast_functions{
  * `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
  */
 inline expression_executor_strategy strategy_from_config()
-{ return duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY; }
+{
+  return duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY;
+}
 
 /**
  * @brief The gpu_expression_executor is responsible for evaluating DuckDB expressions on the GPU
@@ -189,15 +191,21 @@ class gpu_expression_executor {
 
     /// @brief Returns true if the payload holds a cudf::scalar.
     [[nodiscard]] bool is_scalar() const
-    { return std::holds_alternative<std::unique_ptr<cudf::scalar>>(payload); }
+    {
+      return std::holds_alternative<std::unique_ptr<cudf::scalar>>(payload);
+    }
 
     /// @brief Returns true if the payload holds a cudf::column_view.
     [[nodiscard]] bool is_column_view() const
-    { return std::holds_alternative<cudf::column_view>(payload); }
+    {
+      return std::holds_alternative<cudf::column_view>(payload);
+    }
 
     /// @brief Returns true if the payload holds an owned cudf::column.
     [[nodiscard]] bool is_owned_column() const
-    { return std::holds_alternative<std::unique_ptr<cudf::column>>(payload); }
+    {
+      return std::holds_alternative<std::unique_ptr<cudf::column>>(payload);
+    }
 
     /**
      * @brief Returns the AST expression reference from the payload.

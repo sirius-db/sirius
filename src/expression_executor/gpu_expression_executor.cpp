@@ -16,6 +16,7 @@
 
 // sirius
 #include <cudf/cudf_utils.hpp>
+
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <operator/gpu_materialize.hpp>
 
@@ -50,7 +51,6 @@ bool IsFixedWidth(cudf::data_type const& type)
          id != cudf::type_id::DICTIONARY32 && id != cudf::type_id::EMPTY;
 }
 }  // namespace
-
 
 namespace sirius {
 using data_batch     = cucascade::data_batch;

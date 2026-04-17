@@ -16,11 +16,11 @@
 
 // sirius
 #include <config.hpp>
+#include <gpu_buffer_manager.hpp>
+#include <gpu_columns.hpp>
 #include <legacy/expression_executor/gpu_dispatcher.hpp>
 #include <legacy/expression_executor/gpu_expression_executor.hpp>
 #include <legacy/expression_executor/gpu_expression_executor_state.hpp>
-#include <gpu_buffer_manager.hpp>
-#include <gpu_columns.hpp>
 #include <operator/gpu_materialize.hpp>
 
 // cucascade

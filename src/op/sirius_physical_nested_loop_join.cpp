@@ -260,7 +260,9 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
 
 void sirius_physical_nested_loop_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
-{ sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this); }
+{
+  sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
+}
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
 {

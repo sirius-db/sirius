@@ -17,10 +17,10 @@
 // sirius
 #include "duckdb/common/types.hpp"
 
+#include <expression_executor/regex/regex_playground.hpp>
 #include <legacy/expression_executor/gpu_dispatcher.hpp>
 #include <legacy/expression_executor/gpu_expression_executor.hpp>
 #include <legacy/expression_executor/gpu_expression_executor_state.hpp>
-#include <expression_executor/regex/regex_playground.hpp>
 #include <operator/gpu_physical_strings_matching.hpp>
 #include <operator/strlen_from_offsets.cuh>
 
