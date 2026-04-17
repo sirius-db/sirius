@@ -29,7 +29,7 @@ namespace op {
 
 sirius_physical_cte::sirius_physical_cte(std::string ctename,
                                          std::size_t table_index,
-                                         duckdb::vector<duckdb::LogicalType> types,
+                                         duckdb::vector<sirius::logical_type> types,
                                          duckdb::unique_ptr<sirius_physical_operator> top,
                                          duckdb::unique_ptr<sirius_physical_operator> bottom,
                                          std::size_t estimated_cardinality)

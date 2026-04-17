@@ -17,6 +17,7 @@
 // sirius
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/scan_utils.hpp>
 
@@ -55,7 +56,7 @@ std::vector<duckdb::idx_t> build_batch_column_map(
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<duckdb::LogicalType>& returned_types,
+  const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<duckdb::idx_t>& batch_column_map)
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
@@ -85,7 +86,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: column_index={}, primary_idx={}, type={}, filter_type={}",
                      column_index,
                      primary_idx,
-                     col_type.ToString(),
+                     col_type.to_string(),
                      static_cast<int>(filter->filter_type));
 
     auto batch_column_index = batch_column_map[column_index];
@@ -96,8 +97,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: batch_column_index={}", batch_column_index);
 
-    auto column_ref =
-      duckdb::make_uniq<duckdb::BoundReferenceExpression>(col_type, batch_column_index);
+    auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+      sirius::to_duckdb(col_type), batch_column_index);
     auto expr = filter->ToExpression(*column_ref);
     filter_expressions.push_back(std::move(expr));
   }

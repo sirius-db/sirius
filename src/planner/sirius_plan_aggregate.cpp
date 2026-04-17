@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -270,7 +271,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     if (can_use_simple_aggregation) {
       auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                              sirius::op::sirius_physical_ungrouped_aggregate>(
-        op.types, std::move(op.expressions), op.estimated_cardinality, op.distinct_validity);
+        sirius::from_duckdb_vec(op.types),
+        std::move(op.expressions),
+        op.estimated_cardinality,
+        op.distinct_validity);
       group_by->children.push_back(std::move(plan));
       return group_by;
     }
@@ -296,7 +300,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                            sirius::op::sirius_physical_grouped_aggregate>(
       context,
-      op.types,
+      sirius::from_duckdb_vec(op.types),
       std::move(op.expressions),
       std::move(op.groups),
       std::move(op.grouping_sets),
@@ -318,7 +322,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                            sirius::op::sirius_physical_grouped_aggregate>(
       context,
-      op.types,
+      sirius::from_duckdb_vec(op.types),
       std::move(op.expressions),
       std::move(op.groups),
       std::move(op.grouping_sets),
@@ -333,7 +337,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                          sirius::op::sirius_physical_grouped_aggregate>(
     context,
-    op.types,
+    sirius::from_duckdb_vec(op.types),
     std::move(op.expressions),
     std::move(op.groups),
     std::move(op.grouping_sets),
@@ -390,7 +394,7 @@ sirius_physical_plan_generator::extract_aggregate_expressions(
   }
   if (expressions.empty()) { return child; }
   auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-    std::move(types), std::move(expressions), child->estimated_cardinality);
+    sirius::from_duckdb_vec(types), std::move(expressions), child->estimated_cardinality);
   projection->children.push_back(std::move(child));
   return std::move(projection);
 }
