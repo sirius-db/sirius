@@ -772,6 +772,13 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static void SetEnableRowGroupPruning(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_ROW_GROUP_PRUNING = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_ROW_GROUP_PRUNING to {}",
+                   Config::ENABLE_ROW_GROUP_PRUNING);
+}
+
 static void SetCacheScanLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -955,6 +962,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+
+  // Add in config option for parquet row group pruning
+  config.AddExtensionOption("enable_row_group_pruning",
+                            "Whether to prune parquet row groups using filter pushdown statistics",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(Config::ENABLE_ROW_GROUP_PRUNING),
+                            SetEnableRowGroupPruning);
 
   // Add in config options for duckdb scan task
   // Default batch size

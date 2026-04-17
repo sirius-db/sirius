@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <config.hpp>
 #include <data/cached_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
@@ -369,7 +370,7 @@ void parquet_scan_task_global_state::initialize_from_files()
   //===----------Row Group Partitioning for Task Generation----------===//
   for (std::size_t file_idx = 0; file_idx < _file_paths.size(); ++file_idx) {
     auto row_group_indices = readers[file_idx]->all_row_groups(_reader_options);
-    if (_translated_filter) {
+    if (_translated_filter && duckdb::Config::ENABLE_ROW_GROUP_PRUNING) {
       auto const row_groups_before_pruning = row_group_indices.size();
       // clang-format off
       SIRIUS_LOG_INFO("[parquet_scan_task_global_state] Row group pruning: file: {}\n" \

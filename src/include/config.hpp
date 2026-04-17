@@ -67,6 +67,9 @@ struct Config {
   //  - max bytes per sort partition (0 = auto based on 33% GPU memory)
   static uint64_t MAX_SORT_PARTITION_BYTES;
 
+  // For parquet scan: whether to prune row groups using filter pushdown statistics
+  static bool ENABLE_ROW_GROUP_PRUNING;
+
   // Logging configuration
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;

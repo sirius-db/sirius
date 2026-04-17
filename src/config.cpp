@@ -44,6 +44,8 @@ uint64_t Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256ULL;
 
 uint64_t Config::MAX_SORT_PARTITION_BYTES = 0;  ///< 0 = auto (33% of available GPU memory)
 
+bool Config::ENABLE_ROW_GROUP_PRUNING = true;
+
 std::string Config::LOG_LEVEL = "info";
 std::string Config::LOG_DIR   = "log";
 int Config::LOG_FLUSH_SECONDS = 3;

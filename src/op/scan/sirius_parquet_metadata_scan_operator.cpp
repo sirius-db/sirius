@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <config.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
@@ -272,7 +273,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     //===----------Row Group Partitioning----------===//
     auto row_group_indices = reader.all_row_groups(*result->reader_options);
     // Row group pruning with filter pushdown using metadata statistics.
-    if (ast_filter) {
+    if (ast_filter && duckdb::Config::ENABLE_ROW_GROUP_PRUNING) {
       auto const row_groups_before_pruning = row_group_indices.size();
       // clang-format off
       SIRIUS_LOG_DEBUG("[sirius_parquet_metadata_scan_operator] Row group pruning: file: {}\n" \

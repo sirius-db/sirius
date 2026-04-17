@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_parquet_scan.hpp"
 
+#include "config.hpp"
 #include "expression_executor/gpu_expression_translator.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
@@ -89,17 +90,23 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
     auto duckdb_expression = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, batch_column_map);
     if (duckdb_expression) {
-      gpu_expression_translator translator(rmm::cuda_stream_default,
-                                           cudf::get_current_device_resource_ref());
-      translated_filter =
-        translator.translate_expression_with_names(*duckdb_expression, name_resolver);
-      if (!translated_filter) {
-        SIRIUS_LOG_INFO(
-          "[sirius_physical_parquet_scan] Failed to translate filter expression for pushdown. "
-          "Filter will be applied in the table scan operator.");
+      if (duckdb::Config::ENABLE_ROW_GROUP_PRUNING) {
+        gpu_expression_translator translator(rmm::cuda_stream_default,
+                                             cudf::get_current_device_resource_ref());
+        translated_filter =
+          translator.translate_expression_with_names(*duckdb_expression, name_resolver);
+        if (!translated_filter) {
+          SIRIUS_LOG_INFO(
+            "[sirius_physical_parquet_scan] Failed to translate filter expression for pushdown. "
+            "Filter will be applied in the table scan operator.");
+        } else {
+          // Instruct the sirius_physical_table_scan operator to bypass execute()
+          if (table_scan) { table_scan->passthrough = true; }
+        }
       } else {
-        // Instruct the sirius_physical_table_scan operator to bypass execute()
-        if (table_scan) { table_scan->passthrough = true; }
+        SIRIUS_LOG_INFO(
+          "[sirius_physical_parquet_scan] Row group pruning disabled via "
+          "enable_row_group_pruning; filter will be applied in the table scan operator.");
       }
       // Move the duckdb_expression into the table scan
       if (table_scan) { table_scan->filter_expr = std::move(duckdb_expression); }
