@@ -45,6 +45,7 @@
 
 // sirius
 #include <op/scan/parquet_scan_operator_data.hpp>
+#include <op/scan/scan_source_resolver.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -265,8 +266,16 @@ TEST_CASE("pipeline task counting - single file, default max_file_processed (one
   duckdb::vector<duckdb::idx_t> no_projection;
 
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(schema.types, 0);
-  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
-    &gpu_op, schema.types, schema.types, 0, files, schema.column_ids, no_projection, schema.names);
+  auto resolver = std::make_unique<sirius::op::scan::parquet_scan_source_resolver>(
+    files, schema.column_ids, no_projection, schema.names);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(&gpu_op,
+                                                                      schema.types,
+                                                                      schema.types,
+                                                                      0,
+                                                                      std::move(resolver),
+                                                                      schema.column_ids,
+                                                                      no_projection,
+                                                                      schema.names);
 
   auto [metadata_pipeline, gpu_pipeline] = build_pipelines(fixture.engine, metadata_op, gpu_op);
 
@@ -330,12 +339,14 @@ TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_proce
   duckdb::vector<duckdb::idx_t> no_projection;
 
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(schema.types, 0);
+  auto resolver = std::make_unique<sirius::op::scan::parquet_scan_source_resolver>(
+    files, schema.column_ids, no_projection, schema.names);
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
     &gpu_op,
     schema.types,
     schema.types,
     /*estimated_cardinality=*/0,
-    files,
+    std::move(resolver),
     schema.column_ids,
     no_projection,
     schema.names,

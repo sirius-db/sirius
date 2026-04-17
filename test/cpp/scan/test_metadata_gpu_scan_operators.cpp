@@ -22,6 +22,7 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
+#include <op/scan/scan_source_resolver.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 
@@ -181,12 +182,15 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
 {
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(output_types, 0);
 
+  auto resolver = std::make_unique<sirius::op::scan::parquet_scan_source_resolver>(
+    file_paths, column_ids, projection_ids, names);
+
   // --- Pipeline 1: metadata scan ---
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(&gpu_op,
                                                                       output_types,
                                                                       returned_types,
                                                                       0,
-                                                                      file_paths,
+                                                                      std::move(resolver),
                                                                       column_ids,
                                                                       projection_ids,
                                                                       names,
@@ -285,8 +289,16 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
   duckdb::vector<duckdb::idx_t> no_projection;
 
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(schema.types, 0);
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(
-    &gpu_op, schema.types, schema.types, 0, files, schema.column_ids, no_projection, schema.names);
+  auto resolver = std::make_unique<sirius::op::scan::parquet_scan_source_resolver>(
+    files, schema.column_ids, no_projection, schema.names);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             schema.types,
+                                                             schema.types,
+                                                             0,
+                                                             std::move(resolver),
+                                                             schema.column_ids,
+                                                             no_projection,
+                                                             schema.names);
 
   REQUIRE(op.is_source());
   REQUIRE_FALSE(op.all_ports_empty());
@@ -318,8 +330,16 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   duckdb::vector<duckdb::idx_t> no_projection;
 
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(schema.types, 0);
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(
-    &gpu_op, schema.types, schema.types, 0, files, schema.column_ids, no_projection, schema.names);
+  auto resolver = std::make_unique<sirius::op::scan::parquet_scan_source_resolver>(
+    files, schema.column_ids, no_projection, schema.names);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             schema.types,
+                                                             schema.types,
+                                                             0,
+                                                             std::move(resolver),
+                                                             schema.column_ids,
+                                                             no_projection,
+                                                             schema.names);
 
   auto input = op.get_next_task_input_data();
   REQUIRE(input);

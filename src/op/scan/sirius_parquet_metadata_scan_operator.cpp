@@ -17,7 +17,8 @@
 // sirius
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
-#include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
+#include <op/scan/parquet_scan_task.hpp>  // detail::projected_columns_are_flat
+#include <op/scan/scan_source_resolver.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
@@ -29,6 +30,7 @@
 // standard library
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace sirius::op::scan {
 
@@ -40,7 +42,7 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::LogicalType> const& returned_types,
   duckdb::idx_t estimated_cardinality,
-  std::vector<std::string> const& file_paths,
+  std::unique_ptr<scan_source_resolver> resolver,
   duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   duckdb::vector<duckdb::idx_t> const& projection_ids,
   duckdb::vector<std::string> const& names,
@@ -49,14 +51,26 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   std::size_t max_file_processed)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN, std::move(types), estimated_cardinality),
-    _file_paths(file_paths),
     _is_projected(!projection_ids.empty()),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
-    _total_files(file_paths.size()),
     _gpu_scan(gpu_scan)
 {
-  _selected_column_indices = detail::make_selected_column_indices(column_ids, projection_ids);
+  if (!resolver) {
+    throw std::runtime_error(
+      "[sirius_parquet_metadata_scan_operator] resolver must be non-null.");
+  }
+
+  // Resolve the scan source (file paths, read projection, per-batch transform) exactly once.
+  // The resolver is scan-kind-specific: plain parquet passes through; Iceberg widens the
+  // projection with delete-key columns and installs a per-batch delete filter.
+  auto resolved               = resolver->resolve();
+  _file_paths                 = std::move(resolved.file_paths);
+  _selected_column_indices    = std::move(resolved.selected_column_indices);
+  _projected_column_names     = std::move(resolved.projected_column_names);
+  _per_batch_transform        = std::move(resolved.per_batch_transform);
+  _trailing_columns_to_strip  = resolved.trailing_columns_to_strip;
+  _total_files                = _file_paths.size();
 
   // Convert the table filter set into a DuckDB expression. AST translation is deferred to
   // execute() so that a task-local CUDA stream can be used.
@@ -79,36 +93,25 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
     }
   }
 
-  // Projections require column names to map indices to parquet column names.
-  if (_is_projected && names.empty()) {
-    throw std::runtime_error(
-      "[sirius_parquet_metadata_scan_operator] Projection requires column names to be provided.");
-  }
-
   // Construct a) the post_filter_projection_ids list of projection ids corresponding to columns
   //              that remain after pruning pure filter columns, and
   //           b) the set of column indices corresponding to pure filter columns that will be pruned
   //              after filtering.
-  if (_is_projected) {
-    for (auto idx : _selected_column_indices) {
-      _projected_column_names.push_back(names[idx]);
+  if (_is_projected && _has_filter) {
+    std::vector<std::size_t> candidate_post_filter_ids;
+    for (std::size_t i = 0; i < projection_ids.size(); i++) {
+      auto const projection_id = projection_ids[i];
+      if (i < this->types.size()) {
+        candidate_post_filter_ids.push_back(projection_id);
+      } else {
+        // This is a pure filter column that is not among the expected output columns.
+        auto const column_index = column_ids[projection_id].GetPrimaryIndex();
+        _pure_filter_column_indices.insert(column_index);
+      }
     }
-    if (_has_filter) {
-      std::vector<std::size_t> candidate_post_filter_ids;
-      for (std::size_t i = 0; i < projection_ids.size(); i++) {
-        auto const projection_id = projection_ids[i];
-        if (i < this->types.size()) {
-          candidate_post_filter_ids.push_back(projection_id);
-        } else {
-          // This is a pure filter column that is not among the expected output columns.
-          auto const column_index = column_ids[projection_id].GetPrimaryIndex();
-          _pure_filter_column_indices.insert(column_index);
-        }
-      }
-      // Only set post_filter_projection_ids when there are pure filter columns to prune.
-      if (!_pure_filter_column_indices.empty()) {
-        _post_filter_projection_ids = std::move(candidate_post_filter_ids);
-      }
+    // Only set post_filter_projection_ids when there are pure filter columns to prune.
+    if (!_pure_filter_column_indices.empty()) {
+      _post_filter_projection_ids = std::move(candidate_post_filter_ids);
     }
   }
 }
@@ -158,12 +161,23 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   auto result        = std::make_unique<partitioned_parquet_metadata>();
   result->file_paths = input.file_paths;
 
+  // Stamp the resolver-supplied per-batch transform and trailing-strip count onto every
+  // partitioned_parquet_metadata. For plain parquet these are null/0; for Iceberg they carry
+  // the delete-application closure and the number of widened delete-key columns.
+  result->per_batch_transform       = _per_batch_transform;
+  result->trailing_columns_to_strip = _trailing_columns_to_strip;
+
   //===----------Build reader options----------===//
   result->reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
 
-  // Projections
-  if (_is_projected) { result->reader_options->set_column_names(_projected_column_names); }
+  // Projections. Use the presence of resolver-supplied projected column names as the
+  // authoritative signal; this can be true even when _is_projected (planner-level) is false if
+  // a future Iceberg-style resolver widens the read projection without the planner requesting
+  // one.
+  if (!_projected_column_names.empty()) {
+    result->reader_options->set_column_names(_projected_column_names);
+  }
 
   // Filter
   std::shared_ptr<translated_expression> ast_filter;

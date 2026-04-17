@@ -18,6 +18,7 @@
 
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "log/logging.hpp"
+#include "op/scan/scan_source_resolver.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/scan/sirius_parquet_metadata_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -202,12 +203,19 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   // accumulate_metadata() / finalize_partitions() handoff.
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality);
+
+  // The resolver supplies the data-file list and the read projection. For plain parquet there
+  // is no widening and no per-batch transform; an Iceberg resolver (future work) will widen
+  // the projection with delete-key columns and install a delete-application closure.
+  auto resolver = std::make_unique<op::scan::parquet_scan_source_resolver>(
+    std::move(file_paths), scan_op.column_ids, scan_op.projection_ids, scan_op.names);
+
   auto metadata_scan_op = duckdb::make_uniq<op::scan::sirius_parquet_metadata_scan_operator>(
     gpu_scan_op.get(),
     scan_op.types,
     scan_op.returned_types,
     scan_op.estimated_cardinality,
-    file_paths,
+    std::move(resolver),
     scan_op.column_ids,
     scan_op.projection_ids,
     scan_op.names,

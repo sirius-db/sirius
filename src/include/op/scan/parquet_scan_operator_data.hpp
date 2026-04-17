@@ -24,9 +24,15 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/table/table.hpp>
+
+// rmm
+#include <rmm/cuda_stream_view.hpp>
 
 // standard library
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,6 +40,15 @@
 namespace sirius::op::scan {
 
 using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
+
+// Forward-declare the post_convert_fn_t so we don't pull in the full
+// host_parquet_representation header in every translation unit.
+// The actual definition lives in data/host_parquet_representation.hpp.
+using post_convert_fn_t =
+  std::function<std::unique_ptr<cudf::table>(std::unique_ptr<cudf::table>,
+                                             std::string const& data_file_path,
+                                             int64_t first_row_offset,
+                                             rmm::cuda_stream_view)>;
 
 //===----------------------------------------------------------------------===//
 // row_group_range
@@ -109,6 +124,16 @@ class partitioned_parquet_metadata : public op::operator_data {
   std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
     filter_expression;
   std::vector<std::size_t> post_filter_projection_ids;
+
+  /// Optional per-batch transform invoked by the GPU scan operator after a row-group batch
+  /// has been materialized as a cudf::table (e.g. Iceberg V2 delete application).
+  /// Null for plain parquet scans; the GPU scan operator skips the call when null.
+  post_convert_fn_t per_batch_transform;
+  /// Number of trailing columns the GPU scan operator strips from each batch after
+  /// per_batch_transform runs. Used by Iceberg scans to drop delete-key columns that
+  /// were widened into the read projection but are not part of the user's output schema.
+  /// 0 for plain parquet scans.
+  int trailing_columns_to_strip = 0;
 };
 
 //===----------------------------------------------------------------------===//

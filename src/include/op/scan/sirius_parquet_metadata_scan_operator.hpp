@@ -19,6 +19,8 @@
 // sirius
 #include <config.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
+#include <op/scan/parquet_scan_operator_data.hpp>  // post_convert_fn_t
+#include <op/scan/scan_source_resolver.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
@@ -75,8 +77,14 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
 
   //===----------Constructor----------===//
   /**
-   * @brief Construct the metadata scan operator from the individual fields extracted from the
-   *        physical parquet scan node (or equivalent source).
+   * @brief Construct the metadata scan operator from a scan-source resolver plus the planner-
+   *        level filter/projection bits extracted from the physical parquet scan node.
+   *
+   * The resolver is scan-kind-specific (plain parquet, Iceberg, ...) and supplies the data-file
+   * list, the read projection (possibly widened to include extra columns, e.g. Iceberg delete
+   * keys), the optional per-batch GPU transform, and the number of trailing columns to strip.
+   * The remaining parameters are invariant across scan kinds: they drive filter AST translation,
+   * row-group-byte accounting for partitioning, and post-filter projection computation.
    *
    * @param gpu_scan                The downstream gpu scan operator into which to push partition
    *                                metadata. This is necessary in order to avoid the gpu scan
@@ -86,13 +94,18 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    * @param types                   Output column types.
    * @param returned_types          The types of all columns in the source file.
    * @param estimated_cardinality   Estimated output row count.
-   * @param file_paths              The list of parquet files to scan.
-   * @param column_ids              Column ids exposed by the table function (used for column
-   *                                selection; see detail::make_selected_column_indices).
-   * @param projection_ids          Indices into column_ids that the planner has projected out
-   *                                (empty = no projection, read all columns).
-   * @param names                   All column names in schema order (used to build column-name
-   *                                projections passed to the parquet reader).
+   * @param resolver                Scan-source resolver. Consumed at construction time (resolve()
+   *                                is invoked exactly once). Supplies file paths, read projection,
+   *                                per-batch transform, and trailing-strip count.
+   * @param column_ids              Column ids exposed by the table function (used for filter AST
+   *                                ref-index mapping and pure-filter column identification).
+   * @param projection_ids          Planner-level projection (empty = no projection). Used to drive
+   *                                post-filter projection and pure-filter column pruning in the
+   *                                partition byte-accounting loop. NOT used for selecting columns
+   *                                to read — that decision lives in the resolver so Iceberg can
+   *                                widen with delete-key columns.
+   * @param names                   All column names in schema order (used to build the
+   *                                ref-index -> column-name map for AST filter translation).
    * @param table_filter_set        The table filter set for row-group pruning and filter pushdown
    *                                (optional; may be nullptr if no filters or filter translation
    *                                fails).
@@ -100,14 +113,15 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    * @param max_file_processed      Maximum number of files handled by one metadata task.
    *
    * @throws if projection_ids is nonempty or filter_expression is non-nullptr but names is empty
-   *         (column names are required for both projection and filter pushdown).
+   *         (column names are required for filter AST translation; the resolver is responsible
+   *         for the analogous check on projection).
    */
   sirius_parquet_metadata_scan_operator(
     sirius_gpu_parquet_scan_operator* gpu_scan,
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::LogicalType> const& returned_types,
     duckdb::idx_t estimated_cardinality,
-    std::vector<std::string> const& file_paths,
+    std::unique_ptr<scan_source_resolver> resolver,
     duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     duckdb::vector<duckdb::idx_t> const& projection_ids,
     duckdb::vector<std::string> const& names,
@@ -195,13 +209,19 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   [[nodiscard]] std::size_t get_approximate_batch_size() const { return _approximate_batch_size; }
 
  private:
-  /// The list of parquet files to scan.
+  /// The list of parquet files to scan. Populated from scan_source_resolver::resolve().
   std::vector<std::string> _file_paths;
-  /// Column indices to read (after projection), indices into parquet schema.
+  /// Column indices to read (after projection, possibly widened by the resolver), indices into
+  /// parquet schema. Populated from scan_source_resolver::resolve().
   std::vector<std::size_t> _selected_column_indices;
-  /// Whether projection is applied.
+  /// Whether the planner requested a projection. Drives post-filter projection / pure-filter
+  /// column identification. The effective reader column-name list may still be non-empty even
+  /// when this is false (e.g., if a resolver widens the projection) — check
+  /// !_projected_column_names.empty() for that.
   bool _is_projected;
-  /// Column names for the projected columns, in column_ids order.
+  /// Column names for the projected columns, in _selected_column_indices order. Empty when no
+  /// projection should be applied to the parquet reader. Populated from
+  /// scan_source_resolver::resolve().
   std::vector<std::string> _projected_column_names;
   /// Whether there is a filter expression (AST translation is deferred to execute()).
   bool _has_filter;
@@ -217,6 +237,14 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   /// For the metadata scan operator, this is used to prune bytes from the accumulated uncompressed
   /// byte count for partitioning purposes.
   std::unordered_set<std::size_t> _pure_filter_column_indices;
+
+  /// Optional per-batch GPU transform supplied by the resolver. Stamped onto every
+  /// partitioned_parquet_metadata emitted by execute(). Null for plain parquet scans.
+  post_convert_fn_t _per_batch_transform;
+  /// Number of trailing columns the GPU scan operator strips from each batch after the
+  /// per-batch transform runs. Stamped onto every partitioned_parquet_metadata emitted by
+  /// execute(). 0 for plain parquet scans.
+  int _trailing_columns_to_strip = 0;
 
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
