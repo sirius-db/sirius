@@ -212,6 +212,13 @@ void gpu_native_scan_global_state::check_viability()
             // EMPTY = no nulls in this range: the decoder's all-valid
             // pre-fill is exactly correct, no overlay needed.
             case duckdb::CompressionType::COMPRESSION_EMPTY:
+            // CONSTANT validity is how DuckDB encodes "all rows share one
+            // validity value" for a segment — in practice this is the
+            // all-valid case (genuinely all-null columns get EMPTY with
+            // appropriate stats). The existing decoder's all-valid pre-fill
+            // handles it, so accepting it preserves pre-fix behavior for
+            // columns without nulls (TPC-H lineitem, nation, etc.).
+            case duckdb::CompressionType::COMPRESSION_CONSTANT:
             // ROARING: host-decoded into an owned bitmap in direct_block_scan
             // and handed to the decoder as UNCOMPRESSED bytes.
             case duckdb::CompressionType::COMPRESSION_ROARING:
