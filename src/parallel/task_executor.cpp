@@ -21,6 +21,7 @@ namespace parallel {
 
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
+  // WSM TODO: this should return a bool now?
   static_cast<void>(_task_queue.push(std::move(task)));
 }
 
