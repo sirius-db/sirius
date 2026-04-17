@@ -55,17 +55,32 @@ gpu_native_scan_global_state::gpu_native_scan_global_state(
   // use the same mapping: col_indices_[i] = column_ids[projection_ids[i]].
   // Without this, filter-only columns (in WHERE but not SELECT) cause a mismatch
   // where we scan the wrong storage column for the declared type.
+  //
+  // Row-id projections (DuckDB's LIMIT pushdown rewrites SELECT ... LIMIT into
+  // a rowid SEMI-JOIN plan) have no backing storage — rowids are synthesized
+  // from RowGroup::start. gpu_native_scan walks the segment tree directly and
+  // cannot produce synthetic rowids, so refuse viability and fall back to
+  // duckdb_scan_task if any projected column is a rowid.
+  bool has_rowid = false;
   if (!op_.projection_ids.empty()) {
     for (size_t i = 0; i < op_.projection_ids.size(); ++i) {
       auto pid = op_.projection_ids[i];
+      if (op_.column_ids[pid].IsRowIdColumn()) { has_rowid = true; break; }
       col_indices_.emplace_back(op_.column_ids[pid].GetPrimaryIndex());
       col_types_.push_back(op_.scanned_types[i]);
     }
   } else {
-    for (size_t ci = 0; ci < op_.scanned_types.size(); ++ci) {
+    for (size_t ci = 0; ci < op_.column_ids.size(); ++ci) {
+      if (op_.column_ids[ci].IsRowIdColumn()) { has_rowid = true; break; }
       col_indices_.emplace_back(op_.column_ids[ci].GetPrimaryIndex());
       col_types_.push_back(op_.scanned_types[ci]);
     }
+  }
+  if (has_rowid) {
+    viable_ = false;
+    SIRIUS_LOG_INFO(
+      "[gpu_native_scan] not viable: row-id projection — falling back to duckdb_scan_task");
+    return;
   }
 
   // Resolve GPU memory space
