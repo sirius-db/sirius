@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -24,8 +25,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalDummyScan& op)
 {
   D_ASSERT(op.children.size() == 0);
-  return duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(op.types,
-                                                                   op.estimated_cardinality);
+  return duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(
+    sirius::from_duckdb_vec(op.types), op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner

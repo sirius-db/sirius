@@ -33,7 +33,7 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
  public:
   sirius_physical_sort_partition(sirius_physical_order* order_by);
 
-  sirius_physical_sort_partition(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_sort_partition(duckdb::vector<sirius::logical_type> types,
                                  duckdb::vector<duckdb::BoundOrderByNode> orders,
                                  duckdb::vector<std::size_t> projections_p,
                                  std::size_t estimated_cardinality);

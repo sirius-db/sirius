@@ -37,7 +37,7 @@ class sirius_physical_top_n : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TOP_N;
 
  public:
-  sirius_physical_top_n(duckdb::vector<duckdb::LogicalType> types_p,
+  sirius_physical_top_n(duckdb::vector<sirius::logical_type> types_p,
                         duckdb::vector<duckdb::BoundOrderByNode> orders,
                         std::size_t limit,
                         std::size_t offset,

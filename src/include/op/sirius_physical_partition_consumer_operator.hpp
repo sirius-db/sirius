@@ -26,7 +26,7 @@ namespace op {
 class sirius_physical_partition_consumer_operator : public sirius_physical_operator {
  public:
   sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType type,
-                                              duckdb::vector<duckdb::LogicalType> types,
+                                              duckdb::vector<sirius::logical_type> types,
                                               std::size_t estimated_cardinality)
     : sirius_physical_operator(type, std::move(types), estimated_cardinality)
   {

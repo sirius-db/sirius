@@ -17,6 +17,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -34,7 +35,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
   // If this check fails, this is a reference to a materialized recursive CTE.
   if (materialized_cte != materialized_ctes.end()) {
     auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-      op.chunk_types,
+      sirius::from_duckdb_vec(op.chunk_types),
       sirius::op::SiriusPhysicalOperatorType::CTE_SCAN,
       op.estimated_cardinality,
       op.cte_index);
@@ -79,7 +80,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
                       ? sirius::op::SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN
                       : sirius::op::SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN;
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-    cte->second.get()->Types(),
+    sirius::from_duckdb_vec(cte->second.get()->Types()),
     sirius::op::SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN,
     op.estimated_cardinality,
     op.cte_index);

@@ -58,10 +58,10 @@ class sirius_physical_table_scan : public sirius_physical_operator {
  public:
   //! Table scan that immediately projects out filter columns that are unused in the remainder of
   //! the query plan
-  sirius_physical_table_scan(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_table_scan(duckdb::vector<sirius::logical_type> types,
                              duckdb::TableFunction function,
                              duckdb::unique_ptr<duckdb::FunctionData> bind_data,
-                             duckdb::vector<duckdb::LogicalType> returned_types,
+                             duckdb::vector<sirius::logical_type> returned_types,
                              duckdb::vector<duckdb::ColumnIndex> column_ids,
                              duckdb::vector<std::size_t> projection_ids,
                              duckdb::vector<std::string> names,
@@ -76,7 +76,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Bind data of the function
   duckdb::unique_ptr<duckdb::FunctionData> bind_data;
   //! The types of ALL columns that can be returned by the table function
-  duckdb::vector<duckdb::LogicalType> returned_types;
+  duckdb::vector<sirius::logical_type> returned_types;
   //! The column ids used within the table function
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   //! The projected-out column ids
@@ -106,7 +106,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
   bool* already_cached;
 
-  duckdb::vector<duckdb::LogicalType> scanned_types;
+  duckdb::vector<sirius::logical_type> scanned_types;
 
   duckdb::vector<std::size_t> scanned_ids;
 

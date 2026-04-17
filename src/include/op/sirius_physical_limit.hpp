@@ -32,7 +32,7 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
     SiriusPhysicalOperatorType::STREAMING_LIMIT;
 
  public:
-  sirius_physical_streaming_limit(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_streaming_limit(duckdb::vector<sirius::logical_type> types,
                                   duckdb::BoundLimitNode limit_val_p,
                                   duckdb::BoundLimitNode offset_val_p,
                                   std::size_t estimated_cardinality,

@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/planner/operator/logical_delim_get.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -27,7 +28,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDelimGet& op)
 
   // create a PhysicalChunkScan without an owned_collection, the collection will be added later
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-    op.types,
+    sirius::from_duckdb_vec(op.types),
     sirius::op::SiriusPhysicalOperatorType::DELIM_SCAN,
     op.estimated_cardinality,
     nullptr);

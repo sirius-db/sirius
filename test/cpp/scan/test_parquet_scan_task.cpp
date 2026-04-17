@@ -21,6 +21,7 @@
 
 // sirius
 #include <exec/config.hpp>
+#include <helper/type_conversions.hpp>
 #include <op/scan/duckdb_scan_task_queue.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
@@ -200,19 +201,20 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
     }
   }
 
-  return std::make_unique<sirius::op::sirius_physical_parquet_scan>(output_types,
-                                                                    table_function,
-                                                                    std::move(bind_data),
-                                                                    return_types,
-                                                                    std::move(column_ids),
-                                                                    std::move(projection_ids),
-                                                                    std::move(names),
-                                                                    std::move(table_filters),
-                                                                    0,
-                                                                    std::move(extra_info),
-                                                                    duckdb::vector<duckdb::Value>(),
-                                                                    std::move(virtual_columns),
-                                                                    nullptr);
+  return std::make_unique<sirius::op::sirius_physical_parquet_scan>(
+    sirius::from_duckdb_vec(output_types),
+    table_function,
+    std::move(bind_data),
+    sirius::from_duckdb_vec(return_types),
+    std::move(column_ids),
+    std::move(projection_ids),
+    std::move(names),
+    std::move(table_filters),
+    0,
+    std::move(extra_info),
+    duckdb::vector<duckdb::Value>(),
+    std::move(virtual_columns),
+    nullptr);
 }
 
 static duckdb::unique_ptr<duckdb::TableFilterSet> make_id_constant_filter(

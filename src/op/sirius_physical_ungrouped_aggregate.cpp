@@ -49,7 +49,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
@@ -233,9 +233,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
   // The sum column type may differ from the return type (e.g., sum is DECIMAL64 but
   // DuckDB's avg return type is DOUBLE).
   long double sum_host = 0.0L;
-  bool sum_is_decimal =
-    (sum_type.id() == cudf::type_id::DECIMAL32 || sum_type.id() == cudf::type_id::DECIMAL64 ||
-     sum_type.id() == cudf::type_id::DECIMAL128);
+  bool sum_is_decimal  = sirius::IsCudfTypeDecimal(sum_type);
   if (sum_is_decimal) {
     auto denom = std::pow(10.0L, static_cast<long double>(-sum_type.scale()));
     switch (sum_type.id()) {
@@ -396,9 +394,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           // cuDF requires output type == input type for fixed-point (decimal) reductions.
           // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
           // For SUM we widen (expected by duckdb) before the aggregation to avoid overflow.
-          bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
-                             col.type().id() == cudf::type_id::DECIMAL64 ||
-                             col.type().id() == cudf::type_id::DECIMAL128);
+          bool is_decimal = sirius::IsCudfTypeDecimal(col.type());
 
           std::unique_ptr<cudf::column> casted_col;
           if (spec.kind == aggregate_kind::SUM) {
@@ -473,7 +469,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 }
 
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)

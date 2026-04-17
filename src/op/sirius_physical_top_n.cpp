@@ -128,7 +128,7 @@ std::unique_ptr<cudf::table> compute_top_n_table(
 }  // namespace
 
 sirius_physical_top_n::sirius_physical_top_n(
-  duckdb::vector<duckdb::LogicalType> types_p,
+  duckdb::vector<sirius::logical_type> types_p,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
   std::size_t limit,
   std::size_t offset,
@@ -202,7 +202,7 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* 
 }
 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(
-  duckdb::vector<duckdb::LogicalType> types_p,
+  duckdb::vector<sirius::logical_type> types_p,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
   std::size_t limit,
   std::size_t offset,

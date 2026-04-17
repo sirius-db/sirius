@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
@@ -89,7 +90,8 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // filter column
   types.push_back(Traits::logical_type());
 
-  sirius_physical_filter filter(std::move(types), std::move(exprs), filter_vals.size());
+  sirius_physical_filter filter(
+    sirius::from_duckdb_vec(types), std::move(exprs), filter_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = filter.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());

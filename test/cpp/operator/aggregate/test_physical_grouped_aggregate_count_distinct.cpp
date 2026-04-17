@@ -32,6 +32,7 @@
 #include "../operator_type_traits.hpp"
 #include "aggregate_test_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "utils/data_utils.hpp"
@@ -373,11 +374,11 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   auto expected_table = std::make_unique<cudf::table>(std::move(exp_cols));
 
   // Build expressions: [count(distinct col1), min(col1), count(col1)]
-  duckdb::vector<duckdb::LogicalType> output_types;
-  output_types.push_back(KeyTraits::logical_type());    // group key
-  output_types.push_back(duckdb::LogicalType::BIGINT);  // count distinct
-  output_types.push_back(ValTraits::logical_type());    // min
-  output_types.push_back(duckdb::LogicalType::BIGINT);  // count
+  duckdb::vector<sirius::logical_type> output_types;
+  output_types.push_back(sirius::from_duckdb(KeyTraits::logical_type()));    // group key
+  output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));  // count distinct
+  output_types.push_back(sirius::from_duckdb(ValTraits::logical_type()));    // min
+  output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));  // count
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
   groups.push_back(
@@ -414,7 +415,7 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   }
 
   // Clone expressions for merge operator (it takes the same spec)
-  duckdb::vector<duckdb::LogicalType> output_types2 = output_types;
+  duckdb::vector<sirius::logical_type> output_types2 = output_types;
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups2;
   groups2.push_back(
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(KeyTraits::logical_type(), 0));

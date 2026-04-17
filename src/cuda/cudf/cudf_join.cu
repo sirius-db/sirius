@@ -55,11 +55,11 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys,
     if (build_key_cudf.type().id() == probe_key_cudf.type().id()) {
       build_keys_cudf.push_back(build_key_cudf);
       probe_keys_cudf.push_back(probe_key_cudf);
-    } else if (IsCudfTypeDecimal(build_key_cudf.type()) &&
-               IsCudfTypeDecimal(probe_key_cudf.type())) {
+    } else if (sirius::IsCudfTypeDecimal(build_key_cudf.type()) &&
+               sirius::IsCudfTypeDecimal(probe_key_cudf.type())) {
       // Cast for decimal join key
-      int build_decimal_size = GetCudfDecimalTypeSize(build_key_cudf.type());
-      int probe_decimal_size = GetCudfDecimalTypeSize(probe_key_cudf.type());
+      int build_decimal_size = sirius::GetCudfDecimalTypeSize(build_key_cudf.type());
+      int probe_decimal_size = sirius::GetCudfDecimalTypeSize(probe_key_cudf.type());
       if (build_decimal_size < probe_decimal_size) {
         // Cast for build side to probe side
         keys_cast.push_back(cudf::cast(build_key_cudf,
@@ -294,11 +294,11 @@ void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
     if (build_key_cudf.type().id() == probe_key_cudf.type().id()) {
       build_keys_cudf.push_back(build_key_cudf);
       probe_keys_cudf.push_back(probe_key_cudf);
-    } else if (IsCudfTypeDecimal(build_key_cudf.type()) &&
-               IsCudfTypeDecimal(probe_key_cudf.type())) {
+    } else if (sirius::IsCudfTypeDecimal(build_key_cudf.type()) &&
+               sirius::IsCudfTypeDecimal(probe_key_cudf.type())) {
       // Cast for decimal join key
-      int build_decimal_size = GetCudfDecimalTypeSize(build_key_cudf.type());
-      int probe_decimal_size = GetCudfDecimalTypeSize(probe_key_cudf.type());
+      int build_decimal_size = sirius::GetCudfDecimalTypeSize(build_key_cudf.type());
+      int probe_decimal_size = sirius::GetCudfDecimalTypeSize(probe_key_cudf.type());
       if (build_decimal_size < probe_decimal_size) {
         // Cast for build side to probe side
         keys_cast.push_back(cudf::cast(build_key_cudf,
@@ -382,10 +382,10 @@ void cudf_hash_full_join(vector<shared_ptr<GPUColumn>>& probe_keys,
     if (build_key_cudf.type().id() == probe_key_cudf.type().id()) {
       build_keys_cudf.push_back(build_key_cudf);
       probe_keys_cudf.push_back(probe_key_cudf);
-    } else if (IsCudfTypeDecimal(build_key_cudf.type()) &&
-               IsCudfTypeDecimal(probe_key_cudf.type())) {
-      int build_decimal_size = GetCudfDecimalTypeSize(build_key_cudf.type());
-      int probe_decimal_size = GetCudfDecimalTypeSize(probe_key_cudf.type());
+    } else if (sirius::IsCudfTypeDecimal(build_key_cudf.type()) &&
+               sirius::IsCudfTypeDecimal(probe_key_cudf.type())) {
+      int build_decimal_size = sirius::GetCudfDecimalTypeSize(build_key_cudf.type());
+      int probe_decimal_size = sirius::GetCudfDecimalTypeSize(probe_key_cudf.type());
       if (build_decimal_size < probe_decimal_size) {
         keys_cast.push_back(cudf::cast(build_key_cudf,
                                        probe_key_cudf.type(),

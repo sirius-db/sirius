@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -57,8 +58,9 @@ class stub_operator : public sirius::op::sirius_physical_operator {
   using sink_fn    = std::function<void(const sirius::op::operator_data&, rmm::cuda_stream_view)>;
 
   stub_operator()
-    : sirius_physical_operator(
-        sirius::op::SiriusPhysicalOperatorType::FILTER, duckdb::vector<duckdb::LogicalType>{}, 0)
+    : sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::FILTER,
+                               sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
+                               0)
   {
   }
 

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 
@@ -171,12 +172,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   auto merge_aggregates = make_aggregates(merge_types);
 
   sirius_physical_ungrouped_aggregate local_op(
-    std::move(local_types),
+    sirius::from_duckdb_vec(local_types),
     std::move(local_aggregates),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
-    std::move(merge_types),
+    sirius::from_duckdb_vec(merge_types),
     std::move(merge_aggregates),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
@@ -301,12 +302,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
   auto merge_aggregates = make_avg_aggregates(merge_types);
 
   sirius_physical_ungrouped_aggregate local_op(
-    std::move(local_types),
+    sirius::from_duckdb_vec(local_types),
     std::move(local_aggregates),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
-    std::move(merge_types),
+    sirius::from_duckdb_vec(merge_types),
     std::move(merge_aggregates),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);

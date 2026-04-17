@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_limit.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -61,12 +62,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalLimit& op)
     default:
       // GPU pipeline compares all limits at the end, so insertion order does not matter.
       // Always use parallel streaming limit.
-      limit =
-        duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types,
-                                                                       std::move(op.limit_val),
-                                                                       std::move(op.offset_val),
-                                                                       op.estimated_cardinality,
-                                                                       true);
+      limit = duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(
+        sirius::from_duckdb_vec(op.types),
+        std::move(op.limit_val),
+        std::move(op.offset_val),
+        op.estimated_cardinality,
+        true);
       break;
   }
 

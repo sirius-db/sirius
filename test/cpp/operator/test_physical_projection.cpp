@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 
@@ -82,7 +83,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   types.push_back(Traits::logical_type());
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
-  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -130,7 +132,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(Traits::logical_type());
 
-  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -179,7 +182,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   types.push_back(Traits::logical_type());
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
-  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());

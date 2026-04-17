@@ -27,7 +27,7 @@ class sirius_physical_projection : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PROJECTION;
 
  public:
-  sirius_physical_projection(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_projection(duckdb::vector<sirius::logical_type> types,
                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
                              std::size_t estimated_cardinality);
 

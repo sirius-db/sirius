@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 
@@ -60,11 +61,12 @@ mark_join_fixture create_mark_join()
 
   auto left_child = duckdb::make_uniq<sirius_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::INTEGER}),
     0);
   auto right_child = duckdb::make_uniq<sirius_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
@@ -80,9 +82,9 @@ mark_join_fixture create_mark_join()
     std::move(right_child),
     std::move(conditions),
     duckdb::JoinType::MARK,
-    duckdb::vector<duckdb::idx_t>{},        // left_projection_map (empty = all)
-    duckdb::vector<duckdb::idx_t>{},        // right_projection_map (not used by MARK)
-    duckdb::vector<duckdb::LogicalType>{},  // delim_types
+    duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
+    duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,
     nullptr);
 

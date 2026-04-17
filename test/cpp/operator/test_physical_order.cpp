@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
@@ -104,7 +105,8 @@ TEST_CASE("sirius_physical_order sorts 1 column ascending", "[physical_order]")
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -136,7 +138,8 @@ TEST_CASE("sirius_physical_order sorts 1 column descending", "[physical_order]")
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -174,7 +177,8 @@ TEST_CASE("sirius_physical_order sorts by col0, returns both columns", "[physica
 
   duckdb::vector<duckdb::idx_t> projections{0, 1};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -214,7 +218,8 @@ TEST_CASE("sirius_physical_order sorts by 2 keys (asc, desc)", "[physical_order]
 
   duckdb::vector<duckdb::idx_t> projections{0, 1};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -252,7 +257,8 @@ TEST_CASE("sirius_physical_order projects only col1 when sorting by col0", "[phy
   // Only project col1 (payload), not col0 (sort key)
   duckdb::vector<duckdb::idx_t> projections{1};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -292,7 +298,8 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc, return all", "[phy
 
   duckdb::vector<duckdb::idx_t> projections{0, 1, 2};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -340,7 +347,8 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc + col1 desc, return
 
   duckdb::vector<duckdb::idx_t> projections{0, 1, 2};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -379,7 +387,8 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0, project col1 and col2 
 
   duckdb::vector<duckdb::idx_t> projections{1, 2};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
@@ -420,7 +429,8 @@ TEST_CASE("sirius_physical_order handles multiple batches", "[physical_order]")
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 2);
@@ -459,7 +469,8 @@ TEST_CASE("sirius_physical_order handles null input batches", "[physical_order]"
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, batch, nullptr};
   auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -485,7 +496,8 @@ TEST_CASE("sirius_physical_order returns empty for all-null inputs", "[physical_
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_order op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_order op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, nullptr};
   auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());

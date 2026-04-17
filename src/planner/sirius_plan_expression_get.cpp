@@ -18,6 +18,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -48,7 +49,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalExpressionGet& op)
   }
 
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-    op.types,
+    sirius::from_duckdb_vec(op.types),
     sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
     op.expressions.size(),
     std::move(collection));

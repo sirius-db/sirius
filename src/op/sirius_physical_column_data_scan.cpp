@@ -28,7 +28,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   SiriusPhysicalOperatorType op_type,
   std::size_t estimated_cardinality,
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection_p)
@@ -39,7 +39,7 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 }
 
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   SiriusPhysicalOperatorType op_type,
   std::size_t estimated_cardinality,
   std::size_t cte_index)

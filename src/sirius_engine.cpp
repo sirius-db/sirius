@@ -346,7 +346,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // NOTE: dead code preserved for operator ID numbering stability
   auto invalid_op = make_uniq<op::sirius_physical_operator>(
-    op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<duckdb::LogicalType>{}, 0);
+    op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<sirius::logical_type>{}, 0);
 
   // Collect all pipelines for progress tracking
   root_pipeline->get_pipelines(sirius_pipelines, true);

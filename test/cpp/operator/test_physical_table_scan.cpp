@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
@@ -108,10 +109,10 @@ TEMPLATE_TEST_CASE(
   // Create a minimal table function (not used in this test but required by constructor)
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
-  sirius_physical_table_scan table_scan(std::move(types),
+  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
                                         std::move(table_function),
                                         nullptr,  // bind_data
-                                        std::move(returned_types),
+                                        sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
                                         std::move(projection_ids),
                                         std::move(names),
@@ -181,10 +182,10 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
 
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
-  sirius_physical_table_scan table_scan(std::move(types),
+  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
                                         std::move(table_function),
                                         nullptr,
-                                        std::move(returned_types),
+                                        sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
                                         std::move(projection_ids),
                                         std::move(names),
@@ -256,10 +257,10 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
 
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
-  sirius_physical_table_scan table_scan(std::move(types),
+  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
                                         std::move(table_function),
                                         nullptr,
-                                        std::move(returned_types),
+                                        sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
                                         std::move(projection_ids),
                                         std::move(names),
@@ -329,10 +330,10 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
 
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
-  sirius_physical_table_scan table_scan(std::move(types),
+  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
                                         std::move(table_function),
                                         nullptr,
-                                        std::move(returned_types),
+                                        sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
                                         std::move(projection_ids),
                                         std::move(names),
@@ -393,10 +394,10 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
 
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
-  sirius_physical_table_scan table_scan(std::move(types),
+  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
                                         std::move(table_function),
                                         nullptr,
-                                        std::move(returned_types),
+                                        sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
                                         std::move(projection_ids),
                                         std::move(names),
@@ -500,10 +501,10 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
 
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
-  sirius_physical_table_scan table_scan(std::move(types),
+  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
                                         std::move(table_function),
                                         nullptr,
-                                        std::move(returned_types),
+                                        sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
                                         std::move(projection_ids),
                                         std::move(names),

@@ -16,6 +16,9 @@
 
 #pragma once
 
+// sirius
+#include "helper/logical_type.hpp"
+
 // duckdb
 #include <duckdb/common/types.hpp>
 #include <duckdb/planner/table_filter.hpp>
@@ -48,7 +51,7 @@ std::vector<duckdb::idx_t> build_batch_column_map(
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<duckdb::LogicalType>& returned_types,
+  const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<duckdb::idx_t>& batch_column_map);
 
 }  // namespace sirius::op

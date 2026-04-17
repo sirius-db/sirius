@@ -69,19 +69,19 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   duckdb::vector<duckdb::JoinCondition> conditions;
   //! The types of the join keys
-  duckdb::vector<duckdb::LogicalType> condition_types;
+  duckdb::vector<sirius::logical_type> condition_types;
   //! The type of the join
   duckdb::JoinType join_type;
 
   //! The indices for getting the payload columns
   duckdb::vector<std::size_t> payload_column_idxs;
   //! The types of the payload columns
-  duckdb::vector<duckdb::LogicalType> payload_types;
+  duckdb::vector<sirius::logical_type> payload_types;
 
   //! Positions of the RHS columns that need to output
   duckdb::vector<std::size_t> rhs_output_columns;
   //! The types of the output
-  duckdb::vector<duckdb::LogicalType> rhs_output_types;
+  duckdb::vector<sirius::logical_type> rhs_output_types;
 
   //! Output column order: indices into left table columns (empty = identity 0,1,...,left_cols-1)
   duckdb::vector<std::size_t> left_output_col_idxs;
@@ -89,7 +89,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   duckdb::vector<std::size_t> right_output_col_idxs;
 
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
-  duckdb::vector<duckdb::LogicalType> delim_types;
+  duckdb::vector<sirius::logical_type> delim_types;
 
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
 
@@ -116,7 +116,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
  public:
   //! Returns a list of the types of the join conditions
-  duckdb::vector<duckdb::LogicalType> get_join_types() const;
+  duckdb::vector<sirius::logical_type> get_join_types() const;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

@@ -69,14 +69,14 @@ struct metadata_node {
  * @param null_mask_offset The byte offset of the null mask within a compact allocation.
  * @return metadata_node The constructed metadata node.
  */
-inline metadata_node make_flat_metadata_node(duckdb::LogicalType type,
+inline metadata_node make_flat_metadata_node(sirius::logical_type type,
                                              cudf::size_type size,
                                              cudf::size_type null_count,
                                              int64_t data_offset,
                                              int64_t null_mask_offset)
 {
   return metadata_node{
-    duckdb::GetCudfType(type), size, null_count, data_offset, null_mask_offset, {}};
+    sirius::get_cudf_type(type), size, null_count, data_offset, null_mask_offset, {}};
 }
 
 /**

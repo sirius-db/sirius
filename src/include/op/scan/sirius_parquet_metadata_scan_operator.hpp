@@ -97,7 +97,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    *         (column names are required for both projection and filter pushdown).
    */
   sirius_parquet_metadata_scan_operator(
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     duckdb::idx_t estimated_cardinality,
     std::vector<std::string> const& file_paths,
     duckdb::vector<duckdb::ColumnIndex> const& column_ids,
