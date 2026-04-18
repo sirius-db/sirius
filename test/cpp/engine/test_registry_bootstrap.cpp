@@ -14,15 +14,21 @@
  * limitations under the License.
  */
 
+// IMPORTANT: include order matters here. liburing.h (pulled in transitively
+// by io/uring/uring_ioctx.hpp) defines BLOCK_SIZE as a preprocessor macro,
+// which collides with duckdb concurrentqueue's BLOCK_SIZE identifier. Include
+// all duckdb headers (and anything that pulls them in) BEFORE the uring
+// headers.
 #include "catch.hpp"
-#include "io/datasource_factory.hpp"
-#include "io/types.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
 
 #include <duckdb.hpp>
 #include <duckdb/main/connection.hpp>
+
+#include "io/datasource_factory.hpp"
+#include "io/types.hpp"
+#include "io/uring/uring_ioctx.hpp"
 
 #include <exception>
 #include <memory>
