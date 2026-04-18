@@ -17,6 +17,7 @@
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "cuda/scan/gpu_decode_validity.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cudf/column/column.hpp>
@@ -766,11 +767,10 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       staging_buf   = rmm::device_buffer(staging_bytes, stream, mr);
       d_staging_ptr = static_cast<uint8_t*>(staging_buf.data());
       for (auto& [key, entry] : block_map) {
-        cudaMemcpyAsync(d_staging_ptr + entry.device_offset,
-                        entry.host_base,
-                        entry.copy_size,
-                        cudaMemcpyHostToDevice,
-                        stream.value());
+        bounce_h2d_async(d_staging_ptr + entry.device_offset,
+                         entry.host_base,
+                         entry.copy_size,
+                         stream.value());
       }
     }
   }
@@ -893,7 +893,7 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   auto make_device_copy = [&](const void* src, size_t bytes) -> rmm::device_buffer {
     rmm::device_buffer buf(bytes, stream, mr);
     if (bytes > 0) {
-      cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.value());
+      bounce_h2d_async(buf.data(), src, bytes, stream.value());
     }
     return buf;
   };
@@ -915,8 +915,7 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
 
   rmm::device_buffer fsst_arena_buf(arena_bytes, stream, mr);
   if (arena_bytes > 0) {
-    cudaMemcpyAsync(fsst_arena_buf.data(), h_arena.data(), arena_bytes,
-                    cudaMemcpyHostToDevice, stream.value());
+    bounce_h2d_async(fsst_arena_buf.data(), h_arena.data(), arena_bytes, stream.value());
   }
   auto* d_fsst_descs      = reinterpret_cast<batched_seg_desc*>(
                               static_cast<uint8_t*>(fsst_arena_buf.data()) + off_fsst);
@@ -1159,17 +1158,15 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
           vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         size_t seg_mask_bytes = (vseg.row_count + 7) / 8;
         if (val_row_offset % 64 == 0) {
-          cudaMemcpyAsync(d_mask + val_row_offset / 64,
-                          vseg.data_ptr,
-                          seg_mask_bytes,
-                          cudaMemcpyHostToDevice,
-                          stream.value());
+          bounce_h2d_async(d_mask + val_row_offset / 64,
+                           vseg.data_ptr,
+                           seg_mask_bytes,
+                           stream.value());
         } else {
-          cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_mask) + val_row_offset / 8,
-                          vseg.data_ptr,
-                          seg_mask_bytes,
-                          cudaMemcpyHostToDevice,
-                          stream.value());
+          bounce_h2d_async(reinterpret_cast<uint8_t*>(d_mask) + val_row_offset / 8,
+                           vseg.data_ptr,
+                           seg_mask_bytes,
+                           stream.value());
         }
       }
       val_row_offset += vseg.row_count;

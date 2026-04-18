@@ -7,6 +7,7 @@
 #include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "cuda/scan/gpu_decode_validity.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cudf/column/column.hpp>
@@ -159,7 +160,7 @@ void launch_fill_constant(uint8_t* d_dest,
       std::vector<uint8_t> host_buf(static_cast<size_t>(row_count) * type_size);
       for (uint32_t r = 0; r < row_count; ++r)
         std::memcpy(host_buf.data() + r * type_size, val_src, type_size);
-      cudaMemcpyAsync(d_dest, host_buf.data(), host_buf.size(), cudaMemcpyHostToDevice, stream);
+      bounce_h2d_async(d_dest, host_buf.data(), host_buf.size(), stream);
       break;
     }
   }
@@ -209,99 +210,6 @@ __global__ void kernel_count_valid_bits(const uint64_t* __restrict__ mask,
 }
 
 namespace {
-
-//===----------------------------------------------------------------------===//
-// Pinned bounce slab for pageable→device H2D.
-//
-// Problem: the mmap'd DuckDB file gives us pageable virtual addresses.
-// cudaMemcpyAsync from pageable silently becomes synchronous via the driver's
-// internal pinned-bounce buffer (~450 µs/call observed on A100). A whole-file
-// cudaHostRegister fixes it but is impossible for DBs larger than RAM.
-//
-// This slab is the bounded-memory alternative: each pipeline thread owns a
-// small pinned buffer; we memcpy (pageable mmap → pinned slab) in user-space
-// at ~20 GB/s, then cudaMemcpyAsync from the pinned slab hits the true-async
-// DMA fast path. Per-slab cudaEvent serialises recycling — the next memcpy
-// waits for the prior DMA to drain before overwriting.
-//
-// Sizing: observed max coalesced run in transfer_blocks_bulk_h2d is ~16 MB
-// (TPC-H SF=100). 16 MB per pipeline thread × 4 duckdb_scan threads = 64 MB
-// total pinned host RAM — two orders of magnitude below a whole-file pin
-// (27 GB at SF=100). Tunable via SIRIUS_BOUNCE_MB; 0 disables the slab and
-// reverts to the old pageable path for A/B.
-//
-// Accounting: the slab sits OUTSIDE cucascade's host_memory_space budget
-// (it is a direct cudaHostAlloc, not routed through fixed_size_host_memory_
-// resource). At 64 MB this is negligible next to the multi-GB host pool
-// configured in sirius.cfg, but if you shrink sirius's host capacity below
-// ~128 MB you'd want to subtract the slab size there.
-//===----------------------------------------------------------------------===//
-struct pinned_bounce_slab {
-  uint8_t*    buf      = nullptr;
-  size_t      capacity = 0;
-  cudaEvent_t ev       = nullptr;
-  bool        in_use   = false;
-
-  ~pinned_bounce_slab()
-  {
-    if (ev) ::cudaEventDestroy(ev);
-    if (buf) ::cudaFreeHost(buf);
-  }
-};
-
-inline size_t bounce_slab_capacity_bytes()
-{
-  static const size_t cap = []() {
-    size_t mb = 16;  // per-thread default: covers observed max 16 MB run
-    if (const char* env = std::getenv("SIRIUS_BOUNCE_MB")) {
-      long v = std::atol(env);
-      if (v >= 0) mb = static_cast<size_t>(v);
-    }
-    return mb * 1024ULL * 1024ULL;
-  }();
-  return cap;
-}
-
-inline pinned_bounce_slab& get_tls_bounce_slab()
-{
-  thread_local pinned_bounce_slab slab;
-  if (!slab.buf) {
-    const size_t cap = bounce_slab_capacity_bytes();
-    if (cap == 0) return slab;  // disabled → buf stays null; caller falls back
-    cudaError_t rc = ::cudaHostAlloc(reinterpret_cast<void**>(&slab.buf), cap,
-                                     cudaHostAllocPortable);
-    if (rc != cudaSuccess) {
-      ::cudaGetLastError();
-      slab.buf = nullptr;
-      SIRIUS_LOG_WARN("[gpu_native_decode] bounce slab alloc failed ({} MB): {}",
-                      cap / (1 << 20), ::cudaGetErrorString(rc));
-      return slab;
-    }
-    slab.capacity = cap;
-    ::cudaEventCreateWithFlags(&slab.ev, cudaEventDisableTiming);
-  }
-  return slab;
-}
-
-/// Copy [src, src+bytes) → d_dst over `stream`, routing through the TLS
-/// pinned slab when possible. Falls back to plain cudaMemcpyAsync when the
-/// transfer is larger than the slab or the slab is disabled.
-inline void bounce_h2d_async(void* d_dst,
-                             const void* src,
-                             size_t bytes,
-                             cudaStream_t stream)
-{
-  auto& slab = get_tls_bounce_slab();
-  if (!slab.buf || bytes > slab.capacity) {
-    ::cudaMemcpyAsync(d_dst, src, bytes, cudaMemcpyHostToDevice, stream);
-    return;
-  }
-  if (slab.in_use) { ::cudaEventSynchronize(slab.ev); }
-  std::memcpy(slab.buf, src, bytes);
-  ::cudaMemcpyAsync(d_dst, slab.buf, bytes, cudaMemcpyHostToDevice, stream);
-  ::cudaEventRecord(slab.ev, stream);
-  slab.in_use = true;
-}
 
 //===----------------------------------------------------------------------===//
 // Bulk block transfer: stage every unique block referenced by any column
@@ -457,11 +365,10 @@ std::pair<rmm::device_buffer, cudf::size_type> decode_validity_mask(
       size_t seg_mask_bytes = (vseg.row_count + 7) / 8;
       // Aligned and unaligned cases both write byte-aligned; DuckDB validity
       // segments are byte-aligned at row_offset/8 even when not word-aligned.
-      cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_mask) + row_offset / 8,
-                      vseg.data_ptr,
-                      seg_mask_bytes,
-                      cudaMemcpyHostToDevice,
-                      stream.value());
+      bounce_h2d_async(reinterpret_cast<uint8_t*>(d_mask) + row_offset / 8,
+                       vseg.data_ptr,
+                       seg_mask_bytes,
+                       stream.value());
     }
     row_offset += vseg.row_count;
   }
@@ -555,8 +462,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
                           cudaMemcpyDeviceToDevice, stream.value());
         } else {
           // Block wasn't pre-staged (block_id < 0 etc.) — per-segment H2D.
-          cudaMemcpyAsync(d_dest, seg.data_ptr, seg_bytes,
-                          cudaMemcpyHostToDevice, stream.value());
+          bounce_h2d_async(d_dest, seg.data_ptr, seg_bytes, stream.value());
         }
         break;
       }
@@ -606,8 +512,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
     if (!fb_map.empty()) {
       cudaMallocAsync(&d_fb_staging, fb_map.size() * DUCKDB_BLOCK_SIZE, stream.value());
       for (auto const& [host_base, off] : fb_map) {
-        cudaMemcpyAsync(d_fb_staging + off, host_base, DUCKDB_BLOCK_SIZE,
-                        cudaMemcpyHostToDevice, stream.value());
+        bounce_h2d_async(d_fb_staging + off, host_base, DUCKDB_BLOCK_SIZE, stream.value());
       }
     }
 

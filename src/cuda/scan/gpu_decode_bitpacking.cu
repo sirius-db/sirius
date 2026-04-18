@@ -4,6 +4,7 @@
  */
 
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cub/cub.cuh>
@@ -219,7 +220,7 @@ static void decode_typed(const uint8_t* segment_data,
     own_segment = true;
   }
   if (!skip_block_copy) {
-    cudaMemcpyAsync(d_segment, segment_data, segment_size, cudaMemcpyHostToDevice, stream.value());
+    bounce_h2d_async(d_segment, segment_data, segment_size, stream.value());
   }
 
   // 2. Launch fused parse-and-decode kernel.
@@ -513,7 +514,7 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
   size_t desc_bytes = num_segments * sizeof(batched_bp_seg_desc);
   batched_bp_seg_desc* d_descs = nullptr;
   cudaMallocAsync(&d_descs, desc_bytes, stream.value());
-  cudaMemcpyAsync(d_descs, descs, desc_bytes, cudaMemcpyHostToDevice, stream.value());
+  bounce_h2d_async(d_descs, descs, desc_bytes, stream.value());
 
   constexpr uint32_t BLOCK_DIM       = 256;
   constexpr uint32_t max_width       = sizeof(T) * 8;
