@@ -882,7 +882,14 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     total_fsst_rows > 0 ? total_fsst_rows * sizeof(uint32_t) : 0, stream, mr);
   uint32_t* d_comp_offsets = static_cast<uint32_t*>(comp_offsets_buf.data());
 
-  // Upload segment descriptors (via RMM)
+  // Upload segment descriptors (via RMM).
+  //
+  // Previously five separate RMM allocations + cudaMemcpyAsync calls — two
+  // of which (dict_descs, uncomp_descs) were dead (only FSST path reads
+  // d_*_descs directly, the dict/uncomp paths operate on *_chunks uploaded
+  // below). Coalesce the three live FSST descriptors into one arena so each
+  // call site sees one allocation + one H2D instead of three, while the
+  // chunks path upstream still does its own uploads.
   auto make_device_copy = [&](const void* src, size_t bytes) -> rmm::device_buffer {
     rmm::device_buffer buf(bytes, stream, mr);
     if (bytes > 0) {
@@ -891,22 +898,32 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     return buf;
   };
 
-  auto dict_descs_buf =
-    make_device_copy(dict_descs.data(), dict_descs.size() * sizeof(batched_seg_desc));
-  auto fsst_descs_buf =
-    make_device_copy(fsst_descs.data(), fsst_descs.size() * sizeof(batched_seg_desc));
-  auto uncomp_descs_buf =
-    make_device_copy(uncomp_descs.data(), uncomp_descs.size() * sizeof(batched_seg_desc));
-  auto fsst_starts_buf =
-    make_device_copy(fsst_row_starts.data(), fsst_row_starts.size() * sizeof(uint32_t));
-  auto fsst_decoders_buf =
-    make_device_copy(fsst_decoders.data(), fsst_decoders.size() * sizeof(fsst_decoder_compact));
+  auto align_up = [](size_t x, size_t a) { return (x + a - 1) & ~(a - 1); };
+  constexpr size_t kAlign   = alignof(batched_seg_desc);
+  const size_t bytes_fsst   = fsst_descs.size() * sizeof(batched_seg_desc);
+  const size_t bytes_starts = fsst_row_starts.size() * sizeof(uint32_t);
+  const size_t bytes_decs   = fsst_decoders.size() * sizeof(fsst_decoder_compact);
+  const size_t off_fsst     = 0;
+  const size_t off_starts   = align_up(off_fsst + bytes_fsst, kAlign);
+  const size_t off_decs     = align_up(off_starts + bytes_starts, kAlign);
+  const size_t arena_bytes  = off_decs + bytes_decs;
 
-  auto* d_dict_descs      = static_cast<batched_seg_desc*>(dict_descs_buf.data());
-  auto* d_fsst_descs      = static_cast<batched_seg_desc*>(fsst_descs_buf.data());
-  auto* d_uncomp_descs    = static_cast<batched_seg_desc*>(uncomp_descs_buf.data());
-  auto* d_fsst_row_starts = static_cast<uint32_t*>(fsst_starts_buf.data());
-  auto* d_fsst_decoders   = static_cast<fsst_decoder_compact*>(fsst_decoders_buf.data());
+  std::vector<uint8_t> h_arena(arena_bytes);
+  if (bytes_fsst)   std::memcpy(h_arena.data() + off_fsst,   fsst_descs.data(),      bytes_fsst);
+  if (bytes_starts) std::memcpy(h_arena.data() + off_starts, fsst_row_starts.data(), bytes_starts);
+  if (bytes_decs)   std::memcpy(h_arena.data() + off_decs,   fsst_decoders.data(),   bytes_decs);
+
+  rmm::device_buffer fsst_arena_buf(arena_bytes, stream, mr);
+  if (arena_bytes > 0) {
+    cudaMemcpyAsync(fsst_arena_buf.data(), h_arena.data(), arena_bytes,
+                    cudaMemcpyHostToDevice, stream.value());
+  }
+  auto* d_fsst_descs      = reinterpret_cast<batched_seg_desc*>(
+                              static_cast<uint8_t*>(fsst_arena_buf.data()) + off_fsst);
+  auto* d_fsst_row_starts = reinterpret_cast<uint32_t*>(
+                              static_cast<uint8_t*>(fsst_arena_buf.data()) + off_starts);
+  auto* d_fsst_decoders   = reinterpret_cast<fsst_decoder_compact*>(
+                              static_cast<uint8_t*>(fsst_arena_buf.data()) + off_decs);
 
   //===--------------------------------------------------------------------===//
   // Phase 4: Pass 1 — compute string lengths (batched)
