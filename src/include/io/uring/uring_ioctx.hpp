@@ -138,6 +138,16 @@ class uring_ioctx : public sirius_ioctx {
 
   void shutdown() override;
 
+  // -- Capability hooks ------------------------------------------------------
+  // The uring path resolves device reads through a pinned-host bounce buffer
+  // followed by a cudaMemcpyAsync, not real GPUDirect Storage. That still
+  // counts as "supported" for callers that need any device-addressable copy,
+  // but it should NOT be declared "preferred" over a plain host_read — the
+  // bounce copy is strictly slower and is kept only as a transport path.
+
+  [[nodiscard]] bool supports_device_read() const override;
+  [[nodiscard]] bool is_device_read_preferred(size_t size) const override;
+
   ring_pool::guard acquire_host_ring();
   uring_reactor& assign_reactor();
 

@@ -119,6 +119,10 @@ void uring_ioctx::shutdown()
   std::ranges::for_each(_reactors, [](auto& r) { r->shutdown(); });
 }
 
+bool uring_ioctx::supports_device_read() const { return true; }
+
+bool uring_ioctx::is_device_read_preferred(size_t) const { return false; }
+
 ring_pool::guard uring_ioctx::acquire_host_ring() { return _host_pool.acquire(); }
 
 uring_reactor& uring_ioctx::assign_reactor()

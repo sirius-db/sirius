@@ -63,6 +63,9 @@ class mock_ioctx : public sirius_ioctx {
     throw std::runtime_error("mock_ioctx::make_datasource: not exercised in PR1");
   }
 
+  [[nodiscard]] bool supports_device_read() const override { return false; }
+  [[nodiscard]] bool is_device_read_preferred(size_t) const override { return false; }
+
   // Unused read APIs — PR1 does not drive IO through the mock.
   size_t host_read(sirius_io_object&, size_t, size_t, uint8_t*) override { throw std::logic_error("unused"); }
   std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object&, size_t, size_t) override { throw std::logic_error("unused"); }

@@ -359,6 +359,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/io/test_datasource_factory.cpp
+    test/cpp/io/test_device_read_flags.cpp
     test/cpp/io/test_uring_link.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp

@@ -201,6 +201,13 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   virtual std::unique_ptr<cudf::io::datasource> make_datasource(
     std::unique_ptr<sirius_io_object> io_object) = 0;
 
+  // -- Capability hooks -------------------------------------------------------
+  // Mirror cudf::io::datasource so each backend can declare its own caps.
+  // sirius_datasource forwards its overrides here instead of hard-coding.
+
+  [[nodiscard]] virtual bool supports_device_read() const                = 0;
+  [[nodiscard]] virtual bool is_device_read_preferred(size_t size) const = 0;
+
   // -- Read APIs (parameterised by io_object) --------------------------------
 
   virtual size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
