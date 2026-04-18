@@ -64,6 +64,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
+pkg_check_modules(URING REQUIRED IMPORTED_TARGET liburing)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -319,8 +320,8 @@ if(VCPKG_BUILD)
 endif()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
-                      absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::URING
+                      yaml-cpp::yaml-cpp absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
@@ -355,6 +356,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/io/test_uring_link.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory_management/test_cpu_cache.cpp
