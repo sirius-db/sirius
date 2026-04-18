@@ -29,6 +29,7 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,10 @@ namespace sirius::op {
 class sirius_physical_table_scan;
 }  // namespace sirius::op
 
+namespace sirius::io {
+class datasource_registry;
+}  // namespace sirius::io
+
 namespace sirius {
 
 struct operator_params;
@@ -52,9 +57,8 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
-    : context(context), sirius_iface(sirius_iface) {};
-  ~sirius_engine() {}
+  sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface);
+  ~sirius_engine();
 
   duckdb::ClientContext& context;
   sirius_interface& sirius_iface;
@@ -126,6 +130,13 @@ class sirius_engine {
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
+
+  //! Registry of per-scheme sirius_ioctx instances (file, s3, gds, ...).
+  //! Populated at construction with a default uring_ioctx for "file".
+  [[nodiscard]] io::datasource_registry& datasource_registry() noexcept;
+
+ private:
+  std::shared_ptr<io::datasource_registry> datasource_registry_;
 };
 
 }  // namespace sirius

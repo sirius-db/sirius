@@ -19,6 +19,8 @@
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "io/datasource_factory.hpp"
+#include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -54,6 +56,33 @@
 #include <stdexcept>
 
 namespace sirius {
+
+sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
+  : context(context),
+    sirius_iface(sirius_iface),
+    datasource_registry_(std::make_shared<io::datasource_registry>())
+{
+  // Register the default local-file backend (io_uring + O_DIRECT).
+  // Reactor tuning lives in PR13 (sirius_config::uring_config).
+  datasource_registry_->register_ioctx("file", std::make_shared<io::uring_ioctx>());
+}
+
+sirius_engine::~sirius_engine()
+{
+  // Explicit shutdown before dropping the registry so any in-flight
+  // rings/reactors get a chance to quiesce while the ioctx is still alive.
+  if (datasource_registry_) {
+    for (auto const& scheme : datasource_registry_->schemes()) {
+      if (auto ioctx = datasource_registry_->lookup(scheme)) { ioctx->shutdown(); }
+    }
+    datasource_registry_->clear();
+  }
+}
+
+io::datasource_registry& sirius_engine::datasource_registry() noexcept
+{
+  return *datasource_registry_;
+}
 
 void sirius_engine::reset()
 {

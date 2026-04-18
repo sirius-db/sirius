@@ -351,6 +351,7 @@ set(TEST_SOURCES
     test/cpp/debug/test_debug_utils.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/engine/test_registry_bootstrap.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
