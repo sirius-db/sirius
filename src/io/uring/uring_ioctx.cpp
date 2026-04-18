@@ -16,6 +16,7 @@
 
 #include "io/uring/uring_ioctx.hpp"
 
+#include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 
 #include <fcntl.h>
@@ -131,7 +132,7 @@ std::unique_ptr<cudf::io::datasource> uring_ioctx::make_datasource(
 {
   auto* uobj = dynamic_cast<uring_io_object*>(io_object.get());
   if (uobj) uobj->set_reactor(&assign_reactor());
-  return std::make_unique<uring_datasource>(shared_from_this(), std::move(io_object));
+  return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
 }
 
 uring_io_object& uring_ioctx::as_uring(sirius_io_object& obj)
