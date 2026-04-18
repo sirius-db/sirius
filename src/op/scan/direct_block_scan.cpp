@@ -36,6 +36,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -184,24 +186,56 @@ static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
   // per-call time from ~450 µs to ~15 µs. One-time cost is the page walk
   // on first mmap (~40 ns/page).
   //
-  // Opt-out: SIRIUS_DISABLE_MMAP_PIN=1 for A/B benchmarking or when a DB
-  // exceeds free physical memory (pinned pages cannot be swapped).
+  // Safety guard: pinned memory cannot be swapped AND sits outside the
+  // sirius host-memory reservation accounted for by cucascade. If we pin a
+  // large DB (e.g. SF=20 ≈ 5 GB) on a 32 GiB host with a 32 GiB sirius
+  // reservation, downstream operators run out of memory. Cap pinning so the
+  // mmap range consumes at most SIRIUS_MMAP_PIN_MAX_BYTES bytes; default
+  // guards at 25 % of MemAvailable so there's headroom for cucascade.
+  //
+  // Opt-out: SIRIUS_DISABLE_MMAP_PIN=1 skips pinning entirely (old pageable
+  // path). SIRIUS_MMAP_PIN_MAX_BYTES=<N> overrides the auto-cap.
   bool pin_enabled = true;
   if (const char* env = std::getenv("SIRIUS_DISABLE_MMAP_PIN")) {
     if (env[0] != '0') pin_enabled = false;
   }
   if (pin_enabled) {
-    unsigned flags = cudaHostRegisterReadOnly | cudaHostRegisterPortable;
-    cudaError_t rc = ::cudaHostRegister(state->base, state->size, flags);
-    if (rc == cudaSuccess) {
-      state->cuda_registered = true;
-      SIRIUS_LOG_INFO("[direct_block_scan] pinned mmap ({:.1f} MB) for GPU DMA",
-                      file_size / 1e6);
+    size_t pin_cap = 0;
+    if (const char* env = std::getenv("SIRIUS_MMAP_PIN_MAX_BYTES")) {
+      try { pin_cap = std::stoull(env); } catch (...) { pin_cap = 0; }
+    }
+    if (pin_cap == 0) {
+      // Auto-cap at 25 % of MemAvailable from /proc/meminfo. Falls back to
+      // a conservative 1 GiB if the info file cannot be parsed.
+      size_t avail_kb = 0;
+      if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), mi)) {
+          if (std::sscanf(line, "MemAvailable: %zu kB", &avail_kb) == 1) break;
+        }
+        std::fclose(mi);
+      }
+      pin_cap = avail_kb > 0 ? (avail_kb * 1024ULL) / 4 : (1ULL << 30);
+    }
+
+    if (file_size > pin_cap) {
+      SIRIUS_LOG_INFO(
+        "[direct_block_scan] mmap {:.1f} MB exceeds pin cap {:.1f} MB — "
+        "falling back to pageable H2D (set SIRIUS_MMAP_PIN_MAX_BYTES to override)",
+        file_size / 1e6, pin_cap / 1e6);
     } else {
-      SIRIUS_LOG_WARN(
-        "[direct_block_scan] cudaHostRegister failed ({}): falling back to pageable H2D",
-        ::cudaGetErrorString(rc));
-      ::cudaGetLastError();  // clear sticky error
+      unsigned flags = cudaHostRegisterReadOnly | cudaHostRegisterPortable;
+      cudaError_t rc = ::cudaHostRegister(state->base, state->size, flags);
+      if (rc == cudaSuccess) {
+        state->cuda_registered = true;
+        SIRIUS_LOG_INFO("[direct_block_scan] pinned mmap ({:.1f} MB) for GPU DMA",
+                        file_size / 1e6);
+      } else {
+        SIRIUS_LOG_WARN(
+          "[direct_block_scan] cudaHostRegister failed ({}): falling back to pageable H2D",
+          ::cudaGetErrorString(rc));
+        ::cudaGetLastError();  // clear sticky error
+      }
     }
   }
 
