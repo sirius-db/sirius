@@ -49,6 +49,7 @@ class datasource_registry;
 namespace sirius {
 
 struct operator_params;
+struct sirius_config;
 class sirius_interface;
 
 class sirius_engine {
@@ -134,6 +135,14 @@ class sirius_engine {
   //! Registry of per-scheme sirius_ioctx instances (file, s3, gds, ...).
   //! Populated at construction with a default uring_ioctx for "file".
   [[nodiscard]] io::datasource_registry& datasource_registry() noexcept;
+
+  //! Returns the sirius_config attached to this engine's SiriusContext.
+  //! Required by datasource_factory::create so per-scheme backends (s3, gds,
+  //! ...) can consume object-store / tuning settings. Throws if SiriusContext
+  //! is not registered on the ClientContext — that registration happens at
+  //! extension load time, so this accessor is only safe to call during query
+  //! execution.
+  [[nodiscard]] sirius_config const& config() const;
 
  private:
   std::shared_ptr<io::datasource_registry> datasource_registry_;

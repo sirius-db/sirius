@@ -84,6 +84,17 @@ io::datasource_registry& sirius_engine::datasource_registry() noexcept
   return *datasource_registry_;
 }
 
+sirius_config const& sirius_engine::config() const
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw std::runtime_error(
+      "sirius_engine::config(): SiriusContext is not registered on this ClientContext. "
+      "This accessor may only be used during query execution.");
+  }
+  return sirius_ctx->get_config();
+}
+
 void sirius_engine::reset()
 {
   sirius_physical_plan = nullptr;

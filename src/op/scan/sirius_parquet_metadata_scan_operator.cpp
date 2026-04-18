@@ -15,11 +15,14 @@
  */
 
 // sirius
+#include <io/datasource_factory.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+#include <sirius_engine.hpp>
 
 // cudf
 #include <cudf/io/datasource.hpp>
@@ -246,9 +249,14 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   result->datasources.reserve(input.file_paths.size());
   std::size_t file_idx = 0;
+  // Route datasource construction through the per-engine factory so that
+  // non-local schemes (s3://, gds://, …) get dispatched to their registered
+  // ioctx instead of falling back to cudf's default local-file datasource.
+  auto& engine = get_pipeline()->get_engine();
   for (auto const& file_path : input.file_paths) {
     //===----------Read metadata footers----------===//
-    result->datasources.push_back(cudf::io::datasource::create(file_path));
+    result->datasources.push_back(
+      io::datasource_factory::create(file_path, engine.datasource_registry(), engine.config()));
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
 #if CUDF_VERSION_NUM >= 2604

@@ -127,6 +127,12 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   sirius::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
 
+  //! Returns the owning engine. Exposed so scan tasks can reach the
+  //! datasource_registry and config without passing them through every layer
+  //! of task state.
+  [[nodiscard]] sirius_engine& get_engine() noexcept { return engine; }
+  [[nodiscard]] sirius_engine const& get_engine() const noexcept { return engine; }
+
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }
   //! Get the pipeline ID

@@ -21,10 +21,12 @@
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
+#include <io/datasource_factory.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <sirius_engine.hpp>
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -261,8 +263,13 @@ void parquet_scan_task_global_state::initialize_from_files()
   _metadata_byte_sizes.reserve(_file_paths.size());
   _footer_offsets.reserve(_file_paths.size());
 
+  // Route datasource construction through the per-engine factory so that
+  // non-local schemes (s3://, gds://, …) get dispatched to their registered
+  // ioctx instead of falling back to cudf's default local-file datasource.
+  auto& engine = get_pipeline()->get_engine();
   for (auto const& file_path : _file_paths) {
-    auto datasource      = cudf::io::datasource::create(file_path);
+    auto datasource =
+      io::datasource_factory::create(file_path, engine.datasource_registry(), engine.config());
     auto const file_size = datasource->size();
     datasources.push_back(std::move(datasource));
 
@@ -488,7 +495,11 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
 
   if (!_datasource) {
-    _datasource = cudf::io::datasource::create(g_state.get_file_path(l_state.get_file_idx()));
+    auto& engine = g_state.get_pipeline()->get_engine();
+    _datasource  = io::datasource_factory::create(
+      g_state.get_file_path(l_state.get_file_idx()),
+      engine.datasource_registry(),
+      engine.config());
   }
 
   auto reader = g_state.make_reader(l_state.get_file_idx());
