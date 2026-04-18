@@ -27,6 +27,8 @@
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -108,6 +110,18 @@ struct mmap_file_state {
   // first one.
   std::once_flag    layout_once;
   block_layout_info layout;
+
+  // When true, [base, base+size) is page-locked via cudaHostRegister so every
+  // cudaMemcpyAsync sourcing from a block pointer in this range hits the
+  // true-async DMA path instead of the driver's pageable-bounce path
+  // (observed ~450 µs/call drops to ~15 µs/call on A100 per sibling test;
+  // measuring on Turing now).
+  bool cuda_registered = false;
+
+  ~mmap_file_state()
+  {
+    if (cuda_registered && base != nullptr) { ::cudaHostUnregister(base); }
+  }
 };
 
 static std::atomic<mmap_file_state*> g_mmap_last{nullptr};
@@ -163,6 +177,34 @@ static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
   state->owner   = bm;
   state->base    = static_cast<uint8_t*>(mapped);
   state->size    = file_size;
+
+  // Pin the mmap range for GPU DMA. Without this, every cudaMemcpyAsync from
+  // these pages falls into the driver's pageable-bounce path (silent
+  // synchronous staging through driver-pinned memory) — drops effective
+  // per-call time from ~450 µs to ~15 µs. One-time cost is the page walk
+  // on first mmap (~40 ns/page).
+  //
+  // Opt-out: SIRIUS_DISABLE_MMAP_PIN=1 for A/B benchmarking or when a DB
+  // exceeds free physical memory (pinned pages cannot be swapped).
+  bool pin_enabled = true;
+  if (const char* env = std::getenv("SIRIUS_DISABLE_MMAP_PIN")) {
+    if (env[0] != '0') pin_enabled = false;
+  }
+  if (pin_enabled) {
+    unsigned flags = cudaHostRegisterReadOnly | cudaHostRegisterPortable;
+    cudaError_t rc = ::cudaHostRegister(state->base, state->size, flags);
+    if (rc == cudaSuccess) {
+      state->cuda_registered = true;
+      SIRIUS_LOG_INFO("[direct_block_scan] pinned mmap ({:.1f} MB) for GPU DMA",
+                      file_size / 1e6);
+    } else {
+      SIRIUS_LOG_WARN(
+        "[direct_block_scan] cudaHostRegister failed ({}): falling back to pageable H2D",
+        ::cudaGetErrorString(rc));
+      ::cudaGetLastError();  // clear sticky error
+    }
+  }
+
   auto* state_ptr = state.get();
   g_mmap_cache.emplace(bm, std::move(state));
   g_mmap_last.store(state_ptr, std::memory_order_release);
