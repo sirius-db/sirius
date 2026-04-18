@@ -200,6 +200,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/io/datasource_factory.cpp
     src/io/sirius_datasource.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
@@ -356,6 +357,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uring_link.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
