@@ -801,6 +801,63 @@ static sirius::operator_params* get_operator_params(ClientContext& context)
   return &sirius_ctx->get_config().get_operator_params();
 }
 
+static sirius::io::object_store_config* get_object_store_config(ClientContext& context)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; object_store_config SET ignored");
+    return nullptr;
+  }
+  return &sirius_ctx->get_config().get_object_store_config();
+}
+
+static void SetS3Transport(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  auto value = StringValue::Get(parameter);
+  sirius::io::object_store_config::transport t;
+  if (!sirius::io::string_to_enum(std::string_view{value}, t)) {
+    throw InvalidInputException(
+      "Invalid s3_transport '{}'. Valid values: auto, http, rdma", value);
+  }
+  cfg->s3_transport = t;
+  SIRIUS_LOG_DEBUG("Updated config s3_transport to {}", value);
+}
+
+static void SetS3Endpoint(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->endpoint = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config s3_endpoint to {}", cfg->endpoint);
+}
+
+static void SetS3Region(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->region = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config s3_region to {}", cfg->region);
+}
+
+static void SetS3AccessKey(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->access_key = StringValue::Get(parameter);
+  // Don't log the credential itself.
+  SIRIUS_LOG_DEBUG("Updated config s3_access_key (len={})", cfg->access_key.size());
+}
+
+static void SetS3SecretKey(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->secret_key = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config s3_secret_key (len={})", cfg->secret_key.size());
+}
+
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1019,6 +1076,35 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  // Object-store configuration. Values are consumed by the S3 / RDMA S3
+  // backends landing in later PRs; in PR7 they are just stored on the
+  // per-connection sirius_config.
+  config.AddExtensionOption("s3_transport",
+                            "Transport for S3 datasource: 'auto', 'http', or 'rdma'",
+                            LogicalType::VARCHAR,
+                            Value("auto"),
+                            SetS3Transport);
+  config.AddExtensionOption("s3_endpoint",
+                            "Endpoint URL for S3-compatible object store (empty = AWS default)",
+                            LogicalType::VARCHAR,
+                            Value(""),
+                            SetS3Endpoint);
+  config.AddExtensionOption("s3_region",
+                            "Region for S3-compatible object store",
+                            LogicalType::VARCHAR,
+                            Value(""),
+                            SetS3Region);
+  config.AddExtensionOption("s3_access_key",
+                            "Access key ID for S3-compatible object store",
+                            LogicalType::VARCHAR,
+                            Value(""),
+                            SetS3AccessKey);
+  config.AddExtensionOption("s3_secret_key",
+                            "Secret access key for S3-compatible object store",
+                            LogicalType::VARCHAR,
+                            Value(""),
+                            SetS3SecretKey);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

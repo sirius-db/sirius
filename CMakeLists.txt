@@ -347,6 +347,7 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/debug/test_debug_utils.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp

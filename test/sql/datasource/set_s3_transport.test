@@ -1,0 +1,100 @@
+# =============================================================================
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+
+# name: test/sql/datasource/set_s3_transport.test
+# description: Round-trip the S3 object-store configuration variables.
+# group: [sirius]
+
+require sirius
+
+# Default transport is 'auto' before any SET.
+query I
+SELECT current_setting('s3_transport');
+----
+auto
+
+# Default endpoint / region / credentials are empty strings (length 0).
+query I
+SELECT length(current_setting('s3_endpoint'));
+----
+0
+
+query I
+SELECT length(current_setting('s3_region'));
+----
+0
+
+# Round-trip each transport value.
+statement ok
+SET s3_transport = 'rdma';
+
+query I
+SELECT current_setting('s3_transport');
+----
+rdma
+
+statement ok
+SET s3_transport = 'http';
+
+query I
+SELECT current_setting('s3_transport');
+----
+http
+
+statement ok
+SET s3_transport = 'auto';
+
+query I
+SELECT current_setting('s3_transport');
+----
+auto
+
+# Endpoint / region / credentials are plain strings.
+statement ok
+SET s3_endpoint = 'https://minio.internal:9000';
+
+query I
+SELECT current_setting('s3_endpoint');
+----
+https://minio.internal:9000
+
+statement ok
+SET s3_region = 'us-west-2';
+
+query I
+SELECT current_setting('s3_region');
+----
+us-west-2
+
+statement ok
+SET s3_access_key = 'AKIA_TEST';
+
+query I
+SELECT current_setting('s3_access_key');
+----
+AKIA_TEST
+
+statement ok
+SET s3_secret_key = 'shh';
+
+query I
+SELECT current_setting('s3_secret_key');
+----
+shh
+
+# Unknown transport tokens must be rejected with an InvalidInputException.
+statement error
+SET s3_transport = 'smb';
+----
+Invalid s3_transport
