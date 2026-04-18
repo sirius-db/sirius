@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -253,6 +254,20 @@ std::pair<device_block_map, rmm::device_buffer> transfer_blocks_bulk_h2d(
   rmm::device_buffer staging(sorted.size() * DUCKDB_BLOCK_SIZE, stream, mr);
   auto* d_staging = static_cast<uint8_t*>(staging.data());
 
+  static const bool kUseBatch = [] {
+    auto* v = std::getenv("SIRIUS_USE_BATCH_H2D");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+
+  std::vector<void*> b_dsts;
+  std::vector<void*> b_srcs;
+  std::vector<size_t> b_sizes;
+  if (kUseBatch) {
+    b_dsts.reserve(sorted.size());
+    b_srcs.reserve(sorted.size());
+    b_sizes.reserve(sorted.size());
+  }
+
   size_t offset = 0;
   for (size_t i = 0; i < sorted.size();) {
     size_t run_start = i;
@@ -264,17 +279,49 @@ std::pair<device_block_map, rmm::device_buffer> transfer_blocks_bulk_h2d(
     ++i;
     size_t run_len = i - run_start;
 
-    cudaMemcpyAsync(d_staging + offset,
-                    sorted[run_start].host_base,
-                    run_len * DUCKDB_BLOCK_SIZE,
-                    cudaMemcpyHostToDevice,
-                    stream.value());
+    if (kUseBatch) {
+      b_dsts.push_back(d_staging + offset);
+      b_srcs.push_back(const_cast<uint8_t*>(sorted[run_start].host_base));
+      b_sizes.push_back(run_len * DUCKDB_BLOCK_SIZE);
+    } else {
+      cudaMemcpyAsync(d_staging + offset,
+                      sorted[run_start].host_base,
+                      run_len * DUCKDB_BLOCK_SIZE,
+                      cudaMemcpyHostToDevice,
+                      stream.value());
+    }
 
     for (size_t j = run_start; j < i; ++j) {
       map.offsets[sorted[j].block_id] = offset;
       offset += DUCKDB_BLOCK_SIZE;
     }
   }
+
+  if (kUseBatch && !b_dsts.empty()) {
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.srcLocHint     = {cudaMemLocationTypeHost, 0};
+    attr.dstLocHint     = {cudaMemLocationTypeDevice, 0};
+    attr.flags          = cudaMemcpyFlagDefault;
+    std::vector<size_t> idxs(b_dsts.size(), 0);
+    size_t fail_idx = SIZE_MAX;
+    cudaError_t err = cudaMemcpyBatchAsync(b_dsts.data(),
+                                           b_srcs.data(),
+                                           b_sizes.data(),
+                                           b_dsts.size(),
+                                           &attr,
+                                           idxs.data(),
+                                           1,
+                                           &fail_idx,
+                                           stream.value());
+    if (err != cudaSuccess) {
+      SIRIUS_LOG_ERROR("cudaMemcpyBatchAsync failed at idx={}: {}",
+                       fail_idx,
+                       cudaGetErrorString(err));
+      throw std::runtime_error("cudaMemcpyBatchAsync failed");
+    }
+  }
+
   map.total_bytes = offset;
   return {std::move(map), std::move(staging)};
 }
