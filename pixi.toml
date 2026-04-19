@@ -33,6 +33,8 @@ libabseil = ">=20260107.0"
 duckdb = "=1.4.4"
 spdlog = "1.8.*"
 sqlite = ">=3.52.0,<4"
+libcurl = ">=8,<9"
+openssl = ">=3,<4"
 
 [tasks]
 

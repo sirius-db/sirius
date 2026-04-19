@@ -65,6 +65,8 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(URING REQUIRED IMPORTED_TARGET liburing)
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+find_package(OpenSSL REQUIRED)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -201,7 +203,10 @@ set(EXTENSION_SOURCES
     src/sirius_extension.cpp
     src/sirius_interface.cpp
     src/io/datasource_factory.cpp
+    src/io/s3/s3_ioctx.cpp
+    src/io/s3/sigv4.cpp
     src/io/sirius_datasource.cpp
+    src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/util/stream_check_wrapper.cpp
@@ -322,6 +327,7 @@ endif()
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::URING
+                      PkgConfig::CURL OpenSSL::Crypto
                       yaml-cpp::yaml-cpp absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
@@ -359,8 +365,11 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/io/s3/test_s3_ioctx.cpp
+    test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_device_read_flags.cpp
+    test/cpp/io/test_uri_parser.cpp
     test/cpp/io/test_uring_link.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp

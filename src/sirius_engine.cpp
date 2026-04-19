@@ -20,6 +20,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/datasource_factory.hpp"
+#include "io/s3/s3_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
@@ -79,8 +80,30 @@ sirius_engine::~sirius_engine()
   }
 }
 
-io::datasource_registry& sirius_engine::datasource_registry() noexcept
+io::datasource_registry& sirius_engine::datasource_registry()
 {
+  // Lazily register object-store backends the first time the registry is
+  // accessed *after* SiriusContext has been attached. Engine ctor runs before
+  // registered_state is populated, so we can't do this eagerly there.
+  if (context.registered_state) {
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (sirius_ctx) {
+      auto const& osc = sirius_ctx->get_config().get_object_store_config();
+      if (!osc.endpoint.empty() && !datasource_registry_->lookup("s3")) {
+        try {
+          io::s3::s3_ioctx_config scfg;
+          scfg.endpoint   = osc.endpoint;
+          scfg.region     = osc.region.empty() ? "us-east-1" : osc.region;
+          scfg.access_key = osc.access_key;
+          scfg.secret_key = osc.secret_key;
+          datasource_registry_->register_ioctx(
+            "s3", std::make_shared<io::s3::s3_ioctx>(std::move(scfg)));
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_WARN("sirius_engine: failed to register s3 backend: {}", e.what());
+        }
+      }
+    }
+  }
   return *datasource_registry_;
 }
 

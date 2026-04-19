@@ -134,7 +134,9 @@ class sirius_engine {
 
   //! Registry of per-scheme sirius_ioctx instances (file, s3, gds, ...).
   //! Populated at construction with a default uring_ioctx for "file".
-  [[nodiscard]] io::datasource_registry& datasource_registry() noexcept;
+  //! Object-store backends (s3, ...) are registered lazily from the active
+  //! sirius_config on first access once a SiriusContext is attached.
+  [[nodiscard]] io::datasource_registry& datasource_registry();
 
   //! Returns the sirius_config attached to this engine's SiriusContext.
   //! Required by datasource_factory::create so per-scheme backends (s3, gds,

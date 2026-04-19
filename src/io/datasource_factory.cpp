@@ -16,6 +16,9 @@
 
 #include "io/datasource_factory.hpp"
 
+#include "io/s3/s3_io_object.hpp"
+#include "io/s3/s3_ioctx.hpp"
+#include "io/uri_parser.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "sirius_config.hpp"
 
@@ -64,58 +67,52 @@ void datasource_registry::clear()
 
 namespace {
 
-constexpr std::string_view kSchemeDelim = "://";
-constexpr std::string_view kFileScheme  = "file";
+constexpr std::string_view kFileScheme = "file";
+constexpr std::string_view kS3Scheme   = "s3";
 
 }  // namespace
 
-std::string datasource_factory::extract_scheme(std::string_view uri)
-{
-  if (uri.empty()) throw std::invalid_argument("datasource_factory: empty URI");
-  if (uri.front() == '/') return std::string{kFileScheme};
+// Retained for compatibility with PR1 callsites/tests; prefer sirius::io::parse()
+// for new code. PR8 routes both through the real URI parser.
+std::string datasource_factory::extract_scheme(std::string_view uri) { return parse(uri).scheme; }
 
-  auto pos = uri.find(kSchemeDelim);
-  if (pos == std::string_view::npos) return std::string{kFileScheme};
-  if (pos == 0) throw std::invalid_argument("datasource_factory: URI has empty scheme");
-  return std::string{uri.substr(0, pos)};
-}
-
-std::string datasource_factory::extract_path(std::string_view uri)
-{
-  if (uri.empty()) throw std::invalid_argument("datasource_factory: empty URI");
-  auto pos = uri.find(kSchemeDelim);
-  if (pos == std::string_view::npos) return std::string{uri};
-  return std::string{uri.substr(pos + kSchemeDelim.size())};
-}
+std::string datasource_factory::extract_path(std::string_view uri) { return parse(uri).path; }
 
 std::unique_ptr<io_datasource> datasource_factory::create(std::string_view uri,
                                                           datasource_registry const& registry,
                                                           sirius_config const& /*config*/)
 {
-  auto scheme = extract_scheme(uri);
-  auto ioctx  = registry.lookup(scheme);
+  auto p     = parse(uri);
+  auto ioctx = registry.lookup(p.scheme);
   if (!ioctx) {
-    throw std::runtime_error("datasource_factory: no backend registered for scheme '" + scheme +
+    throw std::runtime_error("datasource_factory: no backend registered for scheme '" + p.scheme +
                              "' (uri=" + std::string{uri} + ")");
   }
 
-  auto path = extract_path(uri);
-
-  // PR1 only knows how to build uring_io_object (scheme == "file"). Other
-  // schemes' io_object construction lands in their respective PRs: gds in PR6,
-  // s3 in PR9, rdma_s3 in PR10.
+  // Per-scheme io_object construction. gds (PR6) and rdma_s3 (PR10) land
+  // later; until then, their schemes can be registered but not constructed.
   std::unique_ptr<sirius_io_object> io_object;
-  if (scheme == kFileScheme) {
-    io_object = std::make_unique<uring_io_object>(std::move(path));
+  if (p.scheme == kFileScheme) {
+    io_object = std::make_unique<uring_io_object>(std::move(p.path));
+  } else if (p.scheme == kS3Scheme) {
+    // s3://bucket/key — host carries the bucket, path carries the key.
+    if (p.host.empty())
+      throw std::invalid_argument("datasource_factory: s3 URI missing bucket");
+    auto* s3_ctx = dynamic_cast<s3::s3_ioctx*>(ioctx.get());
+    if (!s3_ctx)
+      throw std::runtime_error("datasource_factory: scheme 's3' registered with non-s3 ioctx");
+    auto obj_size = s3_ctx->head_object_size(p.host, p.path);
+    io_object =
+      std::make_unique<s3::s3_io_object>(std::move(p.host), std::move(p.path), obj_size);
   } else {
-    throw std::runtime_error("datasource_factory: scheme '" + scheme +
-                             "' is registered but object construction is not implemented in PR1");
+    throw std::runtime_error("datasource_factory: scheme '" + p.scheme +
+                             "' is registered but object construction is not yet implemented");
   }
 
-  auto ds = ioctx->make_datasource(std::move(io_object));
+  auto ds     = ioctx->make_datasource(std::move(io_object));
   auto* io_ds = dynamic_cast<io_datasource*>(ds.get());
   if (!io_ds) {
-    throw std::runtime_error("datasource_factory: ioctx for '" + scheme +
+    throw std::runtime_error("datasource_factory: ioctx for '" + p.scheme +
                              "' returned a non-io_datasource");
   }
   (void)ds.release();

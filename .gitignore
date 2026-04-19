@@ -35,3 +35,4 @@ compile_commands.json
 
 # Zed editor settings
 .zed
+.claude/

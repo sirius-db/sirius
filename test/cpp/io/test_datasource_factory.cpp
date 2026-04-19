@@ -137,9 +137,10 @@ TEST_CASE("datasource_factory::extract_scheme — basic forms", "[datasource_fac
   CHECK(datasource_factory::extract_scheme("s3://bucket/key") == "s3");
   CHECK(datasource_factory::extract_scheme("gs://bucket/key") == "gs");
   CHECK(datasource_factory::extract_scheme("rdma_s3://bucket/key") == "rdma_s3");
-  // Bare relative path: treated as file.
-  CHECK(datasource_factory::extract_scheme("relative/f.parquet") == "file");
-  CHECK(datasource_factory::extract_scheme("file.parquet") == "file");
+  // PR8 rejects relative bare paths; callers must pass absolute or scheme://.
+  CHECK_THROWS_AS(datasource_factory::extract_scheme("relative/f.parquet"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(datasource_factory::extract_scheme("file.parquet"), std::invalid_argument);
 }
 
 TEST_CASE("datasource_factory::extract_scheme — malformed URIs throw",
@@ -154,8 +155,9 @@ TEST_CASE("datasource_factory::extract_path — strips scheme delimiter",
 {
   CHECK(datasource_factory::extract_path("/abs/path.parquet") == "/abs/path.parquet");
   CHECK(datasource_factory::extract_path("file:///abs/path.parquet") == "/abs/path.parquet");
-  CHECK(datasource_factory::extract_path("s3://bucket/key") == "bucket/key");
-  CHECK(datasource_factory::extract_path("relative/f.parquet") == "relative/f.parquet");
+  // PR8: host is split out of path; s3://bucket/key -> host="bucket", path="key".
+  CHECK(datasource_factory::extract_path("s3://bucket/key") == "key");
+  CHECK_THROWS_AS(datasource_factory::extract_path("relative/f.parquet"), std::invalid_argument);
   CHECK_THROWS_AS(datasource_factory::extract_path(""), std::invalid_argument);
 }
 
@@ -245,18 +247,22 @@ TEST_CASE("datasource_factory::create — throws when scheme unregistered",
                   std::runtime_error);
 }
 
-TEST_CASE("datasource_factory::create — non-file scheme not wired in PR1",
+TEST_CASE("datasource_factory::create — s3 scheme requires an s3_ioctx",
           "[datasource_factory]")
 {
+  // PR9: s3:// is wired, but construction still requires the registered ioctx
+  // to actually be an s3::s3_ioctx (it must HEAD the object to cache size).
+  // Registering a mock_ioctx lets us assert the factory refuses to proceed
+  // with the wrong backend rather than silently HEADing through a mock.
   datasource_registry reg;
   sirius_config cfg;
   reg.register_ioctx("s3", std::make_shared<mock_ioctx>());
   try {
     (void)datasource_factory::create("s3://bucket/key", reg, cfg);
-    FAIL("expected datasource_factory::create to throw for s3 scheme");
+    FAIL("expected datasource_factory::create to throw for s3 + mock ioctx");
   } catch (std::runtime_error const& e) {
     std::string msg{e.what()};
-    CHECK(msg.find("not implemented in PR1") != std::string::npos);
+    CHECK(msg.find("non-s3 ioctx") != std::string::npos);
   }
 }
 

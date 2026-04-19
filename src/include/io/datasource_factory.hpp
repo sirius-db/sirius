@@ -91,10 +91,13 @@ class datasource_registry {
  * registered @c sirius_ioctx, and asks it to construct a datasource for the
  * corresponding @c sirius_io_object.
  *
- * URI forms supported in PR1 (full URI parsing lands in PR8):
- *   - <tt>/absolute/path</tt>   — treated as scheme @c "file"
- *   - <tt>file:///abs/path</tt> — scheme @c "file"
- *   - <tt>\<scheme\>://...</tt> — any other scheme dispatches to registry[scheme]
+ * URI forms supported (parsing is delegated to @c sirius::io::parse in PR8):
+ *   - <tt>/absolute/path</tt>      — treated as scheme @c "file"
+ *   - <tt>file:///abs/path</tt>    — scheme @c "file"
+ *   - <tt>s3://bucket/key</tt>,
+ *     <tt>gs://bucket/key</tt>,
+ *     <tt>azure://container/blob</tt> — object-store schemes (host/key split)
+ *   - Relative bare paths are rejected; use absolute or a scheme.
  *
  * The Windows-style drive-letter form <tt>C:/...</tt> is not supported (Sirius
  * builds on Linux only; see CMakeLists.txt requirements).
@@ -121,26 +124,27 @@ class datasource_factory {
                                                sirius_config const& config);
 
   /**
-   * @brief Extract the URI scheme. Exposed for testing.
+   * @brief Extract the URI scheme. Thin shim over @c sirius::io::parse.
+   *        Prefer calling @c parse directly for new code; retained for
+   *        compatibility with PR1 callsites and tests.
    *
-   * Rules:
-   *   - An empty input throws.
-   *   - A path beginning with @c '/' has scheme @c "file".
-   *   - Otherwise the scheme is the substring preceding @c "://".
-   *   - If no @c "://" delimiter is present, returns @c "file" (treat input as
-   *     a relative or bare path; downstream ioctx resolves it).
+   * Throws @c std::invalid_argument on the same inputs as @c parse (empty URI,
+   * empty scheme, relative bare path, malformed URI).
    */
   [[nodiscard]] static std::string extract_scheme(std::string_view uri);
 
   /**
-   * @brief Extract the path portion of @p uri (everything after the scheme
-   *        delimiter, or the whole URI when no scheme delimiter exists).
+   * @brief Extract the path portion of @p uri. Thin shim over
+   *        @c sirius::io::parse; returns the parser's @c path field
+   *        (percent-decoded, no host, no leading slash for object-store
+   *        schemes; leading slash retained for @c file).
    *
    * Examples:
    *   - @c "/data/f.parquet"          -> @c "/data/f.parquet"
    *   - @c "file:///data/f.parquet"   -> @c "/data/f.parquet"
-   *   - @c "s3://bucket/key"          -> @c "bucket/key"
-   *   - @c "relative/path"            -> @c "relative/path"
+   *   - @c "s3://bucket/key"          -> @c "key"
+   *
+   * Throws on relative paths, empty keys, malformed URIs.
    */
   [[nodiscard]] static std::string extract_path(std::string_view uri);
 };
