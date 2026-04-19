@@ -37,7 +37,7 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* 
 }
 
 sirius_physical_sort_sample::sirius_physical_sort_sample(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
   std::size_t estimated_cardinality,
   std::size_t num_sample_batches)

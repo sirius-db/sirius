@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "helper/utils.hpp"
 #include "log/logging.hpp"
 
@@ -327,7 +328,9 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
     // handled safely in chunk_to_data_batch: the loop checks validity before
     // reading the string_t payload.
     duckdb::DataChunk chunk;
-    chunk.Initialize(duckdb::Allocator::DefaultAllocator(), source.types);
+    // source.types carries sirius::logical_type (post PR #643); DataChunk
+    // still speaks DuckDB types, so convert at the boundary.
+    chunk.Initialize(duckdb::Allocator::DefaultAllocator(), sirius::to_duckdb_vec(source.types));
     chunk.SetCardinality(1);
     for (auto& vec : chunk.data) {
       auto& validity = duckdb::FlatVector::Validity(vec);

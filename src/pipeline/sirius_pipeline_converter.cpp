@@ -558,7 +558,7 @@ void sirius_pipeline_converter::split_order_by_sink(
       }
     }
     if (!is_identity) {
-      duckdb::vector<duckdb::LogicalType> output_types;
+      duckdb::vector<sirius::logical_type> output_types;
       for (auto idx : original_projections) {
         output_types.push_back(order_ptr->types[idx]);
       }

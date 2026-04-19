@@ -19,7 +19,7 @@
 namespace sirius::op {
 
 sirius_physical_cpu_source::sirius_physical_cpu_source(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection)
   : sirius_physical_operator(
@@ -29,7 +29,7 @@ sirius_physical_cpu_source::sirius_physical_cpu_source(
 {
 }
 
-sirius_physical_cpu_source::sirius_physical_cpu_source(duckdb::vector<duckdb::LogicalType> types,
+sirius_physical_cpu_source::sirius_physical_cpu_source(duckdb::vector<sirius::logical_type> types,
                                                        duckdb::idx_t estimated_cardinality,
                                                        bool produce_single_row)
   : sirius_physical_operator(

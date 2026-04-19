@@ -31,12 +31,12 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CPU_SOURCE;
 
   /// Construct from a COLUMN_DATA_SCAN operator that owns a ColumnDataCollection.
-  sirius_physical_cpu_source(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_cpu_source(duckdb::vector<sirius::logical_type> types,
                              duckdb::idx_t estimated_cardinality,
                              duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection);
 
   /// Construct for EMPTY_RESULT / DUMMY_SCAN (no collection).
-  sirius_physical_cpu_source(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_cpu_source(duckdb::vector<sirius::logical_type> types,
                              duckdb::idx_t estimated_cardinality,
                              bool produce_single_row);
 
