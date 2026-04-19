@@ -1,0 +1,82 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <ctime>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace sirius::io::s3 {
+
+/// Static credentials + region/service for SigV4 signing.
+struct sigv4_signer_config {
+  std::string access_key;
+  std::string secret_key;
+  std::string region;
+  std::string service = "s3";
+};
+
+/// Headers to attach to an HTTP request, in the order caller should emit them.
+/// Caller adds every entry verbatim (Authorization, x-amz-date, etc.).
+struct sigv4_signed_request {
+  std::vector<std::pair<std::string, std::string>> headers;
+};
+
+/**
+ * @brief Sign an HTTP request using AWS Signature Version 4.
+ *
+ * Computes the canonical request / string-to-sign / signing key chain per
+ * https://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html and returns
+ * the full set of headers the caller must attach.
+ *
+ * @param method             HTTP method (`"GET"`, `"HEAD"`).
+ * @param host               Host header value (e.g. `"s3.us-west-2.amazonaws.com"`
+ *                           or `"minio.local:9000"`).
+ * @param canonical_uri      URI path, already RFC3986-encoded (e.g. `"/bucket/key"`).
+ * @param canonical_query    Canonical query string, already encoded & sorted; empty if none.
+ * @param payload_sha256_hex Hex SHA256 of the request body. For GET/HEAD with
+ *                           no body, pass @c sha256_hex("").
+ * @param extra_headers      Additional headers to sign (e.g. `{"range", "bytes=0-99"}`).
+ *                           Keys lowercase; do NOT include `host`, `x-amz-date`,
+ *                           or `x-amz-content-sha256` here — they are added
+ *                           automatically.
+ * @param creds              Access key, secret key, region, service.
+ * @param timestamp_utc      Seconds since epoch; sign produces `x-amz-date`
+ *                           and the scope's date from this. Passed explicitly
+ *                           so tests are deterministic.
+ *
+ * @throw std::invalid_argument on empty credentials.
+ */
+sigv4_signed_request sign_request(std::string_view method,
+                                  std::string_view host,
+                                  std::string_view canonical_uri,
+                                  std::string_view canonical_query,
+                                  std::string_view payload_sha256_hex,
+                                  std::vector<std::pair<std::string, std::string>> const& extra_headers,
+                                  sigv4_signer_config const& creds,
+                                  std::time_t timestamp_utc);
+
+/// Hex-encoded SHA256 digest of @p data. Thin wrapper around OpenSSL SHA256.
+std::string sha256_hex(std::string_view data);
+
+/// RFC 3986 URI-encode @p s. If @p encode_slash is false, `/` passes through
+/// (used for path segments); if true, `/` becomes `%2F` (used for query components).
+std::string uri_encode(std::string_view s, bool encode_slash);
+
+}  // namespace sirius::io::s3
