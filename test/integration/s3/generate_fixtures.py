@@ -10,26 +10,31 @@ Writes files under ``<out_dir>`` (default:
 the MinIO container via ``mc``. Fixtures are regenerated deterministically each
 run so tests can bit-compare the S3-read bytes against the local copy.
 
-  hello.txt          — 16-byte ASCII blob; HEAD + tiny-range test
-  small.parquet      — ~256 rows, 3 columns; bit-equal parquet scan
-  medium.parquet     — ~200k rows; multi-range reads and larger scans
+  hello.txt     — 16-byte ASCII blob; HEAD + tiny-range test
+  small.bin     — 20 KiB deterministic binary blob; bit-equal read via factory
+  medium.bin    — 8 MiB deterministic binary blob; multi-range reads
 
-Uses DuckDB to write the parquet files since DuckDB is already a hard
-dependency of the extension; this avoids adding pyarrow/pandas to the pixi env
-for a test-only helper.
+The blobs are opaque bytes (NOT real parquet) — PR15's C++ integration tests
+only need deterministic, size-known objects they can bit-compare against the
+local copy. Keeping the generator stdlib-only avoids forcing a duckdb / pyarrow
+install on the MinIO host. The SQLLogicTest in test/sql/datasource/s3_read.test
+DOES need real parquet data and is disabled until a stdlib-only parquet
+generator (or an optional pyarrow/duckdb path) is wired back in.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import os
-import subprocess
-import sys
+import random
 from pathlib import Path
 
 
 HELLO_BYTES = b"sirius-s3-hello\n"  # exactly 16 bytes
+SMALL_SIZE = 20 * 1024              # 20 KiB
+MEDIUM_SIZE = 8 * 1024 * 1024       # 8 MiB (medium test needs > 4 MiB)
+SMALL_SEED = 0xA17E57
+MEDIUM_SEED = 0xBE57ED
 
 
 def write_hello(out_dir: Path) -> Path:
@@ -39,55 +44,14 @@ def write_hello(out_dir: Path) -> Path:
     return p
 
 
-def write_parquet_via_duckdb(out_path: Path, sql_select: str) -> Path:
-    # Lazy import so the script can still print --help without duckdb installed.
-    try:
-        import duckdb  # type: ignore
-    except ImportError as e:  # pragma: no cover
-        sys.stderr.write(
-            "error: python `duckdb` module not found; "
-            "inside pixi shell run `pip install duckdb` or use the "
-            "duckdb-python pixi env.\n"
-        )
-        raise SystemExit(1) from e
-
-    con = duckdb.connect(":memory:")
-    con.execute(f"COPY ({sql_select}) TO '{out_path}' (FORMAT PARQUET, COMPRESSION snappy)")
-    con.close()
+def write_deterministic_bytes(out_path: Path, size: int, seed: int) -> Path:
+    # random.Random seeded with a fixed int produces identical bytes across runs
+    # and across Python 3.9+ platforms — good enough for bit-equality tests that
+    # don't care about format, only about byte stability.
+    rng = random.Random(seed)
+    out_path.write_bytes(rng.randbytes(size))
+    assert out_path.stat().st_size == size
     return out_path
-
-
-def write_small_parquet(out_dir: Path) -> Path:
-    p = out_dir / "small.parquet"
-    # 256 rows, 3 columns with different types — exercises cudf's column decode
-    # path enough to catch any byte-level mismatch between local and S3 reads.
-    return write_parquet_via_duckdb(
-        p,
-        """
-        SELECT
-          i::INTEGER                              AS id,
-          (i * 7919)::BIGINT                      AS v,
-          ('name_' || lpad(i::VARCHAR, 4, '0'))   AS name,
-          (DATE '2024-01-01' + INTERVAL (i) DAY)  AS d
-        FROM range(256) t(i)
-        """,
-    )
-
-
-def write_medium_parquet(out_dir: Path) -> Path:
-    p = out_dir / "medium.parquet"
-    # ~200k rows, small row groups so multi-range reads cross boundaries.
-    return write_parquet_via_duckdb(
-        p,
-        """
-        SELECT
-          i::INTEGER                               AS id,
-          (i % 97)::SMALLINT                       AS bucket,
-          (random() * 1e9)::BIGINT                 AS v,
-          repeat('x', 32)                          AS payload
-        FROM range(200000) t(i)
-        """,
-    )
 
 
 def sha256_of(path: Path) -> str:
@@ -119,8 +83,8 @@ def main() -> int:
 
     paths = [
         write_hello(out_dir),
-        write_small_parquet(out_dir),
-        write_medium_parquet(out_dir),
+        write_deterministic_bytes(out_dir / "small.bin", SMALL_SIZE, SMALL_SEED),
+        write_deterministic_bytes(out_dir / "medium.bin", MEDIUM_SIZE, MEDIUM_SEED),
     ]
 
     manifest_path = args.manifest or (out_dir / "MANIFEST.sha256")

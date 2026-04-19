@@ -4,7 +4,7 @@
 # Prerequisites (handled by `make s3-up`):
 #   - MinIO container running at http://127.0.0.1:9000 with credentials
 #     minioadmin/minioadmin (see docker-compose.yml).
-#   - Python interpreter with `duckdb` module installed.
+#   - Python 3 (stdlib only — no extra deps).
 #
 # Usage:
 #   test/integration/s3/fixtures.sh            # generate + upload

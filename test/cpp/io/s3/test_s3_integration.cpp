@@ -21,9 +21,14 @@
 //
 // These tests complement test_s3_ioctx.cpp by focusing on:
 //   - bit-equality between bytes served by S3 and the local fixture copy,
-//   - multi-range reads across parquet row-group boundaries,
+//   - multi-range reads across a large object,
 //   - error surfaces (404 on missing key, 403 on bad credentials),
 // rather than re-covering HEAD / small range GETs already in test_s3_ioctx.
+//
+// The `small.bin` / `medium.bin` fixtures are opaque deterministic blobs (not
+// real parquet) — see test/integration/s3/generate_fixtures.py. The bit-equal
+// checks below do not care about file format, only that local and remote
+// bytes match.
 
 #include "catch.hpp"
 #include "io/datasource_factory.hpp"
@@ -155,13 +160,13 @@ TEST_CASE("s3_integration: hello.txt bytes match local fixture exactly",
   CHECK(std::memcmp(remote.data(), local.data(), object_size) == 0);
 }
 
-TEST_CASE("s3_integration: small.parquet bit-equal via factory",
+TEST_CASE("s3_integration: small.bin bit-equal via factory",
           "[s3][integration]")
 {
   auto e = read_env();
   if (skip_if_env_missing(e)) return;
 
-  auto const local_path = e.local_dir / "small.parquet";
+  auto const local_path = e.local_dir / "small.bin";
   auto const local      = read_file_bytes(local_path);
   REQUIRE(local.size() > 0);
 
@@ -171,46 +176,46 @@ TEST_CASE("s3_integration: small.parquet bit-equal via factory",
 
   std::unique_ptr<io_datasource> ds;
   try {
-    ds = datasource_factory::create("s3://" + e.bucket + "/small.parquet", reg, cfg);
+    ds = datasource_factory::create("s3://" + e.bucket + "/small.bin", reg, cfg);
   } catch (std::exception const& ex) {
     WARN("factory::create failed: " << ex.what());
-    SUCCEED("Skipping: MinIO unreachable or small.parquet missing");
+    SUCCEED("Skipping: MinIO unreachable or small.bin missing");
     return;
   }
   REQUIRE(ds != nullptr);
   REQUIRE(ds->size() == local.size());
 
-  // Full-object read — this is the byte sequence cuDF's parquet reader would
-  // see. If it diverges from the local file the scan downstream would yield
-  // a different cudf::table.
+  // Full-object read — this is the byte sequence a downstream reader would
+  // see. If it diverges from the local file the scan would yield different
+  // bytes than the local fixture.
   auto buf = ds->host_read(0, local.size());
   REQUIRE(buf != nullptr);
   REQUIRE(buf->size() == local.size());
   CHECK(std::memcmp(buf->data(), local.data(), local.size()) == 0);
 
-  // Parquet footer fetch: last 8 bytes hold the footer length + magic and are
-  // what cuDF probes first; mirror that pattern.
+  // Small tail fetch: mirrors the access pattern a parquet reader would use
+  // when probing the footer at the end of an object.
   constexpr std::size_t tail = 8;
   auto tail_buf = ds->host_read(local.size() - tail, tail);
   REQUIRE(tail_buf->size() == tail);
   CHECK(std::memcmp(tail_buf->data(), local.data() + local.size() - tail, tail) == 0);
 }
 
-TEST_CASE("s3_integration: multi-range reads on medium.parquet match local bytes",
+TEST_CASE("s3_integration: multi-range reads on medium.bin match local bytes",
           "[s3][integration]")
 {
   auto e = read_env();
   if (skip_if_env_missing(e)) return;
 
-  auto const local_path = e.local_dir / "medium.parquet";
+  auto const local_path = e.local_dir / "medium.bin";
   auto const local      = read_file_bytes(local_path);
   REQUIRE(local.size() > 4 * 1024 * 1024);  // expect at least 4 MiB
 
   auto ctx = make_ctx(e);
-  std::size_t const object_size = ctx->head_object_size(e.bucket, "medium.parquet");
+  std::size_t const object_size = ctx->head_object_size(e.bucket, "medium.bin");
   REQUIRE(object_size == local.size());
 
-  auto obj = std::make_unique<s3_io_object>(e.bucket, "medium.parquet", object_size);
+  auto obj = std::make_unique<s3_io_object>(e.bucket, "medium.bin", object_size);
 
   // Four disjoint 512 KB windows spread across the file. Using odd offsets
   // ensures we are not accidentally aligned to MinIO's internal chunk size.
