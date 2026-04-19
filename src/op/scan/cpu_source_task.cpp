@@ -297,9 +297,7 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
   // alive on the task (not as a function-local) is what keeps the memory_space
   // valid until the batches are consumed downstream.
   auto* local = dynamic_cast<cpu_source_task_local_state*>(local_state());
-  if (!local) {
-    throw std::runtime_error("[cpu_source_task] Unexpected local state type");
-  }
+  if (!local) { throw std::runtime_error("[cpu_source_task] Unexpected local state type"); }
   local->set_reservation(std::move(reservation));
   auto* reservation_ptr = local->reservation();
 
@@ -342,9 +340,7 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
       validity.SetAllInvalid(1);
       if (!source.types[c].is_varchar()) {
         auto type_size = source.types[c].fixed_width_byte_size();
-        if (type_size > 0) {
-          std::memset(duckdb::FlatVector::GetData(vec), 0, type_size);
-        }
+        if (type_size > 0) { std::memset(duckdb::FlatVector::GetData(vec), 0, type_size); }
       }
     }
     batches.push_back(chunk_to_data_batch(chunk, source.types, mem_space, reservation_ptr));
