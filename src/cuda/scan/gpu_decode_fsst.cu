@@ -4,6 +4,7 @@
  */
 
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cub/cub.cuh>
@@ -227,8 +228,7 @@ void gpu_decode_fsst(
     own_segment = true;
   }
   if (!skip_block_copy) {
-    cudaMemcpyAsync(d_segment, segment_data, segment_size,
-                    cudaMemcpyHostToDevice, stream.value());
+    bounce_h2d_async(d_segment, segment_data, segment_size, stream.value());
   }
 
   // --- Resolve temp buffers: use caller-provided or allocate ---
@@ -262,11 +262,9 @@ void gpu_decode_fsst(
   }
 
   // Upload decoder data (always needed — symbol table varies per segment)
-  cudaMemcpyAsync(d_decoder_len, decoder.len, 255,
-                  cudaMemcpyHostToDevice, stream.value());
-  cudaMemcpyAsync(d_decoder_symbol, decoder.symbol,
-                  255 * sizeof(unsigned long long),
-                  cudaMemcpyHostToDevice, stream.value());
+  bounce_h2d_async(d_decoder_len, decoder.len, 255, stream.value());
+  bounce_h2d_async(d_decoder_symbol, decoder.symbol,
+                   255 * sizeof(unsigned long long), stream.value());
 
   constexpr uint32_t THREADS = 256;
   uint32_t blocks = (row_count + THREADS - 1) / THREADS;

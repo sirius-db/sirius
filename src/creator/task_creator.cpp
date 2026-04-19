@@ -16,6 +16,8 @@
 
 #include "creator/task_creator.hpp"
 
+#include <cstdlib>
+
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
@@ -89,7 +91,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       auto gpu_state = std::make_shared<op::scan::gpu_native_scan_global_state>(
         pipeline, *_pipeline_executor, *_client_context, scan_op);
 
-      if (gpu_state->viable()) {
+      if (gpu_state->viable() && std::getenv("SIRIUS_DISABLE_GPU_NATIVE_SCAN") == nullptr) {
         _gpu_native_scan_global_state_map.emplace(operator_id, std::move(gpu_state));
       } else {
         // Fall back to standard DuckDB scan with table function

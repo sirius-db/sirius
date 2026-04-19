@@ -3,14 +3,17 @@
  * Licensed under the Apache License, Version 2.0
  */
 
+#include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "cuda/scan/gpu_decode_validity.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
@@ -22,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -157,7 +161,7 @@ void launch_fill_constant(uint8_t* d_dest,
       std::vector<uint8_t> host_buf(static_cast<size_t>(row_count) * type_size);
       for (uint32_t r = 0; r < row_count; ++r)
         std::memcpy(host_buf.data() + r * type_size, val_src, type_size);
-      cudaMemcpyAsync(d_dest, host_buf.data(), host_buf.size(), cudaMemcpyHostToDevice, stream);
+      bounce_h2d_async(d_dest, host_buf.data(), host_buf.size(), stream);
       break;
     }
   }
@@ -252,6 +256,20 @@ std::pair<device_block_map, rmm::device_buffer> transfer_blocks_bulk_h2d(
   rmm::device_buffer staging(sorted.size() * DUCKDB_BLOCK_SIZE, stream, mr);
   auto* d_staging = static_cast<uint8_t*>(staging.data());
 
+  static const bool kUseBatch = [] {
+    auto* v = std::getenv("SIRIUS_USE_BATCH_H2D");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+
+  std::vector<void*> b_dsts;
+  std::vector<void*> b_srcs;
+  std::vector<size_t> b_sizes;
+  if (kUseBatch) {
+    b_dsts.reserve(sorted.size());
+    b_srcs.reserve(sorted.size());
+    b_sizes.reserve(sorted.size());
+  }
+
   size_t offset = 0;
   for (size_t i = 0; i < sorted.size();) {
     size_t run_start = i;
@@ -263,17 +281,44 @@ std::pair<device_block_map, rmm::device_buffer> transfer_blocks_bulk_h2d(
     ++i;
     size_t run_len = i - run_start;
 
-    cudaMemcpyAsync(d_staging + offset,
-                    sorted[run_start].host_base,
-                    run_len * DUCKDB_BLOCK_SIZE,
-                    cudaMemcpyHostToDevice,
-                    stream.value());
+    if (kUseBatch) {
+      b_dsts.push_back(d_staging + offset);
+      b_srcs.push_back(const_cast<uint8_t*>(sorted[run_start].host_base));
+      b_sizes.push_back(run_len * DUCKDB_BLOCK_SIZE);
+    } else {
+      bounce_h2d_async(d_staging + offset,
+                       sorted[run_start].host_base,
+                       run_len * DUCKDB_BLOCK_SIZE,
+                       stream.value());
+    }
 
     for (size_t j = run_start; j < i; ++j) {
       map.offsets[sorted[j].block_id] = offset;
       offset += DUCKDB_BLOCK_SIZE;
     }
   }
+
+  if (kUseBatch && !b_dsts.empty()) {
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.srcLocHint     = {cudaMemLocationTypeHost, 0};
+    attr.dstLocHint     = {cudaMemLocationTypeDevice, 0};
+    attr.flags          = cudaMemcpyFlagDefault;
+    std::vector<size_t> idxs(b_dsts.size(), 0);
+    cudaError_t err = cudaMemcpyBatchAsync(b_dsts.data(),
+                                           b_srcs.data(),
+                                           b_sizes.data(),
+                                           b_dsts.size(),
+                                           &attr,
+                                           idxs.data(),
+                                           1,
+                                           stream.value());
+    if (err != cudaSuccess) {
+      SIRIUS_LOG_ERROR("cudaMemcpyBatchAsync failed: {}", cudaGetErrorString(err));
+      throw std::runtime_error("cudaMemcpyBatchAsync failed");
+    }
+  }
+
   map.total_bytes = offset;
   return {std::move(map), std::move(staging)};
 }
@@ -295,8 +340,14 @@ std::pair<rmm::device_buffer, cudf::size_type> decode_validity_mask(
   cudf::size_type null_count = 0;
   if (!col_scan.has_nulls || total_rows == 0) return {std::move(null_mask), null_count};
 
-  size_t mask_bytes  = (total_rows + 63) / 64 * sizeof(uint64_t);
-  null_mask          = rmm::device_buffer(mask_bytes, stream, mr);
+  // cuDF (Arrow spec) expects the null_mask buffer to be 64-byte padded.
+  // If we only allocate the (rows+63)/64*8 bytes we need for the bits,
+  // cuDF's subsequent deep-copy will try to memcpy the Arrow-sized buffer
+  // (up to 63 bytes larger) and fail with cudaErrorInvalidValue. Always
+  // allocate the full Arrow-aligned size.
+  size_t mask_bytes =
+    cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(total_rows));
+  null_mask = rmm::device_buffer(mask_bytes, stream, mr);
   auto* d_mask       = static_cast<uint64_t*>(null_mask.data());
   uint32_t num_words = static_cast<uint32_t>((total_rows + 63) / 64);
 
@@ -315,11 +366,10 @@ std::pair<rmm::device_buffer, cudf::size_type> decode_validity_mask(
       size_t seg_mask_bytes = (vseg.row_count + 7) / 8;
       // Aligned and unaligned cases both write byte-aligned; DuckDB validity
       // segments are byte-aligned at row_offset/8 even when not word-aligned.
-      cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_mask) + row_offset / 8,
-                      vseg.data_ptr,
-                      seg_mask_bytes,
-                      cudaMemcpyHostToDevice,
-                      stream.value());
+      bounce_h2d_async(reinterpret_cast<uint8_t*>(d_mask) + row_offset / 8,
+                       vseg.data_ptr,
+                       seg_mask_bytes,
+                       stream.value());
     }
     row_offset += vseg.row_count;
   }
@@ -368,12 +418,16 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
   rmm::device_buffer data_buf(total_rows * type_size, stream, mr);
   auto* d_output = static_cast<uint8_t*>(data_buf.data());
 
-  // RLE cumsum scratch, lazily allocated if any segment needs it.
+  // RLE cumsum scratch, lazily allocated if any segment needs it. Sourced
+  // from the thread-local decode arena so repeated batches hit the bump
+  // fast-path instead of the allocator.
   constexpr size_t RLE_CUMSUM_CAP = 4096 * sizeof(uint32_t);
   uint32_t* d_rle_cumsum          = nullptr;
+  arena_alloc rle_alloc{nullptr, false};
   for (auto const& seg : col_scan.data.segments) {
     if (seg.compression == duckdb::CompressionType::COMPRESSION_RLE) {
-      cudaMallocAsync(&d_rle_cumsum, RLE_CUMSUM_CAP, stream.value());
+      rle_alloc     = arena_allocate(RLE_CUMSUM_CAP, stream.value());
+      d_rle_cumsum  = static_cast<uint32_t*>(rle_alloc.ptr);
       break;
     }
   }
@@ -413,8 +467,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
                           cudaMemcpyDeviceToDevice, stream.value());
         } else {
           // Block wasn't pre-staged (block_id < 0 etc.) — per-segment H2D.
-          cudaMemcpyAsync(d_dest, seg.data_ptr, seg_bytes,
-                          cudaMemcpyHostToDevice, stream.value());
+          bounce_h2d_async(d_dest, seg.data_ptr, seg_bytes, stream.value());
         }
         break;
       }
@@ -464,8 +517,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
     if (!fb_map.empty()) {
       cudaMallocAsync(&d_fb_staging, fb_map.size() * DUCKDB_BLOCK_SIZE, stream.value());
       for (auto const& [host_base, off] : fb_map) {
-        cudaMemcpyAsync(d_fb_staging + off, host_base, DUCKDB_BLOCK_SIZE,
-                        cudaMemcpyHostToDevice, stream.value());
+        bounce_h2d_async(d_fb_staging + off, host_base, DUCKDB_BLOCK_SIZE, stream.value());
       }
     }
 
@@ -496,7 +548,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
     if (d_fb_staging) cudaFreeAsync(d_fb_staging, stream.value());
   }
 
-  if (d_rle_cumsum) cudaFreeAsync(d_rle_cumsum, stream.value());
+  if (d_rle_cumsum && rle_alloc.needs_free) cudaFreeAsync(d_rle_cumsum, stream.value());
 
   auto [null_mask, null_count] =
     decode_validity_mask(col_scan, total_rows, stream, mr, d_valid_count_out);
@@ -541,9 +593,12 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
   for (size_t ci = 0; ci < num_cols; ++ci) {
     if (col_scans[ci].has_nulls) null_col_indices.push_back(ci);
   }
-  uint32_t* d_valid_counts = nullptr;
+  uint32_t*   d_valid_counts = nullptr;
+  arena_alloc vc_alloc{nullptr, false};
   if (!null_col_indices.empty()) {
-    cudaMallocAsync(&d_valid_counts, null_col_indices.size() * sizeof(uint32_t), stream.value());
+    vc_alloc =
+      arena_allocate(null_col_indices.size() * sizeof(uint32_t), stream.value());
+    d_valid_counts = static_cast<uint32_t*>(vc_alloc.ptr);
   }
   std::vector<int> col_to_slot(num_cols, -1);
   for (size_t i = 0; i < null_col_indices.size(); ++i) {
@@ -586,7 +641,7 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
                d_valid_counts,
                null_col_indices.size() * sizeof(uint32_t),
                cudaMemcpyDeviceToHost);
-    cudaFreeAsync(d_valid_counts, stream.value());
+    if (vc_alloc.needs_free) { cudaFreeAsync(d_valid_counts, stream.value()); }
     for (size_t i = 0; i < null_col_indices.size(); ++i) {
       auto ci = null_col_indices[i];
       auto nc =
@@ -594,6 +649,11 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
       columns[ci]->set_null_count(nc);
     }
   }
+
+  // 6. Reset the thread-local decode arena. Safe because stream.synchronize()
+  //    above has drained every kernel that read arena pointers. Arena grows
+  //    to the peak of this batch, so subsequent batches skip malloc entirely.
+  arena_reset(stream.value());
 
   auto t_end                 = clock::now();
   [[maybe_unused]] auto us   = [](clock::time_point a, clock::time_point b) {

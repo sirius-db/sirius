@@ -4,6 +4,7 @@
  */
 
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cub/cub.cuh>
@@ -141,8 +142,7 @@ void gpu_decode_dictionary(
     own_segment = true;
   }
   if (!skip_block_copy) {
-    cudaMemcpyAsync(d_segment, segment_data, segment_size,
-                    cudaMemcpyHostToDevice, stream.value());
+    bounce_h2d_async(d_segment, segment_data, segment_size, stream.value());
   }
 
   // 2. Resolve temp buffers: use caller-provided or allocate
@@ -337,8 +337,7 @@ void gpu_decode_uncompressed_string(
     own_segment = true;
   }
   if (!skip_block_copy) {
-    cudaMemcpyAsync(d_segment, segment_data, segment_size,
-                    cudaMemcpyHostToDevice, stream.value());
+    bounce_h2d_async(d_segment, segment_data, segment_size, stream.value());
   }
 
   // DuckDB offsets start at byte 8 within the segment

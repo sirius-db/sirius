@@ -4,6 +4,7 @@
  */
 
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cuda_runtime.h>
@@ -131,11 +132,11 @@ void gpu_decode_rle(const uint8_t* segment_data,
   if (d_scratch) {
     d_block = static_cast<uint8_t*>(d_scratch);
     if (!skip_block_copy) {
-      cudaMemcpyAsync(d_block, segment_data, segment_size, cudaMemcpyHostToDevice, stream.value());
+      bounce_h2d_async(d_block, segment_data, segment_size, stream.value());
     }
   } else {
     cudaMallocAsync(&d_block, segment_size, stream.value());
-    cudaMemcpyAsync(d_block, segment_data, segment_size, cudaMemcpyHostToDevice, stream.value());
+    bounce_h2d_async(d_block, segment_data, segment_size, stream.value());
     owns_block = true;
   }
 
@@ -149,7 +150,7 @@ void gpu_decode_rle(const uint8_t* segment_data,
     cudaMallocAsync(&d_cumsum, cumsum_bytes, stream.value());
     owns_cumsum = true;
   }
-  cudaMemcpyAsync(d_cumsum, h_cumsum.data(), cumsum_bytes, cudaMemcpyHostToDevice, stream.value());
+  bounce_h2d_async(d_cumsum, h_cumsum.data(), cumsum_bytes, stream.value());
 
   // Device pointer to values within the block
   const uint8_t* d_seg = d_block + block_offset;

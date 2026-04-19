@@ -17,10 +17,12 @@
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "cuda/scan/gpu_decode_validity.cuh"
+#include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -765,11 +767,10 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       staging_buf   = rmm::device_buffer(staging_bytes, stream, mr);
       d_staging_ptr = static_cast<uint8_t*>(staging_buf.data());
       for (auto& [key, entry] : block_map) {
-        cudaMemcpyAsync(d_staging_ptr + entry.device_offset,
-                        entry.host_base,
-                        entry.copy_size,
-                        cudaMemcpyHostToDevice,
-                        stream.value());
+        bounce_h2d_async(d_staging_ptr + entry.device_offset,
+                         entry.host_base,
+                         entry.copy_size,
+                         stream.value());
       }
     }
   }
@@ -881,31 +882,47 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     total_fsst_rows > 0 ? total_fsst_rows * sizeof(uint32_t) : 0, stream, mr);
   uint32_t* d_comp_offsets = static_cast<uint32_t*>(comp_offsets_buf.data());
 
-  // Upload segment descriptors (via RMM)
+  // Upload segment descriptors (via RMM).
+  //
+  // Previously five separate RMM allocations + cudaMemcpyAsync calls — two
+  // of which (dict_descs, uncomp_descs) were dead (only FSST path reads
+  // d_*_descs directly, the dict/uncomp paths operate on *_chunks uploaded
+  // below). Coalesce the three live FSST descriptors into one arena so each
+  // call site sees one allocation + one H2D instead of three, while the
+  // chunks path upstream still does its own uploads.
   auto make_device_copy = [&](const void* src, size_t bytes) -> rmm::device_buffer {
     rmm::device_buffer buf(bytes, stream, mr);
     if (bytes > 0) {
-      cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.value());
+      bounce_h2d_async(buf.data(), src, bytes, stream.value());
     }
     return buf;
   };
 
-  auto dict_descs_buf =
-    make_device_copy(dict_descs.data(), dict_descs.size() * sizeof(batched_seg_desc));
-  auto fsst_descs_buf =
-    make_device_copy(fsst_descs.data(), fsst_descs.size() * sizeof(batched_seg_desc));
-  auto uncomp_descs_buf =
-    make_device_copy(uncomp_descs.data(), uncomp_descs.size() * sizeof(batched_seg_desc));
-  auto fsst_starts_buf =
-    make_device_copy(fsst_row_starts.data(), fsst_row_starts.size() * sizeof(uint32_t));
-  auto fsst_decoders_buf =
-    make_device_copy(fsst_decoders.data(), fsst_decoders.size() * sizeof(fsst_decoder_compact));
+  auto align_up = [](size_t x, size_t a) { return (x + a - 1) & ~(a - 1); };
+  constexpr size_t kAlign   = alignof(batched_seg_desc);
+  const size_t bytes_fsst   = fsst_descs.size() * sizeof(batched_seg_desc);
+  const size_t bytes_starts = fsst_row_starts.size() * sizeof(uint32_t);
+  const size_t bytes_decs   = fsst_decoders.size() * sizeof(fsst_decoder_compact);
+  const size_t off_fsst     = 0;
+  const size_t off_starts   = align_up(off_fsst + bytes_fsst, kAlign);
+  const size_t off_decs     = align_up(off_starts + bytes_starts, kAlign);
+  const size_t arena_bytes  = off_decs + bytes_decs;
 
-  auto* d_dict_descs      = static_cast<batched_seg_desc*>(dict_descs_buf.data());
-  auto* d_fsst_descs      = static_cast<batched_seg_desc*>(fsst_descs_buf.data());
-  auto* d_uncomp_descs    = static_cast<batched_seg_desc*>(uncomp_descs_buf.data());
-  auto* d_fsst_row_starts = static_cast<uint32_t*>(fsst_starts_buf.data());
-  auto* d_fsst_decoders   = static_cast<fsst_decoder_compact*>(fsst_decoders_buf.data());
+  std::vector<uint8_t> h_arena(arena_bytes);
+  if (bytes_fsst)   std::memcpy(h_arena.data() + off_fsst,   fsst_descs.data(),      bytes_fsst);
+  if (bytes_starts) std::memcpy(h_arena.data() + off_starts, fsst_row_starts.data(), bytes_starts);
+  if (bytes_decs)   std::memcpy(h_arena.data() + off_decs,   fsst_decoders.data(),   bytes_decs);
+
+  rmm::device_buffer fsst_arena_buf(arena_bytes, stream, mr);
+  if (arena_bytes > 0) {
+    bounce_h2d_async(fsst_arena_buf.data(), h_arena.data(), arena_bytes, stream.value());
+  }
+  auto* d_fsst_descs      = reinterpret_cast<batched_seg_desc*>(
+                              static_cast<uint8_t*>(fsst_arena_buf.data()) + off_fsst);
+  auto* d_fsst_row_starts = reinterpret_cast<uint32_t*>(
+                              static_cast<uint8_t*>(fsst_arena_buf.data()) + off_starts);
+  auto* d_fsst_decoders   = reinterpret_cast<fsst_decoder_compact*>(
+                              static_cast<uint8_t*>(fsst_arena_buf.data()) + off_decs);
 
   //===--------------------------------------------------------------------===//
   // Phase 4: Pass 1 — compute string lengths (batched)
@@ -1119,9 +1136,14 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   cudf::size_type null_count = 0;
 
   if (col_scan.has_nulls) {
-    size_t mask_bytes = (total_rows + 63) / 64 * sizeof(uint64_t);
-    null_mask         = rmm::device_buffer(mask_bytes, stream, mr);
-    auto* d_mask      = static_cast<uint64_t*>(null_mask.data());
+    // Match cuDF's Arrow-spec 64-byte padded null_mask size. Using the bit-tight
+    // (rows+63)/64*8 size causes cudf::column deep-copy to memcpy past the end
+    // of the buffer and fail with cudaErrorInvalidValue for non-aligned row
+    // counts (see gpu_native_decode.cu::decode_validity_mask).
+    size_t mask_bytes =
+      cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(total_rows));
+    null_mask    = rmm::device_buffer(mask_bytes, stream, mr);
+    auto* d_mask = static_cast<uint64_t*>(null_mask.data());
 
     uint32_t num_words = static_cast<uint32_t>((total_rows + 63) / 64);
     kernel_fill_valid<<<(num_words + 255) / 256, 256, 0, stream.value()>>>(d_mask, num_words);
@@ -1136,17 +1158,15 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
           vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         size_t seg_mask_bytes = (vseg.row_count + 7) / 8;
         if (val_row_offset % 64 == 0) {
-          cudaMemcpyAsync(d_mask + val_row_offset / 64,
-                          vseg.data_ptr,
-                          seg_mask_bytes,
-                          cudaMemcpyHostToDevice,
-                          stream.value());
+          bounce_h2d_async(d_mask + val_row_offset / 64,
+                           vseg.data_ptr,
+                           seg_mask_bytes,
+                           stream.value());
         } else {
-          cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_mask) + val_row_offset / 8,
-                          vseg.data_ptr,
-                          seg_mask_bytes,
-                          cudaMemcpyHostToDevice,
-                          stream.value());
+          bounce_h2d_async(reinterpret_cast<uint8_t*>(d_mask) + val_row_offset / 8,
+                           vseg.data_ptr,
+                           seg_mask_bytes,
+                           stream.value());
         }
       }
       val_row_offset += vseg.row_count;
