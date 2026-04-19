@@ -3,6 +3,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
+#include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "cuda/scan/gpu_decode_validity.cuh"
@@ -417,12 +418,16 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
   rmm::device_buffer data_buf(total_rows * type_size, stream, mr);
   auto* d_output = static_cast<uint8_t*>(data_buf.data());
 
-  // RLE cumsum scratch, lazily allocated if any segment needs it.
+  // RLE cumsum scratch, lazily allocated if any segment needs it. Sourced
+  // from the thread-local decode arena so repeated batches hit the bump
+  // fast-path instead of the allocator.
   constexpr size_t RLE_CUMSUM_CAP = 4096 * sizeof(uint32_t);
   uint32_t* d_rle_cumsum          = nullptr;
+  arena_alloc rle_alloc{nullptr, false};
   for (auto const& seg : col_scan.data.segments) {
     if (seg.compression == duckdb::CompressionType::COMPRESSION_RLE) {
-      cudaMallocAsync(&d_rle_cumsum, RLE_CUMSUM_CAP, stream.value());
+      rle_alloc     = arena_allocate(RLE_CUMSUM_CAP, stream.value());
+      d_rle_cumsum  = static_cast<uint32_t*>(rle_alloc.ptr);
       break;
     }
   }
@@ -543,7 +548,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
     if (d_fb_staging) cudaFreeAsync(d_fb_staging, stream.value());
   }
 
-  if (d_rle_cumsum) cudaFreeAsync(d_rle_cumsum, stream.value());
+  if (d_rle_cumsum && rle_alloc.needs_free) cudaFreeAsync(d_rle_cumsum, stream.value());
 
   auto [null_mask, null_count] =
     decode_validity_mask(col_scan, total_rows, stream, mr, d_valid_count_out);
@@ -588,9 +593,12 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
   for (size_t ci = 0; ci < num_cols; ++ci) {
     if (col_scans[ci].has_nulls) null_col_indices.push_back(ci);
   }
-  uint32_t* d_valid_counts = nullptr;
+  uint32_t*   d_valid_counts = nullptr;
+  arena_alloc vc_alloc{nullptr, false};
   if (!null_col_indices.empty()) {
-    cudaMallocAsync(&d_valid_counts, null_col_indices.size() * sizeof(uint32_t), stream.value());
+    vc_alloc =
+      arena_allocate(null_col_indices.size() * sizeof(uint32_t), stream.value());
+    d_valid_counts = static_cast<uint32_t*>(vc_alloc.ptr);
   }
   std::vector<int> col_to_slot(num_cols, -1);
   for (size_t i = 0; i < null_col_indices.size(); ++i) {
@@ -633,7 +641,7 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
                d_valid_counts,
                null_col_indices.size() * sizeof(uint32_t),
                cudaMemcpyDeviceToHost);
-    cudaFreeAsync(d_valid_counts, stream.value());
+    if (vc_alloc.needs_free) { cudaFreeAsync(d_valid_counts, stream.value()); }
     for (size_t i = 0; i < null_col_indices.size(); ++i) {
       auto ci = null_col_indices[i];
       auto nc =
@@ -641,6 +649,11 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
       columns[ci]->set_null_count(nc);
     }
   }
+
+  // 6. Reset the thread-local decode arena. Safe because stream.synchronize()
+  //    above has drained every kernel that read arena pointers. Arena grows
+  //    to the peak of this batch, so subsequent batches skip malloc entirely.
+  arena_reset(stream.value());
 
   auto t_end                 = clock::now();
   [[maybe_unused]] auto us   = [](clock::time_point a, clock::time_point b) {

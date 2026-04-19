@@ -3,6 +3,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
+#include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
@@ -510,10 +511,12 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
 {
   if (num_segments == 0) return;
 
-  // Upload descriptors to device
+  // Upload descriptors to device via thread-local scratch arena. After the
+  // first few batches the arena is sized to hold this and we skip
+  // malloc/free entirely.
   size_t desc_bytes = num_segments * sizeof(batched_bp_seg_desc);
-  batched_bp_seg_desc* d_descs = nullptr;
-  cudaMallocAsync(&d_descs, desc_bytes, stream.value());
+  auto desc_alloc   = arena_allocate(desc_bytes, stream.value());
+  auto* d_descs     = static_cast<batched_bp_seg_desc*>(desc_alloc.ptr);
   bounce_h2d_async(d_descs, descs, desc_bytes, stream.value());
 
   constexpr uint32_t BLOCK_DIM       = 256;
@@ -526,7 +529,7 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
     <<<num_segments, BLOCK_DIM, shmem_bytes, stream.value()>>>(
       d_descs, static_cast<T*>(d_output), num_segments);
 
-  cudaFreeAsync(d_descs, stream.value());
+  if (desc_alloc.needs_free) { cudaFreeAsync(d_descs, stream.value()); }
 }
 
 void gpu_decode_bitpacking_batched(const batched_bp_seg_desc* descs,

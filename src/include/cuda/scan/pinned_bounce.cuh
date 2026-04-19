@@ -20,11 +20,13 @@
 // previous DMA to drain before overwriting (602 ms of cudaEventSynchronize
 // observed on Q01 SF=20). With 2 slots, the CPU can memcpy into slot B
 // while DMA drains slot A — we only pay a wait when both slots are still
-// in flight (GPU slower than CPU memcpy). Cost: 2× memory (32 MB/thread
-// default vs 16 MB/thread), still bounded and tiny vs anything else.
+// in flight (GPU slower than CPU memcpy). Cost: 2× memory (32 MB/thread),
+// still bounded and tiny vs anything else.
 //
 // Sizing: 16 MB per slot × 2 slots × 4 pipeline threads = 128 MB total
-// pinned. SIRIUS_BOUNCE_MB env var tunes per-slot size; 0 disables.
+// pinned. The per-slot capacity is a hardcoded default chosen to cover the
+// observed worst-case coalesced H2D run in TPC-H/TPC-DS; tune here if a
+// new workload regresses.
 //
 // Fallback: transfers larger than a slot or a failed cudaHostAlloc drop
 // to plain cudaMemcpyAsync — slower but correct.
@@ -34,12 +36,16 @@
 
 #include <cuda_runtime.h>
 
-#include <cstdlib>
 #include <cstring>
 
 namespace sirius::cuda::scan {
 
 namespace detail {
+
+/// Per-slot pinned-bounce buffer size. 16 MB covers the largest coalesced
+/// H2D run seen on TPC-H SF=20/100; larger workloads can bump this, at a
+/// 2× memory cost per pipeline thread.
+inline constexpr size_t BOUNCE_SLOT_BYTES = 16ULL * 1024 * 1024;
 
 struct bounce_slot {
   uint8_t*    buf    = nullptr;
@@ -50,7 +56,7 @@ struct bounce_slot {
 struct pinned_bounce_ring {
   static constexpr int NUM_SLOTS = 2;
   bounce_slot slots[NUM_SLOTS];
-  size_t      capacity = 0;   // per-slot capacity
+  size_t      capacity = 0;   // per-slot capacity (0 = not yet initialized)
   int         next     = 0;
 
   ~pinned_bounce_ring()
@@ -62,40 +68,26 @@ struct pinned_bounce_ring {
   }
 };
 
-inline size_t bounce_slab_capacity_bytes()
-{
-  static const size_t cap = []() {
-    size_t mb = 16;  // per-slot default: covers observed max 16 MB coalesced run
-    if (const char* env = std::getenv("SIRIUS_BOUNCE_MB")) {
-      long v = std::atol(env);
-      if (v >= 0) mb = static_cast<size_t>(v);
-    }
-    return mb * 1024ULL * 1024ULL;
-  }();
-  return cap;
-}
-
 inline pinned_bounce_ring& get_tls_bounce_ring()
 {
   thread_local pinned_bounce_ring ring;
   if (ring.capacity == 0) {
-    const size_t cap = bounce_slab_capacity_bytes();
-    if (cap == 0) return ring;  // disabled → slots stay null; caller falls back
     bool all_ok = true;
     for (auto& s : ring.slots) {
-      cudaError_t rc = ::cudaHostAlloc(reinterpret_cast<void**>(&s.buf), cap,
+      cudaError_t rc = ::cudaHostAlloc(reinterpret_cast<void**>(&s.buf),
+                                       BOUNCE_SLOT_BYTES,
                                        cudaHostAllocPortable);
       if (rc != cudaSuccess) {
         ::cudaGetLastError();
         s.buf = nullptr;
         SIRIUS_LOG_WARN("[pinned_bounce] slot alloc failed ({} MB): {}",
-                        cap / (1 << 20), ::cudaGetErrorString(rc));
+                        BOUNCE_SLOT_BYTES / (1 << 20), ::cudaGetErrorString(rc));
         all_ok = false;
         break;
       }
       ::cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming);
     }
-    if (all_ok) { ring.capacity = cap; }
+    if (all_ok) ring.capacity = BOUNCE_SLOT_BYTES;
   }
   return ring;
 }
@@ -106,7 +98,7 @@ inline pinned_bounce_ring& get_tls_bounce_ring()
 /// pinned ring when possible. Ping-pongs between ring slots so the next
 /// memcpy can start while the prior DMA is still draining — only waits when
 /// the chosen slot is still in flight. Falls back to plain cudaMemcpyAsync
-/// when the transfer is larger than a slot or the ring is disabled.
+/// when the transfer exceeds slot capacity or the ring failed to initialize.
 inline void bounce_h2d_async(void* d_dst,
                              const void* src,
                              size_t bytes,
