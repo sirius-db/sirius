@@ -52,9 +52,18 @@ Build outputs:
 ### Building Python API
 
 ```bash
-cd duckdb-python
-pip install .
-cd ..
+pixi run -e duckdb-python build-duckdb-python
+```
+
+This uses a dedicated pixi environment (`duckdb-python`) with pip, pybind11, and scikit-build-core. The task automatically points `DUCKDB_SOURCE_PATH` at the repo-level `duckdb/` submodule so the Python package links against the same DuckDB version as the C++ extension.
+
+**Usage from Python:**
+```python
+import duckdb
+
+con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
+result = con.execute("CALL gpu_execution('SELECT ...')").fetchall()
 ```
 
 ## Testing
@@ -145,7 +154,47 @@ export SIRIUS_LOG_LEVEL=debug            # Levels: trace, debug, info, warn, err
 
 ## Development Guidelines
 
-Unsupported operations (data types, operators, row counts exceeding cuDF limits) fall back to DuckDB CPU execution via `src/fallback.cpp`.
+### Loading Library Context for Implementation Tasks
+
+**Before implementing new features, operators, or significant bug fixes**, always run `/module-context <task description>` first. This loads the relevant API documentation for cudf, rmm, duckdb, cucascade, and libkvikio modules so you have accurate function signatures, parameter types, and existing usage patterns. The module docs live in `.claude/skills/module-discover/docs/` and contain detailed API references extracted from the actual library headers.
+
+This is especially important for tasks involving:
+- GPU operators (joins, aggregations, sorting, filters, projections)
+- Memory management (reservations, pools, streams, spilling)
+- Data I/O (parquet scanning, datasources)
+- Expression evaluation (AST, unary/binary ops, type casting)
+- Pipeline execution (tasks, executors, data batches)
+
+### Fallback Strategy
+
+Sirius gracefully falls back to DuckDB CPU execution when:
+- Data size exceeds GPU memory regions (caching or processing)
+- Unsupported data types (nested types, some temporal types)
+- Unsupported operators (window functions, ASOF JOIN, etc.)
+- libcudf row count limitations (~2B rows due to int32_t row IDs)
+
+The fallback mechanism is implemented in `src/fallback.cpp` and integrates with DuckDB's execution engine.
+
+### Supported Features
+
+**Data types:** INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR, DATE, TIMESTAMP, DECIMAL
+**Operators:** FILTER, PROJECTION, JOIN (Hash/Nested Loop/Delim), GROUP BY, ORDER BY, AGGREGATION, TOP-N, LIMIT, CTE, TABLE SCAN
+**Join types:** INNER, LEFT, RIGHT, OUTER (implemented via cudf::left_join, cudf::inner_join, etc.)
+
+### Code Organization
+
+- GPU kernels (`.cu` files) are in `src/cuda/` and subdirectories
+- CPU-side logic (`.cpp` files) coordinates GPU execution
+- Header files (`.hpp`) in `src/include/` mirror source structure
+- Each operator has both a DuckDB-facing interface (`operator/`) and cuDF implementation (`cuda/operator/`)
+
+### Adding New Operators
+
+1. Create header in `src/include/operator/gpu_physical_<operator>.hpp`
+2. Implement DuckDB integration in `src/operator/gpu_physical_<operator>.cpp`
+3. Add cuDF/CUDA implementation in `src/cuda/operator/<operator>.cu`
+4. Register in physical plan generator (`src/gpu_physical_plan_generator.cpp`)
+5. Add tests in `test/cpp/operator/` and `test/sql/`
 
 ### CMake Notes
 
@@ -153,7 +202,7 @@ Unsupported operations (data types, operators, row counts exceeding cuDF limits)
 - Requires C++20 and CUDA standard 20
 - Separable compilation enabled for CUDA (`CMAKE_CUDA_SEPARABLE_COMPILATION ON`)
 - GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
-- Links against: cudf::cudf, rmm::rmm, libnuma, libconfig++, absl::any_invocable, spdlog, cuCascade
+- Links against: cudf::cudf, rmm::rmm, libnuma, yaml-cpp, absl::any_invocable, spdlog, cuCascade
 
 ## Extension Development
 
@@ -170,9 +219,12 @@ CLI:
 ```sql
 LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
 CALL gpu_execution('SELECT ...');
+-- Legacy mode (requires gpu_buffer_init first):
+CALL gpu_buffer_init('1 GB', '2 GB');
+CALL gpu_processing('SELECT ...');
 ```
 
-Python:
+Python (requires `pixi run -e duckdb-python build-duckdb-python` first):
 ```python
 con = duckdb.connect('db.duckdb', config={"allow_unsigned_extensions": "true"})
 con.execute("LOAD '/path/to/sirius.duckdb_extension'")
@@ -186,9 +238,11 @@ Sirius includes Claude Code skills for performance analysis and dataset manageme
 | Skill | Command | Description |
 |-------|---------|-------------|
 | Profile Analyzer | `/profile-analyzer` | Analyzes GPU performance from nsys profiles — kernel occupancy, memory bandwidth, operator attribution, and regression detection. |
-| Dataset Manager | `/dataset-manager` | Manages TPC-H parquet datasets — generate at any scale factor, consolidate files, inspect layout, optimize row groups. |
+| Dataset Manager | `/dataset-manager` | Generates benchmark datasets (TPC-H, TPC-DS, etc.) at any scale factor in parquet or duckdb format. |
 | Optimization Advisor | `/optimization-advisor` | Maps GPU hotspots from nsys profiles to source functions, detects efficiency bottlenecks, sync overhead, and parallelism opportunities. |
-| TPC-DS Benchmark | `/tpcds-benchmark` | Runs TPC-DS benchmarks on Legacy Sirius, Super Sirius, or DuckDB CPU baseline — generate data, execute queries, and compare results. |
+| Benchmark | `/benchmark` | Runs TPC-H or TPC-DS benchmarks on Super Sirius or DuckDB CPU baseline — generate data, execute queries, validate results, and compare timings. |
+| Module Context | `/module-context` | **Auto-loaded before implementation tasks.** Identifies which dependency modules are relevant to a task and loads their API docs (signatures, descriptions, usage examples). |
+| Module Discover | `/module-discover` | Analyzes a dependency library, divides it into modules, and generates LLM-consumable API documentation. Run once per library to populate docs. |
 
 **Useful debugging tools:**
 - `tools/parse_pipeline_log.py`: Parses Sirius pipeline logs to show per-operator row counts for debugging incorrect query results.

@@ -1,7 +1,10 @@
 ---
 name: runtime-errors
-description: Diagnose runtime errors using Sirius log files, cuda-gdb, and Compute Sanitizer. Use when a query crashes (including segfaults), throws exceptions, hangs, or triggers unexpected fallback to CPU.
-argument-hint: [sql-query-or-file] [--timeout 30]
+description: >
+  Use this skill when a Sirius query crashes, segfaults, hangs, throws an exception, or unexpectedly
+  falls back to CPU. Also use when you see CUDA errors, std::bad_alloc, or the process gets killed.
+  Diagnoses issues using log analysis, cuda-gdb, AddressSanitizer, and NVIDIA Compute Sanitizer.
+argument-hint: "[sql-query-or-file] [--timeout 30]"
 disable-model-invocation: true
 ---
 
@@ -85,7 +88,7 @@ For deadlocks and thread-level hangs where log analysis is insufficient:
    build/<preset>/duckdb <db_path> <<'EOF' &
    CALL gpu_execution('<QUERY>');
    EOF
-   HANG_PID=$!
+   HANG_PID=$\!
    ```
 
 2. Wait for it to hang (check with `ps` and log activity), then attach:
@@ -156,6 +159,12 @@ Sirius installs a signal handler (via `install_segfault_backtrace_handler()`) th
 When the automatic backtrace doesn't pinpoint the root cause:
 
 - Insert `SIRIUS_LOG_TRACE("[SIRIUS_DIAG] <location>: reached");` at strategic points around the area identified by the backtrace
+- For data inspection at the suspected crash point, also insert debug utility calls:
+  ```cpp
+  sirius::debug_schema(*batch, stream);  // verify data shape before crash
+  sirius::debug_head(*batch, 5, stream); // inspect actual values
+  sirius::debug_nulls(*batch, stream);   // check for unexpected nulls
+  ```
 - **Binary search strategy:**
   1. Insert log statements at function entry points across the suspected code path
   2. Rebuild, run -- see which log entry was the last to appear before crash
@@ -287,6 +296,12 @@ If Phase 1 identifies the general area but not the root cause:
    - Conditional branch outcomes leading to the error (which `if` path was taken?)
    - Data characteristics: row counts, column types, null counts, string lengths
    - Memory state: allocation sizes, reservation amounts, available GPU memory
+   - Data state at the error site via debug utilities:
+     ```cpp
+     sirius::debug_schema(*batch, stream);
+     sirius::debug_head(*batch, 10, stream);
+     sirius::debug_nulls(*batch, stream);
+     ```
 
 2. Rebuild and re-run with a new log directory. Compare against Phase 1 logs.
 
@@ -359,9 +374,71 @@ At the end of any path, present which `[SIRIUS_DIAG]` log statements should be:
 
 ---
 
-## Why Immediate Flush Matters
+## Debug Utilities
 
-By default, spdlog flushes every 3 seconds (see `SIRIUS_LOG_FLUSH_SEC` in `src/include/log/logging.hpp`). When a segfault or hang occurs, buffered entries are lost. Setting `SIRIUS_LOG_LEVEL=trace` explicitly triggers `spdlog::flush_on(trace)`, which flushes after every log entry -- ensuring the last log before the crash is always visible.
+Sirius provides structured debug utility functions in `src/include/debug_utils.hpp` (implementation in `src/debug_utils.cpp`). Use these for data inspection at suspected fault points instead of writing ad-hoc log statements. All functions output to `SIRIUS_LOG_DEBUG` with `[SIRIUS_DIAG]` prefix, are thread-safe (buffered single-call output), and are wrapped in try/catch (never crash the pipeline).
+
+### Function Signatures
+
+```cpp
+#include "debug_utils.hpp"
+
+// Schema metadata: column names, types, null counts, row count
+sirius::debug_schema(batch, stream);
+sirius::debug_schema(batch, stream, {"col_a", "col_b"});
+
+// Per-column null counts and percentages (zero GPU cost)
+sirius::debug_nulls(batch, stream);
+
+// First N rows in aligned-column or CSV format
+sirius::debug_head(batch, /*n=*/10, stream);
+sirius::debug_head(batch, /*n=*/5, stream, sirius::DebugFormat::CSV);
+
+// N randomly selected rows (catches bugs not in first rows)
+sirius::debug_sample(batch, /*n=*/10, stream);
+
+// Per-column min, max, sum for numeric columns (GPU-side)
+sirius::debug_stats(batch, stream);
+
+// Per-column xxhash_64 fingerprint
+sirius::debug_checksum(batch, stream);
+
+// Compare two batches: schema, row count, per-column value diff
+sirius::debug_diff(batch_a, batch_b, stream);
+```
+
+### Usage for Runtime Error Diagnosis
+
+**At suspected fault points** (before/after the crashing operator):
+```cpp
+// Inspect data shape and types at the fault point:
+sirius::debug_schema(*batch, stream);
+sirius::debug_nulls(*batch, stream);
+
+// Inspect actual data values:
+sirius::debug_head(*batch, 10, stream);
+
+// Check for unexpected nulls or data corruption:
+sirius::debug_stats(*batch, stream);
+```
+
+**When narrowing down a crash to an operator:**
+```cpp
+// Insert at operator input and output:
+sirius::debug_schema(*input_batch, stream);   // verify input shape
+sirius::debug_head(*input_batch, 5, stream);  // check input values
+// ... operator executes ...
+sirius::debug_schema(*output_batch, stream);  // verify output shape
+sirius::debug_head(*output_batch, 5, stream); // check output values
+```
+
+**Key benefits over ad-hoc logging:**
+- Thread-safe: output buffered into single log call (no interleaving)
+- Null-aware: NULL values displayed explicitly, not as garbage
+- Try/catch wrapped: debug call never crashes the pipeline (even if the data is corrupted)
+- Supports all Sirius types: INT, FLOAT, STRING, DECIMAL, TIMESTAMP, DATE
+
+---
 
 ## Known Segfault Patterns
 

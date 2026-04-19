@@ -1,6 +1,9 @@
 ---
 name: validate
-description: Diagnose incorrect query results by comparing against DuckDB CPU, analyzing per-operator row counts and data checksums to pinpoint the faulty operator. Use when a query returns wrong results.
+description: >
+  Use this skill when a Sirius query returns wrong results, missing rows, extra rows, or incorrect
+  values compared to DuckDB CPU. Pinpoints the faulty operator using per-operator row counts and
+  data checksums. Also detects CUDA stream synchronization issues that cause garbage data.
 argument-hint: [sql-query-or-file]
 disable-model-invocation: true
 ---
@@ -49,18 +52,17 @@ Diagnose incorrect query results by comparing Sirius GPU output against DuckDB C
 
 6. **Phase 2: Data validation** (ask user before proceeding)
    If row counts match but results differ, the issue is in data values:
-   - Insert diagnostic logging at operator boundaries to compute data checksums:
-     - `sum()` of each numeric column
-     - `max()` of each numeric column
-     - `head(1)` -- first row sample
-   - Use `SIRIUS_LOG_TRACE("[SIRIUS_DIAG] operator_name checksum: sum={}, max={}, first_row={}", ...)` format
-   - Rebuild and re-run, comparing checksums between GPU and CPU (or good/bad runs)
-   - Narrow down to the specific operator where checksums first diverge
+   - Insert debug utility calls at operator boundaries (see Debug Utilities section):
+     - `sirius::debug_checksum(*batch, stream)` -- per-column xxhash_64 fingerprint
+     - `sirius::debug_stats(*batch, stream)` -- per-column min, max, sum
+     - `sirius::debug_head(*batch, 5, stream)` -- first 5 rows for visual inspection
+   - Compare checksums between GPU and CPU runs (or good/bad runs) to find where data first diverges
+   - Use `sirius::debug_diff(*batch_a, *batch_b, stream)` to directly compare two batches at the same pipeline point
 
 7. **Phase 3: Deep dive into faulty operator** (ask user before proceeding)
    Once the faulty operator is identified:
    - Read its implementation (both the `.cpp` and `.cu` files)
-   - Add more granular logging/print statements inside the operator
+   - Add more granular debug utility calls inside the operator (e.g., `debug_head` after each transform)
    - Rebuild and re-run to understand exactly where data goes wrong
    - Suggest a fix
 
@@ -123,6 +125,67 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
    - Then narrow down: remove `cudaDeviceSynchronize()` calls one by one to find the exact operation that needs proper stream synchronization.
 
 5. **Fix:** Replace `cudf::default_stream()` with the correct per-thread CUDA stream in the faulty code path. Or ensure the operation explicitly synchronizes the stream it actually uses. **Never leave `cudaDeviceSynchronize()` in production code** -- it serializes all GPU work and destroys performance. It is only a diagnostic tool.
+
+## Debug Utilities
+
+Sirius provides structured debug utility functions in `src/include/debug_utils.hpp` (implementation in `src/debug_utils.cpp`). **Always use these instead of ad-hoc `SIRIUS_LOG_TRACE` checksum patterns.** All functions output to `SIRIUS_LOG_DEBUG` with `[SIRIUS_DIAG]` prefix, are thread-safe (buffered single-call output), and are wrapped in try/catch (never crash the pipeline).
+
+### Function Signatures
+
+```cpp
+#include "debug_utils.hpp"
+
+// Per-column xxhash_64 fingerprint -- deterministic across runs
+sirius::debug_checksum(batch, stream);
+sirius::debug_checksum(batch, stream, {"col_a", "col_b"});
+
+// Per-column min, max, sum for numeric columns (GPU-side, no host copy)
+sirius::debug_stats(batch, stream);
+
+// First N rows in aligned-column or CSV format
+sirius::debug_head(batch, /*n=*/10, stream);
+sirius::debug_head(batch, /*n=*/5, stream, sirius::DebugFormat::CSV);
+
+// N randomly selected rows (same formatting as debug_head)
+sirius::debug_sample(batch, /*n=*/10, stream);
+sirius::debug_sample(batch, /*n=*/5, stream, sirius::DebugFormat::ALIGNED, {}, 50, /*seed=*/42);
+
+// Compare two batches: schema check, row count check, per-column value diff
+sirius::debug_diff(batch_a, batch_b, stream);
+sirius::debug_diff(batch_a, batch_b, stream, /*max_diff_rows=*/20, /*max_rows=*/1'000'000);
+
+// Schema metadata (column names, types, null counts, row count)
+sirius::debug_schema(batch, stream);
+
+// Per-column null counts and percentages (zero GPU cost)
+sirius::debug_nulls(batch, stream);
+```
+
+### Usage in Validation Workflow
+
+**Phase 2 (data validation):** Instead of inserting manual `SIRIUS_LOG_TRACE("[SIRIUS_DIAG] operator_name checksum: sum={}, max={}, first_row={}", ...)` statements, insert these debug utility calls at operator boundaries:
+
+```cpp
+// At operator output boundary (e.g., after Execute() or Sink()):
+sirius::debug_checksum(*output_batch, stream);  // stable hash per column
+sirius::debug_stats(*output_batch, stream);     // min/max/sum per column
+sirius::debug_head(*output_batch, 5, stream);   // first 5 rows for visual check
+```
+
+Compare checksums between GPU run and CPU baseline (or good/bad runs) to narrow down the faulty operator.
+
+**Comparing two operator outputs directly:**
+```cpp
+// Compare input and output of a suspected operator:
+sirius::debug_diff(*input_batch, *output_batch, stream);
+// Output: per-column diff count and first 10 differing row indices
+```
+
+**Sampling rows from large batches:**
+```cpp
+// Check random rows (catches bugs not visible in first rows):
+sirius::debug_sample(*batch, 20, stream);
+```
 
 ## Key Design Decisions
 

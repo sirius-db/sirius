@@ -40,22 +40,22 @@ class sirius_physical_order : public sirius_physical_operator {
 
   sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
                         duckdb::vector<duckdb::BoundOrderByNode> orders,
-                        duckdb::vector<duckdb::idx_t> projections_p,
-                        duckdb::idx_t estimated_cardinality,
+                        duckdb::vector<std::size_t> projections_p,
+                        std::size_t estimated_cardinality,
                         bool is_index_sort_p = false);
 
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  duckdb::vector<duckdb::idx_t> projections;
+  duckdb::vector<std::size_t> projections;
   bool is_index_sort;
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::FIXED_ORDER;
+    return sirius::OrderPreservationType::FIXED_ORDER;
   }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,

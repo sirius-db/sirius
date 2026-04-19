@@ -35,20 +35,20 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
 
   sirius_physical_sort_partition(duckdb::vector<duckdb::LogicalType> types,
                                  duckdb::vector<duckdb::BoundOrderByNode> orders,
-                                 duckdb::vector<duckdb::idx_t> projections_p,
-                                 duckdb::idx_t estimated_cardinality);
+                                 duckdb::vector<std::size_t> projections_p,
+                                 std::size_t estimated_cardinality);
 
   //! Order specification (copied from ORDER_BY)
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  duckdb::vector<duckdb::idx_t> projections;
+  duckdb::vector<std::size_t> projections;
 
  public:
   // Source interface
   bool is_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::FIXED_ORDER;
+    return sirius::OrderPreservationType::FIXED_ORDER;
   }
 
  public:

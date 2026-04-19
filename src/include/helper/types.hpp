@@ -16,10 +16,12 @@
 
 #pragma once
 
-namespace duckdb {
+namespace sirius {
 
 enum class OrderByType { ASCENDING, DESCENDING };
 
 enum class AggregationType { SUM, MIN, MAX, COUNT, COUNT_STAR, AVERAGE, FIRST, COUNT_DISTINCT };
 
-}  // namespace duckdb
+enum class OrderPreservationType { INSERTION_ORDER, NO_ORDER, FIXED_ORDER };
+
+}  // namespace sirius

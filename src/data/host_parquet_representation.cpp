@@ -55,7 +55,9 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
                                                               _size_in_bytes,
                                                               _uncompressed_size_in_bytes,
                                                               _file_size,
-                                                              _fallback_datasource);
+                                                              _fallback_datasource,
+                                                              _filter_expression,
+                                                              _post_filter_projection_ids);
   if (_post_convert_fn) { result->set_post_convert_fn(_post_convert_fn); }
   if (!_data_file_path.empty()) { result->set_data_file_path(_data_file_path); }
   return result;
@@ -74,7 +76,9 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::sh
                                     _size_in_bytes,
                                     _uncompressed_size_in_bytes,
                                     _file_size,
-                                    _fallback_datasource));
+                                    _fallback_datasource,
+                                    _filter_expression,
+                                    _post_filter_projection_ids));
   hpr->_column_chunks = _column_chunks;
   if (_post_convert_fn) { hpr->set_post_convert_fn(_post_convert_fn); }
   if (!_data_file_path.empty()) { hpr->set_data_file_path(_data_file_path); }

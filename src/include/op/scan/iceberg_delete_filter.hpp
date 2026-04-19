@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <numeric>
 #include <string>

@@ -193,7 +193,7 @@ TEST_CASE("bounded_thread_pool interrupt wakes multiple blocked callers", "[boun
   std::vector<std::thread> threads;
   for (int i = 0; i < num_waiters; ++i) {
     threads.emplace_back([&pool, &woken] {
-      pool.reserve();  // blocks until a slot is available or interrupted
+      (void)pool.reserve();  // blocks until a slot is available or interrupted
       woken.fetch_add(1);
     });
   }

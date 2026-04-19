@@ -159,13 +159,11 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
     file_paths.push_back(f.path);
   }
 
-  // Exclude hive partition columns from the parquet read projection
-  // (same filtering the base parquet constructor does for plain parquet scans).
-  std::unordered_set<size_t> hive_partition_indices;
-  for (auto const& hpi : bind_data.reader_bind.hive_partitioning_indexes) {
-    hive_partition_indices.insert(hpi.index);
-  }
-  auto selected = detail::make_selected_column_indices(*scan_op, hive_partition_indices);
+  // Compute selected columns. Any hive partition columns present here will be
+  // detected and stripped by the base class's initialize_from_files() via
+  // schema comparison, then re-injected via init_hive_partitions() below.
+  auto selected =
+    detail::make_selected_column_indices(scan_op->column_ids, scan_op->projection_ids);
 
   return {std::move(file_paths), std::move(selected)};
 }

@@ -1,6 +1,12 @@
 ---
 name: profile-analyzer
-description: Analyze Sirius GPU performance from nsys profiles — runs benchmarks, generates reports with kernel occupancy, memory bandwidth, operator attribution, and compares runs for regression detection.
+description: >
+  Use this skill to understand why a Sirius query is slow, identify GPU bottlenecks, or detect
+  performance regressions. Generates reports with kernel occupancy, memory bandwidth, operator
+  attribution, and cross-run comparisons. Trigger when the user mentions profiling, nsys, GPU
+  utilization, kernel analysis, performance reports, or wants to compare query timings across runs.
+  This skill focuses on measurement and reporting — for mapping hotspots to source code fixes,
+  use optimization-advisor instead.
 ---
 
 # Sirius nsys Profile Analyzer
@@ -26,7 +32,11 @@ This is the complete workflow: profile for GPU analysis, then run without profil
 
 **Step 1: Profiled run** (for GPU analysis data)
 ```bash
+# Profile against parquet files
 bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
+
+# Profile against a DuckDB database file (native table scan path)
+bash test/tpch_performance/nsys_report.sh --db-path <path_to.duckdb> [query_numbers...]
 ```
 
 **Step 2: Non-profiled timing run** (for accurate cold/hot times)
@@ -49,6 +59,7 @@ The non-profiled run produces per-query `timings.csv` files with accurate cold/h
 
 **Full options for the profiled run:**
 ```bash
+# Parquet scan profiling
 bash test/tpch_performance/nsys_report.sh \
     --sf <scale_factor> \
     --output-dir ./reports \
@@ -57,7 +68,19 @@ bash test/tpch_performance/nsys_report.sh \
     --query-timeout 120 \
     --compare <baseline_report_dir> \
     [query_numbers...]
+
+# DuckDB native table scan profiling
+bash test/tpch_performance/nsys_report.sh \
+    --db-path <path_to.duckdb> \
+    --output-dir ./reports \
+    --label <custom_name> \
+    --iterations 4 \
+    --query-timeout 120 \
+    --compare <baseline_report_dir> \
+    [query_numbers...]
 ```
+
+The `--db-path` option uses `profile_tpch_nsys_duckdb_native.sh` to profile against native DuckDB tables instead of parquet views. This exercises the `duckdb_scan_task` scan path rather than the `parquet_scan_task` path.
 
 **Output directory structure (profiled):**
 ```

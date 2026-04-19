@@ -58,7 +58,8 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   cucascade::memory::memory_space const* target_memory_space,
   rmm::cuda_stream_view stream)
 {
-  auto& host_src = source.cast<host_parquet_representation>();
+  auto& host_src                         = source.cast<host_parquet_representation>();
+  auto const& post_filter_projection_ids = host_src.get_post_filter_projection_ids();
 
   rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
   rmm::cuda_device_id target_device_id(target_memory_space->get_device_id());
@@ -88,22 +89,33 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   opts.set_row_groups({std::vector<cudf::size_type>(host_src.get_row_group_indices().begin(),
                                                     host_src.get_row_group_indices().end())});
 
-  auto result = cudf::io::read_parquet(opts, stream, mr_ref);
+  auto [table, md] = cudf::io::read_parquet(opts, stream, mr_ref);
 
   // Apply the post-convert hook (used by iceberg scan for V2 delete filtering).
   if (host_src.has_post_convert_fn()) {
-    result.tbl = host_src.apply_post_convert(std::move(result.tbl), stream);
+    table = host_src.apply_post_convert(std::move(table), stream);
   }
 
   // Inject hive partition columns (constant values from file path).
   if (host_src.has_partition_inject_fn()) {
-    result.tbl = host_src.apply_partition_inject(std::move(result.tbl), stream);
+    table = host_src.apply_partition_inject(std::move(table), stream);
   }
 
   stream.synchronize();
 
+  // Now we need to prune the post-filter columns from the table, if there are any.
+  if (!post_filter_projection_ids.empty()) {
+    auto columns = table->release();
+    std::vector<std::unique_ptr<cudf::column>> projected_columns;
+    projected_columns.reserve(post_filter_projection_ids.size());
+    for (auto const id : post_filter_projection_ids) {
+      projected_columns.push_back(std::move(columns[id]));
+    }
+    table = std::make_unique<cudf::table>(std::move(projected_columns));
+  }
+
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(result.tbl), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+    std::move(table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
 }
 
 /**
@@ -163,12 +175,14 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     std::move(dst_allocation),
     std::move(cloned_reader),
     host_src.get_reader_options(),
-    std::move(host_src.get_row_group_indices()),
-    std::move(host_src.get_column_chunk_byte_ranges()),
+    host_src.get_row_group_indices(),
+    host_src.get_column_chunk_byte_ranges(),
     data_size,
     host_src.get_uncompressed_data_size_in_bytes(),
     host_src.get_file_size(),
-    host_src.get_fallback_datasource());
+    host_src.get_fallback_datasource(),
+    host_src.get_filter_expression(),
+    host_src.get_post_filter_projection_ids());
   if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
   if (host_src.has_partition_inject_fn()) {
     dst->set_partition_inject_fn(host_src.get_partition_inject_fn());

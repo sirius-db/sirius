@@ -1,6 +1,10 @@
 ---
 name: update-docs
-description: Incrementally updates Super Sirius documentation by inspecting merged PRs since the last update. Use when user says "update docs", "refresh documentation", or "sync docs with code changes". Reads commit marker from docs/super-sirius/README.md, inspects PR diffs, and updates affected doc files.
+description: >
+  Use this skill to update Super Sirius documentation after code changes. Trigger when the user says
+  "update docs", "refresh documentation", "sync docs with code changes", or after merging PRs that
+  changed the Super Sirius codebase. Inspects merged PRs since the last update and patches affected
+  doc files.
 ---
 
 # Update Super Sirius Documentation
@@ -35,6 +39,12 @@ For each classified change:
 - **Config changes**: Update `configuration.md`
 
 CRITICAL: Read the actual source code for any changed files before updating documentation. Do not guess based on PR titles alone.
+
+IMPORTANT: Present proposed changes one file at a time for user review. Do not apply all changes at once. Show the user what will change in each file and wait for approval before proceeding to the next file.
+
+STYLE: Do not use changelog language ("replaced X with Y", "extracted from", "previously X, now Y"). Describe the current design as-is. These are reference docs, not a changelog. Only include PR numbers in `optimizations.md` entries.
+
+DEPTH: Keep descriptions at the right level of abstraction for the doc file. Don't add overly detailed implementation specifics (e.g., specific deadlock fixes, internal bug fixes) — focus on concepts, interfaces, and behavior that a developer reading the docs needs to understand.
 
 ### Step 5: Update Commit Marker
 Replace the commit hash in `docs/super-sirius/README.md`:

@@ -1,8 +1,10 @@
 ---
 name: build-errors
-description: Analyze C++/CUDA build errors, suggest fixes, and iteratively rebuild until success. Use when compilation fails.
-argument-hint: [preset] [--max-iterations N]
-disable-model-invocation: true
+description: >
+  Use this skill when the build fails, compilation errors occur, or you see undefined references,
+  linker errors, CUDA compilation issues, missing headers, or template instantiation failures.
+  Analyzes errors, suggests fixes, and iteratively rebuilds until success.
+argument-hint: "[preset] [--max-iterations N]"
 ---
 
 # Build Error Analyzer

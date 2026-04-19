@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -50,7 +51,7 @@ namespace op {
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
@@ -119,10 +120,10 @@ aggregate_layout build_aggregate_layout(
   for (size_t i = 0; i < aggregates.size(); ++i) {
     auto& agg = aggregates[i]->Cast<duckdb::BoundAggregateExpression>();
     if (agg.IsDistinct()) {
-      throw duckdb::NotImplementedException("Distinct aggregates not supported in GPU path yet");
+      throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
     }
     if (agg.children.size() > 1) {
-      throw duckdb::NotImplementedException("Aggregates with multiple children not supported yet");
+      throw not_implemented_exception("Aggregates with multiple children not supported yet");
     }
 
     aggregate_spec spec;
@@ -141,7 +142,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "count") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("count() without arguments not supported");
+        throw not_implemented_exception("count() without arguments not supported");
       }
       spec.kind          = aggregate_kind::COUNT;
       spec.return_type   = duckdb::LogicalType::BIGINT;
@@ -152,7 +153,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "sum" || fname == "sum_no_overflow") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("sum() without arguments not supported");
+        throw not_implemented_exception("sum() without arguments not supported");
       }
       spec.kind          = aggregate_kind::SUM;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -162,7 +163,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "min") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("min() without arguments not supported");
+        throw not_implemented_exception("min() without arguments not supported");
       }
       spec.kind          = aggregate_kind::MIN;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -172,7 +173,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "max") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("max() without arguments not supported");
+        throw not_implemented_exception("max() without arguments not supported");
       }
       spec.kind          = aggregate_kind::MAX;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -182,7 +183,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "avg") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("avg() without arguments not supported");
+        throw not_implemented_exception("avg() without arguments not supported");
       }
       spec.kind          = aggregate_kind::AVG;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -203,7 +204,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
       layout.merge_nth_index.push_back(0);  // first element
     } else {
-      throw duckdb::NotImplementedException("Aggregate not supported: " + fname);
+      throw not_implemented_exception("Aggregate not supported: " + fname);
     }
 
     layout.aggregates.push_back(std::move(spec));
@@ -269,7 +270,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
       case cudf::type_id::INT64:
         sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
         break;
-      default: throw duckdb::NotImplementedException("AVG: unsupported sum column type");
+      default: throw not_implemented_exception("AVG: unsupported sum column type");
     }
   }
 
@@ -313,7 +314,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
         out_scalar = make_numeric_scalar_with_value<int32_t>(
           out_cudf_type, static_cast<int32_t>(avg_host), stream);
         break;
-      default: throw duckdb::NotImplementedException("AVG: unsupported return type");
+      default: throw not_implemented_exception("AVG: unsupported return type");
     }
   }
 
@@ -326,9 +327,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (aggregates.empty()) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto layout = build_aggregate_layout(aggregates);
@@ -443,7 +446,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
-  return std::make_unique<operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
 // Helper to deep copy Expression vector (same as in grouped_aggregate)
@@ -472,7 +475,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality,
+  std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_AGGREGATE, std::move(types), estimated_cardinality),
@@ -489,9 +492,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
   if (aggregates.empty()) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
@@ -500,12 +505,14 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     if (batch) { valid_batches.push_back(batch); }
   }
   if (valid_batches.empty()) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
   if (space == nullptr) {
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto layout = build_aggregate_layout(aggregates);
@@ -518,7 +525,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   }
 
   if (!layout.has_avg) {
-    return std::make_unique<operator_data>(
+    return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
 
@@ -547,7 +554,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto const batch_id = ::sirius::get_next_batch_id();
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
-  return std::make_unique<operator_data>(
+  return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
 }
 
@@ -568,7 +575,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
 }  // namespace op
