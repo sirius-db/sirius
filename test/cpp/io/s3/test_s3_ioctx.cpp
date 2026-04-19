@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "io/datasource_factory.hpp"
+#include "io/s3/s3_io_object.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "sirius_config.hpp"
