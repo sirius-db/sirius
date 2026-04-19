@@ -568,7 +568,7 @@ void parquet_scan_task_global_state::init_hive_partitions(
     bool is_partition;
     size_t data_col_idx;
     std::string partition_name;
-    duckdb::LogicalType duckdb_type;
+    sirius::logical_type type;
   };
 
   // Map DuckDB primary index → cuDF column position.
@@ -586,19 +586,17 @@ void parquet_scan_task_global_state::init_hive_partitions(
     if (!seen.insert(primary_idx).second) continue;
 
     if (_hive_partition_index_set.count(primary_idx)) {
-      // scan_op->returned_types is now sirius::logical_type; DuckDBValueToCudfScalar
-      // takes duckdb::LogicalType, so convert at this boundary.
       output_map.push_back(col_source{/* is_partition */ true,
                                       /* data_col_idx */ 0,
                                       scan_op->names[primary_idx],
-                                      sirius::to_duckdb(scan_op->returned_types[primary_idx])});
+                                      scan_op->returned_types[primary_idx]});
     } else {
       auto it = duckdb_to_cudf.find(primary_idx);
       if (it != duckdb_to_cudf.end()) {
         output_map.push_back(col_source{/* is_partition */ false,
                                         /* data_col_idx */ it->second,
                                         /* partition_name */ {},
-                                        /* duckdb_type */ {}});
+                                        /* type */ {}});
       }
     }
   }
@@ -632,8 +630,9 @@ void parquet_scan_task_global_state::init_hive_partitions(
           throw std::runtime_error("[parquet_scan] Missing hive partition key '" +
                                    src.partition_name + "' in file path: " + file_path);
         }
-        auto duckdb_val = duckdb::Value(it->second).DefaultCastAs(src.duckdb_type);
-        auto scalar     = duckdb::DuckDBValueToCudfScalar(duckdb_val, src.duckdb_type, stream);
+        // DefaultCastAs requires a DuckDB type; the scalar factory takes the sirius type.
+        auto duckdb_val = duckdb::Value(it->second).DefaultCastAs(sirius::to_duckdb(src.type));
+        auto scalar     = sirius::value_to_cudf_scalar(duckdb_val, src.type, stream);
         output_columns.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
       }
     }
