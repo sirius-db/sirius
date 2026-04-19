@@ -47,17 +47,24 @@ namespace detail {
 /// 2× memory cost per pipeline thread.
 inline constexpr size_t BOUNCE_SLOT_BYTES = 16ULL * 1024 * 1024;
 
+/// Transfers at or below this size bypass the ring entirely: the
+/// cudaEventRecord + potential cudaEventSynchronize pair (~5–10 µs) exceeds
+/// the pageable-bounce savings on sub-4 KB copies. Fixes tiny-query tail
+/// regressions seen on Q11/Q16/Q22 where startup-dominated transfers pay
+/// ring overhead without benefiting from DMA overlap.
+inline constexpr size_t BOUNCE_SMALL_BYPASS = 4ULL * 1024;
+
 struct bounce_slot {
-  uint8_t*    buf    = nullptr;
-  cudaEvent_t ev     = nullptr;
-  bool        in_use = false;
+  uint8_t* buf   = nullptr;
+  cudaEvent_t ev = nullptr;
+  bool in_use    = false;
 };
 
 struct pinned_bounce_ring {
   static constexpr int NUM_SLOTS = 2;
   bounce_slot slots[NUM_SLOTS];
-  size_t      capacity = 0;   // per-slot capacity (0 = not yet initialized)
-  int         next     = 0;
+  size_t capacity = 0;  // per-slot capacity (0 = not yet initialized)
+  int next        = 0;
 
   ~pinned_bounce_ring()
   {
@@ -74,14 +81,14 @@ inline pinned_bounce_ring& get_tls_bounce_ring()
   if (ring.capacity == 0) {
     bool all_ok = true;
     for (auto& s : ring.slots) {
-      cudaError_t rc = ::cudaHostAlloc(reinterpret_cast<void**>(&s.buf),
-                                       BOUNCE_SLOT_BYTES,
-                                       cudaHostAllocPortable);
+      cudaError_t rc =
+        ::cudaHostAlloc(reinterpret_cast<void**>(&s.buf), BOUNCE_SLOT_BYTES, cudaHostAllocPortable);
       if (rc != cudaSuccess) {
         ::cudaGetLastError();
         s.buf = nullptr;
         SIRIUS_LOG_WARN("[pinned_bounce] slot alloc failed ({} MB): {}",
-                        BOUNCE_SLOT_BYTES / (1 << 20), ::cudaGetErrorString(rc));
+                        BOUNCE_SLOT_BYTES / (1 << 20),
+                        ::cudaGetErrorString(rc));
         all_ok = false;
         break;
       }
@@ -99,11 +106,12 @@ inline pinned_bounce_ring& get_tls_bounce_ring()
 /// memcpy can start while the prior DMA is still draining — only waits when
 /// the chosen slot is still in flight. Falls back to plain cudaMemcpyAsync
 /// when the transfer exceeds slot capacity or the ring failed to initialize.
-inline void bounce_h2d_async(void* d_dst,
-                             const void* src,
-                             size_t bytes,
-                             cudaStream_t stream)
+inline void bounce_h2d_async(void* d_dst, const void* src, size_t bytes, cudaStream_t stream)
 {
+  if (bytes <= detail::BOUNCE_SMALL_BYPASS) {
+    ::cudaMemcpyAsync(d_dst, src, bytes, cudaMemcpyHostToDevice, stream);
+    return;
+  }
   auto& ring = detail::get_tls_bounce_ring();
   if (ring.capacity == 0 || bytes > ring.capacity) {
     ::cudaMemcpyAsync(d_dst, src, bytes, cudaMemcpyHostToDevice, stream);
