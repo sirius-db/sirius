@@ -163,13 +163,22 @@ std::vector<byte_range_info> merge_byte_ranges(std::vector<byte_range_info> cons
 {
   if (byte_ranges.empty()) { return {}; }
 
+  // The merge walk requires ranges sorted by offset. Callers may pass ranges in
+  // projection order (e.g. reader->all_column_chunks_byte_ranges returns them in
+  // the order of set_column_names), which can differ from file-offset order when
+  // the user selects columns out of parquet-file order. Sort defensively.
+  std::vector<byte_range_info> sorted(byte_ranges.begin(), byte_ranges.end());
+  std::sort(sorted.begin(), sorted.end(), [](auto const& a, auto const& b) {
+    return a.offset() < b.offset();
+  });
+
   std::vector<byte_range_info> merged;
-  merged.reserve(byte_ranges.size());
+  merged.reserve(sorted.size());
 
-  auto current_start = byte_ranges[0].offset();
-  auto current_end   = current_start + byte_ranges[0].size();
+  auto current_start = sorted[0].offset();
+  auto current_end   = current_start + sorted[0].size();
 
-  for (auto const& range : byte_ranges) {
+  for (auto const& range : sorted) {
     auto const range_start = range.offset();
     auto const range_end   = range_start + range.size();
 
