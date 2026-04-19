@@ -21,7 +21,8 @@ TEST_BUILD_TARGET ?= unittest
 
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	clang-release clang-debug clang-relwithdebinfo \
-	test test_release test_debug test_reldebug clean list-presets
+	test test_release test_debug test_reldebug clean list-presets \
+	s3-up s3-down s3-test
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -88,3 +89,29 @@ clean:
 
 list-presets: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
+
+# -----------------------------------------------------------------------------
+# S3 integration test scaffolding (PR15)
+# -----------------------------------------------------------------------------
+# `make s3-up`    starts the pinned MinIO container and populates fixtures.
+# `make s3-down`  tears it down (including the data volume).
+# `make s3-test`  runs the [s3][integration] Catch2 tag against it.
+#
+# See test/integration/s3/README.md for details.
+
+S3_COMPOSE := test/integration/s3/docker-compose.yml
+S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
+
+s3-up:
+	docker compose -f $(S3_COMPOSE) up -d
+	test/integration/s3/fixtures.sh
+
+s3-down:
+	docker compose -f $(S3_COMPOSE) down -v
+
+s3-test:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-test: $(S3_TEST_BIN) not found — run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@. test/integration/s3/env.sh && $(S3_TEST_BIN) "[s3][integration]"
