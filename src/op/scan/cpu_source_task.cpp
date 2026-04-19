@@ -85,6 +85,7 @@ cpu_source_task::~cpu_source_task()
 ///   For VARCHAR: [offsets: (num_rows+1)*4] [data: total_string_bytes] [mask: ceil(num_rows/8)]
 static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   duckdb::DataChunk& chunk,
+  const duckdb::vector<sirius::logical_type>& types,
   cucascade::memory::memory_space& mem_space,
   cucascade::memory::reservation* reservation)
 {
@@ -106,14 +107,16 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
         &mem_space));
   }
 
-  // First pass: calculate total allocation size and flatten vectors
+  // First pass: calculate total allocation size and flatten vectors. Dispatch
+  // on sirius::logical_type predicates rather than re-deriving DuckDB types
+  // from chunk.data[c].GetType(); types[] is the canonical shape and avoids
+  // a sirius → DuckDB → sirius hop.
   size_t total_size = 0;
   for (size_t c = 0; c < num_cols; c++) {
     chunk.data[c].Flatten(chunk.size());
     total_size = (total_size + 7) & ~size_t{7};  // align to 8 bytes
 
-    auto const& type = chunk.data[c].GetType();
-    if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+    if (types[c].is_varchar()) {
       // Offsets array
       total_size += static_cast<size_t>(num_rows + 1) * sizeof(int32_t);
       // Calculate total string data size
@@ -125,7 +128,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
       }
       total_size += string_bytes;
     } else {
-      total_size += static_cast<size_t>(num_rows) * duckdb::GetTypeIdSize(type.InternalType());
+      total_size += static_cast<size_t>(num_rows) * types[c].fixed_width_byte_size();
     }
     // Validity mask
     total_size += utils::ceil_div_8(static_cast<size_t>(num_rows));
@@ -158,19 +161,17 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     offset = (offset + 7) & ~size_t{7};  // align
 
     auto& vec             = chunk.data[c];
-    auto const& type      = vec.GetType();
+    auto const& sirius_t  = types[c];
     auto const& validity  = duckdb::FlatVector::Validity(vec);
     cudf::size_type nulls = 0;
 
     cucascade::memory::column_metadata col{};
-    col.type_id  = duckdb::GetCudfType(type).id();
+    col.type_id  = sirius::get_cudf_type(sirius_t).id();
     col.num_rows = num_rows;
     col.scale    = 0;
-    if (type.id() == duckdb::LogicalTypeId::DECIMAL) {
-      col.scale = static_cast<int32_t>(duckdb::DecimalType::GetScale(type));
-    }
+    if (sirius_t.is_decimal()) { col.scale = static_cast<int32_t>(sirius_t.decimal_scale()); }
 
-    if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+    if (sirius_t.is_varchar()) {
       // STRING column: offsets child + data
       auto* string_data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
 
@@ -228,7 +229,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
 
     } else {
       // Fixed-width column
-      size_t type_size = duckdb::GetTypeIdSize(type.InternalType());
+      size_t type_size = sirius_t.fixed_width_byte_size();
 
       // Write data
       size_t data_offset = offset;
@@ -305,7 +306,10 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
 
   if (source.collection && source.collection->Count() > 0) {
-    // Scan the ColumnDataCollection chunk by chunk
+    // Scan the ColumnDataCollection chunk by chunk. source.types is the
+    // operator's sirius-type view of the same schema as
+    // source.collection->Types() — we use it directly to avoid a per-batch
+    // sirius::from_duckdb_vec hop.
     duckdb::ColumnDataScanState scan_state;
     source.collection->InitializeScan(scan_state);
 
@@ -314,7 +318,7 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
 
     while (source.collection->Scan(scan_state, chunk)) {
       if (chunk.size() == 0) break;
-      batches.push_back(chunk_to_data_batch(chunk, mem_space, reservation_ptr));
+      batches.push_back(chunk_to_data_batch(chunk, source.types, mem_space, reservation_ptr));
       chunk.Reset();
     }
   } else if (source.produce_single_row) {
@@ -328,21 +332,22 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
     // handled safely in chunk_to_data_batch: the loop checks validity before
     // reading the string_t payload.
     duckdb::DataChunk chunk;
-    // source.types carries sirius::logical_type (post PR #643); DataChunk
-    // still speaks DuckDB types, so convert at the boundary.
+    // source.types is sirius::logical_type post-#643. DataChunk still speaks
+    // DuckDB types — to_duckdb_vec is the unavoidable boundary conversion.
     chunk.Initialize(duckdb::Allocator::DefaultAllocator(), sirius::to_duckdb_vec(source.types));
     chunk.SetCardinality(1);
-    for (auto& vec : chunk.data) {
+    for (size_t c = 0; c < chunk.data.size(); c++) {
+      auto& vec      = chunk.data[c];
       auto& validity = duckdb::FlatVector::Validity(vec);
       validity.SetAllInvalid(1);
-      if (vec.GetType().InternalType() != duckdb::PhysicalType::VARCHAR) {
-        auto type_size = duckdb::GetTypeIdSize(vec.GetType().InternalType());
+      if (!source.types[c].is_varchar()) {
+        auto type_size = source.types[c].fixed_width_byte_size();
         if (type_size > 0) {
           std::memset(duckdb::FlatVector::GetData(vec), 0, type_size);
         }
       }
     }
-    batches.push_back(chunk_to_data_batch(chunk, mem_space, reservation_ptr));
+    batches.push_back(chunk_to_data_batch(chunk, source.types, mem_space, reservation_ptr));
   }
   // else: EMPTY_RESULT — produce no data batches
 
