@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
+#include "downgrade/downgrade_executor.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -30,17 +31,21 @@
 
 #include <util/stream_check_wrapper.hpp>
 
+#include <algorithm>
+#include <mutex>
 namespace sirius {
 namespace pipeline {
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
-  exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
+  exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
+  sirius::parallel::downgrade_executor* downgrade_executor)
   : sirius::parallel::itask_executor(config),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
-    _memory_space(mem_space)
+    _memory_space(mem_space),
+    _downgrade_executor(downgrade_executor)
 {
 }
 
@@ -86,8 +91,10 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
     SIRIUS_LOG_TRACE(
-      "GPU Pipeline Executor: Acquiring memory reservation of {} bytes for task {}. Memory "
+      "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
+      "{}. Memory "
       "available: {}, total reserved: {}, max: {}",
+      gpu_task->get_pipeline_id(),
       bytes_needs,
       gpu_task->get_task_id(),
       _memory_space->get_available_memory(),
@@ -103,6 +110,91 @@ void gpu_pipeline_executor::manager_loop()
           std::to_string(gpu_task->get_task_id()));
       }
       break;
+    } else if (reservation->size() < bytes_needs && _downgrade_executor) {
+      size_t shortfall    = bytes_needs - reservation->size();
+      size_t partial_size = reservation->size();
+      size_t target_bytes = std::max(shortfall + shortfall / 4, bytes_needs / 4);
+
+      SIRIUS_LOG_DEBUG(
+        "GPU Pipeline Executor: requested reservation size {} but only got {} bytes, reservation "
+        "shortfall {} bytes for pipeline {} "
+        "task {}, requesting predicate-based downgrade (target_bytes={})",
+        bytes_needs,
+        partial_size,
+        shortfall,
+        gpu_task->get_pipeline_id(),
+        gpu_task->get_task_id(),
+        target_bytes);
+
+      reservation.reset();  // release partial reservation before downgrade
+
+      std::unique_ptr<cucascade::memory::reservation> new_reservation;
+      auto* mem_space = _memory_space;
+      size_t freed    = 0;
+      std::mutex reservation_mutex;
+      try {
+        freed =
+          _downgrade_executor
+            ->request_downgrade(target_bytes,
+                                [mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
+                                  std::lock_guard<std::mutex> lock(reservation_mutex);
+                                  if (new_reservation) { return true; }
+                                  auto res = mem_space->make_reservation_or_null(bytes_needs);
+                                  if (res && res->size() >= bytes_needs) {
+                                    new_reservation = std::move(res);
+                                  }
+                                  return new_reservation != nullptr;
+                                })
+            .get();
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
+                        gpu_task->get_task_id(),
+                        e.what());
+        break;
+      }
+
+      if (new_reservation) {
+        reservation = std::move(new_reservation);
+      } else {
+        // Predicate never succeeded — try one final reservation attempt
+        reservation = _memory_space->make_reservation(bytes_needs);
+      }
+
+      if (!reservation) {
+        SIRIUS_LOG_ERROR(
+          "GPU Pipeline Executor: Failed to acquire memory reservation after "
+          "downgrade for task {} (freed {} bytes)",
+          gpu_task->get_task_id(),
+          freed);
+        if (_completion_handler) {
+          _completion_handler->report_error(
+            "GPU Pipeline Executor: Failed to acquire memory reservation "
+            "after downgrade for task " +
+            std::to_string(gpu_task->get_task_id()));
+        }
+        break;
+      }
+      if (reservation->size() < bytes_needs) {
+        SIRIUS_LOG_WARN(
+          "GPU Pipeline Executor: after downgrade ({} bytes freed), reservation "
+          "still partial ({}/{} bytes) for pipeline {} task {} -- proceeding "
+          "with partial reservation",
+          freed,
+          reservation->size(),
+          bytes_needs,
+          gpu_task->get_pipeline_id(),
+          gpu_task->get_task_id());
+      }
+    } else if (reservation->size() < bytes_needs) {
+      // No downgrade executor available -- warn and proceed (this should never happen)
+      SIRIUS_LOG_WARN(
+        "GPU Pipeline Executor: Acquired memory reservation does not match "
+        "requested size for pipeline {} of {} bytes needed for task "
+        "{}. Reservation size: {}. WARNING: Downgrade executor is not available",
+        gpu_task->get_pipeline_id(),
+        bytes_needs,
+        gpu_task->get_task_id(),
+        reservation->size());
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
@@ -190,8 +282,10 @@ void gpu_pipeline_executor::manager_loop()
           // Operator outputs are in idle state; transition to task_created so
           // lock_or_prepare_batch() can lock them for the rescheduled task.
           auto intermediate_data = oom.release_intermediate_data();
-          if (intermediate_data) {
-            for (auto& batch : intermediate_data->get_data_batches()) {
+          auto* pipelineable_intermediate =
+            dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get());
+          if (pipelineable_intermediate) {
+            for (auto& batch : pipelineable_intermediate->get_data_batches()) {
               if (batch) { batch->try_to_create_task(); }
             }
           }

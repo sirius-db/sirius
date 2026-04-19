@@ -62,6 +62,11 @@ class cpu_source_task_global_state : public pipeline::sirius_pipeline_task_globa
 class cpu_source_task_local_state : public pipeline::sirius_pipeline_task_local_state {
  public:
   cpu_source_task_local_state() = default;
+
+  // cpu_source_task runs on a tiny pre-computed DuckDB collection; memory use
+  // is bounded by the reservation we request in compute_task() rather than by
+  // an input-data basis the estimator could derive from.
+  [[nodiscard]] std::size_t get_task_consumption_basis() const override { return 0; }
 };
 
 //===----------------------------------------------------------------------===//

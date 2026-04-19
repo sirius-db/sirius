@@ -21,6 +21,7 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 
 namespace duckdb {
+using sirius::AggregationType;
 
 template <cudf::reduce_aggregation::Kind kind>
 static std::unique_ptr<cudf::reduce_aggregation> make_reduce_aggregation()
@@ -131,6 +132,22 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
         // INT64 SUM can overflow - GPU doesn't support INT128 accumulator
         // Throw exception to trigger CPU fallback which handles overflow correctly
         throw NotImplementedException("GPU SUM of BIGINT may overflow - falling back to CPU");
+      } else if (to_cudf_type.id() == cudf::type_id::DECIMAL32) {
+        int32_t scale = to_cudf_type.scale();
+        to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL64, scale);
+        auto casted_col =
+          cudf::cast(cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->mr);
+        auto casted_result = cudf::reduce(casted_col->view(), *aggregate, to_cudf_type);
+        column[agg]->setFromCudfScalar(*casted_result, gpuBufferManager);
+        continue;
+      } else if (to_cudf_type.id() == cudf::type_id::DECIMAL64) {
+        int32_t scale = to_cudf_type.scale();
+        to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL128, scale);
+        auto casted_col =
+          cudf::cast(cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->mr);
+        auto casted_result = cudf::reduce(casted_col->view(), *aggregate, to_cudf_type);
+        column[agg]->setFromCudfScalar(*casted_result, gpuBufferManager);
+        continue;
       }
 
       // CuDF reduce will return an invalid scalar if all values are NULL

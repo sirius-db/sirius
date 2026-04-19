@@ -73,7 +73,7 @@ class MultiFormatFixtureBase {
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
-      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.yaml";
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
       db           = std::make_unique<duckdb::DuckDB>(nullptr);

@@ -182,7 +182,8 @@ struct parquet_test_fixture {
   /**
    * @brief Build a host_parquet_representation with the given memory space.
    */
-  std::unique_ptr<host_parquet_representation> build_representation(memory_space* mem_space)
+  std::unique_ptr<host_parquet_representation> build_representation(
+    memory_space* mem_space, std::vector<std::size_t> post_filter_projection_ids = {})
   {
     auto* host_mr = mem_space->get_memory_resource_as<fixed_size_host_memory_resource>();
     REQUIRE(host_mr != nullptr);
@@ -226,7 +227,9 @@ struct parquet_test_fixture {
                                                          size_in_bytes,
                                                          uncompressed_size_in_bytes,
                                                          _datasource->size(),
-                                                         _datasource);
+                                                         _datasource,
+                                                         nullptr,
+                                                         std::move(post_filter_projection_ids));
   }
 
   ~parquet_test_fixture()
@@ -267,7 +270,7 @@ TEST_CASE("host_parquet_representation construction", "[host_parquet_representat
 
   SECTION("has correct uncompressed size")
   {
-    REQUIRE(repr->get_uncompressed_size_in_bytes() == fixture.uncompressed_size_in_bytes);
+    REQUIRE(repr->get_uncompressed_data_size_in_bytes() == fixture.uncompressed_size_in_bytes);
   }
 
   SECTION("has row group indices")
@@ -303,7 +306,7 @@ TEST_CASE("host_parquet_representation clone creates independent copy",
   parquet_test_fixture fixture;
   fixture.setup(1000, "clone_test");
 
-  auto repr = fixture.build_representation(host_space);
+  auto repr = fixture.build_representation(host_space, {0, 2});
   REQUIRE(repr != nullptr);
 
   auto cloned_base = repr->clone(rmm::cuda_stream_default);
@@ -329,12 +332,18 @@ TEST_CASE("host_parquet_representation clone creates independent copy",
 
   SECTION("cloned representation has same uncompressed size")
   {
-    REQUIRE(cloned->get_uncompressed_size_in_bytes() == repr->get_uncompressed_size_in_bytes());
+    REQUIRE(cloned->get_uncompressed_data_size_in_bytes() ==
+            repr->get_uncompressed_data_size_in_bytes());
   }
 
   SECTION("cloned representation has same row group indices")
   {
     REQUIRE(cloned->get_row_group_indices() == repr->get_row_group_indices());
+  }
+
+  SECTION("cloned representation preserves post-filter projection ids")
+  {
+    REQUIRE(cloned->get_post_filter_projection_ids() == repr->get_post_filter_projection_ids());
   }
 
   SECTION("cloned representation has same column chunk byte ranges")
@@ -622,6 +631,82 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
   std::filesystem::remove(parquet_path);
 }
 
+TEST_CASE("host_parquet_representation converts to GPU with post-filter projected columns",
+          "[host_parquet_representation][converters][gpu][projection]")
+{
+  sirius_memory_reservation_manager mgr(create_test_configs());
+  cucascade::representation_converter_registry registry;
+  cucascade::register_builtin_converters(registry);
+  register_parquet_converters(registry);
+
+  auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
+  auto* gpu_space  = const_cast<memory_space*>(mgr.get_memory_space(Tier::GPU, 0));
+  REQUIRE(host_space != nullptr);
+  REQUIRE(gpu_space != nullptr);
+
+  // This test runs without a SiriusContext so cuDF's global pinned memory resource
+  // may be unset or point to a stale allocator from a previously-paused context.
+  // Explicitly install a slab allocator backed by the test's own fixed_size_host_memory_resource.
+  auto* fsmr =
+    host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+  REQUIRE(fsmr != nullptr);
+  cucascade::memory::small_pinned_host_memory_resource slab_mr(*fsmr);
+  struct cudf_pinned_guard {
+    rmm::host_device_async_resource_ref prev_mr;
+    std::size_t prev_threshold;
+    ~cudf_pinned_guard() noexcept
+    {
+      cudf::set_pinned_memory_resource(prev_mr);
+      cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
+    }
+  } pinned_guard{cudf::set_pinned_memory_resource(slab_mr),
+                 cudf::get_allocate_host_as_pinned_threshold()};
+  cudf::set_allocate_host_as_pinned_threshold(
+    cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+
+  parquet_test_fixture fixture;
+  fixture.setup(200, "projected_test");
+
+  // This models the parquet reader output for a projected scan that also had a filter-only
+  // column appended by the planner. The materialized table is still in column_ids order
+  // ([id, value, price]), so keeping the final output columns means selecting positions {0, 2}.
+  std::vector<std::size_t> const post_filter_projection_ids{0, 2};
+  auto repr = fixture.build_representation(host_space, post_filter_projection_ids);
+  REQUIRE(repr != nullptr);
+  REQUIRE(repr->get_post_filter_projection_ids() == post_filter_projection_ids);
+
+  auto stream     = gpu_space->acquire_stream();
+  auto gpu_result = registry.convert<cucascade::gpu_table_representation>(*repr, gpu_space, stream);
+  stream.synchronize();
+
+  REQUIRE(gpu_result != nullptr);
+  auto table_view = gpu_result->get_table().view();
+  REQUIRE(table_view.num_rows() == 200);
+  REQUIRE(table_view.num_columns() == 2);
+  REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
+  REQUIRE(table_view.column(1).type().id() == cudf::type_id::FLOAT64);
+
+  std::vector<int32_t> ids(table_view.num_rows());
+  std::vector<double> prices(table_view.num_rows());
+  cudaMemcpy(ids.data(),
+             table_view.column(0).data<int32_t>(),
+             sizeof(int32_t) * ids.size(),
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(prices.data(),
+             table_view.column(1).data<double>(),
+             sizeof(double) * prices.size(),
+             cudaMemcpyDeviceToHost);
+
+  for (size_t i = 0; i < ids.size(); ++i) {
+    REQUIRE(ids[i] == static_cast<int32_t>(i));
+    REQUIRE(prices[i] == static_cast<double>(ids[i]) * 1.5);
+  }
+
+  // Explicitly destroy GPU result and representation before the memory manager
+  gpu_result.reset();
+  repr.reset();
+}
+
 TEST_CASE("host_parquet_representation clone then convert to GPU",
           "[host_parquet_representation][clone][converters][gpu]")
 {
@@ -705,7 +790,7 @@ TEST_CASE("host_parquet_representation cross-host copy converter",
   parquet_test_fixture fixture;
   fixture.setup(200, "cross_host");
 
-  auto repr = fixture.build_representation(host_space_0);
+  auto repr = fixture.build_representation(host_space_0, {0, 2});
   REQUIRE(repr != nullptr);
   REQUIRE(repr->get_device_id() == host_space_0->get_device_id());
 
@@ -717,4 +802,5 @@ TEST_CASE("host_parquet_representation cross-host copy converter",
   REQUIRE(result->get_current_tier() == Tier::HOST);
   REQUIRE(result->get_device_id() == host_space_1->get_device_id());
   REQUIRE(result->get_size_in_bytes() == repr->get_size_in_bytes());
+  REQUIRE(result->get_post_filter_projection_ids() == repr->get_post_filter_projection_ids());
 }

@@ -17,6 +17,7 @@
 #include "pipeline/pipeline_executor.hpp"
 
 #include "creator/task_creator.hpp"
+#include "downgrade/downgrade_executor.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -33,10 +34,12 @@
 namespace sirius {
 namespace pipeline {
 
-pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executor_config,
-                                     const exec::thread_pool_config& scan_executor_config,
-                                     sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-                                     const cucascade::memory::system_topology_info* sys_topology)
+pipeline_executor::pipeline_executor(
+  const exec::thread_pool_config& gpu_executor_config,
+  const exec::thread_pool_config& scan_executor_config,
+  sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  const cucascade::memory::system_topology_info* sys_topology,
+  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
 {
   // Create the scan executor with memory manager for host allocations
   // Pass a publisher so it can submit task requests without depending on pipeline_executor
@@ -57,12 +60,24 @@ pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executo
 
       if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
     }
+    // Find matching downgrade executor for this GPU space
+    sirius::parallel::downgrade_executor* dg_exec = nullptr;
+    if (downgrade_executors) {
+      for (auto& de : *downgrade_executors) {
+        if (de->get_space_id() == space->get_id()) {
+          dg_exec = de.get();
+          break;
+        }
+      }
+    }
+
     // Pass a publisher so gpu_pipeline_executor can submit task requests
     _gpu_executors.emplace(
       device_id,
       std::make_unique<gpu_pipeline_executor>(config,
                                               const_cast<cucascade::memory::memory_space*>(space),
-                                              _task_request_channel.make_publisher()));
+                                              _task_request_channel.make_publisher(),
+                                              dg_exec));
   }
 }
 

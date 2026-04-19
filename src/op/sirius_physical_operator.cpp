@@ -17,10 +17,13 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include "gpu_executor.hpp"
+#include "log/logging.hpp"
+#include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/error.hpp>
 
 #include <optional>
 
@@ -28,48 +31,44 @@ namespace sirius {
 namespace op {
 
 //===--------------------------------------------------------------------===//
-// Operator
+// pipelineable_operator_data
 //===--------------------------------------------------------------------===//
-// LCOV_EXCL_START
-duckdb::unique_ptr<duckdb::OperatorState> sirius_physical_operator::get_operator_state(
-  duckdb::ExecutionContext& context) const
-{
-  return duckdb::make_uniq<duckdb::OperatorState>();
-}
 
-duckdb::unique_ptr<duckdb::GlobalOperatorState> sirius_physical_operator::get_global_operator_state(
-  duckdb::ClientContext& context) const
+std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+pipelineable_operator_data::prepare_for_processing(
+  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
-  return duckdb::make_uniq<duckdb::GlobalOperatorState>();
-}
+  std::vector<::cucascade::data_batch_processing_handle> handles;
+  handles.reserve(_data_batches.size());
 
-//===--------------------------------------------------------------------===//
-// Source
-//===--------------------------------------------------------------------===//
-duckdb::unique_ptr<duckdb::LocalSourceState> sirius_physical_operator::get_local_source_state(
-  duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const
-{
-  return duckdb::make_uniq<duckdb::LocalSourceState>();
-}
+  for (const auto& batch : _data_batches) {
+    if (!batch) {
+      SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
+      return std::nullopt;
+    }
+    std::optional<::cucascade::data_batch_processing_handle> handle;
+    try {
+      handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+    } catch (const rmm::out_of_memory&) {
+      SIRIUS_LOG_ERROR(
+        "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+      throw;
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "pipelineable_operator_data: Unknown error at batch {} preparing for processing, "
+        "state: {}: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()),
+        e.what());
+      throw;
+    }
+    if (!handle) { return std::nullopt; }
+    handles.emplace_back(std::move(*handle));
+  }
 
-duckdb::unique_ptr<duckdb::GlobalSourceState> sirius_physical_operator::get_global_source_state(
-  duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalSourceState>();
-}
-//===--------------------------------------------------------------------===//
-// Sink
-//===--------------------------------------------------------------------===//
-duckdb::unique_ptr<duckdb::LocalSinkState> sirius_physical_operator::get_local_sink_state(
-  duckdb::ExecutionContext& context) const
-{
-  return duckdb::make_uniq<duckdb::LocalSinkState>();
-}
-
-duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global_sink_state(
-  duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalSinkState>();
+  return handles;
 }
 
 std::string sirius_physical_operator::get_name() const
@@ -97,12 +96,9 @@ sirius_physical_operator::get_children() const
 void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& current,
                                                pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  op_state.reset();
-
   auto& state = meta_pipeline.get_state();
   if (is_sink()) {
     // operator is a sink, build a pipeline
-    sink_state.reset();
     D_ASSERT(children.size() == 1);
 
     // single operator: the operator becomes the data source of the current pipeline
@@ -118,7 +114,7 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
       state.set_pipeline_source(current, *this);
     } else {
       if (children.size() != 1) {
-        throw duckdb::InternalException("Operator not supported in build_pipelines");
+        throw internal_exception("Operator not supported in build_pipelines");
       }
       state.add_pipeline_operator(current, *this);
       children[0]->build_pipelines(current, meta_pipeline);
@@ -140,7 +136,7 @@ sirius_physical_operator::get_sources() const
       return result;
     } else {
       if (children.size() != 1) {
-        throw duckdb::InternalException("Operator not supported in get_sources");
+        throw internal_exception("Operator not supported in get_sources");
       }
       return children[0]->get_sources();
     }
@@ -184,15 +180,16 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
     for (auto& [port_name, port_ptr] : ports) {
       ports_string += port_name + ", ";
     }
-    throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
-                                    get_name() + " existing ports are: " + ports_string);
+    throw internal_exception("Port " + std::string(port_id) + " not found in operator " +
+                             get_name() + " existing ports are: " + ports_string);
   }
   return it->second;
 }
 
 void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  for (auto& batch : output_data.get_data_batches()) {
+  auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
+  for (auto& batch : pipelineable_output.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
       next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name, batch);
     }
@@ -203,7 +200,8 @@ std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_
                                                                  rmm::cuda_stream_view stream)
 {
   // not doing anything for now
-  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{});
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
@@ -276,7 +274,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
     if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
 bool sirius_physical_operator::all_ports_empty()

@@ -44,17 +44,17 @@ class sirius_physical_plan_generator {
   duckdb::LogicalDependencyList dependencies;
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
-  duckdb::unordered_map<duckdb::idx_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
+  duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
     recursive_cte_tables;
   //! Used to reference the recurring tables
-  duckdb::unordered_map<duckdb::idx_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
+  duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
     recurring_cte_tables;
   //! Materialized CTE ids must be collected.
   duckdb::unordered_map<
-    duckdb::idx_t,
+    std::size_t,
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>>
     materialized_ctes;
-  // duckdb::unordered_map<duckdb::idx_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
+  // duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
   // gpu_recursive_cte_tables;
 
  public:
@@ -72,11 +72,10 @@ class sirius_physical_plan_generator {
                                        sirius::op::sirius_physical_operator& plan);
   //! The order preservation type of the given operator decided by recursively looking at its
   //! children
-  static duckdb::OrderPreservationType order_preservation_recursive(
+  static sirius::OrderPreservationType order_preservation_recursive(
     sirius::op::sirius_physical_operator& op);
 
-  static bool has_equality(duckdb::vector<duckdb::JoinCondition>& conds,
-                           duckdb::idx_t& range_count);
+  static bool has_equality(duckdb::vector<duckdb::JoinCondition>& conds, std::size_t& range_count);
 
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
@@ -165,7 +164,7 @@ class sirius_physical_plan_generator {
   bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
-  duckdb::idx_t delim_index = 0;
+  std::size_t delim_index = 0;
 
  public:
   duckdb::ClientContext& context;

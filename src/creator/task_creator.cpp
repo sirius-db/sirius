@@ -72,6 +72,10 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
+    // Give each pipeline a pointer to this task_creator so that when a pipeline
+    // finishes (including via downstream notification), it can schedule output consumers.
+    pipeline->set_task_creator(this);
+
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) { continue; }
 
@@ -331,8 +335,8 @@ void task_creator::manager_loop()
                                  : &node->Cast<op::sirius_physical_parquet_scan>();
           while (true) {
             pipeline->mark_task_created();
-            auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
-            if (!partition_idx.has_value()) {
+            auto partition = parquet_task_global_state->claim_next_rg_partition();
+            if (!partition.has_value()) {
               pipeline->mark_task_completed();
               if (pipeline->is_pipeline_finished()) {
                 auto output_consumers = pipeline->get_output_consumers();
@@ -348,7 +352,7 @@ void task_creator::manager_loop()
 
             auto parquet_task_local_state =
               std::make_unique<op::scan::parquet_scan_task_local_state>(*parquet_task_global_state,
-                                                                        *partition_idx);
+                                                                        *partition);
 
             if (destination_data_repositories.empty()) {
               throw std::runtime_error(
@@ -396,7 +400,10 @@ void task_creator::manager_loop()
             pipeline->mark_task_created();
 
             auto input_data = node->get_next_task_input_data();
-            if (!input_data || input_data->get_data_batches().empty()) {
+            auto* pipelineable_input =
+              dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
+            if (!input_data ||
+                (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
               // No data was available (e.g., another thread already consumed it).
               // Balance the counter. mark_task_completed() calls update_pipeline_status()
               // which is correct: if all ports are truly empty and all real tasks have

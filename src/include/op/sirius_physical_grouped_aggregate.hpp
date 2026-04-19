@@ -44,7 +44,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
-    duckdb::idx_t estimated_cardinality);
+    std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate(
     duckdb::ClientContext& context,
@@ -52,8 +52,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
-    duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> grouping_functions,
-    duckdb::idx_t estimated_cardinality,
+    duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
+    std::size_t estimated_cardinality,
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
@@ -71,8 +71,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   // duckdb::vector<duckdb::LogicalType> input_group_types;
 
   // // Filters given to sink and friends
-  // duckdb::unsafe_vector<duckdb::idx_t> non_distinct_filter;
-  // duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
+  // duckdb::unsafe_vector<std::size_t> non_distinct_filter;
+  // duckdb::unsafe_vector<std::size_t> distinct_filter;
 
   // duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
 
@@ -98,9 +98,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   // Source interface
   bool is_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::NO_ORDER;
+    return sirius::OrderPreservationType::NO_ORDER;
   }
 
   // Sink interface

@@ -42,7 +42,13 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
 
   std::optional<task_creation_hint> get_next_task_hint() override
   {
-    if (exhausted.load()) { return std::nullopt; }
+    // A CPU source is single-shot: one task drains the collection. Gate task
+    // creation on task_scheduled so concurrent calls from the task creator
+    // cannot produce duplicate cpu_source_tasks (which would duplicate batches
+    // into the repo). exhausted alone isn't sufficient because it flips only
+    // after the task runs, leaving a window where a second task can be created.
+    bool expected = false;
+    if (!task_scheduled.compare_exchange_strong(expected, true)) { return std::nullopt; }
     return task_creation_hint{TaskCreationHint::READY, this};
   }
 
@@ -52,6 +58,8 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection;
   //! Whether to produce a single empty row (DUMMY_SCAN behavior)
   bool produce_single_row{false};
+  //! Whether a cpu_source_task has been handed out for this operator.
+  std::atomic<bool> task_scheduled{false};
   //! Whether the source has been fully consumed
   std::atomic<bool> exhausted{false};
 };

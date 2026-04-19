@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "sirius/exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -26,8 +27,8 @@ namespace op {
 
 sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
                                              duckdb::vector<duckdb::BoundOrderByNode> orders,
-                                             duckdb::vector<duckdb::idx_t> projections_p,
-                                             duckdb::idx_t estimated_cardinality,
+                                             duckdb::vector<std::size_t> projections_p,
+                                             std::size_t estimated_cardinality,
                                              bool is_index_sort_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
@@ -41,7 +42,8 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
                                                               rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
-  const auto& input_batches = input_data.get_data_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_data_batches();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -53,7 +55,7 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
 
   for (auto const& ord : orders) {
     if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw duckdb::NotImplementedException("Order by only supports bound reference expressions");
+      throw not_implemented_exception("Order by only supports bound reference expressions");
     }
     auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     order_key_idx.push_back(idx);
@@ -79,7 +81,7 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
     if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
   }
 
-  return std::make_unique<operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
 }  // namespace op

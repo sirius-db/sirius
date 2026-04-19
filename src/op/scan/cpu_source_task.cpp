@@ -74,7 +74,9 @@ cpu_source_task::~cpu_source_task()
 ///   [data: type_size * num_rows] [mask: ceil(num_rows/8) bytes]
 ///   For VARCHAR: [offsets: (num_rows+1)*4] [data: total_string_bytes] [mask: ceil(num_rows/8)]
 static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
-  duckdb::DataChunk& chunk, cucascade::memory::memory_space& mem_space)
+  duckdb::DataChunk& chunk,
+  cucascade::memory::memory_space& mem_space,
+  cucascade::memory::reservation* reservation)
 {
   using host_table_allocation    = cucascade::memory::host_table_allocation;
   using host_data_representation = cucascade::host_data_representation;
@@ -82,7 +84,10 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   auto num_rows = static_cast<cudf::size_type>(chunk.size());
   auto num_cols = chunk.ColumnCount();
 
-  if (num_rows == 0) {
+  // Empty-table fast path: zero columns (DUMMY_SCAN) or zero rows produce no
+  // host allocation. allocate_multiple_blocks(0, ...) is not guaranteed to
+  // return an allocation with a usable block, so skip it entirely.
+  if (num_rows == 0 || num_cols == 0) {
     return std::make_shared<cucascade::data_batch>(
       get_next_batch_id(),
       std::make_unique<host_data_representation>(
@@ -116,13 +121,22 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     total_size += utils::ceil_div_8(static_cast<size_t>(num_rows));
   }
 
+  if (total_size == 0) {
+    return std::make_shared<cucascade::data_batch>(
+      get_next_batch_id(),
+      std::make_unique<host_data_representation>(
+        std::make_unique<host_table_allocation>(
+          nullptr, std::vector<cucascade::memory::column_metadata>{}, 0),
+        &mem_space));
+  }
+
   // Allocate pinned host memory
   auto* allocator =
     mem_space.get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   if (!allocator) {
     throw std::runtime_error("[cpu_source_task] Failed to get host memory allocator");
   }
-  auto allocation = allocator->allocate_multiple_blocks(total_size, nullptr);
+  auto allocation = allocator->allocate_multiple_blocks(total_size, reservation);
   auto* base_ptr  = reinterpret_cast<uint8_t*>(allocation->get_blocks()[0]);
 
   // Second pass: copy data and build metadata
@@ -267,6 +281,17 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
   if (!reservation) { throw std::runtime_error("[cpu_source_task] Failed to reserve host memory"); }
   auto& mem_space = const_cast<cucascade::memory::memory_space&>(reservation->get_memory_space());
 
+  // Hand ownership of the reservation to the task's local state. Batches
+  // produced below reference memory backed by this reservation; keeping it
+  // alive on the task (not as a function-local) is what keeps the memory_space
+  // valid until the batches are consumed downstream.
+  auto* local = dynamic_cast<cpu_source_task_local_state*>(local_state());
+  if (!local) {
+    throw std::runtime_error("[cpu_source_task] Unexpected local state type");
+  }
+  local->set_reservation(std::move(reservation));
+  auto* reservation_ptr = local->reservation();
+
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
 
   if (source.collection && source.collection->Count() > 0) {
@@ -279,15 +304,22 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
 
     while (source.collection->Scan(scan_state, chunk)) {
       if (chunk.size() == 0) break;
-      batches.push_back(chunk_to_data_batch(chunk, mem_space));
+      batches.push_back(chunk_to_data_batch(chunk, mem_space, reservation_ptr));
       chunk.Reset();
     }
   } else if (source.produce_single_row) {
-    // DUMMY_SCAN: produce one row with all-null values
+    // DUMMY_SCAN: produce one row with all-null values. Vectors from
+    // Initialize() hold uninitialized storage; mark every row invalid so the
+    // downstream consumer sees a deterministic "single null row" instead of
+    // whatever bytes happened to be in the allocator.
     duckdb::DataChunk chunk;
     chunk.Initialize(duckdb::Allocator::DefaultAllocator(), source.types);
     chunk.SetCardinality(1);
-    batches.push_back(chunk_to_data_batch(chunk, mem_space));
+    for (auto& vec : chunk.data) {
+      auto& validity = duckdb::FlatVector::Validity(vec);
+      validity.SetAllInvalid(1);
+    }
+    batches.push_back(chunk_to_data_batch(chunk, mem_space, reservation_ptr));
   }
   // else: EMPTY_RESULT — produce no data batches
 
@@ -303,10 +335,11 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
 
 void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
+  // DUMMY_SCAN batches are legitimately 0-byte (0 columns, 1 row of "nothing"),
+  // so publish every valid batch rather than filtering on size_in_bytes.
+  // Downstream operators still need to see the batch to know a row existed.
   for (auto& batch : output_data.get_data_batches()) {
-    if (batch && batch->get_data() && batch->get_data()->get_size_in_bytes() > 0) {
-      _data_repo->add_data_batch(batch);
-    }
+    if (batch && batch->get_data()) { _data_repo->add_data_batch(batch); }
   }
 }
 

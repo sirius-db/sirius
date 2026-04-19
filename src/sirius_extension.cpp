@@ -45,6 +45,7 @@ extern "C" int cudaProfilerStop();
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
+#include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -712,6 +713,20 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
 
+static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto value = StringValue::Get(parameter);
+  if (value != "materialize" && value != "ast_interpret" && value != "ast_jit") {
+    throw InvalidInputException(
+      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
+      "ast_jit",
+      value);
+  }
+  Config::EXPRESSION_EXECUTOR_STRATEGY = std::move(value);
+  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
+                   Config::EXPRESSION_EXECUTOR_STRATEGY);
+}
+
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::USE_CUSTOM_TOP_N = BooleanValue::Get(parameter);
@@ -893,6 +908,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::BOOLEAN(Config::USE_CUDF_EXPR),
                             SetUseCudfExpr);
 
+  config.AddExtensionOption(
+    "expression_executor_strategy",
+    "Strategy for the experimental gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "'ast_jit'",
+    LogicalType::VARCHAR,
+    Value(Config::EXPRESSION_EXECUTOR_STRATEGY),
+    SetExpressionExecutorStrategy);
+
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",
                             "Whether or not custom kernel is used to evalaute top n",
@@ -1022,12 +1045,20 @@ static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
 
-  auto& db     = loader.GetDatabaseInstance();
-  auto& config = DBConfig::GetConfig(db);
-  config.GetCallbackManager().Register(make_shared_ptr<duckdb::SiriusContextExtensionCallback>());
+  auto& db           = loader.GetDatabaseInstance();
+  auto& config       = DBConfig::GetConfig(db);
+  auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr = callback.get();
+  config.GetCallbackManager().Register(std::move(callback));
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register SiriusContext on connections that were opened before the extension
+  // was loaded (e.g. when loaded via LOAD in Python or the CLI).
+  for (auto& ctx : ConnectionManager::Get(db).GetConnectionList()) {
+    callback_ptr->OnConnectionOpened(*ctx);
+  }
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
