@@ -49,7 +49,11 @@ extern "C" int cudaProfilerStop();
 #include "io/datasource_factory.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
-#include "io/uring/uring_ioctx.hpp"
+// NOTE: do NOT include "io/uring/uring_ioctx.hpp" here. It transitively pulls
+// <liburing.h>, which defines BLOCK_SIZE as a macro and collides with
+// duckdb/third_party/concurrentqueue's `static const size_t BLOCK_SIZE` (the
+// PCH pulls concurrentqueue into this TU). The debug table function below
+// only needs s3_ioctx.
 #include "log/logging.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
@@ -681,13 +685,18 @@ static void ProfilerStopFunction(ClientContext& context,
 //              registry.lookup(scheme) --> s3_ioctx / uring_ioctx
 //                    |
 //                    v
-//              ds->size()   (HEAD for S3, fstat for local file)
+//              ds->size()   (HEAD for S3)
 //
 // Purpose: give SQLLogicTest a minimal hook into the new S3 IO path so the
 // [s3_debug] SQL test can bit-verify object sizes read from MinIO *without*
 // needing a valid parquet fixture (DuckDB's read_parquet goes through httpfs,
 // not through our s3_ioctx). The function is registered under a
 // "sirius_debug_" prefix to signal it is not a user-facing API.
+//
+// Scope: only s3:// URIs are supported. file:// would require uring_ioctx,
+// and its <liburing.h> BLOCK_SIZE macro collides with DuckDB's
+// concurrentqueue header pulled in via this TU's PCH — keeping the debug
+// hook s3-only avoids the collision without disturbing engine code.
 // ---------------------------------------------------------------------------
 
 struct SiriusDebugDatasourceSizeBind : public TableFunctionData {
@@ -728,13 +737,9 @@ static std::shared_ptr<sirius::io::datasource_registry> MakeDebugRegistry(
   sirius::io::object_store_config const& osc)
 {
   auto reg = std::make_shared<sirius::io::datasource_registry>();
-  // Always register the local-file backend so debug calls work for file:///
-  // URIs on hosts without MinIO — useful for smoke-testing the plumbing
-  // without docker.
-  reg->register_ioctx("file", std::make_shared<sirius::io::uring_ioctx>());
-  // Register S3 only when the user has configured an endpoint (SET
-  // s3_endpoint='...'). Empty endpoint means "no S3 configured" — same
-  // convention as sirius_engine.
+  // file:// backend intentionally omitted here: uring_ioctx pulls liburing,
+  // which breaks this TU's PCH (see include list above). This debug hook
+  // targets s3:// URIs; callers needing file:// should use gpu_execution.
   if (!osc.endpoint.empty()) {
     sirius::io::s3::s3_ioctx_config scfg;
     scfg.endpoint   = osc.endpoint;
