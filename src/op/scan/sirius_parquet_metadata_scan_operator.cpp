@@ -262,7 +262,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
       cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
       *result->reader_options);
     auto metadata = reader.parquet_metadata();
-    if (_is_projected && !detail::projected_columns_are_flat(metadata, _selected_column_indices)) {
+    if (_is_projected && !detail::projected_columns_are_flat(metadata, _projected_column_names)) {
       /// TODO: Support nested column schemas with projection.
       throw std::runtime_error(
         "[sirius_parquet_metadata_scan_operator] Parquet scans with projections currently only "

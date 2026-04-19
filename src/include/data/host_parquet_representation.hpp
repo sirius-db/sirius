@@ -62,6 +62,16 @@ using post_convert_fn_t =
                                              rmm::cuda_stream_view)>;
 
 /**
+ * @brief Function that injects hive partition columns into a GPU table.
+ *
+ * Called after post_convert (if any) to add constant partition columns
+ * (whose values come from the file path, not the parquet data) at the
+ * correct positions in the output table.
+ */
+using partition_inject_fn_t = std::function<std::unique_ptr<cudf::table>(
+  std::unique_ptr<cudf::table>, std::string const& data_file_path, rmm::cuda_stream_view)>;
+
+/**
  * @brief A host representation of Parquet data for use in a hybrid scan.
  *
  * This class encapsulates the necessary components to decompress a slice and/or projection of
@@ -331,6 +341,27 @@ class host_parquet_representation : public cucascade::idata_representation {
 
   [[nodiscard]] std::string const& get_data_file_path() const { return _data_file_path; }
 
+  // -------------------------------------------------------------------------
+  // Hive partition column injection
+  // -------------------------------------------------------------------------
+
+  void set_partition_inject_fn(partition_inject_fn_t fn) { _partition_inject_fn = std::move(fn); }
+
+  [[nodiscard]] bool has_partition_inject_fn() const { return _partition_inject_fn != nullptr; }
+
+  /// Only call after checking has_partition_inject_fn().
+  [[nodiscard]] std::unique_ptr<cudf::table> apply_partition_inject(
+    std::unique_ptr<cudf::table> tbl, rmm::cuda_stream_view stream)
+  {
+    D_ASSERT(_partition_inject_fn);
+    return _partition_inject_fn(std::move(tbl), _data_file_path, stream);
+  }
+
+  [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
+  {
+    return _partition_inject_fn;
+  }
+
   /**
    * @brief Compute the 0-based absolute row offset of the first row in this batch.
    *
@@ -390,7 +421,9 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::vector<std::size_t> _post_filter_projection_ids;
   /// Optional post-convert hook (null for plain parquet, set for iceberg V2 deletes).
   post_convert_fn_t _post_convert_fn;
-  /// Path of the Iceberg data file this batch was read from (empty for plain parquet).
+  /// Optional partition column injection hook (null unless hive-partitioned).
+  partition_inject_fn_t _partition_inject_fn;
+  /// Path of the data file this batch was read from.
   std::string _data_file_path;
 };
 }  // namespace sirius

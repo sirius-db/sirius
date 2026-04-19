@@ -33,6 +33,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
+#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/main/client_context.hpp>
 
 // cudf
@@ -51,6 +52,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -66,6 +68,11 @@ namespace detail {
  * Virtual columns and duplicates are excluded/deduplicated.
  * Defined in parquet_scan_task.cpp.
  *
+ * Note: the returned indices are DuckDB primary indices. Hive partition columns
+ * (present in the DuckDB schema but not in the parquet files) are NOT removed
+ * here — callers must filter them post-hoc using the bind data's
+ * `hive_partitioning_indexes`.
+ *
  * @param column_ids     All column ids exposed by the table function.
  * @param projection_ids Subset of column_ids positions selected by the planner (empty = no
  *                       projection).
@@ -75,12 +82,14 @@ std::vector<size_t> make_selected_column_indices(
   duckdb::vector<duckdb::idx_t> const& projection_ids);
 
 /**
- * @brief Return true if all selected projected columns have a flat (depth-1) schema.
+ * @brief Return true if all projected leaf columns have a flat (depth-1) schema.
  *
+ * Looks up each projected column by name in the parquet file's schema and
+ * checks that its `path_in_schema` has length 1 (i.e., not nested).
  * Defined in parquet_scan_task.cpp.
  */
 bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
-                                std::vector<size_t> const& selected_column_indices);
+                                std::vector<std::string> const& projected_column_names);
 }  // namespace detail
 
 //===----------------------------------------------------------------------===//
@@ -289,6 +298,58 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   [[nodiscard]] post_convert_fn_t get_post_convert_fn() const { return _post_convert_fn; }
 
+  /**
+   * @brief Return the selected column indices (DuckDB primary indices of data-only
+   * columns, in cudf table order — hive partition columns excluded).
+   *
+   * Used by iceberg_scan_task_global_state to compute data_key_indices that correctly map
+   * equality-delete key names to cudf table column positions.
+   */
+  [[nodiscard]] std::vector<size_t> const& get_selected_column_indices() const
+  {
+    return _selected_column_indices;
+  }
+
+  // -------------------------------------------------------------------------
+  // Hive partition column support
+  // -------------------------------------------------------------------------
+
+  /// Metadata for a hive partition column (not present in parquet files).
+  struct hive_partition_column {
+    std::string column_name;     ///< Partition column name (e.g. "year")
+    size_t duckdb_column_index;  ///< Index in scan_op->names / column_ids
+  };
+
+  /// True if this scan involves hive-partitioned files.
+  [[nodiscard]] bool has_hive_partitions() const { return !_hive_partition_columns.empty(); }
+
+  /// Return the partition injection function (may be null).
+  [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
+  {
+    return _partition_inject_fn;
+  }
+
+  /// Return the hive partition column metadata.
+  [[nodiscard]] std::vector<hive_partition_column> const& get_hive_partition_columns() const
+  {
+    return _hive_partition_columns;
+  }
+
+  /// Return the set of DuckDB column indices that are hive partitions.
+  [[nodiscard]] std::unordered_set<size_t> const& get_hive_partition_index_set() const
+  {
+    return _hive_partition_index_set;
+  }
+
+  /**
+   * @brief Initialize hive partition metadata and build the injection function.
+   *
+   * Called from both the public constructor (plain parquet) and the iceberg
+   * subclass constructor. Safe to call after base construction.
+   */
+  void init_hive_partitions(duckdb::MultiFileBindData const& bind_data,
+                            sirius_physical_parquet_scan* scan_op);
+
  protected:
   /**
    * @brief Protected constructor for subclasses that pre-process the file list.
@@ -312,20 +373,25 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   parquet_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
                                  sirius_physical_parquet_scan* scan_op,
                                  std::vector<std::string> file_paths,
-                                 std::vector<size_t> const& selected_column_indices,
-                                 size_t approximate_batch_size);
+                                 std::vector<size_t> selected_column_indices,
+                                 std::size_t approximate_batch_size);
 
  private:
   /**
    * @brief Shared initialization: read footers, apply projections/filters, parse
-   * metadata, and partition row groups. Called by both constructors after
-   * _file_paths has been populated.
+   * metadata, detect hive partitions from the parquet schema, and partition row
+   * groups. Called by both constructors after _file_paths and
+   * _selected_column_indices have been populated.
    */
   void initialize_from_files();
 
   //===----------Fields----------===//
   std::size_t _approximate_batch_size;     ///< Target approximate batch size for scan tasks
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
+
+  /// DuckDB primary indices of data-only columns to read, in cudf table order.
+  /// Hive partition columns are excluded.
+  std::vector<size_t> _selected_column_indices;
 
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
@@ -348,6 +414,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /// Optional hook called after each batch is decompressed to a GPU table.
   /// Null for plain parquet scans; set by iceberg_scan_task_global_state.
   post_convert_fn_t _post_convert_fn;
+
+  /// Optional partition column injection (null unless hive-partitioned).
+  partition_inject_fn_t _partition_inject_fn;
+
+  /// Hive partition columns (not present in parquet files).
+  std::vector<hive_partition_column> _hive_partition_columns;
+  std::unordered_set<size_t> _hive_partition_index_set;
 };
 
 //===----------------------------------------------------------------------===//
