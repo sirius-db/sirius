@@ -34,9 +34,15 @@ make s3-test
 source test/integration/s3/env.sh
 build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
 
-# The SQLLogicTest `test/sql/datasource/s3_read.test` is currently disabled
-# (requires a valid parquet fixture; generate_fixtures.py now writes opaque
-# binary blobs to stay stdlib-only).
+# SQLLogicTest driving the new Sirius S3 IO pipeline from SQL via the
+# sirius_debug_datasource_size() table function. HEAD-only, works with the
+# opaque .bin fixtures (no parquet parser involved).
+source test/integration/s3/env.sh
+build/release/test/unittest --test-dir . test/sql/datasource/s3_debug_size.test
+
+# The SQLLogicTest `test/sql/datasource/s3_read.test` (read_parquet end-to-end)
+# is currently disabled — it requires a valid parquet fixture and
+# generate_fixtures.py now writes opaque binary blobs to stay stdlib-only.
 
 # Tear down (the `-v` in `down -v` also removes the named volume).
 make s3-down
