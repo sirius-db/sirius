@@ -71,7 +71,7 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   std::vector<std::string> const& file_paths,
   duckdb::vector<duckdb::ColumnIndex> const& column_ids,

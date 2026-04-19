@@ -21,6 +21,7 @@
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
+#include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
@@ -585,10 +586,12 @@ void parquet_scan_task_global_state::init_hive_partitions(
     if (!seen.insert(primary_idx).second) continue;
 
     if (_hive_partition_index_set.count(primary_idx)) {
+      // scan_op->returned_types is now sirius::logical_type; DuckDBValueToCudfScalar
+      // takes duckdb::LogicalType, so convert at this boundary.
       output_map.push_back(col_source{/* is_partition */ true,
                                       /* data_col_idx */ 0,
                                       scan_op->names[primary_idx],
-                                      scan_op->returned_types[primary_idx]});
+                                      sirius::to_duckdb(scan_op->returned_types[primary_idx])});
     } else {
       auto it = duckdb_to_cudf.find(primary_idx);
       if (it != duckdb_to_cudf.end()) {
