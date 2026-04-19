@@ -17,7 +17,9 @@
 #include "pipeline/sirius_pipeline_converter.hpp"
 
 #include "log/logging.hpp"
+#include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
@@ -183,6 +185,50 @@ void sirius_pipeline_converter::split_table_scan_source(
   } else {
     throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
   }
+}
+
+void sirius_pipeline_converter::split_cpu_source(
+  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
+{
+  auto src_type = current_pipeline->source->type;
+  // COLUMN_DATA_SCAN with a null collection is LEFT_DELIM_JOIN's cached chunk
+  // scan — populated at runtime by the delim-join sink, not by a
+  // cpu_source_task. Splitting it would create a second pipeline referencing
+  // the same operator and trip "Repository already exists" on complex queries.
+  bool is_column_data_scan =
+    src_type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN &&
+    current_pipeline->get_source()->Cast<op::sirius_physical_column_data_scan>().collection !=
+      nullptr;
+  if (src_type != op::SiriusPhysicalOperatorType::EMPTY_RESULT &&
+      src_type != op::SiriusPhysicalOperatorType::DUMMY_SCAN && !is_column_data_scan) {
+    return;
+  }
+
+  auto* source_op = current_pipeline->get_source().get();
+
+  duckdb::unique_ptr<op::sirius_physical_cpu_source> cpu_source_op;
+  if (src_type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN) {
+    auto& col_scan = source_op->Cast<op::sirius_physical_column_data_scan>();
+    cpu_source_op  = duckdb::make_uniq<op::sirius_physical_cpu_source>(
+      source_op->types, source_op->estimated_cardinality, std::move(col_scan.collection));
+  } else if (src_type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+    cpu_source_op = duckdb::make_uniq<op::sirius_physical_cpu_source>(
+      source_op->types, source_op->estimated_cardinality, true);
+  } else {
+    // EMPTY_RESULT: no data
+    cpu_source_op = duckdb::make_uniq<op::sirius_physical_cpu_source>(
+      source_op->types, source_op->estimated_cardinality, false);
+  }
+
+  auto new_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
+  new_pipeline->source = nullptr;
+  new_pipeline->sink   = cpu_source_op.get();
+
+  current_pipeline->source = cpu_source_op.get();
+  current_pipeline->operators.insert(current_pipeline->operators.begin(), *source_op);
+
+  scheduled_.push_back(new_pipeline);
+  pipeline_breakers_.push_back(std::move(cpu_source_op));
 }
 
 void sirius_pipeline_converter::split_intermediate_joins(
@@ -691,6 +737,10 @@ void sirius_pipeline_converter::split_pipelines(
     // Preprocessing: replace TABLE_SCAN source with concrete scan operator
     split_table_scan_source(current_pipeline);
 
+    // Preprocessing: split COLUMN_DATA_SCAN/EMPTY_RESULT/DUMMY_SCAN sources
+    // into a CPU_SOURCE scan pipeline (analogous to TABLE_SCAN → PARQUET_SCAN).
+    split_cpu_source(current_pipeline);
+
     // Preprocessing: split intermediate joins (modifies current_pipeline in place)
     split_intermediate_joins(current_pipeline);
 
@@ -863,7 +913,8 @@ void sirius_pipeline_converter::wire_data_repositories()
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
+               scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
       for (auto dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
         auto next_op             = dependent_pipeline->get_operators().size() == 0
                                      ? dependent_pipeline->get_sink().get()
@@ -1056,8 +1107,14 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
       } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
-                 first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-        // ignore operators that don't have ports
+                 first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
+                 first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+                 first_op.type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
+                 first_op.type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                 first_op.type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+        // scan-like operators use "scan"; for COLUMN_DATA_SCAN / EMPTY_RESULT /
+        // DUMMY_SCAN, split_cpu_source has wired them with a "scan" port
+        // (not the default one), so skip the default-port lookup here.
       } else {
         // Most operators have "default" port
         auto* default_port = first_op.get_port("default");
@@ -1094,8 +1151,12 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
-        // ignore DUCKDB_SCAN, PARQUET_SCAN, and ICEBERG_SCAN since they don't have ports
+                 sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
+                 sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
+                 sink->type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
+                 sink->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                 sink->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+        // scan-like sinks don't have default ports (they have "scan" or none)
       } else if (sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
         // ignore RESULT_COLLECTOR since it doesn't have ports
       } else {

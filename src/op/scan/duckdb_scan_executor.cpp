@@ -24,6 +24,7 @@
 #include "data/data_batch_utils.hpp"
 #include "data/host_parquet_representation.hpp"
 #include "log/logging.hpp"
+#include "op/scan/cpu_source_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -148,6 +149,11 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 {
   bool is_duckdb_scan  = dynamic_cast<duckdb_scan_task*>(task) != nullptr;
   bool is_parquet_scan = !is_duckdb_scan and dynamic_cast<parquet_scan_task*>(task) != nullptr;
+  bool is_cpu_source =
+    !is_duckdb_scan && !is_parquet_scan && dynamic_cast<cpu_source_task*>(task) != nullptr;
+
+  // CPU source tasks always compute directly (small data, no caching)
+  if (is_cpu_source) { return task->compute_task(stream); }
 
   auto clone_batches = [&](const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
                            rmm::cuda_stream_view stream) {

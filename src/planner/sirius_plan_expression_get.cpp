@@ -17,8 +17,10 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -30,23 +32,28 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalExpressionGet& op)
   D_ASSERT(op.children.size() == 1);
   auto plan = create_plan(*op.children[0]);
 
-  // Evaluate all expressions at plan time using DuckDB's ExpressionExecutor
-  // and materialize results into a ColumnDataCollection. This mirrors DuckDB's
-  // own foldable optimization in plan_expression_get.cpp.
+  auto& allocator = duckdb::Allocator::Get(context);
+
+  // Evaluate all constant expressions and materialize into a ColumnDataCollection.
   auto collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(context, op.types);
 
-  auto& allocator = duckdb::Allocator::Get(context);
   duckdb::DataChunk chunk;
   chunk.Initialize(allocator, op.types);
 
   duckdb::ColumnDataAppendState append_state;
   collection->InitializeAppend(append_state);
   for (std::size_t expression_idx = 0; expression_idx < op.expressions.size(); expression_idx++) {
-    duckdb::ExpressionExecutor executor(context, op.expressions[expression_idx]);
     chunk.Reset();
+    auto& expr_list = op.expressions[expression_idx];
+
+    duckdb::ExpressionExecutor executor(context, expr_list);
     executor.Execute(chunk);
+
     collection->Append(append_state, chunk);
   }
+
+  SIRIUS_LOG_DEBUG("[plan_expression_get] Materialized {} rows into ColumnDataCollection",
+                   collection->Count());
 
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
     sirius::from_duckdb_vec(op.types),
