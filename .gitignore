@@ -36,3 +36,5 @@ compile_commands.json
 # Zed editor settings
 .zed
 .claude/
+test/integration/s3/fixtures
+log/sirius*.log
