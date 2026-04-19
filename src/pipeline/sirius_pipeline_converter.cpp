@@ -1108,8 +1108,13 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                  first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
-                 first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-        // ignore operators that don't have ports
+                 first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+                 first_op.type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
+                 first_op.type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                 first_op.type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+        // scan-like operators use "scan"; for COLUMN_DATA_SCAN / EMPTY_RESULT /
+        // DUMMY_SCAN, split_cpu_source has wired them with a "scan" port
+        // (not the default one), so skip the default-port lookup here.
       } else {
         // Most operators have "default" port
         auto* default_port = first_op.get_port("default");
@@ -1147,8 +1152,11 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
       } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
-        // ignore scan-like sinks since they don't have ports
+                 sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
+                 sink->type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
+                 sink->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
+                 sink->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
+        // scan-like sinks don't have default ports (they have "scan" or none)
       } else if (sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
         // ignore RESULT_COLLECTOR since it doesn't have ports
       } else {
