@@ -208,8 +208,8 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   sirius_physical_parquet_scan* scan_op,
   std::size_t approximate_batch_size)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
-    _scan_op(scan_op),
-    _approximate_batch_size(approximate_batch_size)
+    _approximate_batch_size(approximate_batch_size),
+    _scan_op(scan_op)
 {
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
@@ -232,7 +232,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   // Their values come from directory paths (e.g., partition_col=42/).
   for (auto const& hpi : bind_data.reader_bind.hive_partitioning_indexes) {
     _hive_partition_index_set.insert(hpi.index);
-    _hive_partition_columns.push_back({hpi.value, hpi.index});
+    _hive_partition_columns.push_back(hive_partition_column{hpi.value, hpi.index});
   }
 
   // Build selected column indices, then drop any hive partition columns (they are injected
@@ -268,8 +268,8 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   std::vector<size_t> selected_column_indices,
   std::size_t approximate_batch_size)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
-    _scan_op(scan_op),
     _approximate_batch_size(approximate_batch_size),
+    _scan_op(scan_op),
     _selected_column_indices(std::move(selected_column_indices)),
     _file_paths(std::move(file_paths))
 {
@@ -380,7 +380,7 @@ void parquet_scan_task_global_state::initialize_from_files()
         filtered_indices.push_back(idx);
       } else if (idx < _scan_op->names.size()) {
         _hive_partition_index_set.insert(idx);
-        _hive_partition_columns.push_back({_scan_op->names[idx], idx});
+        _hive_partition_columns.push_back(hive_partition_column{_scan_op->names[idx], idx});
         SIRIUS_LOG_DEBUG(
           "[parquet_scan] Column '{}' (idx={}) not in parquet schema — "
           "treating as partition column.",
@@ -551,7 +551,7 @@ void parquet_scan_task_global_state::init_hive_partitions(
   if (_hive_partition_columns.empty()) {
     for (auto const& hpi : bind_data.reader_bind.hive_partitioning_indexes) {
       _hive_partition_index_set.insert(hpi.index);
-      _hive_partition_columns.push_back({hpi.value, hpi.index});
+      _hive_partition_columns.push_back(hive_partition_column{hpi.value, hpi.index});
     }
   }
 
@@ -585,11 +585,18 @@ void parquet_scan_task_global_state::init_hive_partitions(
     if (!seen.insert(primary_idx).second) continue;
 
     if (_hive_partition_index_set.count(primary_idx)) {
-      output_map.push_back(
-        {true, 0, scan_op->names[primary_idx], scan_op->returned_types[primary_idx]});
+      output_map.push_back(col_source{/* is_partition */ true,
+                                      /* data_col_idx */ 0,
+                                      scan_op->names[primary_idx],
+                                      scan_op->returned_types[primary_idx]});
     } else {
       auto it = duckdb_to_cudf.find(primary_idx);
-      if (it != duckdb_to_cudf.end()) { output_map.push_back({false, it->second, {}, {}}); }
+      if (it != duckdb_to_cudf.end()) {
+        output_map.push_back(col_source{/* is_partition */ false,
+                                        /* data_col_idx */ it->second,
+                                        /* partition_name */ {},
+                                        /* duckdb_type */ {}});
+      }
     }
   }
 
