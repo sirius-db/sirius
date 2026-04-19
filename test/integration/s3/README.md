@@ -93,3 +93,9 @@ A sha256 manifest is written to `fixtures/local/MANIFEST.sha256`.
 - When `SIRIUS_TEST_S3_*` is not set the integration tests `SUCCEED` with a
   skip message rather than failing — this is intentional so the default
   `sirius_unittest` run stays green on CI runners without docker.
+- `env.sh` also exports `SIRIUS_CONFIG_FILE` pointing at `sirius.yaml` in this
+  directory. It caps Super Sirius's startup GPU/host reservation at 256/128
+  MiB so `require sirius` in `s3_debug_size.test` won't OOM on GPUs that
+  don't have ~90% free. The debug path only needs SigV4 + libcurl, so it
+  never touches the reservation manager. If you've already set
+  `SIRIUS_CONFIG_FILE` the `env.sh` assignment is a no-op.

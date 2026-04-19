@@ -18,3 +18,10 @@ export SIRIUS_TEST_S3_KEY="${SIRIUS_TEST_S3_KEY:-hello.txt}"
 # bit-compare S3 bytes against the local copy.
 SIRIUS_TEST_S3_LOCAL_DIR_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/local"
 export SIRIUS_TEST_S3_LOCAL_DIR="${SIRIUS_TEST_S3_LOCAL_DIR:-${SIRIUS_TEST_S3_LOCAL_DIR_DEFAULT}}"
+
+# Point SiriusContextExtensionCallback at a tiny memory config so `require sirius`
+# in s3_debug_size.test doesn't try to reserve ~90% of the GPU on load. The
+# debug path (sirius_debug_datasource_size) never touches the reservation
+# manager, so 256/128 MiB is enough headroom.
+SIRIUS_TEST_S3_CONFIG_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sirius.yaml"
+export SIRIUS_CONFIG_FILE="${SIRIUS_CONFIG_FILE:-${SIRIUS_TEST_S3_CONFIG_DEFAULT}}"
