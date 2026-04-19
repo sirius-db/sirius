@@ -354,7 +354,7 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
                    source.collection ? "ColumnDataCollection"
                                      : (source.produce_single_row ? "DUMMY_SCAN" : "EMPTY_RESULT"));
 
-  return std::make_unique<op::operator_data>(std::move(batches));
+  return std::make_unique<op::pipelineable_operator_data>(std::move(batches));
 }
 
 void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
@@ -362,8 +362,9 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
   // DUMMY_SCAN batches are legitimately 0-byte (0 columns, 1 row of "nothing"),
   // so publish every valid batch rather than filtering on size_in_bytes.
   // Downstream operators still need to see the batch to know a row existed.
-  for (auto& batch : output_data.get_data_batches()) {
-    if (batch && batch->get_data()) { _data_repo->add_data_batch(batch); }
+  auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
+  for (auto& batch : pipelineable_output.release_data_batches()) {
+    if (batch && batch->get_data()) { _data_repo->add_data_batch(std::move(batch)); }
   }
 }
 
