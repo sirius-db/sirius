@@ -63,9 +63,14 @@ class cpu_source_task_local_state : public pipeline::sirius_pipeline_task_local_
  public:
   cpu_source_task_local_state() = default;
 
-  // cpu_source_task runs on a tiny pre-computed DuckDB collection; memory use
-  // is bounded by the reservation we request in compute_task() rather than by
-  // an input-data basis the estimator could derive from.
+  // Required override of the base class's pure virtual. The consumption
+  // basis feeds pipeline_memory_history (via estimate_peak_memory /
+  // record_on_failure / record) so the estimator can learn a task's memory
+  // footprint over time. cpu_source_task never exercises that code path: it
+  // does not call get_estimated_reservation_size(), does not record memory
+  // history, and is only scheduled through the CPU_SOURCE branch in
+  // task_creator/duckdb_scan_executor (neither reads this value). Return 0
+  // to satisfy the interface; the field is otherwise unused for this task.
   [[nodiscard]] std::size_t get_task_consumption_basis() const override { return 0; }
 };
 

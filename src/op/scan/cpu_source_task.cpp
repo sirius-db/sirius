@@ -64,7 +64,16 @@ cpu_source_task::~cpu_source_task()
       _global_state->cast<cpu_source_task_global_state>().get_pipeline() == nullptr) {
     return;
   }
-  _global_state->cast<cpu_source_task_global_state>().get_pipeline()->mark_task_completed();
+  auto& g_state = _global_state->cast<cpu_source_task_global_state>();
+  // If compute_task didn't reach the exhausted=true assignment (threw, was
+  // cancelled, etc.), release the scheduling gate so the task creator can
+  // produce a replacement. On success the gate stays latched together with
+  // exhausted=true, preventing a redundant second task.
+  auto& source = g_state.get_source_op();
+  if (!source.exhausted.load(std::memory_order_acquire)) {
+    source.task_scheduled.store(false, std::memory_order_release);
+  }
+  g_state.get_pipeline()->mark_task_completed();
 }
 
 /// Build a data_batch from a DuckDB DataChunk by copying fixed-width column data
@@ -308,16 +317,27 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
       chunk.Reset();
     }
   } else if (source.produce_single_row) {
-    // DUMMY_SCAN: produce one row with all-null values. Vectors from
-    // Initialize() hold uninitialized storage; mark every row invalid so the
-    // downstream consumer sees a deterministic "single null row" instead of
-    // whatever bytes happened to be in the allocator.
+    // DUMMY_SCAN: produce one row with all-null values. DuckDB's
+    // DataChunk::Initialize allocates but does NOT zero the backing storage,
+    // and chunk_to_data_batch memcpys that backing into the pinned host
+    // allocation. Mark the validity invalid AND zero each fixed-width
+    // vector's data bytes so the produced batch never carries uninitialized
+    // bytes out to downstream operators (which would trip ASAN/MSAN even
+    // though the null mask makes it semantically safe). VARCHAR vectors are
+    // handled safely in chunk_to_data_batch: the loop checks validity before
+    // reading the string_t payload.
     duckdb::DataChunk chunk;
     chunk.Initialize(duckdb::Allocator::DefaultAllocator(), source.types);
     chunk.SetCardinality(1);
     for (auto& vec : chunk.data) {
       auto& validity = duckdb::FlatVector::Validity(vec);
       validity.SetAllInvalid(1);
+      if (vec.GetType().InternalType() != duckdb::PhysicalType::VARCHAR) {
+        auto type_size = duckdb::GetTypeIdSize(vec.GetType().InternalType());
+        if (type_size > 0) {
+          std::memset(duckdb::FlatVector::GetData(vec), 0, type_size);
+        }
+      }
     }
     batches.push_back(chunk_to_data_batch(chunk, mem_space, reservation_ptr));
   }
