@@ -22,7 +22,7 @@ TEST_BUILD_TARGET ?= unittest
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	clang-release clang-debug clang-relwithdebinfo \
 	test test_release test_debug test_reldebug clean list-presets \
-	s3-up s3-down s3-test
+	s3-up s3-down s3-test s3-cpp-test s3-sql-test
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -93,9 +93,12 @@ list-presets: $(PRESETS_LINK)
 # -----------------------------------------------------------------------------
 # S3 integration test scaffolding (PR15)
 # -----------------------------------------------------------------------------
-# `make s3-up`    starts the pinned MinIO container and populates fixtures.
-# `make s3-down`  tears it down (including the data volume).
-# `make s3-test`  runs the [s3][integration] Catch2 tag against it.
+# `make s3-up`        starts the pinned MinIO container and populates fixtures.
+# `make s3-down`      tears it down (including the data volume).
+# `make s3-test`      runs both the Catch2 [s3][integration] tag and the
+#                     SQLLogicTest that drives sirius_debug_datasource_size.
+# `make s3-cpp-test`  only the Catch2 tag.
+# `make s3-sql-test`  only the SQLLogicTest.
 #
 # See test/integration/s3/README.md for details.
 
@@ -109,9 +112,23 @@ s3-up:
 s3-down:
 	docker compose -f $(S3_COMPOSE) down -v
 
-s3-test:
+s3-test: SHELL := /bin/bash
+s3-test: s3-cpp-test s3-sql-test
+
+s3-cpp-test: SHELL := /bin/bash
+s3-cpp-test:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-test: $(S3_TEST_BIN) not found — run \`make release\` first" >&2; \
+	  echo "s3-cpp-test: $(S3_TEST_BIN) not found — run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@. test/integration/s3/env.sh && $(S3_TEST_BIN) "[s3][integration]"
+	@source test/integration/s3/env.sh && $(S3_TEST_BIN) "[s3][integration]"
+
+# Drives the new Sirius S3 IO pipeline from SQL via sirius_debug_datasource_size.
+# Uses $(TEST_PATH) (DuckDB's SQLLogicTest runner), not the Catch2 binary.
+s3-sql-test: SHELL := /bin/bash
+s3-sql-test:
+	@if [ ! -x $(TEST_PATH) ]; then \
+	  echo "s3-sql-test: $(TEST_PATH) not found — run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@source test/integration/s3/env.sh && $(TEST_PATH) --test-dir . test/sql/datasource/s3_debug_size.test

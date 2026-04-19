@@ -27,17 +27,18 @@ Local MinIO + fixture tooling for the `[s3][integration]` Catch2 tests and the
 # Bring MinIO up and populate fixtures.
 make s3-up
 
-# Run the S3 integration Catch2 tag. env.sh points it at the local MinIO.
+# Run both suites against MinIO: the Catch2 [s3][integration] tag and the
+# SQLLogicTest that drives sirius_debug_datasource_size. env.sh is sourced
+# for you by the recipe and points both at the local MinIO.
 make s3-test
 
-# Or run a specific test:
+# Individual suites:
+make s3-cpp-test   # only Catch2 [s3][integration]
+make s3-sql-test   # only test/sql/datasource/s3_debug_size.test
+
+# Or run manually:
 source test/integration/s3/env.sh
 build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
-
-# SQLLogicTest driving the new Sirius S3 IO pipeline from SQL via the
-# sirius_debug_datasource_size() table function. HEAD-only, works with the
-# opaque .bin fixtures (no parquet parser involved).
-source test/integration/s3/env.sh
 build/release/test/unittest --test-dir . test/sql/datasource/s3_debug_size.test
 
 # The SQLLogicTest `test/sql/datasource/s3_read.test` (read_parquet end-to-end)
