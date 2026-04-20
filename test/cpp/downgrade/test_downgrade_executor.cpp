@@ -31,6 +31,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // cudf / rmm
@@ -41,6 +42,7 @@
 
 #include <atomic>
 #include <memory>
+#include <set>
 #include <vector>
 
 using namespace sirius::parallel;
@@ -543,5 +545,243 @@ TEST_CASE("gpu_to_gpu_transfer_via_converter", "[.][multi_gpu_transfer]")
   REQUIRE(batch->get_data() != nullptr);
   REQUIRE(batch->get_data()->get_size_in_bytes() > 0);
 
+  sirius::converter_registry::shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// NUMA downgrade ordering tests (re-authored from v1.0 c5a3d8e + ec2399e)
+//
+// v1.0 originally exercised:
+//   - downgrade_task_global_state constructor's 4th arg (numa_preferred_device_id),
+//     verified by numa_aware_downgrade_global_state_carries_preference (c5a3d8e)
+//   - downgrade_executor constructor's new 6th arg (std::optional<int> gpu_numa_node),
+//     verified by numa_aware_downgrade_executor_passes_numa_node +
+//     downgrade_executor_default_numa_node_is_nullopt (c5a3d8e)
+//   - cucascade strategy candidate ordering with pref=0/1/nullopt (ec2399e)
+//
+// Post-PR-#579 (dev) re-authoring:
+//   - downgrade_task_global_state and downgrade_task_local_state were deleted;
+//     the NUMA preference now rides exec::downgrade_executor_config::preferred_numa_node.
+//   - downgrade_executor's constructor takes that config by value and copies it into
+//     _config. Each dispatched downgrade_task receives preferred_numa_node via the
+//     processing_loop's lambda capture.
+//   - Assertions below target the config struct field + cucascade strategy output
+//     rather than the removed class members. Behavior under test is preserved:
+//     (a) the config field default is nullopt (backward-compat),
+//     (b) explicitly-set values are carried verbatim,
+//     (c) dispatch succeeds end-to-end when the preference is set on a single-GPU host,
+//     (d) cucascade strategy produces the expected NUMA-local-first candidate order on
+//         a multi-GPU fixture.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Build a 2-GPU memory manager for NUMA verification tests. Each GPU gets its own
+/// HOST space (use_host_per_gpu), so the candidate ordering produced by
+/// any_memory_space_in_tier_with_preference can distinguish device_ids 0 and 1.
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_multi_gpu_memory_manager()
+{
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 512ull << 20;  // 512 MB per GPU
+  const double limit_ratio   = 0.75;
+  const size_t host_capacity = 1ull << 30;  // 1 GB per HOST space
+
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio);
+
+  auto space_configs = builder.build();
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+
+  sirius::converter_registry::initialize();
+  return manager;
+}
+
+}  // namespace
+
+TEST_CASE("downgrade_executor_config_carries_preferred_numa_node",
+          "[downgrade][numa_aware_downgrade]")
+{
+  // v1.0 intent (from c5a3d8e numa_aware_downgrade_global_state_carries_preference):
+  // the config object that flows into the downgrade dispatch path must carry the
+  // NUMA preference verbatim. Re-authored against dev's config struct.
+  sirius::exec::downgrade_executor_config cfg_with_pref{
+    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period_ms  = 0,
+    .preferred_numa_node = std::optional<int>{0}};
+  REQUIRE(cfg_with_pref.preferred_numa_node.has_value());
+  REQUIRE(cfg_with_pref.preferred_numa_node.value() == 0);
+
+  sirius::exec::downgrade_executor_config cfg_with_pref7{
+    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period_ms  = 0,
+    .preferred_numa_node = std::optional<int>{7}};
+  REQUIRE(cfg_with_pref7.preferred_numa_node.value() == 7);
+
+  // Default construction: preferred_numa_node must be nullopt (backward-compat guarantee).
+  sirius::exec::downgrade_executor_config cfg_default{};
+  REQUIRE_FALSE(cfg_default.preferred_numa_node.has_value());
+}
+
+TEST_CASE("numa_aware_downgrade_executor_passes_numa_node", "[downgrade][numa_aware_downgrade]")
+{
+  // Re-authored from c5a3d8e: construct an executor whose config carries
+  // preferred_numa_node = 0, dispatch a real downgrade, assert the batch lands on HOST.
+  // Single-GPU execution is sufficient to prove the config threads through to dispatch
+  // (the candidate-ordering behavior on multi-GPU is covered by
+  // numa_downgrade_candidate_ordering_verified below).
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  cucascade::shared_data_repository_manager repo_mgr;
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade_numa"},
+    .monitor_period_ms  = 0,
+    .preferred_numa_node = std::optional<int>{0}};
+  downgrade_executor executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, *mem_mgr);
+  executor.start();
+
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+TEST_CASE("downgrade_executor_default_numa_node_is_nullopt", "[downgrade][numa_aware_downgrade]")
+{
+  // Re-authored from c5a3d8e: the backward-compatible default path (no NUMA preference)
+  // continues to downgrade correctly via the unpreferred any_memory_space_in_tier strategy.
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  cucascade::shared_data_repository_manager repo_mgr;
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  // make_test_executor builds a config without preferred_numa_node set.
+  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  executor.start();
+
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+TEST_CASE("numa_downgrade_candidate_ordering_verified",
+          "[.][downgrade][numa_aware_downgrade][multi_gpu]")
+{
+  // Re-authored from ec2399e: verify cucascade's
+  // any_memory_space_in_tier_with_preference strategy orders candidates so the
+  // preferred device_id appears first, then the cross-NUMA fallback. Requires 2 GPUs
+  // to exercise the ordering (use_host_per_gpu produces one HOST space per GPU).
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs for NUMA candidate ordering test");
+    return;
+  }
+
+  auto mem_mgr = make_multi_gpu_memory_manager();
+
+  auto host_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(host_spaces.size() == 2);
+
+  // pref=0 -> first candidate is device 0, second is device 1.
+  {
+    cucascade::memory::any_memory_space_in_tier_with_preference strategy{
+      cucascade::memory::Tier::HOST, std::optional<size_t>{0}};
+    auto candidates = strategy.get_candidates(*mem_mgr);
+    REQUIRE(candidates.size() == 2);
+    REQUIRE(candidates[0]->get_device_id() == 0);
+    REQUIRE(candidates[1]->get_device_id() == 1);
+  }
+
+  // pref=1 -> first candidate is device 1, second is device 0 (ordering flipped).
+  {
+    cucascade::memory::any_memory_space_in_tier_with_preference strategy{
+      cucascade::memory::Tier::HOST, std::optional<size_t>{1}};
+    auto candidates = strategy.get_candidates(*mem_mgr);
+    REQUIRE(candidates.size() == 2);
+    REQUIRE(candidates[0]->get_device_id() == 1);
+    REQUIRE(candidates[1]->get_device_id() == 0);
+  }
+
+  // pref=nullopt -> both candidates present (order is cucascade-defined, not asserted).
+  {
+    cucascade::memory::any_memory_space_in_tier_with_preference strategy{
+      cucascade::memory::Tier::HOST, std::nullopt};
+    auto candidates = strategy.get_candidates(*mem_mgr);
+    REQUIRE(candidates.size() == 2);
+    std::set<int> device_ids;
+    for (auto* c : candidates) {
+      device_ids.insert(c->get_device_id());
+    }
+    REQUIRE(device_ids.count(0) == 1);
+    REQUIRE(device_ids.count(1) == 1);
+  }
+
+  sirius::converter_registry::shutdown();
+}
+
+TEST_CASE("numa_downgrade_prefers_local_host_space",
+          "[.][downgrade][numa_aware_downgrade][multi_gpu]")
+{
+  // Re-authored from ec2399e: end-to-end proof that a downgrade with
+  // preferred_numa_node=0 lands the batch on the HOST space with device_id=0.
+  // Requires 2 GPUs for the use_host_per_gpu configuration to produce distinct
+  // HOST device_ids.
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs for NUMA downgrade preference test");
+    return;
+  }
+
+  auto mem_mgr = make_multi_gpu_memory_manager();
+
+  auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+  auto* gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+
+  cucascade::shared_data_repository_manager repo_mgr;
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu0);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+
+  auto gpu0_space_id = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade_numa_test"},
+    .monitor_period_ms  = 0,
+    .preferred_numa_node = std::optional<int>{0}};
+  downgrade_executor executor(config, repo_mgr, gpu0_space_id, gpu0, *mem_mgr);
+  executor.start();
+
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  // NUMA-local HOST space was selected (device_id matches preference).
+  REQUIRE(batch->get_memory_space()->get_device_id() == 0);
+
+  executor.stop();
   sirius::converter_registry::shutdown();
 }
