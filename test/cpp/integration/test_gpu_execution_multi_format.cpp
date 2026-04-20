@@ -119,8 +119,7 @@ class MultiFormatFixtureBase {
     }
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
-    sirius::test::require_transparent_execution_delta(
-      before_gpu_stats, after_gpu_stats, 1, 0, 1);
+    sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
 
     // Run on CPU (disable transparent execution)
     con->Query("SET gpu_execution = false;");

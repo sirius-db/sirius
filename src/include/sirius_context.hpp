@@ -33,9 +33,9 @@
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
-#include <map>
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -227,7 +227,7 @@ class SiriusContext : public ClientContextState {
   std::condition_variable query_lifecycle_cv_;
   std::thread::id active_query_owner_{};
   std::size_t active_query_depth_ = 0;
-  bool is_initialized_ = false;
+  bool is_initialized_            = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Destroyed before memory_manager_ (declared after it — reverse destruction order).

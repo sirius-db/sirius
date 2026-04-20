@@ -105,8 +105,7 @@ class TransparentExecutionFixture {
     }
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
-    sirius::test::require_transparent_execution_delta(
-      before_gpu_stats, after_gpu_stats, 1, 0, 1);
+    sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
 
     // Disable transparent execution and run on CPU.
     con->Query("SET gpu_execution = false;");
@@ -190,9 +189,9 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
   // Window functions are not supported by Sirius — should fall back to CPU silently.
   con->Query("CREATE TABLE test_win AS SELECT i AS id, i % 5 AS grp FROM range(100) t(i);");
   auto before_stats = sirius::test::get_transparent_execution_stats(*con);
-  auto result = con->Query(
+  auto result       = con->Query(
     "SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn "
-    "FROM test_win ORDER BY id;");
+          "FROM test_win ORDER BY id;");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 100);
@@ -271,7 +270,7 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
 
   auto second_start = std::chrono::steady_clock::now();
   std::thread second_query([&] {
-    auto result   = other_con->Query("SELECT 42;");
+    auto result    = other_con->Query("SELECT 42;");
     second_elapsed = std::chrono::steady_clock::now() - second_start;
     second_finished.store(true, std::memory_order_release);
     if (!result) {
@@ -294,8 +293,8 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
   first_query.join();
   second_query.join();
 
-  INFO("second query wait time: " <<
-       std::chrono::duration_cast<std::chrono::milliseconds>(second_elapsed).count() << "ms");
+  INFO("second query wait time: "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(second_elapsed).count() << "ms");
   REQUIRE(first_error.empty());
   REQUIRE(second_error.empty());
   REQUIRE(second_elapsed >= 150ms);

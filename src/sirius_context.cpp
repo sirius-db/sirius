@@ -435,8 +435,8 @@ void SiriusContext::restore_transparent_disabled_optimizers(ClientContext& conte
   }
 }
 
-SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execution_stats() const
-  noexcept
+SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execution_stats()
+  const noexcept
 {
   return transparent_execution_stats{
     .successful_rebinds = transparent_rebind_success_count_.load(std::memory_order_relaxed),
@@ -517,9 +517,8 @@ void SiriusContext::acquire_query_lifecycle_slot()
 {
   std::unique_lock lock(query_lifecycle_mutex_);
   auto current_thread = std::this_thread::get_id();
-  query_lifecycle_cv_.wait(lock, [&] {
-    return active_query_depth_ == 0 || active_query_owner_ == current_thread;
-  });
+  query_lifecycle_cv_.wait(
+    lock, [&] { return active_query_depth_ == 0 || active_query_owner_ == current_thread; });
   active_query_owner_ = current_thread;
   active_query_depth_++;
 }

@@ -125,10 +125,10 @@ TEST_CASE("Internal query guard preserves transparent execution state",
   REQUIRE(plan != nullptr);
   sirius_ctx->set_captured_logical_plan(std::move(plan));
 
-  auto expected_disabled = std::set<duckdb::OptimizerType>{duckdb::OptimizerType::COMPRESSED_MATERIALIZATION};
+  auto expected_disabled =
+    std::set<duckdb::OptimizerType>{duckdb::OptimizerType::COMPRESSED_MATERIALIZATION};
   duckdb::DBConfig::GetConfig(client_ctx).options.disabled_optimizers = expected_disabled;
-  sirius_ctx->set_transparent_original_disabled_optimizers(
-    {duckdb::OptimizerType::IN_CLAUSE});
+  sirius_ctx->set_transparent_original_disabled_optimizers({duckdb::OptimizerType::IN_CLAUSE});
 
   {
     duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);

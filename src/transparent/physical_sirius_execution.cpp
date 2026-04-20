@@ -35,7 +35,7 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
   duckdb::unique_ptr<duckdb::QueryResult> result;
   duckdb::unique_ptr<duckdb::DataChunk> current_chunk;
   duckdb::SiriusContext* sirius_context = nullptr;
-  bool finished = false;
+  bool finished                         = false;
 
   duckdb::idx_t MaxThreads() override { return 1; }
 };
@@ -62,9 +62,9 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
 duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobalSourceState(
   duckdb::ClientContext& context) const
 {
-  auto state   = duckdb::make_uniq<SiriusGlobalSourceState>();
-  state->iface = duckdb::make_uniq<sirius::sirius_interface>(context);
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto state            = duckdb::make_uniq<SiriusGlobalSourceState>();
+  state->iface          = duckdb::make_uniq<sirius::sirius_interface>(context);
+  auto sirius_ctx       = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   state->sirius_context = sirius_ctx.get();
   return std::move(state);
 }
