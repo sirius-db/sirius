@@ -38,7 +38,7 @@ class sirius_physical_order : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
 
-  sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_order(duckdb::vector<sirius::logical_type> types,
                         duckdb::vector<duckdb::BoundOrderByNode> orders,
                         duckdb::vector<std::size_t> projections_p,
                         std::size_t estimated_cardinality,

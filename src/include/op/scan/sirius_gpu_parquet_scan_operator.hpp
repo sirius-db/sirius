@@ -71,7 +71,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    * @param estimated_cardinality  Estimated row count.
    * @param gpu_memory_space       GPU memory space for allocating output tables.
    */
-  sirius_gpu_parquet_scan_operator(duckdb::vector<duckdb::LogicalType> types,
+  sirius_gpu_parquet_scan_operator(duckdb::vector<sirius::logical_type> types,
                                    duckdb::idx_t estimated_cardinality,
                                    cucascade::memory::memory_space& gpu_memory_space);
 

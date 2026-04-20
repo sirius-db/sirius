@@ -34,7 +34,7 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
   explicit sirius_physical_concat(
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     sirius_physical_operator* parent_op,
     bool is_build,

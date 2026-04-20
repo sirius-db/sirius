@@ -45,6 +45,7 @@ class sirius_pipeline_task_global_state;
 }  // namespace sirius::pipeline
 
 namespace sirius::op::scan {
+class cpu_source_task_global_state;
 class duckdb_scan_task_global_state;
 class parquet_scan_task_global_state;
 class iceberg_scan_task_global_state;
@@ -194,6 +195,8 @@ class task_creator {
     _scan_operator_global_state_map;
   std::map<size_t, std::shared_ptr<op::scan::parquet_scan_task_global_state>>
     _parquet_scan_operator_global_state_map;
+  std::map<size_t, std::shared_ptr<op::scan::cpu_source_task_global_state>>
+    _cpu_source_operator_global_state_map;
   std::map<size_t, std::shared_ptr<pipeline::sirius_pipeline_task_global_state>>
     _gpu_operator_global_state_map;
   std::unique_ptr<duckdb::ThreadContext> _thread_context;
