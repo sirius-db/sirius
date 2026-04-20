@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <op/scan/hive_partition.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
@@ -33,6 +34,9 @@
 
 namespace sirius::op::scan {
 
+//===----------------------------------------------------------------------===//
+// Parquet scan operator
+//===----------------------------------------------------------------------===//
 /**
  * @brief Operator that reads parquet byte ranges for a batch of row groups and produces
  *        gpu_table_representation data batches for downstream GPU operators.
@@ -123,6 +127,21 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    */
   void finalize_partitions();
 
+  /**
+   * @brief Install a hive-partition injection function.
+   *
+   * Called once by the paired metadata scan operator at construction time when the scan
+   * involves hive partition columns. The closure, built by build_partition_inject_fn(),
+   * is invoked by execute() after the data columns have been read from the parquet file,
+   * to interleave partition-column values parsed from the file path into the output table.
+   *
+   * No-op (leaves _hive_partition_inject_fn null) for non-partitioned scans.
+   */
+  void set_hive_partition_inject_fn(partition_inject_fn_t fn)
+  {
+    _hive_partition_inject_fn = std::move(fn);
+  }
+
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
 
@@ -196,6 +215,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   // ===----------------------------------------------------------------------===//
   std::mutex _metadata_mutex;
   std::atomic<bool> _finalized{false};
+  partition_inject_fn_t _hive_partition_inject_fn;
 
   struct partition_entry {
     std::shared_ptr<partitioned_parquet_metadata> metadata;

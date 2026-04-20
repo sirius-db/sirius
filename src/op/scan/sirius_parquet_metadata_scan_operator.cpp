@@ -16,6 +16,7 @@
 
 // sirius
 #include <log/logging.hpp>
+#include <op/scan/hive_partition.hpp>  // build_partition_inject_fn
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
 #include <op/scan/scan_utils.hpp>
@@ -45,6 +46,7 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   duckdb::vector<duckdb::idx_t> const& projection_ids,
   duckdb::vector<std::string> const& names,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+  duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed)
   : sirius_physical_operator(
@@ -57,6 +59,32 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
     _gpu_scan(gpu_scan)
 {
   _selected_column_indices = detail::make_selected_column_indices(column_ids, projection_ids);
+
+  // Detect hive partition columns — these exist in the DuckDB schema but not in parquet files.
+  // Their values come from directory paths (e.g., partition_col=42/).
+  // We need to drop hive partition columns from the selected column indices, since these are are
+  // injected post-read from the directory path, not read from the parquet file itself.
+  for (auto const& hp_index : partition_indices) {
+    _hive_partition_index_set.insert(hp_index.index);
+    _hive_partition_columns.push_back(hive_partition_column{hp_index.value, hp_index.index});
+  }
+  if (!_hive_partition_index_set.empty()) {
+    _selected_column_indices.erase(
+      std::remove_if(_selected_column_indices.begin(),
+                     _selected_column_indices.end(),
+                     [this](std::size_t idx) { return _hive_partition_index_set.count(idx) > 0; }),
+      _selected_column_indices.end());
+
+    // Build and install the post-read partition injection closure on the paired GPU scan
+    // operator. The closure interleaves partition-column values parsed from the file path into
+    // the cudf table in the order DuckDB expects.
+    _gpu_scan->set_hive_partition_inject_fn(build_partition_inject_fn(column_ids,
+                                                                      names,
+                                                                      returned_types,
+                                                                      _selected_column_indices,
+                                                                      _hive_partition_columns,
+                                                                      _hive_partition_index_set));
+  }
 
   // Convert the table filter set into a DuckDB expression. AST translation is deferred to
   // execute() so that a task-local CUDA stream can be used.
@@ -125,9 +153,7 @@ std::optional<task_creation_hint> sirius_parquet_metadata_scan_operator::get_nex
 }
 
 bool sirius_parquet_metadata_scan_operator::all_ports_empty()
-{
-  return _next_file_idx.load(std::memory_order_relaxed) >= _total_files;
-}
+{ return _next_file_idx.load(std::memory_order_relaxed) >= _total_files; }
 
 std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::get_next_task_input_data()
 {
@@ -321,8 +347,6 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
 }
 
 void sirius_parquet_metadata_scan_operator::finalize_operator()
-{
-  _gpu_scan->finalize_partitions();
-}
+{ _gpu_scan->finalize_partitions(); }
 
 }  // namespace sirius::op::scan

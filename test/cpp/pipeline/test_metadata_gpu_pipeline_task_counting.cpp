@@ -44,6 +44,7 @@
 #include <utils/utils.hpp>
 
 // sirius
+#include <helper/type_conversions.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
@@ -88,9 +89,7 @@ struct pipeline_task_counting_fixture {
       memory_manager(initialize_memory_manager()),
       engine(*con.context, sirius_iface),
       gpu_space(get_space(*memory_manager, Tier::GPU))
-  {
-    REQUIRE(gpu_space != nullptr);
-  }
+  { REQUIRE(gpu_space != nullptr); }
 
   duckdb::DuckDB db;
   duckdb::Connection con;
@@ -264,9 +263,17 @@ TEST_CASE("pipeline task counting - single file, default max_file_processed (one
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(schema.types, 0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
+                                                            0);
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
-    &gpu_op, schema.types, schema.types, 0, files, schema.column_ids, no_projection, schema.names);
+    &gpu_op,
+    sirius::from_duckdb_vec(schema.types),
+    sirius::from_duckdb_vec(schema.types),
+    0,
+    files,
+    schema.column_ids,
+    no_projection,
+    schema.names);
 
   auto [metadata_pipeline, gpu_pipeline] = build_pipelines(fixture.engine, metadata_op, gpu_op);
 
@@ -329,17 +336,19 @@ TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_proce
   auto schema = synthetic_schema();
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(schema.types, 0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
+                                                            0);
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
     &gpu_op,
-    schema.types,
-    schema.types,
+    sirius::from_duckdb_vec(schema.types),
+    sirius::from_duckdb_vec(schema.types),
     /*estimated_cardinality=*/0,
     files,
     schema.column_ids,
     no_projection,
     schema.names,
     /*table_filter_set=*/nullptr,
+    /*partition_indices=*/{},
     sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     /*max_file_processed=*/1);
 

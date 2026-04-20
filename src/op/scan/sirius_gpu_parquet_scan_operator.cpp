@@ -61,9 +61,7 @@ void sirius_gpu_parquet_scan_operator::accumulate_metadata(
 }
 
 void sirius_gpu_parquet_scan_operator::finalize_partitions()
-{
-  _finalized.store(true, std::memory_order_release);
-}
+{ _finalized.store(true, std::memory_order_release); }
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface
@@ -189,6 +187,12 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       "[sirius_gpu_parquet_scan_operator] Pruned pure filter columns; post-filter projection has "
       "{} columns",
       table->num_columns());
+  }
+
+  // Inject hive partition columns, if necessary
+  if (_hive_partition_inject_fn) {
+    table = _hive_partition_inject_fn(std::move(table), scan_data->file_path, stream);
+    SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Injected hive partition columns.");
   }
 
   // Wrap the GPU table in operator_data for the downstream pipeline.

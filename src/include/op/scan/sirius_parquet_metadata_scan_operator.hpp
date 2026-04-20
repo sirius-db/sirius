@@ -26,6 +26,7 @@
 
 // duckdb
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/common/multi_file/multi_file_data.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 
@@ -39,6 +40,9 @@
 
 namespace sirius::op::scan {
 
+//===----------------------------------------------------------------------===//
+// Parquet metadata scan operator
+//===----------------------------------------------------------------------===//
 /**
  * @brief Operator that parses parquet file metadata and produces row-group partitions.
  *
@@ -96,6 +100,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    * @param table_filter_set        The table filter set for row-group pruning and filter pushdown
    *                                (optional; may be nullptr if no filters or filter translation
    *                                fails).
+   * @param partition_indices       The hive partition indices, if any.
    * @param approximate_batch_size  Target uncompressed bytes per row-group partition.
    * @param max_file_processed      Maximum number of files handled by one metadata task.
    *
@@ -111,7 +116,8 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
     duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     duckdb::vector<duckdb::idx_t> const& projection_ids,
     duckdb::vector<std::string> const& names,
-    duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set = nullptr,
+    duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set            = nullptr,
+    duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices = {},
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED);
 
@@ -217,6 +223,10 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   /// For the metadata scan operator, this is used to prune bytes from the accumulated uncompressed
   /// byte count for partitioning purposes.
   std::unordered_set<std::size_t> _pure_filter_column_indices;
+  /// The set of indexes into names/column_ids for hive partition columns
+  std::unordered_set<std::size_t> _hive_partition_index_set;
+  /// The (name, index) pairs for hive partition columns
+  std::vector<hive_partition_column> _hive_partition_columns;
 
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;

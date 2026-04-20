@@ -199,6 +199,7 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   for (auto const& file : bind_data.file_list->GetAllFiles()) {
     file_paths.push_back(file.path);
   }
+  auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
 
   // Construct the pair. metadata_scan_op holds a raw pointer back to gpu_scan_op for the direct
   // accumulate_metadata() / finalize_partitions() handoff.
@@ -213,7 +214,8 @@ void sirius_pipeline_converter::split_parquet_scan_source(
     scan_op.column_ids,
     scan_op.projection_ids,
     scan_op.names,
-    std::move(scan_op.table_filters));
+    std::move(scan_op.table_filters),
+    partition_indices);
 
   auto* gpu_scan_ptr      = gpu_scan_op.get();
   auto* metadata_scan_ptr = metadata_scan_op.get();

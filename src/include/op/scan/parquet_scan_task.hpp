@@ -20,6 +20,7 @@
 #include <config.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
+#include <op/scan/hive_partition.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
@@ -138,9 +139,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @return A const reference to the file path string.
    */
   [[nodiscard]] std::string const& get_file_path(std::size_t file_idx) const
-  {
-    return _file_paths[file_idx];
-  }
+  { return _file_paths[file_idx]; }
 
   /**
    * @brief Get the Parquet reader options, e.g., projections, filters, etc.
@@ -151,9 +150,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @return A const reference to the Parquet reader options.
    */
   [[nodiscard]] cudf::io::parquet_reader_options const& get_options() const
-  {
-    return _reader_options;
-  }
+  { return _reader_options; }
 
   /**
    * @brief Get the number of row group partitions required to exhaust the scan.
@@ -163,9 +160,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @return The number of row group partitions.
    */
   [[nodiscard]] std::size_t get_num_row_group_partitions() const
-  {
-    return _row_group_partitions.size();
-  }
+  { return _row_group_partitions.size(); }
 
   /**
    * @brief Atomically claim and move out the next row group partition index to be processed by a
@@ -192,9 +187,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @return True if there are more partitions to process.
    */
   [[nodiscard]] bool has_more_partitions() const
-  {
-    return _next_rg_partition.load(std::memory_order_relaxed) < _row_group_partitions.size();
-  }
+  { return _next_rg_partition.load(std::memory_order_relaxed) < _row_group_partitions.size(); }
 
   /**
    * @brief Make a hybrid scan Parquet reader with the underlying reader options.
@@ -205,9 +198,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @return A unique pointer to the hybrid scan Parquet reader.
    */
   [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader(std::size_t file_idx) const
-  {
-    return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
-  }
+  { return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options); }
 
   /**
    * @brief Rebind this global state to a new pipeline and scan operator.
@@ -230,27 +221,21 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @brief Get the file size for the given file index.
    */
   [[nodiscard]] std::size_t get_file_size(std::size_t file_idx) const
-  {
-    return _file_sizes[file_idx];
-  }
+  { return _file_sizes[file_idx]; }
 
   /**
    * @brief Get the total number of parquet metadata bytes (header + footer + trailer)
    * that must be cached alongside the column-chunk data for file @p file_idx.
    */
   [[nodiscard]] std::size_t get_metadata_byte_size(std::size_t file_idx) const
-  {
-    return _metadata_byte_sizes[file_idx];
-  }
+  { return _metadata_byte_sizes[file_idx]; }
 
   /**
    * @brief Get the file offset where the parquet footer begins for file @p file_idx.
    * The footer range covers [footer_offset, file_size).
    */
   [[nodiscard]] std::size_t get_footer_offset(std::size_t file_idx) const
-  {
-    return _footer_offsets[file_idx];
-  }
+  { return _footer_offsets[file_idx]; }
 
   /** @brief Get a shared_ptr that pins the translated AST filter expression alive.
    *
@@ -260,9 +245,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @return A shared_ptr to the translated filter expression (may be null if no filter). */
   [[nodiscard]] std::shared_ptr<gpu_expression_translator::translated_expression>
   get_filter_expression() const
-  {
-    return _translated_filter;
-  }
+  { return _translated_filter; }
 
   /**
    * @brief Get projection ids of projected columns post-filter.
@@ -270,9 +253,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @return A const reference to the vector of projection ids.
    */
   [[nodiscard]] std::vector<std::size_t> const& get_post_filter_projection_ids() const
-  {
-    return _post_filter_projection_ids;
-  }
+  { return _post_filter_projection_ids; }
 
   // -------------------------------------------------------------------------
   // Post-convert hook (used by iceberg scan for delete application)
@@ -306,40 +287,26 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * equality-delete key names to cudf table column positions.
    */
   [[nodiscard]] std::vector<size_t> const& get_selected_column_indices() const
-  {
-    return _selected_column_indices;
-  }
+  { return _selected_column_indices; }
 
   // -------------------------------------------------------------------------
   // Hive partition column support
   // -------------------------------------------------------------------------
-
-  /// Metadata for a hive partition column (not present in parquet files).
-  struct hive_partition_column {
-    std::string column_name;     ///< Partition column name (e.g. "year")
-    size_t duckdb_column_index;  ///< Index in scan_op->names / column_ids
-  };
 
   /// True if this scan involves hive-partitioned files.
   [[nodiscard]] bool has_hive_partitions() const { return !_hive_partition_columns.empty(); }
 
   /// Return the partition injection function (may be null).
   [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
-  {
-    return _partition_inject_fn;
-  }
+  { return _partition_inject_fn; }
 
   /// Return the hive partition column metadata.
   [[nodiscard]] std::vector<hive_partition_column> const& get_hive_partition_columns() const
-  {
-    return _hive_partition_columns;
-  }
+  { return _hive_partition_columns; }
 
   /// Return the set of DuckDB column indices that are hive partitions.
   [[nodiscard]] std::unordered_set<size_t> const& get_hive_partition_index_set() const
-  {
-    return _hive_partition_index_set;
-  }
+  { return _hive_partition_index_set; }
 
   /**
    * @brief Initialize hive partition metadata and build the injection function.
@@ -465,9 +432,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    * @return A pointer to the memory space.
    */
   memory_space* get_memory_space()
-  {
-    return const_cast<memory_space*>(&_reservation->get_memory_space());
-  }
+  { return const_cast<memory_space*>(&_reservation->get_memory_space()); }
 
   /**
    * @brief Get the file index of the parquet file to read for this local state.
@@ -491,9 +456,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    * @return The number of uncompressed bytes reserved.
    */
   [[nodiscard]] std::size_t get_reserved_uncompressed_bytes() const
-  {
-    return _partition.reserved_uncompressed_bytes;
-  }
+  { return _partition.reserved_uncompressed_bytes; }
 
   /**
    * @brief Get the number of compressed bytes reserved by this local state.
@@ -501,14 +464,10 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    * @return The number of compressed bytes reserved.
    */
   [[nodiscard]] std::size_t get_reserved_compressed_bytes() const
-  {
-    return _partition.reserved_compressed_bytes + _metadata_bytes;
-  }
+  { return _partition.reserved_compressed_bytes + _metadata_bytes; }
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
-  {
-    return get_reserved_compressed_bytes();
-  }
+  { return get_reserved_compressed_bytes(); }
 
   /**
    * @brief Get the vector of row group indices assigned to this local state.
@@ -516,9 +475,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    * @return A reference to the vector of row group indices.
    */
   [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices()
-  {
-    return _partition.row_group_indices;
-  }
+  { return _partition.row_group_indices; }
 
  private:
   parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition

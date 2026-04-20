@@ -194,6 +194,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     projection_ids,
     names,
     std::move(table_filters),
+    {},
     approximate_batch_size);
 
   // Execute all metadata tasks and sink results into the GPU operator via metadata_op.sink().

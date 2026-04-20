@@ -166,6 +166,7 @@ set(EXTENSION_SOURCES
     src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
+    src/op/scan/hive_partition.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_metadata_reader.cpp
