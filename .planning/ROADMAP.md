@@ -41,7 +41,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 - [x] 04-01-PLAN.md — cuCascade submodule bump (942c0bf -> f47de0b) + build/test gate (BUMP-01/02/03)
 - [x] 04-02-PLAN.md — Cherry-pick 5 v1.0 code commits (preferred_device_id, locality score, push-model routing, scan distribution, integration test) onto dev; carve out downgrade_executor hunks (PORT-01/02/04 partial)
 - [x] 04-03-PLAN.md — Re-author NUMA-aware downgrade on dev PR #579 shape + re-author 3 downgrade test commits (PORT-01/04 completion); includes human-verify checkpoint
-- [ ] 04-04-PLAN.md — PORT-03 YAML config verification + full pre-commit run (PORT-03)
+- [x] 04-04-PLAN.md — PORT-03 YAML config verification + full pre-commit run (PORT-03)
 - [ ] 04-05-PLAN.md — Full unit-test gate + explicit hidden-tag invocation + structural grep gates + phase summary (PORT-05); includes phase sign-off checkpoint
 
 ### Phase 5: Cucascade-Backed Parquet I/O Migration
