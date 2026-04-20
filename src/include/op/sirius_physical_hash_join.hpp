@@ -55,7 +55,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   struct join_projection_columns {
     std::vector<cudf::size_type> col_idxs;
-    duckdb::vector<duckdb::LogicalType> col_types;
+    duckdb::vector<sirius::logical_type> col_types;
   };
 
  public:
@@ -67,7 +67,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::JoinType join_type,
     const duckdb::vector<std::size_t>& left_projection_map,
     const duckdb::vector<std::size_t>& right_projection_map,
-    duckdb::vector<duckdb::LogicalType> delim_types,
+    duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
@@ -88,7 +88,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void initialize_hash_table(duckdb::ClientContext& context) const;
 
   //! The types of the join keys
-  duckdb::vector<duckdb::LogicalType> condition_types;
+  duckdb::vector<sirius::logical_type> condition_types;
   //! The type of the join
   duckdb::JoinType join_type;
 
@@ -100,7 +100,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   join_projection_columns rhs_output_columns;
 
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
-  duckdb::vector<duckdb::LogicalType> delim_types;
+  duckdb::vector<sirius::logical_type> delim_types;
 
   mutable bool unique_build_keys = false;
 

@@ -32,7 +32,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
  public:
   sirius_physical_merge_sort(sirius_physical_order* order_by);
 
-  sirius_physical_merge_sort(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_merge_sort(duckdb::vector<sirius::logical_type> types,
                              duckdb::vector<duckdb::BoundOrderByNode> orders,
                              duckdb::vector<std::size_t> projections_p,
                              std::size_t estimated_cardinality,
@@ -68,7 +68,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
 
   //! Set the final output projection (applied after merge, to remove sort-key-only columns)
   void set_final_projections(duckdb::vector<std::size_t> proj,
-                             duckdb::vector<duckdb::LogicalType> output_types)
+                             duckdb::vector<sirius::logical_type> output_types)
   {
     _final_projections = std::move(proj);
     types              = std::move(output_types);

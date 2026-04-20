@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <helper/logical_type.hpp>
 #include <helper/utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 
@@ -137,7 +138,7 @@ class host_table_chunk_reader {
    */
   host_table_chunk_reader(duckdb::ClientContext& client_ctx,
                           cucascade::host_data_representation const& host_table,
-                          duckdb::vector<duckdb::LogicalType> const& types);
+                          duckdb::vector<sirius::logical_type> const& types);
   ~host_table_chunk_reader() = default;
 
   /**

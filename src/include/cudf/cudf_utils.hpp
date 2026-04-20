@@ -41,6 +41,9 @@
 #if CUDF_VERSION_NUM >= 2604
 #include <cudf/reduction/distinct_count.hpp>
 #endif
+#include "helper/logical_type.hpp"
+#include "sirius/exception.hpp"
+
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -56,11 +59,13 @@
 
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>
+#include <duckdb/common/types/value.hpp>
 
 #include <memory>
+#include <string>
 #include <vector>
 
-namespace duckdb {
+namespace sirius {
 
 inline bool IsCudfTypeDecimal(const cudf::data_type& type)
 {
@@ -73,9 +78,151 @@ inline int GetCudfDecimalTypeSize(const cudf::data_type& type)
   if (type.id() == cudf::type_id::DECIMAL32) { return sizeof(int32_t); }
   if (type.id() == cudf::type_id::DECIMAL64) { return sizeof(int64_t); }
   if (type.id() == cudf::type_id::DECIMAL128) { return sizeof(__int128_t); }
-  throw InternalException("Non decimal cudf type called in `GetCudfDecimalTypeSize`: %d",
-                          static_cast<int>(type.id()));
+  throw internal_exception("Non decimal cudf type called in GetCudfDecimalTypeSize: " +
+                           std::to_string(static_cast<int>(type.id())));
 }
+
+/**
+ * @brief Map a sirius::logical_type to its corresponding cudf::data_type.
+ *
+ * Mirrors duckdb::GetCudfType() but operates on the Sirius-native type system.
+ * This overload is used by GPU operators that have been decoupled from DuckDB.
+ *
+ * @throws duckdb::InvalidInputException if the type is unsupported.
+ */
+inline cudf::data_type get_cudf_type(const logical_type& t)
+{
+  switch (t.id()) {
+    case type_id::TINYINT: return cudf::data_type(cudf::type_id::INT8);
+    case type_id::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
+    case type_id::INTEGER: return cudf::data_type(cudf::type_id::INT32);
+    case type_id::BIGINT: return cudf::data_type(cudf::type_id::INT64);
+    case type_id::HUGEINT:
+      // FIXME: unsafe 128→64-bit narrowing: DuckDB HUGEINT is INT128 but cuDF has no INT128.
+      // Values outside INT64 range are silently corrupted. Matches legacy duckdb::GetCudfType().
+      return cudf::data_type(cudf::type_id::INT64);
+    case type_id::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
+    case type_id::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
+    case type_id::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
+    case type_id::UBIGINT: return cudf::data_type(cudf::type_id::UINT64);
+    case type_id::UHUGEINT:
+      // FIXME: unsafe 128→64-bit narrowing: DuckDB UHUGEINT is UINT128 but cuDF has no UINT128.
+      // Values outside UINT64 range are silently corrupted. Matches legacy duckdb::GetCudfType().
+      return cudf::data_type(cudf::type_id::UINT64);
+    case type_id::FLOAT: return cudf::data_type(cudf::type_id::FLOAT32);
+    case type_id::DOUBLE: return cudf::data_type(cudf::type_id::FLOAT64);
+    case type_id::BOOLEAN: return cudf::data_type(cudf::type_id::BOOL8);
+    case type_id::DATE: return cudf::data_type(cudf::type_id::TIMESTAMP_DAYS);
+    case type_id::TIMESTAMP_SEC: return cudf::data_type(cudf::type_id::TIMESTAMP_SECONDS);
+    case type_id::TIMESTAMP_MS: return cudf::data_type(cudf::type_id::TIMESTAMP_MILLISECONDS);
+    case type_id::TIMESTAMP: return cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS);
+    case type_id::TIMESTAMP_NS: return cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS);
+    case type_id::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
+    case type_id::STRUCT: return cudf::data_type(cudf::type_id::STRUCT);
+    case type_id::LIST:
+    case type_id::SQLNULL:
+    case type_id::INVALID:
+      throw duckdb::InvalidInputException("sirius::get_cudf_type: Type %s cannot be mapped to cuDF",
+                                          t.to_string());
+    case type_id::DECIMAL: {
+      // cuDF uses negative scale convention; precision determines the storage width.
+      auto const neg_scale = static_cast<int32_t>(-t.decimal_scale());
+      if (t.decimal_precision() <= logical_type::decimal_max_precision_int16)
+        throw duckdb::InvalidInputException(
+          "sirius::get_cudf_type: DECIMAL with precision <= %d is stored as INT16 in DuckDB "
+          "and has no direct cuDF equivalent — use DuckDB CPU fallback",
+          logical_type::decimal_max_precision_int16);
+      if (t.decimal_precision() <= logical_type::decimal_max_precision_int32)
+        return cudf::data_type(cudf::type_id::DECIMAL32, neg_scale);
+      if (t.decimal_precision() <= logical_type::decimal_max_precision_int64)
+        return cudf::data_type(cudf::type_id::DECIMAL64, neg_scale);
+      return cudf::data_type(cudf::type_id::DECIMAL128, neg_scale);
+    }
+    default:
+      throw duckdb::InvalidInputException("sirius::get_cudf_type: Unsupported type: %s",
+                                          t.to_string());
+  }
+}
+
+/**
+ * @brief Convert a DuckDB Value to a cudf scalar, typed by sirius::logical_type.
+ *
+ * Used by:
+ *   - Partition column injection (constant columns from hive path values)
+ *   - Expression translator (AST literal nodes) — can be refactored to use this
+ *
+ * The Value argument remains duckdb::Value because Sirius has no native Value
+ * type yet; this sits at the DuckDB boundary and returns a cudf scalar keyed
+ * off the sirius-native logical_type used by GPU operators.
+ *
+ * @param val     The DuckDB value to convert.
+ * @param t       The Sirius logical type (determines cudf type via get_cudf_type).
+ * @param stream  CUDA stream for device operations.
+ * @return A cudf scalar holding the same value. Falls back to string_scalar
+ *         for unsupported cudf types (DECIMAL128, STRUCT, etc.).
+ */
+inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& val,
+                                                          logical_type const& t,
+                                                          rmm::cuda_stream_view stream)
+{
+  auto cudf_type = get_cudf_type(t);
+
+  switch (cudf_type.id()) {
+    case cudf::type_id::INT8:
+      return std::make_unique<cudf::numeric_scalar<int8_t>>(val.GetValue<int8_t>(), true, stream);
+    case cudf::type_id::INT16:
+      return std::make_unique<cudf::numeric_scalar<int16_t>>(val.GetValue<int16_t>(), true, stream);
+    case cudf::type_id::INT32:
+      return std::make_unique<cudf::numeric_scalar<int32_t>>(val.GetValue<int32_t>(), true, stream);
+    case cudf::type_id::INT64:
+      return std::make_unique<cudf::numeric_scalar<int64_t>>(val.GetValue<int64_t>(), true, stream);
+    case cudf::type_id::UINT8:
+      return std::make_unique<cudf::numeric_scalar<uint8_t>>(val.GetValue<uint8_t>(), true, stream);
+    case cudf::type_id::UINT16:
+      return std::make_unique<cudf::numeric_scalar<uint16_t>>(
+        val.GetValue<uint16_t>(), true, stream);
+    case cudf::type_id::UINT32:
+      return std::make_unique<cudf::numeric_scalar<uint32_t>>(
+        val.GetValue<uint32_t>(), true, stream);
+    case cudf::type_id::UINT64:
+      return std::make_unique<cudf::numeric_scalar<uint64_t>>(
+        val.GetValue<uint64_t>(), true, stream);
+    case cudf::type_id::FLOAT32:
+      return std::make_unique<cudf::numeric_scalar<float>>(val.GetValue<float>(), true, stream);
+    case cudf::type_id::FLOAT64:
+      return std::make_unique<cudf::numeric_scalar<double>>(val.GetValue<double>(), true, stream);
+    case cudf::type_id::BOOL8:
+      return std::make_unique<cudf::numeric_scalar<bool>>(val.GetValue<bool>(), true, stream);
+    case cudf::type_id::STRING:
+      return std::make_unique<cudf::string_scalar>(val.GetValue<std::string>(), true, stream);
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return std::make_unique<cudf::numeric_scalar<int32_t>>(val.GetValue<int32_t>(), true, stream);
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return std::make_unique<cudf::numeric_scalar<int64_t>>(val.GetValue<int64_t>(), true, stream);
+    case cudf::type_id::DECIMAL32:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+        val.GetValueUnsafe<typename numeric::decimal32::rep>(),
+        numeric::scale_type{-static_cast<int32_t>(t.decimal_scale())},
+        true,
+        stream);
+    case cudf::type_id::DECIMAL64:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+        val.GetValueUnsafe<typename numeric::decimal64::rep>(),
+        numeric::scale_type{-static_cast<int32_t>(t.decimal_scale())},
+        true,
+        stream);
+    // For unsupported types (DECIMAL128, STRUCT, etc.), fall back to string.
+    // Better than crashing — the column will be STRING instead of native type.
+    default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
+  }
+}
+
+}  // namespace sirius
+
+namespace duckdb {
 
 /**
  * @brief Type switch from duckdb LogicalType to cudf data_type
