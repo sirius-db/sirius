@@ -17,7 +17,6 @@ on:
   push:
     branches:
       - dev
-  pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
