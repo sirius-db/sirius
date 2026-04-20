@@ -367,6 +367,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/io/s3/test_s3_integration.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp
+    test/cpp/io/s3/test_s3_parquet_integration.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_device_read_flags.cpp

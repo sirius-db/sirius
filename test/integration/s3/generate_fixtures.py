@@ -10,16 +10,19 @@ Writes files under ``<out_dir>`` (default:
 the MinIO container via ``mc``. Fixtures are regenerated deterministically each
 run so tests can bit-compare the S3-read bytes against the local copy.
 
-  hello.txt     — 16-byte ASCII blob; HEAD + tiny-range test
-  small.bin     — 20 KiB deterministic binary blob; bit-equal read via factory
-  medium.bin    — 8 MiB deterministic binary blob; multi-range reads
+  hello.txt      — 16-byte ASCII blob; HEAD + tiny-range test
+  small.bin      — 20 KiB deterministic binary blob; bit-equal read via factory
+  medium.bin     — 8 MiB deterministic binary blob; multi-range reads
+  small.parquet  — 256-row patterned parquet (requires pyarrow); drives the
+                   [s3][parquet][integration] test which parses the S3-read
+                   bytes with DuckDB and checks semantic correctness.
 
-The blobs are opaque bytes (NOT real parquet) — PR15's C++ integration tests
-only need deterministic, size-known objects they can bit-compare against the
-local copy. Keeping the generator stdlib-only avoids forcing a duckdb / pyarrow
-install on the MinIO host. The SQLLogicTest in test/sql/datasource/s3_read.test
-DOES need real parquet data and is disabled until a stdlib-only parquet
-generator (or an optional pyarrow/duckdb path) is wired back in.
+The binary blobs are opaque bytes (NOT real parquet) — the byte-equality
+tests in test_s3_integration.cpp only need deterministic, size-known objects.
+Parquet generation is optional: if pyarrow is not installed we skip
+small.parquet with a warning, and the parquet-integration test
+auto-skips when the object is absent from S3. Install pyarrow (``pip install
+pyarrow``) on the host that runs ``make s3-up`` to enable it.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import random
+import sys
 from pathlib import Path
 
 
@@ -35,6 +39,10 @@ SMALL_SIZE = 20 * 1024              # 20 KiB
 MEDIUM_SIZE = 8 * 1024 * 1024       # 8 MiB (medium test needs > 4 MiB)
 SMALL_SEED = 0xA17E57
 MEDIUM_SEED = 0xBE57ED
+
+PARQUET_ROWS = 256
+PARQUET_KNUTH = 2654435761          # Knuth's multiplicative hash constant
+PARQUET_INT64_MASK = (1 << 63) - 1  # keep v positive so it fits INT64 cleanly
 
 
 def write_hello(out_dir: Path) -> Path:
@@ -51,6 +59,44 @@ def write_deterministic_bytes(out_path: Path, size: int, seed: int) -> Path:
     rng = random.Random(seed)
     out_path.write_bytes(rng.randbytes(size))
     assert out_path.stat().st_size == size
+    return out_path
+
+
+def write_patterned_parquet(out_path: Path, num_rows: int = PARQUET_ROWS) -> Path | None:
+    """Write a patterned parquet if pyarrow is available; return None otherwise.
+
+    Schema: id INT32, v INT64, s VARCHAR. Values follow a closed-form pattern
+    so the C++ test can regenerate expected values without reading the file:
+      id = 0..num_rows-1
+      v  = (id * 2654435761) & INT64_MAX
+      s  = f"row-{id:04d}"
+
+    Compression is snappy (DuckDB/cudf both read it; matches what Sirius's
+    prod parquet scan encounters most often).
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        print(
+            "  [skip] small.parquet — pyarrow not installed; run"
+            " `pip install pyarrow` to enable the [s3][parquet][integration] test",
+            file=sys.stderr,
+        )
+        return None
+
+    ids = list(range(num_rows))
+    vs = [((i * PARQUET_KNUTH) & PARQUET_INT64_MASK) for i in ids]
+    ss = [f"row-{i:04d}" for i in ids]
+
+    table = pa.table(
+        {
+            "id": pa.array(ids, type=pa.int32()),
+            "v": pa.array(vs, type=pa.int64()),
+            "s": pa.array(ss, type=pa.string()),
+        }
+    )
+    pq.write_table(table, out_path, compression="snappy")
     return out_path
 
 
@@ -86,6 +132,9 @@ def main() -> int:
         write_deterministic_bytes(out_dir / "small.bin", SMALL_SIZE, SMALL_SEED),
         write_deterministic_bytes(out_dir / "medium.bin", MEDIUM_SIZE, MEDIUM_SEED),
     ]
+    parquet_path = write_patterned_parquet(out_dir / "small.parquet")
+    if parquet_path is not None:
+        paths.append(parquet_path)
 
     manifest_path = args.manifest or (out_dir / "MANIFEST.sha256")
     with manifest_path.open("w") as f:

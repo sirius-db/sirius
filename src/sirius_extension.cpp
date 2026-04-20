@@ -46,14 +46,7 @@ extern "C" int cudaProfilerStop();
 #include "gpu_physical_plan_generator.hpp"
 #endif
 #include "duckdb/main/connection_manager.hpp"
-#include "io/datasource_factory.hpp"
-#include "io/s3/s3_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
-// NOTE: do NOT include "io/uring/uring_ioctx.hpp" here. It transitively pulls
-// <liburing.h>, which defines BLOCK_SIZE as a macro and collides with
-// duckdb/third_party/concurrentqueue's `static const size_t BLOCK_SIZE` (the
-// PCH pulls concurrentqueue into this TU). The debug table function below
-// only needs s3_ioctx.
 #include "log/logging.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
@@ -669,123 +662,6 @@ static void ProfilerStopFunction(ClientContext& context,
   data.finished = true;
 }
 
-// ---------------------------------------------------------------------------
-// sirius_debug_datasource_size(uri VARCHAR) -> BIGINT
-//
-// Test-only table function that exercises the new Sirius datasource pipeline
-// end-to-end from SQL:
-//
-//   SET s3_endpoint / s3_access_key / ...  ->  per-connection sirius_config
-//                    |                                  |
-//                    v                                  v
-//   sirius_debug_datasource_size(uri) --> datasource_factory::create(uri,
-//                                             registry, sirius_config)
-//                    |                                  |
-//                    v                                  v
-//              registry.lookup(scheme) --> s3_ioctx / uring_ioctx
-//                    |
-//                    v
-//              ds->size()   (HEAD for S3)
-//
-// Purpose: give SQLLogicTest a minimal hook into the new S3 IO path so the
-// [s3_debug] SQL test can bit-verify object sizes read from MinIO *without*
-// needing a valid parquet fixture (DuckDB's read_parquet goes through httpfs,
-// not through our s3_ioctx). The function is registered under a
-// "sirius_debug_" prefix to signal it is not a user-facing API.
-//
-// Scope: only s3:// URIs are supported. file:// would require uring_ioctx,
-// and its <liburing.h> BLOCK_SIZE macro collides with DuckDB's
-// concurrentqueue header pulled in via this TU's PCH — keeping the debug
-// hook s3-only avoids the collision without disturbing engine code.
-// ---------------------------------------------------------------------------
-
-struct SiriusDebugDatasourceSizeBind : public TableFunctionData {
-  std::string uri;
-};
-
-struct SiriusDebugDatasourceSizeGlobal : public GlobalTableFunctionState {
-  bool emitted = false;
-};
-
-static unique_ptr<FunctionData> SiriusDebugDatasourceSizeBindFn(
-  ClientContext& context,
-  TableFunctionBindInput& input,
-  vector<LogicalType>& return_types,
-  vector<string>& names)
-{
-  if (input.inputs[0].IsNull()) {
-    throw BinderException("sirius_debug_datasource_size cannot be called with NULL");
-  }
-  auto bind = make_uniq<SiriusDebugDatasourceSizeBind>();
-  bind->uri = input.inputs[0].ToString();
-  return_types.emplace_back(LogicalType::BIGINT);
-  names.emplace_back("size");
-  return std::move(bind);
-}
-
-static unique_ptr<GlobalTableFunctionState> SiriusDebugDatasourceSizeInitFn(
-  ClientContext& context, TableFunctionInitInput& input)
-{
-  return make_uniq<SiriusDebugDatasourceSizeGlobal>();
-}
-
-// Build a throwaway registry mirroring the lazy-registration logic in
-// sirius_engine::datasource_registry(). We don't touch the engine's own
-// registry here so this debug hook stays independent of whether a
-// gpu_execution query has run yet on this connection.
-static std::shared_ptr<sirius::io::datasource_registry> MakeDebugRegistry(
-  sirius::io::object_store_config const& osc)
-{
-  auto reg = std::make_shared<sirius::io::datasource_registry>();
-  // file:// backend intentionally omitted here: uring_ioctx pulls liburing,
-  // which breaks this TU's PCH (see include list above). This debug hook
-  // targets s3:// URIs; callers needing file:// should use gpu_execution.
-  if (!osc.endpoint.empty()) {
-    sirius::io::s3::s3_ioctx_config scfg;
-    scfg.endpoint   = osc.endpoint;
-    scfg.region     = osc.region.empty() ? "us-east-1" : osc.region;
-    scfg.access_key = osc.access_key;
-    scfg.secret_key = osc.secret_key;
-    reg->register_ioctx("s3", std::make_shared<sirius::io::s3::s3_ioctx>(std::move(scfg)));
-  }
-  return reg;
-}
-
-static void SiriusDebugDatasourceSizeFn(ClientContext& context,
-                                        TableFunctionInput& data_p,
-                                        DataChunk& output)
-{
-  auto& state = data_p.global_state->Cast<SiriusDebugDatasourceSizeGlobal>();
-  if (state.emitted) {
-    output.SetCardinality(0);
-    return;
-  }
-  auto& bind = data_p.bind_data->Cast<SiriusDebugDatasourceSizeBind>();
-
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (sirius_ctx == nullptr) {
-    // SiriusContext is attached at extension load time; a missing one here
-    // means the extension failed to initialize for this connection.
-    throw InvalidInputException("sirius_debug_datasource_size: SiriusContext not available");
-  }
-  auto const& cfg = sirius_ctx->get_config();
-  auto registry   = MakeDebugRegistry(cfg.get_object_store_config());
-
-  std::unique_ptr<sirius::io::io_datasource> ds;
-  try {
-    ds = sirius::io::datasource_factory::create(bind.uri, *registry, cfg);
-  } catch (std::exception const& e) {
-    // Surface backend errors (bad scheme, unreachable MinIO, 403/404, ...)
-    // as a DuckDB exception so SQLLogicTest `statement error` can match on it.
-    throw InvalidInputException("sirius_debug_datasource_size('%s'): %s",
-                                bind.uri, e.what());
-  }
-
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(ds->size())));
-  state.emitted = true;
-}
-
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -820,17 +696,6 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "profiler_stop", {}, ProfilerStopFunction, ProfilerBind, ProfilerInit);
   CreateTableFunctionInfo profiler_stop_info(profiler_stop);
   catalog.CreateTableFunction(transaction, profiler_stop_info);
-
-  // Debug hook for the new Sirius datasource pipeline — see the block comment
-  // above SiriusDebugDatasourceSizeBindFn for how the SQL-level SET knobs
-  // thread through to the registry, factory, and ioctx.
-  TableFunction debug_ds_size("sirius_debug_datasource_size",
-                              {LogicalType::VARCHAR},
-                              SiriusDebugDatasourceSizeFn,
-                              SiriusDebugDatasourceSizeBindFn,
-                              SiriusDebugDatasourceSizeInitFn);
-  CreateTableFunctionInfo debug_ds_size_info(debug_ds_size);
-  catalog.CreateTableFunction(transaction, debug_ds_size_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
