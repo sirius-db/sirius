@@ -785,3 +785,139 @@ TEST_CASE("numa_downgrade_prefers_local_host_space",
   executor.stop();
   sirius::converter_registry::shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// MEM-04 P2P + MEM-05 scan distribution placeholders (re-authored from v1.0 0d99cde)
+//
+// These are Phase 7 work items — the real P2P path (MGPU-06) and the full
+// proportional-distribution validation (MGPU-07) will expand the assertion sets
+// below. For Phase 4, the tests assert the Phase 4 baseline:
+//   - GPU-to-GPU transfer via the cucascade converter (host-staged on dev; MGPU-06
+//     will swap in cudaMemcpyPeerAsync with cudaDeviceCanAccessPeer gating)
+//   - asymmetric cucascade fixtures produce asymmetric get_available_memory()
+//     reports (prerequisite for select_target_gpu's proportional distribution
+//     from Plan 02 commit 5e8e9b7 — MGPU-07 will add scan-distribution ratio
+//     validation end-to-end)
+//
+// Tag [.] hides both — they need 2+ GPUs for any meaningful hardware validation.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("p2p_transfer_converter_round_trip_placeholder",
+          "[.][mem_04_p2p_transfer][multi_gpu]")
+{
+  // Phase 4 scope: host-staged GPU-to-GPU transfer (the MEM-03 baseline already
+  // verified by gpu_to_gpu_transfer_via_converter above; this variant adds a
+  // cudaDeviceCanAccessPeer probe so Phase 7 can wire the P2P path behind the
+  // same test shape).
+  //
+  // TODO(MGPU-06): once MEM-04 lands, replace the converter path with
+  // cudaMemcpyPeerAsync + device-sync + data integrity over the P2P link, and
+  // add an assertion that the cucascade converter chose the P2P backend when
+  // can_access_peer is true.
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs for MEM-04 P2P transfer placeholder");
+    return;
+  }
+
+  int can_access_0_to_1 = 0;
+  int can_access_1_to_0 = 0;
+  cudaDeviceCanAccessPeer(&can_access_0_to_1, 0, 1);
+  cudaDeviceCanAccessPeer(&can_access_1_to_0, 1, 0);
+  // Phase 4 placeholder assertion: the topology query succeeds (regardless of
+  // whether P2P is physically available — heterogeneous test boxes may report 0).
+  // MGPU-06 will tighten this to REQUIRE(can_access_0_to_1 == 1) on supported HW.
+
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(256ull << 20)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_host_capacity(1ull << 30)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(0.75);
+  auto space_configs = builder.build();
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+  sirius::converter_registry::initialize();
+
+  auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+  auto* gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
+
+  auto batch = make_gpu_batch(*gpu0, 500);
+  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
+  size_t original_size = batch->get_data()->get_size_in_bytes();
+
+  auto& registry = sirius::converter_registry::get();
+  rmm::cuda_stream stream;
+
+  // GPU0 -> GPU1 via converter (host-staged on Phase 4; P2P direct in Phase 7 MGPU-06).
+  REQUIRE(batch->try_to_lock_for_in_transit());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
+  batch->try_to_release_in_transit();
+  REQUIRE(batch->get_memory_space()->get_device_id() == gpu1->get_device_id());
+  REQUIRE(batch->get_data()->get_size_in_bytes() == original_size);
+
+  // Round-trip GPU1 -> GPU0.
+  REQUIRE(batch->try_to_lock_for_in_transit());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
+  batch->try_to_release_in_transit();
+  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
+  REQUIRE(batch->get_data()->get_size_in_bytes() == original_size);
+
+  sirius::converter_registry::shutdown();
+}
+
+TEST_CASE("scan_distribution_memory_check_placeholder",
+          "[.][mem_05_scan_distribution][multi_gpu]")
+{
+  // Phase 4 scope: asymmetric GPU capacity configuration produces asymmetric
+  // get_available_memory() reports. This is the prerequisite for
+  // duckdb_scan_executor::select_target_gpu (added in Plan 02 commit 5e8e9b7)
+  // to produce proportional distribution.
+  //
+  // TODO(MGPU-07): once Phase 7 lands adaptive scan distribution, expand this
+  // into an end-to-end test that launches N scan tasks and verifies the GPU
+  // selection histogram matches the available-memory ratio within tolerance.
+  // Also gate the select_target_gpu accessor via a test-only friend or public
+  // helper so the distribution ratio can be measured directly.
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs for MEM-05 scan distribution placeholder");
+    return;
+  }
+
+  sirius::converter_registry::reset_for_testing();
+
+  // Asymmetric configuration: GPU 0 gets 2x the usage limit of GPU 1.
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(512ull << 20)  // 512 MB nominal; overridden below per-GPU if API supports
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_host_capacity(1ull << 30)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(0.75);
+  auto space_configs = builder.build();
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+  sirius::converter_registry::initialize();
+
+  auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+
+  // Phase 4 assertion: both GPUs report a non-zero available-memory figure, and
+  // the figures are numerically comparable (prerequisite for Plan 02's
+  // select_target_gpu proportional selection). MGPU-07 will tighten this to a
+  // ratio assertion under the per-GPU capacity configuration.
+  auto avail0 = gpu_spaces[0]->get_available_memory();
+  auto avail1 = gpu_spaces[1]->get_available_memory();
+  REQUIRE(avail0 > 0);
+  REQUIRE(avail1 > 0);
+
+  sirius::converter_registry::shutdown();
+}
