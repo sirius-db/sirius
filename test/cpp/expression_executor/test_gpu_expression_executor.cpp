@@ -1004,6 +1004,29 @@ TEMPLATE_TEST_CASE("experimental execute arithmetic functions",
     }
   }
 
+  SECTION("col0 multiply col1")
+  {
+    duckdb::vector<duckdb::unique_ptr<Expression>> children;
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(
+      make_func_expr("multiply",
+                     LogicalType{LogicalTypeId::INTEGER},
+                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
+                     std::move(children)));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto in0                           = copy_column_to_host<int32_t>(iv.column(0));
+    auto in1                           = copy_column_to_host<int32_t>(iv.column(1));
+    auto out0                          = copy_column_to_host<int32_t>(ov.column(0));
+    for (size_t i = 0; i < in0.size(); ++i) {
+      REQUIRE(out0[i] == in0[i] * in1[i]);
+    }
+  }
+
   SECTION("col0 % 3")
   {
     duckdb::vector<duckdb::unique_ptr<Expression>> children;

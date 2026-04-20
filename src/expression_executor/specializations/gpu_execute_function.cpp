@@ -87,6 +87,35 @@
 namespace sirius::experimental {
 using execute_result = gpu_expression_executor::execute_result;
 
+namespace {
+[[nodiscard]] bool is_add_function(std::string_view function_name)
+{
+  return function_name == ADD_FUNC_STR || function_name == "add";
+}
+
+[[nodiscard]] bool is_subtract_function(std::string_view function_name)
+{
+  return function_name == SUB_FUNC_STR || function_name == "subtract";
+}
+
+[[nodiscard]] bool is_multiply_function(std::string_view function_name)
+{
+  return function_name == MUL_FUNC_STR || function_name == "multiply";
+}
+
+[[nodiscard]] bool is_divide_function(std::string_view function_name)
+{
+  return function_name == DIV_FUNC_STR || function_name == INT_DIV_FUNC_STR ||
+         function_name == "divide";
+}
+
+[[nodiscard]] bool is_modulo_function(std::string_view function_name)
+{
+  return function_name == MOD_FUNC_STR || function_name == "mod" ||
+         function_name == "modulus";
+}
+}  // namespace
+
 execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression const& expr,
                                                 execution_mode mode)
 {
@@ -107,15 +136,15 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
 
     auto function_type_switch_ast =
       [](std::string const& function_name) -> cudf::ast::ast_operator {
-      if (function_name == ADD_FUNC_STR) {
+      if (is_add_function(function_name)) {
         return cudf::ast::ast_operator::ADD;
-      } else if (function_name == SUB_FUNC_STR) {
+      } else if (is_subtract_function(function_name)) {
         return cudf::ast::ast_operator::SUB;
-      } else if (function_name == MUL_FUNC_STR) {
+      } else if (is_multiply_function(function_name)) {
         return cudf::ast::ast_operator::MUL;
-      } else if (function_name == DIV_FUNC_STR || function_name == INT_DIV_FUNC_STR) {
+      } else if (is_divide_function(function_name)) {
         return cudf::ast::ast_operator::DIV;
-      } else if (function_name == MOD_FUNC_STR) {
+      } else if (is_modulo_function(function_name)) {
         return cudf::ast::ast_operator::MOD;
       } else {
         throw duckdb::InternalException(
@@ -176,19 +205,19 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     return execute_result(cudf::binary_operation(
       left.get_column_view(), right.get_column_view(), op, output_type, _stream, _mr));
   };
-  if (func_string == ADD_FUNC_STR) {
+  if (is_add_function(func_string)) {
     return execute_numeric_binary_func(cudf::binary_operator::ADD);
   }
-  if (func_string == SUB_FUNC_STR) {
+  if (is_subtract_function(func_string)) {
     return execute_numeric_binary_func(cudf::binary_operator::SUB);
   }
-  if (func_string == MUL_FUNC_STR) {
+  if (is_multiply_function(func_string)) {
     return execute_numeric_binary_func(cudf::binary_operator::MUL);
   }
-  if (func_string == DIV_FUNC_STR || func_string == INT_DIV_FUNC_STR) {
+  if (is_divide_function(func_string)) {
     return execute_numeric_binary_func(cudf::binary_operator::DIV);
   }
-  if (func_string == MOD_FUNC_STR) {
+  if (is_modulo_function(func_string)) {
     return execute_numeric_binary_func(cudf::binary_operator::MOD);
   }
 

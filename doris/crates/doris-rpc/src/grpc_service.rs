@@ -1152,17 +1152,18 @@ fn execute_exchange_plan_to_location(
     exchange_only: bool,
 ) -> Result<crate::nixl_integration::ExecutionLocation, String> {
     if force_cpu {
-        return Ok(crate::nixl_integration::ExecutionLocation::Cpu(execute_plan(
-            engine,
-            plan,
-            no_cpu_fallback,
-            true,
-        )?));
+        return Ok(crate::nixl_integration::ExecutionLocation::Cpu(
+            execute_plan(engine, plan, no_cpu_fallback, true)?,
+        ));
     }
 
     let partition_spec_ref = partition_spec
         .as_ref()
         .map(|(num_dests, col_indices)| (*num_dests, col_indices.as_slice()));
+    let projection_already_applied = projection_indices
+        .as_ref()
+        .map(|indices| !indices.is_empty())
+        .unwrap_or(false);
 
     match plan {
         ExecPlan::Substrait {
@@ -1200,7 +1201,11 @@ fn execute_exchange_plan_to_location(
                 )?;
                 let artifact = engine
                     .take_exchange_artifact()
-                    .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                    .map_err(|e| format!("take_exchange_artifact: {e}"))?
+                    .map(|mut artifact| {
+                        artifact.set_projection_already_applied(projection_already_applied);
+                        artifact
+                    });
                 Ok(exchange_location_from_artifact(ipc_bytes, artifact))
             }
         }
@@ -1218,7 +1223,11 @@ fn execute_exchange_plan_to_location(
             let ipc_bytes = execute_plan(engine, other, no_cpu_fallback, false)?;
             let artifact = engine
                 .take_exchange_artifact()
-                .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                .map_err(|e| format!("take_exchange_artifact: {e}"))?
+                .map(|mut artifact| {
+                    artifact.set_projection_already_applied(projection_already_applied);
+                    artifact
+                });
             Ok(exchange_location_from_artifact(ipc_bytes, artifact))
         }
     }
@@ -1802,8 +1811,8 @@ fn concat_ipc_streams(ipc_streams: &[&[u8]]) -> Result<Vec<u8>, String> {
     let schema = schema.ok_or_else(|| "missing IPC schema".to_string())?;
     let mut out = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut out, &schema)
-            .map_err(|e| format!("IPC writer: {e}"))?;
+        let mut writer =
+            StreamWriter::try_new(&mut out, &schema).map_err(|e| format!("IPC writer: {e}"))?;
         for batch in &batches {
             writer
                 .write(batch)
@@ -2009,7 +2018,11 @@ fn extract_fragment_output_layout(params: &TPipelineFragmentParams) -> Vec<Outpu
             aggregate_functions = agg.aggregate_functions.len(),
             "root aggregation metadata"
         );
-        log_tuple_layout(desc_tbl, agg.intermediate_tuple_id, "agg_intermediate_tuple");
+        log_tuple_layout(
+            desc_tbl,
+            agg.intermediate_tuple_id,
+            "agg_intermediate_tuple",
+        );
         log_tuple_layout(desc_tbl, agg.output_tuple_id, "agg_output_tuple");
     }
 
@@ -2178,9 +2191,7 @@ fn maybe_project_location_for_exchange(
     Ok(crate::nixl_integration::ExecutionLocation::Cpu(projected))
 }
 
-fn should_preserve_packed_exchange(
-    location: &crate::nixl_integration::ExecutionLocation,
-) -> bool {
+fn should_preserve_packed_exchange(location: &crate::nixl_integration::ExecutionLocation) -> bool {
     matches!(
         location,
         crate::nixl_integration::ExecutionLocation::PackedExchange { .. }
@@ -2317,10 +2328,12 @@ fn project_values_by_indices<T: Clone>(
     projection_indices
         .iter()
         .map(|&idx| {
-            values
-                .get(idx)
-                .cloned()
-                .ok_or_else(|| format!("projection index {idx} out of range for {} values", values.len()))
+            values.get(idx).cloned().ok_or_else(|| {
+                format!(
+                    "projection index {idx} out of range for {} values",
+                    values.len()
+                )
+            })
         })
         .collect()
 }
@@ -2383,7 +2396,10 @@ fn exchange_finalize_projection_indices(
         return None;
     }
 
-    let measure_slot_ids: Vec<i32> = input_slots[num_grouping..].iter().map(|slot| slot.id).collect();
+    let measure_slot_ids: Vec<i32> = input_slots[num_grouping..]
+        .iter()
+        .map(|slot| slot.id)
+        .collect();
     let mut projection_indices: Vec<usize> = (0..num_grouping).collect();
     for agg_fn in &agg_node.aggregate_functions {
         let slot_id = agg_fn
@@ -2497,6 +2513,7 @@ fn packed_exchange_entries_from_local_artifacts(
 ) -> Vec<PackedGpuExchange> {
     let mut packed_list = Vec::new();
     for artifact in local_artifacts {
+        let projection_already_applied = artifact.projection_already_applied();
         let staging_base = artifact.staging_base();
         for partition in artifact.packed_partitions() {
             if partition.packed_size == 0 {
@@ -2511,6 +2528,7 @@ fn packed_exchange_entries_from_local_artifacts(
                 gpu_addr,
                 gpu_size: partition.packed_size,
                 cudf_metadata: partition.metadata.clone(),
+                projection_already_applied,
                 _staging_lease: None,
             });
         }
@@ -2527,11 +2545,30 @@ fn packed_exchange_entries_from_local_artifacts(
                 gpu_addr,
                 gpu_size: entry.packed_size,
                 cudf_metadata: entry.metadata.clone(),
+                projection_already_applied,
                 _staging_lease: None,
             });
         }
     }
     packed_list
+}
+
+fn packed_entries_projection_already_applied(
+    packed_entries: &[PackedGpuExchange],
+) -> Result<bool, String> {
+    let Some(first) = packed_entries.first() else {
+        return Ok(false);
+    };
+    let first_state = first.projection_already_applied;
+    if packed_entries
+        .iter()
+        .any(|entry| entry.projection_already_applied != first_state)
+    {
+        return Err(
+            "inconsistent packed exchange projection state across sender artifacts".to_string(),
+        );
+    }
+    Ok(first_state)
 }
 
 fn register_packed_exchange_table(
@@ -2748,9 +2785,16 @@ fn generate_exchange_agg_merge_sql(
     // order than the AGG_FINAL's aggregate_functions. Compute the mapping from
     // AGG_FINAL order → exchange table column positions using slot_ref → slot_id
     // matching (same logic as node_translator.rs reordering).
-    let measure_permutation: Vec<usize> = exchange_finalize_projection_indices(params, exch.node_id)
-        .map(|projection| projection.into_iter().skip(num_grouping).map(|idx| idx - num_grouping).collect())
-        .unwrap_or_else(|| (0..num_agg_fns).collect());
+    let measure_permutation: Vec<usize> =
+        exchange_finalize_projection_indices(params, exch.node_id)
+            .map(|projection| {
+                projection
+                    .into_iter()
+                    .skip(num_grouping)
+                    .map(|idx| idx - num_grouping)
+                    .collect()
+            })
+            .unwrap_or_else(|| (0..num_agg_fns).collect());
 
     // Build SELECT list.
     let mut select_parts = Vec::new();
@@ -3113,14 +3157,11 @@ fn should_use_exchange_only_capture(
     local_brpc_addr: &str,
     local_gpu_receivers_by_dest: &std::collections::HashMap<i32, bool>,
 ) -> bool {
-    exchange_infos.len() == 1
-        && exchange_infos_are_all_local(exchange_infos, local_brpc_addr)
-        && exchange_infos.iter().all(|info| {
-            local_gpu_receivers_by_dest
-                .get(&info.dest_node_id)
-                .copied()
-                .unwrap_or(false)
-        })
+    let _ = (exchange_infos, local_brpc_addr, local_gpu_receivers_by_dest);
+    // Keep all-local exchange on the materialize+IPC path for now. The 1-BE
+    // correctness baseline depends on this path; exchange-only local artifacts
+    // still show intermittent wrong answers on queries like Q14.
+    false
 }
 
 fn local_exchange_capture_projection_by_dest(
@@ -3147,7 +3188,7 @@ fn local_exchange_capture_projection_by_dest(
     result
 }
 
-fn root_scalar_aggregate_capture_projection(
+fn root_aggregate_capture_projection(
     params: &TPipelineFragmentParams,
     dest_node_id: i32,
     local_capture_projection_by_dest: &std::collections::HashMap<i32, Vec<usize>>,
@@ -3161,14 +3202,6 @@ fn root_scalar_aggregate_capture_projection(
     if agg_node.need_finalize {
         return None;
     }
-    if agg_node
-        .grouping_exprs
-        .as_ref()
-        .map(|g| !g.is_empty())
-        .unwrap_or(false)
-    {
-        return None;
-    }
     local_capture_projection_by_dest
         .get(&dest_node_id)
         .cloned()
@@ -3176,7 +3209,7 @@ fn root_scalar_aggregate_capture_projection(
             info!(
                 dest_node_id,
                 projection_indices = ?indices,
-                "using receiver-derived capture projection for scalar aggregate sender"
+                "using receiver-derived capture projection for aggregate sender"
             );
         })
 }
@@ -3188,7 +3221,7 @@ fn exchange_capture_projection_for_sender(
 ) -> Option<Vec<usize>> {
     let info = exchange_infos.first()?;
     info.output_indices.clone().or_else(|| {
-        root_scalar_aggregate_capture_projection(
+        root_aggregate_capture_projection(
             params,
             info.dest_node_id,
             local_capture_projection_by_dest,
@@ -3258,26 +3291,25 @@ fn extract_exchange_destinations(params: &TPipelineFragmentParams) -> Vec<Exchan
             let sink_output_layout = extract_stream_sink_output_layout(params, stream_sink);
             let sender_contract_projection =
                 if sink_output_layout.is_empty() && !fragment_output_layout.is_empty() {
-                    aggregate_root_runtime_to_contract_projection_indices(params)
-                        .map(|indices| {
-                            (
-                                fragment_output_layout
-                                    .iter()
-                                    .map(|entry| entry.name.clone())
-                                    .collect::<Vec<_>>(),
-                                indices,
-                            )
-                        })
+                    aggregate_root_runtime_to_contract_projection_indices(params).map(|indices| {
+                        (
+                            fragment_output_layout
+                                .iter()
+                                .map(|entry| entry.name.clone())
+                                .collect::<Vec<_>>(),
+                            indices,
+                        )
+                    })
                 } else {
                     None
                 };
-            let (output_names, output_indices) = compute_exchange_projection(
-                &fragment_output_layout,
-                &sink_output_layout,
-            )
-            .map(|(names, indices)| (names, Some(indices)))
-            .or_else(|| sender_contract_projection.map(|(names, indices)| (names, Some(indices))))
-            .unwrap_or_else(|| (Vec::new(), None));
+            let (output_names, output_indices) =
+                compute_exchange_projection(&fragment_output_layout, &sink_output_layout)
+                    .map(|(names, indices)| (names, Some(indices)))
+                    .or_else(|| {
+                        sender_contract_projection.map(|(names, indices)| (names, Some(indices)))
+                    })
+                    .unwrap_or_else(|| (Vec::new(), None));
             if let Some(indices) = output_indices.as_ref() {
                 tracing::info!(
                     dest_node_id = stream_sink.dest_node_id,
@@ -3587,8 +3619,7 @@ impl PBackendService for PBackendServiceHandler {
                 let nixl_agent = self.nixl_agent.clone();
                 let local_brpc_addr = self.local_brpc_addr.clone();
                 let local_gpu_receivers_by_dest = local_gpu_receivers_by_dest.clone();
-                let local_capture_projection_by_dest =
-                    local_capture_projection_by_dest.clone();
+                let local_capture_projection_by_dest = local_capture_projection_by_dest.clone();
                 let exchange_buffer = self.exchange_buffer.clone();
 
                 // Spawn async task: wait for exchange data, decode, load, execute.
@@ -3633,40 +3664,62 @@ impl PBackendService for PBackendServiceHandler {
                             let receiver_projection =
                                 exchange_finalize_projection_indices(&params, node_id);
                             let projection_indices = receiver_projection;
-                            let base_overrides =
-                                exchange_table_column_overrides(&params, node_id);
+                            let base_overrides = exchange_table_column_overrides(&params, node_id);
                             let overrides = match projection_indices.as_deref() {
-                                Some(indices) => match project_exchange_overrides(
-                                    &base_overrides,
-                                    indices,
-                                ) {
-                                    Ok(projected) => projected,
-                                    Err(e) => {
-                                        warn!(
-                                            error = %e,
-                                            table = %table_name,
-                                            projection_indices = ?projection_indices,
-                                            "failed to project exchange table overrides"
-                                        );
-                                        store.store_error(
+                                Some(indices) => {
+                                    match project_exchange_overrides(&base_overrides, indices) {
+                                        Ok(projected) => projected,
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                table = %table_name,
+                                                projection_indices = ?projection_indices,
+                                                "failed to project exchange table overrides"
+                                            );
+                                            store.store_error(
                                             finst_id,
                                             fragment_finst_id,
                                             format!(
                                                 "project exchange table overrides for {table_name}: {e}"
                                             ),
                                         );
-                                        return;
+                                            return;
+                                        }
                                     }
-                                },
+                                }
                                 None => base_overrides,
                             };
                             let packed_entries =
                                 packed_exchange_entries_from_local_artifacts(&local_artifacts);
                             if !packed_entries.is_empty() {
+                                let sender_projection_applied =
+                                    match packed_entries_projection_already_applied(&packed_entries)
+                                    {
+                                        Ok(state) => state,
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                table = %table_name,
+                                                "local GPU exchange artifacts disagree on sender projection state"
+                                            );
+                                            store.store_error(
+                                                finst_id,
+                                                fragment_finst_id,
+                                                format!(
+                                                    "packed local GPU exchange projection state for {table_name}: {e}"
+                                                ),
+                                            );
+                                            return;
+                                        }
+                                    };
                                 let reg_engine = engine.clone();
                                 let reg_table = table_name.clone();
                                 let reg_overrides = overrides.clone();
-                                let reg_projection = projection_indices.clone();
+                                let reg_projection = if sender_projection_applied {
+                                    None
+                                } else {
+                                    projection_indices.clone()
+                                };
                                 let reg_result = tokio::task::spawn_blocking(move || {
                                     let eng = reg_engine.lock().unwrap();
                                     let cols = register_packed_exchange_table(
@@ -3705,8 +3758,7 @@ impl PBackendService for PBackendServiceHandler {
                                             table_schema_types
                                                 .insert(table_name.clone(), actual_types);
                                         }
-                                        gpu_capable_exchange_tables
-                                            .insert(table_name.clone());
+                                        gpu_capable_exchange_tables.insert(table_name.clone());
                                         retained_local_gpu_artifacts
                                             .insert(node_id, local_artifacts);
                                         registered_any_local_tables = true;
@@ -3733,95 +3785,99 @@ impl PBackendService for PBackendServiceHandler {
                             }
 
                             match local_artifacts.first() {
-                                Some(first) => match ipc_schema_columns_and_types(first.ipc_bytes()) {
-                                    Ok((cols, types)) => {
-                                        let expected_cols = if !overrides.is_empty() {
-                                            overrides
-                                                .iter()
-                                                .map(|(_, name, _)| name.clone())
-                                                .collect()
-                                        } else if let Some(indices) = projection_indices.as_deref() {
-                                            match project_values_by_indices(&cols, indices) {
-                                                Ok(projected) => projected,
-                                                Err(e) => {
-                                                    warn!(
-                                                        error = %e,
-                                                        table = %table_name,
-                                                        projection_indices = ?projection_indices,
-                                                        "failed to project IPC schema columns for local GPU exchange"
-                                                    );
-                                                    store.store_error(
+                                Some(first) => {
+                                    match ipc_schema_columns_and_types(first.ipc_bytes()) {
+                                        Ok((cols, types)) => {
+                                            let expected_cols = if !overrides.is_empty() {
+                                                overrides
+                                                    .iter()
+                                                    .map(|(_, name, _)| name.clone())
+                                                    .collect()
+                                            } else if let Some(indices) =
+                                                projection_indices.as_deref()
+                                            {
+                                                match project_values_by_indices(&cols, indices) {
+                                                    Ok(projected) => projected,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            error = %e,
+                                                            table = %table_name,
+                                                            projection_indices = ?projection_indices,
+                                                            "failed to project IPC schema columns for local GPU exchange"
+                                                        );
+                                                        store.store_error(
                                                         finst_id,
                                                         fragment_finst_id,
                                                         format!(
                                                             "project local GPU IPC schema for {table_name}: {e}"
                                                         ),
                                                     );
-                                                    return;
+                                                        return;
+                                                    }
                                                 }
-                                            }
-                                        } else {
-                                            cols
-                                        };
-                                        let expected_types = if let Some(indices) =
-                                            projection_indices.as_deref()
-                                        {
-                                            match project_values_by_indices(&types, indices) {
-                                                Ok(projected) => projected,
-                                                Err(e) => {
-                                                    warn!(
-                                                        error = %e,
-                                                        table = %table_name,
-                                                        projection_indices = ?projection_indices,
-                                                        "failed to project IPC schema types for local GPU exchange"
-                                                    );
-                                                    store.store_error(
+                                            } else {
+                                                cols
+                                            };
+                                            let expected_types = if let Some(indices) =
+                                                projection_indices.as_deref()
+                                            {
+                                                match project_values_by_indices(&types, indices) {
+                                                    Ok(projected) => projected,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            error = %e,
+                                                            table = %table_name,
+                                                            projection_indices = ?projection_indices,
+                                                            "failed to project IPC schema types for local GPU exchange"
+                                                        );
+                                                        store.store_error(
                                                         finst_id,
                                                         fragment_finst_id,
                                                         format!(
                                                             "project local GPU IPC types for {table_name}: {e}"
                                                         ),
                                                     );
-                                                    return;
+                                                        return;
+                                                    }
                                                 }
-                                            }
-                                        } else {
-                                            types.clone()
-                                        };
+                                            } else {
+                                                types.clone()
+                                            };
 
-                                        info!(
-                                            table = %table_name,
-                                            cols = expected_cols.len(),
-                                            projection_indices = ?projection_indices,
-                                            "recorded local GPU exchange schema from IPC fallback"
-                                        );
-                                        let expected_col_count = expected_cols.len();
-                                        table_schemas.insert(table_name.clone(), expected_cols);
-                                        if expected_types.len() == expected_col_count {
-                                            table_schema_types
-                                                .insert(table_name.clone(), expected_types);
+                                            info!(
+                                                table = %table_name,
+                                                cols = expected_cols.len(),
+                                                projection_indices = ?projection_indices,
+                                                "recorded local GPU exchange schema from IPC fallback"
+                                            );
+                                            let expected_col_count = expected_cols.len();
+                                            table_schemas.insert(table_name.clone(), expected_cols);
+                                            if expected_types.len() == expected_col_count {
+                                                table_schema_types
+                                                    .insert(table_name.clone(), expected_types);
+                                            }
+                                            pending_local_exchange_artifacts
+                                                .insert(node_id, local_artifacts);
+                                            let _ = buffer.take(&key);
+                                            continue;
                                         }
-                                        pending_local_exchange_artifacts
-                                            .insert(node_id, local_artifacts);
-                                        let _ = buffer.take(&key);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            error = %e,
-                                            table = %table_name,
-                                            "failed to inspect local GPU exchange IPC schema"
-                                        );
-                                        store.store_error(
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                table = %table_name,
+                                                "failed to inspect local GPU exchange IPC schema"
+                                            );
+                                            store.store_error(
                                             finst_id,
                                             fragment_finst_id,
                                             format!(
                                                 "inspect local GPU exchange schema for {table_name}: {e}"
                                             ),
                                         );
-                                        return;
+                                            return;
+                                        }
                                     }
-                                },
+                                }
                                 None => {
                                     table_schemas.insert(table_name.clone(), vec![]);
                                     pending_local_exchange_artifacts
@@ -3832,17 +3888,14 @@ impl PBackendService for PBackendServiceHandler {
                             }
                         }
 
-                        let packed_source = if let Some(packed_list) = buffer.take_packed_gpu(&key) {
-                            Some((
-                                packed_list,
-                                "packed GPU exchange table (zero CPU copies)",
-                            ))
+                        let packed_source = if let Some(packed_list) = buffer.take_packed_gpu(&key)
+                        {
+                            Some((packed_list, "packed GPU exchange table (zero CPU copies)"))
                         } else {
                             None
                         };
 
-                        if let Some((packed_list, source_label)) = packed_source
-                        {
+                        if let Some((packed_list, source_label)) = packed_source {
                             let first = &packed_list[0];
                             info!(
                                 table = %table_name,
@@ -3860,31 +3913,54 @@ impl PBackendService for PBackendServiceHandler {
                                 exchange_finalize_projection_indices(&params, node_id);
                             let base_overrides = exchange_table_column_overrides(&params, node_id);
                             let overrides = match projection_indices.as_deref() {
-                                Some(indices) => match project_exchange_overrides(
-                                    &base_overrides,
-                                    indices,
-                                ) {
-                                    Ok(projected) => projected,
-                                    Err(e) => {
-                                        warn!(
-                                            error = %e,
-                                            table = %table_name,
-                                            projection_indices = ?projection_indices,
-                                            "failed to project packed GPU exchange overrides"
-                                        );
-                                        store.store_error(
+                                Some(indices) => {
+                                    match project_exchange_overrides(&base_overrides, indices) {
+                                        Ok(projected) => projected,
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                table = %table_name,
+                                                projection_indices = ?projection_indices,
+                                                "failed to project packed GPU exchange overrides"
+                                            );
+                                            store.store_error(
                                             finst_id,
                                             fragment_finst_id,
                                             format!(
                                                 "project packed GPU exchange overrides for {table_name}: {e}"
                                             ),
                                         );
-                                        return;
+                                            return;
+                                        }
                                     }
-                                },
+                                }
                                 None => base_overrides,
                             };
-                            let reg_projection = projection_indices.clone();
+                            let sender_projection_applied =
+                                match packed_entries_projection_already_applied(&packed_owned) {
+                                    Ok(state) => state,
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            table = %table_name,
+                                            source = source_label,
+                                            "packed GPU entries disagree on sender projection state"
+                                        );
+                                        store.store_error(
+                                            finst_id,
+                                            fragment_finst_id,
+                                            format!(
+                                                "packed GPU exchange projection state for {table_name}: {e}"
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                };
+                            let reg_projection = if sender_projection_applied {
+                                None
+                            } else {
+                                projection_indices.clone()
+                            };
                             let reg_result = tokio::task::spawn_blocking(move || {
                                 let eng = reg_engine.lock().unwrap();
                                 register_packed_exchange_table(
@@ -3900,17 +3976,20 @@ impl PBackendService for PBackendServiceHandler {
                             match reg_result {
                                 Ok(Ok(cols)) => {
                                     info!(
-                                        table = %table_name,
-                                        source = source_label,
-                                        cols = cols.len(),
-                                "packed GPU table registered"
-                                    );
+                                            table = %table_name,
+                                            source = source_label,
+                                            cols = cols.len(),
+                                    "packed GPU table registered"
+                                        );
                                     gpu_capable_exchange_tables.insert(table_name.clone());
                                     table_schemas.insert(table_name.clone(), cols);
-                                    if let Ok(schema) = engine.lock().unwrap().get_table_schema(&table_name) {
+                                    if let Ok(schema) =
+                                        engine.lock().unwrap().get_table_schema(&table_name)
+                                    {
                                         let actual_types = table_schema_types_from_duckdb(&schema);
                                         if actual_types.len() == schema.len() {
-                                            table_schema_types.insert(table_name.clone(), actual_types);
+                                            table_schema_types
+                                                .insert(table_name.clone(), actual_types);
                                         }
                                     }
                                     let _ = buffer.take(&key);
@@ -3950,7 +4029,8 @@ impl PBackendService for PBackendServiceHandler {
                             // then resolve column types from the descriptor table.
                             let col_defs: Vec<String> = (|| -> Option<Vec<String>> {
                                 let mut defs = Vec::new();
-                                for slot in exchange_node_ordered_materialized_slots(&params, node_id)
+                                for slot in
+                                    exchange_node_ordered_materialized_slots(&params, node_id)
                                 {
                                     use doris_thrift::types::TPrimitiveType;
                                     let ptype: Option<doris_thrift::types::TPrimitiveType> = slot
@@ -4034,13 +4114,14 @@ impl PBackendService for PBackendServiceHandler {
                                 match engine_guard.get_table_columns(&table_name) {
                                     Ok(cols) => {
                                         table_schemas.insert(table_name.clone(), cols);
-                                        if let Ok(schema) = engine_guard.get_table_schema(&table_name) {
-                                            let actual_types = table_schema_types_from_duckdb(&schema);
+                                        if let Ok(schema) =
+                                            engine_guard.get_table_schema(&table_name)
+                                        {
+                                            let actual_types =
+                                                table_schema_types_from_duckdb(&schema);
                                             if actual_types.len() == schema.len() {
-                                                table_schema_types.insert(
-                                                    table_name.clone(),
-                                                    actual_types,
-                                                );
+                                                table_schema_types
+                                                    .insert(table_name.clone(), actual_types);
                                             }
                                         }
                                     }
@@ -4365,6 +4446,10 @@ impl PBackendService for PBackendServiceHandler {
                             gpu_capable_exchange_tables
                                 .contains(&exchange_table_name(query_id.1, nid))
                         });
+                    let all_exchange_tables_local_gpu = !exchange_node_ids.is_empty()
+                        && exchange_node_ids
+                            .iter()
+                            .all(|&nid| retained_local_gpu_artifacts.contains_key(&nid));
 
                     let (mut exec_plan, output_names) = if let Some(union_sql) =
                         generate_exchange_union_sql(&params)
@@ -4416,10 +4501,14 @@ impl PBackendService for PBackendServiceHandler {
                             &file_scan_map,
                         ) {
                             Ok(plan) => {
-                                let exec = if plan.force_cpu_substrait || !all_exchange_tables_gpu {
+                                let exec = if plan.force_cpu_substrait
+                                    || !all_exchange_tables_gpu
+                                    || all_exchange_tables_local_gpu
+                                {
                                     info!(
                                         force_cpu = plan.force_cpu_substrait,
                                         all_gpu = all_exchange_tables_gpu,
+                                        all_local_gpu = all_exchange_tables_local_gpu,
                                         "exchange fragment using CPU Substrait path",
                                     );
                                     ExecPlan::SubstraitCpuOnly {
@@ -4476,8 +4565,10 @@ impl PBackendService for PBackendServiceHandler {
                                 continue;
                             };
                             let table_name = exchange_table_name(query_id.1, node_id);
-                            let ipc_inputs: Vec<&[u8]> =
-                                local_artifacts.iter().map(|artifact| artifact.ipc_bytes()).collect();
+                            let ipc_inputs: Vec<&[u8]> = local_artifacts
+                                .iter()
+                                .map(|artifact| artifact.ipc_bytes())
+                                .collect();
                             let combined_ipc = match concat_ipc_streams(&ipc_inputs) {
                                 Ok(bytes) => bytes,
                                 Err(e) => {
@@ -4498,8 +4589,8 @@ impl PBackendService for PBackendServiceHandler {
                             };
 
                             let engine_guard = engine.lock().unwrap();
-                            if let Err(e) =
-                                engine_guard.register_exchange_table_from_ipc(&table_name, &combined_ipc)
+                            if let Err(e) = engine_guard
+                                .register_exchange_table_from_ipc(&table_name, &combined_ipc)
                             {
                                 warn!(
                                     error = %e,
@@ -4583,12 +4674,14 @@ impl PBackendService for PBackendServiceHandler {
 
                     // Capture GPU exchange artifact when the plan uses GPU.
                     // Local exchange doesn't need nixl — the artifact stays in-process.
-                    let all_local_exch = exchange_infos_are_all_local(&exchange_infos, &local_brpc_addr);
+                    let all_local_exch =
+                        exchange_infos_are_all_local(&exchange_infos, &local_brpc_addr);
                     let should_retain_exch = should_capture_exchange_artifact(
                         &exchange_infos,
                         &exec_plan,
                         nixl_agent.is_some() || all_local_exch,
-                    ) && !is_cpu_only;
+                    ) && !is_cpu_only
+                        && !all_local_exch;
                     let hash_partition_info_exch = exchange_hash_partition_info(&exchange_infos);
                     let exchange_capture_projection_exch = exchange_capture_projection_for_sender(
                         &params,
@@ -4629,6 +4722,19 @@ impl PBackendService for PBackendServiceHandler {
                                 let query_id = (params.query_id.hi, params.query_id.lo);
                                 let send_result = if exchange_infos.len() == 1 {
                                     if should_preserve_packed_exchange(&location) {
+                                        crate::nixl_integration::send_exchange_with_nixl(
+                                            nixl_agent.as_ref(),
+                                            location,
+                                            &exchange_infos[0],
+                                            query_id,
+                                            sender_id,
+                                            nixl_only,
+                                            &local_brpc_addr,
+                                            &exchange_buffer,
+                                            desc_tbl_slots.as_deref(),
+                                        )
+                                        .await
+                                    } else if all_local_exch {
                                         crate::nixl_integration::send_exchange_with_nixl(
                                             nixl_agent.as_ref(),
                                             location,
@@ -4882,22 +4988,40 @@ impl PBackendService for PBackendServiceHandler {
                             force_cpu = plan.force_cpu_substrait,
                             "translated to Substrait"
                         );
-                        // Force CPU for exchange-only fragments (no file scans,
-                        // only exchange tables). GPU hangs on CPU-registered
-                        // exchange tables.
+                        // Constant-only fragments stay on CPU. Exchange-only
+                        // fragments can remain on GPU when every exchange input
+                        // is backed by a packed GPU table.
                         let has_file_scans = !file_scan_infos.is_empty();
-                        let exec =
-                            if plan.force_cpu_substrait || !has_data_tables || !has_file_scans {
-                                ExecPlan::SubstraitCpuOnly {
-                                    bytes: plan.substrait_bytes,
-                                    sort_limit_sql: plan.sort_limit_sql,
-                                }
-                            } else {
-                                ExecPlan::Substrait {
-                                    bytes: plan.substrait_bytes,
-                                    sort_limit_sql: plan.sort_limit_sql,
-                                }
-                            };
+                        let exchange_node_ids = has_unresolved_exchanges(params);
+                        let all_exchange_inputs_gpu = !exchange_node_ids.is_empty()
+                            && exchange_node_ids.iter().all(|node_id| {
+                                local_gpu_receivers_by_dest
+                                    .get(node_id)
+                                    .copied()
+                                    .unwrap_or(false)
+                            });
+                        let exec = if plan.force_cpu_substrait
+                            || !has_data_tables
+                            || (!has_file_scans && !all_exchange_inputs_gpu)
+                        {
+                            info!(
+                                has_file_scans,
+                                all_exchange_inputs_gpu, "using CPU Substrait for merged fragment"
+                            );
+                            ExecPlan::SubstraitCpuOnly {
+                                bytes: plan.substrait_bytes,
+                                sort_limit_sql: plan.sort_limit_sql,
+                            }
+                        } else {
+                            info!(
+                                has_file_scans,
+                                all_exchange_inputs_gpu, "using GPU Substrait for merged fragment"
+                            );
+                            ExecPlan::Substrait {
+                                bytes: plan.substrait_bytes,
+                                sort_limit_sql: plan.sort_limit_sql,
+                            }
+                        };
                         (exec, Some(plan.output_names), plan.output_column_indices)
                     }
                     Err(e) => {
@@ -4960,6 +5084,9 @@ impl PBackendService for PBackendServiceHandler {
                     &local_brpc_addr,
                 );
 
+                let all_local_exchange =
+                    exchange_infos_are_all_local(&exchange_infos_with_local, &local_brpc_addr);
+
                 if execute_leaf_async {
                     let exec_plan = exec_plan;
                     let output_names = output_names.clone();
@@ -4976,7 +5103,8 @@ impl PBackendService for PBackendServiceHandler {
                             &exchange_infos,
                             &exec_plan,
                             nixl_agent.is_some(),
-                        ) && plan_uses_gpu;
+                        ) && plan_uses_gpu
+                            && !all_local_exchange;
                         let use_exchange_only = should_use_exchange_only_capture(
                             &exchange_infos,
                             &local_brpc_addr,
@@ -5135,19 +5263,10 @@ impl PBackendService for PBackendServiceHandler {
                     })
                     .unwrap_or(false);
 
-            // For the synchronous all-local leaf path, capture an exchange
-            // artifact so local exchange can move an owned GPU artifact instead
-            // of falling back to PBlock. Hash still only uses the artifact path
-            // for the current single-destination all-local case.
-            //
-            // Local exchange doesn't need nixl — the artifact stays in-process.
-            // Only remote exchange transport requires a nixl agent.
-            let should_retain = all_local_exchange
-                && should_capture_exchange_artifact(
-                    &exchange_infos_with_local,
-                    &exec_plan,
-                    self.nixl_agent.is_some() || all_local_exchange,
-                );
+            // Keep same-process leaf exchange on the CPU/PBlock path. The
+            // retained local GPU artifact path is still flaky in 1-BE and
+            // produces intermittent wrong answers on queries like Q6 and Q14.
+            let should_retain = false;
 
             let exchange_output_count = exchange_infos.len();
             let hash_partition_info: Option<(usize, Vec<i32>)> = if is_hash_partitioned {
@@ -5192,49 +5311,65 @@ impl PBackendService for PBackendServiceHandler {
             );
 
             // Sirius/DuckDB execution is blocking — run off the async runtime.
-            let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
-                let t_total = std::time::Instant::now();
-                let engine = engine.lock().unwrap();
-                if should_retain {
-                    let _ = engine.finalize_exchange_tables_direct();
-                    tracing::info!("exchange capture started before GPU execution");
-                    let t_exec = std::time::Instant::now();
-                    let location = execute_exchange_plan_to_location(
-                        &engine,
-                        exec_plan,
-                        no_cpu_fallback,
-                        force_cpu,
-                        hash_partition_info,
-                        exchange_capture_projection,
-                        use_exchange_only,
-                    )?;
-                    tracing::info!(exec_ms = t_exec.elapsed().as_millis() as u64, "execute_exchange_plan completed");
-                    if let Some(names) = exec_output_names {
+            let exec_result = tokio::task::spawn_blocking(
+                move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
+                    let t_total = std::time::Instant::now();
+                    let engine = engine.lock().unwrap();
+                    if should_retain {
+                        let _ = engine.finalize_exchange_tables_direct();
+                        tracing::info!("exchange capture started before GPU execution");
+                        let t_exec = std::time::Instant::now();
+                        let location = execute_exchange_plan_to_location(
+                            &engine,
+                            exec_plan,
+                            no_cpu_fallback,
+                            force_cpu,
+                            hash_partition_info,
+                            exchange_capture_projection,
+                            use_exchange_only,
+                        )?;
                         tracing::info!(
-                            exchange_outputs = exchange_output_count,
-                            output_names = ?names,
-                            output_indices = ?exec_output_indices,
-                            "skipping leaf IPC projection for exchange send"
+                            exec_ms = t_exec.elapsed().as_millis() as u64,
+                            "execute_exchange_plan completed"
                         );
-                    }
-                    tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
-                    Ok(location)
-                } else {
-                    let t_exec = std::time::Instant::now();
-                    let ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
-                    tracing::info!(exec_ms = t_exec.elapsed().as_millis() as u64, ipc_len = ipc_bytes.len(), "execute_plan completed");
-                    if let Some(names) = exec_output_names {
+                        if let Some(names) = exec_output_names {
+                            tracing::info!(
+                                exchange_outputs = exchange_output_count,
+                                output_names = ?names,
+                                output_indices = ?exec_output_indices,
+                                "skipping leaf IPC projection for exchange send"
+                            );
+                        }
                         tracing::info!(
-                            exchange_outputs = exchange_output_count,
-                            output_names = ?names,
-                            output_indices = ?exec_output_indices,
-                            "skipping leaf IPC projection for exchange send"
+                            total_ms = t_total.elapsed().as_millis() as u64,
+                            "leaf spawn_blocking done"
                         );
+                        Ok(location)
+                    } else {
+                        let t_exec = std::time::Instant::now();
+                        let ipc_bytes =
+                            execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
+                        tracing::info!(
+                            exec_ms = t_exec.elapsed().as_millis() as u64,
+                            ipc_len = ipc_bytes.len(),
+                            "execute_plan completed"
+                        );
+                        if let Some(names) = exec_output_names {
+                            tracing::info!(
+                                exchange_outputs = exchange_output_count,
+                                output_names = ?names,
+                                output_indices = ?exec_output_indices,
+                                "skipping leaf IPC projection for exchange send"
+                            );
+                        }
+                        tracing::info!(
+                            total_ms = t_total.elapsed().as_millis() as u64,
+                            "leaf spawn_blocking done"
+                        );
+                        Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                     }
-                    tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
-                    Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
-                }
-            })
+                },
+            )
             .await;
 
             match exec_result {
@@ -5277,9 +5412,24 @@ impl PBackendService for PBackendServiceHandler {
                                     desc_tbl_slots.as_deref(),
                                 )
                                 .await
+                            } else if all_local_exchange {
+                                crate::nixl_integration::send_exchange_with_nixl(
+                                    self.nixl_agent.as_ref(),
+                                    location,
+                                    &exchange_infos[0],
+                                    query_id,
+                                    sender_id,
+                                    self.nixl_only,
+                                    &self.local_brpc_addr,
+                                    &self.exchange_buffer,
+                                    desc_tbl_slots.as_deref(),
+                                )
+                                .await
                             } else {
-                                match maybe_project_location_for_exchange(location, &exchange_infos[0])
-                                {
+                                match maybe_project_location_for_exchange(
+                                    location,
+                                    &exchange_infos[0],
+                                ) {
                                     Ok(projected_location) => {
                                         crate::nixl_integration::send_exchange_with_nixl(
                                             self.nixl_agent.as_ref(),
@@ -6910,7 +7060,15 @@ mod tests {
     fn test_extract_exchange_destinations_prefers_runtime_row_tuple_order() {
         let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         params.desc_tbl = Some(make_desc_table());
-        params.fragment.as_mut().unwrap().plan.as_mut().unwrap().nodes[0].row_tuples = vec![7];
+        params
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes[0]
+            .row_tuples = vec![7];
         params.fragment.as_mut().unwrap().output_exprs =
             Some(vec![slot_ref_expr(24), slot_ref_expr(23)]);
 

@@ -60,8 +60,8 @@ namespace sirius::experimental {
 // The currently supported CAST return types for cuDF ASTs
 static std::array<duckdb::LogicalTypeId, 3> constexpr supported_ast_cast_types{
   {duckdb::LogicalTypeId::UBIGINT, duckdb::LogicalTypeId::BIGINT, duckdb::LogicalTypeId::DOUBLE}};
-static std::array<std::string_view, 6> constexpr supported_ast_functions{
-  "+", "-", "*", "/", "//", "%"};
+static std::array<std::string_view, 12> constexpr supported_ast_functions{
+  "+", "-", "*", "/", "//", "%", "add", "subtract", "multiply", "divide", "mod", "modulus"};
 
 /**
  * @brief The expression_executor_strategy defines how the gpu_expression_executor executes.

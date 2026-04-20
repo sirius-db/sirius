@@ -72,9 +72,18 @@ struct normalized_exchange_view {
   cudf::table_view view() const { return cudf::table_view(columns); }
 };
 
+struct prepared_exchange_view {
+  normalized_exchange_view normalized;
+  bool projection_already_applied = false;
+};
+
+cudf::table_view apply_exchange_projection(
+  cudf::table_view input,
+  const std::vector<int>& projection_indices);
+
 std::optional<normalized_exchange_view> build_normalized_exchange_view(
   cudf::table_view input,
-  const duckdb::vector<duckdb::LogicalType>& expected_types,
+  const duckdb::vector<sirius::logical_type>& expected_types,
   rmm::cuda_stream_view stream)
 {
   if (input.num_columns() != static_cast<cudf::size_type>(expected_types.size())) {
@@ -91,7 +100,7 @@ std::optional<normalized_exchange_view> build_normalized_exchange_view(
   try {
     for (cudf::size_type col_idx = 0; col_idx < input.num_columns(); ++col_idx) {
       auto col_view = input.column(col_idx);
-      auto expected_type = duckdb::GetCudfType(expected_types[col_idx]);
+      auto expected_type = sirius::get_cudf_type(expected_types[col_idx]);
       if (col_view.type() == expected_type) {
         normalized.columns.push_back(col_view);
         continue;
@@ -116,6 +125,34 @@ std::optional<normalized_exchange_view> build_normalized_exchange_view(
   }
 
   return normalized;
+}
+
+std::optional<prepared_exchange_view> build_prepared_exchange_view(
+  cudf::table_view input,
+  const duckdb::vector<sirius::logical_type>& expected_types,
+  const std::vector<int>& projection_indices,
+  rmm::cuda_stream_view stream)
+{
+  auto projected_input = apply_exchange_projection(input, projection_indices);
+  if (projected_input.num_columns() == static_cast<cudf::size_type>(expected_types.size())) {
+    if (!projection_indices.empty()) {
+      SIRIUS_LOG_INFO(
+        "[result_collector] applying exchange sender projection before normalization: input_cols={} projected_cols={} expected_cols={}",
+        input.num_columns(),
+        projected_input.num_columns(),
+        expected_types.size());
+    }
+    if (auto normalized =
+          build_normalized_exchange_view(projected_input, expected_types, stream)) {
+      return prepared_exchange_view{std::move(*normalized), true};
+    }
+    return std::nullopt;
+  }
+
+  if (auto normalized = build_normalized_exchange_view(input, expected_types, stream)) {
+    return prepared_exchange_view{std::move(*normalized), false};
+  }
+  return std::nullopt;
 }
 
 cudf::table_view apply_exchange_projection(
@@ -242,13 +279,19 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
       auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
       cudf::table_view view = gpu_rep.get_table().view();
-      std::optional<normalized_exchange_view> exchange_view_storage;
+      auto& lgb = duckdb::LastGPUBuffers::GetInstance();
+      auto projection_indices = lgb.GetProjectionIndices();
+      std::optional<prepared_exchange_view> exchange_view_storage;
       cudf::table_view exchange_view = view;
 
       if (should_retain) {
-        exchange_view_storage = build_normalized_exchange_view(view, types, stream);
+        exchange_view_storage =
+          build_prepared_exchange_view(view, types, projection_indices, stream);
         if (exchange_view_storage) {
-          exchange_view = exchange_view_storage->view();
+          exchange_view = exchange_view_storage->normalized.view();
+          if (exchange_view_storage->projection_already_applied) {
+            projection_indices.clear();
+          }
         } else {
           SIRIUS_LOG_WARN(
             "[result_collector] retaining disabled for this batch; falling back to CPU exchange");
@@ -256,14 +299,12 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       }
 
       if (should_retain && exchange_view_storage) {
-        auto& lgb = duckdb::LastGPUBuffers::GetInstance();
         // Keep the source GPU batch alive until exchange transfer completes.
         // The packed exchange path may still depend on buffers originating from
         // this batch after the pipeline releases its local references.
         lgb.RetainData(std::static_pointer_cast<void>(input_batch));
         auto [staging_addr, staging_size] = lgb.GetStagingBuffer();
         auto [part_num, part_cols] = lgb.GetPartitionConfig();
-        auto projection_indices = lgb.GetProjectionIndices();
 
         SIRIUS_LOG_INFO(
           "[result_collector] retain path: part_num={} part_cols={} projection_cols={} staging_addr=0x{:x}",

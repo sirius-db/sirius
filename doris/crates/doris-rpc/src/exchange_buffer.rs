@@ -45,6 +45,8 @@ pub struct PackedGpuExchange {
     pub gpu_size: usize,
     /// cudf::pack() metadata for cudf::unpack() on receiver.
     pub cudf_metadata: Vec<u8>,
+    /// Whether the sender already packed this table in receiver/projected order.
+    pub projection_already_applied: bool,
     /// Staging lease keeping the RECV buffer region alive until the exchange
     /// fragment finishes processing. Dropped when ExchangeBuffer entry is consumed.
     pub _staging_lease: Option<crate::gpu_staging_buffer::StagingLease>,
@@ -55,6 +57,10 @@ impl std::fmt::Debug for PackedGpuExchange {
         f.debug_struct("PackedGpuExchange")
             .field("gpu_addr", &format_args!("0x{:x}", self.gpu_addr))
             .field("gpu_size", &self.gpu_size)
+            .field(
+                "projection_already_applied",
+                &self.projection_already_applied,
+            )
             .field("has_lease", &self._staging_lease.is_some())
             .finish()
     }
@@ -72,6 +78,7 @@ pub struct LocalGpuArtifact {
     staging_base: usize,
     packed_partitions: Vec<PackedPartition>,
     packed_broadcast: Vec<PackedBroadcastEntry>,
+    projection_already_applied: bool,
 }
 
 impl LocalGpuArtifact {
@@ -105,6 +112,7 @@ impl LocalGpuArtifact {
                 .iter()
                 .filter_map(|&idx| artifact.packed_broadcast().get(idx).cloned())
                 .collect(),
+            projection_already_applied: artifact.projection_already_applied(),
             _artifact: Some(artifact),
         }
     }
@@ -127,6 +135,10 @@ impl LocalGpuArtifact {
 
     pub fn has_exchange_data(&self) -> bool {
         !self.packed_partitions.is_empty() || !self.packed_broadcast.is_empty()
+    }
+
+    pub fn projection_already_applied(&self) -> bool {
+        self.projection_already_applied
     }
 
     #[cfg(test)]
@@ -159,6 +171,7 @@ impl LocalGpuArtifact {
                     overflow_gpu_addr: 0,
                 })
                 .collect(),
+            projection_already_applied: false,
         }
     }
 }
@@ -169,6 +182,10 @@ impl std::fmt::Debug for LocalGpuArtifact {
             .field("staging_base", &format_args!("0x{:x}", self.staging_base))
             .field("packed_partitions", &self.packed_partitions.len())
             .field("packed_broadcast", &self.packed_broadcast.len())
+            .field(
+                "projection_already_applied",
+                &self.projection_already_applied,
+            )
             .finish()
     }
 }
@@ -209,6 +226,7 @@ impl ExchangeBuffer {
             node_id = key.node_id,
             gpu_addr = format_args!("0x{:x}", data.gpu_addr),
             gpu_size = data.gpu_size,
+            projection_already_applied = data.projection_already_applied,
             has_lease = data._staging_lease.is_some(),
             "store_packed_gpu"
         );
@@ -602,6 +620,7 @@ mod tests {
                 gpu_addr: 0x1234,
                 gpu_size: 64,
                 cudf_metadata: vec![1, 2, 3],
+                projection_already_applied: false,
                 _staging_lease: None,
             },
         );
