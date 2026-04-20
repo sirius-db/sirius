@@ -110,8 +110,10 @@ jobs:
         if: matrix.environment == 'vcpkg'
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
-          restore-keys: vcpkg-${{ runner.os }}-${{ runner.arch }}-
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**', 'vcpkg_triplets/**', 'cmake/CMakePresets.json', 'pixi.lock') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-
 
       - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ matrix.variant == 'legacy' && format('legacy-{0}', matrix.build-type) || case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
         if: matrix.environment != 'vcpkg'
