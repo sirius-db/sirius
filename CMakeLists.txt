@@ -322,7 +322,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   endif()
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-                        cuCascade::cucascade yaml-cpp::yaml-cpp instrumentation_bridge)
+          cuCascade::cucascade yaml-cpp::yaml-cpp telemetry_bridge)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -331,9 +331,9 @@ endforeach()
 target_link_libraries(sirius_extension PkgConfig::NUMA absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
-# cucascade_static / instrumentation_bridge)
+# cucascade_static / telemetry_bridge)
 install(
-  TARGETS sirius_extension cucascade_static instrumentation_bridge
+        TARGETS sirius_extension cucascade_static telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

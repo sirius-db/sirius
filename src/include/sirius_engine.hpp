@@ -26,12 +26,11 @@
 #include "op/sirius_physical_result_collector.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "telemetry-bridge/gen/query.rs.h"
+#include "telemetry-bridge/gen/query_group.rs.h"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/data/data_repository_manager.hpp>
-
-#include "instrumentation-bridge/gen/query.rs.h"
-#include "instrumentation-bridge/gen/query_group.rs.h"
-#include "instrumentation-bridge/gen/uuid.rs.h"
 
 #include <string>
 #include <unordered_map>
@@ -129,13 +128,10 @@ class sirius_engine {
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
-
-  // ---------------------------------------------------------------------------
-  // Telemetry
-  // ---------------------------------------------------------------------------
-  ::uuid::UUID query_group_uuid;
-  ::rust::Box<::quent::query_group::QueryGroupObserver> query_group_observer;
-  ::rust::Box<::quent::query::QueryHandle> query_handle;
+  
+  uuid::UUID query_group_uuid;
+  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer;
+  rust::Box<quent::query::QueryHandle> query_handle;
 };
 
 }  // namespace sirius

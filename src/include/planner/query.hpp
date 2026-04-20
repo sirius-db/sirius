@@ -17,9 +17,9 @@
 #pragma once
 
 #include "duckdb/common/unordered_map.hpp"
-#include "instrumentation-bridge/gen/uuid.rs.h"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 namespace sirius {
 class sirius_engine;

@@ -26,7 +26,7 @@
 #include "common/optional_ptr.hpp"
 #include "common/reference_map.hpp"
 #include "duckdb/parallel/pipeline.hpp"
-#include "instrumentation-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
 namespace sirius {

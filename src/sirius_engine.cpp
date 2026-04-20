@@ -60,19 +60,18 @@ namespace sirius {
 sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
   : context(context),
     sirius_iface(sirius_iface),
-    query_group_uuid(::uuid::now_v7()),
-    query_group_observer(::quent::query_group::create_observer()),
-    query_handle(::quent::query::create(::quent::query::Init{
+    query_group_uuid(uuid::now_v7()),
+    query_group_observer(quent::query_group::create_observer()),
+    query_handle(quent::query::create(quent::query::Init{
       .instance_name  = ::rust::String(""),
       .query_group_id = query_group_uuid,
     }))
 {
   // Declare the query group under this engine
-  query_group_observer->declaration(
-    query_group_uuid,
-    ::quent::query_group::Declaration{
-      .instance_name = ::rust::String("default"),
-      .engine_id     = sirius_iface.telemetry.engine_id(),
+  query_group_observer->declaration(query_group_uuid,
+                                    quent::query_group::Declaration{
+                                      .instance_name = ::rust::String("default"),
+                                      .engine_id     = sirius_iface.telemetry.engine_id(),
     });
 }
 

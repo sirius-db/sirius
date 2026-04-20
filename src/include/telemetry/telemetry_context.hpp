@@ -17,12 +17,10 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
-#include "instrumentation-bridge/gen/context.rs.h"
-#include "instrumentation-bridge/gen/engine.rs.h"
-#include "instrumentation-bridge/gen/uuid.rs.h"
-#include "instrumentation-bridge/gen/worker.rs.h"
-
-#include <memory>
+#include "telemetry-bridge/gen/context.rs.h"
+#include "telemetry-bridge/gen/engine.rs.h"
+#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/worker.rs.h"
 
 namespace sirius::pipeline {
 class sirius_pipeline;
@@ -30,9 +28,7 @@ class sirius_pipeline;
 
 namespace sirius::telemetry {
 
-/// Owns the top-level telemetry state for a single Sirius session:
-/// a quent context, an engine entity, and a worker entity.
-/// Lifetime is tied to sirius_interface (one per connection).
+/// Owns the top-level telemetry states for a single Sirius session.
 class telemetry_context {
  public:
   telemetry_context();
@@ -44,15 +40,15 @@ class telemetry_context {
   telemetry_context(telemetry_context&&)                 = delete;
   telemetry_context& operator=(telemetry_context&&)      = delete;
 
-  [[nodiscard]] const ::uuid::UUID& engine_id() const { return engine_uuid_; }
-  [[nodiscard]] const ::uuid::UUID& worker_id() const { return worker_uuid_; }
+  [[nodiscard]] const uuid::UUID& engine_id() const { return engine_uuid_; }
+  [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
 
  private:
-  ::uuid::UUID engine_uuid_;
-  ::uuid::UUID worker_uuid_;
-  ::rust::Box<::quent::Context> context_;
-  ::rust::Box<::quent::engine::EngineObserver> engine_observer_;
-  ::rust::Box<::quent::worker::WorkerObserver> worker_observer_;
+  uuid::UUID engine_uuid_;
+  uuid::UUID worker_uuid_;
+  rust::Box<quent::Context> context_;
+  rust::Box<quent::engine::EngineObserver> engine_observer_;
+  rust::Box<quent::worker::WorkerObserver> worker_observer_;
 };
 
 /// Emit plan-level telemetry (operator declarations, port declarations, edges)
@@ -60,7 +56,7 @@ class telemetry_context {
 void emit_plan_telemetry(
   const telemetry_context& ctx,
   const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-  const ::uuid::UUID& plan_id,
-  const ::uuid::UUID& query_id);
+  const uuid::UUID& plan_id,
+  const uuid::UUID& query_id);
 
 }  // namespace sirius::telemetry

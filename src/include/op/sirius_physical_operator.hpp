@@ -24,9 +24,9 @@
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
-#include "instrumentation-bridge/gen/uuid.rs.h"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
