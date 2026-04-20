@@ -1904,9 +1904,9 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
   // something).
   SECTION("does not short-circuit when nulls remain — poison child fires")
   {
-    std::vector<int32_t> values     = {10, 99, 30};
-    std::vector<bool> valids        = {true, false, true};
-    auto input                      = make_int32_batch_with_nulls(*space, values, valids);
+    std::vector<int32_t> values = {10, 99, 30};
+    std::vector<bool> valids    = {true, false, true};
+    auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
     auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
                                                                LogicalType{LogicalTypeId::INTEGER});
