@@ -57,7 +57,8 @@ class TransparentExecutionFixture {
   std::unique_ptr<duckdb::Connection> make_connection()
   {
     if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
-      return std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+      return std::make_unique<duckdb::Connection>(
+        sirius::test::g_integration_env->make_connection());
     }
     REQUIRE(db);
     return std::make_unique<duckdb::Connection>(*db);
