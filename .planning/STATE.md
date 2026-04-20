@@ -1,15 +1,15 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.1
-milestone_name: multi-gpu-reintegration-and-cucascade-io
-status: roadmap-ready
-stopped_at: v1.1 roadmap defined (Phases 4-7)
-last_updated: "2026-04-20T00:00:00.000Z"
-last_activity: 2026-04-20
+milestone: v1.0
+milestone_name: Re-integration
+status: executing
+stopped_at: "v1.1 roadmap defined (Phases 4–7); ready for `/gsd:plan-phase 4`"
+last_updated: "2026-04-20T19:47:05.822Z"
+last_activity: 2026-04-20 -- Phase 04 execution started
 progress:
   total_phases: 4
   completed_phases: 0
-  total_plans: 0
+  total_plans: 5
   completed_plans: 0
   percent: 0
 ---
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-20)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Milestone v1.1 — roadmap ready; next step `/gsd:plan-phase 4` (cuCascade Bump + v1.0 Re-integration).
+**Current focus:** Phase 04 — cucascade-bump-v1-0-re-integration
 
 ## Current Position
 
-Phase: 4 (not started)
-Plan: —
-Status: Roadmap ready, awaiting phase planning
-Last activity: 2026-04-20 — v1.1 roadmap written (Phases 4–7)
+Phase: 04 (cucascade-bump-v1-0-re-integration) — EXECUTING
+Plan: 1 of 5
+Status: Executing Phase 04
+Last activity: 2026-04-20 -- Phase 04 execution started
 
 Progress: [░░░░░░░░░░] 0%
 

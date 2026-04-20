@@ -38,7 +38,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
   4. Multi-GPU runtime configuration (`gpu_count`, per-GPU memory budgets, NUMA policy) round-trips through the YAML config parser introduced by PR #565 — the legacy `libconfig++` symbols are absent: `grep -rn 'libconfig' src/` returns zero hits (PORT-03).
   5. Push-model dispatch plumbing (`task_creator` locality computation, `management_eventloop` preferred-device routing, `preferred_device_id` on local and global pipeline task states) is present and exercised by the v1.0 locality test: `build/release/extension/sirius/test/cpp/sirius_unittest "[multi_gpu_foundation],[test_gpu_execution_locality]"` passes on a ≥2-GPU host (or reports `WARN+return` on single-GPU dev boxes per the v1.0 Catch2-v2 convention) (PORT-04, PORT-05).
 **Plans**: 5 plans
-- [ ] 04-01-PLAN.md — cuCascade submodule bump (942c0bf -> f47de0b) + build/test gate (BUMP-01/02/03)
+- [x] 04-01-PLAN.md — cuCascade submodule bump (942c0bf -> f47de0b) + build/test gate (BUMP-01/02/03)
 - [ ] 04-02-PLAN.md — Cherry-pick 5 v1.0 code commits (preferred_device_id, locality score, push-model routing, scan distribution, integration test) onto dev; carve out downgrade_executor hunks (PORT-01/02/04 partial)
 - [ ] 04-03-PLAN.md — Re-author NUMA-aware downgrade on dev PR #579 shape + re-author 3 downgrade test commits (PORT-01/04 completion); includes human-verify checkpoint
 - [ ] 04-04-PLAN.md — PORT-03 YAML config verification + full pre-commit run (PORT-03)
