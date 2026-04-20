@@ -23,6 +23,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
 #include "sirius_config.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <rmm/resource_ref.hpp>
 
@@ -146,10 +147,9 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
-  /// \param engine The engine executing this query (provides telemetry context).
-  void create_query(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-    sirius::sirius_engine& engine);
+  /// \param telemetry_info Info useful for emitting identifiable telemetry.
+  void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+                    sirius::telemetry::telemetry_info telemetry_info);
 
   /// \brief Get the current query.
   [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();

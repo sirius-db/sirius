@@ -20,6 +20,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry/telemetry_context.hpp"
 
 namespace sirius {
 class sirius_engine;
@@ -40,10 +41,10 @@ class query {
    * @brief Construct a new query object.
    *
    * @param pipelines The ordered pipelines required to execute this query.
-   * @param engine The engine executing this query (provides telemetry context).
+   * @param telemetry_info Info useful for emitting identifiable telemetry.
    */
   query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
-        sirius_engine& engine);
+        telemetry::telemetry_info telemetry_info);
 
   ~query() = default;
 
@@ -83,8 +84,8 @@ class query {
   //! Builds the internal data structures from the pipelines
   void build_indices();
 
-  //! Unique telemetry ID for this plan
-  ::uuid::UUID _plan_id;
+  //! Unique ID for this plan
+  uuid::UUID _plan_id;
   //! Pipelines and the order in which they must be executed in order to successfully complete the
   // query.
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> _pipelines;

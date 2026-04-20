@@ -8,5 +8,4 @@ quent-attributes = { git = "https://github.com/rapidsai/quent.git", branch = "ma
 quent-model = { git = "https://github.com/rapidsai/quent.git", branch = "main" }
 quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", branch = "main" }
 quent-stdlib = { git = "https://github.com/rapidsai/quent.git", branch = "main" }
-serde.workspace = true
 uuid = { workspace = true, features = ["serde", "v7"] }

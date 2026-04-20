@@ -213,7 +213,7 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
-  port_info.pseudo_sink_port_uuid = ::uuid::now_v7();
+  port_info.pseudo_sink_port_uuid = uuid::now_v7();
   next_port_after_sink.push_back(port_info);
 }
 
@@ -312,12 +312,6 @@ void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_
 {
   assert(pipeline != nullptr);
   _pipeline = std::move(pipeline);
-}
-
-const ::uuid::UUID& sirius_physical_operator::get_pipeline_uuid() const
-{
-  D_ASSERT(_pipeline != nullptr);
-  return _pipeline->pipeline_uuid;
 }
 
 // implement get_all_ports

@@ -20,7 +20,6 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "log/logging.hpp"
-#include "sirius_interface.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -48,6 +47,7 @@
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "sirius_interface.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -72,13 +72,10 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
                                     quent::query_group::Declaration{
                                       .instance_name = ::rust::String("default"),
                                       .engine_id     = sirius_iface.telemetry.engine_id(),
-    });
+                                    });
 }
 
-sirius_engine::~sirius_engine()
-{
-  query_handle->exit();
-}
+sirius_engine::~sirius_engine() { query_handle->exit(); }
 
 void sirius_engine::reset()
 {
@@ -190,9 +187,7 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_engine::create_child_pipeli
 }
 
 bool sirius_engine::has_result_collector()
-{
-  return sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
-}
+{ return sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR; }
 
 duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 {
@@ -231,7 +226,11 @@ void sirius_engine::execute()
   }
 
   // Create the query with the pipelines
-  sirius_ctx->create_query(std::move(new_scheduled), *this);
+  sirius_ctx->create_query(std::move(new_scheduled),
+                           telemetry::telemetry_info{
+                             .query_id  = query_handle->uuid(),
+                             .worker_id = sirius_iface.telemetry.worker_id(),
+                           });
   auto future = sirius_ctx->get_pipeline_executor().start_query();
   try {
     future.get();

@@ -51,12 +51,17 @@ class telemetry_context {
   rust::Box<quent::worker::WorkerObserver> worker_observer_;
 };
 
+// A POD to hold common identifiers for useful telemetry.
+struct telemetry_info {
+  uuid::UUID query_id;
+  uuid::UUID worker_id;
+};
+
 /// Emit plan-level telemetry (operator declarations, port declarations, edges)
 /// for the given set of pipelines. Called once during query construction.
 void emit_plan_telemetry(
-  const telemetry_context& ctx,
   const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-  const uuid::UUID& plan_id,
-  const uuid::UUID& query_id);
+  uuid::UUID plan_id,
+  telemetry_info telemetry_info);
 
 }  // namespace sirius::telemetry

@@ -37,7 +37,7 @@ telemetry_context::telemetry_context()
     worker_observer_(quent::worker::create_observer())
 {
   // Engine init
-  const char* env_name = std::getenv("SIRIUS_ENGINE_NAME");
+  const char* env_name    = std::getenv("SIRIUS_ENGINE_NAME");
   std::string engine_name = env_name ? env_name : "siriusDB";
 
   engine_observer_->init(engine_uuid_,
@@ -67,15 +67,10 @@ telemetry_context::~telemetry_context()
   engine_observer_->exit(engine_uuid_);
 }
 
-// ---------------------------------------------------------------------------
-// emit_plan_telemetry
-// ---------------------------------------------------------------------------
-
 void emit_plan_telemetry(
-  const telemetry_context& ctx,
   const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-  const uuid::UUID& plan_id,
-  const uuid::UUID& query_id)
+  const uuid::UUID plan_id,
+  const telemetry_info telemetry_info)
 {
   auto operator_obs = quent::operator_::create_observer();
   auto port_obs     = quent::port::create_observer();
@@ -85,12 +80,11 @@ void emit_plan_telemetry(
   rust::Vec<quent::plan::Edges> edges;
 
   for (const auto& pipeline : pipelines) {
-    // --- Operator declaration (one per pipeline) ---
-    auto& pipeline_uuid = pipeline->pipeline_uuid;
+    auto pipeline_uuid = pipeline->pipeline_uuid();
 
     // Build operator name from the chain of operators
     std::string op_chain = "[";
-    auto source = pipeline->get_source();
+    auto source          = pipeline->get_source();
     if (source) { op_chain += source->get_name(); }
     for (auto& op_ref : pipeline->get_operators()) {
       op_chain += " -> " + op_ref.get().get_name();
@@ -104,14 +98,13 @@ void emit_plan_telemetry(
 
     operator_obs->declaration(pipeline_uuid,
                               quent::operator_::Declaration{
-                                .plan_id              = plan_id,
+                                .plan_id             = plan_id,
                                 .parent_operator_ids = {},
                                 .instance_name       = rust::String(instance_name),
                                 .type_name           = rust::String(op_chain),
                                 .custom_attributes   = quent::CustomAttributes{},
                               });
-
-    // --- Port declarations ---
+    
     // Source operator ports
     if (source) {
       for (auto port_id : source->get_port_ids()) {
@@ -130,7 +123,8 @@ void emit_plan_telemetry(
     if (sink) {
       for (auto& npi : sink->get_next_port_after_sink()) {
         // Declare the pseudo-sink port
-        port_obs->declaration(npi.pseudo_sink_port_uuid,
+        port_obs->declaration(
+          npi.pseudo_sink_port_uuid,
           quent::port::Declaration{
             .operator_id   = pipeline_uuid,
             .instance_name = rust::String(std::string(npi.next_operator_port_name) + "_sink"),
@@ -153,12 +147,12 @@ void emit_plan_telemetry(
                         quent::plan::Declaration{
                           .parent =
                             quent::plan::Parent{
-                              .query_id = query_id,
+                              .query_id = telemetry_info.query_id,
                               .plan_id  = uuid::new_nil(),  // no parent plan
                             },
                           .instance_name = rust::String("pipeline_plan"),
                           .edges         = std::move(edges),
-                          .worker_id     = ctx.worker_id(),
+                          .worker_id     = telemetry_info.worker_id,
                         });
 }
 

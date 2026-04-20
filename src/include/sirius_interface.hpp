@@ -65,7 +65,7 @@ class sirius_interface {
   sirius_interface(duckdb::ClientContext& client_context);
   //! The client context
   duckdb::ClientContext& client_context;
-  //! Telemetry context (engine + worker lifetime)
+  //! Session wide telemetry context
   telemetry::telemetry_context telemetry;
   //! The currently active query context
   duckdb::unique_ptr<sirius_active_query_context> sirius_active_query;

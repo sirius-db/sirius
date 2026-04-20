@@ -156,9 +156,7 @@ void SiriusContext::QueryEnd()
 void SiriusContext::QueryEnd(ClientContext& context) { QueryEnd(); }
 
 void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
-{
-  QueryEnd(context);
-}
+{ QueryEnd(context); }
 
 void SiriusContext::initialize(const sirius::sirius_config& config)
 {
@@ -352,10 +350,10 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
 
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-  sirius::sirius_engine& engine)
+  sirius::telemetry::telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
-  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), engine);
+  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), telemetry_info);
   pipeline_executor_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
 }
@@ -401,21 +399,15 @@ void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)
-{
-  spdlog::info("Extension loaded: {}", name);
-}
+{ spdlog::info("Extension loaded: {}", name); }
 
 void SiriusContextExtensionCallback::OnBeginExtensionLoad(DatabaseInstance& db, const string& name)
-{
-  spdlog::info("Beginning to load extension: {}", name);
-}
+{ spdlog::info("Beginning to load extension: {}", name); }
 
 void SiriusContextExtensionCallback::OnExtensionLoadFail(DatabaseInstance& db,
                                                          const string& name,
                                                          const ErrorData& error)
-{
-  spdlog::error("Failed to load extension: {}. Error: {}", name, error.RawMessage());
-}
+{ spdlog::error("Failed to load extension: {}. Error: {}", name, error.RawMessage()); }
 
 void SiriusContextExtensionCallback::read_config_file_if_exists()
 {

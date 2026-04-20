@@ -622,7 +622,6 @@ dependencies = [
  "quent-model",
  "quent-query-engine-model",
  "quent-stdlib",
- "serde",
  "uuid",
 ]
 

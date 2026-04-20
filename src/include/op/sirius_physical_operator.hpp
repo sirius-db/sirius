@@ -284,8 +284,10 @@ class sirius_physical_operator {
     ::cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
-    //! Unique telemetry ID for this source port
-    ::uuid::UUID source_port_uuid{::uuid::now_v7()};
+    //! A UUID for a port on an operator at the beginning of a
+    // pipeline. This port receives data from a prior pipeline,
+    // forming an incoming edge from that pipeline.
+    uuid::UUID source_port_uuid{uuid::now_v7()};
   };
 
   /// Describes a downstream operator's port to which data is pushed
@@ -294,8 +296,18 @@ class sirius_physical_operator {
     sirius_physical_operator* next_operator;
     //! The port name on the downstream operator to push data into
     std::string_view next_operator_port_name;
-    //! Unique telemetry ID for this pseudo-sink port (assigned by add_next_port_after_sink)
-    ::uuid::UUID pseudo_sink_port_uuid;
+    //! A UUID to encode the concept of a pseudo port, to comform to the model of quent,
+    // that sits on an operator, at the end of a pipeline, sending data to a downstream
+    // pipeline's first operator's receiving port, forming a directed edge from the current
+    // operator's pipeline to the next_operator's pipeline:
+    // ┌─ pipeline A ──────────────────┐  ┌─ pipeline B ──────────────────┐
+    // │          ┌─ last op ───────┐  │  │  ┌─ first op ──────┐          │
+    // │ ┌────┐   │ ┌─ pseudo ┐     │  │  │  │     ┌─ port ─┐  │   ┌────┐ │
+    // │ │ op │...│ │        *───────────────────────▶      │  │...│ op │ │
+    // │ └────┘   │ └─ port ──┘     │  │  │  │     └────────┘  │   └────┘ │
+    // │          └─────────────────┘  │  │  └─────────────────┘          │
+    // └───────────────────────────────┘  └───────────────────────────────┘
+    uuid::UUID pseudo_sink_port_uuid;
   };
 
   // source pipeline pushed to repo of the ports
@@ -350,9 +362,6 @@ class sirius_physical_operator {
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
 
   void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
-
-  //! Get the pipeline UUID for telemetry
-  const ::uuid::UUID& get_pipeline_uuid() const;
 
  protected:
   duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;

@@ -91,9 +91,6 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   explicit sirius_pipeline(sirius_engine& engine);
   virtual ~sirius_pipeline() = default;
 
-  //! Unique telemetry UUID for this pipeline (one per pipeline instance)
-  ::uuid::UUID pipeline_uuid{::uuid::now_v7()};
-
  public:
   duckdb::ClientContext& get_client_context();
 
@@ -167,6 +164,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
+  uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
+
  private:
   //! Whether or not the pipeline has been readied
   bool ready;
@@ -215,6 +214,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! NVTX process-wide range tracking the pipeline's active lifetime
   std::atomic<bool> _nvtx_range_started{false};
   nvtxRangeId_t _nvtx_pipeline_range_id{0};
+
+  uuid::UUID _pipeline_uuid{uuid::now_v7()};
 };
 
 }  // namespace pipeline
