@@ -151,13 +151,6 @@ class pipeline_executor {
   }
 
   /**
-   * @brief Get a pointer to a GPU executor's task queue by device id.
-   * @return Pointer to the queue, or nullptr if no executor exists for that device.
-   */
-  [[nodiscard]] exec::inspectable_mpsc<sirius::parallel::itask>* get_gpu_task_queue(
-    int device_id) noexcept;
-
-  /**
    * @brief Set the priority scan operators
    *
    * Sets the scan operators that should be executed with priority.

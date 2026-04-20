@@ -322,16 +322,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   }
 
   auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-  auto* res_mgr = global.get_memory_reservation_manager();
-  if (!res_mgr) {
-    throw std::runtime_error(
-      "gpu_pipeline_task::execute: memory reservation manager not set on global state");
-  }
 
   std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
   try {
-    handles_opt =
-      pipelineable_input->prepare_for_processing(requested_memory_space, stream, *res_mgr);
+    handles_opt = pipelineable_input->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();

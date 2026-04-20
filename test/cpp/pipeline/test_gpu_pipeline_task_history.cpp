@@ -311,7 +311,6 @@ TEST_CASE(
   auto ctx = create_pipeline_context();
   auto global_state =
     std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
-  global_state->set_memory_reservation_manager(f.manager.get());
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
@@ -371,7 +370,6 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
 
   auto global_state =
     std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
-  global_state->set_memory_reservation_manager(f.manager.get());
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
@@ -424,7 +422,6 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
 
   auto global_state =
     std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
-  global_state->set_memory_reservation_manager(f.manager.get());
 
   // Task 1: execute successfully with 20 MB input and 20 MB execute allocation
   auto task1 =
@@ -531,7 +528,6 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
   auto ctx = create_pipeline_context();
   auto global_state =
     std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
-  global_state->set_memory_reservation_manager(f.manager.get());
 
   // Create memory pressure to trigger OOM
   auto mem_pressure_reservation = f.manager->request_reservation(

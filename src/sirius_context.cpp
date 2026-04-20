@@ -251,12 +251,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
 
-  // Wire task queue pointers into downgrade executors now that pipeline_executor_
-  // and its gpu_pipeline_executors have been constructed.
+  // Wire the pipeline task queue into downgrade executors now that pipeline_executor_
+  // has been constructed.
   for (auto& executor : downgrade_executors_) {
-    auto space_id = executor->get_space_id();
-    executor->set_task_queues(pipeline_executor_->get_gpu_task_queue(space_id.device_id),
-                              pipeline_executor_->get_pipeline_task_queue());
+    executor->set_pipeline_task_queue(pipeline_executor_->get_pipeline_task_queue());
   }
 
   // Start everything -- downgrade executors deferred until now

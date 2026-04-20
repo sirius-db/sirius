@@ -78,7 +78,6 @@ class downgrade_executor {
    * @param memory_space Pointer to the memory space (for pressure queries; nullptr disables
    * monitor)
    * @param reservation_manager Reference to the memory reservation manager
-   * @param gpu_task_queue Optional pointer to GPU task queue for tiered fallback
    * @param pipeline_task_queue Optional pointer to pipeline task queue for tiered fallback
    */
   explicit downgrade_executor(
@@ -87,7 +86,6 @@ class downgrade_executor {
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
     sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue      = nullptr,
     sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue = nullptr);
 
   ~downgrade_executor();
@@ -129,16 +127,14 @@ class downgrade_executor {
   size_t request_free_memory_and_wait(size_t bytes);
 
   /**
-   * @brief Set the task queue pointers for tiered downgrade scanning.
+   * @brief Set the pipeline task queue pointer for tiered downgrade scanning.
    *
-   * Must be called before start(). Allows deferred wiring when the queues
-   * are not available at construction time.
+   * Must be called before start(). Allows deferred wiring when the queue
+   * is not available at construction time.
    *
-   * @param gpu_task_queue Pointer to the gpu_pipeline_executor's task queue (TIER 2)
-   * @param pipeline_task_queue Pointer to the pipeline_executor's task queue (TIER 3)
+   * @param pipeline_task_queue Pointer to the pipeline_executor's task queue
    */
-  void set_task_queues(
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue,
+  void set_pipeline_task_queue(
     sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
@@ -170,7 +166,6 @@ class downgrade_executor {
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _gpu_task_queue{nullptr};
   sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };
 

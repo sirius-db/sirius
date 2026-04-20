@@ -133,7 +133,6 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       }
     } else {
       auto gs = std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
-      gs->set_memory_reservation_manager(&_mem_res_mgr);
       _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
     }
   }
