@@ -87,7 +87,7 @@ class downgrade_executor {
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
     sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue = nullptr,
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue      = nullptr,
     sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue = nullptr);
 
   ~downgrade_executor();
@@ -127,6 +127,19 @@ class downgrade_executor {
    * @return size_t Actual bytes freed (may be less than requested)
    */
   size_t request_free_memory_and_wait(size_t bytes);
+
+  /**
+   * @brief Set the task queue pointers for tiered downgrade scanning.
+   *
+   * Must be called before start(). Allows deferred wiring when the queues
+   * are not available at construction time.
+   *
+   * @param gpu_task_queue Pointer to the gpu_pipeline_executor's task queue (TIER 2)
+   * @param pipeline_task_queue Pointer to the pipeline_executor's task queue (TIER 3)
+   */
+  void set_task_queues(
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue,
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
    * @brief Asynchronously request a predicate-driven downgrade.

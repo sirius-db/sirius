@@ -98,6 +98,14 @@ class itask_executor {
    */
   void drain_and_wait();
 
+  /**
+   * @brief Get a raw pointer to the internal task queue.
+   */
+  [[nodiscard]] exec::inspectable_mpsc<itask>* get_task_queue_ptr() noexcept
+  {
+    return &_task_queue;
+  }
+
  protected:
   /**
    * @brief Main dispatch loop — must be implemented by each subclass.

@@ -222,6 +222,14 @@ void pipeline_executor::drain_after_error()
   SIRIUS_LOG_INFO("pipeline_executor: DONE draining after error");
 }
 
+exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_executor::get_gpu_task_queue(
+  int device_id) noexcept
+{
+  auto it = _gpu_executors.find(device_id);
+  if (it == _gpu_executors.end()) { return nullptr; }
+  return it->second->get_task_queue_ptr();
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
