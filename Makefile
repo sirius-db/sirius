@@ -14,9 +14,6 @@
 
 CMAKE ?= cmake
 DUCKDB_DIR ?= duckdb
-TEST_PATH ?= build/release/test/unittest
-TEST_PATH_DEBUG ?= build/debug/test/unittest
-TEST_PATH_RELWITHDEBINFO ?= build/relwithdebinfo/test/unittest
 TEST_BUILD_TARGET ?= sirius_unittest
 MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 
