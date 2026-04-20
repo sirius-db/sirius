@@ -63,33 +63,62 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
   // wait for processing in case a shared batch is in transit in another thread.
   auto lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
 
-  auto cancel_task_if_needed = []() {
+  auto cancel_task_if_needed = [&batch]() {
     SIRIUS_LOG_ERROR(
-      "gpu_pipeline_task: failed to lock batch for processing and cannot prepare batch for "
+      "gpu_pipeline_task: failed to lock batch {} for processing and cannot prepare batch for "
       "processing. This likely means the batch is in transit and there is a bug in "
-      "the in-transit locking logic. Cancelling task to avoid deadlock.");
+      "the in-transit locking logic. Cancelling task to avoid deadlock.",
+      batch->get_batch_id());
   };
 
   while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
-    // Delegate tier-switching conversion to convertible_data_batch::convert().
-    // This unifies the forward-path conversion with the downgrade path, ensuring
-    // both benefit from the same failure-safety guarantees (state restore on error).
-    sirius::convertible_data_batch convertible(batch);
-    bool converted =
-      convertible.convert(std::vector<const cucascade::memory::memory_space*>{target_space},
-                          stream,
-                          res_mgr);
+    try {
+      auto& registry = sirius::converter_registry::get();
+      switch (target_space->get_tier()) {
+        case cucascade::memory::Tier::GPU: {
+          auto prev_state = batch->get_state();
+          if (!batch->try_to_lock_for_in_transit()) {
+            auto current_state = batch->get_state();
+            if (current_state == cucascade::batch_state::in_transit) {
+              // If another thread has taken the in_transit lock, wait to acquire the processing
+              // lock.
+              lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
+              continue;
+            }
+            cancel_task_if_needed();
+            return std::nullopt;
+          }
+          try {
+            batch->convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+          break;
+        }
+        case cucascade::memory::Tier::HOST: {
+          auto prev_state = batch->get_state();
+          if (!batch->try_to_lock_for_in_transit()) {
+            cancel_task_if_needed();
+            return std::nullopt;
+          }
+          try {
+            batch->convert_to<cucascade::host_data_representation>(registry, target_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+          break;
+        }
+        default: cancel_task_if_needed(); return std::nullopt;
+      }
 
-    if (!converted) {
-      // convert() returns false if another thread holds the in_transit lock or no
-      // reservation is available. Re-attempt wait_to_lock_for_processing which
-      // blocks until the batch is available again, matching the original contention
-      // handling.
-      lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
-      continue;
+      lock_result = batch->try_to_lock_for_processing(target_space->get_id());
+    } catch (...) {
+      throw;
     }
-
-    lock_result = batch->try_to_lock_for_processing(target_space->get_id());
   }
 
   if (!lock_result.success) {

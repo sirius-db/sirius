@@ -82,13 +82,14 @@ class convertible_data_batch : public convertible_data {
       auto data_size = _batch->get_data()->get_size_in_bytes();
 
       for (const auto* space : target_spaces) {
-        auto reservation = res_mgr.request_reservation(
-          cucascade::memory::specific_memory_space{space->get_tier(), space->get_id().device_id},
-          data_size);
-        if (!reservation) { continue; }
-
-        auto* mem_space = res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
+        auto* mem_space = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
         if (!mem_space) { continue; }
+
+        // Non-blocking reservation: request_reservation() blocks indefinitely when
+        // GPU memory is unavailable, which deadlocks when the calling task already
+        // holds a reservation on the same memory space.
+        auto reservation = mem_space->make_reservation_or_null(data_size);
+        if (!reservation) { continue; }
 
         auto& converter_registry = sirius::converter_registry::get();
 

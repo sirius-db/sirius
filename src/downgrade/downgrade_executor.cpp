@@ -342,6 +342,14 @@ void downgrade_executor::cancel_pending_requests()
   }
 }
 
+void downgrade_executor::set_task_queues(
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue,
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue)
+{
+  _gpu_task_queue      = gpu_task_queue;
+  _pipeline_task_queue = pipeline_task_queue;
+}
+
 // --- Public request API ---
 
 std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
