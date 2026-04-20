@@ -130,6 +130,7 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
+    src/helper/type_conversions.cpp
     src/cpu_cache.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
@@ -162,6 +163,7 @@ set(EXTENSION_SOURCES
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
+    src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/iceberg_avro_reader.cpp
@@ -175,6 +177,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
@@ -211,6 +214,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
@@ -353,6 +357,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/helper/test_logical_type.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/memory/test_host_table_utils.cpp
@@ -382,6 +387,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
+    test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp

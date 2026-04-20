@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -35,8 +36,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
         projection_map.push_back(i);
       }
     }
-    auto order = duckdb::make_uniq<sirius::op::sirius_physical_order>(
-      op.types, std::move(op.orders), std::move(projection_map), op.estimated_cardinality);
+    auto order =
+      duckdb::make_uniq<sirius::op::sirius_physical_order>(sirius::from_duckdb_vec(op.types),
+                                                           std::move(op.orders),
+                                                           std::move(projection_map),
+                                                           op.estimated_cardinality);
     order->children.push_back(std::move(plan));
     plan = std::move(order);
   }

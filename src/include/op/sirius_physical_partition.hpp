@@ -49,7 +49,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
 
   explicit sirius_physical_partition(
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     sirius_physical_operator* parent_op,
     bool is_build                 = false,
