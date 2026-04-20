@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: "v1.1 roadmap defined (Phases 4–7); ready for `/gsd:plan-phase 4`"
-last_updated: "2026-04-20T20:57:05.384Z"
-last_activity: 2026-04-20 -- Phase 04 execution started
+stopped_at: Completed 04-02-PLAN.md (cherry-picks landed); Plan 04-03 begun
+last_updated: "2026-04-20T22:14:36.865Z"
+last_activity: 2026-04-20
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 5
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 04 (cucascade-bump-v1-0-re-integration) — EXECUTING
-Plan: 1 of 5
-Status: Executing Phase 04
-Last activity: 2026-04-20 -- Phase 04 execution started
+Plan: 2 of 5
+Status: Ready to execute
+Last activity: 2026-04-20
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -54,6 +54,8 @@ Progress: [░░░░░░░░░░] 0%
 - Last 5 plans: —
 - Trend: —
 
+| Phase 04 P02 | 2h | 6 tasks | 13 files |
+
 ## Accumulated Context
 
 ### Decisions
@@ -75,6 +77,8 @@ New for v1.1 (from research synthesis):
 - **[Roadmap v1.1]** Cucascade has only one built-in backend (`"pipeline"`); S3/HTTP/remote URIs are out of scope (covered in PROJECT.md Out of Scope).
 - **[Roadmap v1.1]** Bump + port combined in Phase 4 because the port cannot compile without PR #96 headers from the bumped submodule — splitting would create an unproductive intermediate state.
 - **[Roadmap v1.1]** HYG-01/02 (cuda_stream_default removal) fold into Phase 5 because the adjacent line (`parquet_scan_task.cpp:468`) is touched by the I/O migration anyway.
+- [Phase 04]: Wait-on-preferred-device invariant confirmed in Task 3b: management_eventloop routes to preferred GPU executor whose manager_loop handles capacity via bounded_pool->reserve(); NO fallback re-dispatch to different GPU.
+- [Phase 04]: Test adaptation over re-authoring: test_gpu_pipeline_executor.cpp and test_oom_reschedule.cpp adapted to push-model by scheduling tasks directly on executor (removing request_channel.get() wait loops).
 
 ### Pending Todos
 
@@ -92,6 +96,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-20
-Stopped at: v1.1 roadmap defined (Phases 4–7); ready for `/gsd:plan-phase 4`
-Resume file: .planning/ROADMAP.md
+Last session: 2026-04-20T22:14:36.863Z
+Stopped at: Completed 04-02-PLAN.md (cherry-picks landed); Plan 04-03 begun
+Resume file: None

@@ -11,10 +11,10 @@
 
 ### Port — Re-integrate v1.0 Multi-GPU Commits onto Current `dev`
 
-- [ ] **PORT-01**: 23 multi-GPU commits from `refs/remotes/felipe-ssh/feature/multi-gpu-execution` applied (via cherry-pick or replay) on top of current `dev` HEAD with clean compilation on this branch
-- [ ] **PORT-02**: Re-integrated code compiles against sirius-native type system (`logical_type` / `type_id`, PR #643) — no residual uses of removed DuckDB vocabulary types
+- [x] **PORT-01**: 23 multi-GPU commits from `refs/remotes/felipe-ssh/feature/multi-gpu-execution` applied (via cherry-pick or replay) on top of current `dev` HEAD with clean compilation on this branch
+- [x] **PORT-02**: Re-integrated code compiles against sirius-native type system (`logical_type` / `type_id`, PR #643) — no residual uses of removed DuckDB vocabulary types
 - [ ] **PORT-03**: Multi-GPU runtime settings (GPU count, per-GPU memory budgets, NUMA policy) are read from YAML config (PR #565) rather than libconfig++
-- [ ] **PORT-04**: Push-model task dispatch + `preferred_device_id` plumbing from v1.0 Phase 2 preserved (`task_creator`, `management_eventloop`, `pipeline_task_states`)
+- [x] **PORT-04**: Push-model task dispatch + `preferred_device_id` plumbing from v1.0 Phase 2 preserved (`task_creator`, `management_eventloop`, `pipeline_task_states`)
 - [ ] **PORT-05**: Existing multi-GPU test suites pass: `multi_gpu_foundation`, downgrade executor NUMA tests, `test_gpu_execution_locality` integration tests
 
 ### Bump — cuCascade Submodule Update
@@ -123,10 +123,10 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PORT-01 | Phase 4 | Pending |
-| PORT-02 | Phase 4 | Pending |
+| PORT-01 | Phase 4 | Complete |
+| PORT-02 | Phase 4 | Complete |
 | PORT-03 | Phase 4 | Pending |
-| PORT-04 | Phase 4 | Pending |
+| PORT-04 | Phase 4 | Complete |
 | PORT-05 | Phase 4 | Pending |
 | BUMP-01 | Phase 4 | Pending |
 | BUMP-02 | Phase 4 | Pending |
