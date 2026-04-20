@@ -33,14 +33,12 @@ downgrade_executor::downgrade_executor(
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue,
   sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue)
   : _config(std::move(config)),
     _data_repo_mgr(data_repo_mgr),
     _space_id(space_id),
     _memory_space(memory_space),
     _reservation_manager(reservation_manager),
-    _gpu_task_queue(gpu_task_queue),
     _pipeline_task_queue(pipeline_task_queue)
 {
 }
@@ -125,7 +123,7 @@ void downgrade_executor::processing_loop()
       std::atomic<size_t> batches{0};
       std::atomic<size_t> bytes{0};
     };
-    tier_stats repo_stats, gpu_queue_stats, pipeline_queue_stats;
+    tier_stats repo_stats, pipeline_queue_stats;
 
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
@@ -193,48 +191,7 @@ void downgrade_executor::processing_loop()
       if (pool_interrupted) break;
     }
 
-    // === TIER 2: gpu_pipeline_executor task queue (D-06, LOOP-02) ===
-    if (!req->satisfied.load() && _gpu_task_queue) {
-      convertible_gpu_pipeline_task_provider gpu_provider(*_gpu_task_queue);
-      while (!req->satisfied.load()) {
-        auto candidate = gpu_provider.get_next_convertible(source_space, /*front_to_back=*/false);
-        if (!candidate) break;
-
-        auto candidate_bytes = candidate->bytes_in_space(source_space);
-
-        auto slot = _pool->reserve();
-        if (!slot) break;  // interrupted
-
-        if (req->satisfied.load()) break;
-
-        auto exc_stream = _stream_pool->acquire_stream(
-          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-
-        _pool->dispatch(
-          std::move(slot),
-          [cand       = std::move(candidate),
-           req_ptr    = req.get(),
-           &res_mgr   = _reservation_manager,
-           &targets   = target_spaces,
-           exc_stream = std::move(exc_stream),
-           candidate_bytes,
-           &gpu_queue_stats]() mutable {
-            try {
-              if (cand->convert(targets, exc_stream, res_mgr)) {
-                req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
-                gpu_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                gpu_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
-              }
-            } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
-            }
-          });
-      }
-    }
-
-    // === TIER 3: pipeline_executor task queue (D-06, LOOP-03) ===
+    // === TIER 2: pipeline_executor task queue (D-06, LOOP-02) ===
     if (!req->satisfied.load() && _pipeline_task_queue) {
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
       while (!req->satisfied.load()) {
@@ -290,7 +247,7 @@ void downgrade_executor::processing_loop()
 
     SIRIUS_LOG_DEBUG(
       "[downgrade] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
-      "repos: {}/{} batches/bytes, gpu_queue: {}/{}, pipeline_queue: {}/{}",
+      "repos: {}/{} batches/bytes, pipeline_queue: {}/{}",
       source_label,
       total_batches,
       total_bytes,
@@ -298,8 +255,6 @@ void downgrade_executor::processing_loop()
       throughput_mbs,
       repo_stats.batches.load(std::memory_order_relaxed),
       repo_stats.bytes.load(std::memory_order_relaxed),
-      gpu_queue_stats.batches.load(std::memory_order_relaxed),
-      gpu_queue_stats.bytes.load(std::memory_order_relaxed),
       pipeline_queue_stats.batches.load(std::memory_order_relaxed),
       pipeline_queue_stats.bytes.load(std::memory_order_relaxed));
 
@@ -342,11 +297,9 @@ void downgrade_executor::cancel_pending_requests()
   }
 }
 
-void downgrade_executor::set_task_queues(
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* gpu_task_queue,
+void downgrade_executor::set_pipeline_task_queue(
   sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue)
 {
-  _gpu_task_queue      = gpu_task_queue;
   _pipeline_task_queue = pipeline_task_queue;
 }
 

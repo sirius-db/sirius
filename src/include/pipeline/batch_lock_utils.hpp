@@ -16,18 +16,18 @@
 
 #pragma once
 
-#include "data/convertible_data_batch.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <memory>
 #include <optional>
-#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -43,16 +43,13 @@ namespace pipeline {
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
  * @param stream                  CUDA stream used for any data-movement kernels.
- * @param res_mgr                 Reservation manager for polite reservation checks during
- *                                conversion.
  * @return A processing handle that keeps the batch locked, or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion.
  */
 inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream,
-  sirius::memory::sirius_memory_reservation_manager& res_mgr)
+  rmm::cuda_stream_view stream)
 {
   using status = cucascade::lock_for_processing_status;
   const auto* target_space =

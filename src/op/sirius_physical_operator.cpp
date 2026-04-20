@@ -37,9 +37,7 @@ namespace op {
 
 std::optional<std::vector<::cucascade::data_batch_processing_handle>>
 pipelineable_operator_data::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream,
-  sirius::memory::sirius_memory_reservation_manager& res_mgr)
+  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
   std::vector<::cucascade::data_batch_processing_handle> handles;
   handles.reserve(_data_batches.size());
@@ -51,8 +49,7 @@ pipelineable_operator_data::prepare_for_processing(
     }
     std::optional<::cucascade::data_batch_processing_handle> handle;
     try {
-      handle =
-        pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream, res_mgr);
+      handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory&) {
       SIRIUS_LOG_ERROR(
         "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",

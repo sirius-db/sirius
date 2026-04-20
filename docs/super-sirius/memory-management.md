@@ -103,8 +103,7 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
 3. For each request, the processing loop fetches candidates lazily in tiered order:
    - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
-   - **Tier 2 (gpu_pipeline_executor queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches
-   - **Tier 3 (pipeline_executor queue):** Same provider type for the top-level pipeline task queue
+   - **Tier 2 (pipeline_executor queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
 4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. After each conversion, the `predicate` is evaluated. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
 
 **Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
@@ -114,7 +113,7 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
 1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
-2. **Task queues** are inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
 
