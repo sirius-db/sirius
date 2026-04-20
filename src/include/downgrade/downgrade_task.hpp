@@ -23,6 +23,7 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <memory>
+#include <optional>
 
 namespace sirius {
 namespace parallel {
@@ -36,6 +37,14 @@ namespace parallel {
 struct downgrade_task {
   std::shared_ptr<cucascade::data_batch> batch;
   sirius::memory::sirius_memory_reservation_manager& res_mgr;
+
+  /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
+  /// When set, the GPU->HOST reservation request uses
+  /// cucascade::memory::any_memory_space_in_tier_with_preference{Tier::HOST, *preferred_numa_node}
+  /// so the batch prefers a NUMA-local host memory_space, with cross-NUMA fallback ordering
+  /// provided by cucascade's strategy. When unset (nullopt), the dispatch uses the unpreferred
+  /// any_memory_space_in_tier{Tier::HOST} strategy (original single-GPU default behavior).
+  std::optional<int> preferred_numa_node;
 
   /**
    * @brief Executes the memory downgrade operation for this task.

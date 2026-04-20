@@ -195,10 +195,27 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Create one downgrade executor per GPU memory space BEFORE pipeline_executor,
   // so pointers are available for injection into gpu_pipeline_executors.
   // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
+  //
+  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto dev PR #579 shape):
+  // each GPU's downgrade_executor gets its own copy of downgrade_executor_config with
+  // preferred_numa_node populated from hw_topology().gpus[device_id].numa_node. The config
+  // copy flows into downgrade_task via processing_loop so GPU->HOST dispatch prefers the
+  // NUMA-local host memory_space via cucascade's
+  // any_memory_space_in_tier_with_preference strategy.
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
-    auto spaces        = memory_manager_->get_memory_spaces_for_tier(tier);
-    auto const& dg_cfg = config_.get_downgrade_executor_config();
+    auto spaces          = memory_manager_->get_memory_spaces_for_tier(tier);
+    auto const& base_cfg = config_.get_downgrade_executor_config();
+    auto const& topo     = config_.get_hw_topology();
     for (auto* space : spaces) {
+      // Copy the base downgrade_executor_config so we can attach a per-GPU NUMA preference
+      // without mutating the shared config owned by sirius_config.
+      sirius::exec::downgrade_executor_config dg_cfg = base_cfg;
+      if (tier == cucascade::memory::Tier::GPU) {
+        auto dev_id = space->get_device_id();
+        if (dev_id >= 0 && static_cast<unsigned>(dev_id) < topo.gpus.size()) {
+          dg_cfg.preferred_numa_node = topo.gpus[dev_id].numa_node;
+        }
+      }
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
         dg_cfg,
         *data_repository_manager_,
@@ -219,9 +236,6 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     &config_.get_hw_topology(),
     &downgrade_executors_);
 
-  // TODO(04-03): route preferred_numa_node through downgrade_executor_config (PR #579 shape)
-  // The v1.0 NUMA-aware downgrade work (commit dd86dd0) is deferred to Plan 03, which will
-  // re-author dd86dd0's downgrade_executor hunks onto dev's new downgrade_executor_config shape.
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
     config_.get_task_creator_config(), *memory_manager_, &config_.get_hw_topology());
   task_creator_->set_pipeline_executor(*pipeline_executor_);

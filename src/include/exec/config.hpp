@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,15 @@ struct downgrade_executor_config {
   /// Period in milliseconds for the memory pressure monitor loop.
   /// Set to 0 to disable the monitor loop entirely.
   uint64_t monitor_period_ms{10};
+
+  /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
+  /// When set, the GPU->HOST downgrade dispatch uses
+  /// cucascade::memory::any_memory_space_in_tier_with_preference{Tier::HOST, *preferred_numa_node}
+  /// so batches downgrade to the NUMA-local host memory_space when capacity is available,
+  /// with cross-NUMA fallback. When unset (nullopt), the downgrade dispatch uses the
+  /// unpreferred any_memory_space_in_tier{Tier::HOST} strategy (single-GPU default behavior).
+  /// Populated by SiriusContext from config_.get_hw_topology().gpus[device_id].numa_node.
+  std::optional<int> preferred_numa_node;
 };
 
 }  // namespace sirius::exec

@@ -22,6 +22,7 @@
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 namespace sirius {
 namespace parallel {
@@ -47,9 +48,20 @@ bool downgrade_task::execute(rmm::cuda_stream_view stream)
   }
 
   try {
-    auto data_size   = batch->get_data()->get_size_in_bytes();
-    auto reservation = res_mgr.request_reservation(
-      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
+    auto data_size = batch->get_data()->get_size_in_bytes();
+    // NUMA-aware dispatch (re-authored from v1.0 dd86dd0):
+    // When preferred_numa_node is set, use cucascade's strategy that orders candidates
+    // with the preferred NUMA-local HOST space first, then cross-NUMA fallback. When unset,
+    // fall back to the unpreferred any_memory_space_in_tier strategy (single-GPU default).
+    auto reservation =
+      preferred_numa_node.has_value()
+        ? res_mgr.request_reservation(
+            cucascade::memory::any_memory_space_in_tier_with_preference{
+              cucascade::memory::Tier::HOST,
+              std::optional<size_t>{static_cast<size_t>(*preferred_numa_node)}},
+            data_size)
+        : res_mgr.request_reservation(
+            cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
     if (!reservation) {
       batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
       return false;

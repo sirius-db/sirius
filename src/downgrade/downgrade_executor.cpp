@@ -138,13 +138,20 @@ void downgrade_executor::processing_loop()
       auto exc_stream = _stream_pool->acquire_stream(
         cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
 
+      auto preferred_numa_node = _config.preferred_numa_node;
+
       _pool->dispatch(std::move(slot),
                       [batch      = std::move(batch),
                        req_ptr    = req.get(),
                        &res_mgr   = _reservation_manager,
                        exc_stream = std::move(exc_stream),
-                       batch_size]() mutable {
-                        downgrade_task task{batch, res_mgr};
+                       batch_size,
+                       preferred_numa_node]() mutable {
+                        // Thread the NUMA preference (from downgrade_executor_config,
+                        // re-authored v1.0 dd86dd0 intent) into the POD task so its
+                        // execute() path can select a NUMA-local HOST memory_space via
+                        // cucascade::memory::any_memory_space_in_tier_with_preference.
+                        downgrade_task task{batch, res_mgr, preferred_numa_node};
                         try {
                           if (task.execute(exc_stream)) {
                             req_ptr->bytes_freed.fetch_add(batch_size, std::memory_order_relaxed);
