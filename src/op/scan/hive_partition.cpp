@@ -15,10 +15,9 @@
  */
 
 // sirius
-#include <op/scan/hive_partition.hpp>
-
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
+#include <op/scan/hive_partition.hpp>
 
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>

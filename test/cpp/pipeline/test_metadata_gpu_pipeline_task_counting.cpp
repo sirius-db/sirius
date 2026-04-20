@@ -89,7 +89,9 @@ struct pipeline_task_counting_fixture {
       memory_manager(initialize_memory_manager()),
       engine(*con.context, sirius_iface),
       gpu_space(get_space(*memory_manager, Tier::GPU))
-  { REQUIRE(gpu_space != nullptr); }
+  {
+    REQUIRE(gpu_space != nullptr);
+  }
 
   duckdb::DuckDB db;
   duckdb::Connection con;
