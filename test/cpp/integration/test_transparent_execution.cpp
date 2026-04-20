@@ -99,8 +99,8 @@ class TransparentExecutionFixture {
     for (duckdb::idx_t r = 0; r < gpu_rows.size(); r++) {
       for (duckdb::idx_t c = 0; c < gpu_rows[r].size(); c++) {
         if (gpu_rows[r][c] != cpu_rows[r][c]) {
-          INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
-                      << "] CPU=[" << cpu_rows[r][c] << "]");
+          INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c] << "] CPU=["
+                      << cpu_rows[r][c] << "]");
         }
         REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
       }

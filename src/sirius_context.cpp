@@ -393,8 +393,7 @@ unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
   return std::move(captured_logical_plan_);
 }
 
-void SiriusContext::set_transparent_original_disabled_optimizers(
-  std::set<OptimizerType> disabled)
+void SiriusContext::set_transparent_original_disabled_optimizers(std::set<OptimizerType> disabled)
 {
   std::lock_guard lock(mutex_);
   transparent_original_disabled_optimizers_ = std::move(disabled);
