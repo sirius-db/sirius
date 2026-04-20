@@ -25,7 +25,7 @@
 namespace sirius {
 namespace op {
 
-sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
+sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_type> types,
                                                std::size_t estimated_cardinality,
                                                sirius_physical_operator* parent_op,
                                                bool is_build,

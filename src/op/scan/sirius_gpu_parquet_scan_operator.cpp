@@ -41,7 +41,7 @@ namespace sirius::op::scan {
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
-  duckdb::vector<duckdb::LogicalType> types, duckdb::idx_t estimated_cardinality)
+  duckdb::vector<sirius::logical_type> types, duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality)
 {
@@ -61,9 +61,7 @@ void sirius_gpu_parquet_scan_operator::accumulate_metadata(
 }
 
 void sirius_gpu_parquet_scan_operator::finalize_partitions()
-{
-  _finalized.store(true, std::memory_order_release);
-}
+{ _finalized.store(true, std::memory_order_release); }
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface

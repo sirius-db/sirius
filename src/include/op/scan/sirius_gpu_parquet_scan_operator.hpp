@@ -96,7 +96,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    * @param types                  Output column types (forwarded from the parquet scan operator).
    * @param estimated_cardinality  Estimated row count.
    */
-  sirius_gpu_parquet_scan_operator(duckdb::vector<duckdb::LogicalType> types,
+  sirius_gpu_parquet_scan_operator(duckdb::vector<sirius::logical_type> types,
                                    duckdb::idx_t estimated_cardinality);
 
   //===----------Metadata handoff (called by metadata_scan)----------===//

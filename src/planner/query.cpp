@@ -36,10 +36,11 @@ void query::build_indices()
       // Add to operator-to-pipeline map
       _operator_to_pipeline[source.get()] = pipeline;
 
-      // If it's a table scan, add to scan operators vector
+      // If it's a scan-like source, add to scan operators vector
       if (source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN) {
+          source->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
+          source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
         _scan_operators.push_back(source.get());
       }
     }

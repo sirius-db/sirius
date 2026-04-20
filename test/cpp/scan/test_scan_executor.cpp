@@ -20,6 +20,7 @@
 #include <utils/utils.hpp>
 
 // sirius
+#include <helper/type_conversions.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 #include <pipeline/pipeline_executor.hpp>
@@ -91,11 +92,11 @@ static std::unique_ptr<sirius::op::sirius_physical_duckdb_scan> make_physical_ta
 
   // Create sirius_physical_duckdb_scan with all required parameters
   auto physical_scan = std::make_unique<sirius::op::sirius_physical_duckdb_scan>(
-    table_catalog_entry.GetTypes(),   // types
-    table_scan_function,              // function
-    std::move(bind_data),             // bind_data
-    table_catalog_entry.GetTypes(),   // returned_types
-    std::move(column_ids),            // column_ids
+    sirius::from_duckdb_vec(table_catalog_entry.GetTypes()),  // types
+    table_scan_function,                                      // function
+    std::move(bind_data),                                     // bind_data
+    sirius::from_duckdb_vec(table_catalog_entry.GetTypes()),  // returned_types
+    std::move(column_ids),                                    // column_ids
     std::move(projection_ids),        // projection_ids (maps output to internal columns)
     std::move(column_names),          // names
     nullptr,                          // table_filters

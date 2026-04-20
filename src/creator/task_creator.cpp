@@ -17,6 +17,7 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
+#include "op/scan/cpu_source_task.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/iceberg_scan_task.hpp"
@@ -88,6 +89,11 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_pipeline_executor,
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
+    } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+      _cpu_source_operator_global_state_map.emplace(
+        operator_id,
+        std::make_shared<op::scan::cpu_source_task_global_state>(
+          pipeline, &source_operator->Cast<op::sirius_physical_cpu_source>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
       SIRIUS_LOG_INFO("[task_creator::prepare_for_query] ICEBERG_SCAN operator_id={}", operator_id);
       auto it = _parquet_scan_operator_global_state_map.find(operator_id);
@@ -132,6 +138,7 @@ void task_creator::reset(bool keep_parquet_metadata)
   _scan_operator_global_state_map.clear();
   if (!keep_parquet_metadata) { _parquet_scan_operator_global_state_map.clear(); }
   _gpu_operator_global_state_map.clear();
+  _cpu_source_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();
 }
@@ -344,6 +351,28 @@ void task_creator::manager_loop()
             // I/O parallelism. Otherwise, let the plan drive the creation of more tasks.
             if (_num_scans_in_plan >= 2) { break; }
           }
+        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+          SIRIUS_LOG_DEBUG("Task Creator: creating cpu_source_task for operator {}",
+                           node->get_name());
+          size_t operator_id     = node->get_operator_id();
+          auto cpu_source_global = _cpu_source_operator_global_state_map.at(operator_id);
+
+          pipeline->mark_task_created();
+
+          if (destination_data_repositories.empty()) {
+            throw std::runtime_error(
+              "No destination data repositories provided for cpu source task creation.");
+          }
+
+          auto local_state = std::make_unique<op::scan::cpu_source_task_local_state>();
+          auto task        = std::make_unique<op::scan::cpu_source_task>(get_next_task_id(),
+                                                                  destination_data_repositories[0],
+                                                                  std::move(local_state),
+                                                                  cpu_source_global,
+                                                                  *_client_context);
+          SIRIUS_LOG_DEBUG("Task Creator: scheduling cpu_source_task, dest_repos={}",
+                           destination_data_repositories.size());
+          _pipeline_executor->schedule(std::move(task));
         } else {
           // need to exhaust input batches until all ports are empty
           while (!node->all_ports_empty()) {

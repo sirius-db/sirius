@@ -22,6 +22,7 @@
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
+#include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
@@ -208,7 +209,7 @@ class sirius_physical_operator {
 
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
-                           duckdb::vector<duckdb::LogicalType> types,
+                           duckdb::vector<sirius::logical_type> types,
                            std::size_t estimated_cardinality)
     : type(type),
       types(std::move(types)),
@@ -224,7 +225,7 @@ class sirius_physical_operator {
   //! The set of children of the operator
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
-  duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<sirius::logical_type> types;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
@@ -245,7 +246,7 @@ class sirius_physical_operator {
   virtual duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_children() const;
 
   //! Return a vector of the types that will be returned by this operator
-  const duckdb::vector<duckdb::LogicalType>& get_types() const { return types; }
+  const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }

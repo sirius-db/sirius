@@ -20,6 +20,7 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
+#include <helper/type_conversions.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 
 // cudf
@@ -277,7 +278,8 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR)};
-  sirius::op::result::host_table_chunk_reader reader(*con.context, host_table, types);
+  sirius::op::result::host_table_chunk_reader reader(
+    *con.context, host_table, sirius::from_duckdb_vec(types));
 
   size_t row_base       = 0;
   auto const num_chunks = reader.calculate_num_chunks();
@@ -364,7 +366,8 @@ TEST_CASE("host_table_chunk_reader handles null masks",
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR)};
-  sirius::op::result::host_table_chunk_reader reader(*con.context, host_table, types);
+  sirius::op::result::host_table_chunk_reader reader(
+    *con.context, host_table, sirius::from_duckdb_vec(types));
 
   size_t row_base       = 0;
   auto const num_chunks = reader.calculate_num_chunks();

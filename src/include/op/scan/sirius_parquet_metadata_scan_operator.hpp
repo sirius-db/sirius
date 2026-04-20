@@ -104,8 +104,8 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    */
   sirius_parquet_metadata_scan_operator(
     sirius_gpu_parquet_scan_operator* gpu_scan,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::LogicalType> const& returned_types,
+    duckdb::vector<sirius::logical_type> types,
+    duckdb::vector<sirius::logical_type> const& returned_types,
     duckdb::idx_t estimated_cardinality,
     std::vector<std::string> const& file_paths,
     duckdb::vector<duckdb::ColumnIndex> const& column_ids,
