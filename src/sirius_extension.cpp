@@ -888,8 +888,7 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
 
 static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::ENABLE_GPU_EXECUTION = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_GPU_EXECUTION to {}", Config::ENABLE_GPU_EXECUTION);
+  SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -1051,7 +1050,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "gpu_execution",
     "Whether to transparently intercept SQL queries and execute them on GPU",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_GPU_EXECUTION),
+    Value::BOOLEAN(true),
     SetEnableGpuExecution);
 }
 

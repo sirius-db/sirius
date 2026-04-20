@@ -2,10 +2,10 @@
 
 Super Sirius is the new task-based GPU execution engine in Sirius. It uses `namespace sirius` and replaces the legacy `gpu_processing` path with a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
 
-With a Sirius config file (`~/.sirius/sirius.cfg`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required.
+With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required. Legacy `sirius.cfg` is still recognized for compatibility.
 
 ```sql
--- Just load the extension. If ~/.sirius/sirius.cfg exists, GPU is automatic.
+-- Just load the extension. If ~/.sirius/sirius.yaml exists, GPU is automatic.
 LOAD 'sirius.duckdb_extension';
 
 -- Plain SQL — transparently executed on GPU:

@@ -16,6 +16,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/main/client_context.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
@@ -41,7 +42,7 @@ class TransparentExecutionFixture {
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
-      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.yaml";
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<config_env_guard>(cfg_path.string());
 
@@ -51,6 +52,24 @@ class TransparentExecutionFixture {
 
     // Enable transparent execution.
     con->Query("SET gpu_execution = true;");
+  }
+
+  std::unique_ptr<duckdb::Connection> make_connection()
+  {
+    if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+      return std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+    }
+    REQUIRE(db);
+    return std::make_unique<duckdb::Connection>(*db);
+  }
+
+  static std::string read_setting(duckdb::Connection& connection, const std::string& name)
+  {
+    duckdb::Value setting;
+    auto lookup_result = connection.context->TryGetCurrentSetting(name, setting);
+    REQUIRE(lookup_result.GetScope() != duckdb::SettingScope::INVALID);
+    REQUIRE_FALSE(setting.IsNull());
+    return setting.ToString();
   }
 
   static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
@@ -178,4 +197,23 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 10);
   con->Query("SET gpu_execution = true;");
+}
+
+TEST_CASE_METHOD(TransparentExecutionFixture,
+                 "transparent execution: gpu_execution is session scoped",
+                 "[transparent][integration]")
+{
+  auto other_con = make_connection();
+
+  REQUIRE(read_setting(*con, "gpu_execution") == "true");
+  REQUIRE(read_setting(*other_con, "gpu_execution") == "true");
+
+  other_con->Query("SET gpu_execution = false;");
+  REQUIRE(read_setting(*con, "gpu_execution") == "true");
+  REQUIRE(read_setting(*other_con, "gpu_execution") == "false");
+
+  con->Query("SET gpu_execution = false;");
+  other_con->Query("SET gpu_execution = true;");
+  REQUIRE(read_setting(*con, "gpu_execution") == "false");
+  REQUIRE(read_setting(*other_con, "gpu_execution") == "true");
 }

@@ -16,19 +16,31 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
-#include "config.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
+#include <duckdb/common/types/value.hpp>
+#include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
 #include <spdlog/spdlog.h>
 
 namespace sirius::transparent {
 
+namespace {
+
+bool gpu_execution_enabled(const duckdb::ClientContext& context)
+{
+  duckdb::Value setting;
+  auto lookup_result = context.TryGetCurrentSetting("gpu_execution", setting);
+  return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
+}
+
+}  // namespace
+
 void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
-  if (!duckdb::Config::ENABLE_GPU_EXECUTION) { return; }
+  if (!gpu_execution_enabled(input.context)) { return; }
 
   auto& context = input.context;
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -52,7 +64,7 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
-  if (!duckdb::Config::ENABLE_GPU_EXECUTION) { return; }
+  if (!gpu_execution_enabled(input.context)) { return; }
 
   auto& context = input.context;
 

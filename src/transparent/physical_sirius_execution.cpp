@@ -32,6 +32,7 @@ namespace sirius::transparent {
 struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
   duckdb::unique_ptr<sirius::sirius_interface> iface;
   duckdb::unique_ptr<duckdb::QueryResult> result;
+  duckdb::unique_ptr<duckdb::DataChunk> current_chunk;
   bool finished = false;
 
   duckdb::idx_t MaxThreads() override { return 1; }
@@ -107,13 +108,14 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
   }
 
   // Fetch the next chunk from the materialized result.
-  auto result_chunk = state.result->Fetch();
-  if (!result_chunk || result_chunk->size() == 0) {
+  state.current_chunk = state.result->Fetch();
+  if (!state.current_chunk || state.current_chunk->size() == 0) {
+    state.current_chunk.reset();
     state.finished = true;
     return duckdb::SourceResultType::FINISHED;
   }
 
-  chunk.Reference(*result_chunk);
+  chunk.Reference(*state.current_chunk);
   return duckdb::SourceResultType::HAVE_MORE_OUTPUT;
 }
 

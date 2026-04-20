@@ -49,6 +49,4 @@ std::string Config::LOG_LEVEL = "info";
 std::string Config::LOG_DIR   = "log";
 int Config::LOG_FLUSH_SECONDS = 3;
 
-bool Config::ENABLE_GPU_EXECUTION = true;
-
 }  // namespace duckdb
