@@ -18,21 +18,41 @@ use result_formatter::result_store::ResultStore;
 use sirius_ffi::SiriusEngine;
 
 #[instrument(skip_all, fields(%fe_addr, heartbeat_port, %advertise_host))]
-async fn register_with_fe(fe_addr: &str, heartbeat_port: u16, advertise_host: &str) -> anyhow::Result<()> {
+async fn register_with_fe(
+    fe_addr: &str,
+    heartbeat_port: u16,
+    advertise_host: &str,
+) -> anyhow::Result<()> {
     use base64::Engine;
     // Use Doris HTTP SQL API — avoids MySQL protocol incompatibilities.
     let host = fe_addr.split(':').next().unwrap_or("127.0.0.1");
-    let mysql_port: u16 = fe_addr.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(9030);
+    let mysql_port: u16 = fe_addr
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9030);
     // HTTP API is on port 8030 (mysql_port - 1000 by convention)
     let http_port = mysql_port - 1000;
-    let stmt = format!("ALTER SYSTEM ADD BACKEND '{}:{}'", advertise_host, heartbeat_port);
-    let url = format!("http://{}:{}/api/query/default_cluster/information_schema", host, http_port);
+    let stmt = format!(
+        "ALTER SYSTEM ADD BACKEND '{}:{}'",
+        advertise_host, heartbeat_port
+    );
+    let url = format!(
+        "http://{}:{}/api/query/default_cluster/information_schema",
+        host, http_port
+    );
     let body = format!(r#"{{"stmt":"{}"}}"#, stmt);
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(b"root:")))
+        .header(
+            "Authorization",
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(b"root:")
+            ),
+        )
         .body(body)
         .send()
         .await?;
@@ -65,8 +85,7 @@ fn parse_size(s: &str) -> Option<usize> {
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_span_events(
             tracing_subscriber::fmt::format::FmtSpan::NEW
@@ -91,7 +110,10 @@ fn main() {
         start_time_ms,
         // Placeholder: resolved to actual IP/hostname in run() before gRPC starts.
         // Heartbeat/backend services don't use this field.
-        advertise_host: config.advertise_host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
+        advertise_host: config
+            .advertise_host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
     });
 
     let engine = SiriusEngine::new()
@@ -113,9 +135,10 @@ fn main() {
     let _heartbeat_thread = thread::Builder::new()
         .name("heartbeat-svc".to_string())
         .spawn(move || {
-            if let Err(e) =
-                doris_rpc::heartbeat_service::start_heartbeat_server(&heartbeat_addr, heartbeat_state)
-            {
+            if let Err(e) = doris_rpc::heartbeat_service::start_heartbeat_server(
+                &heartbeat_addr,
+                heartbeat_state,
+            ) {
                 error!(error = %e, "HeartbeatService exited with error");
             }
         })
@@ -154,7 +177,7 @@ fn main() {
             &agent_name,
             None, // No Rust-side staging (RTLD_LOCAL makes cuMemAlloc inaccessible from C++)
         )
-            .map(|a| std::sync::Arc::new(a))
+        .map(|a| std::sync::Arc::new(a))
     };
     // Allocate TWO staging buffers via C++ cudaMalloc:
     // 1. Send staging: used by C++ cudf::chunked_pack to pack outgoing GPU data
@@ -169,8 +192,11 @@ fn main() {
         // Registered with nixl so it can transfer to remote BEs.
         let send_ok = match eng_guard.cuda_alloc(half) {
             Ok(addr) => {
-                info!(addr = format_args!("0x{addr:x}"), size_mb = half / (1024 * 1024),
-                      "allocated SEND staging via C++ cudaMalloc");
+                info!(
+                    addr = format_args!("0x{addr:x}"),
+                    size_mb = half / (1024 * 1024),
+                    "allocated SEND staging via C++ cudaMalloc"
+                );
                 if let Err(e) = eng_guard.set_staging_buffer(addr, half) {
                     warn!(error = %e, "failed to set send staging");
                 }
@@ -180,25 +206,43 @@ fn main() {
                 }
                 true
             }
-            Err(e) => { warn!(error = %e, "send staging alloc failed"); false }
+            Err(e) => {
+                warn!(error = %e, "send staging alloc failed");
+                false
+            }
         };
 
         // Receive staging: nixl writes incoming transfers here.
         // Exchange tables point into this buffer (via registerExternalTable).
         let recv_ok = match eng_guard.cuda_alloc(half) {
             Ok(addr) => {
-                info!(addr = format_args!("0x{addr:x}"), size_mb = half / (1024 * 1024),
-                      "allocated RECV staging via C++ cudaMalloc");
+                info!(
+                    addr = format_args!("0x{addr:x}"),
+                    size_mb = half / (1024 * 1024),
+                    "allocated RECV staging via C++ cudaMalloc"
+                );
                 match agent.register_staging_from_addr(addr, half) {
-                    Ok(()) => { info!("recv staging registered with nixl"); true }
-                    Err(e) => { warn!(error = %e, "recv staging nixl registration failed"); false }
+                    Ok(()) => {
+                        info!("recv staging registered with nixl");
+                        true
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "recv staging nixl registration failed");
+                        false
+                    }
                 }
             }
-            Err(e) => { warn!(error = %e, "recv staging alloc failed"); false }
+            Err(e) => {
+                warn!(error = %e, "recv staging alloc failed");
+                false
+            }
         };
 
         if send_ok && recv_ok {
-            info!("dual staging buffers ready (send + recv, {}MB each)", half / (1024 * 1024));
+            info!(
+                "dual staging buffers ready (send + recv, {}MB each)",
+                half / (1024 * 1024)
+            );
         }
 
         drop(eng_guard);
@@ -215,7 +259,18 @@ fn main() {
     }
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine, exchange_buffer, nixl_agent));
+    rt.block_on(run(
+        config,
+        version,
+        grpc_addr,
+        flight_addr,
+        grpc_state,
+        grpc_store,
+        flight_store,
+        engine,
+        exchange_buffer,
+        nixl_agent,
+    ));
 }
 
 #[instrument(name = "sirius_doris_be", skip_all, fields(
@@ -279,14 +334,21 @@ async fn run(
     });
 
     // Build the local bRPC address for self-transfer detection in exchange sender.
-    let local_brpc_addr = format!(
-        "{}:{}",
-        advertise_host,
-        config.brpc_port,
-    );
+    let local_brpc_addr = format!("{}:{}", advertise_host, config.brpc_port,);
 
-    if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, config.force_cpu, config.nixl_only && !config.allow_brpc_fallback, nixl_agent, local_brpc_addr).await
+    if let Err(e) = doris_rpc::grpc_service::start_grpc_server(
+        &grpc_addr,
+        grpc_state,
+        grpc_store,
+        engine,
+        exchange_buffer,
+        config.no_cpu_fallback,
+        config.force_cpu,
+        config.nixl_only && !config.allow_brpc_fallback,
+        nixl_agent,
+        local_brpc_addr,
+    )
+    .await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }

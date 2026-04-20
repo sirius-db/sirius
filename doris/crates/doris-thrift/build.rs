@@ -61,7 +61,9 @@ fn main() {
             continue;
         }
         let content = fs::read_to_string(&path).unwrap();
-        let fixed = content.replace("#![allow(", "#[allow(").replace("#![cfg_attr(", "#[cfg_attr(");
+        let fixed = content
+            .replace("#![allow(", "#[allow(")
+            .replace("#![cfg_attr(", "#[cfg_attr(");
         fs::write(&path, fixed).unwrap();
     }
 

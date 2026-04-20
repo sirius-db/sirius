@@ -9,21 +9,21 @@ use std::collections::BTreeMap;
 
 use doris_thrift::descriptors::{TDescriptorTable, TSlotDescriptor, TTupleDescriptor};
 use doris_thrift::exprs::{
-    TBoolLiteral, TDecimalLiteral, TExpr, TExprNode, TExprNodeType, TFloatLiteral,
-    TIntLiteral, TIsNullPredicate, TLiteralPredicate, TSlotRef, TStringLiteral,
+    TBoolLiteral, TDecimalLiteral, TExpr, TExprNode, TExprNodeType, TFloatLiteral, TIntLiteral,
+    TIsNullPredicate, TLiteralPredicate, TSlotRef, TStringLiteral,
 };
 use doris_thrift::opcodes::TExprOpcode;
+use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use doris_thrift::partitions::{TDataPartition, TPartitionType};
 use doris_thrift::plan_nodes::{
-    TAggregationNode, TEqJoinCondition, TFileScanNode, THashJoinNode, TJoinOp,
-    TNestedLoopJoinNode, TPlan, TPlanNode, TPlanNodeType, TSortInfo, TSortNode, TUnionNode,
+    TAggregationNode, TEqJoinCondition, TFileScanNode, THashJoinNode, TJoinOp, TNestedLoopJoinNode,
+    TPlan, TPlanNode, TPlanNodeType, TSortInfo, TSortNode, TUnionNode,
 };
 use doris_thrift::planner::TPlanFragment;
 use doris_thrift::types::{
     TFunction, TFunctionBinaryType, TFunctionName, TPrimitiveType, TScalarType, TTypeDesc,
     TTypeNode, TTypeNodeType, TUniqueId,
 };
-use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 
 use ordered_float::OrderedFloat;
 
@@ -177,19 +177,14 @@ pub fn decimal_literal_expr(val: &str, precision: i32, scale: i32) -> TExpr {
 /// Create a TExpr containing a SLOT_REF node.
 pub fn slot_ref_expr(slot_id: i32, type_d: TTypeDesc) -> TExpr {
     TExpr {
-        nodes: vec![make_expr_node(
-            TExprNodeType::SLOT_REF,
-            type_d,
-            0,
-            |n| {
-                n.slot_ref = Some(TSlotRef {
-                    slot_id,
-                    tuple_id: 0,
-                    col_unique_id: None,
-                    is_virtual_slot: None,
-                })
-            },
-        )],
+        nodes: vec![make_expr_node(TExprNodeType::SLOT_REF, type_d, 0, |n| {
+            n.slot_ref = Some(TSlotRef {
+                slot_id,
+                tuple_id: 0,
+                col_unique_id: None,
+                is_virtual_slot: None,
+            })
+        })],
     }
 }
 
@@ -336,7 +331,11 @@ pub fn make_plan_node(
 }
 
 /// Create a UNION_NODE with constant expression lists.
-pub fn make_union_node(node_id: i32, tuple_id: i32, const_expr_lists: Vec<Vec<TExpr>>) -> TPlanNode {
+pub fn make_union_node(
+    node_id: i32,
+    tuple_id: i32,
+    const_expr_lists: Vec<Vec<TExpr>>,
+) -> TPlanNode {
     let mut node = make_plan_node(node_id, TPlanNodeType::UNION_NODE, 0, vec![tuple_id]);
     node.union_node = Some(TUnionNode {
         tuple_id,
@@ -424,19 +423,14 @@ pub fn make_desc_table(
 /// Create a TExpr containing a SLOT_REF node with explicit tuple_id.
 pub fn slot_ref_expr_in_tuple(slot_id: i32, tuple_id: i32, type_d: TTypeDesc) -> TExpr {
     TExpr {
-        nodes: vec![make_expr_node(
-            TExprNodeType::SLOT_REF,
-            type_d,
-            0,
-            |n| {
-                n.slot_ref = Some(TSlotRef {
-                    slot_id,
-                    tuple_id,
-                    col_unique_id: None,
-                    is_virtual_slot: None,
-                })
-            },
-        )],
+        nodes: vec![make_expr_node(TExprNodeType::SLOT_REF, type_d, 0, |n| {
+            n.slot_ref = Some(TSlotRef {
+                slot_id,
+                tuple_id,
+                col_unique_id: None,
+                is_virtual_slot: None,
+            })
+        })],
     }
 }
 
@@ -556,7 +550,12 @@ pub fn literal_pred_expr(value: bool) -> TExpr {
             TExprNodeType::LITERAL_PRED,
             type_desc(TPrimitiveType::BOOLEAN),
             0,
-            |n| n.literal_pred = Some(TLiteralPredicate { value, is_null: false }),
+            |n| {
+                n.literal_pred = Some(TLiteralPredicate {
+                    value,
+                    is_null: false,
+                })
+            },
         )],
     }
 }
@@ -692,10 +691,7 @@ pub fn make_expr_node_pub(
 }
 
 /// Create a minimal TPipelineFragmentParams.
-pub fn make_fragment_params(
-    plan: TPlan,
-    desc_tbl: TDescriptorTable,
-) -> TPipelineFragmentParams {
+pub fn make_fragment_params(plan: TPlan, desc_tbl: TDescriptorTable) -> TPipelineFragmentParams {
     TPipelineFragmentParams {
         protocol_version: doris_thrift::palo_internal_service::PaloInternalServiceVersion::V1,
         query_id: TUniqueId { hi: 1, lo: 1 },

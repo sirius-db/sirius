@@ -157,7 +157,12 @@ impl DescriptorTable {
             .slot_ids
             .iter()
             .copied()
-            .filter(|&sid| self.slots.get(&sid).map(|s| s.is_materialized).unwrap_or(false))
+            .filter(|&sid| {
+                self.slots
+                    .get(&sid)
+                    .map(|s| s.is_materialized)
+                    .unwrap_or(false)
+            })
             .collect();
         materialized
             .iter()
@@ -263,9 +268,7 @@ impl DescriptorTable {
                     for sname in &slot_names {
                         for cols in self.table_column_overrides.values() {
                             let ptr = cols as *const Vec<String>;
-                            if !seen_tables.contains(&ptr)
-                                && cols.iter().any(|c| c == sname)
-                            {
+                            if !seen_tables.contains(&ptr) && cols.iter().any(|c| c == sname) {
                                 matched_overrides.push(cols);
                                 seen_tables.insert(ptr);
                                 break; // Each slot belongs to one override
@@ -277,9 +280,7 @@ impl DescriptorTable {
                         // Search for target column across all matched overrides.
                         let mut tuple_offset = 0;
                         for cols in &matched_overrides {
-                            if let Some(pos) =
-                                cols.iter().position(|c| c == &slot.col_name)
-                            {
+                            if let Some(pos) = cols.iter().position(|c| c == &slot.col_name) {
                                 return Ok(fallback_offset + tuple_offset + pos);
                             }
                             tuple_offset += cols.len();
@@ -296,11 +297,7 @@ impl DescriptorTable {
         self.slot_index_by_name_in_tuples(slot_id, row_tuples)
     }
 
-    fn slot_index_from_child_rel_columns(
-        &self,
-        slot_id: i32,
-        row_tuples: &[i32],
-    ) -> Option<usize> {
+    fn slot_index_from_child_rel_columns(&self, slot_id: i32, row_tuples: &[i32]) -> Option<usize> {
         let child_cols = self.child_rel_column_names.borrow();
         let child_cols = child_cols.as_ref()?;
         if child_cols.is_empty() {
@@ -348,7 +345,10 @@ impl DescriptorTable {
             .enumerate()
             .filter_map(|(idx, used)| if !used { Some(idx) } else { None })
             .collect();
-        for (sid, child_idx) in unnamed_slots.into_iter().zip(remaining_child_cols.into_iter()) {
+        for (sid, child_idx) in unnamed_slots
+            .into_iter()
+            .zip(remaining_child_cols.into_iter())
+        {
             slot_to_child_idx.insert(sid, child_idx);
         }
 
@@ -402,8 +402,7 @@ impl DescriptorTable {
                 .iter()
                 .enumerate()
                 .find(|(idx, name)| {
-                    !used_child_cols[*idx]
-                        && (*name == &slot.col_name || *name == &dedup_name)
+                    !used_child_cols[*idx] && (*name == &slot.col_name || *name == &dedup_name)
                 })
                 .map(|(idx, _)| idx);
 
@@ -420,7 +419,10 @@ impl DescriptorTable {
             .enumerate()
             .filter_map(|(idx, used)| if !used { Some(idx) } else { None })
             .collect();
-        for (sid, child_idx) in unresolved_slots.into_iter().zip(remaining_child_cols.into_iter()) {
+        for (sid, child_idx) in unresolved_slots
+            .into_iter()
+            .zip(remaining_child_cols.into_iter())
+        {
             slot_to_child_idx.insert(sid, child_idx);
         }
 
@@ -434,7 +436,6 @@ impl DescriptorTable {
     /// truth for column ordering in nested JoinRels.
     ///
     /// Falls back to `slot_global_index` if the slot's name isn't found.
-
 
     /// Count total materialized columns across the given tuple IDs.
     pub fn count_materialized_columns(&self, row_tuples: &[i32]) -> usize {
@@ -499,7 +500,9 @@ impl DescriptorTable {
 
     /// Find a slot by column name across all tuples (first match wins).
     pub fn find_slot_by_name(&self, name: &str) -> Option<&SlotInfo> {
-        self.slots.values().find(|s| s.col_name == name && s.is_materialized)
+        self.slots
+            .values()
+            .find(|s| s.col_name == name && s.is_materialized)
     }
 
     /// Set an override column list for a specific table name.
@@ -812,10 +815,7 @@ mod tests {
 
     #[test]
     fn test_slot_not_found() {
-        let desc_tbl = make_desc_table(
-            vec![(0, None)],
-            vec![(0, 0, 0, "id", TPrimitiveType::INT)],
-        );
+        let desc_tbl = make_desc_table(vec![(0, None)], vec![(0, 0, 0, "id", TPrimitiveType::INT)]);
         let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
         assert!(desc.get_slot(999).is_err());
     }
@@ -1006,17 +1006,28 @@ mod tests {
         desc.set_table_column_override(
             "customer".to_string(),
             vec![
-                "c_custkey".into(), "c_name".into(), "c_address".into(),
-                "c_nationkey".into(), "c_phone".into(), "c_acctbal".into(),
-                "c_mktsegment".into(), "c_comment".into(),
+                "c_custkey".into(),
+                "c_name".into(),
+                "c_address".into(),
+                "c_nationkey".into(),
+                "c_phone".into(),
+                "c_acctbal".into(),
+                "c_mktsegment".into(),
+                "c_comment".into(),
             ],
         );
         desc.set_table_column_override(
             "orders".to_string(),
             vec![
-                "o_orderkey".into(), "o_custkey".into(), "o_orderstatus".into(),
-                "o_totalprice".into(), "o_orderdate".into(), "o_orderpriority".into(),
-                "o_clerk".into(), "o_shippriority".into(), "o_comment".into(),
+                "o_orderkey".into(),
+                "o_custkey".into(),
+                "o_orderstatus".into(),
+                "o_totalprice".into(),
+                "o_orderdate".into(),
+                "o_orderpriority".into(),
+                "o_clerk".into(),
+                "o_shippriority".into(),
+                "o_comment".into(),
             ],
         );
 
@@ -1074,27 +1085,48 @@ mod tests {
         desc.set_table_column_override(
             "orders_4".to_string(),
             vec![
-                "o_orderkey".into(), "o_custkey".into(), "o_orderstatus".into(),
-                "o_totalprice".into(), "o_orderdate".into(), "o_orderpriority".into(),
-                "o_clerk".into(), "o_shippriority".into(), "o_comment".into(),
+                "o_orderkey".into(),
+                "o_custkey".into(),
+                "o_orderstatus".into(),
+                "o_totalprice".into(),
+                "o_orderdate".into(),
+                "o_orderpriority".into(),
+                "o_clerk".into(),
+                "o_shippriority".into(),
+                "o_comment".into(),
             ],
         );
         desc.set_table_column_override(
             "customer_2".to_string(),
             vec![
-                "c_custkey".into(), "c_name".into(), "c_address".into(),
-                "c_nationkey".into(), "c_phone".into(), "c_acctbal".into(),
-                "c_mktsegment".into(), "c_comment".into(),
+                "c_custkey".into(),
+                "c_name".into(),
+                "c_address".into(),
+                "c_nationkey".into(),
+                "c_phone".into(),
+                "c_acctbal".into(),
+                "c_mktsegment".into(),
+                "c_comment".into(),
             ],
         );
         desc.set_table_column_override(
             "lineitem_0".to_string(),
             vec![
-                "l_orderkey".into(), "l_partkey".into(), "l_suppkey".into(),
-                "l_linenumber".into(), "l_quantity".into(), "l_extendedprice".into(),
-                "l_discount".into(), "l_tax".into(), "l_returnflag".into(),
-                "l_linestatus".into(), "l_shipdate".into(), "l_commitdate".into(),
-                "l_receiptdate".into(), "l_shipinstruct".into(), "l_shipmode".into(),
+                "l_orderkey".into(),
+                "l_partkey".into(),
+                "l_suppkey".into(),
+                "l_linenumber".into(),
+                "l_quantity".into(),
+                "l_extendedprice".into(),
+                "l_discount".into(),
+                "l_tax".into(),
+                "l_returnflag".into(),
+                "l_linestatus".into(),
+                "l_shipdate".into(),
+                "l_commitdate".into(),
+                "l_receiptdate".into(),
+                "l_shipinstruct".into(),
+                "l_shipmode".into(),
                 "l_comment".into(),
             ],
         );
@@ -1112,17 +1144,45 @@ mod tests {
         // The column order is: orders(9) + customer(8) + lineitem(16) = 33 columns.
         let child_col_names: Vec<String> = vec![
             // orders ReadRel (9 cols)
-            "o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate",
-            "o_orderpriority", "o_clerk", "o_shippriority", "o_comment",
+            "o_orderkey",
+            "o_custkey",
+            "o_orderstatus",
+            "o_totalprice",
+            "o_orderdate",
+            "o_orderpriority",
+            "o_clerk",
+            "o_shippriority",
+            "o_comment",
             // customer ReadRel (8 cols)
-            "c_custkey", "c_name", "c_address", "c_nationkey", "c_phone",
-            "c_acctbal", "c_mktsegment", "c_comment",
+            "c_custkey",
+            "c_name",
+            "c_address",
+            "c_nationkey",
+            "c_phone",
+            "c_acctbal",
+            "c_mktsegment",
+            "c_comment",
             // lineitem ReadRel (16 cols)
-            "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity",
-            "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus",
-            "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct",
-            "l_shipmode", "l_comment",
-        ].into_iter().map(String::from).collect();
+            "l_orderkey",
+            "l_partkey",
+            "l_suppkey",
+            "l_linenumber",
+            "l_quantity",
+            "l_extendedprice",
+            "l_discount",
+            "l_tax",
+            "l_returnflag",
+            "l_linestatus",
+            "l_shipdate",
+            "l_commitdate",
+            "l_receiptdate",
+            "l_shipinstruct",
+            "l_shipmode",
+            "l_comment",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         desc.set_child_rel_column_names(child_col_names);
 
         // Slot 60 (l_orderkey, parent=9): at position 17 in the flattened output.

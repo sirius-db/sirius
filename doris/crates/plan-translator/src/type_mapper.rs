@@ -37,7 +37,10 @@ pub fn map_type_desc(type_desc: &TTypeDesc) -> Result<Type> {
 
 fn map_type_node(node: &TTypeNode, nullable: bool) -> Result<Type> {
     if node.type_ != TTypeNodeType::SCALAR {
-        bail!("only scalar types supported, got type node kind {}", node.type_.0);
+        bail!(
+            "only scalar types supported, got type node kind {}",
+            node.type_.0
+        );
     }
     let scalar = node
         .scalar_type

@@ -3,7 +3,10 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "sirius-doris-be", about = "Sirius GPU Backend for Apache Doris")]
+#[command(
+    name = "sirius-doris-be",
+    about = "Sirius GPU Backend for Apache Doris"
+)]
 pub struct BeConfig {
     /// Heartbeat service port (FE connects here to register this BE).
     #[arg(long, default_value_t = 9050)]

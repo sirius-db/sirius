@@ -67,9 +67,8 @@ impl FlightService for SiriusFlightService {
             }
         };
 
-        let flight_data =
-            batches_to_flight_data(schema, batches)
-                .map_err(|e| Status::internal(format!("failed to convert to flight data: {e}")))?;
+        let flight_data = batches_to_flight_data(schema, batches)
+            .map_err(|e| Status::internal(format!("failed to convert to flight data: {e}")))?;
 
         let stream = futures::stream::iter(flight_data.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
