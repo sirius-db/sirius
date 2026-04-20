@@ -125,6 +125,13 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
   [[nodiscard]] std::size_t get_reservation_bytes() const { return _reservation_bytes; }
 
   /**
+   * @brief Non-owning accessor for the held reservation.
+   *
+   * @return Pointer to the reservation, or nullptr if none is held.
+   */
+  cucascade::memory::reservation* reservation() noexcept { return _reservation.get(); }
+
+  /**
    * @brief Get the basis for estimating task memory consumption.
    *
    * This method allows for different task types to provide their own logic for providing something

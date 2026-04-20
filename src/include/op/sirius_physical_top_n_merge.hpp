@@ -36,7 +36,7 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
  public:
   sirius_physical_top_n_merge(sirius_physical_top_n* top_n);
 
-  sirius_physical_top_n_merge(duckdb::vector<duckdb::LogicalType> types_p,
+  sirius_physical_top_n_merge(duckdb::vector<sirius::logical_type> types_p,
                               duckdb::vector<duckdb::BoundOrderByNode> orders,
                               std::size_t limit,
                               std::size_t offset,

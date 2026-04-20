@@ -44,7 +44,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
   sirius_physical_grouped_aggregate_merge(
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     std::vector<int> group_idx,
     std::vector<cudf::aggregation::Kind> cudf_aggregates,
     std::vector<int> cudf_aggregate_idx,
@@ -56,14 +56,14 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   sirius_physical_grouped_aggregate_merge(
     duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
     std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
     duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
@@ -80,7 +80,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
   duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
   //! A recreation of the input chunk, with nulls for everything that isn't a group
-  duckdb::vector<duckdb::LogicalType> input_group_types;
+  duckdb::vector<sirius::logical_type> input_group_types;
 
   // Filters given to sink and friends
   duckdb::unsafe_vector<std::size_t> non_distinct_filter;

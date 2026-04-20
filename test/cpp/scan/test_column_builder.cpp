@@ -19,6 +19,7 @@
 #include <utils/utils.hpp>
 
 // sirius
+#include <helper/type_conversions.hpp>
 #include <helper/utils.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 
@@ -85,9 +86,10 @@ TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder][s
   SECTION("construct with INTEGER type")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
-    REQUIRE(builder.type.id() == duckdb::LogicalTypeId::INTEGER);
+    REQUIRE(builder.type.id() == sirius::type_id::INTEGER);
     REQUIRE(builder.type_size == sizeof(int32_t));
     REQUIRE(builder.total_data_bytes == 0);
     REQUIRE(builder.null_count == 0);
@@ -96,9 +98,10 @@ TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder][s
   SECTION("construct with BIGINT type")
   {
     auto bigint_type = duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT);
-    duckdb_scan_task_local_state::column_builder builder(bigint_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(bigint_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
-    REQUIRE(builder.type.id() == duckdb::LogicalTypeId::BIGINT);
+    REQUIRE(builder.type.id() == sirius::type_id::BIGINT);
     REQUIRE(builder.type_size == sizeof(int64_t));
     REQUIRE(builder.total_data_bytes == 0);
   }
@@ -106,9 +109,10 @@ TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder][s
   SECTION("construct with VARCHAR type")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
-    REQUIRE(builder.type.id() == duckdb::LogicalTypeId::VARCHAR);
+    REQUIRE(builder.type.id() == sirius::type_id::VARCHAR);
     REQUIRE(builder.total_data_bytes == 0);
     REQUIRE(builder.type_size ==
             DEFAULT_VARCHAR_SIZE);  // For VARCHAR, type_size is the default size
@@ -117,9 +121,10 @@ TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder][s
   SECTION("construct with DOUBLE type")
   {
     auto double_type = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE);
-    duckdb_scan_task_local_state::column_builder builder(double_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(double_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
-    REQUIRE(builder.type.id() == duckdb::LogicalTypeId::DOUBLE);
+    REQUIRE(builder.type.id() == sirius::type_id::DOUBLE);
     REQUIRE(builder.type_size == sizeof(double));
   }
 }
@@ -142,7 +147,8 @@ TEST_CASE("column_builder - accessor initialization",
   SECTION("initialize accessors for fixed-width type")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
     size_t num_rows = 100;
     // Calculate total size needed: data + mask
@@ -166,7 +172,8 @@ TEST_CASE("column_builder - accessor initialization",
   SECTION("initialize accessors for VARCHAR type")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
     size_t num_rows = 100;
     // Calculate total size needed: offsets + data + mask
@@ -208,7 +215,8 @@ TEST_CASE("column_builder - sufficient_space_for_column",
   SECTION("VARCHAR type space check - sufficient space")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
     // Allocate space for 100 rows with default VARCHAR size
     size_t num_rows   = 100;
@@ -241,7 +249,8 @@ TEST_CASE("column_builder - sufficient_space_for_column",
   SECTION("VARCHAR type space check - insufficient space")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, 10);  // Small default size
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type),
+                                                         10);  // Small default size
 
     // Allocate space for 10 rows with small VARCHAR size (10 bytes per row)
     size_t num_rows   = 10;
@@ -285,7 +294,7 @@ TEST_CASE("column_builder - process_mask_for_column",
   SECTION("byte-aligned mask processing")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -320,7 +329,7 @@ TEST_CASE("column_builder - process_mask_for_column",
   SECTION("byte-unaligned mask processing")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -351,7 +360,7 @@ TEST_CASE("column_builder - process_mask_for_column",
   SECTION("null_count reflects invalid rows in validity mask")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -375,7 +384,7 @@ TEST_CASE("column_builder - process_mask_for_column",
   SECTION("null_count remains zero when all rows are valid (mask pointer not null)")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -398,7 +407,7 @@ TEST_CASE("column_builder - process_mask_for_column",
   SECTION("null_count remains zero when validity mask data pointer is null")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -429,7 +438,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
   SECTION("INTEGER column processing")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -468,7 +477,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
   SECTION("BIGINT column processing")
   {
     auto bigint_type = duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT);
-    duckdb_scan_task_local_state::column_builder builder(bigint_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(bigint_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int64_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -505,7 +514,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
   SECTION("DOUBLE column processing")
   {
     auto double_type = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE);
-    duckdb_scan_task_local_state::column_builder builder(double_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(double_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(double) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -545,7 +554,8 @@ TEST_CASE("column_builder - process_column for VARCHAR",
   SECTION("VARCHAR column processing with all valid rows")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
     size_t num_rows   = 10;
     size_t total_size = sizeof(int64_t) * (num_rows + 1) +    // offsets
@@ -591,7 +601,8 @@ TEST_CASE("column_builder - process_column for VARCHAR",
   SECTION("VARCHAR column processing with NULL values")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, DEFAULT_VARCHAR_SIZE);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type),
+                                                         DEFAULT_VARCHAR_SIZE);
 
     size_t num_rows   = 10;
     size_t total_size = sizeof(int64_t) * (num_rows + 1) +    // offsets
@@ -648,7 +659,7 @@ TEST_CASE("column_builder - multiple batch processing",
   SECTION("process multiple batches of INTEGER data")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -684,7 +695,7 @@ TEST_CASE("column_builder - multiple batch processing",
   SECTION("process multiple batches of VARCHAR data")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type), 256);
 
     size_t num_rows   = 20;
     size_t total_size = sizeof(int64_t) * (num_rows + 1) +    // offsets
@@ -729,7 +740,7 @@ TEST_CASE("column_builder - multiple batch processing",
   SECTION("process multiple batches with mixed NULL values")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -792,7 +803,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder][sha
   SECTION("empty vector (0 rows)")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -813,7 +824,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder][sha
   SECTION("all NULL vector")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -855,7 +866,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder][sha
   SECTION("empty strings in VARCHAR")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type), 256);
 
     size_t num_rows      = 10;
     size_t max_data_size = 1024;
@@ -899,7 +910,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder][sha
   SECTION("mixed empty and non-empty VARCHAR strings")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type), 256);
 
     size_t num_rows      = 10;
     size_t max_data_size = 1024;
@@ -948,7 +959,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder][sha
   SECTION("single row processing")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     size_t num_rows   = 10;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -992,8 +1003,9 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     auto int_type    = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
     auto bigint_type = duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT);
 
-    duckdb_scan_task_local_state::column_builder int_builder(int_type, 256);
-    duckdb_scan_task_local_state::column_builder bigint_builder(bigint_type, 256);
+    duckdb_scan_task_local_state::column_builder int_builder(sirius::from_duckdb(int_type), 256);
+    duckdb_scan_task_local_state::column_builder bigint_builder(sirius::from_duckdb(bigint_type),
+                                                                256);
 
     size_t num_rows         = 10;
     size_t int_data_size    = sizeof(int32_t) * num_rows;
@@ -1057,8 +1069,9 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     auto int_type     = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
 
-    duckdb_scan_task_local_state::column_builder int_builder(int_type, 256);
-    duckdb_scan_task_local_state::column_builder varchar_builder(varchar_type, 256);
+    duckdb_scan_task_local_state::column_builder int_builder(sirius::from_duckdb(int_type), 256);
+    duckdb_scan_task_local_state::column_builder varchar_builder(sirius::from_duckdb(varchar_type),
+                                                                 256);
 
     size_t num_rows            = 5;
     size_t int_data_size       = sizeof(int32_t) * num_rows;
@@ -1137,9 +1150,11 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     auto double_type  = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE);
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
 
-    duckdb_scan_task_local_state::column_builder int_builder(int_type, 256);
-    duckdb_scan_task_local_state::column_builder double_builder(double_type, 256);
-    duckdb_scan_task_local_state::column_builder varchar_builder(varchar_type, 256);
+    duckdb_scan_task_local_state::column_builder int_builder(sirius::from_duckdb(int_type), 256);
+    duckdb_scan_task_local_state::column_builder double_builder(sirius::from_duckdb(double_type),
+                                                                256);
+    duckdb_scan_task_local_state::column_builder varchar_builder(sirius::from_duckdb(varchar_type),
+                                                                 256);
 
     size_t num_rows    = 8;
     size_t int_size    = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
@@ -1240,7 +1255,8 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
     duckdb_scan_task_local_state::column_builder builder(
-      varchar_type, 4);  // Small default size: 5 rows * 4 bytes = 20 bytes allocated
+      sirius::from_duckdb(varchar_type),
+      4);  // Small default size: 5 rows * 4 bytes = 20 bytes allocated
 
     size_t num_rows      = 5;
     size_t max_data_size = 20;  // Only 20 bytes of data space
@@ -1276,7 +1292,7 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
   SECTION("VARCHAR with all NULLs uses no data space")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type), 256);
 
     size_t num_rows      = 10;
     size_t max_data_size = 1024;
@@ -1313,7 +1329,7 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
   SECTION("VARCHAR alternating NULL and valid pattern")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(varchar_type), 256);
 
     size_t num_rows      = 10;
     size_t max_data_size = 1024;
@@ -1368,7 +1384,7 @@ TEST_CASE("column_builder - NULL handling at boundaries",
   SECTION("NULLs at byte boundaries in mask")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     // Test with exactly 16 rows (2 mask bytes)
     size_t num_rows   = 16;
@@ -1413,7 +1429,7 @@ TEST_CASE("column_builder - NULL handling at boundaries",
   SECTION("all rows NULL across multiple mask bytes")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     // Test with 24 rows (3 mask bytes)
     size_t num_rows   = 24;
@@ -1442,7 +1458,7 @@ TEST_CASE("column_builder - NULL handling at boundaries",
   SECTION("no NULLs across multiple mask bytes")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    duckdb_scan_task_local_state::column_builder builder(int_type, 256);
+    duckdb_scan_task_local_state::column_builder builder(sirius::from_duckdb(int_type), 256);
 
     // Test with 20 rows (3 mask bytes, last one partial)
     size_t num_rows   = 20;
