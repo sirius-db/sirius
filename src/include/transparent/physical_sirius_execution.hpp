@@ -20,6 +20,7 @@
 
 #include <duckdb/common/enums/physical_operator_type.hpp>
 #include <duckdb/execution/physical_operator.hpp>
+#include <duckdb/planner/logical_operator.hpp>
 
 namespace sirius::transparent {
 
@@ -36,7 +37,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     duckdb::PhysicalOperatorType::EXTENSION;
 
   PhysicalSiriusExecution(duckdb::PhysicalPlan& physical_plan,
-                          duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan,
+                          duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
                           duckdb::vector<duckdb::LogicalType> types,
                           duckdb::vector<std::string> names,
                           duckdb::idx_t estimated_cardinality);
@@ -53,9 +54,11 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
   std::string GetName() const override { return "SIRIUS_GPU_EXECUTION"; }
 
-  /// The Sirius physical plan. Mutable because GetGlobalSourceState is const but we
-  /// need to move the plan into the execution state.
-  mutable duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan_;
+ private:
+  /// A reusable copy of the optimized logical plan.
+  /// DuckDB can execute the same prepared physical operator multiple times, so
+  /// we rebuild a fresh Sirius physical plan from this template for each run.
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan_;
 
   /// Output column names (needed for result construction).
   duckdb::vector<std::string> result_names_;

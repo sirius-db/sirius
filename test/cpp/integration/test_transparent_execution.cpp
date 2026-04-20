@@ -33,8 +33,26 @@ namespace fs = std::filesystem;
 
 /// Guard that sets SIRIUS_CONFIG_FILE for the duration of the test.
 struct config_env_guard {
-  config_env_guard(const std::string& path) { setenv("SIRIUS_CONFIG_FILE", path.c_str(), 1); }
-  ~config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
+  explicit config_env_guard(const std::string& path)
+  {
+    if (const char* current = std::getenv("SIRIUS_CONFIG_FILE")) {
+      had_original_value = true;
+      original_value     = current;
+    }
+    setenv("SIRIUS_CONFIG_FILE", path.c_str(), 1);
+  }
+
+  ~config_env_guard()
+  {
+    if (had_original_value) {
+      setenv("SIRIUS_CONFIG_FILE", original_value.c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_CONFIG_FILE");
+    }
+  }
+
+  std::string original_value;
+  bool had_original_value = false;
 };
 
 /// \brief Fixture that sets up a DuckDB connection with Sirius and transparent execution enabled.
@@ -233,6 +251,40 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
   other_con->Query("SET gpu_execution = true;");
   REQUIRE(read_setting(*con, "gpu_execution") == "false");
   REQUIRE(read_setting(*other_con, "gpu_execution") == "true");
+}
+
+TEST_CASE_METHOD(TransparentExecutionFixture,
+                 "transparent execution: prepared statement can execute repeatedly",
+                 "[transparent][integration]")
+{
+  con->Query("CREATE TABLE test_prepared AS SELECT i AS id FROM range(10) t(i);");
+
+  auto before_stats = sirius::test::get_transparent_execution_stats(*con);
+  auto prepared     = con->Prepare("SELECT SUM(id) AS total FROM test_prepared;");
+  REQUIRE(prepared);
+  REQUIRE_FALSE(prepared->HasError());
+
+  auto require_total = [](duckdb::QueryResult& result, const std::string& expected) {
+    auto chunk = result.Fetch();
+    REQUIRE(chunk);
+    REQUIRE(chunk->size() == 1);
+    REQUIRE(chunk->GetValue(0, 0).ToString() == expected);
+    REQUIRE_FALSE(result.Fetch());
+  };
+
+  auto first_result = prepared->Execute();
+  REQUIRE(first_result);
+  REQUIRE_FALSE(first_result->HasError());
+  require_total(*first_result, "45");
+  first_result.reset();
+
+  auto second_result = prepared->Execute();
+  REQUIRE(second_result);
+  REQUIRE_FALSE(second_result->HasError());
+  require_total(*second_result, "45");
+
+  auto after_stats = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 2);
 }
 
 TEST_CASE_METHOD(TransparentExecutionFixture,

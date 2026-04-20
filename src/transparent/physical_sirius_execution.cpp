@@ -17,6 +17,7 @@
 #include "transparent/physical_sirius_execution.hpp"
 
 #include "log/logging.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
 
@@ -45,13 +46,13 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
 // ---------------------------------------------------------------------------
 PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::PhysicalPlan& physical_plan,
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan,
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<std::string> names,
   duckdb::idx_t estimated_cardinality)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
-    sirius_plan_(std::move(sirius_plan)),
+    logical_plan_(std::move(logical_plan)),
     result_names_(std::move(names))
 {
 }
@@ -87,6 +88,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
   if (!state.result) {
     SIRIUS_LOG_INFO("Transparent GPU execution: executing query");
     if (state.sirius_context) { state.sirius_context->record_transparent_execution(); }
+    if (!logical_plan_) {
+      throw duckdb::InternalException(
+        "Transparent GPU execution is missing the logical plan template");
+    }
 
     // Build a minimal PreparedStatementData with the output schema.
     auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
@@ -94,9 +99,13 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     prepared->types = types;
     prepared->names = result_names_;
 
-    // Move the Sirius physical plan into a sirius_prepared_statement_data.
+    // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
+    // the same prepared physical operator across multiple EXECUTE calls.
+    sirius::planner::sirius_physical_plan_generator planner(context.client);
+    auto sirius_plan = planner.create_plan(logical_plan_->Copy(context.client));
+
     auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
-      std::move(prepared), std::move(sirius_plan_));
+      std::move(prepared), std::move(sirius_plan));
 
     // Execute via the standard sirius_interface path.
     duckdb::PendingQueryParameters parameters;

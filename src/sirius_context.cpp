@@ -480,16 +480,17 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   auto logical_plan = take_captured_logical_plan();
 
   try {
-    // Generate the Sirius physical plan from the captured logical plan.
+    // Validate that the captured logical plan is GPU-translatable before we
+    // install a reusable transparent execution operator for prepared statements.
     sirius::planner::sirius_physical_plan_generator planner(context);
-    auto sirius_plan = planner.create_plan(std::move(logical_plan));
+    planner.create_plan(logical_plan->Copy(context));
 
     spdlog::info("Transparent execution: Sirius physical plan generated successfully");
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
     auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
-      std::move(sirius_plan), prepared.types, prepared.names, 0);
+      std::move(logical_plan), prepared.types, prepared.names, 0);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.
