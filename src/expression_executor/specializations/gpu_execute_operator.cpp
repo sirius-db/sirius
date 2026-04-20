@@ -474,6 +474,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
       }
 
       for (std::size_t child = 1; child < expr.children.size(); ++child) {
+        // Short-circuit if the null_count is zero
+        if (!current_result.get_column_view().has_nulls()) { break; }
         auto replacement = execute(*expr.children[child], execution_mode::MATERIALIZE);
         if (replacement.is_scalar()) {
           current_result = execute_result(cudf::replace_nulls(

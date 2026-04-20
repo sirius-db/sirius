@@ -1872,6 +1872,54 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
     REQUIRE(out_vals[0] == 10);
     REQUIRE(out_vals[1] == 200);
   }
+
+  // Short-circuit: once the running result has no nulls, later children must not be evaluated.
+  // Uses an out-of-range column reference as a "poison" child — if it's ever evaluated,
+  // cudf::table_view::column(999) throws std::out_of_range.
+  SECTION("short-circuits once result has no nulls")
+  {
+    std::vector<int32_t> values_all_valid = {10, 20, 30, 40, 50};
+    std::vector<bool> valids_all_true     = {true, true, true, true, true};
+    auto input = make_int32_batch_with_nulls(*space, values_all_valid, valids_all_true);
+
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                               LogicalType{LogicalTypeId::INTEGER});
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    // Poison: out-of-range reference. Only safe if short-circuit skips it.
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 999));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(std::move(coalesce));
+
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    REQUIRE(ov.num_columns() == 1);
+    REQUIRE(ov.column(0).null_count() == 0);
+    REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == values_all_valid);
+  }
+
+  // Negative control: if the first child has nulls, short-circuit must NOT trigger, and the
+  // poison child is reached — confirming the poison is real (so the positive test above means
+  // something).
+  SECTION("does not short-circuit when nulls remain — poison child fires")
+  {
+    std::vector<int32_t> values     = {10, 99, 30};
+    std::vector<bool> valids        = {true, false, true};
+    auto input                      = make_int32_batch_with_nulls(*space, values, valids);
+
+    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                               LogicalType{LogicalTypeId::INTEGER});
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    coalesce->children.push_back(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 999));
+
+    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    exprs.push_back(std::move(coalesce));
+
+    REQUIRE_THROWS(run_execute(*space, input, exprs, strategy));
+  }
 }
 
 TEMPLATE_TEST_CASE("experimental select COALESCE nested in predicate",
