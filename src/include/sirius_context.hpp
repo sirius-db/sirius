@@ -34,6 +34,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <map>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -49,6 +50,12 @@ namespace duckdb {
 /// \brief Manages the lifetime of the sirius_context within a DuckDB ClientContext.
 class SiriusContext : public ClientContextState {
  public:
+  struct transparent_execution_stats {
+    uint64_t successful_rebinds = 0;
+    uint64_t fallbacks          = 0;
+    uint64_t executions         = 0;
+  };
+
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -120,6 +127,10 @@ class SiriusContext : public ClientContextState {
   {
     _internal_query_depth.fetch_sub(1, std::memory_order_relaxed);
   }
+  [[nodiscard]] bool is_internal_query_active() const noexcept
+  {
+    return _internal_query_depth.load(std::memory_order_relaxed) > 0;
+  }
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
@@ -185,6 +196,18 @@ class SiriusContext : public ClientContextState {
   /// \brief Restore the connection's disabled optimizer set after transparent optimization.
   void restore_transparent_disabled_optimizers(ClientContext& context);
 
+  /// \brief Snapshot counters for transparent execution observability.
+  [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
+
+  /// \brief Record a successful transparent rebind to Sirius.
+  void record_transparent_rebind_success() noexcept;
+
+  /// \brief Record a transparent fallback back to DuckDB.
+  void record_transparent_fallback() noexcept;
+
+  /// \brief Record that a transparently rebound query actually executed through Sirius.
+  void record_transparent_execution() noexcept;
+
  private:
   void throw_if_not_initialized() const;
 
@@ -212,6 +235,10 @@ class SiriusContext : public ClientContextState {
   /// Snapshot of the connection's disabled optimizer set before the transparent
   /// optimizer hook mutates it.
   std::optional<std::set<duckdb::OptimizerType>> transparent_original_disabled_optimizers_;
+
+  std::atomic<uint64_t> transparent_rebind_success_count_{0};
+  std::atomic<uint64_t> transparent_fallback_count_{0};
+  std::atomic<uint64_t> transparent_execution_count_{0};
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius

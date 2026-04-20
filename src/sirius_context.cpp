@@ -110,11 +110,11 @@ SiriusContext::~SiriusContext() noexcept
 
 void SiriusContext::QueryBegin(ClientContext& context)
 {
+  // Suppress all state mutations for internal connections (e.g. iceberg metadata lookups).
+  if (is_internal_query_active()) { return; }
+
   // Clear any stale captured plan from a previous query.
   captured_logical_plan_.reset();
-
-  // Suppress all state mutations for internal connections (e.g. iceberg metadata lookups).
-  if (_internal_query_depth.load(std::memory_order_relaxed) > 0) { return; }
 
   // Reset operator ID counter so each query starts from 0
   sirius::op::sirius_physical_operator::next_operator_id.store(0);
@@ -134,7 +134,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 void SiriusContext::QueryEnd()
 {
   // Suppress state mutations triggered by internal connections (e.g. iceberg metadata lookups).
-  if (_internal_query_depth.load(std::memory_order_relaxed) > 0) { return; }
+  if (is_internal_query_active()) { return; }
 
   spdlog::info("QueryEnd");
   captured_logical_plan_.reset();
@@ -163,6 +163,7 @@ void SiriusContext::QueryEnd()
 
 void SiriusContext::QueryEnd(ClientContext& context)
 {
+  if (is_internal_query_active()) { return; }
   restore_transparent_disabled_optimizers(context);
   QueryEnd();
 }
@@ -414,10 +415,36 @@ void SiriusContext::restore_transparent_disabled_optimizers(ClientContext& conte
   }
 }
 
+SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execution_stats() const
+  noexcept
+{
+  return transparent_execution_stats{
+    .successful_rebinds = transparent_rebind_success_count_.load(std::memory_order_relaxed),
+    .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
+    .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_transparent_rebind_success() noexcept
+{
+  transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_fallback() noexcept
+{
+  transparent_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_execution() noexcept
+{
+  transparent_execution_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
                                                  PreparedStatementMode mode)
 {
+  if (is_internal_query_active()) { return RebindQueryInfo::DO_NOT_REBIND; }
   if (!captured_logical_plan_) { return RebindQueryInfo::DO_NOT_REBIND; }
   if (!is_initialized_) {
     captured_logical_plan_.reset();
@@ -447,11 +474,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     // Replace the DuckDB CPU physical plan.
     prepared.physical_plan = std::move(new_physical_plan);
+    record_transparent_rebind_success();
 
     spdlog::info("Transparent execution: physical plan replaced with GPU operator");
   } catch (NotImplementedException& e) {
+    record_transparent_fallback();
     spdlog::info("Transparent execution fallback (unsupported): {}", e.what());
   } catch (std::exception& e) {
+    record_transparent_fallback();
     spdlog::info("Transparent execution fallback: {}", e.what());
   }
 

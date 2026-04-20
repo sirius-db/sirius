@@ -44,7 +44,7 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 
   auto& context = input.context;
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!ctx || !ctx->is_initialized()) { return; }
+  if (!ctx || !ctx->is_initialized() || ctx->is_internal_query_active()) { return; }
 
   auto disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
   ctx->set_transparent_original_disabled_optimizers(disabled);
@@ -69,7 +69,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto& context = input.context;
 
   auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!ctx || !ctx->is_initialized()) { return; }
+  if (!ctx || !ctx->is_initialized() || ctx->is_internal_query_active()) { return; }
 
   // Restore the original connection setting so transparent execution does not
   // leak optimizer changes into later CPU queries.

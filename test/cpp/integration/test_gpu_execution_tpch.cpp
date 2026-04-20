@@ -21,6 +21,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -117,6 +118,7 @@ class GPUExecutionFixtureBase {
   {
     // Enable transparent GPU execution
     con->Query("SET gpu_execution = true;");
+    auto before_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
 
     // Run on GPU (transparent — plain SQL goes through Sirius optimizer hook)
     auto gpu_result = con->Query(query);
@@ -125,6 +127,9 @@ class GPUExecutionFixtureBase {
       UNSCOPED_INFO("transparent GPU execution error: " << gpu_result->GetError());
     }
     REQUIRE_FALSE(gpu_result->HasError());
+    auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(
+      before_gpu_stats, after_gpu_stats, 1, 0, 1);
 
     // Run on CPU (disable transparent execution)
     con->Query("SET gpu_execution = false;");
@@ -132,6 +137,8 @@ class GPUExecutionFixtureBase {
     con->Query("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
+    auto after_cpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(after_gpu_stats, after_cpu_stats, 0, 0, 0);
 
     // Compare dimensions
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());

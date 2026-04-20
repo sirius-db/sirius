@@ -18,6 +18,7 @@
 #include <duckdb.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <utils/sirius_test_env.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -91,6 +92,8 @@ class TransparentExecutionFixture {
   /// Run a query via plain SQL (transparent GPU path) and via CPU, compare results.
   void compare_transparent_vs_cpu(const std::string& query)
   {
+    auto before_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+
     // Run via transparent GPU execution (plain SQL).
     auto gpu_result = con->Query(query);
     REQUIRE(gpu_result);
@@ -98,6 +101,9 @@ class TransparentExecutionFixture {
       UNSCOPED_INFO("Transparent GPU error: " << gpu_result->GetError());
     }
     REQUIRE_FALSE(gpu_result->HasError());
+    auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(
+      before_gpu_stats, after_gpu_stats, 1, 0, 1);
 
     // Disable transparent execution and run on CPU.
     con->Query("SET gpu_execution = false;");
@@ -105,6 +111,8 @@ class TransparentExecutionFixture {
     con->Query("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
+    auto after_cpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(after_gpu_stats, after_cpu_stats, 0, 0, 0);
 
     // Compare dimensions.
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
@@ -178,12 +186,15 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
 {
   // Window functions are not supported by Sirius — should fall back to CPU silently.
   con->Query("CREATE TABLE test_win AS SELECT i AS id, i % 5 AS grp FROM range(100) t(i);");
+  auto before_stats = sirius::test::get_transparent_execution_stats(*con);
   auto result = con->Query(
     "SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn "
     "FROM test_win ORDER BY id;");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 100);
+  auto after_stats = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 0, 1, 0);
 }
 
 TEST_CASE_METHOD(TransparentExecutionFixture,
@@ -191,12 +202,15 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
                  "[transparent][integration]")
 {
   // When disabled, queries should still work (CPU path).
+  auto before_stats = sirius::test::get_transparent_execution_stats(*con);
   con->Query("SET gpu_execution = false;");
   con->Query("CREATE TABLE test_off AS SELECT i AS id FROM range(10) t(i);");
   auto result = con->Query("SELECT * FROM test_off ORDER BY id;");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 10);
+  auto after_stats = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 0, 0, 0);
   con->Query("SET gpu_execution = true;");
 }
 

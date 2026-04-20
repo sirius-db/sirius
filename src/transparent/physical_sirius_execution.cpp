@@ -17,6 +17,7 @@
 #include "transparent/physical_sirius_execution.hpp"
 
 #include "log/logging.hpp"
+#include "sirius_context.hpp"
 #include "sirius_interface.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
@@ -33,6 +34,7 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
   duckdb::unique_ptr<sirius::sirius_interface> iface;
   duckdb::unique_ptr<duckdb::QueryResult> result;
   duckdb::unique_ptr<duckdb::DataChunk> current_chunk;
+  duckdb::SiriusContext* sirius_context = nullptr;
   bool finished = false;
 
   duckdb::idx_t MaxThreads() override { return 1; }
@@ -62,6 +64,8 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobal
 {
   auto state   = duckdb::make_uniq<SiriusGlobalSourceState>();
   state->iface = duckdb::make_uniq<sirius::sirius_interface>(context);
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  state->sirius_context = sirius_ctx.get();
   return std::move(state);
 }
 
@@ -82,6 +86,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
   // Lazy execution: run the GPU query on first GetData call.
   if (!state.result) {
     SIRIUS_LOG_INFO("Transparent GPU execution: executing query");
+    if (state.sirius_context) { state.sirius_context->record_transparent_execution(); }
 
     // Build a minimal PreparedStatementData with the output schema.
     auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
