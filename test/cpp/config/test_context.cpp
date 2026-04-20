@@ -182,12 +182,12 @@ TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_fo
   builder.set_number_of_gpus(topology.num_gpus).use_host_per_numa();
   auto configs = builder.build(topology);
 
-  // Count GPU and HOST tier configs
+  // Count GPU and HOST tier configs (memory_space_config is a variant post-bump f47de0b)
   size_t gpu_count  = 0;
   size_t host_count = 0;
   for (auto const& cfg : configs) {
-    if (cfg.tier == cucascade::memory::Tier::GPU) { ++gpu_count; }
-    if (cfg.tier == cucascade::memory::Tier::HOST) { ++host_count; }
+    if (std::holds_alternative<cucascade::memory::gpu_memory_space_config>(cfg)) { ++gpu_count; }
+    if (std::holds_alternative<cucascade::memory::host_memory_space_config>(cfg)) { ++host_count; }
   }
 
   REQUIRE(gpu_count == topology.num_gpus);

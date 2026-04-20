@@ -440,13 +440,15 @@ void task_creator::manager_loop()
               std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
 
             // Compute preferred GPU based on data locality (SCHED-01, SCHED-02)
+            // pipelineable_input was cast from input_data before the move into local_state;
+            // the moved-from unique_ptr transfers ownership but leaves the underlying object
+            // at the same address, so the raw pointer remains valid here.
             {
               std::optional<int> preferred_device_id;
-              if (local_state->_input_data &&
-                  !local_state->_input_data->get_data_batches().empty()) {
+              if (pipelineable_input && !pipelineable_input->get_data_batches().empty()) {
                 std::unordered_map<int, size_t> gpu_bytes;
                 std::unordered_map<int, size_t> host_bytes;
-                for (const auto& batch : local_state->_input_data->get_data_batches()) {
+                for (const auto& batch : pipelineable_input->get_data_batches()) {
                   auto* space = batch->get_memory_space();
                   if (!space || !batch->get_data()) { continue; }
                   auto size = batch->get_data()->get_size_in_bytes();
