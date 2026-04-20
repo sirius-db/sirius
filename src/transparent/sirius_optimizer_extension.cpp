@@ -34,17 +34,19 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx || !ctx->is_initialized()) { return; }
 
-  // Disable optimizers that produce DuckDB-internal functions Sirius can't handle.
-  // The post-hook re-enables them so non-GPU queries aren't affected.
-  // Must match the set disabled by gpu_execution()'s PrepareConnection to ensure
-  // identical logical plans between the transparent and explicit GPU paths.
-  auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
+  auto disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
+  ctx->set_transparent_original_disabled_optimizers(disabled);
+
+  // Transparent execution disables optimizers that introduce DuckDB-internal
+  // plan shapes or source operators the rebind path cannot yet execute.
   disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
   disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
   // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
   // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
-  // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources.
+  // Transparent execution still falls back on those COLUMN_DATA_SCAN sources.
   disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
+
+  duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(disabled);
 }
 
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
@@ -57,11 +59,9 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx || !ctx->is_initialized()) { return; }
 
-  // Re-enable the disabled optimizers so they don't leak to non-GPU queries.
-  auto& disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
-  disabled.erase(duckdb::OptimizerType::IN_CLAUSE);
-  disabled.erase(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-  disabled.erase(duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  // Restore the original connection setting so transparent execution does not
+  // leak optimizer changes into later CPU queries.
+  ctx->restore_transparent_disabled_optimizers(context);
 
   // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this
   // copy — that's the single source of truth for GPU support. If the plan contains

@@ -161,7 +161,11 @@ void SiriusContext::QueryEnd()
   }
 }
 
-void SiriusContext::QueryEnd(ClientContext& context) { QueryEnd(); }
+void SiriusContext::QueryEnd(ClientContext& context)
+{
+  restore_transparent_disabled_optimizers(context);
+  QueryEnd();
+}
 
 void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
 {
@@ -387,6 +391,28 @@ void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
 unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
 {
   return std::move(captured_logical_plan_);
+}
+
+void SiriusContext::set_transparent_original_disabled_optimizers(
+  std::set<OptimizerType> disabled)
+{
+  std::lock_guard lock(mutex_);
+  transparent_original_disabled_optimizers_ = std::move(disabled);
+}
+
+void SiriusContext::restore_transparent_disabled_optimizers(ClientContext& context)
+{
+  std::optional<std::set<OptimizerType>> original_disabled_optimizers;
+  {
+    std::lock_guard lock(mutex_);
+    original_disabled_optimizers = std::move(transparent_original_disabled_optimizers_);
+    transparent_original_disabled_optimizers_.reset();
+  }
+
+  if (original_disabled_optimizers) {
+    DBConfig::GetConfig(context).options.disabled_optimizers =
+      std::move(*original_disabled_optimizers);
+  }
 }
 
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,

@@ -29,6 +29,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
@@ -36,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace cucascade::memory {
@@ -177,6 +179,12 @@ class SiriusContext : public ClientContextState {
   /// Called by OnFinalizePrepare to generate the Sirius physical plan.
   duckdb::unique_ptr<duckdb::LogicalOperator> take_captured_logical_plan();
 
+  /// \brief Save the connection's disabled optimizer set before transparent execution mutates it.
+  void set_transparent_original_disabled_optimizers(std::set<duckdb::OptimizerType> disabled);
+
+  /// \brief Restore the connection's disabled optimizer set after transparent optimization.
+  void restore_transparent_disabled_optimizers(ClientContext& context);
+
  private:
   void throw_if_not_initialized() const;
 
@@ -200,6 +208,10 @@ class SiriusContext : public ClientContextState {
   /// Captured optimized logical plan for transparent GPU execution.
   /// Set by the optimizer extension hook, consumed by OnFinalizePrepare.
   duckdb::unique_ptr<duckdb::LogicalOperator> captured_logical_plan_;
+
+  /// Snapshot of the connection's disabled optimizer set before the transparent
+  /// optimizer hook mutates it.
+  std::optional<std::set<duckdb::OptimizerType>> transparent_original_disabled_optimizers_;
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius

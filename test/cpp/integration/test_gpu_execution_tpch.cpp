@@ -22,6 +22,7 @@
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>

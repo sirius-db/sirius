@@ -18,9 +18,11 @@
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -51,6 +53,21 @@ class TransparentExecutionFixture {
     con->Query("SET gpu_execution = true;");
   }
 
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  {
+    std::vector<std::vector<std::string>> rows;
+    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+      std::vector<std::string> row;
+      row.reserve(result.ColumnCount());
+      for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
+        row.push_back(result.GetValue(c, r).ToString());
+      }
+      rows.push_back(std::move(row));
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  }
+
   /// Run a query via plain SQL (transparent GPU path) and via CPU, compare results.
   void compare_transparent_vs_cpu(const std::string& query)
   {
@@ -73,14 +90,21 @@ class TransparentExecutionFixture {
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-    // Compare row data as strings (order-independent).
-    auto gpu_collection = gpu_result->Fetch();
-    auto cpu_collection = cpu_result->Fetch();
+    // Compare row data as strings, independent of output order.
+    auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto gpu_rows = collect_rows(gpu_mat);
+    auto cpu_rows = collect_rows(cpu_mat);
 
-    // For simplicity, compare row counts; detailed comparison is done via
-    // test_gpu_execution_tpch pattern if needed.
-    INFO("GPU rows: " << gpu_result->RowCount() << ", CPU rows: " << cpu_result->RowCount());
-    REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+    for (duckdb::idx_t r = 0; r < gpu_rows.size(); r++) {
+      for (duckdb::idx_t c = 0; c < gpu_rows[r].size(); c++) {
+        if (gpu_rows[r][c] != cpu_rows[r][c]) {
+          INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
+                      << "] CPU=[" << cpu_rows[r][c] << "]");
+        }
+        REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
+      }
+    }
   }
 
  protected:
