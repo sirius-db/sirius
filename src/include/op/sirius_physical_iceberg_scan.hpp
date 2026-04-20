@@ -46,10 +46,10 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
   explicit sirius_physical_iceberg_scan(sirius_physical_table_scan* table_scan);
 
   /// Full-parameter constructor (mirrors sirius_physical_parquet_scan).
-  sirius_physical_iceberg_scan(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_iceberg_scan(duckdb::vector<sirius::logical_type> types,
                                duckdb::TableFunction function,
                                duckdb::unique_ptr<duckdb::FunctionData> bind_data,
-                               duckdb::vector<duckdb::LogicalType> returned_types,
+                               duckdb::vector<sirius::logical_type> returned_types,
                                duckdb::vector<duckdb::ColumnIndex> column_ids,
                                duckdb::vector<std::size_t> projection_ids,
                                duckdb::vector<std::string> names,

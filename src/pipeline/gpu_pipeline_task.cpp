@@ -64,7 +64,7 @@ void validate_operator_output_types(const op::operator_data* data,
       return;
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
-      cudf::data_type expected_cudf = duckdb::GetCudfType(expected_types[c]);
+      cudf::data_type expected_cudf = sirius::get_cudf_type(expected_types[c]);
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {
         SIRIUS_LOG_WARN(

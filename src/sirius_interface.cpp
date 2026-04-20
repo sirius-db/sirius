@@ -24,6 +24,7 @@
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 
 namespace sirius {
@@ -171,7 +172,7 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
       duckdb::ErrorData("Error in sirius_pending_statement_internal"));
   }
   D_ASSERT(sirius_collector->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
-  auto types = sirius_collector->get_types();
+  auto types = sirius::to_duckdb_vec(sirius_collector->get_types());
   D_ASSERT(types == statement.types);
   SIRIUS_LOG_INFO("[sirius_pending_statement_internal] calling engine.initialize");
   engine.initialize(std::move(sirius_collector));

@@ -123,7 +123,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   );
 
   // Create partitioner types (copy of agg_output_types before moving)
-  duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+  duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
@@ -132,11 +132,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
 
-  sirius_physical_partition partitioner(std::move(partitioner_types),
-                                        estimated_cardinality,
-                                        &grouped_aggregator,
-                                        false,
-                                        partition_size);
+  sirius_physical_partition partitioner(
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 is int32_t
@@ -256,7 +253,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   );
 
   // Create partitioner types (copy of agg_output_types before moving)
-  duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+  duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
@@ -265,11 +262,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
 
-  sirius_physical_partition partitioner(std::move(partitioner_types),
-                                        estimated_cardinality,
-                                        &grouped_aggregator,
-                                        false,
-                                        partition_size);
+  sirius_physical_partition partitioner(
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 and col2 are int32_t
@@ -346,7 +340,7 @@ TEST_CASE(
   );
 
   // Create partitioner types (copy of agg_output_types before moving)
-  duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+  duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
@@ -356,7 +350,7 @@ TEST_CASE(
                                                              estimated_cardinality);
 
   sirius_physical_partition partitioner(
-    std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 and col1 are both int32_t; uses default partition size (512 MB)

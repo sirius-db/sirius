@@ -30,6 +30,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "expression_executor/gpu_expression_translator.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -156,12 +157,13 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::JoinType join_type,
   const duckdb::vector<std::size_t>& left_projection_map,
   const duckdb::vector<std::size_t>& right_projection_map,
-  duckdb::vector<duckdb::LogicalType> delim_types,
+  duckdb::vector<sirius::logical_type> delim_types,
   std::size_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
   uint64_t max_build_hash_table_bytes)
-  : sirius_physical_partition_consumer_operator(
-      SiriusPhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
+  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
+                                                sirius::from_duckdb_vec(op.types),
+                                                estimated_cardinality),
     conditions(std::move(cond)),
     join_type(join_type),
     delim_types(std::move(delim_types))

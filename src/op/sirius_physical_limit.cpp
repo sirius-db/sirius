@@ -29,7 +29,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_streaming_limit::sirius_physical_streaming_limit(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::BoundLimitNode limit_val_p,
   duckdb::BoundLimitNode offset_val_p,
   std::size_t estimated_cardinality,

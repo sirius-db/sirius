@@ -96,6 +96,11 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
     table = host_src.apply_post_convert(std::move(table), stream);
   }
 
+  // Inject hive partition columns (constant values from file path).
+  if (host_src.has_partition_inject_fn()) {
+    table = host_src.apply_partition_inject(std::move(table), stream);
+  }
+
   stream.synchronize();
 
   // Now we need to prune the post-filter columns from the table, if there are any.
@@ -179,6 +184,9 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     host_src.get_filter_expression(),
     host_src.get_post_filter_projection_ids());
   if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
+  if (host_src.has_partition_inject_fn()) {
+    dst->set_partition_inject_fn(host_src.get_partition_inject_fn());
+  }
   if (!host_src.get_data_file_path().empty()) {
     dst->set_data_file_path(host_src.get_data_file_path());
   }

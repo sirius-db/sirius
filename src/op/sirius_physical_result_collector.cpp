@@ -20,6 +20,7 @@
 
 #include <cudf/cudf_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <helper/type_conversions.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 #include <op/sirius_physical_result_collector.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
@@ -143,14 +144,15 @@ cudf::table_view apply_exchange_projection(
 
 sirius_physical_result_collector::sirius_physical_result_collector(
   ::sirius::sirius_prepared_statement_data& data)
-  : sirius_physical_operator(
-      SiriusPhysicalOperatorType::RESULT_COLLECTOR, {duckdb::LogicalType::BOOLEAN}, 0),
+  : sirius_physical_operator(SiriusPhysicalOperatorType::RESULT_COLLECTOR,
+                             {sirius::logical_type::make(sirius::type_id::BOOLEAN)},
+                             0),
     statement_type(data.prepared->statement_type),
     properties(data.prepared->properties),
     plan(*data.sirius_physical_plan),
     names(data.prepared->names)
 {
-  this->types = data.prepared->types;
+  this->types = sirius::from_duckdb_vec(data.prepared->types);
 }
 
 std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
@@ -186,7 +188,8 @@ sirius_physical_materialized_collector::sirius_physical_materialized_collector(
   ::sirius::sirius_prepared_statement_data& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
     _client_ctx(client_ctx),
-    result_collection(duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, types))
+    result_collection(
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types)))
 {
 }
 
@@ -197,7 +200,8 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
   std::lock_guard<std::mutex> guard(lock);
   // Return an empty result collection if the result_collection is null (from a move)
   if (!result_collection) {
-    result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, types);
+    result_collection =
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, sirius::to_duckdb_vec(types));
   }
 
   return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
@@ -550,7 +554,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       std::lock_guard<std::mutex> guard(lock);
       // Initialize result collection if it is null (from a move)
       if (!result_collection) {
-        result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, types);
+        result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(
+          _client_ctx, sirius::to_duckdb_vec(types));
       }
       result_collection->Append(chunk);
     }

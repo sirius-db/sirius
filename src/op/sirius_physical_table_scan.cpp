@@ -34,17 +34,16 @@
 namespace sirius {
 namespace op {
 
-uint64_t get_chunk_data_byte_size(duckdb::LogicalType type, std::size_t cardinality)
+uint64_t get_chunk_data_byte_size(sirius::logical_type type, std::size_t cardinality)
 {
-  auto physical_size = duckdb::GetTypeIdSize(type.InternalType());
-  return cardinality * physical_size;
+  return cardinality * type.fixed_width_byte_size();
 }
 
 sirius_physical_table_scan::sirius_physical_table_scan(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::TableFunction function_p,
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
-  duckdb::vector<duckdb::LogicalType> returned_types_p,
+  duckdb::vector<sirius::logical_type> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
   duckdb::vector<std::size_t> projection_ids_p,
   duckdb::vector<std::string> names_p,
