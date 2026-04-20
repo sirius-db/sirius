@@ -60,6 +60,21 @@ namespace duckdb {
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
+namespace {
+
+unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
+                                                        Connection& connection,
+                                                        const string& query)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return connection.Query(query); }
+
+  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  return connection.Query(query);
+}
+
+}  // namespace
+
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
   shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
@@ -327,19 +342,19 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else if (data.plan_error) {
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
         printf(
           "=============================================\nError in GPUExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");
-        data.res = data.conn->Query(data.query);
+        data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -451,7 +466,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       printf(
         "=============================================\nError in SiriusExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
@@ -461,7 +476,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
-          data.res = data.conn->Query(data.query);
+          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
         } else {
           throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
           return;

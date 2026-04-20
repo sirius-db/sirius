@@ -113,22 +113,29 @@ void SiriusContext::QueryBegin(ClientContext& context)
   // Suppress all state mutations for internal connections (e.g. iceberg metadata lookups).
   if (is_internal_query_active()) { return; }
 
-  // Clear any stale captured plan from a previous query.
-  captured_logical_plan_.reset();
+  acquire_query_lifecycle_slot();
 
-  // Reset operator ID counter so each query starts from 0
-  sirius::op::sirius_physical_operator::next_operator_id.store(0);
+  try {
+    // Clear any stale captured plan from a previous query.
+    captured_logical_plan_.reset();
 
-  auto query = context.GetCurrentQuery();
-  spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
-  bool query_cache_hit = false;
-  if (config_.is_scan_caching_enabled()) {
-    query_cache_hit = pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+    // Reset operator ID counter so each query starts from 0
+    sirius::op::sirius_physical_operator::next_operator_id.store(0);
+
+    auto query = context.GetCurrentQuery();
+    spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+    bool query_cache_hit = false;
+    if (config_.is_scan_caching_enabled()) {
+      query_cache_hit = pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+    }
+    pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
+
+    task_creator_->reset(query_cache_hit);
+    task_creator_->set_client_context(context);
+  } catch (...) {
+    release_query_lifecycle_slot();
+    throw;
   }
-  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
-
-  task_creator_->reset(query_cache_hit);
-  task_creator_->set_client_context(context);
 }
 
 void SiriusContext::QueryEnd()
@@ -136,29 +143,36 @@ void SiriusContext::QueryEnd()
   // Suppress state mutations triggered by internal connections (e.g. iceberg metadata lookups).
   if (is_internal_query_active()) { return; }
 
-  spdlog::info("QueryEnd");
-  captured_logical_plan_.reset();
-  query_.reset();
+  try {
+    spdlog::info("QueryEnd");
+    captured_logical_plan_.reset();
+    query_.reset();
 
-  // Drain all downgrade executors before clearing repositories — ensures no downgrade
-  // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
-  for (auto& executor : downgrade_executors_) {
-    executor->drain();
-  }
-
-  // Clear all data repositories between queries.
-  // Any batches still present are leaked — operators should have popped everything.
-  if (data_repository_manager_) {
-    auto leaked = data_repository_manager_->clear_all_repositories();
-    for (auto const& info : leaked) {
-      spdlog::warn(
-        "SiriusContext::QueryEnd: operator {} port '{}' still had {} un-consumed "
-        "data batch(es) (memory leak).",
-        info.operator_id,
-        info.port_id,
-        info.count);
+    // Drain all downgrade executors before clearing repositories — ensures no downgrade
+    // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
+    for (auto& executor : downgrade_executors_) {
+      executor->drain();
     }
+
+    // Clear all data repositories between queries.
+    // Any batches still present are leaked — operators should have popped everything.
+    if (data_repository_manager_) {
+      auto leaked = data_repository_manager_->clear_all_repositories();
+      for (auto const& info : leaked) {
+        spdlog::warn(
+          "SiriusContext::QueryEnd: operator {} port '{}' still had {} un-consumed "
+          "data batch(es) (memory leak).",
+          info.operator_id,
+          info.port_id,
+          info.count);
+      }
+    }
+  } catch (...) {
+    release_query_lifecycle_slot();
+    throw;
   }
+
+  release_query_lifecycle_slot();
 }
 
 void SiriusContext::QueryEnd(ClientContext& context)
@@ -384,6 +398,12 @@ duckdb::shared_ptr<const sirius::planner::query> SiriusContext::get_query() cons
   return query_;
 }
 
+bool SiriusContext::is_query_lifecycle_active() const noexcept
+{
+  std::lock_guard lock(query_lifecycle_mutex_);
+  return active_query_depth_ > 0;
+}
+
 void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
 {
   captured_logical_plan_ = std::move(plan);
@@ -491,6 +511,30 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 void SiriusContext::throw_if_not_initialized() const
 {
   if (!is_initialized_) { throw std::runtime_error("Sirius context is not initialized."); }
+}
+
+void SiriusContext::acquire_query_lifecycle_slot()
+{
+  std::unique_lock lock(query_lifecycle_mutex_);
+  auto current_thread = std::this_thread::get_id();
+  query_lifecycle_cv_.wait(lock, [&] {
+    return active_query_depth_ == 0 || active_query_owner_ == current_thread;
+  });
+  active_query_owner_ = current_thread;
+  active_query_depth_++;
+}
+
+void SiriusContext::release_query_lifecycle_slot()
+{
+  std::unique_lock lock(query_lifecycle_mutex_);
+  D_ASSERT(active_query_depth_ > 0);
+  D_ASSERT(active_query_owner_ == std::this_thread::get_id());
+  active_query_depth_--;
+  if (active_query_depth_ == 0) {
+    active_query_owner_ = {};
+    lock.unlock();
+    query_lifecycle_cv_.notify_one();
+  }
 }
 
 // ================= Free Functions ================= //

@@ -21,9 +21,12 @@
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -231,4 +234,69 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
   other_con->Query("SET gpu_execution = true;");
   REQUIRE(read_setting(*con, "gpu_execution") == "false");
   REQUIRE(read_setting(*other_con, "gpu_execution") == "true");
+}
+
+TEST_CASE_METHOD(TransparentExecutionFixture,
+                 "shared SiriusContext serializes cross-connection queries",
+                 "[transparent][integration]")
+{
+  using namespace std::chrono_literals;
+
+  auto other_con  = make_connection();
+  auto sirius_ctx = sirius::test::get_registered_sirius_context(*con);
+
+  con->Query("SET gpu_execution = false;");
+  other_con->Query("SET gpu_execution = false;");
+
+  std::atomic<bool> second_finished = false;
+  std::string first_error;
+  std::string second_error;
+  std::chrono::steady_clock::duration second_elapsed{};
+
+  std::thread first_query([&] {
+    auto result = con->Query("SELECT pg_sleep(0.25);");
+    if (!result) {
+      first_error = "first query returned null result";
+      return;
+    }
+    if (result->HasError()) { first_error = result->GetError(); }
+  });
+
+  auto wait_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!sirius_ctx->is_query_lifecycle_active() &&
+         std::chrono::steady_clock::now() < wait_deadline) {
+    std::this_thread::sleep_for(5ms);
+  }
+  REQUIRE(sirius_ctx->is_query_lifecycle_active());
+
+  auto second_start = std::chrono::steady_clock::now();
+  std::thread second_query([&] {
+    auto result   = other_con->Query("SELECT 42;");
+    second_elapsed = std::chrono::steady_clock::now() - second_start;
+    second_finished.store(true, std::memory_order_release);
+    if (!result) {
+      second_error = "second query returned null result";
+      return;
+    }
+    if (result->HasError()) {
+      second_error = result->GetError();
+      return;
+    }
+    auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+    if (materialized.RowCount() != 1 || materialized.GetValue(0, 0).ToString() != "42") {
+      second_error = "second query returned unexpected result";
+    }
+  });
+
+  std::this_thread::sleep_for(50ms);
+  REQUIRE_FALSE(second_finished.load(std::memory_order_acquire));
+
+  first_query.join();
+  second_query.join();
+
+  INFO("second query wait time: " <<
+       std::chrono::duration_cast<std::chrono::milliseconds>(second_elapsed).count() << "ms");
+  REQUIRE(first_error.empty());
+  REQUIRE(second_error.empty());
+  REQUIRE(second_elapsed >= 150ms);
 }

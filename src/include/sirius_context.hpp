@@ -35,10 +35,12 @@
 
 #include <map>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 #include <vector>
 
 namespace cucascade::memory {
@@ -182,6 +184,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
 
+  /// \brief Whether the shared query lifecycle slot is currently held by any connection.
+  [[nodiscard]] bool is_query_lifecycle_active() const noexcept;
+
   /// \brief Store a captured logical plan for transparent GPU execution.
   /// Called by the optimizer extension hook after copying the optimized logical plan.
   void set_captured_logical_plan(duckdb::unique_ptr<duckdb::LogicalOperator> plan);
@@ -210,9 +215,18 @@ class SiriusContext : public ClientContextState {
 
  private:
   void throw_if_not_initialized() const;
+  void acquire_query_lifecycle_slot();
+  void release_query_lifecycle_slot();
 
   mutable std::mutex mutex_;
   std::atomic<int> _internal_query_depth{0};
+  // The current Super Sirius runtime is shared across connections, so query
+  // lifecycle callbacks and engine execution must be serialized to avoid
+  // cross-connection state corruption.
+  mutable std::mutex query_lifecycle_mutex_;
+  std::condition_variable query_lifecycle_cv_;
+  std::thread::id active_query_owner_{};
+  std::size_t active_query_depth_ = 0;
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
