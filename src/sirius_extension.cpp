@@ -914,7 +914,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "expression_executor_strategy",
-    "Strategy for the experimental gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "Strategy for the gpu_expression_executor: 'materialize', 'ast_interpret', or "
     "'ast_jit'",
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY))),

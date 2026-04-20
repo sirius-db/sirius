@@ -57,6 +57,7 @@ namespace sirius {
 // The currently supported CAST return types for cuDF ASTs
 static std::array<duckdb::LogicalTypeId, 3> constexpr supported_ast_cast_types{
   {duckdb::LogicalTypeId::UBIGINT, duckdb::LogicalTypeId::BIGINT, duckdb::LogicalTypeId::DOUBLE}};
+// The strings representing the currently supported BOUND_FUNCTION types for cuDF ASTs
 static std::array<std::string_view, 6> constexpr supported_ast_functions{
   "+", "-", "*", "/", "//", "%"};
 

@@ -93,7 +93,7 @@ These operators process data in a single pass without buffering.
 
 Applies a predicate expression to filter rows.
 
-- **GPU execution:** `gpu_expression_executor::select(batch, stream)` — evaluates the boolean expression and compacts rows using cuDF filtering
+- **GPU execution:** `gpu_expression_executor::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
 
 ### `sirius_physical_projection` — `PROJECTION`

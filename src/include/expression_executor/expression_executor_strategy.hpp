@@ -17,7 +17,6 @@
 #pragma once
 
 #include <string_view>
-#include <unordered_map>
 
 namespace sirius {
 
@@ -44,30 +43,11 @@ enum class expression_executor_strategy {
  * Accepts "materialize", "ast_interpret", "ast_jit".
  * @return true on success; false on unrecognized input.
  */
-inline bool string_to_strategy(std::string_view sv, expression_executor_strategy& out)
-{
-  static std::unordered_map<std::string_view, expression_executor_strategy> const map = {
-    {"materialize", expression_executor_strategy::MATERIALIZE},
-    {"ast_interpret", expression_executor_strategy::AST_INTERPRET},
-    {"ast_jit", expression_executor_strategy::AST_JIT},
-  };
-  auto it = map.find(sv);
-  if (it == map.end()) { return false; }
-  out = it->second;
-  return true;
-}
+bool string_to_strategy(std::string_view sv, expression_executor_strategy& out);
 
 /**
  * @brief Returns the canonical string representation of an expression_executor_strategy.
  */
-inline std::string_view strategy_to_string(expression_executor_strategy s)
-{
-  switch (s) {
-    case expression_executor_strategy::MATERIALIZE: return "materialize";
-    case expression_executor_strategy::AST_INTERPRET: return "ast_interpret";
-    case expression_executor_strategy::AST_JIT: return "ast_jit";
-  }
-  return "ast_interpret";
-}
+std::string_view strategy_to_string(expression_executor_strategy s);
 
 }  // namespace sirius
