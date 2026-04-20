@@ -18,6 +18,7 @@
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
+#include <op/scan/parquet_schema_mapping.hpp>  // detail::leaf_indices_for_column
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 
@@ -269,6 +270,30 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
         "support flat projected columns.");
     }
 
+    //===----------Resolve selected DuckDB columns to parquet column chunk indices----------===//
+    // row_group.columns is indexed in parquet schema-leaf order (preorder), which can differ from
+    // DuckDB's logical column order. Resolve by name per file (chunk order is consistent across row
+    // groups in a single file, but can vary across files).
+    std::vector<std::size_t> selected_chunk_indices;
+    std::unordered_set<std::size_t> pure_filter_chunk_indices;
+    if (_is_projected) {
+      selected_chunk_indices.reserve(_projected_column_names.size());
+      for (std::size_t k = 0; k < _projected_column_names.size(); ++k) {
+        auto leaves = detail::leaf_indices_for_column(metadata, _projected_column_names[k]);
+        // projected_columns_are_flat (checked above) guarantees exactly one leaf per name.
+        if (leaves.size() != 1) {
+          throw std::runtime_error(
+            "[sirius_parquet_metadata_scan_operator] Projected column '" +
+            _projected_column_names[k] +
+            "' did not resolve to exactly one parquet leaf in file: " + file_path);
+        }
+        selected_chunk_indices.push_back(leaves.front());
+        if (_pure_filter_column_indices.contains(_selected_column_indices[k])) {
+          pure_filter_chunk_indices.insert(leaves.front());
+        }
+      }
+    }
+
     //===----------Row Group Partitioning----------===//
     auto row_group_indices = reader.all_row_groups(*result->reader_options);
     // Row group pruning with filter pushdown using metadata statistics.
@@ -311,22 +336,33 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
       partition_compressed_bytes   = 0;
     };
 
+    auto accumulate_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {
+      auto const& column_metadata = chunk.meta_data;
+      // Pure filter columns are not part of the scan result, so we omit them from the
+      // uncompressed byte count used for sizing partitions.
+      if (column_metadata.total_uncompressed_size > 0 && !is_pure_filter) {
+        partition_uncompressed_bytes +=
+          static_cast<std::size_t>(column_metadata.total_uncompressed_size);
+      }
+      if (column_metadata.total_compressed_size > 0) {
+        partition_compressed_bytes +=
+          static_cast<std::size_t>(column_metadata.total_compressed_size);
+      }
+    };
+
     for (auto const rg_idx : row_group_indices) {
       auto const& row_group = metadata.row_groups[rg_idx];
       partition_rg_indices.push_back(rg_idx);
 
-      for (auto const col_idx : _selected_column_indices) {
-        auto const& column_metadata = row_group.columns[col_idx].meta_data;
-        // To reflect the fact that pure filter columns are not part of the table scan result,
-        // we omit them from the uncompressed byte count.
-        if (column_metadata.total_uncompressed_size > 0 &&
-            !_pure_filter_column_indices.contains(col_idx)) {
-          partition_uncompressed_bytes +=
-            static_cast<std::size_t>(column_metadata.total_uncompressed_size);
+      if (_is_projected) {
+        for (auto const chunk_idx : selected_chunk_indices) {
+          accumulate_chunk(row_group.columns[chunk_idx],
+                           pure_filter_chunk_indices.contains(chunk_idx));
         }
-        if (column_metadata.total_compressed_size > 0) {
-          partition_compressed_bytes +=
-            static_cast<std::size_t>(column_metadata.total_compressed_size);
+      } else {
+        // Non-projected: all chunks contribute, no pure-filter pruning.
+        for (auto const& chunk : row_group.columns) {
+          accumulate_chunk(chunk, false);
         }
       }
 
