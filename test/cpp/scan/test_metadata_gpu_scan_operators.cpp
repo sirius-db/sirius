@@ -329,15 +329,14 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
 
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
                                                             0);
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(
-    &gpu_op,
-    sirius::from_duckdb_vec(schema.types),
-    sirius::from_duckdb_vec(schema.types),
-    0,
-    files,
-    schema.column_ids,
-    no_projection,
-    schema.names);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             sirius::from_duckdb_vec(schema.types),
+                                                             sirius::from_duckdb_vec(schema.types),
+                                                             0,
+                                                             files,
+                                                             schema.column_ids,
+                                                             no_projection,
+                                                             schema.names);
 
   auto input = op.get_next_task_input_data();
   REQUIRE(input);
