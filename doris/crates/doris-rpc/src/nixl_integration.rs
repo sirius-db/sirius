@@ -298,7 +298,10 @@ pub async fn send_exchange_with_nixl(
     let all_local = destinations.iter().all(|d| d.brpc_addr == local_brpc_addr);
     let location = if all_local {
         match location {
-            ExecutionLocation::PackedExchange { ipc_bytes, artifact } => {
+            ExecutionLocation::PackedExchange {
+                ipc_bytes,
+                artifact,
+            } => {
                 return send_local_packed_exchange(
                     artifact,
                     ipc_bytes,
@@ -1117,7 +1120,33 @@ async fn send_hash_partitioned(
     }
 
     // CPU fallback: decode IPC bytes into Arrow RecordBatch for hashing.
-    let batch = ipc_to_record_batch(ipc_bytes)?;
+    let batch = match ipc_to_record_batch(ipc_bytes) {
+        Ok(batch) => batch,
+        Err(e) if e == "no batches in IPC stream" => {
+            // Sender produced zero output (e.g. join partition with no matches).
+            // Still need to signal EOS to every destination so consumers don't
+            // hang waiting for data that will never arrive. Mirrors the empty
+            // GPU-partition handling above.
+            for dest in destinations {
+                let is_local = dest.brpc_addr == local_brpc_addr;
+                let key = ExchangeKey { query_id, node_id };
+                if is_local {
+                    exchange_buffer.add_block(&key, sender_id, None, true);
+                } else {
+                    crate::exchange_sender::send_eos(dest, query_id, node_id, sender_id)
+                        .await
+                        .map_err(|e| format!("empty CPU partition EOS: {e}"))?;
+                }
+                tracing::info!(
+                    dest = %dest.brpc_addr,
+                    is_local,
+                    "empty CPU partition EOS sent"
+                );
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     let slots = desc_tbl_slots
         .ok_or_else(|| "hash partition requires descriptor table slots".to_string())?;
@@ -1160,9 +1189,10 @@ async fn send_hash_partitioned(
             // Self-transfer via ExchangeBuffer.
             if let Some(batch) = partition_batch {
                 let part_ipc = record_batch_to_ipc(batch)?;
-                if let Some(pblock) =
-                    encode_nonempty_pblock_from_ipc(&part_ipc, "hash partition self-transfer pblock")?
-                {
+                if let Some(pblock) = encode_nonempty_pblock_from_ipc(
+                    &part_ipc,
+                    "hash partition self-transfer pblock",
+                )? {
                     exchange_buffer.add_block(&key, sender_id, Some(pblock), false);
                 }
             }
