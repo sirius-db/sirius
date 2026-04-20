@@ -71,51 +71,6 @@ pipelineable_operator_data::prepare_for_processing(
   return handles;
 }
 
-//===--------------------------------------------------------------------===//
-// Operator
-//===--------------------------------------------------------------------===//
-// LCOV_EXCL_START
-duckdb::unique_ptr<duckdb::OperatorState> sirius_physical_operator::get_operator_state(
-  duckdb::ExecutionContext& context) const
-{
-  return duckdb::make_uniq<duckdb::OperatorState>();
-}
-
-duckdb::unique_ptr<duckdb::GlobalOperatorState> sirius_physical_operator::get_global_operator_state(
-  duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalOperatorState>();
-}
-
-//===--------------------------------------------------------------------===//
-// Source
-//===--------------------------------------------------------------------===//
-duckdb::unique_ptr<duckdb::LocalSourceState> sirius_physical_operator::get_local_source_state(
-  duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const
-{
-  return duckdb::make_uniq<duckdb::LocalSourceState>();
-}
-
-duckdb::unique_ptr<duckdb::GlobalSourceState> sirius_physical_operator::get_global_source_state(
-  duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalSourceState>();
-}
-//===--------------------------------------------------------------------===//
-// Sink
-//===--------------------------------------------------------------------===//
-duckdb::unique_ptr<duckdb::LocalSinkState> sirius_physical_operator::get_local_sink_state(
-  duckdb::ExecutionContext& context) const
-{
-  return duckdb::make_uniq<duckdb::LocalSinkState>();
-}
-
-duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global_sink_state(
-  duckdb::ClientContext& context) const
-{
-  return duckdb::make_uniq<duckdb::GlobalSinkState>();
-}
-
 std::string sirius_physical_operator::get_name() const
 {
   return SiriusPhysicalOperatorToString(type);
@@ -141,12 +96,9 @@ sirius_physical_operator::get_children() const
 void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& current,
                                                pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  op_state.reset();
-
   auto& state = meta_pipeline.get_state();
   if (is_sink()) {
     // operator is a sink, build a pipeline
-    sink_state.reset();
     D_ASSERT(children.size() == 1);
 
     // single operator: the operator becomes the data source of the current pipeline
@@ -162,7 +114,7 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
       state.set_pipeline_source(current, *this);
     } else {
       if (children.size() != 1) {
-        throw duckdb::InternalException("Operator not supported in build_pipelines");
+        throw internal_exception("Operator not supported in build_pipelines");
       }
       state.add_pipeline_operator(current, *this);
       children[0]->build_pipelines(current, meta_pipeline);
@@ -184,7 +136,7 @@ sirius_physical_operator::get_sources() const
       return result;
     } else {
       if (children.size() != 1) {
-        throw duckdb::InternalException("Operator not supported in get_sources");
+        throw internal_exception("Operator not supported in get_sources");
       }
       return children[0]->get_sources();
     }
@@ -228,8 +180,8 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
     for (auto& [port_name, port_ptr] : ports) {
       ports_string += port_name + ", ";
     }
-    throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
-                                    get_name() + " existing ports are: " + ports_string);
+    throw internal_exception("Port " + std::string(port_id) + " not found in operator " +
+                             get_name() + " existing ports are: " + ports_string);
   }
   return it->second;
 }

@@ -21,6 +21,7 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <helper/type_conversions.hpp>
 #include <helper/utils.hpp>
 #include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
@@ -391,9 +392,12 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
   duckdb::LogicalType str_type(duckdb::LogicalTypeId::VARCHAR);
   duckdb::LogicalType big_type(duckdb::LogicalTypeId::BIGINT);
 
-  duckdb_scan_task_local_state::column_builder int_builder(int_type, kDefaultVarcharSize);
-  duckdb_scan_task_local_state::column_builder str_builder(str_type, kDefaultVarcharSize);
-  duckdb_scan_task_local_state::column_builder big_builder(big_type, kDefaultVarcharSize);
+  duckdb_scan_task_local_state::column_builder int_builder(sirius::from_duckdb(int_type),
+                                                           kDefaultVarcharSize);
+  duckdb_scan_task_local_state::column_builder str_builder(sirius::from_duckdb(str_type),
+                                                           kDefaultVarcharSize);
+  duckdb_scan_task_local_state::column_builder big_builder(sirius::from_duckdb(big_type),
+                                                           kDefaultVarcharSize);
 
   size_t byte_offset = 0;
   int_builder.initialize_accessors(num_rows, byte_offset, allocation);
@@ -525,8 +529,10 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
   duckdb::LogicalType int_type(duckdb::LogicalTypeId::INTEGER);
   duckdb::LogicalType str_type(duckdb::LogicalTypeId::VARCHAR);
 
-  duckdb_scan_task_local_state::column_builder int_builder(int_type, kSmallVarcharSize);
-  duckdb_scan_task_local_state::column_builder str_builder(str_type, kSmallVarcharSize);
+  duckdb_scan_task_local_state::column_builder int_builder(sirius::from_duckdb(int_type),
+                                                           kSmallVarcharSize);
+  duckdb_scan_task_local_state::column_builder str_builder(sirius::from_duckdb(str_type),
+                                                           kSmallVarcharSize);
 
   size_t byte_offset = 0;
   int_builder.initialize_accessors(num_rows_expected, byte_offset, allocation);

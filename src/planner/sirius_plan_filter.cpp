@@ -16,6 +16,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -43,7 +44,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
         duckdb::make_uniq<duckdb::BoundReferenceExpression>(op.types[i], op.projection_map[i]));
     }
     auto proj = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-      op.types, std::move(select_list), op.estimated_cardinality);
+      sirius::from_duckdb_vec(op.types), std::move(select_list), op.estimated_cardinality);
     proj->children.push_back(std::move(plan));
     plan = std::move(proj);
   }

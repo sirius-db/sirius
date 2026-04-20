@@ -20,6 +20,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -27,7 +28,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   SiriusPhysicalOperatorType op_type,
   std::size_t estimated_cardinality,
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection_p)
@@ -38,7 +39,7 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 }
 
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   SiriusPhysicalOperatorType op_type,
   std::size_t estimated_cardinality,
   std::size_t cte_index)
@@ -89,9 +90,9 @@ void sirius_physical_column_data_scan::build_pipelines(
     }
     case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
     case SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN:
-      throw duckdb::NotImplementedException("Recursive CTE scan not implemented for GPU");
+      throw not_implemented_exception("Recursive CTE scan not implemented for GPU");
       if (!meta_pipeline.has_recursive_cte()) {
-        throw duckdb::InternalException("Recursive CTE scan found without recursive CTE node");
+        throw internal_exception("Recursive CTE scan found without recursive CTE node");
       }
       break;
     default: break;

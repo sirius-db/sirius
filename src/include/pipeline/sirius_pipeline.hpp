@@ -17,13 +17,14 @@
 #pragma once
 
 #include "duckdb/common/atomic.hpp"
-#include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "op/sirius_physical_operator.hpp"
 // #include "duckdb/parallel/executor_task.hpp"
+#include "common/optional_ptr.hpp"
+#include "common/reference_map.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -51,28 +52,30 @@ class sirius_pipeline_build_state {
 
  public:
   //! Duplicate eliminated join scan dependencies
-  duckdb::reference_map_t<const op::sirius_physical_operator, duckdb::reference<sirius_pipeline>>
+  sirius::reference_map_t<const op::sirius_physical_operator,
+                          std::reference_wrapper<sirius_pipeline>>
     delim_join_dependencies;
   //! Materialized CTE scan dependencies
-  duckdb::reference_map_t<const op::sirius_physical_operator, duckdb::reference<sirius_pipeline>>
+  sirius::reference_map_t<const op::sirius_physical_operator,
+                          std::reference_wrapper<sirius_pipeline>>
     cte_dependencies;
 
  public:
   void set_pipeline_source(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
   void set_pipeline_sink(sirius_pipeline& pipeline,
-                         duckdb::optional_ptr<op::sirius_physical_operator> op,
+                         sirius::optional_ptr<op::sirius_physical_operator> op,
                          std::size_t sink_pipeline_count);
   void set_pipeline_operators(
     sirius_pipeline& pipeline,
-    duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators);
+    duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators);
   void add_pipeline_operator(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
   duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(sirius_engine& engine,
                                                             sirius_pipeline& pipeline,
                                                             op::sirius_physical_operator& op);
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_pipeline_source(sirius_pipeline& pipeline);
-  duckdb::optional_ptr<op::sirius_physical_operator> get_pipeline_sink(sirius_pipeline& pipeline);
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_pipeline_operators(
+  sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_source(sirius_pipeline& pipeline);
+  sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_sink(sirius_pipeline& pipeline);
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> get_pipeline_operators(
     sirius_pipeline& pipeline);
 };
 
@@ -113,16 +116,16 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   // const;
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_operators();
-  duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> get_operators() const;
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> get_operators();
+  duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>> get_operators() const;
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_sink() const noexcept { return sink; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_sink() const noexcept { return sink; }
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
 
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }
@@ -166,11 +169,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Whether or not the pipeline has been initialized
   std::atomic<bool> initialized;
   //! The source of this pipeline
-  duckdb::optional_ptr<op::sirius_physical_operator> source;
+  sirius::optional_ptr<op::sirius_physical_operator> source;
   //! The chain of intermediate operators
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators;
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators;
   //! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
-  duckdb::optional_ptr<op::sirius_physical_operator> sink;
+  sirius::optional_ptr<op::sirius_physical_operator> sink;
 
   //! The global source state
   duckdb::unique_ptr<duckdb::GlobalSourceState> source_state;

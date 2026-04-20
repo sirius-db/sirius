@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -48,7 +49,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
@@ -119,10 +120,10 @@ aggregate_layout build_aggregate_layout(
   for (size_t i = 0; i < aggregates.size(); ++i) {
     auto& agg = aggregates[i]->Cast<duckdb::BoundAggregateExpression>();
     if (agg.IsDistinct()) {
-      throw duckdb::NotImplementedException("Distinct aggregates not supported in GPU path yet");
+      throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
     }
     if (agg.children.size() > 1) {
-      throw duckdb::NotImplementedException("Aggregates with multiple children not supported yet");
+      throw not_implemented_exception("Aggregates with multiple children not supported yet");
     }
 
     aggregate_spec spec;
@@ -141,7 +142,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "count") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("count() without arguments not supported");
+        throw not_implemented_exception("count() without arguments not supported");
       }
       spec.kind          = aggregate_kind::COUNT;
       spec.return_type   = duckdb::LogicalType::BIGINT;
@@ -152,7 +153,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "sum" || fname == "sum_no_overflow") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("sum() without arguments not supported");
+        throw not_implemented_exception("sum() without arguments not supported");
       }
       spec.kind          = aggregate_kind::SUM;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -162,7 +163,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "min") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("min() without arguments not supported");
+        throw not_implemented_exception("min() without arguments not supported");
       }
       spec.kind          = aggregate_kind::MIN;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -172,7 +173,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "max") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("max() without arguments not supported");
+        throw not_implemented_exception("max() without arguments not supported");
       }
       spec.kind          = aggregate_kind::MAX;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -182,7 +183,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "avg") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("avg() without arguments not supported");
+        throw not_implemented_exception("avg() without arguments not supported");
       }
       spec.kind          = aggregate_kind::AVG;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -203,7 +204,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
       layout.merge_nth_index.push_back(0);  // first element
     } else {
-      throw duckdb::NotImplementedException("Aggregate not supported: " + fname);
+      throw not_implemented_exception("Aggregate not supported: " + fname);
     }
 
     layout.aggregates.push_back(std::move(spec));
@@ -232,9 +233,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
   // The sum column type may differ from the return type (e.g., sum is DECIMAL64 but
   // DuckDB's avg return type is DOUBLE).
   long double sum_host = 0.0L;
-  bool sum_is_decimal =
-    (sum_type.id() == cudf::type_id::DECIMAL32 || sum_type.id() == cudf::type_id::DECIMAL64 ||
-     sum_type.id() == cudf::type_id::DECIMAL128);
+  bool sum_is_decimal  = sirius::IsCudfTypeDecimal(sum_type);
   if (sum_is_decimal) {
     auto denom = std::pow(10.0L, static_cast<long double>(-sum_type.scale()));
     switch (sum_type.id()) {
@@ -269,7 +268,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
       case cudf::type_id::INT64:
         sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
         break;
-      default: throw duckdb::NotImplementedException("AVG: unsupported sum column type");
+      default: throw not_implemented_exception("AVG: unsupported sum column type");
     }
   }
 
@@ -313,7 +312,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
         out_scalar = make_numeric_scalar_with_value<int32_t>(
           out_cudf_type, static_cast<int32_t>(avg_host), stream);
         break;
-      default: throw duckdb::NotImplementedException("AVG: unsupported return type");
+      default: throw not_implemented_exception("AVG: unsupported return type");
     }
   }
 
@@ -395,9 +394,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           // cuDF requires output type == input type for fixed-point (decimal) reductions.
           // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
           // For SUM we widen (expected by duckdb) before the aggregation to avoid overflow.
-          bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
-                             col.type().id() == cudf::type_id::DECIMAL64 ||
-                             col.type().id() == cudf::type_id::DECIMAL128);
+          bool is_decimal = sirius::IsCudfTypeDecimal(col.type());
 
           std::unique_ptr<cudf::column> casted_col;
           if (spec.kind == aggregate_kind::SUM) {
@@ -472,7 +469,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 }
 
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)

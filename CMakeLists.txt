@@ -40,6 +40,11 @@ if(VCPKG_BUILD)
   string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CUDA_FLAGS
                        "${CMAKE_CUDA_FLAGS}")
 
+  # The loadable extension must not depend on libcudart.so in the vcpkg build.
+  # Set the CUDA language default to the static runtime before any CUDA targets
+  # are created.
+  set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
   # Strip conda-injected -Wl,-rpath flags from linker flags and disable CMake's
   # RPATH mechanism so binaries don't carry a hardcoded path to the pixi/conda
   # env. All deps are statically linked, so no RPATH is needed. FORCE is
@@ -91,9 +96,41 @@ set(WARNINGS_AS_ERRORS
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
+if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
+  function(sirius_prefer_static_cudart target_name)
+    foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+      get_target_property(_libs "${target_name}" "${_prop}")
+      if(NOT _libs OR _libs STREQUAL "_libs-NOTFOUND")
+        continue()
+      endif()
+
+      set(_patched_libs "${_libs}")
+      list(TRANSFORM _patched_libs REPLACE "^CUDA::cudart$"
+                                           "CUDA::cudart_static")
+      list(TRANSFORM _patched_libs REPLACE "^\\$<LINK_ONLY:CUDA::cudart>$"
+                                           "$<LINK_ONLY:CUDA::cudart_static>")
+
+      if(NOT _patched_libs STREQUAL _libs)
+        set_target_properties("${target_name}" PROPERTIES "${_prop}"
+                                                          "${_patched_libs}")
+      endif()
+    endforeach()
+
+    set_target_properties("${target_name}" PROPERTIES CUDA_RUNTIME_LIBRARY
+                                                      Static)
+  endfunction()
+
+  foreach(_target cucascade_objects cucascade_static cucascade_shared)
+    if(TARGET "${_target}")
+      sirius_prefer_static_cudart("${_target}")
+    endif()
+  endforeach()
+endif()
+
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
+    src/helper/type_conversions.cpp
     src/cpu_cache.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
@@ -126,6 +163,7 @@ set(EXTENSION_SOURCES
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
+    src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/iceberg_avro_reader.cpp
@@ -139,6 +177,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
@@ -175,6 +214,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
@@ -254,6 +294,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
                CUDA_SEPARABLE_COMPILATION ON
                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+  if(VCPKG_BUILD)
+    set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  endif()
+
   # In the vcpkg build, vcpkg include dir must be searched before DuckDB's
   # bundled fmt (which uses duckdb_fmt namespace, incompatible with spdlog).
   # NO_SYSTEM_FROM_IMPORTED prevents -isystem/-I collapse by GCC; BEFORE ensures
@@ -276,50 +320,13 @@ foreach(_target sirius_extension sirius_loadable_extension)
   endif()
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-                        cuCascade::cucascade)
+                        cuCascade::cucascade yaml-cpp::yaml-cpp)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
-# Precompiled headers for extension targets
-target_precompile_headers(
-  sirius_extension
-  PRIVATE
-  # STL headers (60+ combined inclusions)
-  <algorithm>
-  <memory>
-  <optional>
-  <string>
-  <string_view>
-  <vector>
-  # Logging (44/139 source files)
-  "src/include/log/logging.hpp"
-  # DuckDB planner (30+ files)
-  <duckdb/planner/expression/bound_reference_expression.hpp>)
-target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
-
-# CMake PCH doesn't apply to nvcc — skip PCH for CUDA sources
-set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
-                                                       ON)
-
-# The conda-forge GCC wrapper hard-codes -rpath <conda_prefix>/lib into every
-# link invocation. Strip it from the loadable extension so the binary only
-# depends on system libraries at runtime.
-if(VCPKG_BUILD)
-  find_program(_PATCHELF patchelf)
-  if(_PATCHELF)
-    add_custom_command(
-      TARGET sirius_loadable_extension
-      POST_BUILD
-      COMMAND ${_PATCHELF} --remove-rpath
-              $<TARGET_FILE:sirius_loadable_extension>
-      COMMENT "Stripping RPATH from sirius loadable extension")
-  endif()
-endif()
-
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
-                      absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
@@ -352,6 +359,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/helper/test_logical_type.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_transparent_execution.cpp
@@ -382,6 +390,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
+    test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
@@ -414,13 +423,6 @@ link_extension_libraries(sirius_unittest "")
 # that conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
-
-# Precompile Catch2 header (18K lines) once instead of in every test file
-target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
-# unittest.cpp defines CATCH_CONFIG_RUNNER before including catch.hpp, which is
-# incompatible with the PCH (compiled without that define). Exclude it.
-set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/unittest.cpp"
-                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 set_target_properties(
   sirius_unittest
