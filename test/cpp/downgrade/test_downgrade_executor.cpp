@@ -469,3 +469,79 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
 
   executor.stop();
 }
+
+// ---------------------------------------------------------------------------
+// GPU-to-GPU transfer via converter (re-authored from v1.0 c5a3d8e)
+//
+// v1.0's test body was converter-registry-dependent, not downgrade_task-class
+// dependent, so the re-authoring is mostly unchanged. Catch2 v2 skip idiom
+// preserved: WARN+return for <2 GPUs instead of SKIP (per STATE.md Plan 01-03
+// decision — Catch2 v2 lacks a SKIP macro that coexists cleanly with the
+// [downgrade] suite layout).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_to_gpu_transfer_via_converter", "[.][multi_gpu_transfer]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs for cross-device transfer test");
+    return;
+  }
+
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 512ull << 20;  // 512 MB per GPU
+  const double limit_ratio   = 0.75;
+  const size_t host_capacity = 1ull << 30;
+
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio);
+
+  auto space_configs = builder.build();
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+  sirius::converter_registry::initialize();
+
+  auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+
+  auto* gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
+  REQUIRE(gpu0->get_device_id() != gpu1->get_device_id());
+
+  // Create a batch on GPU 0.
+  auto batch = make_gpu_batch(*gpu0, 500);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
+
+  // Convert GPU 0 -> GPU 1 via the converter registry.
+  auto& registry = sirius::converter_registry::get();
+  rmm::cuda_stream stream;
+
+  REQUIRE(batch->try_to_lock_for_in_transit());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
+  batch->try_to_release_in_transit();
+
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_memory_space()->get_device_id() == gpu1->get_device_id());
+
+  // Round-trip GPU 1 -> GPU 0.
+  REQUIRE(batch->try_to_lock_for_in_transit());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
+  batch->try_to_release_in_transit();
+
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
+
+  // Data integrity check: batch still has a non-empty payload after the round-trip.
+  REQUIRE(batch->get_data() != nullptr);
+  REQUIRE(batch->get_data()->get_size_in_bytes() > 0);
+
+  sirius::converter_registry::shutdown();
+}
