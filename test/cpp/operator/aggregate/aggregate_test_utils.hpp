@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "helper/type_conversions.hpp"
 #include "operator/operator_type_traits.hpp"
 #include "utils/data_utils.hpp"
 
@@ -42,7 +43,7 @@ namespace test {
  * @brief Result structure for create_aggregate_expressions
  */
 struct AggregateExpressionResult {
-  duckdb::vector<duckdb::LogicalType> output_types;
+  duckdb::vector<sirius::logical_type> output_types;
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
 };
@@ -84,18 +85,18 @@ AggregateExpressionResult create_aggregate_expressions(
 
   // Create output types: first the group by column types, then the aggregate result types
   for (std::size_t group_idx : group_indexes) {
-    result.output_types.push_back(Traits::logical_type());
+    result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
   }
   for (std::size_t i = 0; i < aggregations.size(); ++i) {
     if (aggregations[i] == "avg") {
       // DECIMAL AVG preserves the DECIMAL type; non-DECIMAL AVG returns DOUBLE
       if constexpr (Traits::is_decimal) {
-        result.output_types.push_back(Traits::logical_type());
+        result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
       } else {
-        result.output_types.push_back(duckdb::LogicalType::DOUBLE);
+        result.output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::DOUBLE));
       }
     } else {
-      result.output_types.push_back(Traits::logical_type());
+      result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
     }
   }
 
@@ -427,9 +428,9 @@ AggregateExpressionResult create_count_distinct_expressions(
 
   // Output types: one per group key column, then BIGINT for the distinct count
   for (std::size_t i = 0; i < group_indexes.size(); ++i) {
-    result.output_types.push_back(KeyTraits::logical_type());
+    result.output_types.push_back(sirius::from_duckdb(KeyTraits::logical_type()));
   }
-  result.output_types.push_back(duckdb::LogicalType::BIGINT);
+  result.output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));
 
   // Group expressions
   for (std::size_t group_idx : group_indexes) {
@@ -475,9 +476,9 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   // Output types: one BIGINT count distinct result per group key
   for (const auto& [type, idx] : key_col_infos) {
-    result.output_types.push_back(type);
+    result.output_types.push_back(sirius::from_duckdb(type));
   }
-  result.output_types.push_back(duckdb::LogicalType::BIGINT);
+  result.output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));
 
   // Group expressions
   for (const auto& [type, idx] : key_col_infos) {

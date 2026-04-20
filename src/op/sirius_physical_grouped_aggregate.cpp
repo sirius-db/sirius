@@ -48,7 +48,7 @@ namespace op {
 
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   std::size_t estimated_cardinality)
@@ -73,7 +73,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
