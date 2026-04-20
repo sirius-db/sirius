@@ -612,15 +612,15 @@ TEST_CASE("downgrade_executor_config_carries_preferred_numa_node",
   // the config object that flows into the downgrade dispatch path must carry the
   // NUMA preference verbatim. Re-authored against dev's config struct.
   sirius::exec::downgrade_executor_config cfg_with_pref{
-    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade"},
-    .monitor_period_ms  = 0,
+    .thread_pool         = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period_ms   = 0,
     .preferred_numa_node = std::optional<int>{0}};
   REQUIRE(cfg_with_pref.preferred_numa_node.has_value());
   REQUIRE(cfg_with_pref.preferred_numa_node.value() == 0);
 
   sirius::exec::downgrade_executor_config cfg_with_pref7{
-    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade"},
-    .monitor_period_ms  = 0,
+    .thread_pool         = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period_ms   = 0,
     .preferred_numa_node = std::optional<int>{7}};
   REQUIRE(cfg_with_pref7.preferred_numa_node.value() == 7);
 
@@ -647,8 +647,8 @@ TEST_CASE("numa_aware_downgrade_executor_passes_numa_node", "[downgrade][numa_aw
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   sirius::exec::downgrade_executor_config config{
-    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade_numa"},
-    .monitor_period_ms  = 0,
+    .thread_pool         = {.num_threads = 1, .thread_name_prefix = "downgrade_numa"},
+    .monitor_period_ms   = 0,
     .preferred_numa_node = std::optional<int>{0}};
   downgrade_executor executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, *mem_mgr);
   executor.start();
@@ -770,8 +770,8 @@ TEST_CASE("numa_downgrade_prefers_local_host_space",
 
   auto gpu0_space_id = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
   sirius::exec::downgrade_executor_config config{
-    .thread_pool        = {.num_threads = 1, .thread_name_prefix = "downgrade_numa_test"},
-    .monitor_period_ms  = 0,
+    .thread_pool         = {.num_threads = 1, .thread_name_prefix = "downgrade_numa_test"},
+    .monitor_period_ms   = 0,
     .preferred_numa_node = std::optional<int>{0}};
   downgrade_executor executor(config, repo_mgr, gpu0_space_id, gpu0, *mem_mgr);
   executor.start();
@@ -802,8 +802,7 @@ TEST_CASE("numa_downgrade_prefers_local_host_space",
 // Tag [.] hides both — they need 2+ GPUs for any meaningful hardware validation.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("p2p_transfer_converter_round_trip_placeholder",
-          "[.][mem_04_p2p_transfer][multi_gpu]")
+TEST_CASE("p2p_transfer_converter_round_trip_placeholder", "[.][mem_04_p2p_transfer][multi_gpu]")
 {
   // Phase 4 scope: host-staged GPU-to-GPU transfer (the MEM-03 baseline already
   // verified by gpu_to_gpu_transfer_via_converter above; this variant adds a
@@ -872,8 +871,7 @@ TEST_CASE("p2p_transfer_converter_round_trip_placeholder",
   sirius::converter_registry::shutdown();
 }
 
-TEST_CASE("scan_distribution_memory_check_placeholder",
-          "[.][mem_05_scan_distribution][multi_gpu]")
+TEST_CASE("scan_distribution_memory_check_placeholder", "[.][mem_05_scan_distribution][multi_gpu]")
 {
   // Phase 4 scope: asymmetric GPU capacity configuration produces asymmetric
   // get_available_memory() reports. This is the prerequisite for

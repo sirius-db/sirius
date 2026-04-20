@@ -204,17 +204,17 @@
 
 ## Cross-Cutting Concerns
 
-**Logging:** 
+**Logging:**
 - spdlog framework, configurable via `SIRIUS_LOG_LEVEL` and `SIRIUS_LOG_DIR`
 - Logged at: Physical plan generation, operator execution, task scheduling, memory allocation
 - Location: `src/include/log/logging.hpp`
 
-**Validation:** 
+**Validation:**
 - Operator trees verified via `sirius_physical_operator::verify()`
 - Expression translator validates AST structure before GPU code generation
 - Type checking in plan generation layer
 
-**Authentication:** 
+**Authentication:**
 - Not applicable (GPU execution engine layer; auth handled by DuckDB)
 
 **CUDA Profiling:**

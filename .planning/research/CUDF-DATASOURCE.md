@@ -484,7 +484,7 @@ After this change, the only kvikio calls remaining in the process are any that c
 ### Pitfall 3 — `cuda_memcpy_async` host-source pinning requirement
 
 **Issue:** cuDF's fallback path (`reader_impl_preprocess_utils.cu:223`, `parquet_io_utils.cpp:142`) calls `cudf::detail::cuda_memcpy_async` with the host buffer from `host_read`. For the async path to actually be async on the GPU (rather than synchronizing), the host buffer needs to be **pinned** (page-locked). Plain `std::vector<uint8_t>` is pageable → cuDF will silently serialize.
-**Prevention:** Have `cucascade_datasource::host_read` allocate from cucascade's `fixed_size_host_memory_resource` (pinned) rather than `std::vector<uint8_t>`. Sirius already uses pinned host memory via `cucascade::memory::fixed_size_host_memory_resource` elsewhere (`parquet_scan_task.cpp:652-658`). Re-use the same allocator for datasource returns.
+**Prevention:** Have `cucascade_datasource::host_read` allocate from cucascade's `fixed_size_host_memory_resource` (pinned) rather than `std::vector<uint8_t>`. Sirius already uses pinned host memory via `cucascade::memory::fixed_size_host_memory_resource` elsewhere (`parquet_scan_task.cpp:652-658`). Reuse the same allocator for datasource returns.
 
 ### Pitfall 4 — Compression codec decoding is independent of kvikio
 

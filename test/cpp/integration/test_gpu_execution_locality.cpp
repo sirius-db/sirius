@@ -18,10 +18,10 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <cuda_runtime_api.h>
 
 #include <optional>
 #include <unordered_map>
@@ -75,7 +75,8 @@ TEST_CASE("pipeline tasks can have different preferred_device_ids", "[data_local
 TEST_CASE("global state preferred_device_id serves as pipeline default", "[data_locality]")
 {
   // SCHED-04: Pipeline-level default from global state
-  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
+  auto global_state =
+    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
 
   REQUIRE_FALSE(global_state->get_preferred_device_id().has_value());
 
@@ -92,7 +93,8 @@ TEST_CASE("local state preferred_device_id takes precedence over global", "[data
 {
   // SCHED-01: Per-task locality score (local) overrides pipeline default (global)
   auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr);
-  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
+  auto global_state =
+    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
 
   global_state->set_preferred_device_id(0);
   local_state->set_preferred_device_id(1);
@@ -103,7 +105,8 @@ TEST_CASE("local state preferred_device_id takes precedence over global", "[data
   REQUIRE(local_state->get_preferred_device_id().value() == 1);
   REQUIRE(global_state->get_preferred_device_id().value() == 0);
   // Local takes precedence
-  REQUIRE(local_state->get_preferred_device_id().value() != global_state->get_preferred_device_id().value());
+  REQUIRE(local_state->get_preferred_device_id().value() !=
+          global_state->get_preferred_device_id().value());
 }
 
 //===----------------------------------------------------------------------===//
@@ -154,9 +157,10 @@ TEST_CASE("locality score selects GPU with most bytes", "[data_locality]")
   gpu_bytes[1] = 4 * 1024 * 1024;  // 4 MB on GPU 1
 
   // The algorithm: pick GPU with most bytes
-  auto preferred = std::max_element(gpu_bytes.begin(), gpu_bytes.end(), [](const auto& a, const auto& b) {
-    return a.second < b.second;
-  });
+  auto preferred =
+    std::max_element(gpu_bytes.begin(), gpu_bytes.end(), [](const auto& a, const auto& b) {
+      return a.second < b.second;
+    });
 
   REQUIRE(preferred->first == 1);  // GPU 1 has more data
   REQUIRE(preferred->second == 4 * 1024 * 1024);
@@ -270,11 +274,11 @@ TEST_CASE("proportional distribution algorithm distributes by memory", "[data_lo
 
   // With 2:6 ratio, GPU 0 gets ~25% and GPU 1 gets ~75%
   double ratio = static_cast<double>(distribution[1]) / distribution[0];
-  REQUIRE(ratio > 2.0);   // Should be approximately 3.0
+  REQUIRE(ratio > 2.0);  // Should be approximately 3.0
   REQUIRE(ratio < 4.0);
 
   INFO("Distribution: GPU 0 = " << distribution[0] << ", GPU 1 = " << distribution[1]
-                                  << ", ratio = " << ratio);
+                                << ", ratio = " << ratio);
 }
 
 TEST_CASE("proportional distribution falls back to round-robin when all full", "[data_locality]")

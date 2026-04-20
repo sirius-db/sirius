@@ -84,11 +84,11 @@ TEST_CASE("descriptive test name", "[tag1][tag2]")
 TEST_CASE("parent test", "[tag]")
 {
   // Setup shared across sections
-  
+
   SECTION("sub-test 1") {
     REQUIRE(...);
   }
-  
+
   SECTION("sub-test 2") {
     REQUIRE(...);
   }
@@ -106,7 +106,7 @@ TEST_CASE("parent test", "[tag]")
 ```cpp
 struct shared_env_listener : Catch::TestEventListenerBase {
   enum class env_need { NONE, SHARED, INTEGRATION };
-  
+
   static env_need classify(Catch::TestCaseInfo const& info);
   void testCaseStarting(Catch::TestCaseInfo const& info) override;
 };
@@ -146,19 +146,19 @@ TEST_CASE("use configuration basic setters", "[config_opt][basic]")
   config::configuration_setter setter;
   int int_value = 0;
   double double_value = 0.0;
-  
+
   setter.add_config("int_value", int_value);
   setter.add_config("double_value", double_value);
-  
+
   libconfig::Config libconfig;
   libconfig.readString(R"(int_value = 100; double_value = 6.28;)");
-  
+
   try {
     setter.apply(libconfig.getRoot());
   } catch (const std::exception& e) {
     std::cerr << "Setting not found: " << e.what() << std::endl;
   }
-  
+
   REQUIRE(int_value == 100);
   REQUIRE(double_value == Approx(6.28));
 }
@@ -170,22 +170,22 @@ class GPUExecutionFixtureBase {
   void compare_gpu_vs_cpu(const std::string& query,
                           std::optional<float> float_tolerance = std::nullopt) {
     con->Query("SET enable_duckdb_fallback = false;");
-    
+
     // Run GPU path
     auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
     auto gpu_result = con->Query(gpu_sql);
     REQUIRE(gpu_result);
     REQUIRE_FALSE(gpu_result->HasError());
-    
+
     // Run CPU baseline
     auto cpu_result = con->Query(query);
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
-    
+
     // Compare row counts and column counts
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-    
+
     // Sort both results for deterministic comparison
     auto ncols = gpu_result->ColumnCount();
     std::string order_clause = " ORDER BY ";
@@ -193,16 +193,16 @@ class GPUExecutionFixtureBase {
       if (c > 0) order_clause += ", ";
       order_clause += std::to_string(c + 1);
     }
-    
+
     auto gpu_sorted = con->Query("SELECT * FROM gpu_execution(\"" + query + "\")" + order_clause);
     auto cpu_sorted = con->Query("SELECT * FROM (" + query + ") t" + order_clause);
-    
+
     // Value-by-value comparison with floating point tolerance
     for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
       for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
         auto gpu_value = gpu_sorted->GetValue(c, r);
         auto cpu_value = cpu_sorted->GetValue(c, r);
-        
+
         if (float_tolerance.has_value() && is_floating_point(gpu_value.type().id())) {
           double gpu_d = gpu_value.GetValue<double>();
           double cpu_d = cpu_value.GetValue<double>();
@@ -243,25 +243,25 @@ TEST_CASE("test_cpu_cache_basic_fixed_single_col", "[.][cpu_cache]")
   // Initialize the buffer manager
   size_t num_records = 1024;
   GPUBufferManager* gpuBufferManager = initialize_test_buffer_manager();
-  
+
   // Create a GPU column
   duckdb::shared_ptr<GPUColumn> gpu_column =
     create_column_with_random_data(GPUColumnTypeId::INT32, num_records);
   duckdb::shared_ptr<GPUIntermediateRelation> relationship =
     make_shared_ptr<GPUIntermediateRelation>(1);
   relationship->columns[0] = gpu_column;
-  
+
   // Cache to CPU
   size_t cpu_cache_bytes = calculate_test_cpu_cache_size(2 * gpu_column->getTotalColumnSize());
   MallocCPUCache cpu_cache(cpu_cache_bytes, 1);
   uint32_t chunk_id = cpu_cache.moveDataToCPU(relationship);
   REQUIRE(chunk_id == 0);
-  
+
   // Load back from cache
   duckdb::shared_ptr<GPUIntermediateRelation> loaded_relationship =
     cpu_cache.moveDataToGPU(chunk_id, true);
   REQUIRE(loaded_relationship->columns.size() == 1);
-  
+
   // Verify data matches
   verify_gpu_column_equality(loaded_relationship->columns[0], gpu_column);
   verify_cuda_errors("CUDA Errors in CPU Caching Test");
@@ -366,7 +366,7 @@ struct sirius_config_env_guard {
 **Helper functions** (`test/cpp/memory_management/test_cpu_cache.cpp`):
 ```cpp
 GPUBufferManager* initialize_test_buffer_manager();
-duckdb::shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId type, 
+duckdb::shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId type,
                                                               size_t num_records);
 void verify_gpu_column_equality(duckdb::shared_ptr<GPUColumn> col1,
                                 duckdb::shared_ptr<GPUColumn> col2);

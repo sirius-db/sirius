@@ -188,7 +188,8 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
-  cucascade::memory::memory_space* _gpu_memory_space{nullptr};  ///< First GPU space (backward compat)
+  cucascade::memory::memory_space* _gpu_memory_space{
+    nullptr};  ///< First GPU space (backward compat)
   std::vector<cucascade::memory::memory_space*> _gpu_memory_spaces;  ///< All GPU memory spaces
   std::atomic<size_t> _scan_round_robin{0};  ///< Round-robin counter for scan distribution
   sirius::creator::task_creator* _task_creator{nullptr};

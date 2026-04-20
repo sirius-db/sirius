@@ -6,7 +6,7 @@
 
 **Area: Dual Execution Paths**
 - Issue: Sirius has two parallel and coexisting code paths (Legacy Sirius in `namespace duckdb` and New Sirius in `namespace sirius`), both fully implemented and functional
-- Files: 
+- Files:
   - Legacy: `src/legacy/` (gpu_executor.cpp, operator/, plan/), `src/operator/`, `src/plan/`
   - New: `src/op/`, `src/planner/`, `src/sirius_engine.cpp`, `src/pipeline/`
 - Impact: Code duplication creates maintenance burden; bug fixes must be applied to both paths; feature parity is difficult to maintain; future developers must understand both implementations
@@ -32,7 +32,7 @@
 
 **Area: Row Counting and Array Indexing**
 - Issue: libcudf uses int32_t for row IDs/indices; any table with > 2^31-1 rows fails, but only checked at execution time
-- Files: 
+- Files:
   - `src/legacy/operator/gpu_physical_hash_join.cpp` lines 599, 831
   - `src/legacy/operator/gpu_physical_ungrouped_aggregate.cpp` line 206
   - `src/legacy/operator/gpu_physical_grouped_aggregate.cpp` (multiple lines)
@@ -66,7 +66,7 @@
 
 **Area: GPU Memory Management with cuCascade**
 - Issue: cuCascade tiered memory system (GPU → pinned host → disk) adds complexity; downgrade executor moves data based on GPU memory pressure; no predefined memory tier strategy documented
-- Files: 
+- Files:
   - `src/downgrade/downgrade_executor.cpp` (downgrade logic)
   - `src/downgrade/downgrade_task.cpp` (batch movement to HOST tier)
   - `src/memory/` (memory management integration)

@@ -154,7 +154,7 @@
 
 **Direct Linkage (CMakeLists.txt):**
 ```
-target_link_libraries(sirius_extension 
+target_link_libraries(sirius_extension
   cudf::cudf                          # GPU DataFrame operations
   rmm::rmm                            # GPU memory management
   spdlog::spdlog                      # Structured logging

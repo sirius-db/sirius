@@ -168,8 +168,8 @@ int duckdb_scan_executor::select_target_gpu()
   }
 
   // Weighted selection: use round-robin counter as deterministic distribution seed
-  auto counter    = _scan_round_robin.fetch_add(1);
-  size_t target   = counter % total_available;
+  auto counter      = _scan_round_robin.fetch_add(1);
+  size_t target     = counter % total_available;
   size_t cumulative = 0;
   for (auto* space : _gpu_memory_spaces) {
     cumulative += space->get_available_memory();
