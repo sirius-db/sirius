@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed 04-04-PLAN.md (PORT-03 verified, pre-commit clean, build verification blocked by executor sandbox); Plan 04-05 next
-last_updated: "2026-04-20T22:55:23.991Z"
+stopped_at: Phase 4 COMPLETE — all 5 plans landed; PORT-01..05 + BUMP-01..03 cleared; 2 hidden-test failures deferred to Phase 6 (MGPU-03) + Phase 7 (MGPU-06) per roadmap scope. Ready for /gsd:transition to Phase 5.
+last_updated: "2026-04-20T23:15:00.000Z"
 last_activity: 2026-04-20
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 5
-  completed_plans: 4
-  percent: 60
+  completed_plans: 5
+  percent: 100
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 
 ## Current Position
 
-Phase: 04 (cucascade-bump-v1-0-re-integration) — EXECUTING
-Plan: 4 of 5
-Status: Ready to execute
+Phase: 04 (cucascade-bump-v1-0-re-integration) — COMPLETE
+Plan: 5 of 5
+Status: Ready for /gsd:transition to Phase 5 (Cucascade-Backed Parquet I/O Migration)
 Last activity: 2026-04-20
 
-Progress: [██████░░░░] 60%
+Progress: [██████████] 100% (phase-scoped)
 
 ## Performance Metrics
 
@@ -57,6 +57,7 @@ Progress: [██████░░░░] 60%
 | Phase 04 P02 | 2h | 6 tasks | 13 files |
 | Phase 04 P03 | 25min | 6 tasks | 8 files |
 | Phase 04-cucascade-bump-v1-0-re-integration P04 | 8min | 2 tasks | 10 files |
+| Phase 04-cucascade-bump-v1-0-re-integration P05 | 35min | 4 tasks | 5 files (2 summaries + STATE/ROADMAP/REQUIREMENTS) |
 
 ## Accumulated Context
 
@@ -83,6 +84,7 @@ New for v1.1 (from research synthesis):
 - [Phase 04]: Test adaptation over re-authoring: test_gpu_pipeline_executor.cpp and test_oom_reschedule.cpp adapted to push-model by scheduling tasks directly on executor (removing request_channel.get() wait loops).
 - [Phase 04]: Plan 04-03: NUMA-aware downgrade re-authored onto dev PR #579 shape (not cherry-picked); POD-extension Strategy A chosen over executor-internal Strategy B (preferred_numa_node on downgrade_task POD preserves v1.0 per-task override semantics)
 - [Phase 04-cucascade-bump-v1-0-re-integration]: Plan 04-04: PORT-03 confirmed as no-op (grep -rn 'libconfig' src/ test/ = 0 hits); Task 1.5 conditional remediation skipped. All v1.0 multi-GPU settings reachable through dev's YAML config reader (PR #565). Pre-commit fixups committed as f5afde1 (pure formatting across 10 files). Build verification blocked by executor-subagent sandbox — deferred to orchestrator/04-05.
+- [Phase 04-cucascade-bump-v1-0-re-integration]: Plan 04-05: Full unit-tests PASS (966 test cases, ~78.8M assertions); all 4 PORT-05 visible tags explicitly invoked and verified to actually run (no silent filtering); 3 of 5 hidden multi-GPU tags PASS on N=2 verification host; 2 hidden tags fail on GPU1->GPU0 converter return leg — deferred to Phase 6 (MGPU-03 device guards) + Phase 7 (MGPU-06 P2P direct). Task 3 checkpoint auto-approved by orchestrator in autonomous full-run mode with "approved — ship with deferral note". All structural grep gates PASS (PORT-02 0 hits LogicalType::*, PORT-03 0 hits libconfig, dead-v1.0-shape 0 hits in live code, BUMP-01 pin f47de0b exact match, PORT-01 26 commits dev..HEAD, PORT-04 7/7 symbol greps hit). Phase 4 SHIPPED.
 
 ### Pending Todos
 
@@ -97,9 +99,11 @@ New for v1.1 (from research synthesis):
 - **Multi-GPU hardware gating:** Several v1.0 validation tests (and the new IO-11 / MGPU-03 / MGPU-06 / MGPU-07 criteria) require an N>1 GPU machine. Single-GPU dev boxes use the Catch2-v2 `WARN+return` convention.
 - **TPC-H SF10 scan regression risk:** Cucascade's `pipeline_io_backend` always stages through pinned host (no GDS) — IO-10 budgets ≤30% regression. If exceeded, escalate upstream (cucascade issue) rather than gate the milestone.
 - **Per-file `open`/`close` in `pipeline_io_backend`:** Research pitfall P1 — no file-handle cache. Profile during Phase 5; if it dominates, file upstream issue.
+- **Cross-GPU converter return-leg fails on 2-GPU HW — scoped to Phase 6 (MGPU-03) / Phase 7 (MGPU-06).** Surfaced in Plan 04-05 Task 2: `[.][multi_gpu_transfer]` and `[.][mem_04_p2p_transfer]` hidden tests PASS on GPU0→GPU1 forward leg but FAIL on GPU1→GPU0 return leg via cucascade converter. Not a Phase 4 regression — exactly at the documented Phase 6/7 scope boundary. MGPU-03 (Phase 6) likely closes the device-guard root cause; MGPU-06 (Phase 7) replaces the host-staged path with `cudaMemcpyPeerAsync`. Regression gate seeded: `test/cpp/downgrade/test_downgrade_executor.cpp:813` with `TODO(MGPU-06)` marker.
+- **TPC-H Q4 parquet flake (pre-existing).** Recurred once in Plans 01/02/05 (retry green). Outside Phase 4 scope. Root-cause investigation scoped to Phase 5 (parquet I/O migration touches the responsible code paths).
 
 ## Session Continuity
 
-Last session: 2026-04-20T22:55:23.988Z
-Stopped at: Completed 04-04-PLAN.md (PORT-03 verified, pre-commit clean, build verification blocked by executor sandbox); Plan 04-05 next
+Last session: 2026-04-20T23:15:00.000Z
+Stopped at: Phase 4 COMPLETE — all 5 plans landed; PORT-01..05 + BUMP-01..03 cleared; 2 hidden-test failures deferred to Phase 6/7. Ready for /gsd:transition to Phase 5.
 Resume file: None

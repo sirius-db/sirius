@@ -20,7 +20,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 - Integer phases (4, 5, 6, 7): Planned milestone work
 - Decimal phases (e.g., 4.1): Urgent insertions (via `/gsd:insert-phase`)
 
-- [ ] **Phase 4: cuCascade Bump + v1.0 Re-integration** — Submodule bump to `origin/main`; replay 23 multi-GPU commits onto current `dev` so they compile against sirius-native types, YAML config, and PR #96 headers
+- [x] **Phase 4: cuCascade Bump + v1.0 Re-integration** — Submodule bump to `origin/main`; replay 23 multi-GPU commits onto current `dev` so they compile against sirius-native types, YAML config, and PR #96 headers
 - [ ] **Phase 5: Cucascade-Backed Parquet I/O Migration** — Ship `sirius::io::cucascade_datasource`, replace every `cudf::io::datasource::create(path)` call-site, remove the `rmm::cuda_stream_default` hygiene debt adjacent to the touched scan code
 - [ ] **Phase 6: Multi-GPU Gap Closure (Topology, Device Safety, Host Memory, GPU↔GPU Converter)** — Close the structural v1.0 gaps (FOUND-01/04/06, CUCS-01/02) that never cleared on `feature/multi-gpu-execution`
 - [ ] **Phase 7: P2P Direct Transfer + Adaptive Scan Partitioning** — Complete the pending v1.0 03-02 plan (MEM-04 P2P via `cudaMemcpyPeerAsync`, MEM-05 memory-proportional scan distribution)
@@ -42,7 +42,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 - [x] 04-02-PLAN.md — Cherry-pick 5 v1.0 code commits (preferred_device_id, locality score, push-model routing, scan distribution, integration test) onto dev; carve out downgrade_executor hunks (PORT-01/02/04 partial)
 - [x] 04-03-PLAN.md — Re-author NUMA-aware downgrade on dev PR #579 shape + re-author 3 downgrade test commits (PORT-01/04 completion); includes human-verify checkpoint
 - [x] 04-04-PLAN.md — PORT-03 YAML config verification + full pre-commit run (PORT-03)
-- [ ] 04-05-PLAN.md — Full unit-test gate + explicit hidden-tag invocation + structural grep gates + phase summary (PORT-05); includes phase sign-off checkpoint
+- [x] 04-05-PLAN.md — Full unit-test gate + explicit hidden-tag invocation + structural grep gates + phase summary (PORT-05); includes phase sign-off checkpoint
 
 ### Phase 5: Cucascade-Backed Parquet I/O Migration
 **Goal**: All Sirius parquet I/O flows through a Sirius-owned `cudf::io::datasource` that delegates to a per-GPU `cucascade::idisk_io_backend`. `cudf::io::datasource::create(path)` disappears from `src/`, and the adjacent `rmm::cuda_stream_default` hygiene debt is cleaned up.
@@ -87,7 +87,7 @@ Phases execute in numeric order: 4 -> 5 -> 6 -> 7. Phase 6 may run partially in 
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 4. cuCascade Bump + v1.0 Re-integration | 3/5 | In Progress | - |
+| 4. cuCascade Bump + v1.0 Re-integration | 5/5 | Complete | 2026-04-20 |
 | 5. Cucascade-Backed Parquet I/O Migration | 0/TBD | Not started | - |
 | 6. Multi-GPU Gap Closure | 0/TBD | Not started | - |
 | 7. P2P Direct Transfer + Adaptive Scan Partitioning | 0/TBD | Not started | - |

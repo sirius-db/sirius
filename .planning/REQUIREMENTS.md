@@ -15,13 +15,13 @@
 - [x] **PORT-02**: Re-integrated code compiles against sirius-native type system (`logical_type` / `type_id`, PR #643) — no residual uses of removed DuckDB vocabulary types
 - [x] **PORT-03**: Multi-GPU runtime settings (GPU count, per-GPU memory budgets, NUMA policy) are read from YAML config (PR #565) rather than libconfig++
 - [x] **PORT-04**: Push-model task dispatch + `preferred_device_id` plumbing from v1.0 Phase 2 preserved (`task_creator`, `management_eventloop`, `pipeline_task_states`)
-- [ ] **PORT-05**: Existing multi-GPU test suites pass: `multi_gpu_foundation`, downgrade executor NUMA tests, `test_gpu_execution_locality` integration tests
+- [x] **PORT-05**: Existing multi-GPU test suites pass: `multi_gpu_foundation`, downgrade executor NUMA tests, `test_gpu_execution_locality` integration tests
 
 ### Bump — cuCascade Submodule Update
 
-- [ ] **BUMP-01**: cuCascade submodule pointer updated from 942c0bf to `origin/main` (f47de0b)
-- [ ] **BUMP-02**: Sirius builds cleanly against new cuCascade surface — absorbs PR #96 (file downgrade / `idisk_io_backend` / `io_backend_registry`), PR #100 (memory_space underflow fix), PR #103 (stream sync on GPU representation destroy), PR #104 (NVML link drop)
-- [ ] **BUMP-03**: All pre-existing cucascade-integration tests (`downgrade`, `reservation`, `converter`) pass after bump with no new flakes
+- [x] **BUMP-01**: cuCascade submodule pointer updated from 942c0bf to `origin/main` (f47de0b)
+- [x] **BUMP-02**: Sirius builds cleanly against new cuCascade surface — absorbs PR #96 (file downgrade / `idisk_io_backend` / `io_backend_registry`), PR #100 (memory_space underflow fix), PR #103 (stream sync on GPU representation destroy), PR #104 (NVML link drop)
+- [x] **BUMP-03**: All pre-existing cucascade-integration tests (`downgrade`, `reservation`, `converter`) pass after bump with no new flakes
 
 ### IO — Replace kvikio with cuCascade `idisk_io_backend` for Parquet I/O
 
@@ -127,10 +127,10 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | PORT-02 | Phase 4 | Complete |
 | PORT-03 | Phase 4 | Complete |
 | PORT-04 | Phase 4 | Complete |
-| PORT-05 | Phase 4 | Pending |
-| BUMP-01 | Phase 4 | Pending |
-| BUMP-02 | Phase 4 | Pending |
-| BUMP-03 | Phase 4 | Pending |
+| PORT-05 | Phase 4 | Complete |
+| BUMP-01 | Phase 4 | Complete |
+| BUMP-02 | Phase 4 | Complete |
+| BUMP-03 | Phase 4 | Complete |
 | IO-01 | Phase 5 | Pending |
 | IO-02 | Phase 5 | Pending |
 | IO-03 | Phase 5 | Pending |
