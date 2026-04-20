@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed 04-02-PLAN.md (cherry-picks landed); Plan 04-03 begun
-last_updated: "2026-04-20T22:14:36.865Z"
+stopped_at: Completed 04-03-PLAN.md (NUMA-aware downgrade re-authored); Plan 04-04 next
+last_updated: "2026-04-20T22:42:24.045Z"
 last_activity: 2026-04-20
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 5
-  completed_plans: 2
-  percent: 0
+  completed_plans: 3
+  percent: 60
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 04 (cucascade-bump-v1-0-re-integration) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-04-20
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
@@ -55,6 +55,7 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: —
 
 | Phase 04 P02 | 2h | 6 tasks | 13 files |
+| Phase 04 P03 | 25min | 6 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -79,6 +80,7 @@ New for v1.1 (from research synthesis):
 - **[Roadmap v1.1]** HYG-01/02 (cuda_stream_default removal) fold into Phase 5 because the adjacent line (`parquet_scan_task.cpp:468`) is touched by the I/O migration anyway.
 - [Phase 04]: Wait-on-preferred-device invariant confirmed in Task 3b: management_eventloop routes to preferred GPU executor whose manager_loop handles capacity via bounded_pool->reserve(); NO fallback re-dispatch to different GPU.
 - [Phase 04]: Test adaptation over re-authoring: test_gpu_pipeline_executor.cpp and test_oom_reschedule.cpp adapted to push-model by scheduling tasks directly on executor (removing request_channel.get() wait loops).
+- [Phase 04]: Plan 04-03: NUMA-aware downgrade re-authored onto dev PR #579 shape (not cherry-picked); POD-extension Strategy A chosen over executor-internal Strategy B (preferred_numa_node on downgrade_task POD preserves v1.0 per-task override semantics)
 
 ### Pending Todos
 
@@ -96,6 +98,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-20T22:14:36.863Z
-Stopped at: Completed 04-02-PLAN.md (cherry-picks landed); Plan 04-03 begun
+Last session: 2026-04-20T22:42:02.264Z
+Stopped at: Completed 04-03-PLAN.md (NUMA-aware downgrade re-authored); Plan 04-04 next
 Resume file: None
