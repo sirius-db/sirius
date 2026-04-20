@@ -37,7 +37,12 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
   3. `git log --oneline dev..HEAD` shows all 23 v1.0 multi-GPU commits (or a squash that includes them) on the current branch, with zero residual references to removed DuckDB vocabulary types: `grep -rnE 'LogicalType::(INTEGER|BIGINT|VARCHAR)' src/` returns zero hits in files touched by the port (PORT-01, PORT-02).
   4. Multi-GPU runtime configuration (`gpu_count`, per-GPU memory budgets, NUMA policy) round-trips through the YAML config parser introduced by PR #565 — the legacy `libconfig++` symbols are absent: `grep -rn 'libconfig' src/` returns zero hits (PORT-03).
   5. Push-model dispatch plumbing (`task_creator` locality computation, `management_eventloop` preferred-device routing, `preferred_device_id` on local and global pipeline task states) is present and exercised by the v1.0 locality test: `build/release/extension/sirius/test/cpp/sirius_unittest "[multi_gpu_foundation],[test_gpu_execution_locality]"` passes on a ≥2-GPU host (or reports `WARN+return` on single-GPU dev boxes per the v1.0 Catch2-v2 convention) (PORT-04, PORT-05).
-**Plans**: TBD
+**Plans**: 5 plans
+- [ ] 04-01-PLAN.md — cuCascade submodule bump (942c0bf -> f47de0b) + build/test gate (BUMP-01/02/03)
+- [ ] 04-02-PLAN.md — Cherry-pick 5 v1.0 code commits (preferred_device_id, locality score, push-model routing, scan distribution, integration test) onto dev; carve out downgrade_executor hunks (PORT-01/02/04 partial)
+- [ ] 04-03-PLAN.md — Re-author NUMA-aware downgrade on dev PR #579 shape + re-author 3 downgrade test commits (PORT-01/04 completion); includes human-verify checkpoint
+- [ ] 04-04-PLAN.md — PORT-03 YAML config verification + full pre-commit run (PORT-03)
+- [ ] 04-05-PLAN.md — Full unit-test gate + explicit hidden-tag invocation + structural grep gates + phase summary (PORT-05); includes phase sign-off checkpoint
 
 ### Phase 5: Cucascade-Backed Parquet I/O Migration
 **Goal**: All Sirius parquet I/O flows through a Sirius-owned `cudf::io::datasource` that delegates to a per-GPU `cucascade::idisk_io_backend`. `cudf::io::datasource::create(path)` disappears from `src/`, and the adjacent `rmm::cuda_stream_default` hygiene debt is cleaned up.
@@ -82,7 +87,7 @@ Phases execute in numeric order: 4 -> 5 -> 6 -> 7. Phase 6 may run partially in 
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 4. cuCascade Bump + v1.0 Re-integration | 0/TBD | Not started | - |
+| 4. cuCascade Bump + v1.0 Re-integration | 0/5 | Not started | - |
 | 5. Cucascade-Backed Parquet I/O Migration | 0/TBD | Not started | - |
 | 6. Multi-GPU Gap Closure | 0/TBD | Not started | - |
 | 7. P2P Direct Transfer + Adaptive Scan Partitioning | 0/TBD | Not started | - |
