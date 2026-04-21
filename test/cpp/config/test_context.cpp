@@ -19,14 +19,19 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <rmm/cuda_stream.hpp>
+#include <utils/utils.hpp>
 
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
@@ -312,6 +317,87 @@ TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
   REQUIRE(gpu_spaces[0]->get_device_id() == 0);
   REQUIRE(gpu_spaces[1]->get_device_id() == 1);
   REQUIRE(gpu_spaces[0]->get_device_id() != gpu_spaces[1]->get_device_id());
+
+  manager->shutdown();
+  sirius::converter_registry::shutdown();
+}
+
+// MGPU-04 forward-leg round-trip: GPU0 -> GPU1 data conversion using the
+// built-in cucascade peer-async converter. Forward leg only — the
+// GPU1 -> GPU0 return leg has a known Phase-4-deferred bug tracked at
+// test/cpp/downgrade/test_downgrade_executor.cpp:813 TODO(MGPU-06) and
+// is Phase-7 scope (planning_context interpretation 4). This test is
+// hidden ([.]) so it skips on single-GPU CI; N=2 hosts run it via the
+// Plan-4 compute-sanitizer invocation.
+TEST_CASE("gpu_to_gpu forward-leg preserves bytes on N>=2 hosts (MGPU-04)",
+          "[.][multi_gpu_foundation][mgpu_04_round_trip]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs for MGPU-04 round-trip");
+    return;
+  }
+
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 256ull << 20;
+  const double limit_ratio   = 0.75;
+  const size_t host_capacity = 1ull << 30;
+
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_numa()
+    .set_reservation_fraction_per_host(limit_ratio);
+
+  auto space_configs = builder.build();
+  auto manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+    std::move(space_configs));
+
+  sirius::converter_registry::initialize();
+  auto& registry = sirius::converter_registry::get();
+
+  auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+  auto* gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
+  REQUIRE(gpu0->get_device_id() == 0);
+  REQUIRE(gpu1->get_device_id() == 1);
+
+  // Build a minimal GPU-resident batch on gpu0. The make_gpu_batch helper in
+  // test_downgrade_executor.cpp lives in an anonymous namespace and is not
+  // reachable from this TU; replicate its body inline using the
+  // sirius::create_cudf_table_with_random_data + sirius::make_data_batch
+  // primitives (same helpers the downgrade test uses).
+  auto build_stream = cudf::get_default_stream();
+  auto mr           = gpu0->get_default_allocator();
+  std::vector<cudf::data_type> col_types                 = {cudf::data_type{cudf::type_id::INT32}};
+  std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
+  auto table =
+    sirius::create_cudf_table_with_random_data(/*num_rows=*/1024, col_types, ranges, build_stream, mr);
+  auto batch = sirius::make_data_batch(std::move(table), *gpu0);
+  REQUIRE(batch != nullptr);
+  auto const original_bytes = batch->get_data()->get_size_in_bytes();
+  REQUIRE(original_bytes > 0);
+  REQUIRE(batch->get_memory_space()->get_device_id() == 0);
+
+  rmm::cuda_stream stream;
+
+  // GPU0 -> GPU1 forward leg (return leg deferred to Phase 7 per Task 2 docstring).
+  REQUIRE(batch->try_to_lock_for_in_transit());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
+  batch->try_to_release_in_transit();
+
+  REQUIRE(batch->get_memory_space()->get_device_id() == 1);
+  REQUIRE(batch->get_data()->get_size_in_bytes() == original_bytes);
+
+  // Deliberately stop at the forward leg. The return leg (GPU1 -> GPU0)
+  // hits the Phase-4 deferred bug — exercising it here would produce a
+  // confusingly-duplicate failure of the tests already tracked at
+  // test_downgrade_executor.cpp:813. Phase 7 (MGPU-06) owns that fix.
 
   manager->shutdown();
   sirius::converter_registry::shutdown();
