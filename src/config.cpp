@@ -35,7 +35,7 @@ uint64_t Config::PRINT_GPU_TABLE_MAX_ROWS = 1000;
 
 bool Config::ENABLE_FALLBACK_CHECK = false;
 
-bool Config::ENABLE_DUCKDB_FALLBACK = false;
+bool Config::ENABLE_DUCKDB_FALLBACK = true;
 
 bool Config::ENABLE_REGEX_JIT_IMPL = true;
 
