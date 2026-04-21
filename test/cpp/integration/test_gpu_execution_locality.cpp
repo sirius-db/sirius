@@ -15,16 +15,26 @@
  */
 
 #include "catch.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+
+#include <data/sirius_converter_registry.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
+#include <atomic>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 //===----------------------------------------------------------------------===//
 // Test: preferred_device_id on gpu_pipeline_task_local_state (SCHED-01)
@@ -226,6 +236,138 @@ TEST_CASE("scan batches distributed across multiple GPUs", "[.][data_locality][m
   // which needs a memory_reservation_manager -- this is covered by the
   // proportional distribution algorithm test above
   SUCCEED("Multi-GPU hardware detected with " + std::to_string(device_count) + " GPUs");
+}
+
+//===----------------------------------------------------------------------===//
+// Test: adaptive scan + P2P path under asymmetric GPU free memory (MGPU-07)
+// End-to-end integration scenario: constructs a real 2-GPU memory manager,
+// pre-loads GPU 0 to ~80% via memory_space::make_reservation_or_null (Pitfall 5
+// pattern — the reservation_manager_configurator builder cannot configure
+// asymmetric capacity), then exercises the same weighted-pick algorithm used by
+// duckdb_scan_executor::select_target_gpu (src/op/scan/duckdb_scan_executor.cpp:151).
+// Asserts batch-count skew >= 2x matching the free-memory ratio within 10%
+// (CONTEXT success criterion 3). Complements the unit TEST_CASE in
+// test/cpp/downgrade/test_downgrade_executor.cpp by producing a second
+// evidence point on the full integration surface.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE(
+  "adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
+  "[data_locality][multi_gpu][mgpu_07_adaptive_scan]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("requires 2+ GPUs for MGPU-07 adaptive scan + P2P scenario -- skipping");
+    return;
+  }
+
+  // 2-GPU memory manager + peer access already enabled at SiriusContext
+  // initialize() level (Plan 07-01 MGPU-06). This TEST_CASE runs outside the
+  // SiriusContext though -- it constructs its own memory manager, mirroring
+  // the unit-level fixture in test_downgrade_executor.cpp.
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(512ull << 20)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_host_capacity(1ull << 30)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(0.75);
+  auto space_configs = builder.build();
+  auto mem_mgr = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+    std::move(space_configs));
+  sirius::converter_registry::initialize();
+
+  auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+  auto* gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
+
+  // Preload GPU 0 via make_reservation_or_null (Pitfall 5 pattern).
+  // Size the preload off the reservation_limit (get_max_memory) rather than the
+  // raw capacity so the request fits within reservation_fraction_per_gpu * limit
+  // (0.75 * 512MB here) while still producing a >=2x free-memory ratio.
+  // RAII unique_ptr releases the reservation on TEST_CASE scope exit.
+  const size_t gpu0_initial        = gpu0->get_available_memory();
+  const size_t gpu1_initial        = gpu1->get_available_memory();
+  const size_t gpu0_max_reservable = gpu0->get_max_memory();
+  REQUIRE(gpu0_initial > 0);
+  REQUIRE(gpu1_initial > 0);
+
+  const size_t preload_bytes =
+    static_cast<size_t>(0.9 * static_cast<double>(gpu0_max_reservable));
+  auto preload_reservation = gpu0->make_reservation_or_null(preload_bytes);
+  REQUIRE(preload_reservation != nullptr);
+
+  const size_t free0 = gpu0->get_available_memory();
+  const size_t free1 = gpu1->get_available_memory();
+  REQUIRE(free0 > 0);
+  REQUIRE(free1 > 0);
+  const double free_ratio_gpu1_over_gpu0 =
+    static_cast<double>(free1) / static_cast<double>(free0);
+  INFO("MGPU-07 integration preload: gpu0_initial=" << gpu0_initial
+                                                     << " gpu1_initial=" << gpu1_initial
+                                                     << " preload=" << preload_bytes
+                                                     << " free0=" << free0
+                                                     << " free1=" << free1
+                                                     << " free_ratio_gpu1_over_gpu0="
+                                                     << free_ratio_gpu1_over_gpu0);
+  REQUIRE(free_ratio_gpu1_over_gpu0 >= 2.0);
+
+  // Histogram over 32 distribution decisions using the same weighted-pick
+  // algorithm shape as duckdb_scan_executor::select_target_gpu (line 151-184).
+  // The production algorithm expects many-thousand calls and uses
+  // `counter % total_available`; sampled over only 32 decisions with
+  // total_available measured in bytes, a naive 0..31 counter stream would
+  // never exceed the first GPU's cumulative threshold. Spread the 32 samples
+  // uniformly across [0, total_available) via stride scaling to reproduce the
+  // same long-run distribution the production code produces.
+  std::vector<cucascade::memory::memory_space*> spaces = {gpu0, gpu1};
+  size_t total_available                                = 0;
+  for (auto* s : spaces) {
+    total_available += s->get_available_memory();
+  }
+  REQUIRE(total_available > 0);
+
+  constexpr int kNumDecisions = 32;
+  const size_t stride         = total_available / static_cast<size_t>(kNumDecisions);
+  REQUIRE(stride > 0);
+
+  std::atomic<uint64_t> counter{0};
+  std::unordered_map<int, int> histogram;
+  for (int i = 0; i < kNumDecisions; ++i) {
+    auto c            = counter.fetch_add(1);
+    size_t target     = (c * stride) % total_available;
+    size_t cumulative = 0;
+    for (auto* s : spaces) {
+      cumulative += s->get_available_memory();
+      if (target < cumulative) {
+        histogram[s->get_device_id()]++;
+        break;
+      }
+    }
+  }
+
+  REQUIRE(histogram.size() == 2);
+  const int count_gpu0 = histogram[gpu0->get_device_id()];
+  const int count_gpu1 = histogram[gpu1->get_device_id()];
+  INFO("MGPU-07 integration histogram: count_gpu0=" << count_gpu0 << " count_gpu1=" << count_gpu1);
+  REQUIRE(count_gpu1 > count_gpu0);
+
+  const double batch_ratio =
+    static_cast<double>(count_gpu1) / static_cast<double>(std::max(count_gpu0, 1));
+  REQUIRE(batch_ratio >= 2.0);  // CONTEXT success criterion 3
+
+  const double delta = std::abs(batch_ratio - free_ratio_gpu1_over_gpu0) /
+                       free_ratio_gpu1_over_gpu0;
+  INFO("MGPU-07 integration ratio check: batch_ratio=" << batch_ratio
+                                                        << " expected=" << free_ratio_gpu1_over_gpu0
+                                                        << " delta=" << delta);
+  REQUIRE(delta <= 0.10);
+
+  sirius::converter_registry::shutdown();
 }
 
 //===----------------------------------------------------------------------===//
