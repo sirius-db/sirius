@@ -157,8 +157,10 @@ class communication_executor : public sirius::parallel::itask_executor {
 
  protected:
   void manager_loop() override;
+  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
 
  private:
+  cucascade::memory::exclusive_stream_pool _stream_pool;  // For cudf::chunked_pack
   cucascade::memory::memory_space* _staging_mem_space;
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
@@ -167,9 +169,10 @@ class communication_executor : public sirius::parallel::itask_executor {
 ```
 
 Key differences from `gpu_pipeline_executor`:
-- No CUDA stream pool — worker threads do not run GPU kernels (packing uses the default stream or a dedicated pack stream)
+- Stream pool is used **only for packing** (`cudf::chunked_pack` in Phase 1) — NIXL transfers are stream-agnostic (driven by the RDMA NIC, not GPU kernels)
 - No `task_request_publisher` — communication tasks do not compete for GPU compute slots
 - Uses a staging-dedicated `memory_space` (or a carved-out region of the GPU memory space)
+- `get_per_thread_init()` sets the CUDA device per worker thread (same as GPU executor)
 
 ### Manager Loop
 
@@ -195,24 +198,30 @@ Each worker thread executes a 4-phase transfer lifecycle:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ Phase 1 — Pack (C++ direct)                             │
-│   cudf::chunked_pack into staging buffer                │
+│ Phase 1 — Pack (C++ direct, uses CUDA stream)           │
+│   Acquire stream from _stream_pool                      │
+│   cudf::chunked_pack into staging buffer (GPU kernel)   │
+│   cudaStreamSynchronize — wait for pack to complete     │
 │   Register staging buffer with NIXL agent               │
+│   Release stream back to pool                           │
 ├─────────────────────────────────────────────────────────┤
 │ Phase 2 — Metadata Exchange (FFI → Rust tonic)          │
 │   Send ExchangeMetadata gRPC to receiver                │
 │   Wait for response: dst buffer addresses + NIXL meta   │
 ├─────────────────────────────────────────────────────────┤
-│ Phase 3 — RDMA Transfer (C++ direct — hot path)         │
+│ Phase 3 — RDMA Transfer (C++ direct — no stream needed) │
 │   Load receiver NIXL metadata (cached per peer)         │
-│   create_xfer_req() + post_xfer_req()                   │
-│   Poll get_xfer_status() until complete                 │
+│   createXferReq() + postXferReq()                       │
+│   Poll getXferStatus() until complete                   │
+│   (RDMA NIC drives transfer, GPU not involved)          │
 ├─────────────────────────────────────────────────────────┤
 │ Phase 4 — Completion (FFI → Rust tonic)                 │
 │   Send TransferComplete gRPC to receiver                │
 │   Release staging reservation + deregister NIXL buffer  │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**Stream usage:** Only Phase 1 needs a CUDA stream — `cudf::chunked_pack` runs GPU kernels to serialize table data into a contiguous buffer. The NIXL API is entirely stream-agnostic; transfers are driven by the RDMA NIC hardware (via UCX/GPUDirect RDMA), not GPU kernels.
 
 **Boundary crossing summary:** NIXL operations (phases 1, 3) are called directly from C++ — NIXL is a native C++ library (`doris/thirdparty/nixl/src/api/cpp/`). gRPC operations (phases 2, 4) cross into Rust via `extern "C"` FFI. The RDMA hot path stays in C++; only the metadata RPCs (small messages, two round-trips per transfer) cross the boundary.
 
