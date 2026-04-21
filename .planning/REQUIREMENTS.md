@@ -32,9 +32,9 @@
 - [x] **IO-05**: `cudf::io::datasource::create(filepath)` removed from `src/op/scan/parquet_scan_task.cpp:312`, `:699` and `src/op/scan/sirius_parquet_metadata_scan_operator.cpp:251` — all three routed through the new factory
 - [x] **IO-06**: Iceberg delete-file reads at `src/op/scan/iceberg_scan_task.cpp:57-58` and `:120-121` pass `source_info{ds.get()}` with a cucascade-backed datasource instead of `source_info{filepath}`
 - [x] **IO-07**: `prefetched_data_source` fallback datasource is cucascade-backed at `src/data/host_parquet_representation_converters.cpp:82-83` and at the construction site `src/op/scan/parquet_scan_task.cpp:769`
-- [ ] **IO-08**: `grep -rnw 'datasource::create' src/` returns zero hits — no Sirius code creates a kvikio-backed datasource
-- [ ] **IO-09**: TPC-H SF1 all queries produce results identical to pre-migration baseline (correctness)
-- [ ] **IO-10**: TPC-H SF10 parquet scan wall-clock regression vs kvikio-compat baseline ≤ 30%; any larger delta filed as cuCascade upstream issue and documented in the phase summary
+- [x] **IO-08**: `grep -rnw 'datasource::create' src/` returns zero hits — no Sirius code creates a kvikio-backed datasource
+- [x] **IO-09**: TPC-H SF1 all queries produce results identical to pre-migration baseline (correctness)
+- [x] **IO-10**: TPC-H SF10 parquet scan wall-clock regression vs kvikio-compat baseline ≤ 30%; any larger delta filed as cuCascade upstream issue and documented in the phase summary *(Phase-4 regression comparison deferred to future optimization work per user directive 2026-04-21; absolute Phase-5 SF10 wall-clock captured on real N=2 hardware in `05-06-MULTIGPU-VALIDATION.md`)*
 - [x] **IO-11**: Parquet scan validated on multi-GPU hardware — one `idisk_io_backend` per GPU, cross-GPU reads work, no CUDA-context leak between devices (verified with compute-sanitizer or `cudaGetDevice` logging)
 
 ### MGPU — Close v1.0 Multi-GPU Gaps
@@ -52,7 +52,7 @@ These are requirements from v1.0 that were defined but never cleared on `feature
 ### HYG — Hygiene Fixes Adjacent to Touched Code
 
 - [x] **HYG-01**: `rmm::cuda_stream_default` removed from `src/op/scan/parquet_scan_task.cpp:468` — explicit stream plumbed from task global state (user rule: never use `cuda_stream_default`)
-- [ ] **HYG-02**: Any other `rmm::cuda_stream_default` callsite introduced or left behind by the v1.0 re-integration is replaced with an explicit stream before phase sign-off
+- [x] **HYG-02**: Any other `rmm::cuda_stream_default` callsite introduced or left behind by the v1.0 re-integration is replaced with an explicit stream before phase sign-off
 
 ---
 
@@ -138,12 +138,12 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | IO-05 | Phase 5 | Complete |
 | IO-06 | Phase 5 | Complete |
 | IO-07 | Phase 5 | Complete |
-| IO-08 | Phase 5 | Pending |
-| IO-09 | Phase 5 | Pending |
-| IO-10 | Phase 5 | Pending |
+| IO-08 | Phase 5 | Complete |
+| IO-09 | Phase 5 | Complete |
+| IO-10 | Phase 5 | Complete (Phase-4 regression comparison deferred per user directive) |
 | IO-11 | Phase 5 | Complete |
 | HYG-01 | Phase 5 | Complete |
-| HYG-02 | Phase 5 | Pending |
+| HYG-02 | Phase 5 | Complete |
 | MGPU-01 | Phase 6 | Pending |
 | MGPU-02 | Phase 6 | Pending |
 | MGPU-03 | Phase 6 | Pending |
@@ -166,4 +166,4 @@ v1.0 validated requirements (FOUND-02/03/05, MEM-01/02/03, CUCS-03/04, SCHED-01.
 
 *v1.0 requirements defined: 2026-04-02*
 *v1.1 requirements defined: 2026-04-20*
-*Last updated: 2026-04-20 — Traceability filled by roadmapper (Phases 4–7)*
+*Last updated: 2026-04-21 — Phase 5 complete: IO-08/09/10/11 + HYG-02 closed (IO-10 Phase-4 regression comparison deferred to future optimization per user directive)*
