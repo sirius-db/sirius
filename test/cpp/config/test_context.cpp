@@ -254,6 +254,29 @@ TEST_CASE("converter_registry has gpu_to_gpu converter (MEM-03)", "[multi_gpu_fo
   sirius::converter_registry::shutdown();
 }
 
+// MGPU-04 registration gate: cucascade::register_builtin_converters (called
+// by sirius::converter_registry::initialize()) registers a GPU->GPU
+// peer-async converter at cucascade/src/data/representation_converter.cpp:1464.
+// This test is the grep-verifiable gate that proves the registration
+// survives SiriusContext init. See 06-RESEARCH.md Finding 2 for why we do
+// not register a second converter here.
+TEST_CASE("converter_registry exposes gpu_to_gpu converter after initialize() (MGPU-04)",
+          "[multi_gpu_foundation][mgpu_04_registration]")
+{
+  sirius::converter_registry::reset_for_testing();
+  sirius::converter_registry::initialize();
+
+  auto& registry = sirius::converter_registry::get();
+
+  bool has_gpu_to_gpu =
+    registry
+      .has_converter<cucascade::gpu_table_representation,
+                     cucascade::gpu_table_representation>();
+  REQUIRE(has_gpu_to_gpu);
+
+  sirius::converter_registry::shutdown();
+}
+
 TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
 {
   int device_count = 0;
