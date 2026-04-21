@@ -474,8 +474,8 @@ TEST_CASE("inspectable_mpsc interrupt unblocks concurrent pop", "[inspectable_mp
 
   // Consumer thread: block in pop()
   std::thread consumer([&]() {
-    consumer_started = true;
-    pop_result       = queue.pop();
+    consumer_started  = true;
+    pop_result        = queue.pop();
     consumer_returned = true;
   });
 
@@ -519,8 +519,7 @@ TEST_CASE("inspectable_mpsc interrupt unblocks concurrent pop", "[inspectable_mp
 // Predicate inspection: pop_if tests
 // =============================================================================
 
-TEST_CASE("inspectable_mpsc pop_if front_to_back finds and removes match",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc pop_if front_to_back finds and removes match", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 40, 50}) {
@@ -540,8 +539,7 @@ TEST_CASE("inspectable_mpsc pop_if front_to_back finds and removes match",
   REQUIRE(remaining == std::vector<int>{10, 20, 40, 50});
 }
 
-TEST_CASE("inspectable_mpsc pop_if back_to_front finds and removes match",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc pop_if back_to_front finds and removes match", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 40, 50}) {
@@ -560,8 +558,7 @@ TEST_CASE("inspectable_mpsc pop_if back_to_front finds and removes match",
   REQUIRE(remaining == std::vector<int>{10, 20, 40, 50});
 }
 
-TEST_CASE("inspectable_mpsc pop_if front_to_back returns first of duplicates",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc pop_if front_to_back returns first of duplicates", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 20, 50}) {
@@ -580,8 +577,7 @@ TEST_CASE("inspectable_mpsc pop_if front_to_back returns first of duplicates",
   REQUIRE(remaining == std::vector<int>{10, 30, 20, 50});
 }
 
-TEST_CASE("inspectable_mpsc pop_if back_to_front returns last of duplicates",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc pop_if back_to_front returns last of duplicates", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 20, 50}) {
@@ -600,8 +596,7 @@ TEST_CASE("inspectable_mpsc pop_if back_to_front returns last of duplicates",
   REQUIRE(remaining == std::vector<int>{10, 20, 30, 50});
 }
 
-TEST_CASE("inspectable_mpsc pop_if no match returns nullptr",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc pop_if no match returns nullptr", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30}) {
@@ -613,13 +608,11 @@ TEST_CASE("inspectable_mpsc pop_if no match returns nullptr",
   REQUIRE(queue.size() == 3);
 }
 
-TEST_CASE("inspectable_mpsc pop_if empty queue returns nullptr",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc pop_if empty queue returns nullptr", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
 
-  auto result =
-      queue.pop_if([](const int& /*v*/) { return true; }, true);
+  auto result = queue.pop_if([](const int& /*v*/) { return true; }, true);
   REQUIRE(result == nullptr);
 }
 
@@ -627,8 +620,7 @@ TEST_CASE("inspectable_mpsc pop_if empty queue returns nullptr",
 // Predicate inspection: get_if tests
 // =============================================================================
 
-TEST_CASE("inspectable_mpsc get_if front_to_back finds without removing",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc get_if front_to_back finds without removing", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 40, 50}) {
@@ -641,8 +633,7 @@ TEST_CASE("inspectable_mpsc get_if front_to_back finds without removing",
   REQUIRE(queue.size() == 5);
 }
 
-TEST_CASE("inspectable_mpsc get_if back_to_front finds without removing",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc get_if back_to_front finds without removing", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 40, 50}) {
@@ -655,8 +646,7 @@ TEST_CASE("inspectable_mpsc get_if back_to_front finds without removing",
   REQUIRE(queue.size() == 5);
 }
 
-TEST_CASE("inspectable_mpsc get_if front_to_back returns first of duplicates",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc get_if front_to_back returns first of duplicates", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 20, 50}) {
@@ -669,8 +659,7 @@ TEST_CASE("inspectable_mpsc get_if front_to_back returns first of duplicates",
   REQUIRE(*ptr == 20);
 
   // Remove the first 20 via pop_if
-  auto removed =
-      queue.pop_if([](const int& v) { return v == 20; }, true);
+  auto removed = queue.pop_if([](const int& v) { return v == 20; }, true);
   REQUIRE(removed != nullptr);
 
   // get_if again should find the second 20
@@ -682,9 +671,7 @@ TEST_CASE("inspectable_mpsc get_if front_to_back returns first of duplicates",
   REQUIRE(queue.size() == 4);
 }
 
-TEST_CASE(
-    "inspectable_mpsc get_if back_to_front returns last of duplicates",
-    "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc get_if back_to_front returns last of duplicates", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30, 20, 50}) {
@@ -697,12 +684,10 @@ TEST_CASE(
   REQUIRE(*ptr == 20);
 
   // Remove the back 20 via pop_if(false), then get_if(false) finds front 20
-  auto removed =
-      queue.pop_if([](const int& v) { return v == 20; }, false);
+  auto removed = queue.pop_if([](const int& v) { return v == 20; }, false);
   REQUIRE(removed != nullptr);
 
-  auto* ptr2 =
-      queue.get_if([](const int& v) { return v == 20; }, false);
+  auto* ptr2 = queue.get_if([](const int& v) { return v == 20; }, false);
   REQUIRE(ptr2 != nullptr);
   REQUIRE(*ptr2 == 20);
 
@@ -710,8 +695,7 @@ TEST_CASE(
   REQUIRE(queue.size() == 4);
 }
 
-TEST_CASE("inspectable_mpsc get_if no match returns nullptr",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc get_if no match returns nullptr", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {10, 20, 30}) {
@@ -723,13 +707,11 @@ TEST_CASE("inspectable_mpsc get_if no match returns nullptr",
   REQUIRE(queue.size() == 3);
 }
 
-TEST_CASE("inspectable_mpsc get_if empty queue returns nullptr",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc get_if empty queue returns nullptr", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
 
-  auto* ptr =
-      queue.get_if([](const int& /*v*/) { return true; }, true);
+  auto* ptr = queue.get_if([](const int& /*v*/) { return true; }, true);
   REQUIRE(ptr == nullptr);
 }
 
@@ -737,23 +719,20 @@ TEST_CASE("inspectable_mpsc get_if empty queue returns nullptr",
 // Predicate inspection: mutable_pop_if tests
 // =============================================================================
 
-TEST_CASE("inspectable_mpsc mutable_pop_if removes matching element",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc mutable_pop_if removes matching element", "[inspectable_mpsc]")
 {
   inspectable_mpsc<test_payload> queue;
   for (int i = 1; i <= 5; ++i) {
     REQUIRE(queue.emplace(i, "item_" + std::to_string(i)));
   }
 
-  auto result =
-      queue.mutable_pop_if([](test_payload& p) { return p.id == 3; }, true);
+  auto result = queue.mutable_pop_if([](test_payload& p) { return p.id == 3; }, true);
   REQUIRE(result != nullptr);
   REQUIRE(result->id == 3);
   REQUIRE(queue.size() == 4);
 }
 
-TEST_CASE("inspectable_mpsc mutable_pop_if respects search direction",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc mutable_pop_if respects search direction", "[inspectable_mpsc]")
 {
   inspectable_mpsc<test_payload> queue;
   for (int id : {1, 2, 3, 2, 5}) {
@@ -761,8 +740,7 @@ TEST_CASE("inspectable_mpsc mutable_pop_if respects search direction",
   }
 
   // back_to_front should remove the last element with id==2
-  auto result =
-      queue.mutable_pop_if([](test_payload& p) { return p.id == 2; }, false);
+  auto result = queue.mutable_pop_if([](test_payload& p) { return p.id == 2; }, false);
   REQUIRE(result != nullptr);
   REQUIRE(result->id == 2);
 
@@ -778,23 +756,20 @@ TEST_CASE("inspectable_mpsc mutable_pop_if respects search direction",
 // Predicate inspection: mutable_get_if tests
 // =============================================================================
 
-TEST_CASE("inspectable_mpsc mutable_get_if finds without removing",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc mutable_get_if finds without removing", "[inspectable_mpsc]")
 {
   inspectable_mpsc<test_payload> queue;
   for (int i = 1; i <= 5; ++i) {
     REQUIRE(queue.emplace(i, "item_" + std::to_string(i)));
   }
 
-  auto* ptr =
-      queue.mutable_get_if([](test_payload& p) { return p.id == 3; }, true);
+  auto* ptr = queue.mutable_get_if([](test_payload& p) { return p.id == 3; }, true);
   REQUIRE(ptr != nullptr);
   REQUIRE(ptr->id == 3);
   REQUIRE(queue.size() == 5);
 }
 
-TEST_CASE("inspectable_mpsc mutable_get_if respects search direction",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc mutable_get_if respects search direction", "[inspectable_mpsc]")
 {
   inspectable_mpsc<test_payload> queue;
   for (int id : {1, 2, 3, 2, 5}) {
@@ -802,24 +777,20 @@ TEST_CASE("inspectable_mpsc mutable_get_if respects search direction",
   }
 
   // front_to_back finds the first id==2
-  auto* ptr1 =
-      queue.mutable_get_if([](test_payload& p) { return p.id == 2; }, true);
+  auto* ptr1 = queue.mutable_get_if([](test_payload& p) { return p.id == 2; }, true);
   REQUIRE(ptr1 != nullptr);
   REQUIRE(ptr1->id == 2);
 
   // back_to_front finds the second id==2
-  auto* ptr2 =
-      queue.mutable_get_if([](test_payload& p) { return p.id == 2; }, false);
+  auto* ptr2 = queue.mutable_get_if([](test_payload& p) { return p.id == 2; }, false);
   REQUIRE(ptr2 != nullptr);
   REQUIRE(ptr2->id == 2);
 
   // Remove first 2, then mutable_get_if should find the remaining 2
-  auto removed =
-      queue.mutable_pop_if([](test_payload& p) { return p.id == 2; }, true);
+  auto removed = queue.mutable_pop_if([](test_payload& p) { return p.id == 2; }, true);
   REQUIRE(removed != nullptr);
 
-  auto* ptr3 =
-      queue.mutable_get_if([](test_payload& p) { return p.id == 2; }, true);
+  auto* ptr3 = queue.mutable_get_if([](test_payload& p) { return p.id == 2; }, true);
   REQUIRE(ptr3 != nullptr);
   REQUIRE(ptr3->id == 2);
 }
@@ -828,8 +799,7 @@ TEST_CASE("inspectable_mpsc mutable_get_if respects search direction",
 // Predicate inspection: order preservation
 // =============================================================================
 
-TEST_CASE("inspectable_mpsc pop_if preserves remaining element order",
-          "[inspectable_mpsc]")
+TEST_CASE("inspectable_mpsc pop_if preserves remaining element order", "[inspectable_mpsc]")
 {
   inspectable_mpsc<int> queue;
   for (int v : {1, 2, 3, 4, 5}) {
