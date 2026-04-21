@@ -42,7 +42,7 @@
 These are requirements from v1.0 that were defined but never cleared on `feature/multi-gpu-execution`. They re-surface as active in v1.1.
 
 - [x] **MGPU-01** *(formerly FOUND-01)*: Runtime topology discovery via cucascade `topology_discovery` — GPU count, NUMA domains, GPU↔NUMA mapping
-- [ ] **MGPU-02** *(formerly FOUND-04)*: Single-GPU systems run with zero behavior or performance regression vs the pre-milestone baseline (baseline = current `dev` HEAD TPC-H SF10 timings)
+- [x] **MGPU-02** *(formerly FOUND-04)*: Single-GPU systems run with zero behavior or performance regression vs the pre-milestone baseline (baseline = current `dev` HEAD TPC-H SF10 timings) *(Phase-5 baseline regression comparison deferred to future optimization per user directive 2026-04-21; absolute Phase-6 SF10 wall-clock captured on real N=2 hardware in `06-04-VALIDATION.md` §4)*
 - [x] **MGPU-03** *(formerly FOUND-06)*: Device-guard conventions enforced on every execution thread — validated via compute-sanitizer `--tool memcheck --require-cuda-init` on a 2+ GPU system
 - [x] **MGPU-04** *(formerly CUCS-01)*: GPU↔GPU representation converter registered in cucascade converter registry (feeds MEM-04 P2P path)
 - [x] **MGPU-05** *(formerly CUCS-02)*: Per-NUMA host memory spaces configured with `numa_region_pinned_host_allocator`
@@ -145,7 +145,7 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | HYG-01 | Phase 5 | Complete |
 | HYG-02 | Phase 5 | Complete |
 | MGPU-01 | Phase 6 | Complete |
-| MGPU-02 | Phase 6 | Pending |
+| MGPU-02 | Phase 6 | Complete (Phase-5 regression comparison deferred per user directive) |
 | MGPU-03 | Phase 6 | Complete |
 | MGPU-04 | Phase 6 | Complete |
 | MGPU-05 | Phase 6 | Complete |
@@ -166,4 +166,4 @@ v1.0 validated requirements (FOUND-02/03/05, MEM-01/02/03, CUCS-03/04, SCHED-01.
 
 *v1.0 requirements defined: 2026-04-02*
 *v1.1 requirements defined: 2026-04-20*
-*Last updated: 2026-04-21 — Phase 5 complete: IO-08/09/10/11 + HYG-02 closed (IO-10 Phase-4 regression comparison deferred to future optimization per user directive)*
+*Last updated: 2026-04-21 — Phase 6 complete: MGPU-01/02/03/04/05 closed on N=2 hardware (MGPU-02 Phase-5 regression comparison deferred to future optimization per user directive, identical to Phase 5's IO-10 treatment). Phase 7 remaining for v1.1 close (MGPU-06 P2P direct + MGPU-07 adaptive scan).*
