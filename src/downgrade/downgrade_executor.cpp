@@ -27,6 +27,16 @@
 namespace sirius {
 namespace parallel {
 
+static std::string tier_to_string(cucascade::memory::Tier tier)
+{
+  switch (tier) {
+    case cucascade::memory::Tier::GPU: return "GPU";
+    case cucascade::memory::Tier::HOST: return "HOST";
+    case cucascade::memory::Tier::DISK: return "DISK";
+    default: return "UNKNOWN";
+  }
+}
+
 downgrade_executor::downgrade_executor(
   exec::downgrade_executor_config config,
   cucascade::shared_data_repository_manager& data_repo_mgr,
@@ -38,6 +48,7 @@ downgrade_executor::downgrade_executor(
     _data_repo_mgr(data_repo_mgr),
     _space_id(space_id),
     _memory_space(memory_space),
+    _source_label(tier_to_string(space_id.tier) + ":" + std::to_string(space_id.device_id)),
     _reservation_manager(reservation_manager),
     _pipeline_task_queue(pipeline_task_queue)
 {
@@ -118,12 +129,19 @@ void downgrade_executor::processing_loop()
     auto& req    = request;
     auto t_start = std::chrono::steady_clock::now();
 
-    // Per-tier tracking for LOG-01
-    struct tier_stats {
+    // Per-source tracking (repos vs pipeline_queue)
+    struct source_stats {
       std::atomic<size_t> batches{0};
       std::atomic<size_t> bytes{0};
     };
-    tier_stats repo_stats, pipeline_queue_stats;
+    source_stats repo_stats, pipeline_queue_stats;
+
+    // Per-target-tier tracking (host vs disk)
+    struct target_tier_stats {
+      std::atomic<size_t> batches{0};
+      std::atomic<size_t> bytes{0};
+    };
+    target_tier_stats host_target_stats, disk_target_stats;
 
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
@@ -135,6 +153,7 @@ void downgrade_executor::processing_loop()
     for (auto* hs : host_spaces) {
       target_spaces.push_back(hs);
     }
+    size_t host_end_idx = target_spaces.size();
     auto disk_spaces =
       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
     for (auto* ds : disk_spaces) {
@@ -178,14 +197,27 @@ void downgrade_executor::processing_loop()
            &targets   = target_spaces,
            exc_stream = std::move(exc_stream),
            candidate_bytes,
-           &repo_stats]() mutable {
+           host_end_idx,
+           &repo_stats,
+           &host_target_stats,
+           &disk_target_stats]() mutable {
             try {
-              if (cand->convert(targets, exc_stream, res_mgr)) {
+              auto result = cand->convert(targets, exc_stream, res_mgr);
+              if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                 repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
                 repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                // Check predicate after each convert
+                for (size_t i = 0; i < result->size(); ++i) {
+                  if ((*result)[i] == 0) continue;
+                  if (i < host_end_idx) {
+                    host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                    host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                  } else {
+                    disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                    disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                  }
+                }
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
@@ -222,13 +254,27 @@ void downgrade_executor::processing_loop()
            &targets   = target_spaces,
            exc_stream = std::move(exc_stream),
            candidate_bytes,
-           &pipeline_queue_stats]() mutable {
+           host_end_idx,
+           &pipeline_queue_stats,
+           &host_target_stats,
+           &disk_target_stats]() mutable {
             try {
-              if (cand->convert(targets, exc_stream, res_mgr)) {
+              auto result = cand->convert(targets, exc_stream, res_mgr);
+              if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                for (size_t i = 0; i < result->size(); ++i) {
+                  if ((*result)[i] == 0) continue;
+                  if (i < host_end_idx) {
+                    host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                    host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                  } else {
+                    disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                    disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                  }
+                }
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
@@ -248,12 +294,14 @@ void downgrade_executor::processing_loop()
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     double throughput_mbs =
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
-    std::string source_label = req->is_monitor_request ? "monitor " : "";
+    std::string request_label = req->is_monitor_request ? "monitor " : "";
 
     SIRIUS_LOG_DEBUG(
-      "[downgrade] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
-      "repos: {}/{} batches/bytes, pipeline_queue: {}/{}",
-      source_label,
+      "[downgrade] [{}] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
+      "repos: {}/{} batches/bytes, pipeline_queue: {}/{} | "
+      "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+      _source_label,
+      request_label,
       total_batches,
       total_bytes,
       duration_ms,
@@ -261,7 +309,11 @@ void downgrade_executor::processing_loop()
       repo_stats.batches.load(std::memory_order_relaxed),
       repo_stats.bytes.load(std::memory_order_relaxed),
       pipeline_queue_stats.batches.load(std::memory_order_relaxed),
-      pipeline_queue_stats.bytes.load(std::memory_order_relaxed));
+      pipeline_queue_stats.bytes.load(std::memory_order_relaxed),
+      host_target_stats.batches.load(std::memory_order_relaxed),
+      host_target_stats.bytes.load(std::memory_order_relaxed),
+      disk_target_stats.batches.load(std::memory_order_relaxed),
+      disk_target_stats.bytes.load(std::memory_order_relaxed));
 
     // Fulfill the promise
     req->result.set_value(total_bytes);

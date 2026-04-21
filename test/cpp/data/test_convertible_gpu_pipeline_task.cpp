@@ -17,18 +17,17 @@
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
 
+#include <rmm/cuda_stream.hpp>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
 #include <exec/inspectable_mpsc.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
-
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/memory/common.hpp>
-#include <cucascade/memory/memory_space.hpp>
-
-#include <rmm/cuda_stream.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -47,10 +46,10 @@ struct test_env {
   rmm::cuda_stream conv_stream;
 
   test_env()
-    : mgr(sirius::test::operator_utils::initialize_memory_manager())
-    , gpu_space(mgr->get_memory_space(cucascade::memory::Tier::GPU, 0))
-    , host_space(mgr->get_memory_space(cucascade::memory::Tier::HOST, 0))
-    , conv_stream()
+    : mgr(sirius::test::operator_utils::initialize_memory_manager()),
+      gpu_space(mgr->get_memory_space(cucascade::memory::Tier::GPU, 0)),
+      host_space(mgr->get_memory_space(cucascade::memory::Tier::HOST, 0)),
+      conv_stream()
   {
   }
 
@@ -67,10 +66,7 @@ test_env& env()
 class dummy_task_local_state : public sirius::parallel::itask_local_state {};
 class dummy_task : public sirius::parallel::itask {
  public:
-  dummy_task()
-    : itask(std::make_unique<dummy_task_local_state>(), nullptr)
-  {
-  }
+  dummy_task() : itask(std::make_unique<dummy_task_local_state>(), nullptr) {}
   void execute(rmm::cuda_stream_view /*stream*/) override {}
 };
 
@@ -87,13 +83,10 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
     }
   }
 
-  auto op_data =
-    std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
+  auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
   auto local =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
-      std::move(op_data));
-  auto global =
-    std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(nullptr);
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
+  auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(nullptr);
 
   return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     task_id,
@@ -104,8 +97,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
 
 }  // anonymous namespace
 
-TEST_CASE("RAII returns task to queue on destruction",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("RAII returns task to queue on destruction", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -127,8 +119,7 @@ TEST_CASE("RAII returns task to queue on destruction",
   REQUIRE(queue.size() == 1);
 }
 
-TEST_CASE("RAII returns task after successful convert",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("RAII returns task after successful convert", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -143,8 +134,8 @@ TEST_CASE("RAII returns task after successful convert",
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
 
-    bool result = cd->convert({e.host_space}, e.stream(), *e.mgr);
-    REQUIRE(result == true);
+    auto result = cd->convert({e.host_space}, e.stream(), *e.mgr);
+    REQUIRE(result.has_value());
     // cd destroyed here, task returned to queue via RAII
   }
 
@@ -153,22 +144,18 @@ TEST_CASE("RAII returns task after successful convert",
   // Verify the batch is now in HOST tier
   auto returned_task = queue.try_pop();
   REQUIRE(returned_task != nullptr);
-  auto* gpt =
-    dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(returned_task.get());
+  auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(returned_task.get());
   REQUIRE(gpt != nullptr);
-  auto* ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(
-    gpt->local_state());
+  auto* ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(gpt->local_state());
   REQUIRE(ls != nullptr);
-  auto* pod = dynamic_cast<sirius::op::pipelineable_operator_data*>(
-    ls->_input_data.get());
+  auto* pod = dynamic_cast<sirius::op::pipelineable_operator_data*>(ls->_input_data.get());
   REQUIRE(pod != nullptr);
   REQUIRE(pod->get_data_batches().size() == 1);
   REQUIRE(pod->get_data_batches()[0]->get_memory_space()->get_tier() ==
           cucascade::memory::Tier::HOST);
 }
 
-TEST_CASE("RAII returns task on exception",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("RAII returns task on exception", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -195,8 +182,7 @@ TEST_CASE("RAII returns task on exception",
   REQUIRE(queue.size() == 1);
 }
 
-TEST_CASE("non-gpu_pipeline_task skipped by predicate",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("non-gpu_pipeline_task skipped by predicate", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -210,8 +196,7 @@ TEST_CASE("non-gpu_pipeline_task skipped by predicate",
   REQUIRE(queue.size() == 1);  // dummy task still in queue
 }
 
-TEST_CASE("wrong memory_space skipped by predicate",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("wrong memory_space skipped by predicate", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -229,8 +214,7 @@ TEST_CASE("wrong memory_space skipped by predicate",
   REQUIRE(queue.size() == 1);
 }
 
-TEST_CASE("wrong batch_state skipped by predicate",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("wrong batch_state skipped by predicate", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -247,8 +231,7 @@ TEST_CASE("wrong batch_state skipped by predicate",
   REQUIRE(queue.size() == 1);
 }
 
-TEST_CASE("matching task selected by predicate",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("matching task selected by predicate", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -264,8 +247,7 @@ TEST_CASE("matching task selected by predicate",
   REQUIRE(queue.is_empty());
 }
 
-TEST_CASE("convert GPU task to HOST",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -279,14 +261,13 @@ TEST_CASE("convert GPU task to HOST",
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd != nullptr);
 
-  bool result = cd->convert({e.host_space}, e.stream(), *e.mgr);
-  REQUIRE(result == true);
+  auto result = cd->convert({e.host_space}, e.stream(), *e.mgr);
+  REQUIRE(result.has_value());
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::task_created);
 }
 
-TEST_CASE("bytes_in_space returns correct size",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -310,8 +291,7 @@ TEST_CASE("bytes_in_space returns correct size",
   REQUIRE(cd->bytes_in_space(e.host_space) == 0);
 }
 
-TEST_CASE("get_all_convertible extracts all matching tasks",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("get_all_convertible extracts all matching tasks", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -335,8 +315,7 @@ TEST_CASE("get_all_convertible extracts all matching tasks",
   REQUIRE(queue.size() == 3);
 }
 
-TEST_CASE("RAII on interrupted queue does not crash",
-          "[convertible_gpu_pipeline_task]")
+TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 

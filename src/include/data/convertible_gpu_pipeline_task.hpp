@@ -104,17 +104,20 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @param target_spaces  Candidate destination memory spaces (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
-   * @return true if at least one batch was converted, false otherwise.
+   * @return A vector of bytes converted per target space index on success, or nullopt if
+   *         no batches were converted.
    */
-  bool convert(const std::vector<const cucascade::memory::memory_space*>& target_spaces,
-               rmm::cuda_stream_view stream,
-               sirius::memory::sirius_memory_reservation_manager& res_mgr) override
+  std::optional<std::vector<std::size_t>> convert(
+    const std::vector<const cucascade::memory::memory_space*>& target_spaces,
+    rmm::cuda_stream_view stream,
+    sirius::memory::sirius_memory_reservation_manager& res_mgr) override
   {
     auto* pipelineable = get_pipelineable_data();
-    if (!pipelineable) { return false; }
+    if (!pipelineable) { return std::nullopt; }
 
     const auto& batches = pipelineable->get_data_batches();
-    bool any_converted  = false;
+    std::vector<std::size_t> totals(target_spaces.size(), 0);
+    bool any_converted = false;
 
     for (const auto& batch : batches) {
       if (!batch) { continue; }
@@ -134,10 +137,17 @@ class convertible_gpu_pipeline_task : public convertible_data {
       if (batch->get_state() != cucascade::batch_state::task_created) { continue; }
 
       sirius::convertible_data_batch batch_converter(batch);
-      any_converted |= batch_converter.convert(target_spaces, stream, res_mgr);
+      auto result = batch_converter.convert(target_spaces, stream, res_mgr);
+      if (result) {
+        any_converted = true;
+        for (std::size_t i = 0; i < result->size(); ++i) {
+          totals[i] += (*result)[i];
+        }
+      }
     }
 
-    return any_converted;
+    if (!any_converted) { return std::nullopt; }
+    return totals;
   }
 
   /**
