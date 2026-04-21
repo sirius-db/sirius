@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Phase 4 COMPLETE — all 5 plans landed; PORT-01..05 + BUMP-01..03 cleared; 2 hidden-test failures deferred to Phase 6 (MGPU-03) + Phase 7 (MGPU-06) per roadmap scope. Ready for /gsd:transition to Phase 5.
-last_updated: "2026-04-20T23:15:00.000Z"
-last_activity: 2026-04-20
+stopped_at: Completed 05-01-PLAN.md — Wave 1 scaffolding (baseline + adapter header + build registration); ready for plan 05-02 (adapter implementation + registry wiring in SiriusContext)
+last_updated: "2026-04-21T01:06:03.868Z"
+last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 1
-  total_plans: 5
-  completed_plans: 5
+  total_plans: 11
+  completed_plans: 7
   percent: 100
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-20)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 04 — cucascade-bump-v1-0-re-integration
+**Current focus:** Phase 05 — cucascade-backed-parquet-i-o-migration
 
 ## Current Position
 
-Phase: 04 (cucascade-bump-v1-0-re-integration) — COMPLETE
-Plan: 5 of 5
-Status: Ready for /gsd:transition to Phase 5 (Cucascade-Backed Parquet I/O Migration)
-Last activity: 2026-04-20
+Phase: 05 (cucascade-backed-parquet-i-o-migration) — EXECUTING
+Plan: 2 of 6
+Status: Ready to execute
+Last activity: 2026-04-21
 
 Progress: [██████████] 100% (phase-scoped)
 
@@ -58,6 +58,7 @@ Progress: [██████████] 100% (phase-scoped)
 | Phase 04 P03 | 25min | 6 tasks | 8 files |
 | Phase 04-cucascade-bump-v1-0-re-integration P04 | 8min | 2 tasks | 10 files |
 | Phase 04-cucascade-bump-v1-0-re-integration P05 | 35min | 4 tasks | 5 files (2 summaries + STATE/ROADMAP/REQUIREMENTS) |
+| Phase 05-cucascade-backed-parquet-i-o-migration P01 | 5.5min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -85,6 +86,7 @@ New for v1.1 (from research synthesis):
 - [Phase 04]: Plan 04-03: NUMA-aware downgrade re-authored onto dev PR #579 shape (not cherry-picked); POD-extension Strategy A chosen over executor-internal Strategy B (preferred_numa_node on downgrade_task POD preserves v1.0 per-task override semantics)
 - [Phase 04-cucascade-bump-v1-0-re-integration]: Plan 04-04: PORT-03 confirmed as no-op (grep -rn 'libconfig' src/ test/ = 0 hits); Task 1.5 conditional remediation skipped. All v1.0 multi-GPU settings reachable through dev's YAML config reader (PR #565). Pre-commit fixups committed as f5afde1 (pure formatting across 10 files). Build verification blocked by executor-subagent sandbox — deferred to orchestrator/04-05.
 - [Phase 04-cucascade-bump-v1-0-re-integration]: Plan 04-05: Full unit-tests PASS (966 test cases, ~78.8M assertions); all 4 PORT-05 visible tags explicitly invoked and verified to actually run (no silent filtering); 3 of 5 hidden multi-GPU tags PASS on N=2 verification host; 2 hidden tags fail on GPU1->GPU0 converter return leg — deferred to Phase 6 (MGPU-03 device guards) + Phase 7 (MGPU-06 P2P direct). Task 3 checkpoint auto-approved by orchestrator in autonomous full-run mode with "approved — ship with deferral note". All structural grep gates PASS (PORT-02 0 hits LogicalType::*, PORT-03 0 hits libconfig, dead-v1.0-shape 0 hits in live code, BUMP-01 pin f47de0b exact match, PORT-01 26 commits dev..HEAD, PORT-04 7/7 symbol greps hit). Phase 4 SHIPPED.
+- [Phase 05-cucascade-backed-parquet-i-o-migration]: Plan 05-01: supports_device_read() locked to false in cucascade_datasource header (IO-02 multi-GPU safety); copy/move deleted so shared_ptr<idisk_io_backend> cannot cross CUDA contexts; stub .cpp includes header to verify standalone-compileability; Tier-A baseline (this host) + Tier-B baseline (2+ GPU validation host from plan 04-05) together form the authoritative pre-migration correctness snapshot for IO-09
 
 ### Pending Todos
 
@@ -104,6 +106,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-20T23:15:00.000Z
-Stopped at: Phase 4 COMPLETE — all 5 plans landed; PORT-01..05 + BUMP-01..03 cleared; 2 hidden-test failures deferred to Phase 6/7. Ready for /gsd:transition to Phase 5.
+Last session: 2026-04-21T01:06:03.866Z
+Stopped at: Completed 05-01-PLAN.md — Wave 1 scaffolding (baseline + adapter header + build registration); ready for plan 05-02 (adapter implementation + registry wiring in SiriusContext)
 Resume file: None

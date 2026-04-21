@@ -25,7 +25,7 @@
 
 ### IO — Replace kvikio with cuCascade `idisk_io_backend` for Parquet I/O
 
-- [ ] **IO-01**: `sirius::io::cucascade_datasource` subclass of `cudf::io::datasource` ships in `src/io/`, backed by cuCascade's `idisk_io_backend` via `io_backend_registry` factory
+- [x] **IO-01**: `sirius::io::cucascade_datasource` subclass of `cudf::io::datasource` ships in `src/io/`, backed by cuCascade's `idisk_io_backend` via `io_backend_registry` factory
 - [ ] **IO-02**: `cucascade_datasource` declares `supports_device_read() == false` so cuDF host-stages reads and issues memcpys on the caller's explicit stream (no GDS, no cuFile, no kvikio)
 - [ ] **IO-03**: `host_read` returns pinned host memory allocated from cucascade's host-memory resource so cuDF's `cuda_memcpy_async` stays truly asynchronous
 - [ ] **IO-04**: Per-GPU `idisk_io_backend` instances cached in `SiriusContext`, created once per device under `rmm::cuda_set_device_raii` so each instance owns streams/pinned buffers in its GPU's context
@@ -131,7 +131,7 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | BUMP-01 | Phase 4 | Complete |
 | BUMP-02 | Phase 4 | Complete |
 | BUMP-03 | Phase 4 | Complete |
-| IO-01 | Phase 5 | Pending |
+| IO-01 | Phase 5 | Complete |
 | IO-02 | Phase 5 | Pending |
 | IO-03 | Phase 5 | Pending |
 | IO-04 | Phase 5 | Pending |
