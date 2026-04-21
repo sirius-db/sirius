@@ -238,6 +238,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   };
   create_executors_for_tier(cucascade::memory::Tier::GPU);
+  create_executors_for_tier(cucascade::memory::Tier::HOST);
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
     config_.get_gpu_pipeline_executor_config(),
