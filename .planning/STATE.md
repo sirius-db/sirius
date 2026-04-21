@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed 05-03-PLAN.md — Wave 2 parallel; SiriusContext I/O backend registry + per-GPU cache wired; ready for Plans 05-04 + 05-05 (pure consumers of get_io_backend_for / get_gpu_io_backends)
-last_updated: "2026-04-21T01:19:10.021Z"
+stopped_at: Completed 05-04-PLAN.md — Wave 3 parallel; parquet_scan_task migrated to cucascade_datasource (IO-05 2/3 sites + IO-07 transitive + HYG-01 closed); ready for Plan 05-05 sibling + Plan 05-06 phase sign-off
+last_updated: "2026-04-21T01:32:40.459Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 11
-  completed_plans: 9
+  completed_plans: 10
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 05 (cucascade-backed-parquet-i-o-migration) — EXECUTING
-Plan: 3 of 6
+Plan: 4 of 6
 Status: Ready to execute
 Last activity: 2026-04-21
 
@@ -61,6 +61,7 @@ Progress: [██████████] 100% (phase-scoped)
 | Phase 05-cucascade-backed-parquet-i-o-migration P01 | 5.5min | 3 tasks | 5 files |
 | Phase 05 P02 | 6min | 2 tasks | 2 files |
 | Phase 05 P03 | 9 min | 2 tasks | 2 files |
+| Phase 05 P04 | ~9 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -92,6 +93,8 @@ New for v1.1 (from research synthesis):
 - [Phase 05-cucascade-backed-parquet-i-o-migration]: Plan 05-02: cucascade_datasource uses cudaMallocHost + RAII pinned_host_buffer instead of fixed_size_host_memory_resource — adapter stays context-independent (no SiriusContext coupling), preserving unit testability. std::launch::async (not deferred) for host_read_async per CONTEXT lock.
 - [Phase 05]: Plan 05-03: SiriusContext now owns cucascade io_backend_registry + per-GPU idisk_io_backend cache; both accessors (get_io_backend_for point-lookup + get_gpu_io_backends map-view) declared here so Plans 04+05 are pure consumers (sirius_context.hpp sealed for Phase 5)
 - [Phase 05]: Plan 05-03: Per-GPU backend construction under rmm::cuda_set_device_raii with IO-11 audit log (device_id + cudaGetDevice readback); teardown clears gpu_io_backends_ + io_backend_registry_ BEFORE memory_manager_->shutdown() to avoid cudaErrorInvalidResourceHandle at extension unload
+- [Phase 05]: Plan 05-04: Approach C plumbing — task_creator seeds parquet_scan_task_global_state with SiriusContext::get_gpu_io_backends() map. Pure-consumer invariant on sirius_context.hpp upheld (Plan 03 sole owner).
+- [Phase 05]: Plan 05-04: parquet_scan_task inherits from sirius_pipeline_itask (not gpu_pipeline_task) so there is no get_preferred_device_id() helper on the task. Hot-path backend selection uses g_state.get_preferred_device_id() with first-backend fallback — mirrors pipeline_executor's default routing for non-gpu_pipeline_task instances.
 
 ### Pending Todos
 
@@ -111,6 +114,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T01:19:10.018Z
-Stopped at: Completed 05-03-PLAN.md — Wave 2 parallel; SiriusContext I/O backend registry + per-GPU cache wired; ready for Plans 05-04 + 05-05 (pure consumers of get_io_backend_for / get_gpu_io_backends)
+Last session: 2026-04-21T01:32:40.456Z
+Stopped at: Completed 05-04-PLAN.md — Wave 3 parallel; parquet_scan_task migrated to cucascade_datasource (IO-05 2/3 sites + IO-07 transitive + HYG-01 closed); ready for Plan 05-05 sibling + Plan 05-06 phase sign-off
 Resume file: None
