@@ -55,7 +55,13 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
   4. TPC-H SF1 all 22 queries produce bitwise-identical result sets to the pre-migration baseline on the same hardware: `build/release/test/unittest --test-dir . test/sql/tpch-sirius.test` passes; TPC-H SF10 parquet scan wall-clock regression vs the Phase 4 kvikio-compat baseline is ≤30% (if it exceeds, the delta is filed upstream against cuCascade and recorded in the phase summary) (IO-09, IO-10).
   5. Parquet scan validated on a 2+ GPU host with one `idisk_io_backend` instance per GPU: `compute-sanitizer --tool memcheck build/release/test/unittest --test-dir . test/sql/tpch-sirius.test` reports zero CUDA-context errors, and a manual 2-GPU scan run logs distinct `cudaGetDevice()` values per backend instance (IO-04, IO-11).
   6. `grep -rn 'cuda_stream_default' src/` returns zero hits in any file touched by the v1.1 migration — specifically `src/op/scan/parquet_scan_task.cpp:468` (the `filter_row_groups_with_stats` call) now receives an explicit stream threaded from the scan task's global state (HYG-01, HYG-02).
-**Plans**: TBD
+**Plans**: 6 plans
+- [ ] 05-01-PLAN.md — Baseline capture + sirius::io::cucascade_datasource header + CMakeLists registration (IO-01 skeleton)
+- [ ] 05-02-PLAN.md — Adapter implementation + Catch2 unit tests with mock idisk_io_backend (IO-01, IO-02, IO-03)
+- [ ] 05-03-PLAN.md — SiriusContext io_backend_registry + per-GPU backend cache under rmm::cuda_set_device_raii (IO-04, IO-11 infra)
+- [ ] 05-04-PLAN.md — parquet_scan_task.cpp migration (lines 312 + 699) + HYG-01 explicit stream fix at line 468 (IO-05, IO-07, HYG-01)
+- [ ] 05-05-PLAN.md — sirius_parquet_metadata_scan_operator.cpp:251 + iceberg_scan_task.cpp:57/120 migrations (IO-05, IO-06)
+- [ ] 05-06-PLAN.md — IO-08 global grep gate + HYG-02 sweep + SF1 diff + IO-11 compute-sanitizer + IO-10 SF10 measurement + phase sign-off checkpoint + phase SUMMARY (IO-08, IO-09, IO-10, IO-11, HYG-02)
 
 ### Phase 6: Multi-GPU Gap Closure (Topology, Device Safety, Host Memory, GPU↔GPU Converter)
 **Goal**: The five structural v1.0 gaps that never cleared on `feature/multi-gpu-execution` — runtime topology discovery, single-GPU no-regression guarantee, device-guard enforcement across every thread, GPU↔GPU converter registration, and per-NUMA pinned host memory spaces — are closed on `dev`-rebased code.
@@ -88,7 +94,7 @@ Phases execute in numeric order: 4 -> 5 -> 6 -> 7. Phase 6 may run partially in 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 4. cuCascade Bump + v1.0 Re-integration | 5/5 | Complete | 2026-04-20 |
-| 5. Cucascade-Backed Parquet I/O Migration | 0/TBD | Not started | - |
+| 5. Cucascade-Backed Parquet I/O Migration | 0/6 | Not started | - |
 | 6. Multi-GPU Gap Closure | 0/TBD | Not started | - |
 | 7. P2P Direct Transfer + Adaptive Scan Partitioning | 0/TBD | Not started | - |
 
