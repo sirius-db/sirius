@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed Plan 06-03 (MGPU-04 registration-gate + hidden forward-leg round-trip test in test_context.cpp) — Wave 1 parallel
-last_updated: "2026-04-21T14:14:33.216Z"
+stopped_at: "Completed 06-01-PLAN.md — MGPU-01 fail-hard + MGPU-05 assertion wired in SiriusContext::initialize(); Wave 1 parallel"
+last_updated: "2026-04-21T14:15:12.240Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 15
-  completed_plans: 14
+  completed_plans: 15
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 06 (multi-gpu-gap-closure-topology-device-safety-host-memory-gpu-gpu-converter) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-04-21
 
@@ -88,6 +88,7 @@ Phase SUMMARY at `.planning/phases/05-cucascade-backed-parquet-i-o-migration/05-
 | Phase 05 P06 | ~35min (spread; Task 1 + 2a-first + 2a-re-run + 2b + Task 3) | 3 tasks | 4 files (VALIDATION + MULTIGPU-VALIDATION + SUMMARY + state) |
 | Phase 06 P02 | 2m 34s | 2 tasks | 2 files |
 | Phase 06 P03 | 10min | 2 tasks | 1 files |
+| Phase 06 P01 | 6min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -125,6 +126,7 @@ New for v1.1 (from research synthesis):
 - [Phase 05]: Plan 05-06: All 13 Phase-5 requirements closed on real N=2 hardware (2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2). compute-sanitizer memcheck 0 errors across 57 test cases / 1.92M assertions; per-backend cudaGetDevice readback matches target (GPU 0→0, GPU 1→1); SF10 wall-clock captured on both 1-GPU and 2-GPU configs with correct results. IO-10 Phase-4 regression comparison explicitly deferred to future optimization work per user directive 2026-04-21 ("we don't need to run any comparisons, let's just make sure everything is working, we can optimize later"). Phase 5 SHIPPED.
 - [Phase 06-02]: MGPU-03 device-guard teeth: both Super Sirius noexcept per-thread init callbacks (gpu_pipeline_executor + downgrade_executor) now check cudaSetDevice return and log spdlog::error on failure. No RAII conversion — per-thread pinning is lifetime-scoped (documented rationale in MGPU-03 comment blocks).
 - [Phase 06]: Plan 06-03: MGPU-04 verified via grep-only test additions (interpretation 2 from RESEARCH.md Finding 2 + Finding 6) — the cucascade peer-async GPU->GPU converter registered by register_builtin_converters is what Sirius tests, not a new host-staged override. Registration-gate test at test_context.cpp:268 is [multi_gpu_foundation][mgpu_04_registration]; hidden forward-leg round-trip at test_context.cpp:332 is [.][multi_gpu_foundation][mgpu_04_round_trip]. Zero unregister_converter calls; zero cuda_stream_default uses; zero src/ modifications (Wave 1 scope respected).
+- [Phase 06]: [Phase 06 Plan 01] Topology cache + validated accessor pattern locked — reuse existing config_.get_hw_topology() (no new accessor, no re-discovery call); fail-hard on num_gpus == 0 at initialize() entry, warn-not-throw on host_spaces \!= num_numa_nodes when num_numa_nodes > 0; MGPU-01 block comment rephrased to avoid self-tripping the text-based grep gate.
 
 ### Pending Todos
 
@@ -143,6 +145,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T14:14:33.213Z
-Stopped at: Completed Plan 06-03 (MGPU-04 registration-gate + hidden forward-leg round-trip test in test_context.cpp) — Wave 1 parallel
+Last session: 2026-04-21T14:14:59.627Z
+Stopped at: Completed 06-01-PLAN.md — MGPU-01 fail-hard + MGPU-05 assertion wired in SiriusContext::initialize(); Wave 1 parallel
 Resume file: None
