@@ -166,4 +166,4 @@ v1.0 validated requirements (FOUND-02/03/05, MEM-01/02/03, CUCS-03/04, SCHED-01.
 
 *v1.0 requirements defined: 2026-04-02*
 *v1.1 requirements defined: 2026-04-20*
-*Last updated: 2026-04-21 — Phase 6 complete: MGPU-01/02/03/04/05 closed on N=2 hardware (MGPU-02 Phase-5 regression comparison deferred to future optimization per user directive, identical to Phase 5's IO-10 treatment). Phase 7 remaining for v1.1 close (MGPU-06 P2P direct + MGPU-07 adaptive scan).*
+*Last updated: 2026-04-21 — **Milestone v1.1 COMPLETE.** Phase 7 closed with MGPU-06 P2P direct transfer + MGPU-07 adaptive scan partitioning on real N=2 hardware (2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2). All 28 v1.1 requirements `[x]` across Phases 4+5+6+7 (8 + 13 + 5 + 2). Next lifecycle step: `/gsd:audit → /gsd:complete → /gsd:cleanup`.*

@@ -23,7 +23,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 - [x] **Phase 4: cuCascade Bump + v1.0 Re-integration** — Submodule bump to `origin/main`; replay 23 multi-GPU commits onto current `dev` so they compile against sirius-native types, YAML config, and PR #96 headers
 - [x] **Phase 5: Cucascade-Backed Parquet I/O Migration** — Ship `sirius::io::cucascade_datasource`, replace every `cudf::io::datasource::create(path)` call-site, remove the `rmm::cuda_stream_default` hygiene debt adjacent to the touched scan code
 - [x] **Phase 6: Multi-GPU Gap Closure (Topology, Device Safety, Host Memory, GPU↔GPU Converter)** — Close the structural v1.0 gaps (FOUND-01/04/06, CUCS-01/02) that never cleared on `feature/multi-gpu-execution`
-- [ ] **Phase 7: P2P Direct Transfer + Adaptive Scan Partitioning** — Complete the pending v1.0 03-02 plan (MEM-04 P2P via `cudaMemcpyPeerAsync`, MEM-05 memory-proportional scan distribution)
+- [x] **Phase 7: P2P Direct Transfer + Adaptive Scan Partitioning** — Complete the pending v1.0 03-02 plan (MEM-04 P2P via `cudaMemcpyPeerAsync`, MEM-05 memory-proportional scan distribution)
 
 ## Phase Details
 
@@ -92,7 +92,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 - [x] 07-01-PLAN.md — SiriusContext peer-access enable loop + CPU risk probe (MGPU-06 infra)
 - [x] 07-02-PLAN.md — Un-hide MGPU-06 hidden tests + checksum integrity + return leg + conditional Sirius-side override (MGPU-06)
 - [x] 07-03-PLAN.md — MGPU-07 asymmetric-memory distribution test + adaptive-scan integration scenario (MGPU-07)
-- [ ] 07-04-PLAN.md — Phase validation on N=2 host (compute-sanitizer + nsys + bandwidth + fallback) + SUMMARY + milestone-level closure cue (MGPU-06, MGPU-07)
+- [x] 07-04-PLAN.md — Phase validation on N=2 host (compute-sanitizer + nsys + bandwidth + fallback) + SUMMARY + milestone-level closure cue (MGPU-06, MGPU-07)
 
 ## Progress
 
@@ -104,7 +104,7 @@ Phases execute in numeric order: 4 -> 5 -> 6 -> 7. Phase 6 may run partially in 
 | 4. cuCascade Bump + v1.0 Re-integration | 5/5 | Complete | 2026-04-20 |
 | 5. Cucascade-Backed Parquet I/O Migration | 6/6 | Complete | 2026-04-21 |
 | 6. Multi-GPU Gap Closure | 4/4 | Complete | 2026-04-21 |
-| 7. P2P Direct Transfer + Adaptive Scan Partitioning | 0/4 | Planned | - |
+| 7. P2P Direct Transfer + Adaptive Scan Partitioning | 4/4 | Complete | 2026-04-21 |
 
 ## Coverage
 

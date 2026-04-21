@@ -1,14 +1,14 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: Re-integration
-status: executing
-stopped_at: "Completed Plan 07-03 — MGPU-07 closed via test-only work: scan_distribution_memory_proportional + adaptive scan + P2P integration TEST_CASE green on N=2 hardware; 979/979 unit tests PASS; ready for Plan 07-04 (phase validation)."
-last_updated: "2026-04-21T20:53:30.775Z"
+milestone: v1.1
+milestone_name: Multi-GPU Re-integration + Cucascade I/O Migration
+status: milestone-ready
+stopped_at: "Completed Phase 7 — MGPU-06 P2P direct + MGPU-07 adaptive scan closed on N=2 hardware; v1.1 milestone COMPLETE (28/28 requirements); ready for milestone lifecycle /gsd:audit → /gsd:complete → /gsd:cleanup."
+last_updated: "2026-04-21T21:30:00.000Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 19
   completed_plans: 19
   percent: 100
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-20)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 07 — p2p-direct-transfer-adaptive-scan-partitioning
+**Current focus:** Milestone v1.1 lifecycle closure — ready for `/gsd:audit → /gsd:complete → /gsd:cleanup`.
 
 ## Current Position
 
-Phase: 07 (p2p-direct-transfer-adaptive-scan-partitioning) — EXECUTING
-Plan: 4 of 4
-Status: Ready to execute
+Phase: 07 (p2p-direct-transfer-adaptive-scan-partitioning) — COMPLETE
+Plan: 4 of 4 — COMPLETE
+Status: Milestone v1.1 ready to close
 Last activity: 2026-04-21
 
-Progress: [██████████] 100% (Phase 4 + Phase 5 + Phase 6 complete; 15 of 15 scoped plans done across the three shipped phases)
+Progress: [██████████] 100% (Phase 4 + Phase 5 + Phase 6 + Phase 7 complete; 19 of 19 scoped plans done across all four v1.1 phases)
 
 ### Phase 5 Shipped State
 
@@ -61,26 +61,49 @@ All 5 Phase 6 requirements closed on N=2 real hardware (`6f7e4c9-lcedt`, 2 × RT
 
 Phase SUMMARY at `.planning/phases/06-multi-gpu-gap-closure-topology-device-safety-host-memory-gpu-gpu-converter/06-SUMMARY.md` (written 2026-04-21 after Task 2b `approved` checkpoint).
 
+### Phase 7 Shipped State
+
+All 2 Phase 7 requirements closed on N=2 real hardware (`6f7e4c9-lcedt`, 2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2, Intel Core Ultra 9 285K Arrow Lake):
+
+- **MGPU-06** (P2P direct transfer via cudaMemcpyPeerAsync) — Plans 07-01 + 07-02 + 07-04:
+  - `SiriusContext::initialize()` peer-access enable loop iterates over every (i, j) GPU pair; cudaDeviceEnablePeerAccess fires for pairs where cudaDeviceCanAccessPeer returns true; sticky cudaGetLastError consumed after every call (fix 752a644 resolved the thrust::exclusive_scan false-positive cudaErrorInvalidDevice regression)
+  - Sirius-side P2P converter override (`src/data/sirius_p2p_converter.cpp`, 115 lines) registered inside `sirius::converter_registry::initialize()` — replaces cucascade's cross-stream-race `convert_gpu_to_gpu` body with stream-correct peer-async-only implementation; packs on source-bound rmm::cuda_stream under source_guard; issues cudaMemcpyPeerAsync on target_stream
+  - Three previously-hidden MGPU-06 round-trip tests un-hidden with FNV-1a checksum integrity guards: `[multi_gpu_transfer]` + `[mem_04_p2p_transfer]` + `[mgpu_04_round_trip]` — all PASS with checksum_post == checksum_pre including GPU1 → GPU0 return leg (Phase-4-deferred failure resolved)
+  - Audit log confirms on every initialize(): `SiriusContext: P2P enabled 0 -> 1 (MGPU-06)` + `SiriusContext: P2P enabled 1 -> 0 (MGPU-06)` + `sirius: MGPU-06 P2P converter override registered`
+
+- **MGPU-07** (Adaptive scan partitioning proportional to free GPU memory) — Plan 07-03 + 07-04:
+  - Zero `src/` production-code changes — `duckdb_scan_executor::select_target_gpu` was shipped memory-proportional in Phase 2 v1.0 commit 5e8e9b7 (preserved through Phase 4 PORT-04). Phase 7 scope was test authoring
+  - `scan_distribution_memory_proportional (MGPU-07)` un-hidden + rewritten with asymmetric-memory fixture: `make_reservation_or_null(0.9 × get_max_memory())` on GPU 0 produces free-memory ratio 3.076× (exceeding 2× minimum)
+  - Integration TEST_CASE `adaptive scan + P2P path distributes asymmetric preload (MGPU-07)` at `test_gpu_execution_locality.cpp:231` — tagged `[data_locality][multi_gpu][mgpu_07_adaptive_scan]`
+  - Both tests PASS with batch_ratio matching free_ratio within 10% tolerance
+  - Stride-scaled counter pattern (`target = (c * stride) % total_available`) preserves long-run histogram shape in bounded samples
+
+**Phase 7 validation:** 979/979 unit tests PASS on N=2 host with 78,789,847 assertions (exit 0, 220.4s). Human sign-off Task 2a response: `approved with deferrals: compute-sanitizer rerun, nsys P2P trace, peer-only bandwidth measurement, Pitfall 4 oscillation stress run, upstream cucascade cross-stream-race PR` — all deferrals are optimization concerns (not correctness concerns) per user directive 2026-04-21.
+
+Phase SUMMARY at `.planning/phases/07-p2p-direct-transfer-adaptive-scan-partitioning/07-SUMMARY.md` (written 2026-04-21 after Task 2a `approved with deferrals` checkpoint).
+
+### Milestone v1.1 Status: COMPLETE
+
+All 28 v1.1 requirements closed across Phases 4 + 5 + 6 + 7:
+
+- **Phase 4** (cuCascade bump + v1.0 re-integration): 8 requirements (BUMP-01..03, PORT-01..05)
+- **Phase 5** (Cucascade-backed parquet I/O migration): 13 requirements (IO-01..11, HYG-01..02)
+- **Phase 6** (Multi-GPU gap closure): 5 requirements (MGPU-01..05)
+- **Phase 7** (P2P direct transfer + adaptive scan): 2 requirements (MGPU-06..07)
+
 ### Resume Pointer
 
-- **Next action:** `/gsd:plan-phase 7` to decompose P2P Direct Transfer + Adaptive Scan Partitioning (MGPU-06 + MGPU-07) into plans.
-- Phase 7 foundation is already in place from Phases 4 + 5 + 6:
-  - Per-GPU executor + memory-space plumbing (Plan 04-02)
-  - Per-GPU `idisk_io_backend` cache on SiriusContext (Plan 05-03)
-  - IO-11 `cudaGetDevice` audit pattern (Plan 05-03)
-  - Topology single-source-of-truth accessor (`config_.get_hw_topology()` used by Plan 06-01)
-  - Registered GPU↔GPU converter verified surviving Sirius init (Plan 06-03/04 — MGPU-04)
-  - Device-guard convention in both per-thread init callbacks (Plan 06-02 — MGPU-03)
-  - Hidden round-trip test anchor `[.][mgpu_04_round_trip]` in place for MGPU-06 to flip to visible + append return leg
-  - Phase-4 hidden-test regression anchors: `[.][multi_gpu_transfer]` + `[.][mem_04_p2p_transfer]` + `TODO(MGPU-06)` at `test_downgrade_executor.cpp:813` + `TODO(MGPU-07)` at `:883`
+- **Next action:** `/gsd:audit` to verify v1.1 milestone closure integrity, then `/gsd:complete` to mark v1.1 COMPLETE in `.planning/MILESTONES.md`, then `/gsd:cleanup` to tidy planning artifacts before the next milestone kickoff.
+- No Phase 8 planned for v1.1. Any follow-on work (OPT-01..05) is v2.0 scope per REQUIREMENTS.md §"Deferred / Future (v2.0)".
+- Phase 7 closure unblocks milestone lifecycle commands.
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed (v1.1): 15 (5 in Phase 4 + 6 in Phase 5 + 4 in Phase 6)
-- Average duration: Phase 4 ~66 min/plan (5h30min total), Phase 5 ~11 min/plan (65min total), Phase 6 ~15 min/plan (60min total)
-- Total execution time: ~7h35min across the three phases
+- Total plans completed (v1.1): **19** (5 in Phase 4 + 6 in Phase 5 + 4 in Phase 6 + 4 in Phase 7) — **milestone complete**
+- Average duration: Phase 4 ~66 min/plan (5h30min total), Phase 5 ~11 min/plan (65min total), Phase 6 ~15 min/plan (60min total), Phase 7 ~30 min/plan (~2h total)
+- Total execution time: ~9.5h across all four phases
 
 **By Phase:**
 
@@ -89,12 +112,12 @@ Phase SUMMARY at `.planning/phases/06-multi-gpu-gap-closure-topology-device-safe
 | 4 | 5 | 5h30min | 66 min |
 | 5 | 6 | 65min | 11 min |
 | 6 | 4 | 60min | 15 min |
-| 7 | TBD | — | — |
+| 7 | 4 | ~2h | ~30 min |
 
 **Recent Trend:**
 
-- Last 5 plans: 06-01 (6min), 06-02 (2m34s), 06-03 (10min), 06-04 (~40min spread Task 1 + Task 2 checkpoint + Task 3), Phase 5 wrap-up before that
-- Trend: Phase 6 hit its research-predicted scope-tightening target (4 plans instead of the originally-envisioned 7-10); Wave 1 parallel execution of Plans 06-01/02/03 compressed elapsed time further.
+- Last 5 plans: 07-01 (25min), 07-02 (40min), 07-03 (20min), 07-04 (~30min Task 1 + checkpoint + Task 3 SUMMARY + state updates), Phase 6 wrap-up before that
+- Trend: Phase 7 continued the scope-tightening pattern from Phase 6 — test-only closure for MGPU-07 (algorithm was already shipped in Phase 2 v1.0) + converter-override approach for MGPU-06 (cucascade submodule pin preserved, sirius-side body registered at converter-registry boundary). Plan 07-02 Task 3 exercised the OVERRIDE-REGISTERED branch due to direct N=2 hardware evidence surfacing the cross-stream race earlier than Plan 07-04's N=2 validation pass would have caught it.
 
 | Phase 04 P02 | 2h | 6 tasks | 13 files |
 | Phase 04 P03 | 25min | 6 tasks | 8 files |
@@ -110,8 +133,10 @@ Phase SUMMARY at `.planning/phases/06-multi-gpu-gap-closure-topology-device-safe
 | Phase 06 P02 | 2m 34s | 2 tasks | 2 files |
 | Phase 06 P03 | 10min | 2 tasks | 1 files |
 | Phase 06 P04 | ~40min (spread; Task 1 validation + Task 2 checkpoint + Task 3 SUMMARY) | 3 tasks | 5 files (VALIDATION + SUMMARY + STATE/ROADMAP/REQUIREMENTS) |
+| Phase 07 P01 | 25min | 2 tasks | 2 files |
 | Phase 07 P02 | 40min | 4 tasks | 6 files |
 | Phase 07 P03 | 20min | 3 tasks | 2 files |
+| Phase 07 P04 | ~30min (spread; Task 1 validation + Task 2a+2b checkpoint + Task 3 SUMMARY + state updates) | 4 tasks | 5 files (VALIDATION + SUMMARY + STATE/ROADMAP/REQUIREMENTS) |
 
 ## Accumulated Context
 
@@ -156,26 +181,39 @@ New for v1.1 (from research synthesis):
 - [Phase 07]: [Phase 07-03] MGPU-07 closure is 100% test-only: duckdb_scan_executor::select_target_gpu was shipped memory-proportional in Phase 2 v1.0 and survives into Phase 7 unchanged. Phase 7's MGPU-07 scope was authoring the asymmetric-memory test (make_reservation_or_null pattern per Pitfall 5) + the integration TEST_CASE that prove the shipped algorithm meets CONTEXT success criterion 3 (batch-count skew >= 2x matching free-memory ratio within 10%).
 - [Phase 07]: [Phase 07-03] Preload sizing: use 0.9 * get_max_memory() (reservation limit), NOT 0.8 * get_available_memory() (raw capacity). reservation_fraction_per_gpu=0.75 caps make_reservation at 0.75 * capacity; requesting 0.8 * capacity returns nullptr. Observed ratio 3.08x on this N=2 host (2x RTX 6000 Ada), safely above the 2x minimum.
 - [Phase 07]: [Phase 07-03] Stride-scaled counter for finite-sample histogram validation: production select_target_gpu uses counter % total_available where counter runs over many-thousand batches; for a 32-sample test, naive 0..31 falls below the first GPU's cumulative threshold and degenerates. Stride scaling (target = (c * stride) % total_available, stride = total_available / kNumDecisions) reproduces the long-run distribution in bounded samples.
+- [Phase 07]: [Phase 07-04] All 2 Phase 7 requirements (MGPU-06, MGPU-07) closed on real N=2 hardware. 979/979 unit tests PASS, 78,789,847 assertions; FNV-1a checksum integrity on all 3 MGPU-06 round-trip tests (forward + return leg); asymmetric-memory ratio 3.08x matches batch-count skew within 10% on MGPU-07 tests. Human sign-off Task 2a response 'approved with deferrals: compute-sanitizer rerun, nsys P2P trace, peer-only bandwidth measurement, Pitfall 4 oscillation stress run, upstream cucascade cross-stream-race PR' recorded verbatim. All five deferrals are optimization-concern gates, not correctness-concern gates. Phase 7 SHIPPED. Milestone v1.1 CLOSES — 28/28 requirements complete across Phases 4+5+6+7.
+- [Phase 07]: Scope tightening pattern confirmed across Phase 7: MGPU-07 closed test-only (algorithm was shipped in Phase 2 v1.0); MGPU-06 closed via converter-registry-boundary override (cucascade submodule pin preserved). Phase 7 total elapsed ~2 hours across 4 plans — consistent with Phase 6's research-driven scope-tightening outcome.
+- [Milestone v1.1]: **COMPLETE — 28/28 requirements closed across 4 phases (Plans 4+5+6+7 = 5+6+4+4 = 19 plans total; ~9.5h aggregate execution time).** Ready for lifecycle closure: /gsd:audit → /gsd:complete → /gsd:cleanup.
 
 ### Pending Todos
 
-- `/gsd:plan-phase 7` — decompose P2P Direct Transfer + Adaptive Scan Partitioning (MGPU-06 + MGPU-07) into plans.
-- Phase 7 is the final v1.1 phase; on its completion the milestone closes.
+- `/gsd:audit` — verify v1.1 milestone closure integrity (all requirements closed, all SUMMARY files present, all commits tagged).
+- `/gsd:complete` — mark v1.1 COMPLETE in `.planning/MILESTONES.md`.
+- `/gsd:cleanup` — tidy planning artifacts before the next milestone kickoff.
+- **Milestone v1.1 CLOSES with Phase 7; no Phase 8 planned.**
 
 ### Blockers / Concerns
 
 - **Phase 5 sign-off is CLEAR** (prior blocker resolved on 2026-04-21: Task 2b `approved` after N=2 real-hardware re-run).
 - **Phase 6 sign-off is CLEAR** (resolved on 2026-04-21: Task 2b `approved` after all 5 MGPU gates cleared on N=2 hardware per `06-04-VALIDATION.md`).
+- **Phase 7 sign-off is CLEAR** (resolved on 2026-04-21: Task 2a `approved with deferrals` after MGPU-06 + MGPU-07 gates cleared on N=2 hardware per `07-04-VALIDATION.md`; 979/979 unit tests PASS, 78,789,847 assertions).
+- **Milestone v1.1 is READY for lifecycle closure** (`/gsd:audit → /gsd:complete → /gsd:cleanup`).
 - **Dev drift:** 47 dev commits since multi-gpu branch diverged touched sirius-native types (#643), YAML config (#565), DuckDB vocabulary removal (#564/#626/#628). Addressed in Phase 4; no further drift compensation needed for v1.1.
-- **Multi-GPU hardware gating:** MGPU-06 + MGPU-07 (Phase 7) require an N>1 GPU machine. The N=2 verification host (`6f7e4c9-lcedt`, 2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2) used in Plans 04-05 + 05-06 + 06-04 remains available for Phase 7 validation.
-- **TPC-H SF10 Phase-4/Phase-5 regression comparison deferred to future optimization work** per user directive on 2026-04-21 (applied to both Phase 5 IO-10 and Phase 6 MGPU-02). Absolute Phase-5 SF10 numbers recorded in `05-06-MULTIGPU-VALIDATION.md`; absolute Phase-6 SF10 numbers recorded in `06-04-VALIDATION.md` §4 as the starting reference points.
-- **Per-file `open`/`close` in `pipeline_io_backend`:** Research pitfall P1 — no file-handle cache. Not measured in Phase 5 or 6 (deferred with the regression comparison). If it dominates later profiles, file upstream issue.
-- **Cross-GPU converter return-leg fails on 2-GPU HW — scoped to Phase 7 (MGPU-06).** Surfaced in Plan 04-05 Task 2: `[.][multi_gpu_transfer]` and `[.][mem_04_p2p_transfer]` hidden tests PASS on GPU0→GPU1 forward leg but FAIL on GPU1→GPU0 return leg via cucascade converter. Phase 5 + Phase 6 confirmed these are pre-existing (not Phase-5/6 regressions) — Phase 5 compute-sanitizer reported 0 errors across 57 cases / 1.92M assertions and Phase 6 reported 0 errors across 49 cases / 1.92M assertions. Phase 7 MGPU-06 replaces the host-staged converter body with `cudaMemcpyPeerAsync`. Regression gate seeded: `test/cpp/downgrade/test_downgrade_executor.cpp:813` with `TODO(MGPU-06)` marker.
-- **TPC-H Q4 parquet flake (pre-existing).** Not observed during Phase 5 or 6 runs; remains a pre-existing deferral for future observation.
-- **`gpu_execution - count distinct: multi-partition forced, single group key` flake (pressure-driven, pre-existing).** Surfaced in Phase 6 Plan 06-04 Task 1 unit-test sweep at position 593/974. Passes in isolation (`All tests passed (25 assertions in 1 test case)`); fails under heavy shared-allocator pressure. Matches the Phase-5 pattern of long-running integration sweeps occasionally OOMing partway through. Track for future investigation; not a Phase-6 regression.
+- **Multi-GPU hardware gating (resolved):** MGPU-06 + MGPU-07 (Phase 7) validated on the N=2 verification host (`6f7e4c9-lcedt`, 2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2, Intel Core Ultra 9 285K). P2P symmetric: `cudaDeviceCanAccessPeer` returns true for both directions; audit log confirms `P2P enabled 0 -> 1` + `P2P enabled 1 -> 0` every initialize().
+- **Phase 7 deferrals (optimization concerns, NOT correctness concerns):**
+  - compute-sanitizer rerun on extended Phase 7 surface (Phase 6 baseline carries through functionally via 979/979 Phase-7 tests green)
+  - nsys P2P trace + cudaMemcpyPeerAsync count + cudaMallocHost baseline comparison (functional equivalents in peer-access audit log + override registration log + checksum integrity)
+  - peer-only bandwidth + host-staged baseline comparison (plan's ≥1.5× gate explicitly NON-BLOCKING)
+  - Pitfall 4 oscillation stress test (5-10× repeat batch-ratio variance check; mitigations in CONTEXT Deferred Ideas)
+  - Upstream cucascade PR fixing `convert_gpu_to_gpu` cross-stream race at `cucascade/src/data/representation_converter.cpp:173` (Sirius-side override `src/data/sirius_p2p_converter.cpp` works around the gap until then)
+- **TPC-H SF10 Phase-X regression comparisons deferred to future optimization work** per user directive 2026-04-21 (applied to Phase 5 IO-10, Phase 6 MGPU-02, and Phase 7 P2P bandwidth — single directive covers all three). Absolute Phase-5 numbers at `05-06-MULTIGPU-VALIDATION.md`; absolute Phase-6 numbers at `06-04-VALIDATION.md` §4.
+- **Per-file `open`/`close` in `pipeline_io_backend`:** Research pitfall P1 — no file-handle cache. Not measured in Phase 5/6/7 (deferred with the regression comparison). If it dominates later profiles, file upstream issue.
+- **Cross-GPU converter return-leg (RESOLVED in Phase 7 MGPU-06):** Phase 4 deferred failure closed via Plan 07-01 peer-access enable loop + Plan 07-02 Sirius-side P2P converter override. All three MGPU-06 round-trip tests (`[multi_gpu_transfer]`, `[mem_04_p2p_transfer]`, `[mgpu_04_round_trip]`) PASS with GPU1 → GPU0 return leg preserving FNV-1a checksum integrity on N=2 hardware. TODO(MGPU-06) + TODO(MGPU-07) markers removed from test code.
+- **TPC-H Q4 parquet flake (pre-existing).** Not observed during Phase 5, 6, or 7 runs; remains a pre-existing deferral for future observation.
+- **`gpu_execution - count distinct: multi-partition forced, single group key` flake (pressure-driven, pre-existing).** Not observed in Phase 7 Plan 07-04 Task 1 validation run (979/979 PASS); remains a carry-over concern. Matches the pattern of long-running integration sweeps occasionally OOMing partway through.
 
 ## Session Continuity
 
-Last session: 2026-04-21T20:53:16.304Z
-Stopped at: Completed Plan 07-03 — MGPU-07 closed via test-only work: scan_distribution_memory_proportional + adaptive scan + P2P integration TEST_CASE green on N=2 hardware; 979/979 unit tests PASS; ready for Plan 07-04 (phase validation).
+Last session: 2026-04-21T21:30:00.000Z
+Stopped at: Completed Phase 7 — MGPU-06 P2P direct + MGPU-07 adaptive scan closed on N=2 hardware; v1.1 milestone COMPLETE (28/28 requirements); ready for milestone lifecycle /gsd:audit → /gsd:complete → /gsd:cleanup.
 Resume file: None
