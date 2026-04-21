@@ -38,7 +38,6 @@
 
 // standard library
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <numeric>
 
@@ -75,9 +74,7 @@ memory_space* get_default_gpu_space()
 }
 
 rmm::device_async_resource_ref get_resource_ref(memory_space& space)
-{
-  return rmm::to_device_async_resource_ref_checked(space.get_default_allocator());
-}
+{ return rmm::to_device_async_resource_ref_checked(space.get_default_allocator()); }
 
 template <typename T>
 std::vector<T> copy_column_to_host(const cudf::column_view& col)
@@ -423,8 +420,8 @@ duckdb::unique_ptr<BoundFunctionExpression> make_func_expr(
 // execute() — reference, constant, comparison (basic smoke test per type)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental execute projects references, constants, and comparisons",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -535,8 +532,8 @@ TEMPLATE_TEST_CASE("experimental execute projects references, constants, and com
 // select() — basic filter + edge cases
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select filters rows and handles edge cases",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -628,8 +625,8 @@ TEMPLATE_TEST_CASE("experimental select filters rows and handles edge cases",
 // Arithmetic functions (AST-capable): col + const, col * col
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental execute arithmetic functions",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("execute arithmetic functions",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -716,8 +713,8 @@ TEMPLATE_TEST_CASE("experimental execute arithmetic functions",
 // cudf::binary_operation on fixed_point columns/scalars).
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental execute decimal arithmetic (DECIMAL64)",
-                   "[expression_executor][experimental][decimal]",
+TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
+                   "[expression_executor][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -815,8 +812,8 @@ TEMPLATE_TEST_CASE("experimental execute decimal arithmetic (DECIMAL64)",
   }
 }
 
-TEMPLATE_TEST_CASE("experimental execute decimal arithmetic (DECIMAL32)",
-                   "[expression_executor][experimental][decimal]",
+TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL32)",
+                   "[expression_executor][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -858,8 +855,8 @@ TEMPLATE_TEST_CASE("experimental execute decimal arithmetic (DECIMAL32)",
   REQUIRE(out0 == expected);
 }
 
-TEMPLATE_TEST_CASE("experimental execute nested decimal arithmetic (col + 1.00) * 2",
-                   "[expression_executor][experimental][decimal]",
+TEMPLATE_TEST_CASE("execute nested decimal arithmetic (col + 1.00) * 2",
+                   "[expression_executor][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -912,8 +909,8 @@ TEMPLATE_TEST_CASE("experimental execute nested decimal arithmetic (col + 1.00) 
   REQUIRE(out0 == expected);
 }
 
-TEMPLATE_TEST_CASE("experimental execute decimal arithmetic (DECIMAL128)",
-                   "[expression_executor][experimental][decimal]",
+TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL128)",
+                   "[expression_executor][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -955,8 +952,8 @@ TEMPLATE_TEST_CASE("experimental execute decimal arithmetic (DECIMAL128)",
   }
 }
 
-TEMPLATE_TEST_CASE("experimental execute decimal DIV (DECIMAL64)",
-                   "[expression_executor][experimental][decimal]",
+TEMPLATE_TEST_CASE("execute decimal DIV (DECIMAL64)",
+                   "[expression_executor][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1001,8 +998,8 @@ TEMPLATE_TEST_CASE("experimental execute decimal DIV (DECIMAL64)",
   REQUIRE(out0 == expected);
 }
 
-TEMPLATE_TEST_CASE("experimental execute decimal TPC-H Q1 shape price * (1 - discount)",
-                   "[expression_executor][experimental][decimal]",
+TEMPLATE_TEST_CASE("execute decimal TPC-H Q1 shape price * (1 - discount)",
+                   "[expression_executor][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1070,8 +1067,8 @@ TEMPLATE_TEST_CASE("experimental execute decimal TPC-H Q1 shape price * (1 - dis
 // LIKE / NOT LIKE (AST breakers — string functions always materialize)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select LIKE and NOT LIKE",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1153,8 +1150,8 @@ TEMPLATE_TEST_CASE("experimental select LIKE and NOT LIKE",
 // CASE/WHEN (always materializes — AST breaker)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental execute CASE expression",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("execute CASE expression",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1195,8 +1192,8 @@ TEMPLATE_TEST_CASE("experimental execute CASE expression",
   }
 }
 
-TEMPLATE_TEST_CASE("experimental execute CASE with multiple WHEN branches",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("execute CASE with multiple WHEN branches",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1245,11 +1242,8 @@ TEMPLATE_TEST_CASE("experimental execute CASE with multiple WHEN branches",
 // BETWEEN (decomposed into two comparisons + AND)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select BETWEEN",
-                   "[expression_executor][experimental]",
-                   mat_strategy,
-                   ast_interpret_strategy,
-                   ast_jit_strategy)
+TEMPLATE_TEST_CASE(
+  "select BETWEEN", "[expression_executor]", mat_strategy, ast_interpret_strategy, ast_jit_strategy)
 {
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
@@ -1282,8 +1276,8 @@ TEMPLATE_TEST_CASE("experimental select BETWEEN",
 // IN / NOT IN (AST breaker when constant list — uses cudf::contains)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select IN and NOT IN",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select IN and NOT IN",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1345,8 +1339,8 @@ TEMPLATE_TEST_CASE("experimental select IN and NOT IN",
 // IS NULL / IS NOT NULL / NOT (operator expressions)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select IS NULL and IS NOT NULL",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select IS NULL and IS NOT NULL",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1396,8 +1390,8 @@ TEMPLATE_TEST_CASE("experimental select IS NULL and IS NOT NULL",
 // COALESCE — AST breaker, always materialized, exercised across all strategies
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental execute COALESCE",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("execute COALESCE",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1579,8 +1573,8 @@ TEMPLATE_TEST_CASE("experimental execute COALESCE",
   }
 }
 
-TEMPLATE_TEST_CASE("experimental select COALESCE nested in predicate",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select COALESCE nested in predicate",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1615,8 +1609,8 @@ TEMPLATE_TEST_CASE("experimental select COALESCE nested in predicate",
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 50});
 }
 
-TEMPLATE_TEST_CASE("experimental select respects null mask under plain comparison",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select respects null mask under plain comparison",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1648,8 +1642,8 @@ TEMPLATE_TEST_CASE("experimental select respects null mask under plain compariso
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
 }
 
-TEMPLATE_TEST_CASE("experimental select COMPARE_NOT_DISTINCT_FROM",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select COMPARE_NOT_DISTINCT_FROM",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy)
 {
@@ -1677,8 +1671,8 @@ TEMPLATE_TEST_CASE("experimental select COMPARE_NOT_DISTINCT_FROM",
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30});
 }
 
-TEMPLATE_TEST_CASE("experimental select COMPARE_DISTINCT_FROM",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select COMPARE_DISTINCT_FROM",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy)
 {
@@ -1705,8 +1699,8 @@ TEMPLATE_TEST_CASE("experimental select COMPARE_DISTINCT_FROM",
   REQUIRE(ov.column(0).null_count() == 2);
 }
 
-TEMPLATE_TEST_CASE("experimental select NOT operator",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select NOT operator",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1744,8 +1738,8 @@ TEMPLATE_TEST_CASE("experimental select NOT operator",
 // Conjunction with AST breaker: AND/OR mixing AST-capable and non-AST nodes
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select conjunction with AST breaker",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select conjunction with AST breaker",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1796,8 +1790,8 @@ TEMPLATE_TEST_CASE("experimental select conjunction with AST breaker",
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected_col0);
 }
 
-TEMPLATE_TEST_CASE("experimental select OR conjunction",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select OR conjunction",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1840,8 +1834,8 @@ TEMPLATE_TEST_CASE("experimental select OR conjunction",
 // Exercises AST breaker (CASE) nested within AST-capable nodes
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select with nested CASE in predicate",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select with nested CASE in predicate",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1887,8 +1881,8 @@ TEMPLATE_TEST_CASE("experimental select with nested CASE in predicate",
 // IN with conjunction (multi-column filter, mirrors a TPC-H style predicate)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental select IN with conjunction multi-column",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("select IN with conjunction multi-column",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1944,8 +1938,8 @@ TEMPLATE_TEST_CASE("experimental select IN with conjunction multi-column",
 // Arithmetic in projection combined with CASE — complex execute() output
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("experimental execute mixed arithmetic and CASE projection",
-                   "[expression_executor][experimental]",
+TEMPLATE_TEST_CASE("execute mixed arithmetic and CASE projection",
+                   "[expression_executor]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
