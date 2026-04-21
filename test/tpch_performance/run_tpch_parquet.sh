@@ -99,10 +99,44 @@ if [ "$ENGINE" != "sirius" ]; then
     export SIRIUS_DISABLE=1
 fi
 
-if [ ! -d "$PARQUET_DIR" ]; then
+has_parquet_data() {
+    local parquet_dir="$1"
+    local parquet_file
+    for parquet_file in "$parquet_dir"/*.parquet "$parquet_dir"/*/*.parquet; do
+        [ -f "$parquet_file" ] && return 0
+    done
+    return 1
+}
+
+ensure_parquet_data() {
+    if [ -d "$PARQUET_DIR" ] && has_parquet_data "$PARQUET_DIR"; then
+        return 0
+    fi
+
     echo "Parquet directory not found: $PARQUET_DIR"
-    echo "Generating TPC-H SF${SF} dataset using tpchgen-rs..."
-    (cd "$SCRIPT_DIR" && pixi run bash generate_tpch_data.sh "$SF" "$PARQUET_DIR")
+    echo "Generating TPC-H SF${SF} dataset..."
+    (
+        cd "$SCRIPT_DIR" &&
+            env -u PIXI_PROJECT_MANIFEST -u PIXI_ENVIRONMENT_NAME \
+                pixi run --manifest-path "$SCRIPT_DIR/pixi.toml" \
+                bash generate_tpch_data.sh "$SF" "$PARQUET_DIR"
+    )
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: failed to generate parquet data for SF${SF} (exit code ${status})."
+        return "$status"
+    fi
+
+    if ! [ -d "$PARQUET_DIR" ] || ! has_parquet_data "$PARQUET_DIR"; then
+        echo "ERROR: parquet data is still unavailable after generation: $PARQUET_DIR"
+        return 1
+    fi
+}
+
+ensure_parquet_data
+status=$?
+if [ "$status" -ne 0 ]; then
+    exit "$status"
 fi
 
 # Build CREATE VIEW statements.
@@ -227,10 +261,13 @@ run_single_session() {
     TOTAL_ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
     echo "Total wall-clock time: ${TOTAL_ELAPSED}s"
 
+    local RUN_STATUS=0
     if [ "$SESSION_EXIT" -eq 124 ]; then
         echo "SESSION TIMEOUT: DuckDB was killed after ${SESSION_TIMEOUT}s"
+        RUN_STATUS=124
     elif [ "$SESSION_EXIT" -ne 0 ]; then
         echo "SESSION FAILED: DuckDB exited with code $SESSION_EXIT"
+        RUN_STATUS=$SESSION_EXIT
     fi
 
     rm -f "$TEMP_SQL"
@@ -268,13 +305,14 @@ run_single_session() {
 
         if [ -z "$SECTION" ]; then
             echo "  NO OUTPUT (session may have timed out or crashed before this query)"
-            echo "no output" > "$RESULT_FILE"
+            echo "error: no output (session may have timed out or crashed before this query)" > "$RESULT_FILE"
             {
                 echo "step,runtime_s"
                 for ((i = 0; i < NUM_ITERATIONS; i++)); do
                     echo "iter_$((i + 1)),N/A"
                 done
             } > "$TIMING_FILE"
+            [ "$RUN_STATUS" -eq 0 ] && RUN_STATUS=1
             echo "  Timings written to $TIMING_FILE"
             continue
         fi
@@ -313,12 +351,14 @@ run_single_session() {
     done
 
     rm -f "$TEMP_OUTPUT"
+    return "$RUN_STATUS"
 }
 
 # =============================================================================
 # Multi-session mode: each query in its own fresh DuckDB process (duckdb only)
 # =============================================================================
 run_multi_session() {
+    local RUN_STATUS=0
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
 
@@ -371,8 +411,10 @@ run_multi_session() {
 
         if [ "$Q_EXIT" -eq 124 ]; then
             echo "  TIMEOUT: killed after ${SESSION_TIMEOUT}s"
+            RUN_STATUS=124
         elif [ "$Q_EXIT" -ne 0 ]; then
             echo "  FAILED: DuckDB exited with code $Q_EXIT"
+            [ "$RUN_STATUS" -eq 0 ] && RUN_STATUS=$Q_EXIT
         fi
 
         # Check for errors in output.
@@ -426,15 +468,17 @@ run_multi_session() {
 
         echo "  Timings written to $TIMING_FILE"
     done
+    return "$RUN_STATUS"
 }
 
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+RUN_STATUS=0
 if [ "$MULTI_SESSION" = true ]; then
-    run_multi_session
+    run_multi_session || RUN_STATUS=$?
 else
-    run_single_session
+    run_single_session || RUN_STATUS=$?
 fi
 
 # ---------------------------------------------------------------------------
@@ -486,3 +530,4 @@ else
     echo "Results saved as result_${ENGINE}_sf${SF}_q*.txt"
     echo "Timings saved as timings_${ENGINE}_sf${SF}_q*.csv"
 fi
+exit "$RUN_STATUS"
