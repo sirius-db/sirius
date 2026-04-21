@@ -89,22 +89,6 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_pipeline_executor,
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
-    } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-      auto it = _parquet_scan_operator_global_state_map.find(operator_id);
-      if (it != _parquet_scan_operator_global_state_map.end()) {
-        it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
-      } else {
-        const auto& op_params =
-          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-            ->get_config()
-            .get_operator_params();
-        _parquet_scan_operator_global_state_map.emplace(
-          operator_id,
-          std::make_shared<op::scan::parquet_scan_task_global_state>(
-            pipeline,
-            &source_operator->Cast<op::sirius_physical_parquet_scan>(),
-            op_params.scan_task_batch_size));
-      }
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
       _cpu_source_operator_global_state_map.emplace(
         operator_id,
@@ -164,8 +148,7 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 {
   if (node == nullptr) { return nullptr; }
 
-  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-      node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
     size_t operator_id             = node->get_operator_id();
     auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
     if (parquet_task_global_state->has_more_partitions()) {
@@ -324,8 +307,7 @@ void task_creator::manager_loop()
           pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
                                           // with the task creation
           _pipeline_executor->schedule(std::move(scan_task));
-        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-                   node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
           // ICEBERG_SCAN inherits from PARQUET_SCAN; Cast<> is type-checked by enum so use

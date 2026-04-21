@@ -112,7 +112,6 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::SORT_PARTITION: return "SORT_PARTITION";
     case SiriusPhysicalOperatorType::SORT_SAMPLE: return "SORT_SAMPLE";
     case SiriusPhysicalOperatorType::DUCKDB_SCAN: return "DUCKDB_SCAN";
-    case SiriusPhysicalOperatorType::PARQUET_SCAN: return "PARQUET_SCAN";
     case SiriusPhysicalOperatorType::ICEBERG_SCAN: return "ICEBERG_SCAN";
     case SiriusPhysicalOperatorType::CPU_SOURCE: return "CPU_SOURCE";
     case SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN: return "PARQUET_METADATA_SCAN";

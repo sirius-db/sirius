@@ -160,6 +160,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void mark_task_created();
   void mark_task_completed();
 
+  //! Observers for the per-pipeline task counters (testing / diagnostics).
+  [[nodiscard]] std::size_t get_tasks_created() const { return tasks_created.load(); }
+  [[nodiscard]] std::size_t get_tasks_completed() const { return tasks_completed.load(); }
+
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 

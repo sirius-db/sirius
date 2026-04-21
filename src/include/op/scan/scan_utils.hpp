@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include "helper/logical_type.hpp"
+#include <helper/logical_type.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
