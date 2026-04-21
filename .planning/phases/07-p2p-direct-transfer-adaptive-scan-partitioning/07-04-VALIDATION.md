@@ -352,7 +352,19 @@ The Sirius-side P2P converter override (RESEARCH.md Pattern 2) was therefore imp
 
 ## 12. Human Sign-off
 
-*To be filled by Task 2b after human response is captured.*
+**Task 2a checkpoint response (verbatim from orchestrator on 2026-04-21):**
+
+> `approved with deferrals: compute-sanitizer rerun, nsys P2P trace, peer-only bandwidth measurement, Pitfall 4 oscillation stress run, upstream cucascade cross-stream-race PR`
+>
+> Rationale: per user directive 2026-04-21 ("we don't need to run any comparisons, let's just make sure everything is working, we can optimize later"), Phase 7's correctness gates are cleared functionally on real N=2 hardware via 979/979 unit tests PASS + FNV-1a checksum integrity on three MGPU-06 round-trip tests + histogram evidence from two MGPU-07 distribution tests. Quantitative bandwidth comparisons, extended compute-sanitizer runs, and upstream cucascade PRs are optimization concerns deferred to future work. Plan 07-02 Task 3 verdict OVERRIDE-REGISTERED is confirmed — the Sirius-side P2P converter override ships in v1.1 and its continued presence is tracked via the initialize()-time log line.
+
+**Interpretation:** Phase 7 gates validated. All 2 Phase-7 requirements (MGPU-06, MGPU-07) close; the 5 deferrals listed above are tracked as future items in the Phase SUMMARY and STATE.md `Blockers / Concerns` section.
+
+**Phase 7 outcome: PASS with documented deferrals.**
+
+---
+
+*Sign-off captured: 2026-04-21*
 
 ---
 
