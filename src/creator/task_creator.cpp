@@ -139,16 +139,23 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       } else {
         SIRIUS_LOG_INFO("[task_creator::prepare_for_query] creating NEW state for id={}",
                         operator_id);
-        const auto& op_params =
-          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-            ->get_config()
-            .get_operator_params();
+        // Approach C (Phase 5 Plan 04/05): seed iceberg_scan_task_global_state
+        // with the per-GPU cucascade io backend map from SiriusContext. The map
+        // is forwarded to the base parquet_scan_task_global_state so that both
+        // the data-file footer pre-reads AND build_delete_pipeline() (delete-file
+        // reads via Approach A helpers — Plan 05-05) can resolve backends via
+        // get_gpu_io_backends().
+        auto* sirius_ctx =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+        const auto& op_params = sirius_ctx->get_config().get_operator_params();
+        auto gpu_io_backends  = sirius_ctx->get_gpu_io_backends();
         _parquet_scan_operator_global_state_map.emplace(
           operator_id,
           std::make_shared<op::scan::iceberg_scan_task_global_state>(
             pipeline,
             &source_operator->Cast<op::sirius_physical_iceberg_scan>(),
-            op_params.scan_task_batch_size));
+            op_params.scan_task_batch_size,
+            std::move(gpu_io_backends)));
       }
     } else {
       _gpu_operator_global_state_map.emplace(

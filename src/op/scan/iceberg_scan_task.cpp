@@ -209,9 +209,13 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
 iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
-  size_t approximate_batch_size)
-  : iceberg_scan_task_global_state(
-      std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size)
+  size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
+  : iceberg_scan_task_global_state(std::move(pipeline),
+                                   scan_op,
+                                   prepare(scan_op),
+                                   approximate_batch_size,
+                                   std::move(gpu_io_backends))
 {
   // Propagate hive partition info to the base class so it can build
   // the partition injection function (same as the public constructor does).
@@ -223,12 +227,14 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
   init_data init,
-  size_t approximate_batch_size)
+  size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
                                    std::move(init.file_paths),
                                    std::move(init.selected_column_indices),
-                                   approximate_batch_size)
+                                   approximate_batch_size,
+                                   std::move(gpu_io_backends))
 {
   build_delete_pipeline(scan_op);
 }
