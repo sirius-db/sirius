@@ -52,6 +52,9 @@
 #include <cudf/io/parquet_io_utils.hpp>
 #endif
 
+// rmm
+#include <rmm/cuda_stream.hpp>
+
 // standard library
 #include <algorithm>
 #include <chrono>
@@ -453,6 +456,13 @@ void parquet_scan_task_global_state::initialize_from_files()
   // _selected_column_indices entry (DuckDB primary index) to the parquet
   // column position. This is necessary because after hive partition removal
   // the DuckDB indices no longer coincide with parquet column positions.
+  //
+  // HYG-01: explicit stream for the planning-time filter_row_groups_with_stats
+  // call below. A throwaway local stream is sufficient here — this is
+  // scan-plan time, called once per file, and the filter call is
+  // self-contained (no other work queued on this stream). User rule
+  // forbids the default-stream sentinel everywhere in Sirius.
+  rmm::cuda_stream planning_stream;
   for (std::size_t file_idx = 0; file_idx < _file_paths.size(); ++file_idx) {
     auto row_group_indices = readers[file_idx]->all_row_groups(_reader_options);
     if (_translated_filter) {
@@ -465,7 +475,7 @@ void parquet_scan_task_global_state::initialize_from_files()
       // clang-format on
       // Prune row groups with filter pushdown using metadata statistics.
       row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
-        row_group_indices, _reader_options, rmm::cuda_stream_default);
+        row_group_indices, _reader_options, planning_stream.view());
       auto const row_groups_after_pruning = row_group_indices.size();
       auto const pruned_row_groups        = row_groups_before_pruning - row_groups_after_pruning;
       // clang-format off
