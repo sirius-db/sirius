@@ -171,8 +171,57 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   config_ = config;
 
+  // ---- MGPU-01: Topology fail-hard + startup log ----
+  // Topology is discovered once in sirius_config::sirius_config() via
+  // cucascade::memory::topology_discovery. This block validates the cached
+  // result at initialize() entry — before any memory_manager_ / io_backend /
+  // downgrade_executor construction — so downstream failures don't mask a
+  // stub topology. The accessor at src/include/sirius_context.hpp:117
+  // (get_hw_topology()) is the sole authorised source of GPU/NUMA counts
+  // going forward; Super Sirius files must not call cudaGetDeviceCount /
+  // numa_node_of_cpu directly (enforced by the MGPU-01 grep sweep gate).
+  auto const& topo = config_.get_hw_topology();
+  if (topo.num_gpus == 0) {
+    throw std::runtime_error(
+      "SiriusContext::initialize: cucascade::topology_discovery reported 0 GPUs — "
+      "refusing to initialize on stub topology (MGPU-01 fail-hard).");
+  }
+  spdlog::info(
+    "SiriusContext: topology summary — {} GPU(s), {} NUMA node(s), host='{}'",
+    topo.num_gpus, topo.num_numa_nodes, topo.hostname);
+  for (auto const& gpu : topo.gpus) {
+    spdlog::info("  GPU {}: {} (numa={}, pci={})",
+                 gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
+  }
+
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  // ---- MGPU-05: Per-NUMA host memory space assertion ----
+  // sirius_config::apply_defaults (src/sirius_config.cpp:216) + YAML-path
+  // both call .use_host_per_numa() so cucascade builds one
+  // numa_region_pinned_host_memory_resource per NUMA node. This block
+  // verifies the configurator honoured that request post-construction and
+  // logs the host_space count alongside topology.num_numa_nodes for the
+  // Phase-6 validation artifact (/proc/PID/numa_maps evidence goes in
+  // 06-SUMMARY.md). Warn-not-throw: non-NUMA CI hosts legitimately report
+  // num_numa_nodes == 0 (RESEARCH.md Pitfall 4).
+  {
+    auto const mgpu05_host_spaces =
+      memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    spdlog::info(
+      "SiriusContext: {} host memory space(s) created for {} NUMA node(s)",
+      mgpu05_host_spaces.size(), topo.num_numa_nodes);
+    if (topo.num_numa_nodes > 0
+        && mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
+      spdlog::warn(
+        "SiriusContext: host space count ({}) != NUMA node count ({}) — "
+        "MGPU-05 expects one host space per NUMA domain. Check "
+        "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
+        "configuration.",
+        mgpu05_host_spaces.size(), topo.num_numa_nodes);
+    }
+  }
 
   // ---- Cucascade disk I/O backend registry + per-GPU backend cache ----
   // Registers the built-in "pipeline" backend and creates one
