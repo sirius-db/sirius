@@ -128,12 +128,17 @@ void downgrade_executor::processing_loop()
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-    // Build target spaces list: for GPU->HOST downgrade, target is HOST tier
+    // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK tier
     std::vector<const cucascade::memory::memory_space*> target_spaces;
     auto host_spaces =
       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     for (auto* hs : host_spaces) {
       target_spaces.push_back(hs);
+    }
+    auto disk_spaces =
+      _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+    for (auto* ds : disk_spaces) {
+      target_spaces.push_back(ds);
     }
 
     // === TIER 1: Data repositories ===

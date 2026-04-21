@@ -21,8 +21,9 @@ namespace parallel {
 
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
-  // WSM TODO: this should return a bool now?
-  static_cast<void>(_task_queue.push(std::move(task)));
+  if (!_task_queue.push(std::move(task))) {
+    SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
+  }
 }
 
 void itask_executor::start()

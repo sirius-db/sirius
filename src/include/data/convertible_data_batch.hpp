@@ -24,6 +24,7 @@
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -41,7 +42,7 @@ namespace sirius {
 /**
  * @brief Concrete convertible_data wrapping a cucascade::data_batch.
  *
- * Generalizes the downgrade_task::execute() pattern: saves batch state, locks for
+ * Generalizes the pattern for converting a data_batch: saves batch state, locks for
  * in_transit, iterates target memory spaces requesting reservations, converts via
  * the converter registry, and restores the previous state on all paths (success,
  * failure, exception).
@@ -94,12 +95,16 @@ class convertible_data_batch : public convertible_data {
         auto& converter_registry = sirius::converter_registry::get();
 
         switch (space->get_tier()) {
+          case cucascade::memory::Tier::GPU:
+            _batch->convert_to<cucascade::gpu_table_representation>(
+              converter_registry, mem_space, stream);
+            break;
           case cucascade::memory::Tier::HOST:
             _batch->convert_to<cucascade::host_data_representation>(
               converter_registry, mem_space, stream);
             break;
-          case cucascade::memory::Tier::GPU:
-            _batch->convert_to<cucascade::gpu_table_representation>(
+          case cucascade::memory::Tier::DISK:
+            _batch->convert_to<cucascade::disk_data_representation>(
               converter_registry, mem_space, stream);
             break;
           default: continue;
@@ -142,7 +147,7 @@ class convertible_data_batch : public convertible_data {
  * (back-to-front) for both partitions and batches, matching the downgrade eviction
  * pattern of preferring the most recently added data.
  * NOTE: We can technically convert data_batches that have had a task created, but those
- * data_batches should be pulled form the task queue
+ * data_batches should be pulled from the task queue
  */
 class convertible_data_batch_provider : public convertible_data_provider {
  public:

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "data/convertible_data.hpp"
+#include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "exec/inspectable_mpsc.hpp"
 #include "log/logging.hpp"
@@ -132,49 +133,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
       // Only convert batches in task_created state
       if (batch->get_state() != cucascade::batch_state::task_created) { continue; }
 
-      auto prev_state = batch->get_state();
-
-      if (!batch->try_to_lock_for_in_transit()) { continue; }
-
-      try {
-        auto data_size       = batch->get_data()->get_size_in_bytes();
-        bool space_succeeded = false;
-
-        for (const auto* space : target_spaces) {
-          auto reservation = res_mgr.request_reservation(
-            cucascade::memory::specific_memory_space{space->get_tier(), space->get_id().device_id},
-            data_size);
-          if (!reservation) { continue; }
-
-          auto* mem_space = res_mgr.get_memory_space(reservation->tier(), reservation->device_id());
-          if (!mem_space) { continue; }
-
-          auto& registry = sirius::converter_registry::get();
-
-          switch (space->get_tier()) {
-            case cucascade::memory::Tier::HOST:
-              batch->convert_to<cucascade::host_data_representation>(registry, mem_space, stream);
-              break;
-            case cucascade::memory::Tier::GPU:
-              batch->convert_to<cucascade::gpu_table_representation>(registry, mem_space, stream);
-              break;
-            default: continue;
-          }
-
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-          any_converted   = true;
-          space_succeeded = true;
-          break;
-        }
-
-        if (!space_succeeded) {
-          // No target space succeeded for this batch — restore state
-          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-        }
-      } catch (...) {
-        batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-        throw;
-      }
+      sirius::convertible_data_batch batch_converter(batch);
+      any_converted |= batch_converter.convert(target_spaces, stream, res_mgr);
     }
 
     return any_converted;
