@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <io/cucascade_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
@@ -29,6 +30,7 @@
 
 // standard library
 #include <algorithm>
+#include <filesystem>
 #include <stdexcept>
 
 namespace sirius::op::scan {
@@ -79,14 +81,16 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   duckdb::vector<std::string> const& names,
   std::size_t approximate_batch_size,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
-  std::size_t max_file_processed)
+  std::size_t max_file_processed,
+  std::shared_ptr<cucascade::idisk_io_backend> io_backend)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN, std::move(types), estimated_cardinality),
     _file_paths(file_paths),
     _is_projected(!projection_ids.empty()),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
-    _total_files(file_paths.size())
+    _total_files(file_paths.size()),
+    _io_backend(std::move(io_backend))
 {
   _selected_column_indices = detail::make_selected_column_indices(column_ids, projection_ids);
 
@@ -246,9 +250,20 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   result->datasources.reserve(input.file_paths.size());
   std::size_t file_idx = 0;
+  if (!_io_backend) {
+    throw std::runtime_error(
+      "[sirius_parquet_metadata_scan_operator] No cucascade io_backend supplied at "
+      "construction. Caller must resolve first GPU backend via "
+      "SiriusContext::get_gpu_io_backends() and pass it to the constructor.");
+  }
   for (auto const& file_path : input.file_paths) {
-    //===----------Read metadata footers----------===//
-    result->datasources.push_back(cudf::io::datasource::create(file_path));
+    //===----------Read metadata footers (IO-05: cucascade-backed)----------===//
+    // Planning-time metadata scan — first-GPU backend chosen deterministically
+    // by the caller. Metadata-only reads so context mismatch is correctness-neutral
+    // (research Pitfall 6).
+    auto const file_size = std::filesystem::file_size(file_path);
+    result->datasources.push_back(std::make_unique<sirius::io::cucascade_datasource>(
+      _io_backend, std::filesystem::path{file_path}, file_size));
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
 #if CUDF_VERSION_NUM >= 2604

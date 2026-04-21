@@ -27,7 +27,9 @@
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 
 // cucascade
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // cudf
@@ -43,6 +45,8 @@
 // standard library
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -54,6 +58,22 @@ namespace {
 //===----------------------------------------------------------------------===//
 // Helpers
 //===----------------------------------------------------------------------===//
+
+/// Construct a standalone cucascade disk-io backend for tests that directly
+/// instantiate sirius_parquet_metadata_scan_operator without a full
+/// SiriusContext in scope. The backend lives for the duration of the test.
+///
+/// IO-05 (Plan 05-05): the metadata scan operator now requires a cucascade
+/// io_backend at construction time. Tests that don't run under a registered
+/// SiriusContext use this helper to produce a registry-owned backend.
+inline std::shared_ptr<cucascade::idisk_io_backend> make_test_io_backend()
+{
+  static cucascade::io_backend_registry registry;
+  static std::once_flag registry_init_flag;
+  std::call_once(registry_init_flag,
+                 [&] { cucascade::register_builtin_io_backends(registry); });
+  return registry.create_default_backend();
+}
 
 /// Write a DuckDB table to a parquet file.  Returns the path.
 std::filesystem::path write_parquet(duckdb::Connection& con,
@@ -188,7 +208,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     projection_ids,
     names,
     approximate_batch_size,
-    std::move(table_filters));
+    std::move(table_filters),
+    sirius::op::scan::sirius_parquet_metadata_scan_operator::DEFAULT_MAX_FILE_PROCESSED,
+    make_test_io_backend());
 
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
     sirius::from_duckdb_vec(output_types), 0, gpu_space);
@@ -283,13 +305,17 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(sirius::from_duckdb_vec(schema.types),
-                                                             0,
-                                                             files,
-                                                             schema.column_ids,
-                                                             no_projection,
-                                                             schema.names,
-                                                             1024 * 1024);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(
+    sirius::from_duckdb_vec(schema.types),
+    0,
+    files,
+    schema.column_ids,
+    no_projection,
+    schema.names,
+    1024 * 1024,
+    /*table_filter_set=*/nullptr,
+    sirius::op::scan::sirius_parquet_metadata_scan_operator::DEFAULT_MAX_FILE_PROCESSED,
+    make_test_io_backend());
 
   REQUIRE(op.is_source());
   REQUIRE_FALSE(op.all_ports_empty());
@@ -320,13 +346,17 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(sirius::from_duckdb_vec(schema.types),
-                                                             0,
-                                                             files,
-                                                             schema.column_ids,
-                                                             no_projection,
-                                                             schema.names,
-                                                             1024 * 1024);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(
+    sirius::from_duckdb_vec(schema.types),
+    0,
+    files,
+    schema.column_ids,
+    no_projection,
+    schema.names,
+    1024 * 1024,
+    /*table_filter_set=*/nullptr,
+    sirius::op::scan::sirius_parquet_metadata_scan_operator::DEFAULT_MAX_FILE_PROCESSED,
+    make_test_io_backend());
 
   auto input = op.get_next_task_input_data();
   REQUIRE(input);

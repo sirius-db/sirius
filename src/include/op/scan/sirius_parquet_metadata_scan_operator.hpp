@@ -21,6 +21,9 @@
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 
+// cucascade
+#include <cucascade/data/disk_io_backend.hpp>
+
 // duckdb
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
@@ -92,6 +95,14 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    *                                (optional; may be nullptr if no filters or filter translation
    * fails).
    * @param max_file_processed      Maximum number of files handled by one metadata task.
+   * @param io_backend              Per-GPU cucascade io backend used to construct the
+   *                                sirius::io::cucascade_datasource adapters in execute().
+   *                                Planning-time call site — caller resolves via
+   *                                SiriusContext::get_gpu_io_backends() and passes the first
+   *                                GPU's backend (research Pitfall 6 — correctness-neutral).
+   *                                If nullptr, execute() throws at the footer-read site; it
+   *                                is the caller's responsibility to supply a backend for
+   *                                production code paths.
    *
    * @throws if projection_ids is nonempty or filter_expression is non-nullptr but names is empty
    *         (column names are required for both projection and filter pushdown).
@@ -105,7 +116,8 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
     duckdb::vector<std::string> const& names,
     std::size_t approximate_batch_size,
     duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set = nullptr,
-    std::size_t max_file_processed                              = DEFAULT_MAX_FILE_PROCESSED);
+    std::size_t max_file_processed                              = DEFAULT_MAX_FILE_PROCESSED,
+    std::shared_ptr<cucascade::idisk_io_backend> io_backend     = nullptr);
 
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
@@ -181,6 +193,12 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
   std::size_t _total_files;
+
+  /// Per-GPU cucascade io backend used for constructing cucascade_datasource adapters.
+  /// Supplied at construction (resolved by the caller via
+  /// SiriusContext::get_gpu_io_backends()). May be null in isolated test contexts;
+  /// if null, execute() throws at the datasource construction site.
+  std::shared_ptr<cucascade::idisk_io_backend> _io_backend;
 
   /// Atomic file-batch counter; incremented by get_next_task_input_data().
   std::atomic<std::size_t> _next_file_idx{0};
