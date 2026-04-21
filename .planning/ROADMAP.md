@@ -88,7 +88,11 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
   2. When P2P access is unavailable (`cudaDeviceCanAccessPeer` returns false), the converter falls back to the existing host-staged path without error — verified on a host with P2P explicitly disabled via `CUDA_VISIBLE_DEVICES` or equivalent (MGPU-06).
   3. A large scan run against a 2-GPU host with asymmetric available memory (e.g., GPU 0 pre-loaded to 80% capacity, GPU 1 idle) distributes batches proportional to free memory — the resulting batch counts per GPU differ by ≥2× and match the ratio of free capacity within 10% (MGPU-07).
   4. Integration test `test_gpu_execution_locality` extended with the P2P + adaptive-scan scenarios passes on a ≥2-GPU host; on single-GPU dev boxes the same test emits `WARN+return` per Catch2-v2 convention and does not fail (MGPU-06, MGPU-07).
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 07-01-PLAN.md — SiriusContext peer-access enable loop + CPU risk probe (MGPU-06 infra)
+- [ ] 07-02-PLAN.md — Un-hide MGPU-06 hidden tests + checksum integrity + return leg + conditional Sirius-side override (MGPU-06)
+- [ ] 07-03-PLAN.md — MGPU-07 asymmetric-memory distribution test + adaptive-scan integration scenario (MGPU-07)
+- [ ] 07-04-PLAN.md — Phase validation on N=2 host (compute-sanitizer + nsys + bandwidth + fallback) + SUMMARY + milestone-level closure cue (MGPU-06, MGPU-07)
 
 ## Progress
 
@@ -100,7 +104,7 @@ Phases execute in numeric order: 4 -> 5 -> 6 -> 7. Phase 6 may run partially in 
 | 4. cuCascade Bump + v1.0 Re-integration | 5/5 | Complete | 2026-04-20 |
 | 5. Cucascade-Backed Parquet I/O Migration | 6/6 | Complete | 2026-04-21 |
 | 6. Multi-GPU Gap Closure | 4/4 | Complete | 2026-04-21 |
-| 7. P2P Direct Transfer + Adaptive Scan Partitioning | 0/TBD | Not started | - |
+| 7. P2P Direct Transfer + Adaptive Scan Partitioning | 0/4 | Planned | - |
 
 ## Coverage
 
