@@ -93,7 +93,7 @@ These operators process data in a single pass without buffering.
 
 Applies a predicate expression to filter rows.
 
-- **GPU execution:** `GpuExpressionExecutor::select(batch, stream)` — evaluates the boolean expression and compacts rows using cuDF filtering
+- **GPU execution:** `gpu_expression_executor::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
 
 ### `sirius_physical_projection` — `PROJECTION`
@@ -101,7 +101,7 @@ Applies a predicate expression to filter rows.
 
 Evaluates a list of expressions to produce output columns.
 
-- **GPU execution:** `GpuExpressionExecutor::execute(batch, stream)` — evaluates each expression, producing a new table with projected columns
+- **GPU execution:** `gpu_expression_executor::execute(batch, stream)` — evaluates each expression, producing a new table with projected columns
 - **Key members:** `select_list` (output expressions)
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
@@ -309,8 +309,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | GPU_PARQUET_SCAN | Scan | Parquet byte reading from metadata |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
-| FILTER | Relational | `GpuExpressionExecutor::select()` |
-| PROJECTION | Relational | `GpuExpressionExecutor::execute()` |
+| FILTER | Relational | `gpu_expression_executor::select()` |
+| PROJECTION | Relational | `gpu_expression_executor::execute()` |
 | STREAMING_LIMIT | Relational | Atomic claim-based |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |

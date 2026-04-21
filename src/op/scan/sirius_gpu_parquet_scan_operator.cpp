@@ -25,6 +25,7 @@
 
 // cudf
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
@@ -61,9 +62,7 @@ void sirius_gpu_parquet_scan_operator::accumulate_metadata(
 }
 
 void sirius_gpu_parquet_scan_operator::finalize_partitions()
-{
-  _finalized.store(true, std::memory_order_release);
-}
+{ _finalized.store(true, std::memory_order_release); }
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface
@@ -165,9 +164,10 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   if (std::holds_alternative<std::shared_ptr<duckdb::Expression>>(scan_data->filter_expression)) {
     auto& duckdb_expr = std::get<std::shared_ptr<duckdb::Expression>>(scan_data->filter_expression);
     if (duckdb_expr) {
-      duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*duckdb_expr);
+      sirius::gpu_expression_executor gpu_expression_executor(
+        duckdb_expr.get(), cudf::get_current_device_resource_ref(), stream);
       auto input_batch  = sirius::make_data_batch(std::move(table), mem_space);
-      auto output_batch = gpu_expression_executor.select(input_batch, stream);
+      auto output_batch = gpu_expression_executor.select(input_batch);
       if (!output_batch) { return std::make_unique<operator_data>(); }
       table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
       SIRIUS_LOG_DEBUG(

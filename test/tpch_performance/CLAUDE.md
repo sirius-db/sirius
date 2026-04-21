@@ -198,8 +198,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 
 ## Query Files
 
-- `tpch_queries/orig/q*.sql` — Plain SQL queries
-- `tpch_queries/gpu/q*.sql` — Queries wrapped in `call gpu_execution('...');` for Sirius
+- `tpch_queries/orig/q*.sql` — Plain SQL queries used by both Sirius and DuckDB runners
 
 ## Key Files
 
