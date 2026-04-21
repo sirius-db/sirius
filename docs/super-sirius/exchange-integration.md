@@ -399,10 +399,11 @@ The Rust bump allocator (`gpu_staging_buffer.rs`) is replaced by per-transfer cu
 
 | Aspect | Current (Rust) | Proposed (C++) |
 |--------|----------------|----------------|
-| Allocation | Pre-allocated bump pool (1GB default) | On-demand reservation per transfer |
-| Memory pressure | Invisible to cuCascade | Participates in downgrade/upgrade |
-| Lifetime | Epoch-based reset when all leases drop | RAII reservation, released after transfer |
-| Overflow | Fallback to individual `cuMemAlloc` | Downgrade executor frees GPU memory |
+| Allocation | Pre-allocated bump pool (1GB default) | Pre-allocated region from cuCascade, sub-allocated per transfer |
+| NIXL registration | Once at startup, shared across transfers | Once at startup — avoids per-transfer `ucp_mem_map()` overhead |
+| Memory pressure | Invisible to cuCascade | Region reserved via cuCascade, but not reclaimable by downgrade |
+| Lifetime | Epoch-based reset when all leases drop | Bump/slab allocator within pre-registered region |
+| Overflow | Fallback to individual `cuMemAlloc` + per-transfer registration | Fallback to per-transfer cuCascade reservation + registration (slow path) |
 
 ### Sender Reservation Flow
 
@@ -474,7 +475,17 @@ nixl:
 
 ## Open Questions
 
-1. **Per-transfer NIXL registration overhead**: The current design registers and deregisters staging buffers with NIXL on every transfer. Under the hood, `registerMem()` calls `ucp_mem_map()` which pins pages and creates RDMA memory keys — a kernel-level operation that costs tens to hundreds of microseconds, scaling with buffer size. The current Rust design avoids this by registering a large staging buffer once at startup and sub-allocating from it. We may need a similar approach: allocate a staging region from cuCascade at init time, register it with NIXL once, and sub-allocate per transfer. This trades flexibility (on-demand reservation sizing) for avoiding per-transfer registration cost.
+1. **Per-transfer NIXL registration overhead**: Registering memory with NIXL is expensive. The full `registerMem()` path (under exclusive agent lock) involves:
+   - `ucp_mem_map()` — kernel-level page pinning and RDMA memory key creation
+   - `ucp_mem_query()` — additional syscall to verify GPU VRAM type
+   - `ucp_rkey_pack()` — serialize the remote access key into a transferable blob
+   - NIXL bookkeeping — section maps, metadata allocation
+
+   The exclusive agent lock (`NIXL_LOCK_GUARD` in `nixl_agent.cpp:427`) serializes all concurrent registrations on the same agent, creating contention when multiple worker threads register simultaneously. UCX's registration cache (RCACHE, configured with 1024 entries at `ucx_utils.cpp:458`) helps with re-registering the same address range, but with dynamic cuCascade allocations the addresses change each time, so RCACHE provides no benefit.
+
+   The current Rust code solves this by pre-registering staging buffers once at startup and sub-allocating per transfer — sender skips registration entirely when staged (`nixl_integration.rs:1320`), receiver tries pre-registered staging first and only falls back to per-transfer registration on overflow (`nixl_service.rs:164-208`).
+
+   **Recommendation**: Allocate a staging region from cuCascade at init time, register it with NIXL once, and sub-allocate per transfer (bump allocator or slab). This preserves cuCascade memory pressure management while avoiding per-transfer `ucp_mem_map()` cost. The trade-off is that the staging region has a fixed reservation size that cannot be reclaimed by the downgrade executor.
 
 2. **Staging memory space**: Should staging use a dedicated cuCascade memory space (separate capacity/thresholds) or share the GPU compute space? A dedicated space prevents exchange from starving compute, but reduces total available GPU memory.
 
