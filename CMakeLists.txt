@@ -364,6 +364,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_s3.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/io/s3/test_s3_integration.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp

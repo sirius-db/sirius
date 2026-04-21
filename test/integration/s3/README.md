@@ -1,9 +1,12 @@
 # S3 integration test scaffolding
 
 Local MinIO + fixture tooling for the Catch2 `[s3][integration]` tests,
-including the semantic end-to-end `[s3][parquet][integration]` test which
-reads a parquet object through Sirius's S3 pipeline and parses the bytes with
-DuckDB to verify row-level correctness.
+including both:
+- lower-level datasource/parquet semantic tests that read bytes through
+  Sirius's S3 datasource and validate them out-of-band, and
+- a true end-to-end `gpu_execution` test that queries
+  `read_parquet('s3://...')` through Sirius itself and verifies row-level
+  correctness without DuckDB `httpfs`.
 
 ## What this gives you
 
@@ -17,8 +20,9 @@ DuckDB to verify row-level correctness.
   container image so tests can bit-compare (and parse) S3 reads against the
   local copy.
 - `env.sh` that exports the `SIRIUS_TEST_S3_*` variables consumed by
-  `test/cpp/io/s3/test_s3_ioctx.cpp`, `test_s3_integration.cpp`, and
-  `test_s3_parquet_integration.cpp`.
+  `test/cpp/io/s3/test_s3_ioctx.cpp`, `test_s3_integration.cpp`,
+  `test_s3_parquet_integration.cpp`, and the S3 `gpu_execution` integration
+  tests under `test/cpp/integration/`.
 
 ## Requirements
 
@@ -74,7 +78,7 @@ so a second run produces identical files and the sha256 manifest stays stable:
 | `hello.txt` | 16 B | HEAD + tiny-range read |
 | `small.bin` | 20 KiB | bit-equal full-object read via `datasource_factory` |
 | `medium.bin` | 8 MiB | multi-range reads at odd offsets |
-| `small.parquet` | ~few KB | semantic end-to-end: read via `datasource_factory`, parse with DuckDB, assert patterned rows. Only generated if `pyarrow` is installed. |
+| `small.parquet` | ~few KB | deterministic parquet used by both the datasource-level semantic test and the true `gpu_execution` S3 end-to-end test. Only generated if `pyarrow` is installed. |
 
 `small.bin` / `medium.bin` are opaque deterministic byte blobs, not real
 parquet — the byte-equality tests in `test_s3_integration.cpp` do not invoke
@@ -82,7 +86,7 @@ a parquet reader.
 
 `small.parquet` has schema `id INT32, v INT64, s VARCHAR` and 256 rows with
 values derived in closed form (`v = id * 2654435761`, `s = "row-<id:04d>"`),
-so the C++ test regenerates expected values without reading the local file.
+so the C++ tests regenerate expected values without needing a CPU-side S3 read.
 
 A sha256 manifest is written to `fixtures/local/MANIFEST.sha256`.
 
