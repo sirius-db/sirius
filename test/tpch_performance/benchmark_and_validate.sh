@@ -268,6 +268,7 @@ fi
 # Parse optional flags
 DUCKDB_RESULTS_DIR=""
 MULTI_SESSION=false
+CACHE_LEVEL=""
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
@@ -297,6 +298,10 @@ while [ $# -gt 1 ]; do
         --multi-session)
             MULTI_SESSION=true
             shift
+            ;;
+        --cache-level)
+            CACHE_LEVEL="$2"
+            shift 2
             ;;
         *)
             break
@@ -525,6 +530,9 @@ for engine in $ENGINES; do
     EXTRA_ARGS+=(--timeout "$QUERY_TIMEOUT")
     if [ "$MULTI_SESSION" = true ]; then
         EXTRA_ARGS+=(--multi-session)
+    fi
+    if [ -n "$CACHE_LEVEL" ]; then
+        EXTRA_ARGS+=(--cache-level "$CACHE_LEVEL")
     fi
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log"
