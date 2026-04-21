@@ -148,10 +148,12 @@ void downgrade_executor::processing_loop()
 
     // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK tier
     std::vector<const cucascade::memory::memory_space*> target_spaces;
-    auto host_spaces =
-      _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    for (auto* hs : host_spaces) {
-      target_spaces.push_back(hs);
+    if (_space_id.tier == cucascade::memory::Tier::GPU) {
+      auto host_spaces =
+        _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      for (auto* hs : host_spaces) {
+        target_spaces.push_back(hs);
+      }
     }
     size_t host_end_idx = target_spaces.size();
     auto disk_spaces =
