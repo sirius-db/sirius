@@ -36,9 +36,33 @@
 
 #include <cucascade/memory/common.hpp>
 
+#include <cctype>
 #include <mutex>
 
 namespace sirius::op::scan {
+
+namespace {
+
+bool starts_with_query_keyword(const std::string& query, const std::string_view keyword)
+{
+  auto pos = query.find_first_not_of(" \t\r\n");
+  if (pos == std::string::npos) { return false; }
+  if (query.size() - pos < keyword.size()) { return false; }
+  for (std::size_t i = 0; i < keyword.size(); ++i) {
+    auto ch = static_cast<unsigned char>(query[pos + i]);
+    if (std::tolower(ch) != keyword[i]) { return false; }
+  }
+  return true;
+}
+
+bool is_cacheable_query_text(const std::string& query)
+{
+  return query.find("gpu_execution") != std::string::npos ||
+         query.find("gpu_processing") != std::string::npos ||
+         starts_with_query_keyword(query, "select") || starts_with_query_keyword(query, "with");
+}
+
+}  // namespace
 
 duckdb_scan_executor::duckdb_scan_executor(
   exec::thread_pool_config config,
@@ -77,13 +101,10 @@ void duckdb_scan_executor::set_completion_handler(
 bool duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
 {
   if (_cache_level == cache_level::NONE) { return false; }
-  // Only track queries that go through the Sirius GPU execution path.
-  // Other SQL statements (SET, INSERT, etc.) don't produce scan tasks
-  // and should not invalidate the cache.
-  if (query.find("gpu_execution") == std::string::npos &&
-      query.find("gpu_processing") == std::string::npos) {
-    return false;
-  }
+  // Only track statements that can drive Sirius scan tasks.
+  // Transparent execution now runs plain SELECT/WITH SQL, while helper
+  // statements like SET and CREATE VIEW should not invalidate the cache.
+  if (!is_cacheable_query_text(query)) { return false; }
   std::hash<std::string> hash_fn;
   auto new_query_hash = hash_fn(query);
   if (new_query_hash == _query_hash) {

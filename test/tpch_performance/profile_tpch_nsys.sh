@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Profile TPC-H GPU queries with NVIDIA Nsight Systems (nsys)
+# Profile TPC-H Sirius queries with NVIDIA Nsight Systems (nsys)
 #
 # Runs each query in its own DuckDB process wrapped by nsys, producing
 # per-query .nsys-rep and .sqlite files for analysis. Each query is
@@ -48,7 +48,7 @@ if [ $# -lt 1 ]; then
     echo "  SIRIUS_CONFIG_FILE - path to Sirius config (required)"
     echo "  DUCKDB             - path to DuckDB binary (default: build/release/duckdb)"
     echo "  PARQUET_DIR        - path to parquet data directory (default: test_datasets/tpch_parquet_sf<SF>)"
-    echo "  QUERY_DIR          - path to GPU query SQL files (default: test/tpch_performance/tpch_queries/gpu)"
+    echo "  QUERY_DIR          - path to TPC-H query SQL files (default: test/tpch_performance/tpch_queries/orig)"
     echo "  OUTPUT_DIR         - output directory for profiles (default: nsys_profiles/sf<SF>)"
     echo "  QUERY_TIMEOUT      - per-query timeout in seconds (default: 90)"
     echo "  ITERATIONS         - number of query iterations (default: 2 for cold+hot)"
@@ -63,7 +63,7 @@ else
 fi
 
 PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
-QUERY_DIR="${QUERY_DIR:-$SCRIPT_DIR/tpch_queries/gpu}"
+QUERY_DIR="${QUERY_DIR:-$SCRIPT_DIR/tpch_queries/orig}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/nsys_profiles/sf${SF}}"
 
 if [ ! -f "$DUCKDB" ]; then

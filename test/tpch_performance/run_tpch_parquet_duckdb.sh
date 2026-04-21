@@ -17,7 +17,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
-QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
+QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 
 PARQUET_DIR=""
 if [ "${1:-}" = "--parquet-dir" ]; then
@@ -75,12 +75,9 @@ for q in "${QUERIES[@]}"; do
     echo ""
     echo "========== Q${q} =========="
 
-    # Extract SQL from inside gpu_execution('...')
-    INNER_SQL=$(sed -n "s/call gpu_execution('//; s/');//; p" "$QUERY_FILE" | sed "s/''/'/g")
-
     TEMP_SQL=$(mktemp /tmp/tpch_duckdb_q${q}_XXXXXX.sql)
     printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
-    printf '%s\n' "$INNER_SQL" >> "$TEMP_SQL"
+    cat "$QUERY_FILE" >> "$TEMP_SQL"
 
     START_TIME=$(date +%s.%N)
     "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
