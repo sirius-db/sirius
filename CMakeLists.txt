@@ -138,8 +138,8 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/downgrade/downgrade_task.cpp
+    src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
-    src/expression_executor/gpu_expression_executor_state.cpp
     src/expression_executor/gpu_expression_translator.cpp
     src/expression_executor/regex/regex_playground.cpp
     src/expression_executor/specializations/gpu_execute_between.cpp
@@ -262,9 +262,6 @@ set(CUDA_SOURCES
     src/cuda/cudf/cudf_join.cu
     src/cuda/cudf/cudf_orderby.cu
     src/cuda/cudf/cudf_utils.cu
-    src/cuda/expression_executor/gpu_dispatch_materialize.cu
-    src/cuda/expression_executor/gpu_dispatch_select.cu
-    src/cuda/expression_executor/gpu_dispatch_string.cu
     src/cuda/operator/arbitrary_expression.cu
     src/cuda/operator/comparison_expression.cu
     src/cuda/operator/hash_join_inner.cu
@@ -279,6 +276,10 @@ set(CUDA_SOURCES
     src/cuda/print.cu
     src/cuda/utils.cu)
 # cmake-format: on
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
+  list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
+endif()
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
