@@ -165,6 +165,7 @@ class downgrade_executor {
   cucascade::shared_data_repository_manager& _data_repo_mgr;
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
+  std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
   sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };

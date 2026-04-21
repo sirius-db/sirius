@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <vector>
 
 // Forward declarations — avoid pulling in heavy headers
@@ -63,12 +64,14 @@ class convertible_data {
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
-   * @return true if the conversion succeeded, false if no target space was available.
+   * @return A vector of bytes converted per target space index on success, or nullopt if
+   *         no conversion occurred.
    * @throws std::exception on unrecoverable conversion errors (state is still restored).
    */
-  virtual bool convert(const std::vector<const cucascade::memory::memory_space*>& target_spaces,
-                       rmm::cuda_stream_view stream,
-                       sirius::memory::sirius_memory_reservation_manager& res_mgr) = 0;
+  virtual std::optional<std::vector<std::size_t>> convert(
+    const std::vector<const cucascade::memory::memory_space*>& target_spaces,
+    rmm::cuda_stream_view stream,
+    sirius::memory::sirius_memory_reservation_manager& res_mgr) = 0;
 
   /**
    * @brief Get the size in bytes of this data unit in the specified memory space.

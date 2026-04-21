@@ -71,14 +71,16 @@ TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_dat
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  bool result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
 
-  REQUIRE(result == true);
+  REQUIRE(result.has_value());
+  REQUIRE((*result).size() == 1);
+  REQUIRE((*result)[0] > 0);
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
 
-TEST_CASE("convertible_data_batch returns false with empty target_spaces",
+TEST_CASE("convertible_data_batch returns nullopt with empty target_spaces",
           "[convertible_data_batch]")
 {
   auto& e = env();
@@ -90,9 +92,9 @@ TEST_CASE("convertible_data_batch returns false with empty target_spaces",
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  bool result = wrapper.convert({}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({}, e.stream(), *e.mgr);
 
-  REQUIRE(result == false);
+  REQUIRE_FALSE(result.has_value());
   REQUIRE(batch->get_memory_space() == e.gpu_space);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
@@ -197,9 +199,9 @@ TEST_CASE("convertible_data_batch convert fails when batch already in_transit",
   REQUIRE(batch->get_state() == cucascade::batch_state::in_transit);
 
   sirius::convertible_data_batch wrapper(batch);
-  bool result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
 
-  REQUIRE(result == false);
+  REQUIRE_FALSE(result.has_value());
   // State is preserved as in_transit
   REQUIRE(batch->get_state() == cucascade::batch_state::in_transit);
 

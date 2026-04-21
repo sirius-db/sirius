@@ -18,6 +18,7 @@
 
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -69,27 +70,29 @@ class convertible_data_batch : public convertible_data {
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
-   * @return true if the conversion succeeded, false if no target space was available.
+   * @return A vector of bytes converted per target space index on success, or nullopt if
+   *         no conversion occurred.
    */
-  bool convert(const std::vector<const cucascade::memory::memory_space*>& target_spaces,
-               rmm::cuda_stream_view stream,
-               sirius::memory::sirius_memory_reservation_manager& res_mgr) override
+  std::optional<std::vector<std::size_t>> convert(
+    const std::vector<const cucascade::memory::memory_space*>& target_spaces,
+    rmm::cuda_stream_view stream,
+    sirius::memory::sirius_memory_reservation_manager& res_mgr) override
   {
     auto prev_state = _batch->get_state();
 
-    if (!_batch->try_to_lock_for_in_transit()) { return false; }
+    if (!_batch->try_to_lock_for_in_transit()) { return std::nullopt; }
 
     try {
       auto data_size = _batch->get_data()->get_size_in_bytes();
 
-      for (const auto* space : target_spaces) {
-        auto* mem_space = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
+      for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
+        const auto* space = target_spaces[idx];
+        auto* mem_space   = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
         if (!mem_space) { continue; }
 
-        // Non-blocking reservation: request_reservation() blocks indefinitely when
-        // GPU memory is unavailable, which deadlocks when the calling task already
-        // holds a reservation on the same memory space.
+        // Non-blocking reservation
         auto reservation = mem_space->make_reservation_or_null(data_size);
+
         if (!reservation) { continue; }
 
         auto& converter_registry = sirius::converter_registry::get();
@@ -111,12 +114,14 @@ class convertible_data_batch : public convertible_data {
         }
 
         _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-        return true;
+        std::vector<std::size_t> bytes_per_target(target_spaces.size(), 0);
+        bytes_per_target[idx] = data_size;
+        return bytes_per_target;
       }
 
       // No target space succeeded
       _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-      return false;
+      return std::nullopt;
     } catch (...) {
       _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
       throw;
