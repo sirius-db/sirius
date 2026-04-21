@@ -401,7 +401,7 @@ Performed after writing this SUMMARY.
 - `97b9085 docs(07-01): complete plan` — FOUND
 - `e4c452d test(07-02): un-hide + checksum` — FOUND
 - `7182797 test(07-02): enable_p2p_for_test helper` — FOUND
-- `18152b9 feat(07-02): P2P converter override` — FOUND (full hash 18352b9)
+- `18352b9 feat(07-02): P2P converter override` — FOUND
 - `f2a78cb docs(07-02): complete plan` — FOUND
 - `25be040 feat(07-03): MGPU-07 tests` — FOUND
 - `8115f21 docs(07-03): complete plan` — FOUND
