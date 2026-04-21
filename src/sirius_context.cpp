@@ -253,6 +253,62 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // ---- MGPU-06: Enable P2P peer access for every available GPU pair ----
+  // cucascade::convert_gpu_to_gpu at cucascade/src/data/representation_converter.cpp:173
+  // already calls cudaMemcpyPeerAsync on every GPU->GPU conversion. For that
+  // call to bypass host staging and avoid the Phase-4-deferred return-leg bug
+  // at test/cpp/downgrade/test_downgrade_executor.cpp:813 TODO(MGPU-06), peer
+  // access must be enabled ONCE at init for every (src, dst) pair the host
+  // supports. This block is the net-new Sirius code RESEARCH.md Finding 1
+  // identified as the core MGPU-06 closure. Non-fatal failure mode:
+  // spdlog::error and continue -- host-staged fallback in cucascade's
+  // converter is a correct alternate path.
+  {
+    auto const& mgpu06_topo = config_.get_hw_topology();
+    if (mgpu06_topo.num_gpus >= 2) {
+      peer_access_enabled_pairs_.reserve(
+        static_cast<size_t>(mgpu06_topo.num_gpus) * (mgpu06_topo.num_gpus - 1));
+      for (unsigned i = 0; i < mgpu06_topo.num_gpus; ++i) {
+        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{static_cast<int>(i)}};
+        for (unsigned j = 0; j < mgpu06_topo.num_gpus; ++j) {
+          if (i == j) continue;
+          int can_access        = 0;
+          cudaError_t probe_err = cudaDeviceCanAccessPeer(&can_access,
+                                                          static_cast<int>(i),
+                                                          static_cast<int>(j));
+          if (probe_err != cudaSuccess) {
+            spdlog::error(
+              "SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {} (MGPU-06)",
+              i, j, cudaGetErrorString(probe_err));
+            continue;
+          }
+          if (can_access == 0) {
+            spdlog::info(
+              "SiriusContext: no P2P access {} -> {} -- falling back to host staging (MGPU-06)",
+              i, j);
+            continue;
+          }
+          cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
+          if (enable_err == cudaSuccess
+              || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
+            peer_access_enabled_pairs_.emplace(static_cast<int>(i),
+                                               static_cast<int>(j));
+            spdlog::info("SiriusContext: P2P enabled {} -> {} (MGPU-06)", i, j);
+          } else {
+            spdlog::error(
+              "SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {} (MGPU-06)",
+              j, i, cudaGetErrorString(enable_err));
+          }
+        }
+      }
+    } else {
+      spdlog::info(
+        "SiriusContext: skipping MGPU-06 peer-access enable loop (num_gpus={}); "
+        "single-GPU host has no pairs to enable",
+        mgpu06_topo.num_gpus);
+    }
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -356,6 +412,11 @@ void SiriusContext::terminate()
   // cudaEventDestroy) runs against a still-live CUDA context. Mirrors
   // the downgrade_executors_ teardown order above.
   gpu_io_backends_.clear();
+  // MGPU-06: clear peer-access cache. No cudaDeviceDisablePeerAccess call --
+  // CUDA cleans up peer-access mappings at process exit, and explicit disable
+  // during shutdown risks tearing down mappings the memory_manager_ teardown
+  // (below) may still traverse for GPU->HOST drains.
+  peer_access_enabled_pairs_.clear();
   io_backend_registry_.clear();
 
   // Ensure all CUDA operations (including async copies from downgrade tasks)
