@@ -26,6 +26,8 @@
 
 #include <rmm/resource_ref.hpp>
 
+#include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/data/io_backend_registry.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
 #include <duckdb/planner/extension_callback.hpp>
@@ -34,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace cucascade::memory {
@@ -137,6 +140,35 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
   get_downgrade_executors() const;
 
+  /// @brief Resolve the per-GPU cucascade disk I/O backend for the given device.
+  ///
+  /// Backends are constructed once per GPU during initialize() under
+  /// rmm::cuda_set_device_raii so their internal streams + pinned buffers are
+  /// bound to the matching CUDA context. Callers supply device_id from
+  /// gpu_pipeline_task::get_preferred_device_id() (local_state wins over
+  /// global_state per Phase 4 push-model semantics).
+  ///
+  /// @param device_id GPU device id (must be one of the GPU memory spaces
+  ///        configured at context init).
+  /// @return Shared pointer to the backend for that device.
+  /// @throws std::out_of_range if no backend was registered for device_id.
+  [[nodiscard]] std::shared_ptr<cucascade::idisk_io_backend> get_io_backend_for(
+    int device_id) const;
+
+  /// @brief Read-only view of the full per-GPU backend cache.
+  ///
+  /// Used by consumers that need to enumerate all configured GPU backends
+  /// (e.g. task_creator seeding parquet_scan_task_global_state with a copy
+  /// of the map, or planning-time reads picking the first-available backend
+  /// deterministically). Returns by const-reference — the map's lifetime is
+  /// tied to SiriusContext; callers must not hold the reference past
+  /// terminate().
+  [[nodiscard]] std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> const&
+  get_gpu_io_backends() const
+  {
+    return gpu_io_backends_;
+  }
+
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
@@ -163,6 +195,14 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  // Cucascade disk I/O backend registry + per-GPU cache of idisk_io_backend
+  // instances. One backend per GPU — constructed in initialize() under
+  // rmm::cuda_set_device_raii so streams and pinned host buffers bind to the
+  // matching CUDA context. Destroyed in terminate() BEFORE memory_manager_
+  // shutdown so cudaFreeHost / cudaStreamDestroy in the backend dtors still
+  // have a live CUDA context (mirrors downgrade_executors_ teardown pattern).
+  cucascade::io_backend_registry io_backend_registry_;
+  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends_;
   // Destroyed before memory_manager_ (declared after it — reverse destruction order).
   std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
   // Previous cuDF pinned resource and threshold — restored in terminate() before
