@@ -264,7 +264,7 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
 2. **Reader-level filter pushdown:** The cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. The `TABLE_SCAN` operator is set to passthrough (`passthrough = true`) since filtering is already done by the reader.
 
-If AST translation fails (e.g., unsupported expression types), the `TABLE_SCAN` operator runs the `GpuExpressionExecutor` on the decoded batch as before.
+If AST translation fails (e.g., unsupported expression types), the `TABLE_SCAN` operator runs the `gpu_expression_executor` on the decoded batch as before.
 
 **Filter translation path:** `TableFilterSet` → `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER` and `IS_NOT_NULL` types) → `gpu_expression_translator` → cuDF AST tree.
 

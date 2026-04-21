@@ -12,6 +12,17 @@ option(ENABLE_LEGACY_SIRIUS
 # CUDA kernels: GPUColumn, GPUPipeline, GPUExecutor, operators, etc.)
 # cmake-format: off
 set(SIRIUS_LEGACY_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/gpu_expression_executor.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/gpu_expression_executor_state.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_between.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_case.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_cast.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_comparison.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_conjunction.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_constant.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_function.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_operator.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_reference.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gpu_columns.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gpu_executor.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gpu_meta_pipeline.cpp
@@ -39,6 +50,12 @@ set(SIRIUS_LEGACY_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_table_scan.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_top_n.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_ungrouped_aggregate.cpp
+    PARENT_SCOPE)
+
+set(SIRIUS_LEGACY_CUDA_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_materialize.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_select.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_string.cu
     PARENT_SCOPE)
 
 # Sources only compiled when the legacy entry point is enabled

@@ -46,16 +46,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   /// TODO: the operator should choose the execution strategy based on statistics and a deeper
   /// understand of the trade-offs between the different strategies. See:
   /// https://github.com/sirius-db/sirius/issues/636
-  sirius::experimental::expression_executor_strategy strategy;
-  if (!sirius::experimental::string_to_strategy(duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY,
-                                                strategy)) {
-    throw duckdb::InvalidInputException(
-      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
-      "ast_jit",
-      duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY);
-  }
-  sirius::experimental::gpu_expression_executor gpu_expression_executor(
-    select_list, strategy, cudf::get_current_device_resource_ref(), stream);
+  sirius::gpu_expression_executor gpu_expression_executor(
+    select_list, cudf::get_current_device_resource_ref(), stream);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

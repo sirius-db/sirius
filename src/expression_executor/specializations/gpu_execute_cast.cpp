@@ -21,9 +21,10 @@
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
 
 // cudf
+#include <cudf/cudf_utils.hpp>
 #include <cudf/unary.hpp>
 
-namespace sirius::experimental {
+namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
 execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression const& expr,
@@ -79,32 +80,4 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
   return execute_result(std::move(result_column));
 }
 
-}  // namespace sirius::experimental
-
-namespace duckdb {
-namespace sirius {
-
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const BoundCastExpression& expr, GpuExpressionExecutorState& root)
-{
-  auto result = make_uniq<GpuExpressionState>(expr, root);
-  result->AddChild(*expr.child);
-  return std::move(result);
-}
-
-// Note that constants are CASTed before they reach the execution engine
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpression& expr,
-                                                             GpuExpressionState* state)
-{
-  auto return_type = GetCudfType(expr.return_type);
-
-  // Resolve the child
-  auto* child_state = state->child_states[0].get();
-  auto child        = Execute(*expr.child, child_state);
-
-  // Execute the cast
-  return cudf::cast(child->view(), return_type, execution_stream, resource_ref);
-}
-
 }  // namespace sirius
-}  // namespace duckdb

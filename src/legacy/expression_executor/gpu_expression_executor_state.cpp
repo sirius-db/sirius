@@ -16,8 +16,8 @@
 
 #include <cudf/cudf_utils.hpp>
 
-#include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
+#include <legacy/expression_executor/gpu_expression_executor.hpp>
+#include <legacy/expression_executor/gpu_expression_executor_state.hpp>
 
 namespace duckdb {
 namespace sirius {

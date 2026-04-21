@@ -194,7 +194,7 @@ Query hash matching detects cache hits. On cache hit (PRELOAD mode), data is loa
 2. The AST is set on `parquet_reader_options` via `set_filter()`, pushing filtering into the cuDF reader
 3. `TABLE_SCAN` is set to passthrough (no GPU expression evaluation needed)
 
-If translation fails, filtering falls back to `GpuExpressionExecutor` on the decoded batch.
+If translation fails, filtering falls back to `gpu_expression_executor` on the decoded batch.
 
 **Code path:**
 - `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`

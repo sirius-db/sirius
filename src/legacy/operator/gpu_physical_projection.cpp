@@ -16,7 +16,7 @@
 
 #include "operator/gpu_physical_projection.hpp"
 
-#include "expression_executor/gpu_expression_executor.hpp"
+#include "legacy/expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {
