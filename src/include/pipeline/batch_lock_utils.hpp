@@ -36,8 +36,7 @@ namespace pipeline {
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
  *
  * If the batch is already in the requested memory space it is locked in place. If it resides
- * elsewhere the batch is first converted (moved) to the requested space via
- * convertible_data_batch::convert() and then locked.
+ * elsewhere the batch is first converted (moved) to the requested space and then locked.
  *
  * @param batch                   The batch to lock/prepare.
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current

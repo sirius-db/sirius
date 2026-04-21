@@ -44,7 +44,7 @@ namespace sirius {
  * Generalizes the downgrade_task::execute() pattern: saves batch state, locks for
  * in_transit, iterates target memory spaces requesting reservations, converts via
  * the converter registry, and restores the previous state on all paths (success,
- * failure, exception). This satisfies BATCH-03 failure safety.
+ * failure, exception).
  */
 class convertible_data_batch : public convertible_data {
  public:

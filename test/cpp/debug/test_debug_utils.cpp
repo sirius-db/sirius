@@ -528,7 +528,7 @@ TEST_CASE("debug_stats on numeric columns produces output without throwing", "[d
 }
 
 // ---------------------------------------------------------------------------
-// Test case 16: debug_stats skips BOOL column with non-numeric note (D-08, STATS-02)
+// Test case 16: debug_stats skips BOOL column with non-numeric note
 // ---------------------------------------------------------------------------
 
 TEST_CASE("debug_stats skips BOOL column as non-numeric", "[debug_utils]")
@@ -1301,7 +1301,7 @@ TEST_CASE("debug_sample basic operation with named columns", "[debug_utils]")
 }
 
 // ---------------------------------------------------------------------------
-// Test case 41: debug_sample with fixed seed is reproducible (SAMPLE-03, D-08)
+// Test case 41: debug_sample with fixed seed is reproducible
 // ---------------------------------------------------------------------------
 
 TEST_CASE("debug_sample with fixed seed is reproducible", "[debug_utils]")
