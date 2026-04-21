@@ -182,7 +182,7 @@ class sirius_physical_operator {
 
   //! The physical operator type
   SiriusPhysicalOperatorType type;
-  //! The set of children of the operator
+  //! The set of children of the operator (operators that feed data _into_ the current operator)
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
   duckdb::vector<sirius::logical_type> types;

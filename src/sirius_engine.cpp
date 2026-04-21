@@ -63,14 +63,14 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
     query_group_uuid(uuid::now_v7()),
     query_group_observer(quent::query_group::create_observer()),
     query_handle(quent::query::create(quent::query::Init{
-      .instance_name  = ::rust::String(""),
+      .instance_name  = "",
       .query_group_id = query_group_uuid,
     }))
 {
   // Declare the query group under this engine
   query_group_observer->declaration(query_group_uuid,
                                     quent::query_group::Declaration{
-                                      .instance_name = ::rust::String("default"),
+                                      .instance_name = "default",
                                       .engine_id     = sirius_iface.telemetry.engine_id(),
                                     });
 }
@@ -201,12 +201,12 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
   return res;
 }
 
-void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> plan)
+void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> physical_plan)
 {
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
   query_handle->planning();
   reset();
-  sirius_owned_plan = std::move(plan);
+  sirius_owned_plan = std::move(physical_plan);
   // Pre-fetch iceberg delete-file metadata before initialize_internal() assigns
   // operator IDs to pipeline-breaker operators (PARTITION, CONCAT, etc.).
   // The DuckDB metadata connection is opened under InternalQueryGuard so that

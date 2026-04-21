@@ -28,7 +28,7 @@ class sirius_pipeline;
 
 namespace sirius::telemetry {
 
-/// Owns the top-level telemetry states for a single Sirius session.
+/// Owns the top-level telemetry states for a single Sirius session (sirius_interface level).
 class telemetry_context {
  public:
   telemetry_context();

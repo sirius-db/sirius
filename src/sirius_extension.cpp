@@ -394,7 +394,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
 
-  // Parse the query just to get the result type information and to create preparedstatmement data
+  // Parse the query just to get the result type information and to create PreparedStatementData
   Parser parser(context.GetParserOptions());
   parser.ParseQuery(result->query);
   Planner planner(context);
