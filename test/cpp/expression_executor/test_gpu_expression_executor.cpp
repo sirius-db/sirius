@@ -74,7 +74,9 @@ memory_space* get_default_gpu_space()
 }
 
 rmm::device_async_resource_ref get_resource_ref(memory_space& space)
-{ return rmm::to_device_async_resource_ref_checked(space.get_default_allocator()); }
+{
+  return rmm::to_device_async_resource_ref_checked(space.get_default_allocator());
+}
 
 template <typename T>
 std::vector<T> copy_column_to_host(const cudf::column_view& col)
