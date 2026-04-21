@@ -102,6 +102,39 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   return sirius::make_data_batch(std::move(table), gpu_space);
 }
 
+// MGPU-06 test helper: enable CUDA driver-level peer access for every GPU
+// pair, idempotently, with sticky-error consumption (matches Plan 07-01's
+// enable-loop pattern at sirius_context.cpp). Test-scope because these
+// TEST_CASEs build a bare memory manager rather than going through
+// SiriusContext::initialize(). Without this, cucascade's peer-async
+// convert_gpu_to_gpu triggers cudaErrorIllegalAddress on the return leg.
+// Returns true if at least one pair was enabled (bidirectionally
+// P2P-capable).
+inline bool enable_p2p_for_test(int num_gpus)
+{
+  bool any_enabled = false;
+  for (int i = 0; i < num_gpus; ++i) {
+    for (int j = 0; j < num_gpus; ++j) {
+      if (i == j) { continue; }
+      int can_access = 0;
+      if (cudaDeviceCanAccessPeer(&can_access, i, j) != cudaSuccess || !can_access) {
+        (void)cudaGetLastError();
+        continue;
+      }
+      cudaError_t prev_dev_err = cudaSetDevice(i);
+      (void)prev_dev_err;
+      cudaError_t enable_err = cudaDeviceEnablePeerAccess(j, 0);
+      (void)cudaGetLastError();  // consume sticky state (see 07-01 SUMMARY)
+      if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
+        any_enabled = true;
+      }
+    }
+  }
+  cudaSetDevice(0);
+  (void)cudaGetLastError();
+  return any_enabled;
+}
+
 /**
  * @brief MGPU-06 data integrity guard (Phase 7 / RESEARCH.md Pitfall 2).
  *
@@ -558,6 +591,12 @@ TEST_CASE("gpu_to_gpu_transfer_via_converter", "[multi_gpu_transfer]")
   auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
   REQUIRE(gpu0->get_device_id() != gpu1->get_device_id());
 
+  // Enable CUDA driver-level peer access (Plan 07-01's enable loop runs
+  // inside SiriusContext::initialize(); this TEST_CASE bypasses that seam).
+  // Without the enable, cucascade's peer-async convert_gpu_to_gpu triggers
+  // cudaErrorIllegalAddress on the return leg (MGPU-06 bug).
+  enable_p2p_for_test(2);
+
   // Create a batch on GPU 0.
   auto batch = make_gpu_batch(*gpu0, 500);
   REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
@@ -905,6 +944,10 @@ TEST_CASE("p2p_transfer_converter_round_trip", "[mem_04_p2p_transfer][multi_gpu]
   REQUIRE(gpu_spaces.size() == 2);
   auto* gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
   auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
+
+  // Enable CUDA driver-level peer access (Plan 07-01's enable loop is
+  // bypassed because this TEST_CASE doesn't go through SiriusContext).
+  enable_p2p_for_test(2);
 
   auto batch = make_gpu_batch(*gpu0, 500);
   REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
