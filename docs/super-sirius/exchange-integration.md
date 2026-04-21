@@ -474,12 +474,14 @@ nixl:
 
 ## Open Questions
 
-1. **Staging memory space**: Should staging use a dedicated cuCascade memory space (separate capacity/thresholds) or share the GPU compute space? A dedicated space prevents exchange from starving compute, but reduces total available GPU memory.
+1. **Per-transfer NIXL registration overhead**: The current design registers and deregisters staging buffers with NIXL on every transfer. Under the hood, `registerMem()` calls `ucp_mem_map()` which pins pages and creates RDMA memory keys — a kernel-level operation that costs tens to hundreds of microseconds, scaling with buffer size. The current Rust design avoids this by registering a large staging buffer once at startup and sub-allocating from it. We may need a similar approach: allocate a staging region from cuCascade at init time, register it with NIXL once, and sub-allocate per transfer. This trades flexibility (on-demand reservation sizing) for avoiding per-transfer registration cost.
 
-2. **NIXL agent lifecycle**: One per `SiriusContext` (shared across queries) or one per query? Per-context is simpler but requires thread-safe access. Per-query provides isolation but increases NIXL initialization overhead.
+2. **Staging memory space**: Should staging use a dedicated cuCascade memory space (separate capacity/thresholds) or share the GPU compute space? A dedicated space prevents exchange from starving compute, but reduces total available GPU memory.
 
-3. **STRING column offset corruption**: The known NIXL RDMA bug that corrupts STRING column offsets (see `.planning/codebase/CONCERNS.md`) needs to be addressed regardless of C++ vs Rust. The current workaround uses `cudf::pack` instead of `cudf::chunked_pack` for STRING columns — this workaround carries over to the C++ implementation.
+3. **NIXL agent lifecycle**: One per `SiriusContext` (shared across queries) or one per query? Per-context is simpler but requires thread-safe access. Per-query provides isolation but increases NIXL initialization overhead.
 
-4. **bRPC fallback**: Should the bRPC CPU fallback path also move to C++ eventually, or remain in Rust as a separate code path?
+4. **STRING column offset corruption**: The known NIXL RDMA bug that corrupts STRING column offsets (see `.planning/codebase/CONCERNS.md`) needs to be addressed regardless of C++ vs Rust. The current workaround uses `cudf::pack` instead of `cudf::chunked_pack` for STRING columns — this workaround carries over to the C++ implementation.
 
-5. **Host-pinned receive buffers**: Should the receiver support allocating host-pinned memory (via cuCascade HOST tier) as a fallback when GPU memory is exhausted, instead of NACK-ing the sender?
+5. **bRPC fallback**: Should the bRPC CPU fallback path also move to C++ eventually, or remain in Rust as a separate code path?
+
+6. **Host-pinned receive buffers**: Should the receiver support allocating host-pinned memory (via cuCascade HOST tier) as a fallback when GPU memory is exhausted, instead of NACK-ing the sender?
