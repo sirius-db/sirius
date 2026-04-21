@@ -21,7 +21,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 - Decimal phases (e.g., 4.1): Urgent insertions (via `/gsd:insert-phase`)
 
 - [x] **Phase 4: cuCascade Bump + v1.0 Re-integration** — Submodule bump to `origin/main`; replay 23 multi-GPU commits onto current `dev` so they compile against sirius-native types, YAML config, and PR #96 headers
-- [ ] **Phase 5: Cucascade-Backed Parquet I/O Migration** — Ship `sirius::io::cucascade_datasource`, replace every `cudf::io::datasource::create(path)` call-site, remove the `rmm::cuda_stream_default` hygiene debt adjacent to the touched scan code
+- [x] **Phase 5: Cucascade-Backed Parquet I/O Migration** — Ship `sirius::io::cucascade_datasource`, replace every `cudf::io::datasource::create(path)` call-site, remove the `rmm::cuda_stream_default` hygiene debt adjacent to the touched scan code
 - [ ] **Phase 6: Multi-GPU Gap Closure (Topology, Device Safety, Host Memory, GPU↔GPU Converter)** — Close the structural v1.0 gaps (FOUND-01/04/06, CUCS-01/02) that never cleared on `feature/multi-gpu-execution`
 - [ ] **Phase 7: P2P Direct Transfer + Adaptive Scan Partitioning** — Complete the pending v1.0 03-02 plan (MEM-04 P2P via `cudaMemcpyPeerAsync`, MEM-05 memory-proportional scan distribution)
 
@@ -61,7 +61,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 - [x] 05-03-PLAN.md — SiriusContext io_backend_registry + per-GPU backend cache under rmm::cuda_set_device_raii (IO-04, IO-11 infra)
 - [x] 05-04-PLAN.md — parquet_scan_task.cpp migration (lines 312 + 699) + HYG-01 explicit stream fix at line 468 (IO-05, IO-07, HYG-01)
 - [x] 05-05-PLAN.md — sirius_parquet_metadata_scan_operator.cpp:251 + iceberg_scan_task.cpp:57/120 migrations (IO-05, IO-06)
-- [ ] 05-06-PLAN.md — IO-08 global grep gate + HYG-02 sweep + SF1 diff + IO-11 compute-sanitizer + IO-10 SF10 measurement + phase sign-off checkpoint + phase SUMMARY (IO-08, IO-09, IO-10, IO-11, HYG-02)
+- [x] 05-06-PLAN.md — IO-08 global grep gate + HYG-02 sweep + SF1 diff + IO-11 compute-sanitizer + IO-10 SF10 measurement + phase sign-off checkpoint + phase SUMMARY (IO-08, IO-09, IO-10, IO-11, HYG-02)
 
 ### Phase 6: Multi-GPU Gap Closure (Topology, Device Safety, Host Memory, GPU↔GPU Converter)
 **Goal**: The five structural v1.0 gaps that never cleared on `feature/multi-gpu-execution` — runtime topology discovery, single-GPU no-regression guarantee, device-guard enforcement across every thread, GPU↔GPU converter registration, and per-NUMA pinned host memory spaces — are closed on `dev`-rebased code.
@@ -94,7 +94,7 @@ Phases execute in numeric order: 4 -> 5 -> 6 -> 7. Phase 6 may run partially in 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 4. cuCascade Bump + v1.0 Re-integration | 5/5 | Complete | 2026-04-20 |
-| 5. Cucascade-Backed Parquet I/O Migration | 0/6 | Not started | - |
+| 5. Cucascade-Backed Parquet I/O Migration | 6/6 | Complete | 2026-04-21 |
 | 6. Multi-GPU Gap Closure | 0/TBD | Not started | - |
 | 7. P2P Direct Transfer + Adaptive Scan Partitioning | 0/TBD | Not started | - |
 
