@@ -20,9 +20,10 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
-
+#include <utility>
 namespace sirius::exec {
 
 template <typename T>
@@ -141,7 +142,7 @@ class inspectable_mpsc {
   /**
    * \brief Returns true if the queue is active (not interrupted).
    */
-  [[nodiscard]] bool is_open() const noexcept
+  [[nodiscard]] bool is_open() const
   {
     std::unique_lock<std::mutex> lock(_mutex);
     return _active;
@@ -150,7 +151,7 @@ class inspectable_mpsc {
   /**
    * \brief Returns true if the queue contains no items.
    */
-  [[nodiscard]] bool is_empty() const noexcept
+  [[nodiscard]] bool is_empty() const
   {
     std::unique_lock<std::mutex> lock(_mutex);
     return _queue.empty();
@@ -159,7 +160,7 @@ class inspectable_mpsc {
   /**
    * \brief Returns the number of items currently in the queue.
    */
-  [[nodiscard]] std::size_t size() const noexcept
+  [[nodiscard]] std::size_t size() const
   {
     std::unique_lock<std::mutex> lock(_mutex);
     return _queue.size();
@@ -174,8 +175,7 @@ class inspectable_mpsc {
    *
    * Holds the mutex for the entire scan. Predicate should be lightweight.
    */
-  std::unique_ptr<T> pop_if(std::function<bool(const T&)> predicate,
-                             bool front_to_back)
+  std::unique_ptr<T> pop_if(std::function<bool(const T&)> predicate, bool front_to_back)
   {
     std::unique_lock<std::mutex> lock(_mutex);
     if (front_to_back) {
@@ -238,8 +238,7 @@ class inspectable_mpsc {
    * allowing state inspection that requires non-const access. Holds
    * the mutex for the full scan duration.
    */
-  std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate,
-                                     bool front_to_back)
+  std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate, bool front_to_back)
   {
     std::unique_lock<std::mutex> lock(_mutex);
     if (front_to_back) {
@@ -275,8 +274,7 @@ class inspectable_mpsc {
    * drain(), or other mutating queue operation. Safe under MPSC
    * single-consumer.
    */
-  T* mutable_get_if(std::function<bool(T&)> predicate,
-                     bool front_to_back)
+  T* mutable_get_if(std::function<bool(T&)> predicate, bool front_to_back)
   {
     std::unique_lock<std::mutex> lock(_mutex);
     if (front_to_back) {
