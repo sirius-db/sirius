@@ -134,14 +134,12 @@ void gpu_pipeline_executor::manager_loop()
         freed =
           _downgrade_executor
             ->request_downgrade([mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
-                                  std::lock_guard<std::mutex> lock(reservation_mutex);
-                                  if (new_reservation) { return true; }
-                                  auto res = mem_space->make_reservation_or_null(bytes_needs);
-                                  if (res && res->size() >= bytes_needs) {
-                                    new_reservation = std::move(res);
-                                  }
-                                  return new_reservation != nullptr;
-                                })
+              std::lock_guard<std::mutex> lock(reservation_mutex);
+              if (new_reservation) { return true; }
+              auto res = mem_space->make_reservation_or_null(bytes_needs);
+              if (res && res->size() >= bytes_needs) { new_reservation = std::move(res); }
+              return new_reservation != nullptr;
+            })
             .get();
       } catch (const std::exception& e) {
         SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",

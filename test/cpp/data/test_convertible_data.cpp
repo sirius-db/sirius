@@ -75,8 +75,7 @@ class stub_convertible_data_provider : public sirius::convertible_data_provider 
 
 }  // anonymous namespace
 
-TEST_CASE("convertible_data interface can be subclassed and instantiated",
-          "[convertible_data]")
+TEST_CASE("convertible_data interface can be subclassed and instantiated", "[convertible_data]")
 {
   auto data = std::make_unique<stub_convertible_data>();
   REQUIRE(data != nullptr);
