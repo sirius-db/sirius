@@ -22,16 +22,20 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <cucascade/data/disk_io_backend.hpp>
+
 #include <rmm/detail/error.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <io/cucascade_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/iceberg_scan_task.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -47,14 +51,29 @@ namespace {
  * @brief Read a positional-delete parquet file and append its records to @p out_map.
  *
  * The file must have schema: { file_path STRING, pos BIGINT }.
+ *
+ * @param backend Per-GPU cucascade io backend used to construct the stack-local
+ *                sirius::io::cucascade_datasource adapter. Approach A
+ *                (Plan 05-05): backend resolved by the caller via
+ *                SiriusContext::get_gpu_io_backends() (inherited map from
+ *                parquet_scan_task_global_state) and passed in explicitly.
  */
 void read_positional_delete_file(std::string const& delete_file_path,
-                                 std::unordered_map<std::string, std::vector<int64_t>>& out_map)
+                                 std::unordered_map<std::string, std::vector<int64_t>>& out_map,
+                                 std::shared_ptr<cucascade::idisk_io_backend> backend)
 {
   auto stream = cudf::get_default_stream();
 
+  // IO-06: cucascade-backed datasource for iceberg positional-delete read.
+  // Adapter is stack-allocated — must outlive the synchronous read_parquet
+  // call (source_info takes a non-owning raw pointer; see research Pitfall 4).
+  // Each callsite constructs its own adapter — do not share (Pitfall 5).
+  auto const file_size = std::filesystem::file_size(delete_file_path);
+  sirius::io::cucascade_datasource ds{
+    std::move(backend), std::filesystem::path{delete_file_path}, file_size};
+
   auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{delete_file_path}).build();
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl || result.tbl->num_rows() == 0) { return; }
@@ -111,13 +130,28 @@ void read_positional_delete_file(std::string const& delete_file_path,
 
 /**
  * @brief Read an equality-delete parquet file and return (table, column_names).
+ *
+ * @param backend Per-GPU cucascade io backend used to construct the stack-local
+ *                sirius::io::cucascade_datasource adapter. Approach A
+ *                (Plan 05-05): backend resolved by the caller via
+ *                SiriusContext::get_gpu_io_backends() (inherited map from
+ *                parquet_scan_task_global_state) and passed in explicitly.
  */
 std::pair<std::unique_ptr<cudf::table>, std::vector<std::string>> read_equality_delete_file(
-  std::string const& delete_file_path)
+  std::string const& delete_file_path, std::shared_ptr<cucascade::idisk_io_backend> backend)
 {
   auto stream = cudf::get_default_stream();
+
+  // IO-06: cucascade-backed datasource for iceberg equality-delete read.
+  // Adapter is stack-allocated — must outlive the synchronous read_parquet
+  // call (source_info takes a non-owning raw pointer; see research Pitfall 4).
+  // Each callsite constructs its own adapter — do not share (Pitfall 5).
+  auto const file_size = std::filesystem::file_size(delete_file_path);
+  sirius::io::cucascade_datasource ds{
+    std::move(backend), std::filesystem::path{delete_file_path}, file_size};
+
   auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{delete_file_path}).build();
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl) {
@@ -210,6 +244,24 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
     return;
   }
 
+  // Resolve per-GPU cucascade io backend used for stack-local cucascade_datasource
+  // adapters in the delete-file helpers (Approach A — iceberg helper signatures
+  // extended with backend parameter; see Plan 05-05).
+  //
+  // The base parquet_scan_task_global_state owns the map (seeded by task_creator
+  // from SiriusContext::get_gpu_io_backends() — Plan 05-04 Approach C). Delete
+  // files are read here at global-state construction time, so we pick the first
+  // available GPU's backend deterministically (same rationale as planning-time
+  // metadata reads — research Pitfall 6; reads are metadata-only so context
+  // mismatch is correctness-neutral).
+  auto const& gpu_io_backends = this->get_gpu_io_backends();
+  if (gpu_io_backends.empty()) {
+    throw std::runtime_error(
+      "[iceberg] No GPU io_backends available for delete-file reads — "
+      "SiriusContext must have registered at least one backend.");
+  }
+  auto iceberg_io_backend = gpu_io_backends.begin()->second;
+
   // -----------------------------------------------------------------------
   // Positional deletes → positional_delete_filter
   // -----------------------------------------------------------------------
@@ -221,7 +273,7 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
 
     for (auto const& del_path : scan_op->positional_delete_files) {
       SIRIUS_LOG_DEBUG("[iceberg] Reading positional-delete file: {}", del_path);
-      read_positional_delete_file(del_path, pos_deletes);
+      read_positional_delete_file(del_path, pos_deletes, iceberg_io_backend);
     }
 
     for (auto& [path, positions] : pos_deletes) {
@@ -246,7 +298,7 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
 
     for (auto const& eq_path : scan_op->equality_delete_files) {
       SIRIUS_LOG_DEBUG("[iceberg] Reading equality-delete file: {}", eq_path);
-      auto [part, names] = read_equality_delete_file(eq_path);
+      auto [part, names] = read_equality_delete_file(eq_path, iceberg_io_backend);
 
       if (key_column_names.empty()) {
         key_column_names = names;
