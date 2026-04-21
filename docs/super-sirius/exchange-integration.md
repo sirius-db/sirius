@@ -485,6 +485,8 @@ nixl:
 
    The current Rust code solves this by pre-registering staging buffers once at startup and sub-allocating per transfer — sender skips registration entirely when staged (`nixl_integration.rs:1320`), receiver tries pre-registered staging first and only falls back to per-transfer registration on overflow (`nixl_service.rs:164-208`).
 
+   UCX's pool-level registration cache (`UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES=cuda`) cannot help here either. cuCascade uses RMM's `cuda_async_memory_resource` (`cudaMallocAsync` underneath), which UCX classifies as `UCS_MEMORY_TYPE_CUDA_MANAGED` — the `reg_whole_alloc_bitmap` only matches `UCS_MEMORY_TYPE_CUDA`, so the whole-allocation registration optimization silently skips these allocations. While `ucp_mem_map()` does check the rcache, it only hits on exact `(addr, size)` matches — dynamic cuCascade allocations give different addresses each time.
+
    **Recommendation**: Allocate a staging region from cuCascade at init time, register it with NIXL once, and sub-allocate per transfer (bump allocator or slab). This preserves cuCascade memory pressure management while avoiding per-transfer `ucp_mem_map()` cost. The trade-off is that the staging region has a fixed reservation size that cannot be reclaimed by the downgrade executor.
 
 2. **Staging memory space**: Should staging use a dedicated cuCascade memory space (separate capacity/thresholds) or share the GPU compute space? A dedicated space prevents exchange from starving compute, but reduces total available GPU memory.
