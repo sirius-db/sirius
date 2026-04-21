@@ -90,14 +90,13 @@ if [ "$ENGINE" != "sirius" ] && [ "$ENGINE" != "duckdb" ]; then
     echo "Unknown engine, please use sirius or duckdb"
     exit 1
 fi
-if [ "$ENGINE" == "sirius" ]; then
-    DUCKDB="$SIRIUS_DUCKDB"
-    QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
-else
-    # Use the same binary but disable Sirius so the extension doesn't initialize.
-    DUCKDB="$SIRIUS_DUCKDB"
+DUCKDB="$SIRIUS_DUCKDB"
+# Both engines use the same plain SQL queries — transparent execution
+# routes queries through GPU when SiriusContext is initialized.
+QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+if [ "$ENGINE" != "sirius" ]; then
+    # Disable Sirius so the extension doesn't initialize (CPU-only).
     export SIRIUS_DISABLE=1
-    QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 fi
 
 if [ ! -d "$PARQUET_DIR" ]; then

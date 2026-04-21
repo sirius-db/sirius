@@ -1,13 +1,23 @@
 # Super Sirius Documentation
 
-Super Sirius is the new task-based GPU execution engine in Sirius, invoked via `CALL gpu_execution('SELECT ...')`. It uses `namespace sirius` and replaces the legacy `gpu_processing` path with a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
+Super Sirius is the new task-based GPU execution engine in Sirius. It uses `namespace sirius` and replaces the legacy `gpu_processing` path with a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
+
+With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required. Legacy `sirius.cfg` is still recognized for compatibility.
+
+```sql
+-- Just load the extension. If ~/.sirius/sirius.yaml exists, GPU is automatic.
+LOAD 'sirius.duckdb_extension';
+
+-- Plain SQL — transparently executed on GPU:
+SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
+```
 
 ## How It Differs from Legacy Sirius
 
-| Aspect | Legacy (`gpu_processing`) | Super Sirius (`gpu_execution`) |
+| Aspect | Legacy (`gpu_processing`) | Super Sirius |
 |--------|---------------------------|-------------------------------|
 | Namespace | `duckdb` | `sirius` |
-| Entry point | `CALL gpu_processing(...)` | `CALL gpu_execution(...)` |
+| Entry point | `CALL gpu_processing(...)` | Plain SQL (transparent) or `CALL gpu_execution(...)` |
 | Plan generator | `GPUPhysicalPlanGenerator` | `sirius_physical_plan_generator` |
 | Operators | `GPUPhysicalOperator` in `src/operator/` | `sirius_physical_operator` in `src/op/` |
 | Execution model | Single-threaded GPU executor | Multi-pipeline task-based execution |
@@ -45,4 +55,4 @@ Super Sirius is the new task-based GPU execution engine in Sirius, invoked via `
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
 
-<!-- last-updated-commit: d40e8ce9d605d8c0a9118159bc34cf6c234e6abe -->
+<!-- last-updated-commit: 662eb28df59609c188bec5ea1adae9388325f660 -->

@@ -243,6 +243,8 @@ set(EXTENSION_SOURCES
     src/telemetry_context.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/transparent/physical_sirius_execution.cpp
+    src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
 
@@ -364,6 +366,7 @@ set(TEST_SOURCES
     test/cpp/helper/test_logical_type.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_transparent_execution.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory_management/test_cpu_cache.cpp
