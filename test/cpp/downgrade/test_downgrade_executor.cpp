@@ -35,12 +35,14 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // cudf / rmm
+#include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <set>
 #include <vector>
@@ -98,6 +100,45 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
 
   return sirius::make_data_batch(std::move(table), gpu_space);
+}
+
+/**
+ * @brief MGPU-06 data integrity guard (Phase 7 / RESEARCH.md Pitfall 2).
+ *
+ * Computes a 64-bit FNV-1a hash over a GPU-resident batch's packed payload to
+ * detect silent PCIe P2P write-ordering corruption on Ada Lovelace + Sapphire
+ * Rapids hosts. Packs on the current device via cudf::pack, copies the packed
+ * GPU buffer to host, and hashes the bytes. The returned checksum is meant to
+ * be compared before and after a GPU->GPU round trip; a mismatch indicates
+ * silent data corruption on the PCIe path (see
+ * .planning/phases/07-p2p-direct-transfer-adaptive-scan-partitioning/07-RESEARCH.md
+ * Pitfall 2).
+ *
+ * Test-only; uses inline cudaMemcpyAsync + stream.synchronize() (not
+ * CUCASCADE_CUDA_TRY) per test-code convention.
+ */
+uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
+                                         rmm::cuda_stream_view stream)
+{
+  auto const& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
+  auto packed         = cudf::pack(gpu_rep.get_table(), stream);
+  stream.synchronize();
+
+  auto const bytes = packed.gpu_data->size();
+  std::vector<uint8_t> host_buf(bytes);
+  cudaMemcpyAsync(host_buf.data(),
+                  packed.gpu_data->data(),
+                  bytes,
+                  cudaMemcpyDeviceToHost,
+                  stream.value());
+  stream.synchronize();
+
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (auto b : host_buf) {
+    h ^= static_cast<uint64_t>(b);
+    h *= 0x100000001b3ULL;
+  }
+  return h;
 }
 
 /**
@@ -482,7 +523,7 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
 // [downgrade] suite layout).
 // ---------------------------------------------------------------------------
 
-TEST_CASE("gpu_to_gpu_transfer_via_converter", "[.][multi_gpu_transfer]")
+TEST_CASE("gpu_to_gpu_transfer_via_converter", "[multi_gpu_transfer]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -526,6 +567,13 @@ TEST_CASE("gpu_to_gpu_transfer_via_converter", "[.][multi_gpu_transfer]")
   auto& registry = sirius::converter_registry::get();
   rmm::cuda_stream stream;
 
+  // MGPU-06 data integrity guard — silent PCIe P2P write-ordering corruption
+  // is NVIDIA-documented on Ada Lovelace + Sapphire Rapids platforms (Pitfall 2
+  // in .planning/phases/07-*/07-RESEARCH.md). Compute the FNV-1a checksum
+  // over the batch payload BEFORE the round trip so we can assert equality
+  // AFTER the return leg; a mismatch = silent data corruption.
+  auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream);
+
   REQUIRE(batch->try_to_lock_for_in_transit());
   batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
   batch->try_to_release_in_transit();
@@ -544,6 +592,17 @@ TEST_CASE("gpu_to_gpu_transfer_via_converter", "[.][multi_gpu_transfer]")
   // Data integrity check: batch still has a non-empty payload after the round-trip.
   REQUIRE(batch->get_data() != nullptr);
   REQUIRE(batch->get_data()->get_size_in_bytes() > 0);
+
+  // MGPU-06 Pitfall 2 / Sapphire Rapids silent data corruption guard:
+  // the post-round-trip checksum must equal the pre-round-trip checksum.
+  // If this fails on an Ada Lovelace + Intel Xeon Sapphire Rapids (or later)
+  // host, consult Pitfall 2 in .planning/phases/07-*/07-RESEARCH.md — the
+  // mitigation is to disable P2P on the affected platform or use
+  // Hopper/Blackwell GPUs (which fix the PCIe write-ordering dependency).
+  auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream);
+  INFO("MGPU-06 data integrity: checksum_pre=" << checksum_pre
+                                                << " checksum_post=" << checksum_post);
+  REQUIRE(checksum_post == checksum_pre);
 
   sirius::converter_registry::shutdown();
 }
@@ -802,21 +861,20 @@ TEST_CASE("numa_downgrade_prefers_local_host_space",
 // Tag [.] hides both — they need 2+ GPUs for any meaningful hardware validation.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("p2p_transfer_converter_round_trip_placeholder", "[.][mem_04_p2p_transfer][multi_gpu]")
+TEST_CASE("p2p_transfer_converter_round_trip", "[mem_04_p2p_transfer][multi_gpu]")
 {
-  // Phase 4 scope: host-staged GPU-to-GPU transfer (the MEM-03 baseline already
-  // verified by gpu_to_gpu_transfer_via_converter above; this variant adds a
-  // cudaDeviceCanAccessPeer probe so Phase 7 can wire the P2P path behind the
-  // same test shape).
-  //
-  // TODO(MGPU-06): once MEM-04 lands, replace the converter path with
-  // cudaMemcpyPeerAsync + device-sync + data integrity over the P2P link, and
-  // add an assertion that the cucascade converter chose the P2P backend when
-  // can_access_peer is true.
+  // MGPU-06 is closed as of Phase 7 (peer-access enable loop at
+  // SiriusContext::initialize() + cucascade peer-async converter body). On
+  // N=2 hosts where cudaDeviceCanAccessPeer returns 1, the P2P path activates
+  // (cudaMemcpyPeerAsync in cucascade::convert_gpu_to_gpu); otherwise the
+  // host-staged fallback remains correct. The checksum assertion below is
+  // the silent-corruption guard per Pitfall 2 in
+  // .planning/phases/07-*/07-RESEARCH.md — Ada Lovelace + Sapphire Rapids
+  // platforms can silently drop PCIe writes without this guard tripping.
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
   if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs for MEM-04 P2P transfer placeholder");
+    WARN("skipping: requires >=2 GPUs for MEM-04 P2P transfer round-trip");
     return;
   }
 
@@ -824,9 +882,10 @@ TEST_CASE("p2p_transfer_converter_round_trip_placeholder", "[.][mem_04_p2p_trans
   int can_access_1_to_0 = 0;
   cudaDeviceCanAccessPeer(&can_access_0_to_1, 0, 1);
   cudaDeviceCanAccessPeer(&can_access_1_to_0, 1, 0);
-  // Phase 4 placeholder assertion: the topology query succeeds (regardless of
-  // whether P2P is physically available — heterogeneous test boxes may report 0).
-  // MGPU-06 will tighten this to REQUIRE(can_access_0_to_1 == 1) on supported HW.
+  // Topology query succeeds on every supported platform; whether P2P is
+  // physically available depends on host wiring (NVLink / PCIe fabric). The
+  // checksum assertion below protects correctness regardless of which code
+  // path cucascade's converter picks.
 
   sirius::converter_registry::reset_for_testing();
 
@@ -854,19 +913,38 @@ TEST_CASE("p2p_transfer_converter_round_trip_placeholder", "[.][mem_04_p2p_trans
   auto& registry = sirius::converter_registry::get();
   rmm::cuda_stream stream;
 
-  // GPU0 -> GPU1 via converter (host-staged on Phase 4; P2P direct in Phase 7 MGPU-06).
+  // MGPU-06 data integrity guard — Pitfall 2 (Ada Lovelace + Sapphire Rapids
+  // silent PCIe P2P write-ordering corruption). Capture the FNV-1a checksum
+  // over the batch payload BEFORE any cross-GPU transfer.
+  auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream);
+
+  // GPU0 -> GPU1 via converter (MGPU-06: cudaMemcpyPeerAsync when the
+  // peer-access enable loop at SiriusContext::initialize() successfully
+  // enabled the pair; host-staged fallback otherwise).
   REQUIRE(batch->try_to_lock_for_in_transit());
   batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
   batch->try_to_release_in_transit();
   REQUIRE(batch->get_memory_space()->get_device_id() == gpu1->get_device_id());
   REQUIRE(batch->get_data()->get_size_in_bytes() == original_size);
 
-  // Round-trip GPU1 -> GPU0.
+  // Round-trip GPU1 -> GPU0. Phase 4 Plan 04-05 Task 2 found this return leg
+  // failed on the N=2 verification host; Phase 7 Plan 07-01's peer-access
+  // enable loop closes that bug by registering driver-level P2P mappings
+  // once at SiriusContext init.
   REQUIRE(batch->try_to_lock_for_in_transit());
   batch->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
   batch->try_to_release_in_transit();
   REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
   REQUIRE(batch->get_data()->get_size_in_bytes() == original_size);
+
+  // MGPU-06 Pitfall 2 / Sapphire Rapids silent data corruption guard:
+  // post-round-trip checksum must equal the pre-round-trip checksum. If this
+  // fails on an Ada Lovelace + Intel Xeon Sapphire Rapids (or later) host,
+  // see Pitfall 2 in .planning/phases/07-*/07-RESEARCH.md.
+  auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream);
+  INFO("MGPU-06 P2P round-trip checksum: pre=" << checksum_pre
+                                                << " post=" << checksum_post);
+  REQUIRE(checksum_post == checksum_pre);
 
   sirius::converter_registry::shutdown();
 }

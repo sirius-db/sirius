@@ -24,6 +24,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -33,6 +34,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <utils/utils.hpp>
 
+#include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>
@@ -40,6 +42,38 @@
 #include <set>
 #include <source_location>
 #include <string>
+#include <vector>
+
+namespace {
+// MGPU-06 data integrity guard (Phase 7 / RESEARCH.md Pitfall 2). See the
+// equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp for
+// documentation — this is the same FNV-1a checksum over a packed batch
+// payload, duplicated here because the downgrade TU's helper lives in an
+// anonymous namespace and is not reachable from this TU.
+uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
+                                         rmm::cuda_stream_view stream)
+{
+  auto const& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
+  auto packed         = cudf::pack(gpu_rep.get_table(), stream);
+  stream.synchronize();
+
+  auto const bytes = packed.gpu_data->size();
+  std::vector<uint8_t> host_buf(bytes);
+  cudaMemcpyAsync(host_buf.data(),
+                  packed.gpu_data->data(),
+                  bytes,
+                  cudaMemcpyDeviceToHost,
+                  stream.value());
+  stream.synchronize();
+
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (auto b : host_buf) {
+    h ^= static_cast<uint64_t>(b);
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+}  // namespace
 
 namespace fs = std::filesystem;
 
@@ -322,15 +356,16 @@ TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
   sirius::converter_registry::shutdown();
 }
 
-// MGPU-04 forward-leg round-trip: GPU0 -> GPU1 data conversion using the
-// built-in cucascade peer-async converter. Forward leg only — the
-// GPU1 -> GPU0 return leg has a known Phase-4-deferred bug tracked at
-// test/cpp/downgrade/test_downgrade_executor.cpp:813 TODO(MGPU-06) and
-// is Phase-7 scope (planning_context interpretation 4). This test is
-// hidden ([.]) so it skips on single-GPU CI; N=2 hosts run it via the
-// Plan-4 compute-sanitizer invocation.
-TEST_CASE("gpu_to_gpu forward-leg preserves bytes on N>=2 hosts (MGPU-04)",
-          "[.][multi_gpu_foundation][mgpu_04_round_trip]")
+// MGPU-04 + MGPU-06 full round-trip: GPU0 -> GPU1 -> GPU0 data conversion
+// using the built-in cucascade peer-async converter. Phase 7 Plan 07-01's
+// peer-access enable loop at SiriusContext::initialize() closes the
+// Phase-4-deferred GPU1 -> GPU0 return-leg bug, so this test now exercises
+// both legs and gates correctness with an FNV-1a checksum over the batch
+// payload (silent-corruption guard per Pitfall 2 in
+// .planning/phases/07-*/07-RESEARCH.md — Ada Lovelace + Sapphire Rapids).
+// WARN+return on single-GPU hosts (Catch2 v2 skip idiom).
+TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-06)",
+          "[multi_gpu_foundation][mgpu_04_round_trip]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -386,7 +421,12 @@ TEST_CASE("gpu_to_gpu forward-leg preserves bytes on N>=2 hosts (MGPU-04)",
 
   rmm::cuda_stream stream;
 
-  // GPU0 -> GPU1 forward leg (return leg deferred to Phase 7 per Task 2 docstring).
+  // MGPU-06 Pitfall 2 data integrity guard — Ada Lovelace + Sapphire Rapids
+  // silent PCIe P2P write-ordering corruption. Capture the FNV-1a checksum
+  // over the batch payload BEFORE any cross-GPU transfer.
+  auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream.view());
+
+  // GPU0 -> GPU1 forward leg.
   REQUIRE(batch->try_to_lock_for_in_transit());
   batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
   batch->try_to_release_in_transit();
@@ -394,10 +434,27 @@ TEST_CASE("gpu_to_gpu forward-leg preserves bytes on N>=2 hosts (MGPU-04)",
   REQUIRE(batch->get_memory_space()->get_device_id() == 1);
   REQUIRE(batch->get_data()->get_size_in_bytes() == original_bytes);
 
-  // Deliberately stop at the forward leg. The return leg (GPU1 -> GPU0)
-  // hits the Phase-4 deferred bug — exercising it here would produce a
-  // confusingly-duplicate failure of the tests already tracked at
-  // test_downgrade_executor.cpp:813. Phase 7 (MGPU-06) owns that fix.
+  // MGPU-06 return leg: Phase 7 Plan 07-01's peer-access enable loop at
+  // SiriusContext::initialize() closes the Phase-4-deferred GPU1 -> GPU0
+  // bug. Checksum integrity guard per RESEARCH.md Pitfall 2 (silent data
+  // corruption on Ada Lovelace + Sapphire Rapids).
+  REQUIRE(batch->try_to_lock_for_in_transit());
+  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
+  batch->try_to_release_in_transit();
+
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
+  REQUIRE(batch->get_data()->get_size_in_bytes() == original_bytes);
+
+  // Final data-integrity gate: post-round-trip checksum must equal
+  // pre-round-trip checksum. Failure here on an Ada Lovelace + Intel Xeon
+  // Sapphire Rapids (or later) host = silent data corruption; see Pitfall 2
+  // in .planning/phases/07-*/07-RESEARCH.md for the NVIDIA-documented
+  // mitigation (disable P2P on affected platforms, or use Hopper/Blackwell).
+  auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream.view());
+  INFO("MGPU-04 + MGPU-06 round-trip checksum: pre=" << checksum_pre
+                                                      << " post=" << checksum_post);
+  REQUIRE(checksum_post == checksum_pre);
 
   manager->shutdown();
   sirius::converter_registry::shutdown();
