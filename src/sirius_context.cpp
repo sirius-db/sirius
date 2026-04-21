@@ -27,8 +27,11 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
+#include <rmm/cuda_device.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -36,8 +39,10 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace duckdb {
 
@@ -169,6 +174,35 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
+  // ---- Cucascade disk I/O backend registry + per-GPU backend cache ----
+  // Registers the built-in "pipeline" backend and creates one
+  // idisk_io_backend instance per GPU memory space. Each instance is
+  // constructed under rmm::cuda_set_device_raii so its internal
+  // cudaStreamCreate / cudaMallocHost / cudaEventCreateWithFlags bind
+  // to that GPU's CUDA context. One-per-GPU is required for multi-GPU
+  // safety — see .planning/research/CUCASCADE-IO.md §"Per-GPU backend
+  // ownership" and Phase 5 RESEARCH.md Pitfall 1.
+  cucascade::register_builtin_io_backends(io_backend_registry_);
+  {
+    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(
+      cucascade::memory::Tier::GPU);
+    gpu_io_backends_.reserve(gpu_spaces.size());
+    for (auto* gpu_space : gpu_spaces) {
+      auto const device_id = gpu_space->get_device_id();
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+      auto backend = io_backend_registry_.create_default_backend();
+      // IO-11 audit: log the device_id we targeted and the actual current
+      // device at the moment the backend was created. These should match.
+      int readback = -1;
+      cudaGetDevice(&readback);
+      spdlog::info(
+        "SiriusContext: io_backend created for GPU {} (cudaGetDevice readback={})",
+        device_id,
+        readback);
+      gpu_io_backends_[device_id] = std::move(backend);
+    }
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -267,6 +301,13 @@ void SiriusContext::terminate()
   }
   downgrade_executors_.clear();
 
+  // Destroy per-GPU io_backend instances BEFORE memory_manager_->shutdown()
+  // so each backend's dtor (cudaFreeHost / cudaStreamDestroy /
+  // cudaEventDestroy) runs against a still-live CUDA context. Mirrors
+  // the downgrade_executors_ teardown order above.
+  gpu_io_backends_.clear();
+  io_backend_registry_.clear();
+
   // Ensure all CUDA operations (including async copies from downgrade tasks)
   // are complete before destroying pinned memory pools.  cudaStreamDestroy
   // returns immediately even when copies are still in-flight; without this
@@ -302,6 +343,18 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
 {
   throw_if_not_initialized();
   return *memory_manager_;
+}
+
+std::shared_ptr<cucascade::idisk_io_backend> SiriusContext::get_io_backend_for(int device_id) const
+{
+  throw_if_not_initialized();
+  auto it = gpu_io_backends_.find(device_id);
+  if (it == gpu_io_backends_.end()) {
+    throw std::out_of_range(
+      "SiriusContext::get_io_backend_for: no io_backend registered for device_id=" +
+      std::to_string(device_id));
+  }
+  return it->second;
 }
 
 cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager()
