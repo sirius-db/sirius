@@ -164,16 +164,14 @@ for q in "${QUERIES[@]}"; do
     # Strip trailing semicolons from the query
     CLEANED_SQL=$(echo "$QUERY_SQL" | sed 's/;[[:space:]]*$//')
 
-    # Escape inner double quotes, then wrap with gpu_execution("...")
-    ESCAPED_SQL=$(echo "$CLEANED_SQL" | sed 's/"/\\"/g')
-
-    # Write SQL file: views, timer, then two runs of gpu_execution
+    # Write SQL file: views, timer, then two runs of plain SQL.
+    # Transparent execution routes queries through GPU when SiriusContext is initialized.
     TEMP_SQL="$OUTPUT_DIR/tmp_q${q}.sql"
     {
         printf '%s\n' "$VIEW_SQL"
         printf ".timer on\n"
-        printf 'CALL gpu_execution("%s");\n' "$ESCAPED_SQL"
-        printf 'CALL gpu_execution("%s");\n' "$ESCAPED_SQL"
+        printf '%s;\n' "$CLEANED_SQL"
+        printf '%s;\n' "$CLEANED_SQL"
     } > "$TEMP_SQL"
 
     Q_RESULT_FILE="$OUTPUT_DIR/result_q${q}.txt"

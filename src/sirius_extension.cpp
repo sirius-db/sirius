@@ -39,6 +39,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
 #include "gpu_buffer_manager.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -58,6 +59,21 @@ namespace duckdb {
 
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
+
+namespace {
+
+unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
+                                                        Connection& connection,
+                                                        const string& query)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return connection.Query(query); }
+
+  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  return connection.Query(query);
+}
+
+}  // namespace
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
@@ -326,19 +342,19 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else if (data.plan_error) {
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
         printf(
           "=============================================\nError in GPUExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");
-        data.res = data.conn->Query(data.query);
+        data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -450,7 +466,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       printf(
         "=============================================\nError in SiriusExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
@@ -460,7 +476,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
-          data.res = data.conn->Query(data.query);
+          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
         } else {
           throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
           return;
@@ -885,6 +901,11 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
                    params->max_build_hash_table_bytes);
 }
 
+static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
+{
+  SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1039,6 +1060,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption(
+    "gpu_execution",
+    "Whether to transparently intercept SQL queries and execute them on GPU",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(true),
+    SetEnableGpuExecution);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1053,6 +1081,13 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register optimizer extension for transparent GPU execution.
+  // Pre-hook disables incompatible optimizers; post-hook captures the plan.
+  OptimizerExtension opt_ext;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
+  OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
   // was loaded (e.g. when loaded via LOAD in Python or the CLI).

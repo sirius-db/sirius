@@ -4,33 +4,49 @@ This document traces a Super Sirius query end-to-end, from SQL string to `QueryR
 
 ## Entry Point
 
-The user invokes Super Sirius via DuckDB:
+Users write plain SQL — transparent execution intercepts the query and routes it to the GPU:
 
 ```sql
-CALL gpu_execution('SELECT * FROM lineitem WHERE l_quantity > 25');
+SELECT * FROM lineitem WHERE l_quantity > 25;
 ```
 
-## Step 1: Extension Table Function Bind
+The explicit `CALL gpu_execution('...')` function is also still supported.
+
+## Step 1: Optimizer Extension Hook (Transparent Execution)
+
+**Files:** `src/transparent/sirius_optimizer_extension.cpp`, `src/sirius_context.cpp`
+
+DuckDB's optimizer calls two Sirius hooks registered via `OptimizerExtension`:
+
+1. **Pre-optimization** (`sirius_pre_optimizer_hook`): Snapshots the connection's disabled optimizer set, then disables `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `STATISTICS_PROPAGATION` because those can produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute.
+
+2. **Post-optimization** (`sirius_optimizer_hook`): Restores the connection's original disabled optimizer set, then copies the optimized logical plan via `LogicalOperator::Copy()` and stores it in `SiriusContext`.
+
+3. **OnFinalizePrepare** (`SiriusContext::OnFinalizePrepare`): After DuckDB generates its CPU physical plan, this hook:
+   - Retrieves the stored logical plan copy
+   - Calls `sirius_physical_plan_generator::create_plan()` — the single source of truth for GPU support
+   - If successful, creates a `PhysicalSiriusExecution` operator (a DuckDB `PhysicalOperator` subclass) and replaces `prepared.physical_plan`
+   - If `create_plan()` throws (unsupported operator/type), the CPU plan remains — silent fallback
+
+4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
+
+## Step 1b: Explicit Table Function Path (Legacy)
 
 **File:** `src/sirius_extension.cpp`
 
-DuckDB calls `GPUExecutionBind()` which:
+When using `CALL gpu_execution('SELECT ...')`, the flow is different:
 
-1. Extracts the SQL string from the function arguments
-2. Parses and optimizes the query through DuckDB's standard pipeline (parser → binder → optimizer)
-3. Generates the Sirius physical plan via `sirius_physical_plan_generator::create_plan()`
-4. Wraps both the DuckDB prepared statement and the Sirius plan into `sirius_prepared_statement_data`
-5. Returns `SiriusTableFunctionData` containing the prepared statement
-
-## Step 2: Extension Table Function Execute
-
-**File:** `src/sirius_extension.cpp`
-
-DuckDB calls `GPUExecutionFunction()` which:
-
-1. Creates a `sirius_interface` for the current connection
-2. Calls `sirius_iface->sirius_execute_query(prepared_statement)` to run the query
+1. `GPUExecutionBind()` re-parses the inner SQL, optimizes it, and generates the Sirius physical plan
+2. `GPUExecutionFunction()` creates a `sirius_interface` and calls `sirius_execute_query()`
 3. On failure (if fallback enabled), gracefully falls back to DuckDB CPU execution
+
+This path is still supported but is no longer the primary way to use Sirius.
+
+## Step 2: GPU Execution via PhysicalSiriusExecution
+
+**File:** `src/transparent/physical_sirius_execution.cpp`
+
+For transparent execution, DuckDB's executor calls `PhysicalSiriusExecution::GetData()` which lazily triggers the Sirius GPU engine on the first call. It creates a `sirius_interface`, wraps the Sirius physical plan in a `sirius_prepared_statement_data`, and calls `sirius_execute_query()`.
 
 ## Step 3: Query Lifecycle Setup
 
