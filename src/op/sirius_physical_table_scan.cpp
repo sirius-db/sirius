@@ -170,6 +170,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
   auto& out_table = gpu_rep.get_table();
 
+  if (expected_output_columns == 0) {
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
+  }
+
   bool needs_projection =
     static_cast<std::size_t>(out_table.num_columns()) != expected_output_columns;
   std::vector<std::size_t> selected_indices;

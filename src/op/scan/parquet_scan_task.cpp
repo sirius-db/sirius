@@ -411,13 +411,37 @@ void parquet_scan_task_global_state::initialize_from_files()
   //===----------Projections----------===//
   std::unordered_set<std::size_t> pure_filter_column_indices;
   std::vector<std::string> projected_column_names;
-  if (is_projected) {
-    projected_column_names.reserve(_selected_column_indices.size());
-    std::for_each(_selected_column_indices.begin(),
-                  _selected_column_indices.end(),
-                  [this, &projected_column_names](std::size_t col_idx) {
-                    projected_column_names.push_back(_scan_op->names[col_idx]);
-                  });
+  bool selected_row_count_carrier = false;
+  if (_selected_column_indices.empty() && !_file_metadatas.empty() && !_scan_op->names.empty()) {
+    auto const& first_meta = _file_metadatas[0];
+    for (size_t i = 1; i < first_meta.schema.size(); ++i) {
+      if (first_meta.schema[i].num_children != 0) { continue; }
+      auto const& leaf_name = first_meta.schema[i].name;
+      auto it               = std::find(_scan_op->names.begin(), _scan_op->names.end(), leaf_name);
+      if (it == _scan_op->names.end()) { continue; }
+
+      auto const duckdb_idx = static_cast<size_t>(std::distance(_scan_op->names.begin(), it));
+      _selected_column_indices.push_back(duckdb_idx);
+      projected_column_names.push_back(leaf_name);
+      selected_row_count_carrier = true;
+      SIRIUS_LOG_DEBUG(
+        "[parquet_scan] Selected carrier column '{}' (idx={}) to preserve row counts for a "
+        "no-output-column scan.",
+        leaf_name,
+        duckdb_idx);
+      break;
+    }
+  }
+
+  if (is_projected || selected_row_count_carrier) {
+    if (projected_column_names.empty()) {
+      projected_column_names.reserve(_selected_column_indices.size());
+      std::for_each(_selected_column_indices.begin(),
+                    _selected_column_indices.end(),
+                    [this, &projected_column_names](std::size_t col_idx) {
+                      projected_column_names.push_back(_scan_op->names[col_idx]);
+                    });
+    }
 #if CUDF_VERSION_NUM >= 2604
     _reader_options.set_column_names(projected_column_names);
 #else

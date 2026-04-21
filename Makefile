@@ -14,14 +14,13 @@
 
 CMAKE ?= cmake
 DUCKDB_DIR ?= duckdb
-TEST_PATH ?= build/release/test/unittest
-TEST_PATH_DEBUG ?= build/debug/test/unittest
-TEST_PATH_RELWITHDEBINFO ?= build/relwithdebinfo/test/unittest
-TEST_BUILD_TARGET ?= unittest
+TEST_BUILD_TARGET ?= sirius_unittest
+MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo \
+	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug clean list-presets
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
@@ -40,13 +39,13 @@ build/%/build.ninja: $(CMAKE_INPUTS) | $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset $*
 
 release: build/release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(MAIN_BUILD_TARGETS)
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(TEST_BUILD_TARGET)
 endif
 
 debug: build/debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(MAIN_BUILD_TARGETS)
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(TEST_BUILD_TARGET)
 endif
@@ -56,22 +55,31 @@ reldebug: relwithdebinfo
 debug-release: relwithdebinfo
 
 relwithdebinfo: build/relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(MAIN_BUILD_TARGETS)
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
 endif
 
 legacy-release: build/legacy-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset legacy-release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset legacy-release --target $(MAIN_BUILD_TARGETS)
 
 clang-release: build/clang-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(MAIN_BUILD_TARGETS)
 
 clang-debug: build/clang-debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(MAIN_BUILD_TARGETS)
 
 clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(MAIN_BUILD_TARGETS)
+
+ci-release: build/ci-release/build.ninja
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release
+
+configure_ci:
+	@echo "configure_ci step is skipped for this extension build..."
+
+set_duckdb_version:
+	@echo "DuckDB version is pinned by the submodule; skipping checkout of $(DUCKDB_GIT_VERSION)."
 
 test: test_release
 

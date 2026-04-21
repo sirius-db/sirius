@@ -5,8 +5,8 @@
 	ignore = dirty
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
-	url = https://github.com/duckdb/extension-ci-tools
-	branch = main
+	url = https://github.com/sirius-db/extension-ci-tools
+	branch = sirius
 [submodule "substrait"]
 	path = substrait
 	url = https://github.com/sirius-db/duckdb-substrait-extension.git
