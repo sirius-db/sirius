@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed 05-04-PLAN.md — Wave 3 parallel; parquet_scan_task migrated to cucascade_datasource (IO-05 2/3 sites + IO-07 transitive + HYG-01 closed); ready for Plan 05-05 sibling + Plan 05-06 phase sign-off
-last_updated: "2026-04-21T01:32:40.459Z"
+stopped_at: Completed 05-05-PLAN.md — Wave 3 sibling; metadata scan + iceberg delete-file reads migrated to cucascade_datasource (IO-05 final site + IO-06); iceberg ctor handoff from Plan 05-04 closed; ready for Plan 05-06 phase sign-off
+last_updated: "2026-04-21T01:47:18.186Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 11
-  completed_plans: 10
+  completed_plans: 11
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 05 (cucascade-backed-parquet-i-o-migration) — EXECUTING
-Plan: 4 of 6
+Plan: 6 of 6
 Status: Ready to execute
 Last activity: 2026-04-21
 
@@ -62,6 +62,7 @@ Progress: [██████████] 100% (phase-scoped)
 | Phase 05 P02 | 6min | 2 tasks | 2 files |
 | Phase 05 P03 | 9 min | 2 tasks | 2 files |
 | Phase 05 P04 | ~9 min | 2 tasks | 3 files |
+| Phase 05 P05 | 20min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -95,6 +96,7 @@ New for v1.1 (from research synthesis):
 - [Phase 05]: Plan 05-03: Per-GPU backend construction under rmm::cuda_set_device_raii with IO-11 audit log (device_id + cudaGetDevice readback); teardown clears gpu_io_backends_ + io_backend_registry_ BEFORE memory_manager_->shutdown() to avoid cudaErrorInvalidResourceHandle at extension unload
 - [Phase 05]: Plan 05-04: Approach C plumbing — task_creator seeds parquet_scan_task_global_state with SiriusContext::get_gpu_io_backends() map. Pure-consumer invariant on sirius_context.hpp upheld (Plan 03 sole owner).
 - [Phase 05]: Plan 05-04: parquet_scan_task inherits from sirius_pipeline_itask (not gpu_pipeline_task) so there is no get_preferred_device_id() helper on the task. Hot-path backend selection uses g_state.get_preferred_device_id() with first-backend fallback — mirrors pipeline_executor's default routing for non-gpu_pipeline_task instances.
+- [Phase 05]: Plan 05-05: Approach A (locked) for iceberg delete-file helpers — helper signatures gain std::shared_ptr<cucascade::idisk_io_backend> backend parameter; callers resolve via inherited get_gpu_io_backends(). Completes Plan 05-04's declared iceberg handoff (iceberg_scan_task_global_state ctor forwards gpu_io_backends to base + task_creator iceberg branch seeds map). Pure-consumer invariant on sirius_context.hpp upheld.
 
 ### Pending Todos
 
@@ -114,6 +116,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T01:32:40.456Z
-Stopped at: Completed 05-04-PLAN.md — Wave 3 parallel; parquet_scan_task migrated to cucascade_datasource (IO-05 2/3 sites + IO-07 transitive + HYG-01 closed); ready for Plan 05-05 sibling + Plan 05-06 phase sign-off
+Last session: 2026-04-21T01:47:07.068Z
+Stopped at: Completed 05-05-PLAN.md — Wave 3 sibling; metadata scan + iceberg delete-file reads migrated to cucascade_datasource (IO-05 final site + IO-06); iceberg ctor handoff from Plan 05-04 closed; ready for Plan 05-06 phase sign-off
 Resume file: None
