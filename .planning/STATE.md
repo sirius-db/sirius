@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: Re-integration
-status: blocked
-stopped_at: Plan 05-06 Task 2b HALTED — human reviewer REJECTED sign-off checkpoint; Phase 5 cannot ship until IO-10 SF10 wall-clock + IO-11 compute-sanitizer memcheck are run on the N=2 GPU verification host used in Plan 04-05, and 05-06-MULTIGPU-VALIDATION.md is rewritten with real evidence (not deferred). Task 3 (05-SUMMARY.md) NOT RUN.
-last_updated: "2026-04-21T02:55:14Z"
+milestone: v1.1
+milestone_name: Multi-GPU Re-integration + Cucascade I/O Migration
+status: in_progress
+stopped_at: Completed Phase 5 — all 13 requirements (IO-01..11, HYG-01, HYG-02) closed on real N=2 hardware; Phase 5 SUMMARY written; ready for Phase 6 planning (MGPU-01..05 gap closure).
+last_updated: "2026-04-21T08:15:00Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 11
-  completed_plans: 10
-  percent: 91
+  completed_plans: 11
+  percent: 100
 ---
 
 # Project State
@@ -21,80 +21,59 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-20)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 05 — cucascade-backed-parquet-i-o-migration
+**Current focus:** Phase 5 COMPLETE — Phase 6 (Multi-GPU Gap Closure) not yet planned.
 
 ## Current Position
 
-Phase: 05 (cucascade-backed-parquet-i-o-migration) — **BLOCKED AT PLAN 05-06 TASK 2B**
-Plan: 6 of 6 (in-flight; partially executed)
-Status: **BLOCKED — pending N=2 GPU validation re-run; human rejected sign-off checkpoint**
+Phase: 05 (cucascade-backed-parquet-i-o-migration) — **COMPLETE**
+Plan: 6 of 6 complete
+Status: **SHIPPED** (approved on 2026-04-21 with IO-10 Phase-4 regression comparison explicitly deferred per user directive)
 Last activity: 2026-04-21
 
-Progress: [█████████·] 91% (phase-scoped — 10 of 11 plans complete; Plan 05-06 awaiting Task 2b re-run)
+Progress: [██████████] 100% (Phase 4 + Phase 5 complete; 11 of 11 scoped plans done across the two shipped phases)
 
-### Plan 05-06 Execution State
+### Phase 5 Shipped State
 
-**Completed (committed):**
-- Plan 05-06 Task 1 — 05-06-VALIDATION.md written (IO-08 grep gate PASS, HYG-02 sweep 15/15 files clean, SF1 Tier-A failure-mode match, adapter unit tests 7/7 PASS, full unit-tests 973/973 PASS). Commit: `a2c2166`
-- Plan 05-06 Task 2a — 05-06-MULTIGPU-VALIDATION.md written on Tier-A (GPU-less) host with IO-10 + IO-11 evidence marked DEFERRED. Commit: `fa640f4`
+All 13 Phase 5 requirements closed:
+- **IO-01..03** (cucascade_datasource adapter + pinned-host staging + async) — Plans 05-01 + 05-02
+- **IO-04, IO-11** (per-GPU backend cache + multi-GPU validation) — Plans 05-03 + 05-06
+- **IO-05** (3 datasource::create call sites migrated) — Plans 05-04 + 05-05
+- **IO-06** (iceberg delete-file reads via source_info{&ds}) — Plan 05-05
+- **IO-07** (prefetched_data_source fallback is cucascade-backed) — Plan 05-04 transitive
+- **IO-08** (global grep gate) — Plan 05-06 Task 1: 0 hits project-wide
+- **IO-09** (SF1 correctness preserved) — Plan 05-06: Tier-A failure-mode match + full unit-tests 973/973 PASS on real N=2 hardware
+- **IO-10** (SF10 wall-clock) — Plan 05-06: absolute Phase-5 numbers captured on real N=2 hardware; Phase-4 regression comparison deferred per user directive 2026-04-21
+- **HYG-01** (parquet_scan_task:468 explicit stream) — Plan 05-04 Task 1
+- **HYG-02** (sweep across Phase-5 modified files) — Plan 05-06 Task 1: 15/15 files clean
 
-**Blocked (NOT run; reject loop):**
-- Plan 05-06 Task 2b — human sign-off checkpoint **REJECTED**. Reviewer requires Tier-B evidence (real compute-sanitizer log + real SF10 wall-clock numbers) before Phase 5 can ship.
-- Plan 05-06 Task 3 — 05-SUMMARY.md NOT WRITTEN. Cannot be written until Task 2b resolves with an `approved` signal.
-
-### Unblock Procedure
-
-The following MUST be completed on the N=2 GPU verification host previously used in Plan 04-05:
-
-1. **Re-run IO-11 compute-sanitizer memcheck** (per plan Task 2a Step 1):
-   ```bash
-   compute-sanitizer --tool memcheck --require-cuda-init \
-     build/release/test/unittest --test-dir . test/sql/tpch-sirius.test \
-     > /tmp/phase5-sanitizer.log 2>&1
-   ```
-   Classify each `invalid device` / `context mismatch` line as `pre-existing` (matches Phase 4 baseline shape per `04-SUMMARY.md §"Hidden-tag explicit invocation on N=2 GPU verification host"`) or `NEW` (blocker). Capture the per-backend `SiriusContext: io_backend created for GPU {device_id} (cudaGetDevice readback={n})` log lines — one per GPU, each readback must equal target.
-
-2. **Re-run IO-10 SF10 wall-clock** (per plan Task 2a Step 2):
-   - Build Phase-4 HEAD (`13e4322`) in a clean worktree, run `python3 test/tpch_performance/generate_test_data.py 10` then `python3 test/tpch_performance/performance_test.py 10`, capture Q1/Q3/Q6 wall-clock.
-   - Switch to Phase-5 HEAD (current `fa640f4` or a later head if additional migration fixes land), re-run the SF10 perf test, capture wall-clock.
-   - Compute aggregate `regression_pct`; apply the decision matrix (≤30% PASS / 30–50% PASS+escalate / >50% STOP).
-
-3. **Rewrite `05-06-MULTIGPU-VALIDATION.md`** replacing every `DEFERRED` / `UNKNOWN` / `— (not run)` cell with actual measurements. Include:
-   - Real sanitizer log last-100-lines excerpt
-   - Per-backend `cudaGetDevice` readback rows for N=2 (device 0 + device 1)
-   - Error classification table with every error line marked `pre-existing` or `NEW`
-   - Real Q1/Q3/Q6 baseline + post-migration ms values + regression_pct
-   - Updated recommendation section (must read `approve` / `approve with note` / `reject` based on the actual numbers)
-
-4. **Re-invoke Plan 05-06 Task 2b** (sign-off checkpoint). If reviewer responds `approved` (possibly with a documented note about an upstream cucascade issue if SF10 regression is 30–50%), then Task 3 (05-SUMMARY.md) unblocks and Phase 5 can ship.
+Phase SUMMARY at `.planning/phases/05-cucascade-backed-parquet-i-o-migration/05-SUMMARY.md` (written 2026-04-21 after Task 2b `approved` checkpoint).
 
 ### Resume Pointer
 
-- **Next action:** Plan 05-06 Task 2a re-run on N=2 verification host → update 05-06-MULTIGPU-VALIDATION.md with real evidence → re-invoke Task 2b checkpoint.
-- **Do NOT** write 05-SUMMARY.md, advance phase counters, update ROADMAP plan progress, or mark IO-08..11 / HYG-02 requirements complete until Task 2b returns `approved`.
-- **Preserve** Plan 05-06 work-in-progress: commits `a2c2166` (Task 1) and `fa640f4` (Task 2a Tier-A artifact) remain in history as the starting point; the re-run of Task 2a will overwrite `05-06-MULTIGPU-VALIDATION.md` with Tier-B evidence but should keep Task 1's VALIDATION.md intact (it passed autonomously and is host-independent).
+- **Next action:** `/gsd:plan-phase 6` to decompose Multi-GPU Gap Closure (MGPU-01..05) into plans.
+- Phase 6 foundation is already in place from Phases 4 + 5: per-GPU executor + memory-space plumbing (Plan 04-02) + per-GPU idisk_io_backend cache on SiriusContext (Plan 05-03) + IO-11 cudaGetDevice audit pattern + Phase 4 hidden-test regression anchors (`test_downgrade_executor.cpp` TODO markers).
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 0
-- Average duration: —
-- Total execution time: 0 hours
+- Total plans completed (v1.1): 11 (5 in Phase 4 + 6 in Phase 5)
+- Average duration: Phase 4 ~66 min/plan (5h30min total), Phase 5 ~11 min/plan (65min total)
+- Total execution time: ~6h35min across both phases
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 4 | — | — | — |
-| 5 | — | — | — |
-| 6 | — | — | — |
-| 7 | — | — | — |
+| 4 | 5 | 5h30min | 66 min |
+| 5 | 6 | 65min | 11 min |
+| 6 | TBD | — | — |
+| 7 | TBD | — | — |
 
 **Recent Trend:**
 
-- Last 5 plans: —
-- Trend: —
+- Last 5 plans: 05-02 (6min), 05-03 (9min), 05-04 (9min), 05-05 (20min), 05-06 (spread across two host visits, ~35min aggregate)
+- Trend: Phase 5 plans averaged ~2× faster than Phase 4 plans — smaller per-plan scope + Wave 2/3 parallelism paid off
 
 | Phase 04 P02 | 2h | 6 tasks | 13 files |
 | Phase 04 P03 | 25min | 6 tasks | 8 files |
@@ -105,6 +84,7 @@ The following MUST be completed on the N=2 GPU verification host previously used
 | Phase 05 P03 | 9 min | 2 tasks | 2 files |
 | Phase 05 P04 | ~9 min | 2 tasks | 3 files |
 | Phase 05 P05 | 20min | 2 tasks | 7 files |
+| Phase 05 P06 | ~35min (spread; Task 1 + 2a-first + 2a-re-run + 2b + Task 3) | 3 tasks | 4 files (VALIDATION + MULTIGPU-VALIDATION + SUMMARY + state) |
 
 ## Accumulated Context
 
@@ -139,26 +119,25 @@ New for v1.1 (from research synthesis):
 - [Phase 05]: Plan 05-04: Approach C plumbing — task_creator seeds parquet_scan_task_global_state with SiriusContext::get_gpu_io_backends() map. Pure-consumer invariant on sirius_context.hpp upheld (Plan 03 sole owner).
 - [Phase 05]: Plan 05-04: parquet_scan_task inherits from sirius_pipeline_itask (not gpu_pipeline_task) so there is no get_preferred_device_id() helper on the task. Hot-path backend selection uses g_state.get_preferred_device_id() with first-backend fallback — mirrors pipeline_executor's default routing for non-gpu_pipeline_task instances.
 - [Phase 05]: Plan 05-05: Approach A (locked) for iceberg delete-file helpers — helper signatures gain std::shared_ptr<cucascade::idisk_io_backend> backend parameter; callers resolve via inherited get_gpu_io_backends(). Completes Plan 05-04's declared iceberg handoff (iceberg_scan_task_global_state ctor forwards gpu_io_backends to base + task_creator iceberg branch seeds map). Pure-consumer invariant on sirius_context.hpp upheld.
+- [Phase 05]: Plan 05-06: All 13 Phase-5 requirements closed on real N=2 hardware (2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2). compute-sanitizer memcheck 0 errors across 57 test cases / 1.92M assertions; per-backend cudaGetDevice readback matches target (GPU 0→0, GPU 1→1); SF10 wall-clock captured on both 1-GPU and 2-GPU configs with correct results. IO-10 Phase-4 regression comparison explicitly deferred to future optimization work per user directive 2026-04-21 ("we don't need to run any comparisons, let's just make sure everything is working, we can optimize later"). Phase 5 SHIPPED.
 
 ### Pending Todos
 
-- `/gsd:plan-phase 4` — decompose cuCascade bump + v1.0 re-integration into plans.
-- After Phase 4 lands: `/gsd:plan-phase 5` for the parquet I/O migration.
-- After Phase 5: `/gsd:plan-phase 6` for topology + device safety + converter + NUMA host allocator.
-- After Phase 6: `/gsd:plan-phase 7` for P2P direct + adaptive scan.
+- `/gsd:plan-phase 6` — decompose Multi-GPU Gap Closure (MGPU-01..05: topology discovery, single-GPU no-regression, device-guard enforcement, GPU↔GPU converter registration, per-NUMA host memory spaces).
+- After Phase 6: `/gsd:plan-phase 7` for MGPU-06 P2P direct + MGPU-07 adaptive scan.
 
 ### Blockers / Concerns
 
-- **[ACTIVE BLOCKER] Phase 5 sign-off requires N=2 GPU validation re-run.** Plan 05-06 Task 2b was REJECTED on 2026-04-21 because Task 2a was run on a Tier-A (GPU-less) planning/CI host and its 05-06-MULTIGPU-VALIDATION.md artifact documents IO-10 + IO-11 as `DEFERRED` rather than measured. Per reviewer: "Phase 5 cannot ship until compute-sanitizer memcheck (IO-11) and SF10 wall-clock measurement (IO-10) are run on the N=2 verification host used in Phase 4." The must_haves frontmatter in 05-06-PLAN.md explicitly requires Tier-B evidence (items 4 and 5). Unblock procedure documented under "Current Position → Unblock Procedure" above.
-- **Dev drift:** 47 dev commits since multi-gpu branch diverged touched sirius-native types (#643), YAML config (#565), DuckDB vocabulary removal (#564/#626/#628). Phase 4 must adapt all 23 porting commits to these APIs.
-- **Multi-GPU hardware gating:** Several v1.0 validation tests (and the new IO-11 / MGPU-03 / MGPU-06 / MGPU-07 criteria) require an N>1 GPU machine. Single-GPU dev boxes use the Catch2-v2 `WARN+return` convention.
-- **TPC-H SF10 scan regression risk:** Cucascade's `pipeline_io_backend` always stages through pinned host (no GDS) — IO-10 budgets ≤30% regression. If exceeded, escalate upstream (cucascade issue) rather than gate the milestone.
-- **Per-file `open`/`close` in `pipeline_io_backend`:** Research pitfall P1 — no file-handle cache. Profile during Phase 5; if it dominates, file upstream issue.
-- **Cross-GPU converter return-leg fails on 2-GPU HW — scoped to Phase 6 (MGPU-03) / Phase 7 (MGPU-06).** Surfaced in Plan 04-05 Task 2: `[.][multi_gpu_transfer]` and `[.][mem_04_p2p_transfer]` hidden tests PASS on GPU0→GPU1 forward leg but FAIL on GPU1→GPU0 return leg via cucascade converter. Not a Phase 4 regression — exactly at the documented Phase 6/7 scope boundary. MGPU-03 (Phase 6) likely closes the device-guard root cause; MGPU-06 (Phase 7) replaces the host-staged path with `cudaMemcpyPeerAsync`. Regression gate seeded: `test/cpp/downgrade/test_downgrade_executor.cpp:813` with `TODO(MGPU-06)` marker.
-- **TPC-H Q4 parquet flake (pre-existing).** Recurred once in Plans 01/02/05 (retry green). Outside Phase 4 scope. Root-cause investigation scoped to Phase 5 (parquet I/O migration touches the responsible code paths).
+- **Phase 5 sign-off is CLEAR** (prior blocker resolved on 2026-04-21: Task 2b `approved` after N=2 real-hardware re-run — see Phase 5 SUMMARY §"Phase 5 Outcome").
+- **Dev drift:** 47 dev commits since multi-gpu branch diverged touched sirius-native types (#643), YAML config (#565), DuckDB vocabulary removal (#564/#626/#628). Addressed in Phase 4; no further drift compensation needed for v1.1.
+- **Multi-GPU hardware gating:** MGPU-03 + MGPU-06 + MGPU-07 (Phase 6/7) require an N>1 GPU machine. The N=2 verification host (`6f7e4c9-lcedt`, 2 × RTX 6000 Ada) used in Plans 04-05 + 05-06 remains available for Phase 6 validation.
+- **TPC-H SF10 Phase-4 regression comparison deferred to future optimization work** per user directive on 2026-04-21. Absolute Phase-5 SF10 numbers are recorded in `05-06-MULTIGPU-VALIDATION.md` as the starting reference point.
+- **Per-file `open`/`close` in `pipeline_io_backend`:** Research pitfall P1 — no file-handle cache. Not measured in Phase 5 (deferred with the regression comparison). If it dominates later profiles, file upstream issue.
+- **Cross-GPU converter return-leg fails on 2-GPU HW — scoped to Phase 6 (MGPU-03) / Phase 7 (MGPU-06).** Surfaced in Plan 04-05 Task 2: `[.][multi_gpu_transfer]` and `[.][mem_04_p2p_transfer]` hidden tests PASS on GPU0→GPU1 forward leg but FAIL on GPU1→GPU0 return leg via cucascade converter. Phase 5 confirmed these are pre-existing (not Phase-5 regressions) — compute-sanitizer on N=2 reported 0 errors across 57 test cases / 1.92M assertions, so Phase 5 code is clean of its own multi-GPU bugs. MGPU-03 (Phase 6) likely closes the device-guard root cause; MGPU-06 (Phase 7) replaces the host-staged path with `cudaMemcpyPeerAsync`. Regression gate seeded: `test/cpp/downgrade/test_downgrade_executor.cpp:813` with `TODO(MGPU-06)` marker.
+- **TPC-H Q4 parquet flake (pre-existing).** Not observed during Phase 5 runs; remains a pre-existing deferral for future observation.
 
 ## Session Continuity
 
-Last session: 2026-04-21T02:55:14Z
-Stopped at: Plan 05-06 Task 2b HALTED — human reviewer rejected sign-off checkpoint. Task 2a produced a Tier-A-only artifact (05-06-MULTIGPU-VALIDATION.md) with IO-10 + IO-11 marked DEFERRED; reviewer requires Tier-B evidence from the N=2 GPU verification host before Phase 5 can ship. Task 3 (05-SUMMARY.md) NOT RUN. Plan 05-06 work-in-progress preserved: Task 1 VALIDATION.md (commit a2c2166) + Task 2a Tier-A MULTIGPU-VALIDATION.md (commit fa640f4) both intact in history.
-Resume file: .planning/phases/05-cucascade-backed-parquet-i-o-migration/05-06-PLAN.md Task 2a (re-run on N=2 host) → Task 2b (re-invoke checkpoint)
+Last session: 2026-04-21T08:15:00Z
+Stopped at: Completed Phase 5 — all 13 requirements closed on real N=2 hardware, Phase 5 SUMMARY written, STATE + ROADMAP + REQUIREMENTS updated. Phase 5 SHIPPED.
+Resume file: `/gsd:plan-phase 6` for Multi-GPU Gap Closure decomposition.
