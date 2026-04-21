@@ -153,6 +153,8 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/fallback.cpp
     src/gpu_buffer_manager.cpp
+    # I/O adapters (Phase 5 — cucascade-backed parquet)
+    src/io/cucascade_datasource.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -358,6 +360,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/io/test_cucascade_datasource.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
