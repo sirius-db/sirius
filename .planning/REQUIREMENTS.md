@@ -43,7 +43,7 @@ These are requirements from v1.0 that were defined but never cleared on `feature
 
 - [ ] **MGPU-01** *(formerly FOUND-01)*: Runtime topology discovery via cucascade `topology_discovery` — GPU count, NUMA domains, GPU↔NUMA mapping
 - [ ] **MGPU-02** *(formerly FOUND-04)*: Single-GPU systems run with zero behavior or performance regression vs the pre-milestone baseline (baseline = current `dev` HEAD TPC-H SF10 timings)
-- [ ] **MGPU-03** *(formerly FOUND-06)*: Device-guard conventions enforced on every execution thread — validated via compute-sanitizer `--tool memcheck --require-cuda-init` on a 2+ GPU system
+- [x] **MGPU-03** *(formerly FOUND-06)*: Device-guard conventions enforced on every execution thread — validated via compute-sanitizer `--tool memcheck --require-cuda-init` on a 2+ GPU system
 - [ ] **MGPU-04** *(formerly CUCS-01)*: GPU↔GPU representation converter registered in cucascade converter registry (feeds MEM-04 P2P path)
 - [ ] **MGPU-05** *(formerly CUCS-02)*: Per-NUMA host memory spaces configured with `numa_region_pinned_host_allocator`
 - [ ] **MGPU-06** *(formerly MEM-04)*: GPU-direct peer-to-peer transfer via `cudaMemcpyPeerAsync` when P2P access is available — measurably faster than host staging (completes 03-02 plan)
@@ -146,7 +146,7 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | HYG-02 | Phase 5 | Complete |
 | MGPU-01 | Phase 6 | Pending |
 | MGPU-02 | Phase 6 | Pending |
-| MGPU-03 | Phase 6 | Pending |
+| MGPU-03 | Phase 6 | Complete |
 | MGPU-04 | Phase 6 | Pending |
 | MGPU-05 | Phase 6 | Pending |
 | MGPU-06 | Phase 7 | Pending |

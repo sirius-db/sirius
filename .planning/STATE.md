@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.1
-milestone_name: Multi-GPU Re-integration + Cucascade I/O Migration
-status: in_progress
-stopped_at: Completed Phase 5 — all 13 requirements (IO-01..11, HYG-01, HYG-02) closed on real N=2 hardware; Phase 5 SUMMARY written; ready for Phase 6 planning (MGPU-01..05 gap closure).
-last_updated: "2026-04-21T08:15:00Z"
+milestone: v1.0
+milestone_name: Re-integration
+status: executing
+stopped_at: Completed 06-02-PLAN.md (MGPU-03 device-guard enforcement in 2 noexcept callbacks); Wave 1 parallel with 06-01 + 06-03
+last_updated: "2026-04-21T14:12:12.714Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 2
-  total_plans: 11
-  completed_plans: 11
+  total_plans: 15
+  completed_plans: 13
   percent: 100
 ---
 
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-20)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 5 COMPLETE — Phase 6 (Multi-GPU Gap Closure) not yet planned.
+**Current focus:** Phase 06 — multi-gpu-gap-closure-topology-device-safety-host-memory-gpu-gpu-converter
 
 ## Current Position
 
-Phase: 05 (cucascade-backed-parquet-i-o-migration) — **COMPLETE**
-Plan: 6 of 6 complete
-Status: **SHIPPED** (approved on 2026-04-21 with IO-10 Phase-4 regression comparison explicitly deferred per user directive)
+Phase: 06 (multi-gpu-gap-closure-topology-device-safety-host-memory-gpu-gpu-converter) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
 Last activity: 2026-04-21
 
 Progress: [██████████] 100% (Phase 4 + Phase 5 complete; 11 of 11 scoped plans done across the two shipped phases)
@@ -35,6 +35,7 @@ Progress: [██████████] 100% (Phase 4 + Phase 5 complete; 11 
 ### Phase 5 Shipped State
 
 All 13 Phase 5 requirements closed:
+
 - **IO-01..03** (cucascade_datasource adapter + pinned-host staging + async) — Plans 05-01 + 05-02
 - **IO-04, IO-11** (per-GPU backend cache + multi-GPU validation) — Plans 05-03 + 05-06
 - **IO-05** (3 datasource::create call sites migrated) — Plans 05-04 + 05-05
@@ -85,6 +86,7 @@ Phase SUMMARY at `.planning/phases/05-cucascade-backed-parquet-i-o-migration/05-
 | Phase 05 P04 | ~9 min | 2 tasks | 3 files |
 | Phase 05 P05 | 20min | 2 tasks | 7 files |
 | Phase 05 P06 | ~35min (spread; Task 1 + 2a-first + 2a-re-run + 2b + Task 3) | 3 tasks | 4 files (VALIDATION + MULTIGPU-VALIDATION + SUMMARY + state) |
+| Phase 06 P02 | 2m 34s | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -120,6 +122,7 @@ New for v1.1 (from research synthesis):
 - [Phase 05]: Plan 05-04: parquet_scan_task inherits from sirius_pipeline_itask (not gpu_pipeline_task) so there is no get_preferred_device_id() helper on the task. Hot-path backend selection uses g_state.get_preferred_device_id() with first-backend fallback — mirrors pipeline_executor's default routing for non-gpu_pipeline_task instances.
 - [Phase 05]: Plan 05-05: Approach A (locked) for iceberg delete-file helpers — helper signatures gain std::shared_ptr<cucascade::idisk_io_backend> backend parameter; callers resolve via inherited get_gpu_io_backends(). Completes Plan 05-04's declared iceberg handoff (iceberg_scan_task_global_state ctor forwards gpu_io_backends to base + task_creator iceberg branch seeds map). Pure-consumer invariant on sirius_context.hpp upheld.
 - [Phase 05]: Plan 05-06: All 13 Phase-5 requirements closed on real N=2 hardware (2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2). compute-sanitizer memcheck 0 errors across 57 test cases / 1.92M assertions; per-backend cudaGetDevice readback matches target (GPU 0→0, GPU 1→1); SF10 wall-clock captured on both 1-GPU and 2-GPU configs with correct results. IO-10 Phase-4 regression comparison explicitly deferred to future optimization work per user directive 2026-04-21 ("we don't need to run any comparisons, let's just make sure everything is working, we can optimize later"). Phase 5 SHIPPED.
+- [Phase 06-02]: MGPU-03 device-guard teeth: both Super Sirius noexcept per-thread init callbacks (gpu_pipeline_executor + downgrade_executor) now check cudaSetDevice return and log spdlog::error on failure. No RAII conversion — per-thread pinning is lifetime-scoped (documented rationale in MGPU-03 comment blocks).
 
 ### Pending Todos
 
@@ -138,6 +141,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T08:15:00Z
-Stopped at: Completed Phase 5 — all 13 requirements closed on real N=2 hardware, Phase 5 SUMMARY written, STATE + ROADMAP + REQUIREMENTS updated. Phase 5 SHIPPED.
-Resume file: `/gsd:plan-phase 6` for Multi-GPU Gap Closure decomposition.
+Last session: 2026-04-21T14:12:12.712Z
+Stopped at: Completed 06-02-PLAN.md (MGPU-03 device-guard enforcement in 2 noexcept callbacks); Wave 1 parallel with 06-01 + 06-03
+Resume file: None
