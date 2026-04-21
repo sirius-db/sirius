@@ -29,6 +29,7 @@
 
 // cucascade
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
@@ -52,6 +53,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -117,11 +119,16 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param[in] pipeline The pipeline associated with this task
    * @param[in] scan_op The physical table scan operator
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
+   * @param[in] gpu_io_backends Per-GPU cucascade io backends indexed by device_id.
+   *            Seeded by task_creator from SiriusContext::get_gpu_io_backends()
+   *            (Approach C, Phase 5 Plan 04). Used for planning-time footer
+   *            pre-reads and hot-path per-task datasource construction.
    */
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
-    std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE);
+    std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends = {});
 
   //===----------Methods----------===//
   /**
@@ -232,6 +239,24 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   [[nodiscard]] std::size_t get_file_size(std::size_t file_idx) const
   {
     return _file_sizes[file_idx];
+  }
+
+  /**
+   * @brief Access the per-GPU cucascade io backend map (Approach C, Phase 5 Plan 04).
+   *
+   * Seeded at construction time by task_creator from
+   * SiriusContext::get_gpu_io_backends(). Keyed by device_id; value is a
+   * shared_ptr to the per-GPU cucascade::idisk_io_backend bound to that
+   * GPU's CUDA context. Used by compute_task() (hot path, routed by
+   * preferred_device_id) and by initialize_from_files() (planning-time,
+   * first-available GPU).
+   *
+   * @return A const reference to the map.
+   */
+  [[nodiscard]] std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> const&
+  get_gpu_io_backends() const
+  {
+    return _gpu_io_backends;
   }
 
   /**
@@ -369,12 +394,16 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param selected_column_indices Column indices to read (may be widened for
    *                                equality-delete key columns).
    * @param approximate_batch_size  Target uncompressed batch size for partitioning.
+   * @param gpu_io_backends         Per-GPU cucascade io backends indexed by
+   *                                device_id (Approach C; see public ctor).
    */
-  parquet_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-                                 sirius_physical_parquet_scan* scan_op,
-                                 std::vector<std::string> file_paths,
-                                 std::vector<size_t> selected_column_indices,
-                                 std::size_t approximate_batch_size);
+  parquet_scan_task_global_state(
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+    sirius_physical_parquet_scan* scan_op,
+    std::vector<std::string> file_paths,
+    std::vector<size_t> selected_column_indices,
+    std::size_t approximate_batch_size,
+    std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends = {});
 
  private:
   /**
@@ -421,6 +450,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /// Hive partition columns (not present in parquet files).
   std::vector<hive_partition_column> _hive_partition_columns;
   std::unordered_set<size_t> _hive_partition_index_set;
+
+  /// Per-GPU cucascade io backends keyed by device_id. Seeded by task_creator
+  /// from SiriusContext::get_gpu_io_backends() at global-state construction
+  /// time (Approach C, Phase 5 Plan 04). The adapter layer
+  /// (sirius::io::cucascade_datasource) is constructed here with the backend
+  /// selected by preferred_device_id (hot path) or first-available (planning).
+  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> _gpu_io_backends;
 };
 
 //===----------------------------------------------------------------------===//

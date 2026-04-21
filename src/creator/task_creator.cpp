@@ -108,16 +108,21 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       if (it != _parquet_scan_operator_global_state_map.end()) {
         it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
       } else {
-        const auto& op_params =
-          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-            ->get_config()
-            .get_operator_params();
+        // Approach C (Phase 5 Plan 04): seed parquet_scan_task_global_state with
+        // the per-GPU cucascade io backend map from SiriusContext. The map is
+        // captured by copy into the global_state; scan tasks look up the backend
+        // for their preferred_device_id in compute_task().
+        auto* sirius_ctx =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+        const auto& op_params  = sirius_ctx->get_config().get_operator_params();
+        auto gpu_io_backends   = sirius_ctx->get_gpu_io_backends();
         _parquet_scan_operator_global_state_map.emplace(
           operator_id,
           std::make_shared<op::scan::parquet_scan_task_global_state>(
             pipeline,
             &source_operator->Cast<op::sirius_physical_parquet_scan>(),
-            op_params.scan_task_batch_size));
+            op_params.scan_task_batch_size,
+            std::move(gpu_io_backends)));
       }
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
       _cpu_source_operator_global_state_map.emplace(

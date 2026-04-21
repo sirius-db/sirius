@@ -22,6 +22,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
 #include <helper/type_conversions.hpp>
+#include <io/cucascade_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
@@ -60,6 +61,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -210,10 +213,12 @@ std::vector<byte_range_info> merge_byte_ranges(std::vector<byte_range_info> cons
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_parquet_scan* scan_op,
-  std::size_t approximate_batch_size)
+  std::size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
-    _scan_op(scan_op)
+    _scan_op(scan_op),
+    _gpu_io_backends(std::move(gpu_io_backends))
 {
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
@@ -270,12 +275,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   sirius_physical_parquet_scan* scan_op,
   std::vector<std::string> file_paths,
   std::vector<size_t> selected_column_indices,
-  std::size_t approximate_batch_size)
+  std::size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
     _scan_op(scan_op),
     _selected_column_indices(std::move(selected_column_indices)),
-    _file_paths(std::move(file_paths))
+    _file_paths(std::move(file_paths)),
+    _gpu_io_backends(std::move(gpu_io_backends))
 {
   if (_file_paths.empty()) {
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
@@ -311,9 +318,24 @@ void parquet_scan_task_global_state::initialize_from_files()
   _metadata_byte_sizes.reserve(_file_paths.size());
   _footer_offsets.reserve(_file_paths.size());
 
+  // IO-05: use cucascade-backed datasource instead of kvikio file_source.
+  // Planning-time reads — pick the first available GPU backend deterministically;
+  // the reads are small (footer only) and don't populate per-GPU row-group
+  // allocations, so context mismatch is correctness-neutral (research Pitfall 6).
+  auto const planning_backend_it = _gpu_io_backends.begin();
+  if (planning_backend_it == _gpu_io_backends.end()) {
+    throw std::runtime_error(
+      "[parquet_scan_task_global_state] No GPU io_backends configured — "
+      "SiriusContext::initialize() must have populated at least one "
+      "(Approach C seeding via task_creator required).");
+  }
+
   for (auto const& file_path : _file_paths) {
-    auto datasource      = cudf::io::datasource::create(file_path);
-    auto const file_size = datasource->size();
+    // cucascade::idisk_io_backend has no size() API; use std::filesystem
+    // (research Open Q3). The adapter caches the file_size for size() calls.
+    auto const file_size = std::filesystem::file_size(file_path);
+    auto datasource      = std::make_unique<sirius::io::cucascade_datasource>(
+      planning_backend_it->second, std::filesystem::path{file_path}, file_size);
     datasources.push_back(std::move(datasource));
 
 #if CUDF_VERSION_NUM >= 2604
@@ -706,7 +728,39 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
 
   if (!_datasource) {
-    _datasource = cudf::io::datasource::create(g_state.get_file_path(l_state.get_file_idx()));
+    // IO-05 + IO-04: route the per-task datasource construction to the
+    // per-GPU cucascade backend selected by preferred_device_id.
+    //
+    // parquet_scan_task is a sirius_pipeline_itask (NOT a gpu_pipeline_task),
+    // so the two-tier local_state/global_state get_preferred_device_id() helper
+    // from gpu_pipeline_task is not directly available. We consult the
+    // global_state's pipeline-level preferred device (set on
+    // sirius_pipeline_task_global_state base) when present. Today, the
+    // pipeline_executor routes non-gpu_pipeline_task instances to the first GPU
+    // executor by default (pipeline_executor.cpp:237-244), so parquet_scan_task
+    // effectively runs on the first GPU when no explicit preference is set —
+    // we mirror that behavior here by falling back to the first configured
+    // backend. This keeps the adapter construction aligned with the actual
+    // executor-routing decision and avoids silent context mismatch.
+    auto const& backends = g_state.get_gpu_io_backends();
+    if (backends.empty()) {
+      throw std::runtime_error(
+        "[parquet_scan_task::compute_task] no GPU io_backends configured — "
+        "SiriusContext::initialize() must have populated at least one "
+        "(Approach C seeding via task_creator required)");
+    }
+    auto const preferred = g_state.get_preferred_device_id();
+    auto backend_it =
+      preferred.has_value() ? backends.find(*preferred) : backends.begin();
+    if (backend_it == backends.end()) {
+      throw std::out_of_range(
+        "[parquet_scan_task::compute_task] no io_backend for device_id=" +
+        std::to_string(preferred.value_or(-1)));
+    }
+    auto const& file_path = g_state.get_file_path(l_state.get_file_idx());
+    auto const file_size  = g_state.get_file_size(l_state.get_file_idx());
+    _datasource           = std::make_shared<sirius::io::cucascade_datasource>(
+      backend_it->second, std::filesystem::path{file_path}, file_size);
   }
 
   auto reader = g_state.make_reader(l_state.get_file_idx());
