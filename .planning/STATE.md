@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
-status: executing
-stopped_at: Completed 05-05-PLAN.md — Wave 3 sibling; metadata scan + iceberg delete-file reads migrated to cucascade_datasource (IO-05 final site + IO-06); iceberg ctor handoff from Plan 05-04 closed; ready for Plan 05-06 phase sign-off
-last_updated: "2026-04-21T01:47:18.186Z"
+status: blocked
+stopped_at: Plan 05-06 Task 2b HALTED — human reviewer REJECTED sign-off checkpoint; Phase 5 cannot ship until IO-10 SF10 wall-clock + IO-11 compute-sanitizer memcheck are run on the N=2 GPU verification host used in Plan 04-05, and 05-06-MULTIGPU-VALIDATION.md is rewritten with real evidence (not deferred). Task 3 (05-SUMMARY.md) NOT RUN.
+last_updated: "2026-04-21T02:55:14Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 11
-  completed_plans: 11
-  percent: 100
+  completed_plans: 10
+  percent: 91
 ---
 
 # Project State
@@ -25,12 +25,54 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 
 ## Current Position
 
-Phase: 05 (cucascade-backed-parquet-i-o-migration) — EXECUTING
-Plan: 6 of 6
-Status: Ready to execute
+Phase: 05 (cucascade-backed-parquet-i-o-migration) — **BLOCKED AT PLAN 05-06 TASK 2B**
+Plan: 6 of 6 (in-flight; partially executed)
+Status: **BLOCKED — pending N=2 GPU validation re-run; human rejected sign-off checkpoint**
 Last activity: 2026-04-21
 
-Progress: [██████████] 100% (phase-scoped)
+Progress: [█████████·] 91% (phase-scoped — 10 of 11 plans complete; Plan 05-06 awaiting Task 2b re-run)
+
+### Plan 05-06 Execution State
+
+**Completed (committed):**
+- Plan 05-06 Task 1 — 05-06-VALIDATION.md written (IO-08 grep gate PASS, HYG-02 sweep 15/15 files clean, SF1 Tier-A failure-mode match, adapter unit tests 7/7 PASS, full unit-tests 973/973 PASS). Commit: `a2c2166`
+- Plan 05-06 Task 2a — 05-06-MULTIGPU-VALIDATION.md written on Tier-A (GPU-less) host with IO-10 + IO-11 evidence marked DEFERRED. Commit: `fa640f4`
+
+**Blocked (NOT run; reject loop):**
+- Plan 05-06 Task 2b — human sign-off checkpoint **REJECTED**. Reviewer requires Tier-B evidence (real compute-sanitizer log + real SF10 wall-clock numbers) before Phase 5 can ship.
+- Plan 05-06 Task 3 — 05-SUMMARY.md NOT WRITTEN. Cannot be written until Task 2b resolves with an `approved` signal.
+
+### Unblock Procedure
+
+The following MUST be completed on the N=2 GPU verification host previously used in Plan 04-05:
+
+1. **Re-run IO-11 compute-sanitizer memcheck** (per plan Task 2a Step 1):
+   ```bash
+   compute-sanitizer --tool memcheck --require-cuda-init \
+     build/release/test/unittest --test-dir . test/sql/tpch-sirius.test \
+     > /tmp/phase5-sanitizer.log 2>&1
+   ```
+   Classify each `invalid device` / `context mismatch` line as `pre-existing` (matches Phase 4 baseline shape per `04-SUMMARY.md §"Hidden-tag explicit invocation on N=2 GPU verification host"`) or `NEW` (blocker). Capture the per-backend `SiriusContext: io_backend created for GPU {device_id} (cudaGetDevice readback={n})` log lines — one per GPU, each readback must equal target.
+
+2. **Re-run IO-10 SF10 wall-clock** (per plan Task 2a Step 2):
+   - Build Phase-4 HEAD (`13e4322`) in a clean worktree, run `python3 test/tpch_performance/generate_test_data.py 10` then `python3 test/tpch_performance/performance_test.py 10`, capture Q1/Q3/Q6 wall-clock.
+   - Switch to Phase-5 HEAD (current `fa640f4` or a later head if additional migration fixes land), re-run the SF10 perf test, capture wall-clock.
+   - Compute aggregate `regression_pct`; apply the decision matrix (≤30% PASS / 30–50% PASS+escalate / >50% STOP).
+
+3. **Rewrite `05-06-MULTIGPU-VALIDATION.md`** replacing every `DEFERRED` / `UNKNOWN` / `— (not run)` cell with actual measurements. Include:
+   - Real sanitizer log last-100-lines excerpt
+   - Per-backend `cudaGetDevice` readback rows for N=2 (device 0 + device 1)
+   - Error classification table with every error line marked `pre-existing` or `NEW`
+   - Real Q1/Q3/Q6 baseline + post-migration ms values + regression_pct
+   - Updated recommendation section (must read `approve` / `approve with note` / `reject` based on the actual numbers)
+
+4. **Re-invoke Plan 05-06 Task 2b** (sign-off checkpoint). If reviewer responds `approved` (possibly with a documented note about an upstream cucascade issue if SF10 regression is 30–50%), then Task 3 (05-SUMMARY.md) unblocks and Phase 5 can ship.
+
+### Resume Pointer
+
+- **Next action:** Plan 05-06 Task 2a re-run on N=2 verification host → update 05-06-MULTIGPU-VALIDATION.md with real evidence → re-invoke Task 2b checkpoint.
+- **Do NOT** write 05-SUMMARY.md, advance phase counters, update ROADMAP plan progress, or mark IO-08..11 / HYG-02 requirements complete until Task 2b returns `approved`.
+- **Preserve** Plan 05-06 work-in-progress: commits `a2c2166` (Task 1) and `fa640f4` (Task 2a Tier-A artifact) remain in history as the starting point; the re-run of Task 2a will overwrite `05-06-MULTIGPU-VALIDATION.md` with Tier-B evidence but should keep Task 1's VALIDATION.md intact (it passed autonomously and is host-independent).
 
 ## Performance Metrics
 
@@ -107,6 +149,7 @@ New for v1.1 (from research synthesis):
 
 ### Blockers / Concerns
 
+- **[ACTIVE BLOCKER] Phase 5 sign-off requires N=2 GPU validation re-run.** Plan 05-06 Task 2b was REJECTED on 2026-04-21 because Task 2a was run on a Tier-A (GPU-less) planning/CI host and its 05-06-MULTIGPU-VALIDATION.md artifact documents IO-10 + IO-11 as `DEFERRED` rather than measured. Per reviewer: "Phase 5 cannot ship until compute-sanitizer memcheck (IO-11) and SF10 wall-clock measurement (IO-10) are run on the N=2 verification host used in Phase 4." The must_haves frontmatter in 05-06-PLAN.md explicitly requires Tier-B evidence (items 4 and 5). Unblock procedure documented under "Current Position → Unblock Procedure" above.
 - **Dev drift:** 47 dev commits since multi-gpu branch diverged touched sirius-native types (#643), YAML config (#565), DuckDB vocabulary removal (#564/#626/#628). Phase 4 must adapt all 23 porting commits to these APIs.
 - **Multi-GPU hardware gating:** Several v1.0 validation tests (and the new IO-11 / MGPU-03 / MGPU-06 / MGPU-07 criteria) require an N>1 GPU machine. Single-GPU dev boxes use the Catch2-v2 `WARN+return` convention.
 - **TPC-H SF10 scan regression risk:** Cucascade's `pipeline_io_backend` always stages through pinned host (no GDS) — IO-10 budgets ≤30% regression. If exceeded, escalate upstream (cucascade issue) rather than gate the milestone.
@@ -116,6 +159,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T01:47:07.068Z
-Stopped at: Completed 05-05-PLAN.md — Wave 3 sibling; metadata scan + iceberg delete-file reads migrated to cucascade_datasource (IO-05 final site + IO-06); iceberg ctor handoff from Plan 05-04 closed; ready for Plan 05-06 phase sign-off
-Resume file: None
+Last session: 2026-04-21T02:55:14Z
+Stopped at: Plan 05-06 Task 2b HALTED — human reviewer rejected sign-off checkpoint. Task 2a produced a Tier-A-only artifact (05-06-MULTIGPU-VALIDATION.md) with IO-10 + IO-11 marked DEFERRED; reviewer requires Tier-B evidence from the N=2 GPU verification host before Phase 5 can ship. Task 3 (05-SUMMARY.md) NOT RUN. Plan 05-06 work-in-progress preserved: Task 1 VALIDATION.md (commit a2c2166) + Task 2a Tier-A MULTIGPU-VALIDATION.md (commit fa640f4) both intact in history.
+Resume file: .planning/phases/05-cucascade-backed-parquet-i-o-migration/05-06-PLAN.md Task 2a (re-run on N=2 host) → Task 2b (re-invoke checkpoint)
