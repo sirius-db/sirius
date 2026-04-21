@@ -29,6 +29,7 @@ Super Sirius is the new task-based GPU execution engine in Sirius, invoked via `
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
+| [Exchange Integration](exchange-integration.md) | Design proposal: communication executor, NIXL in C++, overlapped compute+transfer |
 
 ## Suggested Reading Order
 
