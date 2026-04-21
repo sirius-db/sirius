@@ -104,9 +104,7 @@ bool duckdb_scan_executor::cache_scan_results_for_query(const std::string& query
   // Only track statements that can drive Sirius scan tasks.
   // Transparent execution now runs plain SELECT/WITH SQL, while helper
   // statements like SET and CREATE VIEW should not invalidate the cache.
-  if (!is_cacheable_query_text(query)) {
-    return false;
-  }
+  if (!is_cacheable_query_text(query)) { return false; }
   std::hash<std::string> hash_fn;
   auto new_query_hash = hash_fn(query);
   if (new_query_hash == _query_hash) {
