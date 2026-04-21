@@ -57,7 +57,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
   6. `grep -rn 'cuda_stream_default' src/` returns zero hits in any file touched by the v1.1 migration — specifically `src/op/scan/parquet_scan_task.cpp:468` (the `filter_row_groups_with_stats` call) now receives an explicit stream threaded from the scan task's global state (HYG-01, HYG-02).
 **Plans**: 6 plans
 - [x] 05-01-PLAN.md — Baseline capture + sirius::io::cucascade_datasource header + CMakeLists registration (IO-01 skeleton)
-- [ ] 05-02-PLAN.md — Adapter implementation + Catch2 unit tests with mock idisk_io_backend (IO-01, IO-02, IO-03)
+- [x] 05-02-PLAN.md — Adapter implementation + Catch2 unit tests with mock idisk_io_backend (IO-01, IO-02, IO-03)
 - [ ] 05-03-PLAN.md — SiriusContext io_backend_registry + per-GPU backend cache under rmm::cuda_set_device_raii (IO-04, IO-11 infra)
 - [ ] 05-04-PLAN.md — parquet_scan_task.cpp migration (lines 312 + 699) + HYG-01 explicit stream fix at line 468 (IO-05, IO-07, HYG-01)
 - [ ] 05-05-PLAN.md — sirius_parquet_metadata_scan_operator.cpp:251 + iceberg_scan_task.cpp:57/120 migrations (IO-05, IO-06)

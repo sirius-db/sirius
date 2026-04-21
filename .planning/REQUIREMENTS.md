@@ -26,8 +26,8 @@
 ### IO — Replace kvikio with cuCascade `idisk_io_backend` for Parquet I/O
 
 - [x] **IO-01**: `sirius::io::cucascade_datasource` subclass of `cudf::io::datasource` ships in `src/io/`, backed by cuCascade's `idisk_io_backend` via `io_backend_registry` factory
-- [ ] **IO-02**: `cucascade_datasource` declares `supports_device_read() == false` so cuDF host-stages reads and issues memcpys on the caller's explicit stream (no GDS, no cuFile, no kvikio)
-- [ ] **IO-03**: `host_read` returns pinned host memory allocated from cucascade's host-memory resource so cuDF's `cuda_memcpy_async` stays truly asynchronous
+- [x] **IO-02**: `cucascade_datasource` declares `supports_device_read() == false` so cuDF host-stages reads and issues memcpys on the caller's explicit stream (no GDS, no cuFile, no kvikio)
+- [x] **IO-03**: `host_read` returns pinned host memory allocated from cucascade's host-memory resource so cuDF's `cuda_memcpy_async` stays truly asynchronous
 - [ ] **IO-04**: Per-GPU `idisk_io_backend` instances cached in `SiriusContext`, created once per device under `rmm::cuda_set_device_raii` so each instance owns streams/pinned buffers in its GPU's context
 - [ ] **IO-05**: `cudf::io::datasource::create(filepath)` removed from `src/op/scan/parquet_scan_task.cpp:312`, `:699` and `src/op/scan/sirius_parquet_metadata_scan_operator.cpp:251` — all three routed through the new factory
 - [ ] **IO-06**: Iceberg delete-file reads at `src/op/scan/iceberg_scan_task.cpp:57-58` and `:120-121` pass `source_info{ds.get()}` with a cucascade-backed datasource instead of `source_info{filepath}`
@@ -132,8 +132,8 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | BUMP-02 | Phase 4 | Complete |
 | BUMP-03 | Phase 4 | Complete |
 | IO-01 | Phase 5 | Complete |
-| IO-02 | Phase 5 | Pending |
-| IO-03 | Phase 5 | Pending |
+| IO-02 | Phase 5 | Complete |
+| IO-03 | Phase 5 | Complete |
 | IO-04 | Phase 5 | Pending |
 | IO-05 | Phase 5 | Pending |
 | IO-06 | Phase 5 | Pending |
