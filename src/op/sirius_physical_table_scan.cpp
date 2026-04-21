@@ -153,8 +153,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (filter_expr != nullptr) {
-    duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
-    output_batch = gpu_expression_executor.select(batch_ref, stream);
+    sirius::gpu_expression_executor gpu_expression_executor(
+      filter_expr.get(), cudf::get_current_device_resource_ref(), stream);
+    output_batch = gpu_expression_executor.select(batch_ref);
     if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
   } else {
     output_batch = batch_ref;
@@ -165,6 +166,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   std::size_t expected_output_columns = types.size();
   auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
   auto& out_table = gpu_rep.get_table();
+
+  if (expected_output_columns == 0) {
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
+  }
 
   if (static_cast<std::size_t>(out_table.num_columns()) > expected_output_columns) {
     SIRIUS_LOG_DEBUG(

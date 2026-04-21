@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "expression_executor/gpu_dispatcher.hpp"
+#include "legacy/expression_executor/gpu_dispatcher.hpp"
 #include "operator/gpu_physical_strings_matching.hpp"
 #include "operator/gpu_physical_substring.hpp"
 

@@ -16,7 +16,6 @@
 
 // sirius
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
 #include <log/logging.hpp>
 
 // duckdb
@@ -31,6 +30,8 @@
 
 // cudf
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/search.hpp>
 #include <cudf/unary.hpp>
@@ -42,180 +43,168 @@
 // standard library
 #include <algorithm>
 
-namespace duckdb::sirius {
-// These functors are useful in the new and the legacy expression executors
-
-// Helper template functor to reduce bloat
+namespace {
 template <typename T>
-struct ExecuteNumericIn {
-  static std::unique_ptr<cudf::column> Do(const BoundOperatorExpression& expr,
-                                          const cudf::column_view& input_view,
-                                          rmm::device_async_resource_ref mr,
-                                          rmm::cuda_stream_view stream)
-  {
-    std::vector<T> children_vals;
-    for (idx_t child = 1; child < expr.children.size(); ++child) {
-      const auto& child_expression = expr.children[child]->Cast<BoundConstantExpression>();
-      children_vals.push_back(child_expression.value.GetValue<T>());
-    }
-    rmm::device_uvector<T> children_vals_d(children_vals.size(), stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
-                                  children_vals.data(),
-                                  children_vals.size() * sizeof(T),
-                                  cudaMemcpyHostToDevice,
-                                  stream));
-    cudf::column_view children_view(input_view.type(),
-                                    static_cast<cudf::size_type>(children_vals.size()),
-                                    children_vals_d.data(),
-                                    nullptr,
-                                    0,
-                                    0);
-    return cudf::contains(children_view, input_view, stream, mr);
+std::unique_ptr<cudf::column> execute_numeric_in(const duckdb::BoundOperatorExpression& expr,
+                                                 const cudf::column_view& input_view,
+                                                 rmm::device_async_resource_ref mr,
+                                                 rmm::cuda_stream_view stream)
+{
+  std::vector<T> children_vals;
+  for (std::size_t child = 1; child < expr.children.size(); ++child) {
+    const auto& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
+    children_vals.push_back(child_expression.value.GetValue<T>());
   }
-};
+  rmm::device_uvector<T> children_vals_d(children_vals.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
+                                children_vals.data(),
+                                children_vals.size() * sizeof(T),
+                                cudaMemcpyHostToDevice,
+                                stream));
+  cudf::column_view children_view(input_view.type(),
+                                  static_cast<cudf::size_type>(children_vals.size()),
+                                  children_vals_d.data(),
+                                  nullptr,
+                                  0,
+                                  0);
+  return cudf::contains(children_view, input_view, stream, mr);
+}
 
 // For decimal (fixed_point) types. Uses GetValueUnsafe<Rep> to avoid lossy conversion through
 // double, and unpacks duckdb::hugeint_t into __int128_t for decimal128.
 template <typename DecimalT>
-struct ExecuteDecimalIn {
+std::unique_ptr<cudf::column> execute_decimal_in(const duckdb::BoundOperatorExpression& expr,
+                                                 const cudf::column_view& input_view,
+                                                 rmm::device_async_resource_ref mr,
+                                                 rmm::cuda_stream_view stream)
+{
   using Rep = typename DecimalT::rep;
-  static std::unique_ptr<cudf::column> Do(const BoundOperatorExpression& expr,
-                                          const cudf::column_view& input_view,
-                                          rmm::device_async_resource_ref mr,
-                                          rmm::cuda_stream_view stream)
-  {
-    std::vector<Rep> children_vals;
-    children_vals.reserve(expr.children.size() - 1);
-    for (idx_t child = 1; child < expr.children.size(); ++child) {
-      const auto& child_expression = expr.children[child]->Cast<BoundConstantExpression>();
-      if constexpr (std::is_same_v<DecimalT, numeric::decimal128>) {
-        auto hugeint_value = child_expression.value.GetValueUnsafe<hugeint_t>();
-        children_vals.push_back((__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower);
-      } else {
-        children_vals.push_back(child_expression.value.GetValueUnsafe<Rep>());
-      }
+  std::vector<Rep> children_vals;
+  children_vals.reserve(expr.children.size() - 1);
+  for (std::size_t child = 1; child < expr.children.size(); ++child) {
+    auto const& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
+    if constexpr (std::is_same_v<DecimalT, numeric::decimal128>) {
+      auto hugeint_value = child_expression.value.GetValueUnsafe<duckdb::hugeint_t>();
+      children_vals.push_back((__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower);
+    } else {
+      children_vals.push_back(child_expression.value.GetValueUnsafe<Rep>());
     }
-    rmm::device_uvector<Rep> children_vals_d(children_vals.size(), stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
-                                  children_vals.data(),
-                                  children_vals.size() * sizeof(Rep),
-                                  cudaMemcpyHostToDevice,
-                                  stream));
-    // input_view.type() carries the scale, so the haystack column matches the needle's type.
-    cudf::column_view children_view(input_view.type(),
-                                    static_cast<cudf::size_type>(children_vals.size()),
-                                    children_vals_d.data(),
-                                    nullptr,
-                                    0,
-                                    0);
-    return cudf::contains(children_view, input_view, stream, mr);
   }
-};
+  rmm::device_uvector<Rep> children_vals_d(children_vals.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
+                                children_vals.data(),
+                                children_vals.size() * sizeof(Rep),
+                                cudaMemcpyHostToDevice,
+                                stream));
+  // input_view.type() carries the scale, so the haystack column matches the needle's type.
+  cudf::column_view children_view(input_view.type(),
+                                  static_cast<cudf::size_type>(children_vals.size()),
+                                  children_vals_d.data(),
+                                  nullptr,
+                                  0,
+                                  0);
+  return cudf::contains(children_view, input_view, stream, mr);
+}
 
 // For timestamp types. Pulls the underlying integral count out of the duckdb wrapper struct
 // (date_t.days / timestamp_*_t.value) and uploads as the cudf timestamp's rep type.
 template <typename CudfTimestampT>
-struct ExecuteTimestampIn {
+std::unique_ptr<cudf::column> execute_timestamp_in(const duckdb::BoundOperatorExpression& expr,
+                                                   const cudf::column_view& input_view,
+                                                   rmm::device_async_resource_ref mr,
+                                                   rmm::cuda_stream_view stream)
+{
   using Rep = typename CudfTimestampT::rep;
-  static std::unique_ptr<cudf::column> Do(const BoundOperatorExpression& expr,
-                                          const cudf::column_view& input_view,
-                                          rmm::device_async_resource_ref mr,
-                                          rmm::cuda_stream_view stream)
-  {
-    std::vector<Rep> children_vals;
-    children_vals.reserve(expr.children.size() - 1);
-    for (idx_t child = 1; child < expr.children.size(); ++child) {
-      const auto& child_expression = expr.children[child]->Cast<BoundConstantExpression>();
-      if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_D>) {
-        children_vals.push_back(child_expression.value.GetValue<date_t>().days);
-      } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_s>) {
-        children_vals.push_back(child_expression.value.GetValue<timestamp_sec_t>().value);
-      } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_ms>) {
-        children_vals.push_back(child_expression.value.GetValue<timestamp_ms_t>().value);
-      } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_us>) {
-        children_vals.push_back(child_expression.value.GetValue<timestamp_tz_t>().value);
-      } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_ns>) {
-        children_vals.push_back(child_expression.value.GetValue<timestamp_ns_t>().value);
-      } else {
-        static_assert(sizeof(CudfTimestampT) == 0, "Unsupported cudf timestamp type");
-      }
+  std::vector<Rep> children_vals;
+  children_vals.reserve(expr.children.size() - 1);
+  for (std::size_t child = 1; child < expr.children.size(); ++child) {
+    const auto& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
+    if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_D>) {
+      children_vals.push_back(child_expression.value.GetValue<duckdb::date_t>().days);
+    } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_s>) {
+      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_sec_t>().value);
+    } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_ms>) {
+      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_ms_t>().value);
+    } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_us>) {
+      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_tz_t>().value);
+    } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_ns>) {
+      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_ns_t>().value);
+    } else {
+      static_assert(sizeof(CudfTimestampT) == 0, "Unsupported cudf timestamp type");
     }
-    rmm::device_uvector<Rep> children_vals_d(children_vals.size(), stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
-                                  children_vals.data(),
-                                  children_vals.size() * sizeof(Rep),
-                                  cudaMemcpyHostToDevice,
-                                  stream));
-    cudf::column_view children_view(input_view.type(),
-                                    static_cast<cudf::size_type>(children_vals.size()),
-                                    children_vals_d.data(),
-                                    nullptr,
-                                    0,
-                                    0);
-    return cudf::contains(children_view, input_view, stream, mr);
   }
-};
+  rmm::device_uvector<Rep> children_vals_d(children_vals.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
+                                children_vals.data(),
+                                children_vals.size() * sizeof(Rep),
+                                cudaMemcpyHostToDevice,
+                                stream));
+  cudf::column_view children_view(input_view.type(),
+                                  static_cast<cudf::size_type>(children_vals.size()),
+                                  children_vals_d.data(),
+                                  nullptr,
+                                  0,
+                                  0);
+  return cudf::contains(children_view, input_view, stream, mr);
+}
 
-// For strings
-struct ExecuteStringIn {
-  static std::unique_ptr<cudf::column> Do(const BoundOperatorExpression& expr,
-                                          const cudf::column_view& input_view,
-                                          rmm::device_async_resource_ref mr,
-                                          rmm::cuda_stream_view stream)
-  {
-    auto num_strings = static_cast<cudf::size_type>(expr.children.size() - 1);
-    auto num_offsets = num_strings + 1;
+std::unique_ptr<cudf::column> execute_string_in(const duckdb::BoundOperatorExpression& expr,
+                                                const cudf::column_view& input_view,
+                                                rmm::device_async_resource_ref mr,
+                                                rmm::cuda_stream_view stream)
+{
+  auto const num_strings = static_cast<cudf::size_type>(expr.children.size() - 1);
+  auto const num_offsets = num_strings + 1;
 
-    // We need to convert to cudf/arrow format...
-    std::vector<char> chars;
-    std::vector<cudf::size_type> offsets;
-    cudf::size_type offset = 0;
-    for (idx_t child = 1; child < expr.children.size(); ++child) {
-      const auto& child_expression = expr.children[child]->Cast<BoundConstantExpression>();
-      const auto& child_string     = child_expression.value.GetValue<std::string>();
-      chars.insert(chars.end(), child_string.begin(), child_string.end());
-      offsets.push_back(offset);
-      offset += static_cast<cudf::size_type>(child_string.size());
-    }
+  // We need to convert to cudf/arrow format...
+  std::vector<char> chars;
+  std::vector<cudf::size_type> offsets;
+  cudf::size_type offset = 0;
+  for (std::size_t child = 1; child < expr.children.size(); ++child) {
+    const auto& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
+    const auto& child_string     = child_expression.value.GetValue<std::string>();
+    chars.insert(chars.end(), child_string.begin(), child_string.end());
     offsets.push_back(offset);
-
-    // Allocate buffers and copy to device
-    rmm::device_uvector<char> chars_buffer(offset, stream, mr);
-    rmm::device_uvector<cudf::size_type> offsets_buffer(num_offsets, stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(chars_buffer.data(),
-                                  chars.data(),
-                                  chars.size() * sizeof(char),
-                                  cudaMemcpyHostToDevice,
-                                  stream));
-    CUDF_CUDA_TRY(cudaMemcpyAsync(offsets_buffer.data(),
-                                  offsets.data(),
-                                  offsets.size() * sizeof(cudf::size_type),
-                                  cudaMemcpyHostToDevice,
-                                  stream));
-
-    // Make CuDF things
-    auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                                      num_offsets,
-                                                      std::move(offsets_buffer).release(),
-                                                      rmm::device_buffer{},
-                                                      0);
-    std::vector<std::unique_ptr<cudf::column>> children;
-    children.push_back(std::move(offsets_col));
-    auto in_strings_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
-                                                         num_strings,
-                                                         std::move(chars_buffer).release(),
-                                                         rmm::device_buffer{},
-                                                         0,
-                                                         std::move(children));
-
-    // Execute the search
-    return cudf::contains(in_strings_col->view(), input_view, stream, mr);
+    offset += static_cast<cudf::size_type>(child_string.size());
   }
-};
+  offsets.push_back(offset);
 
-}  // namespace duckdb::sirius
+  // Allocate buffers and copy to device
+  rmm::device_uvector<char> chars_buffer(offset, stream, mr);
+  rmm::device_uvector<cudf::size_type> offsets_buffer(num_offsets, stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(chars_buffer.data(),
+                                chars.data(),
+                                chars.size() * sizeof(char),
+                                cudaMemcpyHostToDevice,
+                                stream));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(offsets_buffer.data(),
+                                offsets.data(),
+                                offsets.size() * sizeof(cudf::size_type),
+                                cudaMemcpyHostToDevice,
+                                stream));
 
-namespace sirius::experimental {
+  // Make CuDF things
+  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
+                                                    num_offsets,
+                                                    std::move(offsets_buffer).release(),
+                                                    rmm::device_buffer{},
+                                                    0);
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(std::move(offsets_col));
+  auto in_strings_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
+                                                       num_strings,
+                                                       std::move(chars_buffer).release(),
+                                                       rmm::device_buffer{},
+                                                       0,
+                                                       std::move(children));
+
+  // Execute the search
+  return cudf::contains(in_strings_col->view(), input_view, stream, mr);
+}
+
+}  // namespace
+
+namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
 execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression const& expr,
@@ -336,84 +325,83 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
         std::unique_ptr<cudf::column> contains_column;
         switch (test.get_column_view().type().id()) {
           case cudf::type_id::INT8:
-            contains_column = duckdb::sirius::ExecuteNumericIn<int8_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<int8_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::INT16:
-            contains_column = duckdb::sirius::ExecuteNumericIn<int16_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<int16_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::INT32:
-            contains_column = duckdb::sirius::ExecuteNumericIn<int32_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<int32_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::INT64:
-            contains_column = duckdb::sirius::ExecuteNumericIn<int64_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<int64_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::UINT8:
-            contains_column = duckdb::sirius::ExecuteNumericIn<uint8_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<uint8_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::UINT16:
-            contains_column = duckdb::sirius::ExecuteNumericIn<uint16_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<uint16_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::UINT32:
-            contains_column = duckdb::sirius::ExecuteNumericIn<uint32_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<uint32_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::UINT64:
-            contains_column = duckdb::sirius::ExecuteNumericIn<uint64_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<uint64_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::FLOAT32:
-            contains_column = duckdb::sirius::ExecuteNumericIn<float_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<float_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::FLOAT64:
-            contains_column = duckdb::sirius::ExecuteNumericIn<double_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<double_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::BOOL8:
-            contains_column = duckdb::sirius::ExecuteNumericIn<uint8_t>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_numeric_in<uint8_t>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::DECIMAL32:
-            contains_column = duckdb::sirius::ExecuteDecimalIn<numeric::decimal32>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_decimal_in<numeric::decimal32>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::DECIMAL64:
-            contains_column = duckdb::sirius::ExecuteDecimalIn<numeric::decimal64>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_decimal_in<numeric::decimal64>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::DECIMAL128:
-            contains_column = duckdb::sirius::ExecuteDecimalIn<numeric::decimal128>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_decimal_in<numeric::decimal128>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::TIMESTAMP_DAYS:
-            contains_column = duckdb::sirius::ExecuteTimestampIn<cudf::timestamp_D>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_timestamp_in<cudf::timestamp_D>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::TIMESTAMP_SECONDS:
-            contains_column = duckdb::sirius::ExecuteTimestampIn<cudf::timestamp_s>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_timestamp_in<cudf::timestamp_s>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::TIMESTAMP_MILLISECONDS:
-            contains_column = duckdb::sirius::ExecuteTimestampIn<cudf::timestamp_ms>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_timestamp_in<cudf::timestamp_ms>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::TIMESTAMP_MICROSECONDS:
-            contains_column = duckdb::sirius::ExecuteTimestampIn<cudf::timestamp_us>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_timestamp_in<cudf::timestamp_us>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::TIMESTAMP_NANOSECONDS:
-            contains_column = duckdb::sirius::ExecuteTimestampIn<cudf::timestamp_ns>::Do(
-              expr, test.get_column_view(), _mr, _stream);
+            contains_column =
+              execute_timestamp_in<cudf::timestamp_ns>(expr, test.get_column_view(), _mr, _stream);
             break;
           case cudf::type_id::STRING:
-            contains_column =
-              duckdb::sirius::ExecuteStringIn::Do(expr, test.get_column_view(), _mr, _stream);
+            contains_column = execute_string_in(expr, test.get_column_view(), _mr, _stream);
             break;
           default:
             throw duckdb::NotImplementedException(
@@ -516,129 +504,4 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
   }
 }
 
-}  // namespace sirius::experimental
-
-namespace duckdb {
-namespace sirius {
-
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const BoundOperatorExpression& expr, GpuExpressionExecutorState& root)
-{
-  auto result = std::make_unique<GpuExpressionState>(expr, root);
-  for (auto& child : expr.children) {
-    result->AddChild(*child);
-  }
-  return std::move(result);
-}
-
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperatorExpression& expr,
-                                                             GpuExpressionState* state)
-{
-  auto expression_type = expr.GetExpressionType();
-  auto return_type     = GetCudfType(expr.return_type);
-
-  if (expression_type == ExpressionType::COMPARE_IN ||
-      expression_type == ExpressionType::COMPARE_NOT_IN) {
-    if (expr.children.size() < 2) {
-      throw InvalidInputException("Execute[BOUND_OPERATOR]: IN needs at least two children!");
-    }
-
-    // Evaluate the left side
-    auto left      = Execute(*expr.children[0], state->child_states[0].get());
-    auto left_type = left->type();
-
-    // Optimization: special handling for case where RHS are all constants
-    if (std::all_of(expr.children.begin() + 1, expr.children.end(), [](const auto& child) {
-          return child->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
-        })) {
-      // All types should be the same
-      switch (left_type.id()) {
-        case cudf::type_id::INT16:
-          return ExecuteNumericIn<int16_t>::Do(expr, left->view(), resource_ref, execution_stream);
-        case cudf::type_id::INT32:
-          return ExecuteNumericIn<int32_t>::Do(expr, left->view(), resource_ref, execution_stream);
-        case cudf::type_id::INT64:
-          return ExecuteNumericIn<int64_t>::Do(expr, left->view(), resource_ref, execution_stream);
-        case cudf::type_id::FLOAT32:
-          return ExecuteNumericIn<float_t>::Do(expr, left->view(), resource_ref, execution_stream);
-        case cudf::type_id::FLOAT64:
-          return ExecuteNumericIn<double_t>::Do(expr, left->view(), resource_ref, execution_stream);
-        case cudf::type_id::BOOL8:
-          return ExecuteNumericIn<uint8_t>::Do(expr, left->view(), resource_ref, execution_stream);
-        case cudf::type_id::STRING:
-          return ExecuteStringIn::Do(expr, left->view(), resource_ref, execution_stream);
-        default:
-          SIRIUS_LOG_ERROR("UNKNOWN TYPE: {}", static_cast<int32_t>(left->type().id()));
-          throw NotImplementedException("Execute[IN_CONSTANTS]: Unimplemented type: %d!",
-                                        static_cast<int>(left_type.id()));
-      }
-    }
-
-    // For every child, OR the result of the comparison with the left to get the overall result.
-    std::unique_ptr<cudf::column> intermediate_result = nullptr;
-    for (idx_t child = 1; child < expr.children.size(); ++child) {
-      // Resolve the child
-      auto comparator        = Execute(*expr.children[child], state->child_states[child].get());
-      auto comparison_result = cudf::binary_operation(left->view(),
-                                                      comparator->view(),
-                                                      cudf::binary_operator::EQUAL,
-                                                      return_type,
-                                                      execution_stream,
-                                                      resource_ref);
-
-      if (child == 1) {
-        // First child: Move to result
-        intermediate_result = std::move(comparison_result);
-      } else {
-        // Otherwise OR together
-        intermediate_result = cudf::binary_operation(intermediate_result->view(),
-                                                     comparison_result->view(),
-                                                     cudf::binary_operator::LOGICAL_OR,
-                                                     return_type,
-                                                     execution_stream,
-                                                     resource_ref);
-      }
-    }
-
-    // NOT IN?
-    if (expression_type == ExpressionType::COMPARE_NOT_IN) {
-      // Negate the result and return
-      return cudf::unary_operation(
-        intermediate_result->view(), cudf::unary_operator::NOT, execution_stream, resource_ref);
-    } else {
-      // Return the result
-      return std::move(intermediate_result);
-    }
-  } else if (expression_type == ExpressionType::OPERATOR_COALESCE) {
-    throw NotImplementedException("Execute[OPERATOR_COALESCE]: Not yet implemented!");
-  } else if (expr.children.size() == 1) {
-    // Resolve child
-    auto child = Execute(*expr.children[0], state->child_states[0].get());
-
-    switch (expr.GetExpressionType()) {
-      case ExpressionType::OPERATOR_NOT: {
-        return cudf::unary_operation(
-          child->view(), cudf::unary_operator::NOT, execution_stream, resource_ref);
-      }
-      case ExpressionType::OPERATOR_IS_NULL: {
-        return cudf::is_null(child->view(), execution_stream, resource_ref);
-      }
-      case ExpressionType::OPERATOR_IS_NOT_NULL: {
-        std::unique_ptr<cudf::column> temp =
-          cudf::is_null(child->view(), execution_stream, resource_ref);
-        return cudf::unary_operation(
-          temp->view(), cudf::unary_operator::NOT, execution_stream, resource_ref);
-      }
-      default:
-        throw NotImplementedException(
-          "Execute[OPERATOR]: Unimplemented operator type with 1 "
-          "child!");
-    }
-  }
-
-  // If we've gotten this far, something ain't right
-  throw NotImplementedException("Execute[OPERATOR]: Unimplemented operator type!");
-}
-
 }  // namespace sirius
-}  // namespace duckdb
