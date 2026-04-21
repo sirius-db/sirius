@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.1
-milestone_name: Multi-GPU Re-integration + Cucascade I/O Migration
+milestone: v1.0
+milestone_name: Re-integration
 status: executing
-stopped_at: "Completed Phase 6 — all 5 MGPU requirements closed on N=2 hardware; Phase 6 SUMMARY written; ready for Phase 7 planning (MGPU-06 P2P + MGPU-07 adaptive scan)."
-last_updated: "2026-04-21T15:20:30Z"
+stopped_at: Completed Phase 6 — all 5 MGPU requirements closed on N=2 hardware; Phase 6 SUMMARY written; ready for Phase 7 planning (MGPU-06 P2P + MGPU-07 adaptive scan).
+last_updated: "2026-04-21T20:12:58.030Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 3
-  total_plans: 15
-  completed_plans: 15
+  total_plans: 19
+  completed_plans: 17
   percent: 100
 ---
 
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-20)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 7 — P2P Direct Transfer + Adaptive Scan Partitioning (pending planning)
+**Current focus:** Phase 07 — p2p-direct-transfer-adaptive-scan-partitioning
 
 ## Current Position
 
-Phase: 06 (multi-gpu-gap-closure-topology-device-safety-host-memory-gpu-gpu-converter) — **COMPLETE**
-Plan: 4 of 4 (all plans shipped)
-Status: Phase 6 SHIPPED 2026-04-21; ready for Phase 7 planning
+Phase: 07 (p2p-direct-transfer-adaptive-scan-partitioning) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
 Last activity: 2026-04-21
 
 Progress: [██████████] 100% (Phase 4 + Phase 5 + Phase 6 complete; 15 of 15 scoped plans done across the three shipped phases)

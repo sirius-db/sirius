@@ -1,0 +1,92 @@
+version: 1
+
+project:
+  name: "sirius"
+  description: "DuckDB GPU Extension for GPU-accelerated SQL"
+
+commands:
+  build:
+    - name: build
+      description: "Standard build with make (all cores)"
+      command: "make -j$(nproc)"
+      timeout: 900
+
+    - name: build-nightly
+      description: "Nightly build via pixi nightly-runner environment"
+      command: "pixi run -e nightly-runner nightly-run"
+      timeout: 1800
+
+  test:
+    - name: unit-tests
+      description: "Run C++ unit tests (abort on first failure)"
+      command: "./build/release/extension/sirius/test/cpp/sirius_unittest --abort"
+      timeout: 300
+      output_parser: gtest
+      # command IS the binary here, so debug_command is not needed.
+      # valgrind will wrap it directly:
+      #   valgrind ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+
+  benchmark:
+    - name: tpch-benchmark
+      description: "Run TPC-H benchmark and validate results"
+      command: "./test/tpch_performance/benchmark_and_validate.sh {scale_factor}"
+      timeout: 3600
+      args:
+        - name: scale_factor
+          description: "TPC-H scale factor (1, 10, 100)"
+          type: number
+          default: 1
+
+    - name: tpch-report
+      description: "Generate report from existing benchmark results"
+      command: "./test/tpch_performance/benchmark_and_validate.sh --report {run_dir}"
+      timeout: 120
+      args:
+        - name: run_dir
+          description: "Path to previous benchmark run directory"
+          type: string
+
+  lint:
+    - name: pre-commit
+      description: "Run pre-commit hooks on all files"
+      command: "pre-commit run --all-files"
+      timeout: 120
+
+  configure:
+    - name: cmake-debug
+      description: "Configure CMake with debug preset (GCC)"
+      command: "cmake --preset debug"
+      timeout: 120
+
+    - name: cmake-release
+      description: "Configure CMake with release preset (GCC)"
+      command: "cmake --preset release"
+      timeout: 120
+
+    - name: cmake-clang-release
+      description: "Configure CMake with Clang release preset"
+      command: "cmake --preset clang-release"
+      timeout: 120
+
+    - name: cmake-vcpkg-release
+      description: "Configure CMake with vcpkg release preset"
+      command: "cmake --preset vcpkg-release"
+      timeout: 120
+
+  clean:
+    - name: clean
+      description: "Remove build directory"
+      command: "rm -rf build"
+      timeout: 60
+
+debug:
+  tools:
+    valgrind:
+      default_flags: "--leak-check=full --track-origins=yes --suppressions=valgrind.supp"
+    compute-sanitizer:
+      default_flags: "--tool memcheck --leak-check full"
+    gdb:
+      default_flags: "-q"
+  asan_build_command: "CXXFLAGS='-fsanitize=address -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address' make -j$(nproc)"
+  coredump_directory: "/tmp/cores"
+  log_directory: "/tmp/sirius-debug-logs"
