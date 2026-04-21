@@ -282,7 +282,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
 bool sirius_physical_operator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (!port_ptr->repo) { continue; }  // dependencey-only port; always empty
+    if (!port_ptr->repo) { continue; }  // dependency-only port; always empty
     if (port_ptr->repo->total_size() != 0) { return false; }
   }
   return true;

@@ -323,13 +323,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
-  // auto* pipelineable_input =
-  //   dynamic_cast<op::pipelineable_operator_data*>(local_state._input_data.get());
-  // if (!pipelineable_input) {
-  //   throw std::runtime_error(
-  //     "gpu_pipeline_task::execute: input_data is not pipelineable_operator_data");
-  // }
-
   std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
   try {
     handles_opt =

@@ -1027,7 +1027,6 @@ void sirius_pipeline_converter::wire_data_repositories()
         auto* next_op            = dependent_pipeline->get_operators().size() == 0
                                      ? dependent_pipeline->get_sink().get()
                                      : &dependent_pipeline->get_operators()[0].get();
-        std::size_t op_id        = next_op->operator_id;
         std::string_view port_id = "handoff";
         next_op->add_port(
           port_id,
