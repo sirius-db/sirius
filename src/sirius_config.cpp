@@ -213,6 +213,11 @@ struct host_mem_config {
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
   {
+    // MGPU-05: cucascade builds one numa_region_pinned_host_memory_resource
+    // per distinct NUMA node when the configurator sees this call. Relied
+    // upon by SiriusContext::initialize() which asserts host_spaces.size()
+    // == topology.num_numa_nodes on the default path. YAML configs may
+    // override by explicitly setting per-space numa_id.
     builder.use_host_per_numa();
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));

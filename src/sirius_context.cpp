@@ -178,8 +178,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // downgrade_executor construction — so downstream failures don't mask a
   // stub topology. The accessor at src/include/sirius_context.hpp:117
   // (get_hw_topology()) is the sole authorised source of GPU/NUMA counts
-  // going forward; Super Sirius files must not call cudaGetDeviceCount /
-  // numa_node_of_cpu directly (enforced by the MGPU-01 grep sweep gate).
+  // going forward; Super Sirius files must not call the raw CUDA/NUMA
+  // device-enumeration APIs directly (enforced by the MGPU-01 grep sweep
+  // gate documented in .planning/phases/06-*/06-01-SUMMARY.md).
   auto const& topo = config_.get_hw_topology();
   if (topo.num_gpus == 0) {
     throw std::runtime_error(
