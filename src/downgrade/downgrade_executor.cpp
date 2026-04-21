@@ -136,7 +136,7 @@ void downgrade_executor::processing_loop()
       target_spaces.push_back(hs);
     }
 
-    // === TIER 1: Data repositories (D-01, LOOP-01) ===
+    // === TIER 1: Data repositories ===
     // Collect all repositories first so we can iterate (and later sort by priority).
     // We use get_all_convertible() to snapshot eligible batches once per repo,
     // avoiding re-scanning the same batch before its state changes from idle.
@@ -180,7 +180,7 @@ void downgrade_executor::processing_loop()
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                 repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
                 repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                // D-08: Check predicate after each convert
+                // Check predicate after each convert
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
@@ -191,7 +191,7 @@ void downgrade_executor::processing_loop()
       if (pool_interrupted) break;
     }
 
-    // === TIER 2: pipeline_executor task queue (D-06, LOOP-02) ===
+    // === TIER 2: pipeline_executor task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
       while (!req->satisfied.load()) {
@@ -233,10 +233,10 @@ void downgrade_executor::processing_loop()
       }
     }
 
-    // Wait for all in-flight work to finish (D-08: predicate also checked in workers)
+    // Wait for all in-flight work to finish (predicate also checked in workers)
     _pool->wait_all();
 
-    // === Logging (D-09, LOG-01) ===
+    // === Logging ===
     auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);
     auto total_batches = req->batches_downgraded.load(std::memory_order_relaxed);
     auto duration_ms =

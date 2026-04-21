@@ -40,9 +40,8 @@ namespace sirius {
 /**
  * @brief Abstract interface for a single unit of data that can be converted between memory tiers.
  *
- * Generalizes the save-prev_state / lock-for-in_transit / convert / restore pattern used by
- * downgrade_task::execute() and batch_lock_utils::lock_or_prepare_batch(). Concrete
- * implementations wrap either a data_batch (Phase 6) or a gpu_pipeline_task (Phase 7).
+ * Generalizes the save-prev_state / lock-for-in_transit / convert / restore pattern. Concrete
+ * implementations wrap either a data_batch or a gpu_pipeline_task.
  *
  * Implementations are responsible for:
  * - Acquiring any necessary locks (e.g., in_transit lock on data_batch)
@@ -85,9 +84,8 @@ class convertible_data {
 /**
  * @brief Abstract interface for discovering convertible data units in a container.
  *
- * Providers iterate over a backing container (data_repository for Phase 6,
- * inspectable_mpsc for Phase 7) and return wrapped convertible_data instances
- * matching a target memory space filter.
+ * Providers iterate over a backing container (data_repository or inspectable_mpsc) and return
+ * wrapped convertible_data instances matching a target memory space filter.
  */
 class convertible_data_provider {
  public:

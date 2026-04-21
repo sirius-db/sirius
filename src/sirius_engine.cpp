@@ -352,7 +352,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   root_pipeline->get_pipelines(sirius_pipelines, true);
   SIRIUS_LOG_DEBUG("total_pipelines = {}", sirius_pipelines.size());
 
-  // Auto-log the enriched query plan (D-08)
+  // Auto-log the enriched query plan
   pipeline::sirius_plan_printer plan_printer(new_scheduled);
   SIRIUS_LOG_INFO("Query Plan:\n{}", plan_printer.render());
 }

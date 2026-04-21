@@ -17,16 +17,15 @@
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
 
-#include <data/convertible_data_batch.hpp>
-#include <data/data_batch_utils.hpp>
+#include <rmm/cuda_stream.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <rmm/cuda_stream.hpp>
+#include <data/convertible_data_batch.hpp>
+#include <data/data_batch_utils.hpp>
 
 #include <memory>
 #include <vector>
@@ -43,10 +42,10 @@ struct test_env {
   rmm::cuda_stream conv_stream;
 
   test_env()
-    : mgr(sirius::test::operator_utils::initialize_memory_manager())
-    , gpu_space(mgr->get_memory_space(cucascade::memory::Tier::GPU, 0))
-    , host_space(mgr->get_memory_space(cucascade::memory::Tier::HOST, 0))
-    , conv_stream()
+    : mgr(sirius::test::operator_utils::initialize_memory_manager()),
+      gpu_space(mgr->get_memory_space(cucascade::memory::Tier::GPU, 0)),
+      host_space(mgr->get_memory_space(cucascade::memory::Tier::HOST, 0)),
+      conv_stream()
   {
   }
 
@@ -201,15 +200,14 @@ TEST_CASE("convertible_data_batch convert fails when batch already in_transit",
   bool result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
 
   REQUIRE(result == false);
-  // State is preserved as in_transit (per BATCH-03)
+  // State is preserved as in_transit
   REQUIRE(batch->get_state() == cucascade::batch_state::in_transit);
 
   // Clean up: release in_transit so batch can be destroyed cleanly
   batch->try_to_release_in_transit();
 }
 
-TEST_CASE("convertible_data_batch bytes_in_space returns correct size",
-          "[convertible_data_batch]")
+TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[convertible_data_batch]")
 {
   auto& e = env();
 

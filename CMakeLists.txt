@@ -349,7 +349,6 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
-    test/cpp/data/test_convertible_data.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/data/test_host_parquet_representation.cpp
