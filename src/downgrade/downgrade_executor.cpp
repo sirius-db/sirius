@@ -58,7 +58,18 @@ void downgrade_executor::start()
   absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space) {
     auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
+    per_thread_init = [device_id]() noexcept {
+      // MGPU-03: pin each worker thread to the downgrade executor's GPU
+      // context. Silent failure would cause downgrade memcpys to leak
+      // across GPU contexts. Lambda is noexcept so we inline the check
+      // rather than use CUCASCADE_CUDA_TRY (RESEARCH.md Pitfall 3).
+      cudaError_t err = cudaSetDevice(device_id);
+      if (err != cudaSuccess) {
+        spdlog::error(
+          "downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+          device_id, cudaGetErrorString(err));
+      }
+    };
   }
 
   _pool = std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
