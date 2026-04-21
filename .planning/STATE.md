@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed 06-02-PLAN.md (MGPU-03 device-guard enforcement in 2 noexcept callbacks); Wave 1 parallel with 06-01 + 06-03
-last_updated: "2026-04-21T14:12:12.714Z"
+stopped_at: Completed Plan 06-03 (MGPU-04 registration-gate + hidden forward-leg round-trip test in test_context.cpp) — Wave 1 parallel
+last_updated: "2026-04-21T14:14:33.216Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 15
-  completed_plans: 13
+  completed_plans: 14
   percent: 100
 ---
 
@@ -87,6 +87,7 @@ Phase SUMMARY at `.planning/phases/05-cucascade-backed-parquet-i-o-migration/05-
 | Phase 05 P05 | 20min | 2 tasks | 7 files |
 | Phase 05 P06 | ~35min (spread; Task 1 + 2a-first + 2a-re-run + 2b + Task 3) | 3 tasks | 4 files (VALIDATION + MULTIGPU-VALIDATION + SUMMARY + state) |
 | Phase 06 P02 | 2m 34s | 2 tasks | 2 files |
+| Phase 06 P03 | 10min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -123,6 +124,7 @@ New for v1.1 (from research synthesis):
 - [Phase 05]: Plan 05-05: Approach A (locked) for iceberg delete-file helpers — helper signatures gain std::shared_ptr<cucascade::idisk_io_backend> backend parameter; callers resolve via inherited get_gpu_io_backends(). Completes Plan 05-04's declared iceberg handoff (iceberg_scan_task_global_state ctor forwards gpu_io_backends to base + task_creator iceberg branch seeds map). Pure-consumer invariant on sirius_context.hpp upheld.
 - [Phase 05]: Plan 05-06: All 13 Phase-5 requirements closed on real N=2 hardware (2 × RTX 6000 Ada, driver 595.58.03, CUDA 13.2). compute-sanitizer memcheck 0 errors across 57 test cases / 1.92M assertions; per-backend cudaGetDevice readback matches target (GPU 0→0, GPU 1→1); SF10 wall-clock captured on both 1-GPU and 2-GPU configs with correct results. IO-10 Phase-4 regression comparison explicitly deferred to future optimization work per user directive 2026-04-21 ("we don't need to run any comparisons, let's just make sure everything is working, we can optimize later"). Phase 5 SHIPPED.
 - [Phase 06-02]: MGPU-03 device-guard teeth: both Super Sirius noexcept per-thread init callbacks (gpu_pipeline_executor + downgrade_executor) now check cudaSetDevice return and log spdlog::error on failure. No RAII conversion — per-thread pinning is lifetime-scoped (documented rationale in MGPU-03 comment blocks).
+- [Phase 06]: Plan 06-03: MGPU-04 verified via grep-only test additions (interpretation 2 from RESEARCH.md Finding 2 + Finding 6) — the cucascade peer-async GPU->GPU converter registered by register_builtin_converters is what Sirius tests, not a new host-staged override. Registration-gate test at test_context.cpp:268 is [multi_gpu_foundation][mgpu_04_registration]; hidden forward-leg round-trip at test_context.cpp:332 is [.][multi_gpu_foundation][mgpu_04_round_trip]. Zero unregister_converter calls; zero cuda_stream_default uses; zero src/ modifications (Wave 1 scope respected).
 
 ### Pending Todos
 
@@ -141,6 +143,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T14:12:12.712Z
-Stopped at: Completed 06-02-PLAN.md (MGPU-03 device-guard enforcement in 2 noexcept callbacks); Wave 1 parallel with 06-01 + 06-03
+Last session: 2026-04-21T14:14:33.213Z
+Stopped at: Completed Plan 06-03 (MGPU-04 registration-gate + hidden forward-leg round-trip test in test_context.cpp) — Wave 1 parallel
 Resume file: None

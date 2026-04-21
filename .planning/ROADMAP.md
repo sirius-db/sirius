@@ -76,7 +76,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
 **Plans**: 4 plans
 - [ ] 06-01-PLAN.md — Topology fail-hard + startup log + MGPU-01 sweep gate + MGPU-05 per-NUMA assertion (MGPU-01, MGPU-05)
 - [x] 06-02-PLAN.md — Device-guard enforcement in `gpu_pipeline_executor` + `downgrade_executor` `noexcept` per-thread init callbacks (MGPU-03)
-- [ ] 06-03-PLAN.md — MGPU-04 registration-gate test + hidden forward-leg round-trip test (no new converter registration) (MGPU-04)
+- [x] 06-03-PLAN.md — MGPU-04 registration-gate test + hidden forward-leg round-trip test (no new converter registration) (MGPU-04)
 - [ ] 06-04-PLAN.md — Phase validation on N=2 host (compute-sanitizer + SF10 + numa_maps) + SUMMARY + STATE/ROADMAP/REQUIREMENTS updates + human sign-off checkpoint (MGPU-01..05 gate)
 
 ### Phase 7: P2P Direct Transfer + Adaptive Scan Partitioning
