@@ -2,39 +2,53 @@
 
 ## What This Is
 
-Sirius is a GPU-native SQL engine that runs as a DuckDB extension (`sirius.duckdb_extension`). It intercepts DuckDB's physical plan and routes supported operators to GPU execution via cuDF / RMM / cuCascade, falling back to DuckDB's CPU engine for unsupported cases. The engine is being extended to execute across multiple GPUs on a single node, with data-locality-aware task scheduling and NUMA-aware memory management.
+Sirius is a GPU-native SQL engine that runs as a DuckDB extension (`sirius.duckdb_extension`). It intercepts DuckDB's physical plan and routes supported operators to GPU execution via cuDF / RMM / cuCascade, falling back to DuckDB's CPU engine for unsupported cases. As of v1.1, Sirius executes transparently across multiple GPUs on a single node, with data-locality-aware task scheduling, NUMA-aware memory management, driver-level P2P peer access, and a multi-GPU-safe parquet I/O path built on cucascade's `idisk_io_backend` (no kvikio).
 
 ## Core Value
 
 Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
 
+## Current State
+
+**v1.1 shipped 2026-04-21** — Multi-GPU Re-integration + Cucascade I/O Migration.
+- 4 phases / 19 plans / 44 tasks / 28 requirements cleared
+- Full test suite: 979/979 pass on N=2 hardware (2× RTX 6000 Ada, driver 595.58.03, CUDA 13.2)
+- Branch: `feature/single-node-multi-gpu2`
+- Archive: `.planning/milestones/v1.1-*`
+
 ## Requirements
 
 ### Validated
 
-<!-- Shipped and validated on feature/multi-gpu-execution (v1.0, unmerged — carried as the behavioral baseline this milestone re-integrates on top of current `dev`). -->
+Shipped and validated in v1.1.
 
-- ✓ **FOUND-02** — per-GPU executor with independent CUDA context, stream pool, thread pool *(v1.0, unmerged)*
-- ✓ **FOUND-03** — per-GPU reservation tracking (OOM on GPU 0 ≠ block GPU 1) *(v1.0, unmerged)*
-- ✓ **FOUND-05** — per-GPU downgrade executor monitors its own memory space *(v1.0, unmerged)*
-- ✓ **MEM-01** — GPU→HOST downgrade prefers pinned host memory on the same NUMA domain *(v1.0, unmerged)*
-- ✓ **MEM-02** — fallback to cross-NUMA host memory when NUMA-local is exhausted *(v1.0, unmerged)*
-- ✓ **MEM-03** — GPU→GPU data transfer via host staging using cucascade converters *(v1.0, unmerged)*
-- ✓ **CUCS-03** — NUMA-aware ordering in downgrade strategy *(v1.0, unmerged)*
-- ✓ **CUCS-04** — multi-GPU memory-space configuration tested with N>1 GPUs *(v1.0, unmerged)*
-- ✓ **SCHED-01..SCHED-05** — data-locality task routing + cross-GPU scan distribution *(v1.0, unmerged)*
-
-> "Unmerged" = implemented and tested on `feature/multi-gpu-execution` but never landed on `dev`. This milestone re-integrates them on top of `dev`'s 47 intervening commits.
+- ✓ **BUMP-01..03** — cucascade submodule bumped 942c0bf → f47de0b (PR #96 file-downgrade + io_backend_registry, PR #100 underflow fix, PR #103 stream sync, PR #104 NVML drop) — *v1.1*
+- ✓ **PORT-01..05** — 23 v1.0 multi-GPU commits re-landed on current `dev`; push-model dispatch + `preferred_device_id` plumbing preserved; YAML config replaces libconfig++ — *v1.1*
+- ✓ **IO-01..11** — `sirius::io::cucascade_datasource` replaces every `cudf::io::datasource::create(path)` call-site; per-GPU `idisk_io_backend` cache on `SiriusContext` under `rmm::cuda_set_device_raii`; kvikio removed; SF1 correctness preserved — *v1.1*
+- ✓ **MGPU-01** — runtime topology discovery via cucascade (fail-hard on zero-GPU; 3-line startup log) — *v1.1*
+- ✓ **MGPU-02** — single-GPU SF10 no-regression (absolute Phase-6 timings captured) — *v1.1*
+- ✓ **MGPU-03** — device-guard `cudaSetDevice` enforcement with `spdlog::error` in both `noexcept` per-thread init callbacks; compute-sanitizer memcheck 0 errors — *v1.1*
+- ✓ **MGPU-04** — GPU↔GPU converter registered in `sirius::converter_registry::initialize()`; forward-leg + return-leg round-trip PASS on N=2 — *v1.1*
+- ✓ **MGPU-05** — per-NUMA host memory spaces via `numa_region_pinned_host_allocator` — *v1.1*
+- ✓ **MGPU-06** — GPU-direct P2P via `cudaMemcpyPeerAsync`; `cudaDeviceEnablePeerAccess` loop at init; Sirius-side `sirius_p2p_converter_factory` override works around cucascade's cross-stream race — *v1.1*
+- ✓ **MGPU-07** — adaptive scan partitioning proportional to free GPU memory (3.08× ratio → batch-count skew within 10% tolerance) — *v1.1*
+- ✓ **HYG-01/02** — `rmm::cuda_stream_default` removed from `parquet_scan_task.cpp:468` and every Phase-5-modified file — *v1.1*
 
 ### Active
 
-<!-- Milestone v1.1: Multi-GPU Re-integration + Cucascade I/O Migration. Scoped in REQUIREMENTS.md. -->
+<!-- Next milestone — scope to be defined via /gsd:new-milestone. -->
 
-- [ ] Re-integrate 23 multi-GPU commits on top of current `dev`
-- [ ] Replace kvikio-backed parquet I/O with cucascade's `disk_io_backend` + `io_backend_registry`
-- [ ] Bump cucascade submodule from 942c0bf → `origin/main` (f47de0b, includes PR #96 file-downgrade)
-- [ ] Complete Phase 3 Plan 2 — MEM-04 (cudaMemcpyPeerAsync P2P) + MEM-05 (adaptive scan partitioning by available GPU memory)
-- [ ] Close remaining FOUND-01, FOUND-04, FOUND-06, CUCS-01, CUCS-02 gaps exposed by re-integration
+- *(None — v1.1 shipped. Run `/gsd:new-milestone` to define next milestone scope.)*
+
+## Next Milestone Goals
+
+Unscoped. Candidates for v1.2 seeded from v1.1 tech debt:
+
+1. **Upstream cucascade `convert_gpu_to_gpu` cross-stream fix** — file PR against `cucascade` so Sirius can drop the `sirius_p2p_converter` override.
+2. **Performance regression comparisons** — resume Phase-5 vs Phase-4 parquet I/O wall-clock comparison and Phase-6 vs Phase-5 single-GPU SF10 comparison (deferred from v1.1 per user directive).
+3. **Cucascade `idisk_io_backend` file-handle cache** — research pitfall P1; upstream or wrap if profiling shows a hotspot.
+4. **`cudaDeviceDisablePeerAccess` on explicit teardown** — currently rely on CUDA cleanup at process exit.
+5. **TPC-H Q4 parquet flake** — intermittent; scope a focused investigation.
 
 ### Out of Scope
 
@@ -67,13 +81,17 @@ Any query can transparently execute across every GPU on the node — tasks are s
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Replace kvikio with cucascade io_backend | kvikio/cuFile bind to a single CUDA context → unsafe for multi-GPU task dispatch; cucascade's registry supports per-backend factories and is already the tier-conversion authority. | — Pending |
-| Cucascade pinned to `origin/main` | PR #96 introduces the `disk_io_backend` + `io_backend_registry` we depend on; staying on 942c0bf would require backporting. | — Pending |
-| Re-integrate as a new milestone (v1.1), not merge | 47 dev commits include type-system and config refactors that touch files the multi-gpu work modifies; a fresh plan-by-plan re-integration is cheaper than conflict resolution. | — Pending |
-| Push-model task dispatch for locality routing | Pull model (wait for task_request) couldn't use data-locality info; push (pop task first, route by preferred_device_id) enables SCHED-01..04. | ✓ Validated in v1.0 (02-01-SUMMARY) |
-| preferred_device_id on both local_state + global_state | Per-task override with pipeline-level default covers both scan distribution and inherited locality. | ✓ Validated in v1.0 (02-01-SUMMARY) |
-| NUMA-aware downgrade via cucascade `any_memory_space_in_tier_with_preference` | Avoids bespoke NUMA logic in Sirius; cucascade owns tier selection. | ✓ Validated in v1.0 (01-01, 03-01) |
-| KvikIO/GDS explicitly out of scope | Removing the dependency is the milestone; re-adding it for any code path defeats the purpose. | — Pending |
+| Replace kvikio with cucascade io_backend | kvikio/cuFile bind to a single CUDA context → unsafe for multi-GPU task dispatch. | ✓ Good — v1.1 shipped; `grep -rnw 'datasource::create' src/` returns zero hits |
+| Cucascade pinned to `origin/main` (f47de0b) | PR #96 introduces the `idisk_io_backend` + `io_backend_registry` Sirius depends on. | ✓ Good — all 28 v1.1 requirements validated on this pin |
+| Re-integrate as a new milestone (v1.1), not merge | 47 dev commits include type-system and config refactors — fresh plan-by-plan replay cheaper than conflict resolution. | ✓ Good — v1.1 shipped in 4 phases; replay strategy validated |
+| Push-model task dispatch for locality routing | Pull model couldn't use data-locality info; push (pop task first, route by preferred_device_id) enables SCHED-01..04. | ✓ Good — validated end-to-end in v1.1 |
+| preferred_device_id on both local_state + global_state | Per-task override with pipeline-level default covers both scan distribution and inherited locality. | ✓ Good — v1.1 integration tests PASS |
+| NUMA-aware downgrade via cucascade `any_memory_space_in_tier_with_preference` | Avoids bespoke NUMA logic in Sirius; cucascade owns tier selection. | ✓ Good — v1.1 re-authored onto dev's PR #579 shape; downgrade tests PASS on N=2 |
+| KvikIO/GDS explicitly out of scope | Removing the dependency was the milestone goal; re-adding for any path defeats the purpose. | ✓ Good — v1.1 grep gate enforced |
+| Sirius-side `sirius_p2p_converter` override for GPU↔GPU | cucascade's `convert_gpu_to_gpu` has a cross-stream race (`cudaMemcpyPeerAsync` on caller stream vs post-copy table on target_stream). Override issues peer copy on target_stream. | ⚠️ Revisit — works around upstream; upstream PR is tech debt in v1.2 |
+| Consume `cudaGetLastError()` after `cudaDeviceEnablePeerAccess` | CUDA leaves the return code in thread-local error slot; subsequent unrelated calls fail spuriously with same code. | ✓ Good — pattern established for future CUDA-state-mutation code |
+| `supports_device_read() == false` in cucascade_datasource | Host-stage via pinned memory + `cuda_memcpy_async` on caller's stream stays truly async and avoids GDS entirely. | ✓ Good — v1.1 IO-02/03 validated |
+| Adaptive scan via existing `select_target_gpu` (no code change needed) | `duckdb_scan_executor::select_target_gpu` was already memory-proportional since v1.0 Phase 2; Phase 7 MGPU-07 scope was test-authoring only. | ✓ Good — 3.08× free-memory ratio test proves proportional skew within 10% tolerance |
 
 ## Evolution
 
@@ -93,4 +111,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-20 — v1.1 milestone initialized (Multi-GPU Re-integration + Cucascade I/O Migration)*
+*Last updated: 2026-04-21 after v1.1 milestone completion*
