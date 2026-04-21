@@ -28,14 +28,14 @@
 - [x] **IO-01**: `sirius::io::cucascade_datasource` subclass of `cudf::io::datasource` ships in `src/io/`, backed by cuCascade's `idisk_io_backend` via `io_backend_registry` factory
 - [x] **IO-02**: `cucascade_datasource` declares `supports_device_read() == false` so cuDF host-stages reads and issues memcpys on the caller's explicit stream (no GDS, no cuFile, no kvikio)
 - [x] **IO-03**: `host_read` returns pinned host memory allocated from cucascade's host-memory resource so cuDF's `cuda_memcpy_async` stays truly asynchronous
-- [ ] **IO-04**: Per-GPU `idisk_io_backend` instances cached in `SiriusContext`, created once per device under `rmm::cuda_set_device_raii` so each instance owns streams/pinned buffers in its GPU's context
+- [x] **IO-04**: Per-GPU `idisk_io_backend` instances cached in `SiriusContext`, created once per device under `rmm::cuda_set_device_raii` so each instance owns streams/pinned buffers in its GPU's context
 - [ ] **IO-05**: `cudf::io::datasource::create(filepath)` removed from `src/op/scan/parquet_scan_task.cpp:312`, `:699` and `src/op/scan/sirius_parquet_metadata_scan_operator.cpp:251` — all three routed through the new factory
 - [ ] **IO-06**: Iceberg delete-file reads at `src/op/scan/iceberg_scan_task.cpp:57-58` and `:120-121` pass `source_info{ds.get()}` with a cucascade-backed datasource instead of `source_info{filepath}`
 - [ ] **IO-07**: `prefetched_data_source` fallback datasource is cucascade-backed at `src/data/host_parquet_representation_converters.cpp:82-83` and at the construction site `src/op/scan/parquet_scan_task.cpp:769`
 - [ ] **IO-08**: `grep -rnw 'datasource::create' src/` returns zero hits — no Sirius code creates a kvikio-backed datasource
 - [ ] **IO-09**: TPC-H SF1 all queries produce results identical to pre-migration baseline (correctness)
 - [ ] **IO-10**: TPC-H SF10 parquet scan wall-clock regression vs kvikio-compat baseline ≤ 30%; any larger delta filed as cuCascade upstream issue and documented in the phase summary
-- [ ] **IO-11**: Parquet scan validated on multi-GPU hardware — one `idisk_io_backend` per GPU, cross-GPU reads work, no CUDA-context leak between devices (verified with compute-sanitizer or `cudaGetDevice` logging)
+- [x] **IO-11**: Parquet scan validated on multi-GPU hardware — one `idisk_io_backend` per GPU, cross-GPU reads work, no CUDA-context leak between devices (verified with compute-sanitizer or `cudaGetDevice` logging)
 
 ### MGPU — Close v1.0 Multi-GPU Gaps
 
@@ -134,14 +134,14 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | IO-01 | Phase 5 | Complete |
 | IO-02 | Phase 5 | Complete |
 | IO-03 | Phase 5 | Complete |
-| IO-04 | Phase 5 | Pending |
+| IO-04 | Phase 5 | Complete |
 | IO-05 | Phase 5 | Pending |
 | IO-06 | Phase 5 | Pending |
 | IO-07 | Phase 5 | Pending |
 | IO-08 | Phase 5 | Pending |
 | IO-09 | Phase 5 | Pending |
 | IO-10 | Phase 5 | Pending |
-| IO-11 | Phase 5 | Pending |
+| IO-11 | Phase 5 | Complete |
 | HYG-01 | Phase 5 | Pending |
 | HYG-02 | Phase 5 | Pending |
 | MGPU-01 | Phase 6 | Pending |

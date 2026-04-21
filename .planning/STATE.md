@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed 05-02-PLAN.md (Wave 2 parallel with 05-03) — cucascade_datasource implementation (202L impl + 311L tests, 7 TEST_CASEs, all grep gates PASS)
-last_updated: "2026-04-21T01:13:56.388Z"
+stopped_at: Completed 05-03-PLAN.md — Wave 2 parallel; SiriusContext I/O backend registry + per-GPU cache wired; ready for Plans 05-04 + 05-05 (pure consumers of get_io_backend_for / get_gpu_io_backends)
+last_updated: "2026-04-21T01:19:10.021Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 11
-  completed_plans: 8
+  completed_plans: 9
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 05 (cucascade-backed-parquet-i-o-migration) — EXECUTING
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
 Last activity: 2026-04-21
 
@@ -60,6 +60,7 @@ Progress: [██████████] 100% (phase-scoped)
 | Phase 04-cucascade-bump-v1-0-re-integration P05 | 35min | 4 tasks | 5 files (2 summaries + STATE/ROADMAP/REQUIREMENTS) |
 | Phase 05-cucascade-backed-parquet-i-o-migration P01 | 5.5min | 3 tasks | 5 files |
 | Phase 05 P02 | 6min | 2 tasks | 2 files |
+| Phase 05 P03 | 9 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -89,6 +90,8 @@ New for v1.1 (from research synthesis):
 - [Phase 04-cucascade-bump-v1-0-re-integration]: Plan 04-05: Full unit-tests PASS (966 test cases, ~78.8M assertions); all 4 PORT-05 visible tags explicitly invoked and verified to actually run (no silent filtering); 3 of 5 hidden multi-GPU tags PASS on N=2 verification host; 2 hidden tags fail on GPU1->GPU0 converter return leg — deferred to Phase 6 (MGPU-03 device guards) + Phase 7 (MGPU-06 P2P direct). Task 3 checkpoint auto-approved by orchestrator in autonomous full-run mode with "approved — ship with deferral note". All structural grep gates PASS (PORT-02 0 hits LogicalType::*, PORT-03 0 hits libconfig, dead-v1.0-shape 0 hits in live code, BUMP-01 pin f47de0b exact match, PORT-01 26 commits dev..HEAD, PORT-04 7/7 symbol greps hit). Phase 4 SHIPPED.
 - [Phase 05-cucascade-backed-parquet-i-o-migration]: Plan 05-01: supports_device_read() locked to false in cucascade_datasource header (IO-02 multi-GPU safety); copy/move deleted so shared_ptr<idisk_io_backend> cannot cross CUDA contexts; stub .cpp includes header to verify standalone-compileability; Tier-A baseline (this host) + Tier-B baseline (2+ GPU validation host from plan 04-05) together form the authoritative pre-migration correctness snapshot for IO-09
 - [Phase 05-cucascade-backed-parquet-i-o-migration]: Plan 05-02: cucascade_datasource uses cudaMallocHost + RAII pinned_host_buffer instead of fixed_size_host_memory_resource — adapter stays context-independent (no SiriusContext coupling), preserving unit testability. std::launch::async (not deferred) for host_read_async per CONTEXT lock.
+- [Phase 05]: Plan 05-03: SiriusContext now owns cucascade io_backend_registry + per-GPU idisk_io_backend cache; both accessors (get_io_backend_for point-lookup + get_gpu_io_backends map-view) declared here so Plans 04+05 are pure consumers (sirius_context.hpp sealed for Phase 5)
+- [Phase 05]: Plan 05-03: Per-GPU backend construction under rmm::cuda_set_device_raii with IO-11 audit log (device_id + cudaGetDevice readback); teardown clears gpu_io_backends_ + io_backend_registry_ BEFORE memory_manager_->shutdown() to avoid cudaErrorInvalidResourceHandle at extension unload
 
 ### Pending Todos
 
@@ -108,6 +111,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T01:13:56.386Z
-Stopped at: Completed 05-02-PLAN.md (Wave 2 parallel with 05-03) — cucascade_datasource implementation (202L impl + 311L tests, 7 TEST_CASEs, all grep gates PASS)
+Last session: 2026-04-21T01:19:10.018Z
+Stopped at: Completed 05-03-PLAN.md — Wave 2 parallel; SiriusContext I/O backend registry + per-GPU cache wired; ready for Plans 05-04 + 05-05 (pure consumers of get_io_backend_for / get_gpu_io_backends)
 Resume file: None
