@@ -36,19 +36,36 @@ Shipped and validated in v1.1.
 
 ### Active
 
-<!-- Next milestone — scope to be defined via /gsd:new-milestone. -->
+<!-- Milestone v1.2: Multi-GPU SQL Pipeline Fix. Scoped in REQUIREMENTS.md. -->
 
-- *(None — v1.1 shipped. Run `/gsd:new-milestone` to define next milestone scope.)*
+- [ ] Fix cross-device stream-correctness in `pipeline::lock_or_prepare_batch` (cudaErrorInvalidValue on num_gpus>=2)
+- [ ] Parameterize `test_gpu_execution_tpch.cpp` on `num_gpus:{1,2}` so MCP `unit-tests` catches multi-GPU regressions
+- [ ] Add `num_gpus: 2` config to `test/cpp/integration/integration.yaml` fixture
+- [ ] Acceptance gate: `[mgpu-audit] pipeline_task` + `scan_batch` counts > 0 on both GPUs across a TPC-H SF1 run
+- [ ] All 22 TPC-H queries pass at SF1 and SF10 on `num_gpus: 2` with correct results
 
-## Next Milestone Goals
+## Current Milestone: v1.2 Multi-GPU SQL Pipeline Fix
 
-Unscoped. Candidates for v1.2 seeded from v1.1 tech debt:
+**Goal:** Close the v1.1 gap revealed by post-ship e2e verification — cross-device stream-correctness bug in `pipelineable_operator_data::prepare_for_processing` → `pipeline::lock_or_prepare_batch` throws `cudaErrorInvalidValue: invalid argument` on non-trivial SQL when `num_gpus >= 2`. Same fix shape as the Plan 07-02 Sirius-side P2P converter override (pack on source-device RAII + source stream, copy on target stream).
 
-1. **Upstream cucascade `convert_gpu_to_gpu` cross-stream fix** — file PR against `cucascade` so Sirius can drop the `sirius_p2p_converter` override.
-2. **Performance regression comparisons** — resume Phase-5 vs Phase-4 parquet I/O wall-clock comparison and Phase-6 vs Phase-5 single-GPU SF10 comparison (deferred from v1.1 per user directive).
-3. **Cucascade `idisk_io_backend` file-handle cache** — research pitfall P1; upstream or wrap if profiling shows a hotspot.
-4. **`cudaDeviceDisablePeerAccess` on explicit teardown** — currently rely on CUDA cleanup at process exit.
-5. **TPC-H Q4 parquet flake** — intermittent; scope a focused investigation.
+**Target features:**
+- Cross-device stream-correctness fix in `pipeline::lock_or_prepare_batch`
+- Test coverage: parameterize TPC-H integration on `num_gpus:{1,2}`
+- Acceptance gate via `[mgpu-audit]` counts > 0 on both GPUs
+
+**Key context:**
+- v1.1 closed 2026-04-21 at commit `076b587` / tag `v1.1` with infra shipped but SQL gap flagged
+- `[mgpu-audit]` logging already landed in `fd24174` (from v1.1 verification)
+- Evidence + reproduction: `.planning/milestones/v1.1-E2E-VERIFICATION.md`
+
+## Deferred to Future Milestones
+
+- Upstream cucascade `convert_gpu_to_gpu` cross-stream fix (drop Sirius override once upstream lands)
+- Phase-5 vs Phase-4 parquet I/O regression comparison
+- Phase-6 vs Phase-5 single-GPU SF10 regression comparison
+- Cucascade `idisk_io_backend` file-handle cache (research pitfall P1)
+- `cudaDeviceDisablePeerAccess` on explicit teardown
+- TPC-H Q4 parquet intermittent flake investigation
 
 ### Out of Scope
 
@@ -111,4 +128,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-21 after v1.1 milestone completion*
+*Last updated: 2026-04-21 — v1.2 milestone initialized (Multi-GPU SQL Pipeline Fix)*
