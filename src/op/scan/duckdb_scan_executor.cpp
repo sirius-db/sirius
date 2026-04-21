@@ -177,6 +177,11 @@ int duckdb_scan_executor::select_target_gpu()
       SIRIUS_LOG_DEBUG("Scan executor: distributing scan batch to GPU {} (available: {} bytes)",
                        space->get_device_id(),
                        space->get_available_memory());
+      // v1.1 e2e verification audit: info-level scan-batch assignment log
+      // so a real SQL query can be grepped for per-GPU batch distribution.
+      SIRIUS_LOG_INFO("[mgpu-audit] scan_batch assigned to GPU {} (available: {} bytes)",
+                      space->get_device_id(),
+                      space->get_available_memory());
       return space->get_device_id();
     }
   }

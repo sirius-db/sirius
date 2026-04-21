@@ -244,6 +244,9 @@ void pipeline_executor::management_eventloop()
     }
 
     SIRIUS_LOG_DEBUG("management_eventloop: routing task to GPU {}", target_device_id);
+    // v1.1 e2e verification audit: info-level dispatch log so a real SQL query
+    // can be grepped for per-GPU task distribution without needing debug logs.
+    SIRIUS_LOG_INFO("[mgpu-audit] pipeline_task dispatched to GPU {}", target_device_id);
     // wait_on_preferred_device: when the preferred GPU executor is at capacity,
     // the task sits in *that* executor's queue rather than falling back to a
     // different GPU. This is the v1.0 Phase 02-01 user-locked decision recorded
