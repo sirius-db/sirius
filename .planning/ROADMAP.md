@@ -90,7 +90,7 @@ These are **history, not active work**. All v1.0 validated behavior is re-valida
   4. Integration test `test_gpu_execution_locality` extended with the P2P + adaptive-scan scenarios passes on a ≥2-GPU host; on single-GPU dev boxes the same test emits `WARN+return` per Catch2-v2 convention and does not fail (MGPU-06, MGPU-07).
 **Plans**: 4 plans
 - [x] 07-01-PLAN.md — SiriusContext peer-access enable loop + CPU risk probe (MGPU-06 infra)
-- [ ] 07-02-PLAN.md — Un-hide MGPU-06 hidden tests + checksum integrity + return leg + conditional Sirius-side override (MGPU-06)
+- [x] 07-02-PLAN.md — Un-hide MGPU-06 hidden tests + checksum integrity + return leg + conditional Sirius-side override (MGPU-06)
 - [ ] 07-03-PLAN.md — MGPU-07 asymmetric-memory distribution test + adaptive-scan integration scenario (MGPU-07)
 - [ ] 07-04-PLAN.md — Phase validation on N=2 host (compute-sanitizer + nsys + bandwidth + fallback) + SUMMARY + milestone-level closure cue (MGPU-06, MGPU-07)
 

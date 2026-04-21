@@ -46,7 +46,7 @@ These are requirements from v1.0 that were defined but never cleared on `feature
 - [x] **MGPU-03** *(formerly FOUND-06)*: Device-guard conventions enforced on every execution thread — validated via compute-sanitizer `--tool memcheck --require-cuda-init` on a 2+ GPU system
 - [x] **MGPU-04** *(formerly CUCS-01)*: GPU↔GPU representation converter registered in cucascade converter registry (feeds MEM-04 P2P path)
 - [x] **MGPU-05** *(formerly CUCS-02)*: Per-NUMA host memory spaces configured with `numa_region_pinned_host_allocator`
-- [ ] **MGPU-06** *(formerly MEM-04)*: GPU-direct peer-to-peer transfer via `cudaMemcpyPeerAsync` when P2P access is available — measurably faster than host staging (completes 03-02 plan)
+- [x] **MGPU-06** *(formerly MEM-04)*: GPU-direct peer-to-peer transfer via `cudaMemcpyPeerAsync` when P2P access is available — measurably faster than host staging (completes 03-02 plan)
 - [ ] **MGPU-07** *(formerly MEM-05)*: Adaptive scan partitioning — scan batches distributed across GPUs proportional to available GPU memory, not round-robin (completes 03-02 plan)
 
 ### HYG — Hygiene Fixes Adjacent to Touched Code
@@ -149,7 +149,7 @@ Requirements defined on `refs/remotes/felipe-ssh/feature/multi-gpu-execution`. M
 | MGPU-03 | Phase 6 | Complete |
 | MGPU-04 | Phase 6 | Complete |
 | MGPU-05 | Phase 6 | Complete |
-| MGPU-06 | Phase 7 | Pending |
+| MGPU-06 | Phase 7 | Complete |
 | MGPU-07 | Phase 7 | Pending |
 
 **Coverage:**

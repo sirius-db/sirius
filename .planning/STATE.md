@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: Re-integration
 status: executing
-stopped_at: Completed Phase 6 — all 5 MGPU requirements closed on N=2 hardware; Phase 6 SUMMARY written; ready for Phase 7 planning (MGPU-06 P2P + MGPU-07 adaptive scan).
-last_updated: "2026-04-21T20:12:58.030Z"
+stopped_at: Completed Plan 07-02 — MGPU-06 end-to-end closed on N=2 hardware via Sirius-side P2P converter override; 977/977 unit tests PASS; ready for Plan 07-03 (MGPU-07 adaptive scan).
+last_updated: "2026-04-21T20:37:29.124Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 19
-  completed_plans: 17
+  completed_plans: 18
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 07 (p2p-direct-transfer-adaptive-scan-partitioning) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-04-21
 
@@ -110,6 +110,7 @@ Phase SUMMARY at `.planning/phases/06-multi-gpu-gap-closure-topology-device-safe
 | Phase 06 P02 | 2m 34s | 2 tasks | 2 files |
 | Phase 06 P03 | 10min | 2 tasks | 1 files |
 | Phase 06 P04 | ~40min (spread; Task 1 validation + Task 2 checkpoint + Task 3 SUMMARY) | 3 tasks | 5 files (VALIDATION + SUMMARY + STATE/ROADMAP/REQUIREMENTS) |
+| Phase 07 P02 | 40min | 4 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -150,6 +151,7 @@ New for v1.1 (from research synthesis):
 - [Phase 06]: Plan 06-03: MGPU-04 verified via grep-only test additions (interpretation 2 from RESEARCH.md Finding 2 + Finding 6) — the cucascade peer-async GPU->GPU converter registered by register_builtin_converters is what Sirius tests, not a new host-staged override. Registration-gate test at test_context.cpp:268 is [multi_gpu_foundation][mgpu_04_registration]; hidden forward-leg round-trip at test_context.cpp:332 is [.][multi_gpu_foundation][mgpu_04_round_trip]. Zero unregister_converter calls; zero cuda_stream_default uses; zero src/ modifications (Wave 1 scope respected).
 - [Phase 06]: Plan 06-04: All 5 MGPU-01..05 requirements closed on real N=2 hardware. compute-sanitizer memcheck 0 errors across 49 cases / 1.92M assertions on [multi_gpu_foundation] + [integration][gpu_execution][parquet][join]. MGPU-04 hidden forward-leg round-trip PASS (9 assertions). MGPU-02 Phase-5 regression comparison deferred per user directive 2026-04-21 (same directive as Phase 5's IO-10 deferral). Human sign-off Task 2b response 'approved' recorded verbatim. Phase 6 SHIPPED — Phase 7 unblocked.
 - [Phase 06]: Scope tightening pattern: research-driven re-scope from "implementation phase" (7-10 plans) to "audit + enforce + log + test" phase (4 plans, ~60min aggregate). Research found 4 of 5 structural gaps were PARTIALLY closed upstream (topology in sirius_config, peer-async converter in register_builtin_converters, per-NUMA allocator as cucascade default, device guards mostly in place). Verify-not-register pattern locked for MGPU-04.
+- [Phase 07]: [Phase 07-02] Task 3 OVERRIDE-REGISTERED (not SKIP): Plan 07-01's enable loop alone did not close the return-leg bug because unit tests bypass SiriusContext. After enable_p2p_for_test workaround surfaced a second failure class (cucascade cross-stream race, cudaErrorInvalidValue), the Sirius-side P2P converter override was implemented per RESEARCH.md Pattern 2. Registered inside sirius::converter_registry::initialize() so it covers both extension and test paths. Override packs on source-bound rmm::cuda_stream and issues cudaMemcpyPeerAsync on target_stream — eliminating the cross-stream race in cucascade's built-in body.
 
 ### Pending Todos
 
@@ -170,6 +172,6 @@ New for v1.1 (from research synthesis):
 
 ## Session Continuity
 
-Last session: 2026-04-21T15:20:30Z
-Stopped at: Completed Phase 6 — all 5 MGPU requirements closed on N=2 hardware; Phase 6 SUMMARY written; ready for Phase 7 planning (MGPU-06 P2P + MGPU-07 adaptive scan).
+Last session: 2026-04-21T20:37:29.121Z
+Stopped at: Completed Plan 07-02 — MGPU-06 end-to-end closed on N=2 hardware via Sirius-side P2P converter override; 977/977 unit tests PASS; ready for Plan 07-03 (MGPU-07 adaptive scan).
 Resume file: None
