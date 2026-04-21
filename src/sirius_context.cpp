@@ -289,6 +289,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
             continue;
           }
           cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
+          // Always consume sticky error state — cudaErrorPeerAccessAlreadyEnabled
+          // (and any other non-fatal condition) persists in the runtime until
+          // cudaGetLastError() is called, which would make the NEXT CUDA API
+          // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
+          (void)cudaGetLastError();
           if (enable_err == cudaSuccess
               || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
             peer_access_enabled_pairs_.emplace(static_cast<int>(i),
