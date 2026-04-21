@@ -55,7 +55,18 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
   auto device_id = _memory_space->get_device_id();
   return [device_id]() noexcept {
-    cudaSetDevice(device_id);
+    // MGPU-03: per-thread init runs on a worker thread just spawned by the
+    // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
+    // context; silent failure would cause every downstream CUDA call on
+    // this thread to land on GPU 0 regardless of device_id. We cannot use
+    // CUCASCADE_CUDA_TRY here because the lambda is noexcept (RESEARCH.md
+    // Pitfall 3) — inline the check instead.
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+      spdlog::error(
+        "gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+        device_id, cudaGetErrorString(err));
+    }
     sirius::util::enable_log_on_default_stream();
   };
 }
