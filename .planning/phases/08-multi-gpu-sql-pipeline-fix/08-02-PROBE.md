@@ -12,12 +12,75 @@
 
 ## Probe Verdict
 
-**Probe DEFERRED** — single-GPU host (no NVIDIA driver active); probe re-runs on
-verification host during Plan 08-06 (SF100 ship gate).
+**Probe FAIL** — re-run on 2026-04-21 by the orchestrator against real GPU
+hardware via MCP project-commands (the worktree bash sandbox has no GPU, but
+MCP does). One integration test fails on `num_gpus: 2` with the exact v1.1
+bug signature: `cudaErrorInvalidValue` at `cuda_memcpy.cu:42`. FIX-01 closed
+the scan-dispatch path (Site A) but NOT the hive-partition / host-to-gpu
+converter path (Site C: `convert_host_fast_to_gpu`).
 
-Static audit of all cross-device CUDA memcpy call-sites in `src/pipeline/` and
-`src/op/` IS complete below. Runtime signal (cudaErrorInvalidValue presence /
-absence) cannot be produced on this host.
+**Branch Decision: Branch B** — author a Sirius-side `host_data_representation
+→ gpu_table_representation` converter override mirroring Pattern 2 shape with
+a target-bound stream + target-device RAII guard.
+
+See "Probe re-run on 2026-04-21 (orchestrator)" section below for exact
+command, exit code, and failing-test details. The original "DEFERRED" note
+(preserved below for history) reflected an earlier sandboxed attempt that
+had no GPU access.
+
+## Probe re-run on 2026-04-21 (orchestrator)
+
+The initial probe (section "Hardware Availability" below) returned DEFERRED
+because the worktree's shell sandbox has no GPU access. The orchestrator
+re-ran the probe using `mcp__project-commands__run_command unit-tests`, which
+DOES have GPU access on this host. The 2-GPU configuration was applied by
+temporarily editing `test/cpp/integration/integration.yaml` to
+`num_gpus: 2` and reverting after the run (verified via `git diff` empty on
+the yaml file before this record).
+
+### Command
+
+```bash
+# Temporarily flipped test/cpp/integration/integration.yaml num_gpus: 1 -> 2
+mcp__project-commands__run_command unit-tests
+# Then reverted the yaml back to num_gpus: 1
+```
+
+### Result
+
+- **Exit code:** 1
+- **Tests:** 316 run, 315 passed, **1 FAILED**
+- **Failing test:** `gpu_execution hive partition - filter on data column`
+  - **File:** `test/cpp/integration/test_gpu_execution_multi_format.cpp:815`
+  - **Assertion:** `REQUIRE_FALSE` at line 100 (of the fixture) reported the
+    diff between GPU and CPU result was non-zero (i.e., the GPU path raised
+    an exception and failed to produce a result).
+- **Error verbatim:**
+
+```
+CUDA error encountered at:
+/tmp/conda-bld-output/work/cpp/src/copying/cuda_memcpy.cu:42:
+1 cudaErrorInvalidValue invalid argument
+```
+
+### Interpretation
+
+This is EXACTLY the v1.1 bug signature. The hive-partition read path hits
+`host_data_representation → gpu_table_representation` via cucascade's
+`convert_host_fast_to_gpu` (Site C in the audit below). FIX-01 closed the
+scan-executor dispatch path (Site A), but it does NOT bind a target-bound
+stream across the host→gpu converter frame — cucascade's body at
+`representation_converter.cpp:849` calls `batch.flush(stream, ...)` with the
+caller's stream, which may not be bound to the target device.
+
+### Branch Decision
+
+**Branch B selected** — author Sirius-side host→gpu converter override
+mirroring Pattern 2 with `cudaMemcpyHostToDevice` under `rmm::cuda_set_device_raii`
+for the target GPU, and consume a target-bound stream acquired from
+`target_memory_space->acquire_stream()` (not the caller's stream).
+
+Task 3 of 08-02-PLAN.md is UNBLOCKED by this decision.
 
 ## Hardware Availability
 
@@ -215,7 +278,21 @@ HYG-02 baseline: `grep -rn 'rmm::cuda_stream_default' src/` == 41 (unchanged
 from 08-01 SUMMARY.md). No net-new uses introduced by Task 1 (no source
 edits).
 
-## Branch Decision
+## Branch Decision (updated 2026-04-21)
+
+**ACTUAL (post-re-run): Branch B selected.** The MCP-driven re-probe above
+produced a concrete FAIL on the hive-partition filter test with
+`cudaErrorInvalidValue` at `cuda_memcpy.cu`, confirming Site C (cucascade's
+`convert_host_fast_to_gpu`) is not discharged by FIX-01. Task 3 authors
+the host→gpu converter override per Pattern 2 (pack/unpack fallback with
+`cudaMemcpyHostToDevice`) since `BatchCopyAccumulator` and
+`reconstruct_column` are not in cucascade's public headers.
+
+The original Branch-C recommendation (preserved below) applied under the
+constraint that no GPU was available; MCP's runtime access has now made the
+probe deterministic.
+
+## Branch Decision (original, superseded)
 
 **Recommended: Branch C (DEFERRED — re-run probe on verification host during 08-06)**
 
