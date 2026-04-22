@@ -5,7 +5,7 @@ milestone_name: milestone
 status: executing
 stopped_at: Phase 2 context gathered
 last_updated: "2026-04-22T14:07:15.843Z"
-last_activity: 2026-04-22 -- Phase 01 execution started
+last_activity: 2026-04-22 - Completed quick task 260422-igz: Fix data_batch RAII lifecycle
 progress:
   total_phases: 3
   completed_phases: 1
@@ -72,6 +72,12 @@ None yet.
 ### Blockers/Concerns
 
 None yet.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260422-igz | Fix data_batch RAII lifecycle: add atomic read_only_count, destructors for read_only_data_batch and mutable_data_batch, simplify to_idle, add concurrent unit tests | 2026-04-22 | 078a63b | [260422-igz-fix-data-batch-raii-lifecycle-add-atomic](./quick/260422-igz-fix-data-batch-raii-lifecycle-add-atomic/) |
 
 ## Session Continuity
 
