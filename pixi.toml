@@ -22,10 +22,11 @@ sccache = "*"
 unzip = "*"
 clang = "21.*"
 wget = "*"
-pre-commit = "*"
 clang-tools = "21.*"
 pkg-config = "*"
 mold = "*"
+identify = ">=2.6.19,<3"
+pre-commit = ">=4.6.0,<5"
 
 [feature.dev-libs.dependencies]
 librmm = "*"

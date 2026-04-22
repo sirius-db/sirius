@@ -390,7 +390,6 @@ std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> 
   auto future    = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
-    req->result.set_value(0);
     return future;
   }
   return future;

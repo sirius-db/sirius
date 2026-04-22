@@ -247,7 +247,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @param space The memory space to query.
    * @return Total size in bytes.
    */
-  std::size_t get_bytes_in_space(cucascade::memory::memory_space* space) const override
+  std::size_t get_bytes_in_space(cucascade::memory::memory_space* space) const
   {
     std::size_t total = 0;
     auto num_parts    = _repo->num_partitions();

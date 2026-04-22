@@ -113,16 +113,6 @@ class convertible_data_provider {
    */
   virtual std::vector<std::unique_ptr<convertible_data>> get_all_convertible(
     cucascade::memory::memory_space* space, bool front_to_back) = 0;
-
-  /**
-   * @brief Get the total byte size of all data in the given memory space.
-   *
-   * Sums bytes_in_space() across all data units the provider can see.
-   *
-   * @param space The memory space to query.
-   * @return Total size in bytes.
-   */
-  virtual std::size_t get_bytes_in_space(cucascade::memory::memory_space* space) const = 0;
 };
 
 }  // namespace sirius

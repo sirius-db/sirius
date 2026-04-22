@@ -286,21 +286,6 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     return results;
   }
 
-  /**
-   * @brief Get the total byte size of task data in the given memory space.
-   *
-   * Returns 0 because precise byte counting would require temporarily removing
-   * and re-inserting tasks, which is unsafe under concurrent producers. Callers
-   * needing exact totals should use get_all_convertible() + bytes_in_space().
-   *
-   * @param space The memory space to query.
-   * @return Always 0 (see rationale above).
-   */
-  std::size_t get_bytes_in_space(cucascade::memory::memory_space* /*space*/) const override
-  {
-    return 0;
-  }
-
  private:
   /**
    * @brief Predicate: does this task contain data_batches in the given space with
