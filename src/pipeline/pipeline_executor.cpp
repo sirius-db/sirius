@@ -236,17 +236,25 @@ void pipeline_executor::management_eventloop()
 
     // Determine target GPU from task's data locality preference (SCHED-01/02/04).
     int target_device_id = _gpu_executors.begin()->first;  // default: first GPU
+    uint64_t task_id     = 0;
     if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
       auto pref = gpu_task->get_preferred_device_id();
       if (pref.has_value() && _gpu_executors.count(pref.value())) {
         target_device_id = pref.value();
       }
+      task_id = gpu_task->get_task_id();
     }
 
     SIRIUS_LOG_DEBUG("management_eventloop: routing task to GPU {}", target_device_id);
     // v1.1 e2e verification audit: info-level dispatch log so a real SQL query
     // can be grepped for per-GPU task distribution without needing debug logs.
-    SIRIUS_LOG_INFO("[mgpu-audit] pipeline_task dispatched to GPU {}", target_device_id);
+    // Phase 8 AUDIT-01: appended task_id= suffix so tests can grep + awk-split +
+    // sort -u to count UNIQUE tasks per GPU (robust against log-line duplication
+    // from retries). The leading "[mgpu-audit] pipeline_task dispatched to GPU N"
+    // substring is preserved verbatim for backward-compat with v1.1 verification greps.
+    SIRIUS_LOG_INFO("[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}",
+                    target_device_id,
+                    task_id);
     // wait_on_preferred_device: when the preferred GPU executor is at capacity,
     // the task sits in *that* executor's queue rather than falling back to a
     // different GPU. This is the v1.0 Phase 02-01 user-locked decision recorded
