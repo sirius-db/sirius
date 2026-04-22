@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: executing
-stopped_at: "Completed 08-04-PLAN.md (TEST-01/02 infra: integration-2gpu.yaml + shared_test_env wiring + RUN_TPCH_MGPU parameterization of 44 TPC-H TEST_CASEs)"
-last_updated: "2026-04-22T02:45:12.409Z"
+stopped_at: "Completed 08-05-PLAN.md (AUDIT TEST_CASE + SF10 Q1/Q6/Q12 2-GPU variants + Q4 retry; partial runtime evidence: 609 passed, 1 known-08-06-bug fail, 373 deferred due to MCP --abort)"
+last_updated: "2026-04-22T04:28:59.956Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 6
-  completed_plans: 4
-  percent: 50
+  completed_plans: 5
+  percent: 83
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 08 (multi-gpu-sql-pipeline-fix) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute
 Last activity: 2026-04-22
 
-Progress: [█████░░░░░] 50% (3/6 plans complete)
+Progress: [████████░░] 83% (5/6 plans complete)
 
 ## Performance Metrics
 
@@ -40,6 +40,7 @@ Progress: [█████░░░░░] 50% (3/6 plans complete)
 | Phase 08 P02 | 15min | 3 tasks | 5 files |
 | Phase 08 P03 | 6min | 2 tasks | 2 files |
 | Phase 08 P04 | 20min | 3 tasks | 5 files |
+| Phase 08 P05 | 86min | 3 tasks | 4 files |
 
 ## Decisions
 
@@ -53,6 +54,11 @@ Progress: [█████░░░░░] 50% (3/6 plans complete)
 - [Phase 08]: [08-04] TEST-01/02: added integration-2gpu.yaml + g_integration_env_2gpu + acquire_integration_env_for() helper + RUN_TPCH_MGPU macro. All 44 TPC-H TEST_CASEs parameterized on num_gpus in {1,2} via Catch2 GENERATE. integration.yaml unchanged (1-GPU default preserved).
 - [Phase 08]: [08-04] Chose research-recommended Option A (Catch2 GENERATE inside TEST_CASE body) over Option B (TEMPLATE_TEST_CASE_METHOD) and Option C (duplicated flavors). Lowest-churn: zero TEST_CASE_METHOD header edits, 44 mechanical one-line call-site substitutions.
 - [Phase 08]: [08-04] Virtual setup_schema() hook on GPUExecutionFixtureBase re-runs subclass DDL on fresh connection after each bind_env(num_gpus); avoids leaking 1-GPU schema into 2-GPU connection when bind_env(2) reassigns con.
+- [Phase 08]: [08-05] AUDIT TEST_CASE authored routing through DuckDB ATTACH path (not parquet) — decouples assertion from open 08-06 host_parquet bug. Pre-verified statically; runtime deferred to 08-06.
+- [Phase 08]: [08-05] SF10 Q1/Q6/Q12 TEST_CASEs gated on SIRIUS_TEST_SF10_PATH env var + cudaGetDeviceCount>=2, both WARN+return on miss. Runtime verification deferred to 08-06 verification host.
+- [Phase 08]: [08-05] Q4 retry wrapper scoped to tpch_q4 TEST_CASE only (DuckDB + parquet flavors). Other queries keep RUN_TPCH_MGPU so real regressions fail loudly. Per ROADMAP Phase 8 Success Criterion 2 flake policy.
+- [Phase 08]: [08-05] Audit TEST_CASE threshold: >=5 per GPU when SIRIUS_TEST_SF10_PATH is set (ROADMAP criterion 4 strict), >=1 per GPU otherwise (SF1 lineitem ~6 total batches). Strict threshold fires on 08-06 verification host.
+- [Phase 08]: [08-05] MCP daemon caches commands.yaml at session start; hot-reload unsupported. unit-tests cannot be invoked with --abortx 999 or tag filter from this agent. 08-06 will use a fresh session or close the host_parquet bug so --abort never trips.
 
 ## Accumulated Context
 
@@ -90,6 +96,6 @@ Progress: [█████░░░░░] 50% (3/6 plans complete)
 
 ## Session Continuity
 
-Last session: 2026-04-22T02:45:12.407Z
-Stopped at: Completed 08-04-PLAN.md (TEST-01/02 infra: integration-2gpu.yaml + shared_test_env wiring + RUN_TPCH_MGPU parameterization of 44 TPC-H TEST_CASEs)
+Last session: 2026-04-22T04:28:45.118Z
+Stopped at: Completed 08-05-PLAN.md (AUDIT TEST_CASE + SF10 Q1/Q6/Q12 2-GPU variants + Q4 retry; partial runtime evidence: 609 passed, 1 known-08-06-bug fail, 373 deferred due to MCP --abort)
 Resume file: None
