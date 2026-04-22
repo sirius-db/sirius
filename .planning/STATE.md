@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
-status: executing
-stopped_at: "Completed 08-05-PLAN.md (AUDIT TEST_CASE + SF10 Q1/Q6/Q12 2-GPU variants + Q4 retry; partial runtime evidence: 609 passed, 1 known-08-06-bug fail, 373 deferred due to MCP --abort)"
-last_updated: "2026-04-22T04:28:59.956Z"
+status: verifying
+stopped_at: "Completed 08-06-PLAN.md (FIX-03 HYG PASS, FIX-04 build PASS, Pattern 2 idiom grep PASS; carryover fix applied to host_parquet converter but residual cudaErrorInvalidValue @ cuda_memcpy.cu:42 remains on num_gpus=2 parquet path — v1.2 ship BLOCKED pending additional fix-site closure)"
+last_updated: "2026-04-22T05:29:30.497Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 1
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 6
-  completed_plans: 5
-  percent: 83
+  completed_plans: 6
+  percent: 100
 ---
 
 # Project State
@@ -25,12 +25,13 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 
 ## Current Position
 
-Phase: 08 (multi-gpu-sql-pipeline-fix) — EXECUTING
+Phase: 08 (multi-gpu-sql-pipeline-fix) — COMPLETE (ship-blocked)
 Plan: 6 of 6
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-04-22
 
-Progress: [████████░░] 83% (5/6 plans complete)
+Progress: [██████████] 100% (6/6 plans complete)
+Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md`
 
 ## Performance Metrics
 
@@ -41,6 +42,7 @@ Progress: [████████░░] 83% (5/6 plans complete)
 | Phase 08 P03 | 6min | 2 tasks | 2 files |
 | Phase 08 P04 | 20min | 3 tasks | 5 files |
 | Phase 08 P05 | 86min | 3 tasks | 4 files |
+| Phase 08 P06 | 21min | 3 tasks | 3 files |
 
 ## Decisions
 
@@ -59,6 +61,10 @@ Progress: [████████░░] 83% (5/6 plans complete)
 - [Phase 08]: [08-05] Q4 retry wrapper scoped to tpch_q4 TEST_CASE only (DuckDB + parquet flavors). Other queries keep RUN_TPCH_MGPU so real regressions fail loudly. Per ROADMAP Phase 8 Success Criterion 2 flake policy.
 - [Phase 08]: [08-05] Audit TEST_CASE threshold: >=5 per GPU when SIRIUS_TEST_SF10_PATH is set (ROADMAP criterion 4 strict), >=1 per GPU otherwise (SF1 lineitem ~6 total batches). Strict threshold fires on 08-06 verification host.
 - [Phase 08]: [08-05] MCP daemon caches commands.yaml at session start; hot-reload unsupported. unit-tests cannot be invoked with --abortx 999 or tag filter from this agent. 08-06 will use a fresh session or close the host_parquet bug so --abort never trips.
+- [Phase 08]: [08-06] Applied carryover fix (Pattern 2 idiom) to convert_host_parquet_to_gpu_with_prefetched_data_source per orchestrator directive; mirrors 08-02 Branch B template. Build + HYG clean. Same cudaErrorInvalidValue signature persists on num_gpus=2 parquet TPC-H Q1 — residual fix-site beyond 08-06's scope, handed off with 4 hypothesis candidates.
+- [Phase 08]: [08-06] FIX-03 verdict: PASS — grep of rmm::cuda_stream_default in src/ returns 41 matches (unchanged phase-7 baseline); 0 net-new introductions by Phase 8.
+- [Phase 08]: [08-06] FIX-04 verdict: PASS — mcp build exit 0 after rm -rf build. ROADMAP criterion 5 (Pattern 2 idiom grep) PASS with 6 code matches across 4 fix sites.
+- [Phase 08]: [08-06] Phase 8 ship verdict BLOCKED — criteria 1/2/4/6 DEFERRED because TPC-H Q1 parquet + num_gpus=2 still hits cudaErrorInvalidValue @ cuda_memcpy.cu:42 after carryover fix. SF100 Q1 ship-gate not run because SF1 parquet already reproduces the blocker.
 
 ## Accumulated Context
 
@@ -92,10 +98,11 @@ Progress: [████████░░] 83% (5/6 plans complete)
 
 ### Blockers / Concerns
 
+- **[v1.2 SHIP BLOCKER — 08-06]** Residual `cudaErrorInvalidValue @ cuda_memcpy.cu:42` on num_gpus=2 parquet path. Failing tests: `gpu_execution hive partition - filter on data column` and `gpu_execution - TPC-H Query 1 parquet`. The 08-06 carryover fix at `convert_host_parquet_to_gpu_with_prefetched_data_source` (Pattern 2 idiom mirroring 08-02 Branch B template) was applied and build+HYG pass, but the same bug signature persists — indicating at least one additional fix-site. 4 hypothesis candidates and concrete suggested next actions documented in `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-06-VALIDATION.md` "Open Issue — Residual Carryover-Fix Incompleteness" section. Blocks ROADMAP criteria 1 + 2 + 4 + 6 (criteria 3 + 5 pass as static invariants).
 - **Integration fixture scope:** TPC-H fixture currently hard-codes `num_gpus: 1` via `setenv` inside the test fixture. Flipping globally may uncover other multi-GPU bugs not exposed by the unit-test suite today. Phase 8 plans should parameterize TPC-H specifically (per TEST-01) rather than flip the default globally — the parameterization approach is what AUDIT-03 requires anyway (2-GPU variant MUST execute in default unit-tests run, but the 1-GPU variant need not be removed).
 
 ## Session Continuity
 
-Last session: 2026-04-22T04:28:45.118Z
-Stopped at: Completed 08-05-PLAN.md (AUDIT TEST_CASE + SF10 Q1/Q6/Q12 2-GPU variants + Q4 retry; partial runtime evidence: 609 passed, 1 known-08-06-bug fail, 373 deferred due to MCP --abort)
+Last session: 2026-04-22T05:28:51.539Z
+Stopped at: Completed 08-06-PLAN.md (FIX-03 HYG PASS, FIX-04 build PASS, Pattern 2 idiom grep PASS; carryover fix applied to host_parquet converter but residual cudaErrorInvalidValue @ cuda_memcpy.cu:42 remains on num_gpus=2 parquet path — v1.2 ship BLOCKED pending additional fix-site closure)
 Resume file: None

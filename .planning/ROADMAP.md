@@ -20,9 +20,9 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 
 </details>
 
-### 🚧 v1.2 — Active
+### 🚧 v1.2 — Active (ship-blocked)
 
-- [ ] **Phase 8: Multi-GPU SQL Pipeline Fix** — Cross-device stream-correctness fix in `lock_or_prepare_batch` + TPC-H 2-GPU test parameterization + `[mgpu-audit]` acceptance gate
+- [~] **Phase 8: Multi-GPU SQL Pipeline Fix** — 6/6 plans complete; criteria 3 + 5 PASS (HYG + Pattern 2 grep); criteria 1/2/4/6 DEFERRED on residual `cudaErrorInvalidValue @ cuda_memcpy.cu:42` on parquet + num_gpus=2 path. See `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md` for full ship verdict.
 
 ## Phase Details
 
@@ -43,7 +43,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
   - [x] 08-03-PLAN.md — AUDIT-01/02/03 [mgpu-audit] log payload extension (task_id/batch_id)
   - [x] 08-04-PLAN.md — TEST-01/02 integration-2gpu.yaml fixture + GENERATE(1,2) parameterization
   - [x] 08-05-PLAN.md — TEST-03/04 + AUDIT TEST_CASE (SF1 full + SF10 Q1/Q6/Q12 + log-grep assertions)
-  - [ ] 08-06-PLAN.md — FIX-03/04 HYG+build sweep + SF100 Q1 VALIDATION on N=2 hardware
+  - [x] 08-06-PLAN.md — FIX-03/04 HYG+build sweep + SF100 Q1 VALIDATION on N=2 hardware
 
 ## Progress
 
@@ -53,4 +53,4 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 5. Cucascade-Backed Parquet I/O Migration | v1.1 | 6/6 | Complete | 2026-04-21 |
 | 6. Multi-GPU Gap Closure | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 7. P2P Direct Transfer + Adaptive Scan | v1.1 | 4/4 | Complete | 2026-04-21 |
-| 8. Multi-GPU SQL Pipeline Fix | v1.2 | 0/6 | Not started | - |
+| 8. Multi-GPU SQL Pipeline Fix | v1.2 | 6/6 | Complete (ship-blocked) | 2026-04-22 |

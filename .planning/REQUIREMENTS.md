@@ -13,8 +13,8 @@
 
 - [x] **FIX-01**: `pipelineable_operator_data::prepare_for_processing` → `pipeline::lock_or_prepare_batch` no longer throws `cudaErrorInvalidValue: invalid argument` when source and target devices differ. Pack on source-device RAII + source stream; copy on target stream (Pattern 2 — same shape as `src/data/sirius_p2p_converter.cpp` from Plan 07-02).
 - [x] **FIX-02**: Audit every other cross-device CUDA memcpy call-site in `src/pipeline/` and `src/op/` for the same bug pattern; apply the same fix where present. Document surfaces covered.
-- [ ] **FIX-03**: Zero net-new `rmm::cuda_stream_default` uses (HYG discipline maintained).
-- [ ] **FIX-04**: Build clean on MCP (`mcp__project-commands__run_command build` exit 0) after fix.
+- [x] **FIX-03**: Zero net-new `rmm::cuda_stream_default` uses (HYG discipline maintained).
+- [x] **FIX-04**: Build clean on MCP (`mcp__project-commands__run_command build` exit 0) after fix.
 
 ### TEST — Integration Suite Multi-GPU Coverage
 
@@ -51,8 +51,8 @@
 |-------------|-------|--------|
 | FIX-01 | Phase 8 | Complete |
 | FIX-02 | Phase 8 | Complete |
-| FIX-03 | Phase 8 | Pending |
-| FIX-04 | Phase 8 | Pending |
+| FIX-03 | Phase 8 | Complete |
+| FIX-04 | Phase 8 | Complete |
 | TEST-01 | Phase 8 | Complete |
 | TEST-02 | Phase 8 | Complete |
 | TEST-03 | Phase 8 | Complete |
