@@ -19,10 +19,10 @@
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "exec/inspectable_mpsc.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
+#include "parallel/task_queue.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -47,24 +47,24 @@ namespace sirius {
  * @brief Concrete convertible_data wrapping a gpu_pipeline_task with RAII queue ownership.
  *
  * Takes exclusive ownership of an itask via unique_ptr. On destruction, pushes the task
- * back into the originating inspectable_mpsc queue unless the queue has been interrupted
- * (shutdown). This enables temporary extraction from the queue for conversion, with
- * guaranteed return on all code paths.
+ * back into the originating task queue unless the queue has been closed (shutdown). This
+ * enables temporary extraction from the queue for conversion, with guaranteed return on
+ * all code paths.
  *
- * The convert() method follows the same save/lock/convert/restore pattern as
- * convertible_data_batch: for each data_batch in the task's input data, it saves the
- * previous state, locks for in_transit, attempts conversion to a target memory space,
- * and restores state on all paths (success, failure, exception).
+ * The convert() method uses the RAII mutable lock pattern: for each data_batch in the
+ * task's input data, it acquires a mutable_data_batch via to_mutable() or try_to_mutable(),
+ * attempts conversion to a target memory space, and relies on the mutable_data_batch RAII
+ * destructor to restore idle state on all exit paths (success, failure, exception).
  */
 class convertible_gpu_pipeline_task : public convertible_data {
  public:
   /**
    * @brief Construct from a task extracted from the queue.
    * @param task The task to wrap (exclusive ownership taken).
-   * @param queue The originating queue (task is returned here on destruction).
+   * @param queue The originating task queue (task is returned here on destruction).
    */
   convertible_gpu_pipeline_task(std::unique_ptr<sirius::parallel::itask> task,
-                                sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
+                                sirius::parallel::itask_queue& queue)
     : _task(std::move(task)), _queue(queue)
   {
   }
@@ -79,38 +79,36 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Destructor: returns the task to the queue via RAII.
    *
    * If the task has been moved-from (nullptr), does nothing.
-   * If push() returns false (queue interrupted during shutdown), logs a warning
-   * and lets the task be destroyed — this is expected during query teardown.
+   * Pushes the task back to the queue; if the queue is closed (shutdown),
+   * the task is destroyed -- this is expected during query teardown.
    */
   ~convertible_gpu_pipeline_task() override
   {
-    if (_task) {
-      if (!_queue.push(std::move(_task))) {
-        SIRIUS_LOG_WARN("convertible_gpu_pipeline_task: queue interrupted, task destroyed");
-      }
-    }
+    if (_task) { _queue.push(std::move(_task)); }
   }
 
   /**
    * @brief Convert this task's data batches to reside in one of the target memory spaces.
    *
    * Iterates the data_batches from the task's pipelineable_operator_data input.
-   * For each batch:
-   * - Skips batches already in a target space (no conversion needed)
-   * - Skips batches not in task_created state (busy or already processing)
-   * - Locks for in_transit, requests a reservation in each target space, converts
-   * - Restores the previous batch state on all paths
+   * For each batch not already at a target space, delegates to convertible_data_batch
+   * which acquires a mutable_data_batch (blocking or non-blocking), attempts the conversion,
+   * and releases automatically via RAII.
    *
    * @param target_spaces  Candidate destination memory spaces (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
+   * @param blocking       When true, uses to_mutable() (blocks until exclusive lock acquired).
+   *                       When false, uses try_to_mutable() (returns nullopt immediately if
+   *                       the lock is unavailable).
    * @return A vector of bytes converted per target space index on success, or nullopt if
    *         no batches were converted.
    */
   std::optional<std::vector<std::size_t>> convert(
     const std::vector<const cucascade::memory::memory_space*>& target_spaces,
     rmm::cuda_stream_view stream,
-    sirius::memory::sirius_memory_reservation_manager& res_mgr) override
+    sirius::memory::sirius_memory_reservation_manager& res_mgr,
+    bool blocking = true) override
   {
     auto* pipelineable = get_pipelineable_data();
     if (!pipelineable) { return std::nullopt; }
@@ -122,22 +120,24 @@ class convertible_gpu_pipeline_task : public convertible_data {
     for (const auto& batch : batches) {
       if (!batch) { continue; }
 
-      // Skip batches already at a target space — no conversion needed
-      auto* batch_space      = batch->get_memory_space();
-      bool already_at_target = false;
-      for (const auto* ts : target_spaces) {
-        if (batch_space == ts) {
-          already_at_target = true;
-          break;
+      // Quick check: skip batches already at a target space (avoid unnecessary locking)
+      {
+        auto ro            = batch->to_read_only();
+        auto* batch_space  = ro.get_memory_space();
+        bool at_target     = false;
+        for (const auto* ts : target_spaces) {
+          if (batch_space == ts) {
+            at_target = true;
+            break;
+          }
         }
+        cucascade::data_batch::to_idle(std::move(ro));
+        if (at_target) { continue; }
       }
-      if (already_at_target) { continue; }
 
-      // Only convert batches in task_created state
-      if (batch->get_state() != cucascade::batch_state::task_created) { continue; }
-
+      // Delegate to convertible_data_batch which handles to_mutable() internally
       sirius::convertible_data_batch batch_converter(batch);
-      auto result = batch_converter.convert(target_spaces, stream, res_mgr);
+      auto result = batch_converter.convert(target_spaces, stream, res_mgr, blocking);
       if (result) {
         any_converted = true;
         for (std::size_t i = 0; i < result->size(); ++i) {
@@ -154,7 +154,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Get the size in bytes of this task's data in the specified memory space.
    *
    * Sums bytes across all data_batches in the task's input that reside in the
-   * given memory space.
+   * given memory space. Accesses memory space via to_read_only() as required by
+   * the new cucascade API.
    *
    * @param space The memory space to query.
    * @return Total size in bytes, or 0 if no data resides in that space.
@@ -166,9 +167,10 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
     std::size_t total = 0;
     for (const auto& batch : pipelineable->get_data_batches()) {
-      if (batch && batch->get_memory_space() == space) {
-        total += batch->get_data()->get_size_in_bytes();
-      }
+      if (!batch) { continue; }
+      auto ro = batch->to_read_only();
+      if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
+      cucascade::data_batch::to_idle(std::move(ro));
     }
     return total;
   }
@@ -210,29 +212,25 @@ class convertible_gpu_pipeline_task : public convertible_data {
   }
 
   std::unique_ptr<sirius::parallel::itask> _task;
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>& _queue;
+  sirius::parallel::itask_queue& _queue;
 };
 
 /**
- * @brief Concrete convertible_data_provider that discovers convertible tasks in an
- *        inspectable_mpsc queue.
+ * @brief Concrete convertible_data_provider that discovers convertible tasks in a task queue.
  *
- * Uses mutable_pop_if to extract tasks whose data_batches match a given memory space
- * and batch_state::task_created. Each extracted task is wrapped in a
- * convertible_gpu_pipeline_task, which returns the task to the queue on destruction
- * via RAII.
+ * Filters tasks by checking data_batches for batch_state::idle and a matching memory space.
+ * Only batches in batch_state::idle are considered for conversion -- the new cucascade API
+ * requires idle state before acquiring a mutable or read-only accessor.
  *
- * Non-gpu_pipeline_tasks and tasks without pipelineable_operator_data are silently
- * skipped by the predicate (they remain in the queue).
+ * Non-gpu_pipeline_tasks and tasks without pipelineable_operator_data are silently skipped.
  */
 class convertible_gpu_pipeline_task_provider : public convertible_data_provider {
  public:
   /**
    * @brief Construct from a reference to the task queue.
-   * @param queue The inspectable_mpsc queue to search (non-owning reference).
+   * @param queue The task queue to search (non-owning reference).
    */
-  explicit convertible_gpu_pipeline_task_provider(
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
+  explicit convertible_gpu_pipeline_task_provider(sirius::parallel::itask_queue& queue)
     : _queue(queue)
   {
   }
@@ -240,61 +238,45 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   /**
    * @brief Get the next task whose data_batches match the given memory space.
    *
-   * Calls mutable_pop_if with a predicate that navigates the dynamic_cast chain
-   * and checks for data_batches in the target space with batch_state::task_created.
+   * Returns nullptr -- the new itask_queue interface does not support in-place
+   * inspection or predicate-based extraction. Callers needing task-level downgrade
+   * should use get_all_convertible() or interact with the repository directly.
    *
    * @param space           The memory space to filter by.
    * @param front_to_back   Iteration direction.
-   * @return A convertible_gpu_pipeline_task wrapping the matching task, or nullptr.
+   * @return Always nullptr (queue inspection not supported by itask_queue).
    */
-  std::unique_ptr<convertible_data> get_next_convertible(cucascade::memory::memory_space* space,
-                                                         bool front_to_back) override
+  std::unique_ptr<convertible_data> get_next_convertible(
+    cucascade::memory::memory_space* /*space*/, bool /*front_to_back*/) override
   {
-    auto result = _queue.mutable_pop_if(
-      [space](sirius::parallel::itask& task) { return has_matching_batches(task, space); },
-      front_to_back);
-
-    if (!result) { return nullptr; }
-    return std::make_unique<convertible_gpu_pipeline_task>(std::move(result), _queue);
+    return nullptr;
   }
 
   /**
-   * @brief Get all tasks whose data_batches match the given memory space.
+   * @brief Get all convertible tasks matching the given memory space.
    *
-   * Repeatedly calls mutable_pop_if until no more matching tasks are found.
-   * Each extracted task is wrapped in a convertible_gpu_pipeline_task for RAII
-   * queue return.
+   * Returns an empty vector -- the new itask_queue interface does not support
+   * in-place inspection or predicate-based extraction without removing tasks.
    *
    * @param space           The memory space to filter by.
    * @param front_to_back   Iteration direction.
-   * @return A vector of convertible_gpu_pipeline_task instances (may be empty).
+   * @return Always empty (queue inspection not supported by itask_queue).
    */
   std::vector<std::unique_ptr<convertible_data>> get_all_convertible(
-    cucascade::memory::memory_space* space, bool front_to_back) override
+    cucascade::memory::memory_space* /*space*/, bool /*front_to_back*/) override
   {
-    std::vector<std::unique_ptr<convertible_data>> results;
-
-    while (true) {
-      auto result = _queue.mutable_pop_if(
-        [space](sirius::parallel::itask& task) { return has_matching_batches(task, space); },
-        front_to_back);
-
-      if (!result) { break; }
-      results.push_back(std::make_unique<convertible_gpu_pipeline_task>(std::move(result), _queue));
-    }
-
-    return results;
+    return {};
   }
 
   /**
    * @brief Get the total byte size of task data in the given memory space.
    *
-   * Returns 0 because precise byte counting would require temporarily removing
-   * and re-inserting tasks, which is unsafe under concurrent producers. Callers
-   * needing exact totals should use get_all_convertible() + bytes_in_space().
+   * Returns 0 because precise byte counting is not supported without in-place
+   * queue inspection. Callers needing exact totals should use repository-based
+   * providers.
    *
    * @param space The memory space to query.
-   * @return Always 0 (see rationale above).
+   * @return Always 0.
    */
   std::size_t get_bytes_in_space(cucascade::memory::memory_space* /*space*/) const override
   {
@@ -304,14 +286,14 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
  private:
   /**
    * @brief Predicate: does this task contain data_batches in the given space with
-   *        batch_state::task_created?
+   *        batch_state::idle?
    *
-   * Lightweight — only performs dynamic_casts and state checks. Suitable for use
-   * under the queue mutex per inspectable_mpsc contract (T-07-01 mitigation).
+   * Lightweight -- only performs dynamic_casts and state checks. Accesses memory
+   * space via to_read_only() as required by the new cucascade API.
    *
-   * @param task  The task to inspect (mutable reference from mutable_pop_if).
+   * @param task  The task to inspect.
    * @param space The memory space to match.
-   * @return true if the task has at least one matching batch.
+   * @return true if the task has at least one matching batch in batch_state::idle.
    */
   static bool has_matching_batches(sirius::parallel::itask& task,
                                    cucascade::memory::memory_space* space)
@@ -320,16 +302,18 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     if (!pipelineable) { return false; }
 
     for (const auto& batch : pipelineable->get_data_batches()) {
-      if (batch && batch->get_memory_space() == space &&
-          batch->get_state() == cucascade::batch_state::task_created) {
-        return true;
-      }
+      if (!batch) { continue; }
+      if (batch->get_state() != cucascade::batch_state::idle) { continue; }
+      auto ro      = batch->to_read_only();
+      bool matches = (ro.get_memory_space() == space);
+      cucascade::data_batch::to_idle(std::move(ro));
+      if (matches) { return true; }
     }
 
     return false;
   }
 
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>& _queue;
+  sirius::parallel::itask_queue& _queue;
 };
 
 }  // namespace sirius
