@@ -49,7 +49,7 @@ Plans:
 Plans:
 - [x] 02-01-PLAN.md — Rewrite conversion/downgrade path to use to_mutable() RAII and remove old state machine
 - [x] 02-02-PLAN.md — Result collector clone_to pattern and subscribe/unsubscribe lifecycle wiring
-- [ ] 02-03-PLAN.md — Gap closure: scope SC4 and fix [[nodiscard]] to_idle() discards
+- [x] 02-03-PLAN.md — Gap closure: scope SC4 and fix [[nodiscard]] to_idle() discards
 
 ### Phase 3: Operator Sweep and Clean Build
 **Goal**: Every operator casts to the correct new type, every legacy accessor call site on idle batches uses `to_read_only()`, and the project compiles cleanly against cucascade d9dc331
