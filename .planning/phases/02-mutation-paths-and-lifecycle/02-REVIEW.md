@@ -1,6 +1,6 @@
 ---
 phase: 02-mutation-paths-and-lifecycle
-reviewed: 2026-04-22T14:46:35Z
+reviewed: 2026-04-22T21:14:57Z
 depth: standard
 files_reviewed: 6
 files_reviewed_list:
@@ -11,154 +11,163 @@ files_reviewed_list:
   - src/include/pipeline/gpu_pipeline_task.hpp
   - src/pipeline/gpu_pipeline_task.cpp
 findings:
-  critical: 3
-  warning: 2
+  critical: 7
+  warning: 1
   info: 2
-  total: 7
+  total: 10
 status: issues_found
 ---
 
 # Phase 02: Code Review Report
 
-**Reviewed:** 2026-04-22T14:46:35Z
+**Reviewed:** 2026-04-22T21:14:57Z
 **Depth:** standard
 **Files Reviewed:** 6
 **Status:** issues_found
 
 ## Summary
 
-These files implement the cucascade 3-class data_batch API refactoring: RAII accessor types (read_only_data_batch, mutable_data_batch), clone_to pattern in the result collector, and subscribe/unsubscribe lifecycle in gpu_pipeline_task. The overall design direction is correct -- RAII lock acquisition, explicit clone_to for tier conversion, and subscriber lifecycle tracking are well-structured.
-
-However, there are three critical compilation-blocking issues: (1) use of a nonexistent type `data_batch_processing_handle`, (2) direct calls to `batch->get_data()` which is private on the new `data_batch` API and only accessible through accessor types, and (3) all `to_idle()` calls discard the `[[nodiscard]]` return value which will fail under warnings-as-errors. These must be fixed before the code can compile against cucascade commit d9dc331.
+These files implement the data_batch mutation/conversion paths and the GPU pipeline task lifecycle within the data_batch refactoring project. The new convertible_data abstraction layer (`convertible_data.hpp`, `convertible_data_batch.hpp`, `convertible_gpu_pipeline_task.hpp`) and result collector (`sirius_physical_result_collector.cpp`) correctly use the new cucascade 3-class RAII API (`to_read_only()`, `to_mutable()`, `try_to_mutable()`). However, the GPU pipeline task files (`gpu_pipeline_task.hpp`, `gpu_pipeline_task.cpp`) still contain multiple call sites that access **private** methods directly on `data_batch` (`get_data()`, `get_current_tier()`), which will not compile against the new cucascade API. Additionally, `gpu_pipeline_task.cpp` references the defunct type `data_batch_processing_handle` which no longer exists in the cucascade API.
 
 ## Critical Issues
 
-### CR-01: Nonexistent type `data_batch_processing_handle` in gpu_pipeline_task.cpp
+### CR-01: Type does not exist -- `data_batch_processing_handle` removed from cucascade API
 
 **File:** `src/pipeline/gpu_pipeline_task.cpp:350`
-**Issue:** Lines 350 and 376 declare variables of type `cucascade::data_batch_processing_handle`, but this type does not exist in the cucascade headers at commit d9dc331. The `prepare_for_processing` method (defined in `src/op/sirius_physical_operator.cpp:37-72`) returns `std::optional<std::vector<cucascade::read_only_data_batch>>`. This is a compilation error.
+**Issue:** The code declares `std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt` and uses it again at line 376. The type `data_batch_processing_handle` does not exist in the new cucascade API (commit d9dc331). The `prepare_for_processing` method (declared in `sirius_physical_operator.hpp:128`) returns `std::optional<std::vector<cucascade::read_only_data_batch>>`. This is a compilation failure.
 **Fix:**
 ```cpp
-// Line 350: change from
+// Line 350: Change from
 std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
-// to
+// To
 std::optional<std::vector<cucascade::read_only_data_batch>> handles_opt;
 
-// Line 376: change from
+// Line 376: Change from
 std::vector<cucascade::data_batch_processing_handle> processing_handles = std::move(*handles_opt);
-// to
+// To
 std::vector<cucascade::read_only_data_batch> processing_handles = std::move(*handles_opt);
 ```
 
-### CR-02: Direct `batch->get_data()` calls on idle data_batch (private in new API)
+### CR-02: Direct access to private `data_batch::get_data()` in `get_task_consumption_basis()`
 
-**File:** `src/include/pipeline/gpu_pipeline_task.hpp:104-105,120-122` and `src/pipeline/gpu_pipeline_task.cpp:97,411,441-442`
-**Issue:** The new cucascade API makes `get_data()`, `get_current_tier()`, and `get_memory_space()` **private** on `data_batch` (lines 224-243 of `cucascade/include/cucascade/data/data_batch.hpp`). They are only accessible through `read_only_data_batch` or `mutable_data_batch` accessor objects. The following call sites access these private methods directly on `data_batch`:
-
-- `gpu_pipeline_task.hpp:104-105` (`get_task_consumption_basis`): `batch->get_data()->get_uncompressed_data_size_in_bytes()`
-- `gpu_pipeline_task.hpp:120-122` (`get_estimated_bytes_to_materialize_input`): `batch->get_data()->get_current_tier()` and `batch->get_data()->get_uncompressed_data_size_in_bytes()`
-- `gpu_pipeline_task.cpp:97` (`log_operator_data`): `batch->get_data()->get_size_in_bytes()`
-- `gpu_pipeline_task.cpp:411` (memory metrics): `batch->get_data()->get_size_in_bytes()`
-- `gpu_pipeline_task.cpp:441-442` (`get_input_size`): `batch->get_data()->get_size_in_bytes()`
-
-Additionally, `get_cudf_table_view()` at `gpu_pipeline_task.cpp:95` (via `data_batch_utils.hpp:55`) calls `batch.get_data()` directly.
-
-These will all fail to compile.
-
-**Fix:** Each call site needs to acquire a `read_only_data_batch` accessor, perform the read, and release it. For example, in `get_task_consumption_basis`:
+**File:** `src/include/pipeline/gpu_pipeline_task.hpp:104-105`
+**Issue:** `batch->get_data()` is called directly on the idle `data_batch`. In the new cucascade API, `get_data()` is a **private** method on `data_batch` (line 247 of `cucascade/data/data_batch.hpp`), accessible only through `read_only_data_batch` or `mutable_data_batch` RAII accessors. This will not compile.
+**Fix:**
 ```cpp
-[[nodiscard]] std::size_t get_task_consumption_basis() const override
-{
-  if (_estimation_basis) { return *_estimation_basis; }
-  std::size_t input_size = 0;
-  auto* pipelineable_input =
-    dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
-  if (pipelineable_input) {
-    for (const auto& batch : pipelineable_input->get_data_batches()) {
-      if (!batch) { continue; }
-      auto ro = batch->to_read_only();
-      auto* data = ro.get_data();
-      if (data) {
-        input_size += data->get_uncompressed_data_size_in_bytes();
-      }
-      (void)cucascade::data_batch::to_idle(std::move(ro));
-    }
+for (const auto& batch : pipelineable_input->get_data_batches()) {
+  if (!batch) { continue; }
+  auto ro = batch->to_read_only();
+  auto* data = ro.get_data();
+  if (data) {
+    input_size += data->get_uncompressed_data_size_in_bytes();
   }
-  _estimation_basis = input_size;
-  return *_estimation_basis;
 }
 ```
 
-The same pattern applies to all other call sites. For `log_operator_data`, since it runs while read_only handles are held (batches are in read_only state), an alternative is to pass the accessor handles through, or use `try_to_read_only()` to avoid blocking.
+### CR-03: Direct access to private `data_batch::get_data()` and `get_current_tier()` in `get_estimated_bytes_to_materialize_input()`
 
-### CR-03: Discarded `[[nodiscard]]` return from `to_idle()` will fail under warnings-as-errors
-
-**File:** `src/op/sirius_physical_result_collector.cpp` (11 instances), `src/include/data/convertible_data_batch.hpp` (4 instances), `src/include/data/convertible_gpu_pipeline_task.hpp` (3 instances)
-**Issue:** `data_batch::to_idle()` is declared `[[nodiscard]]` and returns `std::shared_ptr<data_batch>`. All 18 call sites across the reviewed files discard the return value:
+**File:** `src/include/pipeline/gpu_pipeline_task.hpp:120-122`
+**Issue:** Same private access violation as CR-02. Both `batch->get_data()` and `batch->get_data()->get_current_tier()` are called directly on the idle `data_batch`. `get_current_tier()` is also private on `data_batch` (line 241 of `cucascade/data/data_batch.hpp`).
+**Fix:**
 ```cpp
-cucascade::data_batch::to_idle(std::move(ro));  // return value discarded
-```
-The project uses `-Werror` (warnings as errors), so discarding a `[[nodiscard]]` return will produce a compilation error.
-
-**Fix:** Cast to void to explicitly discard, or capture the return value:
-```cpp
-// Option 1: explicit discard (preferred when caller already holds a shared_ptr to the batch)
-(void)cucascade::data_batch::to_idle(std::move(ro));
-
-// Option 2: capture if the returned shared_ptr is needed
-auto batch_ptr = cucascade::data_batch::to_idle(std::move(ro));
+for (const auto& batch : pipelineable_input->get_data_batches()) {
+  if (!batch) { continue; }
+  auto ro = batch->to_read_only();
+  auto* data = ro.get_data();
+  if (data && ro.get_current_tier() != cucascade::memory::Tier::GPU) {
+    input_size += data->get_uncompressed_data_size_in_bytes();
+  }
+}
 ```
 
-Apply `(void)` cast consistently at all 18 call sites:
-- `sirius_physical_result_collector.cpp`: lines 133, 138, 151, 166, 179, 185, 203, 215, 221, 247, 250
-- `convertible_data_batch.hpp`: lines 147, 150, 274, 305
-- `convertible_gpu_pipeline_task.hpp`: lines 134, 173, 309
+### CR-04: `get_cudf_table_view()` utility calls private `data_batch::get_data()`
+
+**File:** `src/pipeline/gpu_pipeline_task.cpp:52` and `src/pipeline/gpu_pipeline_task.cpp:95` (via `data_batch_utils.hpp:55`)
+**Issue:** The `get_cudf_table_view(const cucascade::data_batch& batch)` function in `data_batch_utils.hpp:55` calls `batch.get_data()` directly on the data_batch, which is private. This function is called at lines 52 and 95 of `gpu_pipeline_task.cpp` (`validate_operator_output_types` and `log_operator_data`). Both call sites will fail to compile. Note: `data_batch_utils.hpp` is not in the review scope but the callers are -- these callers need to be updated to use the read_only accessor pattern.
+**Fix:** The `get_cudf_table_view` utility should be refactored to accept a `read_only_data_batch&` or `idata_representation*`, or callers should acquire a `read_only_data_batch` first and access the data through it:
+```cpp
+// In log_operator_data (line 94-97):
+for (auto& batch : pipelineable_data.get_data_batches()) {
+  auto ro = batch->to_read_only();
+  auto* data = ro.get_data();
+  auto& gpu_repr = data->cast<cucascade::gpu_table_representation>();
+  auto view = gpu_repr.get_table();
+  batch_rows += std::to_string(view.num_rows()) + "  ";
+  total_bytes += data->get_size_in_bytes();
+}
+```
+
+### CR-05: Direct `batch->get_data()` in `get_input_size()`
+
+**File:** `src/pipeline/gpu_pipeline_task.cpp:441-442`
+**Issue:** Same private access violation. `batch->get_data()` is called directly on the idle `data_batch` without acquiring a read_only accessor first.
+**Fix:**
+```cpp
+for (const auto& batch : pipelineable_input->get_data_batches()) {
+  if (!batch) { continue; }
+  auto ro = batch->to_read_only();
+  auto* data = ro.get_data();
+  if (!data) { continue; }
+  input_size += data->get_size_in_bytes();
+}
+```
+
+### CR-06: Direct `batch->get_data()` in `execute()` output metrics
+
+**File:** `src/pipeline/gpu_pipeline_task.cpp:411`
+**Issue:** Same private access violation in the memory metrics recording section of `execute()`. `batch->get_data()` is called on output batches without a read_only accessor.
+**Fix:**
+```cpp
+for (const auto& batch : pipelineable_output->get_data_batches()) {
+  if (!batch) { continue; }
+  auto ro = batch->to_read_only();
+  auto* data = ro.get_data();
+  if (data) { output_bytes += data->get_size_in_bytes(); }
+}
+```
+
+### CR-07: Direct `batch->get_data()` in `log_operator_data()`
+
+**File:** `src/pipeline/gpu_pipeline_task.cpp:97`
+**Issue:** `batch->get_data()->get_size_in_bytes()` is called directly on the idle `data_batch` in the `log_operator_data` helper. This is a separate call from the `get_cudf_table_view` issue (CR-04) -- even if the table view utility is fixed, this line still directly accesses the private `get_data()` method.
+**Fix:** Combine with the read_only accessor from CR-04's fix:
+```cpp
+auto ro = batch->to_read_only();
+total_bytes += ro.get_data()->get_size_in_bytes();
+```
 
 ## Warnings
 
-### WR-01: TOCTOU race in `try_get_batch` between state check and lock acquisition
+### WR-01: TOCTOU race in `try_get_batch()` state check
 
-**File:** `src/include/data/convertible_data_batch.hpp:301-303`
-**Issue:** The code checks `batch->get_state() != cucascade::batch_state::idle` at line 301, then calls `batch->to_read_only()` at line 303. Between these two lines, another thread could transition the batch out of idle (e.g., to mutable_locked). Since `to_read_only()` blocks until the shared lock is acquired, this is not a crash -- but it means the supposedly "lightweight" filter can block indefinitely if the batch is held exclusively by another thread. The same pattern exists in `has_matching_batches` at `convertible_gpu_pipeline_task.hpp:306-307`.
-**Fix:** Use `try_to_read_only()` instead of `to_read_only()` to preserve non-blocking semantics:
+**File:** `src/include/data/convertible_data_batch.hpp:295-297`
+**Issue:** The code checks `batch->get_state() != cucascade::batch_state::idle` at line 295, then calls `batch->to_read_only()` at line 297. Between these two lines, another thread could change the batch state. If the batch transitions to `mutable_locked` between the check and `to_read_only()`, the call will block until the mutable lock is released (not a crash, but defeats the purpose of the idle-state filter). This is a minor concurrency concern; the `to_read_only()` call is safe because it blocks on the shared_mutex, but the pre-check provides a false sense of filtering.
+**Fix:** Use `try_to_read_only()` instead to avoid blocking on non-idle batches:
 ```cpp
 auto ro_opt = batch->try_to_read_only();
-if (!ro_opt) { return nullptr; }  // batch not idle or lock unavailable
-auto& ro = *ro_opt;
-bool matches = (ro.get_memory_space() == space);
-(void)cucascade::data_batch::to_idle(std::move(ro));
-```
-
-### WR-02: Reservation acquired but never explicitly released on conversion success
-
-**File:** `src/include/data/convertible_data_batch.hpp:104`
-**Issue:** In `convertible_data_batch::convert()`, a reservation is acquired at line 104 via `mem_space->make_reservation_or_null(data_size)`. On success, the `reservation` local goes out of scope when the function returns at line 125, which will release it via RAII. However, after `convert_to` completes, the data now resides in the target space using that reserved memory. If the RAII destructor on `reservation` frees the reserved bytes before the data is actually tracked by the memory space's accounting, this could lead to over-commitment. The correctness depends on whether `convert_to` updates the memory space's internal bookkeeping before `reservation` is destroyed. This should be verified against cucascade's memory accounting model.
-**Fix:** Verify that cucascade's `convert_to` properly updates memory space accounting such that the reservation can safely be released after conversion. If not, the reservation should be transferred to the batch's lifecycle. Add a comment documenting this invariant:
-```cpp
-// convert_to updates the memory space's internal bookkeeping, so the reservation
-// can safely be released (RAII) after conversion completes.
+if (!ro_opt) { return nullptr; }
+if (ro_opt->get_memory_space() == space) {
+  return std::make_unique<convertible_data_batch>(std::move(batch));
+}
+return nullptr;
 ```
 
 ## Info
 
-### IN-01: Dead code -- `has_matching_batches` is never called
+### IN-01: Dead code -- `has_matching_batches()` is never called
 
-**File:** `src/include/data/convertible_gpu_pipeline_task.hpp:298-314`
-**Issue:** `convertible_gpu_pipeline_task_provider::has_matching_batches()` is a private static method that is never called. All three public virtual methods (`get_next_convertible`, `get_all_convertible`, `get_bytes_in_space`) return stub values (nullptr, empty vector, 0) without referencing it. This is dead code.
-**Fix:** Remove `has_matching_batches` or add a TODO explaining when it will be wired in:
-```cpp
-// TODO: Wire has_matching_batches into get_next_convertible/get_all_convertible
-// when itask_queue supports in-place inspection (see convertible_gpu_pipeline_task_provider docs).
-```
+**File:** `src/include/data/convertible_gpu_pipeline_task.hpp:296-310`
+**Issue:** The private static method `has_matching_batches()` is defined but never referenced anywhere in the codebase. All three public methods of `convertible_gpu_pipeline_task_provider` (`get_next_convertible`, `get_all_convertible`, `get_bytes_in_space`) return stub values and do not call this method.
+**Fix:** Remove the dead method or add a comment explaining that it is reserved for future use when the `itask_queue` interface supports predicate-based inspection.
 
-### IN-02: Stub provider -- `convertible_gpu_pipeline_task_provider` returns empty results
+### IN-02: Stub provider -- `convertible_gpu_pipeline_task_provider` returns no data
 
-**File:** `src/include/data/convertible_gpu_pipeline_task.hpp:227-316`
-**Issue:** All three virtual methods of `convertible_gpu_pipeline_task_provider` return stub values: `get_next_convertible` returns nullptr, `get_all_convertible` returns empty vector, `get_bytes_in_space` returns 0. The class effectively does nothing. The comments explain this is because `itask_queue` lacks inspection support, but the class still implements the full `convertible_data_provider` interface, which may mislead callers into expecting functional behavior.
-**Fix:** Consider adding a compile-time or runtime indication that this provider is a no-op, or document it more prominently in the class-level docstring. If this is intentional scaffolding, add a TODO with a tracking reference.
+**File:** `src/include/data/convertible_gpu_pipeline_task.hpp:247-282`
+**Issue:** All three methods of `convertible_gpu_pipeline_task_provider` return empty/zero results (`nullptr`, `{}`, `0`). The class implements the `convertible_data_provider` interface but provides no functionality. The comments explain this is because `itask_queue` does not support in-place inspection, but callers receiving this provider will silently get no results without any indication that the provider is non-functional.
+**Fix:** Consider adding a log message or documenting at the call site that this provider is a no-op placeholder. Alternatively, if this provider will never be functional, consider not instantiating it at all in the calling code.
 
 ---
 
-_Reviewed: 2026-04-22T14:46:35Z_
+_Reviewed: 2026-04-22T21:14:57Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
