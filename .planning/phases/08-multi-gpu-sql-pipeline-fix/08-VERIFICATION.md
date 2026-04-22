@@ -4,7 +4,29 @@ milestone: v1.2
 verified: 2026-04-21T00:00:00Z
 status: gaps_found
 score: 3/6 ROADMAP criteria PASS; 8/11 REQ-IDs PASS runtime; 11/11 REQ-IDs authored
-re_verification: false
+re_verification: true
+resolved:
+  date: 2026-04-22T21:20:00Z
+  commits:
+    - 93fea6f  # sirius — per-GPU filter translation
+    - ecb96c1  # cucascade submodule bump (pinned memory Portable+Mapped)
+  residual_closed: true
+  diagnosis_doc: .planning/phases/08-multi-gpu-sql-pipeline-fix/08-11-DIAGNOSIS.md
+  note: |
+    The residual fix-site identified in this verification (host_parquet path
+    leaking cudaErrorInvalidValue @ cuda_memcpy.cu:42 under num_gpus>1) was
+    NOT in the convert_host_parquet_to_gpu_with_prefetched_data_source
+    function itself. The root cause is that sirius_physical_parquet_scan
+    translated the DuckDB filter expression ONCE at plan-construction time,
+    binding every cudf::scalar's device_buffer to the planner's current
+    device (typically GPU 0). Tasks dispatched to other GPUs then tried to
+    evaluate that filter's AST against per-rowgroup stats and faulted.
+    Fix: build one translated filter tree per configured GPU at plan time,
+    select per-task at converter time. See 08-11-DIAGNOSIS.md for full
+    probe chain, call stack, and validation matrix.
+    Hypothesis C in 08-08-DIAGNOSIS.md (cucascade-internal stream mismatch
+    in enqueue_device_copies) was close — same layer, wrong function — and
+    is superseded by 08-11-DIAGNOSIS.md.
 
 # Per-REQ-ID accounting (all 11 Phase 8 requirements must be in this table)
 requirements:
