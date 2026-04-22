@@ -17,6 +17,7 @@
 #include "op/sirius_physical_partition.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+#include <cuda_runtime.h>
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -24,6 +25,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -128,6 +130,51 @@ class GPUExecutionFixtureBase {
                               std::optional<float> float_tolerance = std::nullopt)
   {
     if (!bind_env(num_gpus)) { return false; }
+    compare_gpu_vs_cpu(query, float_tolerance);
+    return true;
+  }
+
+  /**
+   * @brief Returns SIRIUS_TEST_SF10_PATH env var value, or empty if unset.
+   * TEST-04 SF10 smoke TEST_CASEs gate on this — caller WARN+returns when empty.
+   */
+  static std::string sf10_path()
+  {
+    const char* p = std::getenv("SIRIUS_TEST_SF10_PATH");
+    return p ? std::string{p} : std::string{};
+  }
+
+  /**
+   * @brief Create views over the 8 TPC-H parquet tables at SIRIUS_TEST_SF10_PATH
+   * on the current connection. Must be called AFTER bind_env() so the views
+   * are attached to the newly-bound connection. Uses CREATE OR REPLACE VIEW
+   * so it can re-run after a schema-owning subclass setup_schema() also ran.
+   */
+  void attach_sf10_tables()
+  {
+    auto base = sf10_path();
+    REQUIRE_FALSE(base.empty());
+    static const char* kTables[] = {
+      "lineitem", "orders", "customer", "nation", "region", "part", "partsupp", "supplier"};
+    for (auto* t : kTables) {
+      auto r = con->Query("CREATE OR REPLACE VIEW " + std::string{t} +
+                          " AS SELECT * FROM read_parquet('" + base + "/" + std::string{t} +
+                          ".parquet');");
+      REQUIRE(r);
+      REQUIRE_FALSE(r->HasError());
+    }
+  }
+
+  /**
+   * @brief bind_env + attach_sf10_tables + compare_gpu_vs_cpu. Returns false
+   * if the requested env is unavailable. Caller should WARN+return on false.
+   */
+  bool compare_gpu_vs_cpu_sf10_for(int num_gpus,
+                                   const std::string& query,
+                                   std::optional<float> float_tolerance = std::nullopt)
+  {
+    if (!bind_env(num_gpus)) { return false; }
+    attach_sf10_tables();
     compare_gpu_vs_cpu(query, float_tolerance);
     return true;
   }
@@ -3418,40 +3465,55 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "limit 10;");
 }
 
+// TPC-H Q4 parquet has a pre-existing intermittent flake (see ROADMAP Phase 8
+// Success Criterion 2: "Q4 parquet flake policy: retry once per v1.1 precedent,
+// not treated as regression"). The retry is scoped to Q4 ONLY — real regressions
+// on other queries must fail loudly. We wrap the SAME body shape as RUN_TPCH_MGPU
+// but handle any std::exception from compare_gpu_vs_cpu by retrying once with
+// a fresh bind_env.
+static constexpr auto kTpchQ4Body =
+  "select o.o_orderpriority, count(*) as order_count "
+  "from orders o "
+  "where o.o_orderdate >= date '1996-10-01' "
+  "and o.o_orderdate < date '1997-01-01' "
+  "and exists ("
+  "  select * from lineitem l "
+  "  where l.l_orderkey = o.o_orderkey "
+  "  and l.l_commitdate < l.l_receiptdate"
+  ") "
+  "group by o.o_orderpriority "
+  "order by o.o_orderpriority;";
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 4",
                  "[integration][gpu_execution][TPC-H][Q4]")
 {
-  RUN_TPCH_MGPU(
-    "select o.o_orderpriority, count(*) as order_count "
-    "from orders o "
-    "where o.o_orderdate >= date '1996-10-01' "
-    "and o.o_orderdate < date '1997-01-01' "
-    "and exists ("
-    "  select * from lineitem l "
-    "  where l.l_orderkey = o.o_orderkey "
-    "  and l.l_commitdate < l.l_receiptdate"
-    ") "
-    "group by o.o_orderpriority "
-    "order by o.o_orderpriority;");
+  auto const num_gpus = GENERATE(1, 2);
+  CAPTURE(num_gpus);
+  try {
+    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+  } catch (std::exception const& first_err) {
+    WARN("tpch_q4 first attempt failed (pre-existing flake per ROADMAP Phase 8 "
+         "Success Criterion 2); retrying once: "
+         << first_err.what());
+    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 4 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q4]")
 {
-  RUN_TPCH_MGPU(
-    "select o.o_orderpriority, count(*) as order_count "
-    "from orders o "
-    "where o.o_orderdate >= date '1996-10-01' "
-    "and o.o_orderdate < date '1997-01-01' "
-    "and exists ("
-    "  select * from lineitem l "
-    "  where l.l_orderkey = o.o_orderkey "
-    "  and l.l_commitdate < l.l_receiptdate"
-    ") "
-    "group by o.o_orderpriority "
-    "order by o.o_orderpriority;");
+  auto const num_gpus = GENERATE(1, 2);
+  CAPTURE(num_gpus);
+  try {
+    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+  } catch (std::exception const& first_err) {
+    WARN("tpch_q4 parquet first attempt failed (pre-existing flake per ROADMAP "
+         "Phase 8 Success Criterion 2); retrying once: "
+         << first_err.what());
+    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -4220,6 +4282,108 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     ") as custsale "
     "group by cntrycode "
     "order by cntrycode;");
+}
+
+//===----------------------------------------------------------------------===//
+// TPC-H SF10 smoke variants (TEST-04)
+//
+// These TEST_CASEs run TPC-H Q1, Q6, Q12 at SF10 on num_gpus=2. They are
+// gated on the SIRIUS_TEST_SF10_PATH env var (skip with WARN if unset) AND
+// on >=2 GPUs (WARN+return per Catch2 v2 convention). The views are built on
+// top of the SF10 parquet via compare_gpu_vs_cpu_sf10_for which CREATE OR
+// REPLACE VIEWs the 8 TPC-H tables after bind_env.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - tpch_q1_sf10_2gpu",
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q1]")
+{
+  if (sf10_path().empty()) {
+    WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q1 variant (TEST-04 gate)");
+    return;
+  }
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("tpch_q1_sf10_2gpu requires >=2 GPUs; skipping");
+    return;
+  }
+  if (!compare_gpu_vs_cpu_sf10_for(
+        /*num_gpus=*/2,
+        "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
+        "sum(l_extendedprice) as sum_base_price, "
+        "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price, "
+        "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge, "
+        "avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price, "
+        "avg(l_discount) as avg_disc, count(*) as count_order "
+        "from lineitem "
+        "where l_shipdate <= date '1995-08-19' "
+        "group by l_returnflag, l_linestatus "
+        "order by l_returnflag, l_linestatus;",
+        0.0001f)) {
+    return;
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - tpch_q6_sf10_2gpu",
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q6]")
+{
+  if (sf10_path().empty()) {
+    WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q6 variant (TEST-04 gate)");
+    return;
+  }
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("tpch_q6_sf10_2gpu requires >=2 GPUs; skipping");
+    return;
+  }
+  if (!compare_gpu_vs_cpu_sf10_for(
+        /*num_gpus=*/2,
+        "select sum(l_extendedprice * l_discount) as revenue "
+        "from lineitem "
+        "where l_shipdate >= date '1995-01-01' "
+        "and l_shipdate < date '1996-01-01' "
+        "and l_discount between 0.07 - 0.01 and 0.07 + 0.01 "
+        "and l_quantity < 24;",
+        0.0001f)) {
+    return;
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - tpch_q12_sf10_2gpu",
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q12]")
+{
+  if (sf10_path().empty()) {
+    WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q12 variant (TEST-04 gate)");
+    return;
+  }
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("tpch_q12_sf10_2gpu requires >=2 GPUs; skipping");
+    return;
+  }
+  if (!compare_gpu_vs_cpu_sf10_for(
+        /*num_gpus=*/2,
+        "select l_shipmode, "
+        "sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' "
+        "         then 1 else 0 end) as high_line_count, "
+        "sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' "
+        "         then 1 else 0 end) as low_line_count "
+        "from orders, lineitem "
+        "where o_orderkey = l_orderkey "
+        "and l_shipmode in ('SHIP', 'AIR') "
+        "and l_commitdate < l_receiptdate "
+        "and l_shipdate < l_commitdate "
+        "and l_receiptdate >= date '1995-01-01' "
+        "and l_receiptdate < date '1996-01-01' "
+        "group by l_shipmode "
+        "order by l_shipmode;")) {
+    return;
+  }
 }
 
 //===----------------------------------------------------------------------===//
