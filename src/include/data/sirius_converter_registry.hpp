@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <data/host_parquet_representation_converters.hpp>
+#include <data/sirius_host_to_gpu_converter.hpp>
 #include <data/sirius_p2p_converter.hpp>
 
 #include <spdlog/spdlog.h>
@@ -79,6 +81,33 @@ class converter_registry {
       cucascade::gpu_table_representation>(
       &sirius::data::sirius_p2p_converter_factory);
     spdlog::info("sirius: MGPU-06 P2P converter override registered");
+
+    // FIX-02 (v1.2): host_data_representation -> gpu_table_representation
+    // override. cucascade's built-in convert_host_fast_to_gpu at
+    // cucascade/src/data/representation_converter.cpp:825-856 issues the
+    // batched H2D copy on the CALLER's stream (line 849) while holding a
+    // device RAII guard on target_device_id (line 837). Under num_gpus == 2
+    // the caller's stream may live on a non-target device, raising
+    // cudaErrorInvalidValue at cuda_memcpy.cu:42 — exact v1.1 bug signature.
+    // See .planning/phases/08-multi-gpu-sql-pipeline-fix/08-02-PROBE.md for
+    // the failing-test reproduction (hive-partition filter on num_gpus=2).
+    // The Sirius override acquires a target-bound stream via
+    // target_memory_space->acquire_stream() and issues every H2D copy on
+    // that stream under a target-device RAII guard (Pattern 2 shape).
+    auto const host_removed = instance_->unregister_converter<
+      cucascade::host_data_representation,
+      cucascade::gpu_table_representation>();
+    if (!host_removed) {
+      spdlog::warn(
+        "sirius: expected cucascade built-in host_data_representation -> "
+        "gpu_table_representation converter to be registered before FIX-02 "
+        "override but unregister returned false");
+    }
+    instance_->register_converter<
+      cucascade::host_data_representation,
+      cucascade::gpu_table_representation>(
+      &sirius::data::sirius_host_fast_to_gpu_factory);
+    spdlog::info("sirius: FIX-02 host->gpu converter override registered");
   }
 
   /**
