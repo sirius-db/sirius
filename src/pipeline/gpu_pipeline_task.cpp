@@ -19,7 +19,6 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
-#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -155,10 +154,37 @@ gpu_pipeline_task::gpu_pipeline_task(
     _task_id(task_id),
     _data_repos(std::move(data_repos))
 {
+  // Subscribe to all input data_batches (LIFE-01, D-06)
+  auto& ls = _local_state->cast<gpu_pipeline_task_local_state>();
+  if (ls._input_data) {
+    auto* pipelineable_input =
+      dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get());
+    if (pipelineable_input) {
+      for (const auto& batch : pipelineable_input->get_data_batches()) {
+        if (batch) {
+          batch->subscribe();
+          _input_batches.push_back(batch);
+        }
+      }
+    }
+  }
 }
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
+  // Unsubscribe from all input data_batches (LIFE-02, D-06)
+  for (const auto& batch : _input_batches) {
+    if (batch) {
+      try {
+        batch->unsubscribe();
+      } catch (...) {
+        // Destructor must not throw; log if possible
+        SIRIUS_LOG_WARN("gpu_pipeline_task: unsubscribe failed for batch {}",
+                        batch->get_batch_id());
+      }
+    }
+  }
+
   if (_oom_rescheduled) { return; }
   if (_global_state == nullptr ||
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
@@ -321,14 +347,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       "gpu_pipeline_task::execute: input_data is not pipelineable_operator_data");
   }
 
-  auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-
   std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
   try {
     handles_opt = pipelineable_input->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();
+    auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
     SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
@@ -386,6 +411,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
         if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
       }
     }
+    auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
     SIRIUS_LOG_TRACE(
       "Pipeline {}: memory history record - input_basis={}, output_bytes={}, reservation_bytes={}, "
