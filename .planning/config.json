@@ -35,6 +35,7 @@
     "text_mode": false,
     "ui_phase": true,
     "ui_safety_gate": true,
-    "verifier": true
+    "verifier": true,
+    "_auto_chain_active": false
   }
 }
