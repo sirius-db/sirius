@@ -399,13 +399,19 @@ TEST_CASE("metadata_scan_operator - projection restricts byte accounting to sele
   // --- Full scan (no projection): all chunks contribute. ---
   std::size_t full_uncompressed_bytes = 0;
   {
+    sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(full_types),
+                                                              0);
     sirius::op::scan::sirius_parquet_metadata_scan_operator op(
+      &gpu_op,
+      sirius::from_duckdb_vec(full_types),
       sirius::from_duckdb_vec(full_types),
       0,
       files,
       column_ids,
       /*projection_ids=*/duckdb::vector<duckdb::idx_t>{},
       names,
+      /*table_filter_set=*/nullptr,
+      /*partition_indices=*/{},
       BIG_BATCH);
     auto input = op.get_next_task_input_data();
     REQUIRE(input);
@@ -422,13 +428,19 @@ TEST_CASE("metadata_scan_operator - projection restricts byte accounting to sele
     duckdb::vector<duckdb::LogicalType> projected_types{duckdb::LogicalType::INTEGER,
                                                         duckdb::LogicalType::INTEGER};
     duckdb::vector<duckdb::idx_t> projection_ids{1, 2};
+    sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+      sirius::from_duckdb_vec(projected_types), 0);
     sirius::op::scan::sirius_parquet_metadata_scan_operator op(
+      &gpu_op,
       sirius::from_duckdb_vec(projected_types),
+      sirius::from_duckdb_vec(full_types),
       0,
       files,
       column_ids,
       projection_ids,
       names,
+      /*table_filter_set=*/nullptr,
+      /*partition_indices=*/{},
       BIG_BATCH);
     auto input = op.get_next_task_input_data();
     REQUIRE(input);
