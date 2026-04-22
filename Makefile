@@ -21,7 +21,7 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
-	test test_release test_debug test_reldebug clean list-presets
+	test test_release test_debug test_reldebug test_ci-release clean list-presets
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -73,7 +73,10 @@ clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(MAIN_BUILD_TARGETS)
 
 ci-release: build/ci-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
+endif
 
 configure_ci:
 	@echo "configure_ci step is skipped for this extension build..."
@@ -94,6 +97,10 @@ test_debug: debug
 test_reldebug: relwithdebinfo
 	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
 	@echo "Run C++ unit tests with: ./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest"
+
+test_ci-release: ci-release
+	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
+	@echo "Run C++ unit tests with: ./build/ci-release/extension/sirius/test/cpp/sirius_unittest"
 
 clean:
 	rm -rf build
