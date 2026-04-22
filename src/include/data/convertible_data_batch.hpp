@@ -142,12 +142,7 @@ class convertible_data_batch : public convertible_data {
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
     auto ro = _batch->to_read_only();
-    if (ro.get_memory_space() == space) {
-      auto size = ro.get_data()->get_size_in_bytes();
-      cucascade::data_batch::to_idle(std::move(ro));
-      return size;
-    }
-    cucascade::data_batch::to_idle(std::move(ro));
+    if (ro.get_memory_space() == space) { return ro.get_data()->get_size_in_bytes(); }
     return 0;
   }
 
@@ -271,7 +266,6 @@ class convertible_data_batch_provider : public convertible_data_provider {
         if (!batch) { continue; }
         auto ro = batch->to_read_only();
         if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
-        cucascade::data_batch::to_idle(std::move(ro));
       }
     }
 
@@ -300,11 +294,10 @@ class convertible_data_batch_provider : public convertible_data_provider {
 
     if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
 
-    auto ro      = batch->to_read_only();
-    bool matches = (ro.get_memory_space() == space);
-    cucascade::data_batch::to_idle(std::move(ro));
-
-    if (matches) { return std::make_unique<convertible_data_batch>(std::move(batch)); }
+    auto ro = batch->to_read_only();
+    if (ro.get_memory_space() == space) {
+      return std::make_unique<convertible_data_batch>(std::move(batch));
+    }
 
     return nullptr;
   }

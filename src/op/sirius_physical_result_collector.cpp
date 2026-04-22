@@ -130,14 +130,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     auto* data = ro.get_data();
 
     if (!data) {
-      cucascade::data_batch::to_idle(std::move(ro));
       throw invalid_input_exception(
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
     }
-    if (data->get_size_in_bytes() == 0) {
-      cucascade::data_batch::to_idle(std::move(ro));
-      return;
-    }
+    if (data->get_size_in_bytes() == 0) { return; }
 
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
       // Use clone_to to clone directly into HOST representation (one-step, per D-05/CONV-03)
@@ -148,7 +144,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         data->get_size_in_bytes());
       if (!reservation) {
-        cucascade::data_batch::to_idle(std::move(ro));
         throw internal_exception(
           "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
       }
@@ -162,9 +157,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto result_batch = ro.clone_to<cucascade::host_data_representation>(
         registry, next_batch_id, &mem_space, stream);
 
-      // Release read lock on input batch
-      cucascade::data_batch::to_idle(std::move(ro));
-
       // Access the result batch's data (it's a new idle batch, needs read lock)
       auto result_ro          = result_batch->to_read_only();
       auto* result_data        = result_ro.get_data();
@@ -176,13 +168,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto const& host_table        = result_data->cast<cucascade::host_data_representation>();
       auto const* ht                = host_table.get_host_table().get();
       if (!ht) {
-        cucascade::data_batch::to_idle(std::move(result_ro));
         throw invalid_input_exception(
           "[GPUPhysicalMaterializedCollector] host_data_representation has null "
           "get_host_table()");
       }
       if (!ht->allocation) {
-        cucascade::data_batch::to_idle(std::move(result_ro));
         throw invalid_input_exception(
           "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
       }
@@ -200,8 +190,6 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         result_collection->Append(chunk);
       }
 
-      cucascade::data_batch::to_idle(std::move(result_ro));
-
     } else if (data->get_current_tier() == cucascade::memory::Tier::HOST) {
       // Data already in HOST tier -- read directly through the read_only accessor
       assert(dynamic_cast<cucascade::host_data_representation*>(data) != nullptr);
@@ -212,13 +200,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
       auto const* ht = host_table.get_host_table().get();
       if (!ht) {
-        cucascade::data_batch::to_idle(std::move(ro));
         throw invalid_input_exception(
           "[GPUPhysicalMaterializedCollector] host_data_representation has null "
           "get_host_table()");
       }
       if (!ht->allocation) {
-        cucascade::data_batch::to_idle(std::move(ro));
         throw invalid_input_exception(
           "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
       }
@@ -244,10 +230,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         result_collection->Append(chunk);
       }
 
-      cucascade::data_batch::to_idle(std::move(ro));
-
     } else {
-      cucascade::data_batch::to_idle(std::move(ro));
       throw invalid_input_exception(
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }

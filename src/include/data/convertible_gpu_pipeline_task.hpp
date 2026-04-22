@@ -131,7 +131,6 @@ class convertible_gpu_pipeline_task : public convertible_data {
             break;
           }
         }
-        cucascade::data_batch::to_idle(std::move(ro));
         if (at_target) { continue; }
       }
 
@@ -170,7 +169,6 @@ class convertible_gpu_pipeline_task : public convertible_data {
       if (!batch) { continue; }
       auto ro = batch->to_read_only();
       if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
-      cucascade::data_batch::to_idle(std::move(ro));
     }
     return total;
   }
@@ -304,10 +302,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     for (const auto& batch : pipelineable->get_data_batches()) {
       if (!batch) { continue; }
       if (batch->get_state() != cucascade::batch_state::idle) { continue; }
-      auto ro      = batch->to_read_only();
-      bool matches = (ro.get_memory_space() == space);
-      cucascade::data_batch::to_idle(std::move(ro));
-      if (matches) { return true; }
+      auto ro = batch->to_read_only();
+      if (ro.get_memory_space() == space) { return true; }
     }
 
     return false;
