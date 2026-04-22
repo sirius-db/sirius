@@ -195,8 +195,15 @@ int duckdb_scan_executor::select_target_gpu()
                        space->get_available_memory());
       // v1.1 e2e verification audit: info-level scan-batch assignment log
       // so a real SQL query can be grepped for per-GPU batch distribution.
-      SIRIUS_LOG_INFO("[mgpu-audit] scan_batch assigned to GPU {} (available: {} bytes)",
+      // Phase 8 AUDIT-02: appended batch_id= suffix (reusing the already-fetched
+      // _scan_round_robin counter value as the unique per-batch id) so tests can
+      // grep + awk-split + sort -u to count UNIQUE batches per GPU (robust
+      // against log-line duplication from retries). The leading
+      // "[mgpu-audit] scan_batch assigned to GPU N" substring is preserved
+      // verbatim for backward-compat with v1.1 verification greps.
+      SIRIUS_LOG_INFO("[mgpu-audit] scan_batch assigned to GPU {} batch_id={} (available: {} bytes)",
                       space->get_device_id(),
+                      counter,
                       space->get_available_memory());
       return space->get_device_id();
     }
