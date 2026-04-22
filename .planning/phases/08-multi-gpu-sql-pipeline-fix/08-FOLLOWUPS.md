@@ -114,32 +114,56 @@ can't pass `--engines sirius`, `SIRIUS_CONFIG_FILE`, or `PARQUET_DIR`.
 needing `dangerouslyDisableSandbox: true` (when/if MCP sandbox gets
 GPU access).
 
-## 5. mgpu-audit TEST_CASE cannot prime 24 GB RMM pool
+## 5. mgpu-audit TEST_CASE — TWO problems, the second is the real one
 
-`test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp:150` fails
-on this host (2× RTX 6000 Ada 48 GB) with
+### 5a. 24 GB pool-prime OOM (workaround found, not applied)
+
+`test_gpu_execution_tpch_mgpu_audit.cpp:150` originally fails with
 `std::bad_alloc: out_of_memory: CUDA error (failed to allocate
-25433702400 bytes) at .../rmm/mr/cuda_async_view_memory_resource.hpp:86`
-when `acquire_integration_env_for(2)` → `env->resume()` →
-SiriusContext → `cuda_async_memory_resource(capacity=24GB)` tries to
-prime the pool via an initial alloc/dealloc on device 0.
+25433702400 bytes) at .../rmm/mr/cuda_async_view_memory_resource.hpp:86`.
 
-Reproduces in complete isolation (1 test, fresh process). GPU is 15 MB
-used per nvidia-smi, so 24 GB should fit. Likely a CUDA/driver/rmm
-interaction specific to this host — not introduced by 93fea6f. Audit
-TEST_CASE was authored but never ran green at Phase 8 verification
-(blocked by the earlier residual failure our fix closes).
+Reproduces in complete isolation. GPU is 15 MB used per nvidia-smi.
+Not a regression from 93fea6f — audit TEST_CASE was authored but never
+ran green at Phase 8 verification (blocked by the residual failure our
+fix closed).
 
-Full suite run (no --abort): **983 tests, 981 passed, 2 failed** on
-feature/single-node-multi-gpu2. One of the 2 is this audit case; the
-other is likely a sibling that shares the 2-GPU env.
+**Workaround verified:** lowering `usage_limit_fraction` from 0.5 → 0.4
+in `test/cpp/integration/integration-2gpu.yaml` fixes the OOM. Not
+applied — exposes a second failure (5b below) that is the real issue.
 
-**Scope:** not a regression from 93fea6f. Investigation needs to look at
-pool prime timing vs pre-existing CUDA context state, or lower
-`usage_limit_fraction` in `integration-2gpu.yaml` to see if the pool
-primes cleanly at 0.4 or 0.3.
+### 5b. Pipeline tasks and scan tasks don't co-distribute across GPUs
 
-**Estimate:** 30 min investigation; fix size unknown.
+With 5a worked around, the audit test next fails at line 243:
+`REQUIRE(counts[0].pipeline_ids.size() >= min_count)` with
+`0 >= 1` and diagnostic:
+```
+per-GPU audit counts from /tmp/sirius-mgpu-audit-XXXX:
+  GPU0{pipeline=0, scan=4} GPU1{pipeline=3, scan=0}
+```
+
+**All scan tasks landed on GPU 0; all pipeline tasks landed on GPU 1.**
+The audit's invariant is that *both* task kinds must be distributed
+across *both* GPUs (>=1 of each on each). This is a legitimate
+dispatch-policy question, not a test-config tweak:
+
+- Is the scan_executor deliberately pinning scans to one GPU when the
+  total scan count is small (SF1 lineitem has ~6 batches)?
+- Does the pipeline_executor's round-robin dispatcher prefer a single
+  GPU when the scan output all lands on one GPU?
+- Is this an actual invariant violation (the audit is right and
+  dispatch is broken) or is the audit's >=1 threshold too strict for
+  SF1-small-batch-count workloads?
+
+**Estimate:** 1-2 hours investigation (trace scan and pipeline
+dispatch decisions) to classify as dispatch bug vs audit over-spec.
+If the threshold is right, fix is in dispatch logic; if the threshold
+is too strict, scope-constrain the assertion (e.g. require >=1 of
+*either* type on both GPUs, not both types on both GPUs).
+
+**Scope note:** the `93fea6f` fix makes the AUDIT test able to *run*
+for the first time. The fact that it runs-and-fails-on-assertion is
+progress — it exposes a distribution question that was hidden behind
+the earlier crash.
 
 ---
 
