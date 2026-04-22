@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: verifying
-stopped_at: "Completed 08-06-PLAN.md (FIX-03 HYG PASS, FIX-04 build PASS, Pattern 2 idiom grep PASS; carryover fix applied to host_parquet converter but residual cudaErrorInvalidValue @ cuda_memcpy.cu:42 remains on num_gpus=2 parquet path — v1.2 ship BLOCKED pending additional fix-site closure)"
-last_updated: "2026-04-22T05:29:30.497Z"
+stopped_at: "Completed 08-07-PLAN.md (gap-closure instrumentation: [mgpu-probe] breadcrumbs landed at host_parquet converter entry+exit + parquet_scan_task::compute_task entry; build exit 0; HYG-02 preserved; ready for 08-08 reproduction)"
+last_updated: "2026-04-22T13:45:33.356Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 1
-  completed_phases: 1
-  total_plans: 6
-  completed_plans: 6
+  completed_phases: 0
+  total_plans: 10
+  completed_plans: 8
   percent: 100
 ---
 
@@ -43,6 +43,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 08 P04 | 20min | 3 tasks | 5 files |
 | Phase 08 P05 | 86min | 3 tasks | 4 files |
 | Phase 08 P06 | 21min | 3 tasks | 3 files |
+| Phase 08 P07 | 10min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -65,6 +66,8 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 08]: [08-06] FIX-03 verdict: PASS — grep of rmm::cuda_stream_default in src/ returns 41 matches (unchanged phase-7 baseline); 0 net-new introductions by Phase 8.
 - [Phase 08]: [08-06] FIX-04 verdict: PASS — mcp build exit 0 after rm -rf build. ROADMAP criterion 5 (Pattern 2 idiom grep) PASS with 6 code matches across 4 fix sites.
 - [Phase 08]: [08-06] Phase 8 ship verdict BLOCKED — criteria 1/2/4/6 DEFERRED because TPC-H Q1 parquet + num_gpus=2 still hits cudaErrorInvalidValue @ cuda_memcpy.cu:42 after carryover fix. SF100 Q1 ship-gate not run because SF1 parquet already reproduces the blocker.
+- [Phase 08]: [08-07] Added three [mgpu-probe] INFO breadcrumbs (host_parquet entry+exit, parquet_scan_task::compute_task entry) with grep-stable payload discriminating hypotheses A/B/C/D carried forward from 08-VERIFICATION.md. Plan's <interfaces> claim on log/logging.hpp include wiring was wrong — added it inline per Rule 3.
+- [Phase 08]: [08-07] HYG-02 baseline still 41 matches; zero logic changes, zero new RAII, zero new stream acquires, zero yaml edits, zero cucascade edits. Instrumentation-only gap-closure plan unblocks 08-08 reproduction.
 
 ## Accumulated Context
 
@@ -103,6 +106,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-22T05:28:51.539Z
-Stopped at: Completed 08-06-PLAN.md (FIX-03 HYG PASS, FIX-04 build PASS, Pattern 2 idiom grep PASS; carryover fix applied to host_parquet converter but residual cudaErrorInvalidValue @ cuda_memcpy.cu:42 remains on num_gpus=2 parquet path — v1.2 ship BLOCKED pending additional fix-site closure)
+Last session: 2026-04-22T13:45:33.354Z
+Stopped at: Completed 08-07-PLAN.md (gap-closure instrumentation: [mgpu-probe] breadcrumbs landed at host_parquet converter entry+exit + parquet_scan_task::compute_task entry; build exit 0; HYG-02 preserved; ready for 08-08 reproduction)
 Resume file: None
