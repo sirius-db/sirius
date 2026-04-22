@@ -29,7 +29,7 @@ Reroute the pipeline's core data path to use `read_only_data_batch` end-to-end a
 - **D-09:** `compute_task` receives the `read_only_pipelineable_operator_data` from `prepare_for_processing` and passes it through the operator chain
 
 ### `run_one_operator` signature
-- **D-10:** `run_one_operator` takes `read_only_pipelineable_operator_data` as its input type (not a raw vector, not a generic `const operator_data&`)
+- **D-10:** `run_one_operator` takes `const operator_data&` (base class polymorphism) — accepts both `read_only_pipelineable_operator_data` and `pipelineable_operator_data` via IS-A. Required because the compute_task loop feeds mutable operator output back as input to subsequent operators. (Updated: originally strict type, relaxed after plan-checker identified mixed-type loop conflict)
 
 ### Claude's Discretion
 - Internal helper functions and logging adjustments within the changed functions
