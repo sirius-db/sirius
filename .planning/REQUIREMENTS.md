@@ -47,19 +47,26 @@
 
 ## Traceability
 
-*Filled in by roadmapper.*
-
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FIX-01..04 | Phase 8 | Pending |
-| TEST-01..04 | Phase 8 | Pending |
-| AUDIT-01..03 | Phase 8 | Pending |
+| FIX-01 | Phase 8 | Pending |
+| FIX-02 | Phase 8 | Pending |
+| FIX-03 | Phase 8 | Pending |
+| FIX-04 | Phase 8 | Pending |
+| TEST-01 | Phase 8 | Pending |
+| TEST-02 | Phase 8 | Pending |
+| TEST-03 | Phase 8 | Pending |
+| TEST-04 | Phase 8 | Pending |
+| AUDIT-01 | Phase 8 | Pending |
+| AUDIT-02 | Phase 8 | Pending |
+| AUDIT-03 | Phase 8 | Pending |
 
 **Coverage:**
 - v1.2 requirements: 11 total (4 FIX + 4 TEST + 3 AUDIT)
-- Mapped to phases: *tbd by roadmapper*
-- Unmapped: *tbd by roadmapper*
+- Mapped to phases: 11 / 11 (100%)
+- Unmapped: 0
 
 ---
 
 *v1.2 requirements defined: 2026-04-21*
+*Traceability populated by roadmapper: 2026-04-21*
