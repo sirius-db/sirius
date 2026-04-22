@@ -18,6 +18,7 @@
 #include <data/cached_data_representation.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
+#include <log/logging.hpp>
 #include <op/scan/cached_ranges.hpp>
 #include <op/scan/prefetched_data_source.hpp>
 
@@ -85,6 +86,24 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
   rmm::cuda_device_id target_device_id(target_memory_space->get_device_id());
 
+  // [mgpu-probe] entry instrumentation (08-07 gap-closure).
+  // Captures the device/stream identity the converter OBSERVES before any
+  // RAII switch or target-stream acquire. If current_device != target_device_id
+  // at entry, hypothesis A (upstream frame in wrong device context) is confirmed.
+  // If current_device == target_device_id but stream handle differs from target
+  // stream at exit, hypothesis D (mr_ref captured before RAII) is in play.
+  {
+    int current_device = -1;
+    (void)cudaGetDevice(&current_device);
+    SIRIUS_LOG_INFO(
+      "[mgpu-probe] host_parquet_to_gpu entry current_device={} stream={} "
+      "target_device_id={} memspace_device_id={}",
+      current_device,
+      static_cast<void*>(stream.value()),
+      target_device_id.value(),
+      target_memory_space->get_device_id());
+  }
+
   // --- Sync caller stream BEFORE switching device. The caller's stream may
   // --- be bound to a different device than target_device_id; syncing it
   // --- under its own device is safe (cuda_stream_view::synchronize wraps
@@ -139,6 +158,23 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   // Consume any sticky CUDA state before returning so a later call-site does
   // not surface a stray error against us (matches Pattern 2 hygiene).
   (void)cudaGetLastError();
+
+  // [mgpu-probe] exit instrumentation (08-07 gap-closure).
+  // Captures the device context right after the target-bound read + inject
+  // chain completes and the sticky-error consume runs. If we reach here and
+  // the upstream caller STILL fails at cuda_memcpy.cu:42, the hazard is not
+  // inside this function and is either upstream (hypothesis A/C) or on the
+  // post-return column-projection path below.
+  {
+    int current_device_exit = -1;
+    (void)cudaGetDevice(&current_device_exit);
+    SIRIUS_LOG_INFO(
+      "[mgpu-probe] host_parquet_to_gpu exit current_device={} target_stream={} "
+      "target_device_id={}",
+      current_device_exit,
+      static_cast<void*>(target_stream.value()),
+      target_device_id.value());
+  }
 
   // Now we need to prune the post-filter columns from the table, if there are any.
   if (!post_filter_projection_ids.empty()) {
