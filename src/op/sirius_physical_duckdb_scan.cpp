@@ -52,10 +52,10 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_s
 }
 
 sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::TableFunction function_p,
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
-  duckdb::vector<duckdb::LogicalType> returned_types_p,
+  duckdb::vector<sirius::logical_type> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
   duckdb::vector<std::size_t> projection_ids_p,
   duckdb::vector<std::string> names_p,
@@ -100,7 +100,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     for (auto pid : projection_ids) {
       auto col_idx = column_ids[pid].GetPrimaryIndex();
       if (column_ids[pid].IsRowIdColumn()) {
-        scanned_types.push_back(duckdb::LogicalType::BIGINT);
+        scanned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
       } else {
         scanned_types.push_back(returned_types[col_idx]);
       }
@@ -110,7 +110,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     for (std::size_t i = 0; i < num_cols; i++) {
       auto col_idx = column_ids[i].GetPrimaryIndex();
       if (column_ids[i].IsRowIdColumn()) {
-        scanned_types.push_back(duckdb::LogicalType::BIGINT);
+        scanned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
       } else {
         scanned_types.push_back(returned_types[col_idx]);
       }
@@ -118,7 +118,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
   }
 
   if (scanned_types.empty()) {
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+    scanned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();

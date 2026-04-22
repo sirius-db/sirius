@@ -16,6 +16,7 @@
 
 // test
 #include <catch.hpp>
+#include <helper/type_conversions.hpp>
 #include <utils/utils.hpp>
 
 // sirius
@@ -242,14 +243,14 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1", "c2"};
-  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(sirius::from_duckdb_vec(types), 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(pipelineable_operator_data({batch}), cudf::get_default_stream());
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   size_t row_base = 0;
@@ -308,14 +309,14 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1"};
-  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(sirius::from_duckdb_vec(types), 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(pipelineable_operator_data({batch}), stream);
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   size_t row_base = 0;
@@ -401,7 +402,8 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1"};
-  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(sirius::from_duckdb_vec(types), 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
@@ -450,8 +452,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     }
   }
 
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   std::vector<row_t> actual_rows;

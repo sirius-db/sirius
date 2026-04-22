@@ -214,7 +214,7 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
     static constexpr uint8_t FULL_MASK = 0xFF;  ///< Byte mask with all bits set
 
     //===----------Fields----------===//
-    duckdb::LogicalType type;  ///< DuckDB logical type of the column
+    sirius::logical_type type;  ///< Sirius logical type of the column
     size_t type_size;  ///< Size of the column data type in bytes (for VARCHAR, just data size)
     size_t total_data_bytes =
       0;  ///< Total number of data bytes written for this column (only needed for VARCHAR)
@@ -238,7 +238,7 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
      * @param[in] t The DuckDB logical type of the column.
      * @param[in] default_varchar_size The default size to use for VARCHAR data.
      */
-    column_builder(duckdb::LogicalType t, size_t default_varchar_size);
+    column_builder(sirius::logical_type t, size_t default_varchar_size);
 
     // no copying
     column_builder(const column_builder&)            = delete;

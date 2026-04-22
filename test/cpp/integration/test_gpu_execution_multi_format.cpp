@@ -33,7 +33,9 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -86,70 +88,81 @@ class MultiFormatFixtureBase {
     return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
   }
 
+  /// Collect all rows from a MaterializedQueryResult as sorted vectors of stringified values.
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  {
+    std::vector<std::vector<std::string>> rows;
+    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+      std::vector<std::string> row;
+      row.reserve(result.ColumnCount());
+      for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
+        row.push_back(result.GetValue(c, r).ToString());
+      }
+      rows.push_back(std::move(row));
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  }
+
   void compare_gpu_vs_cpu(const std::string& query,
                           std::optional<float> float_tolerance = std::nullopt)
   {
-    con->Query("SET enable_duckdb_fallback = false;");
+    // Enable transparent GPU execution
+    con->Query("SET gpu_execution = true;");
+    auto before_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
 
-    auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
-    auto gpu_result = con->Query(gpu_sql);
+    // Run on GPU (transparent — plain SQL goes through Sirius optimizer hook)
+    auto gpu_result = con->Query(query);
     REQUIRE(gpu_result);
     if (gpu_result->HasError()) {
-      UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError());
+      UNSCOPED_INFO("transparent GPU execution error: " << gpu_result->GetError());
     }
     REQUIRE_FALSE(gpu_result->HasError());
+    auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
 
+    // Run on CPU (disable transparent execution)
+    con->Query("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
+    con->Query("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
+    auto after_cpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(after_gpu_stats, after_cpu_stats, 0, 0, 0);
 
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-    // Sort both result sets for deterministic comparison
-    auto ncols               = gpu_result->ColumnCount();
-    std::string order_clause = " ORDER BY ";
-    for (duckdb::idx_t c = 0; c < ncols; c++) {
-      if (c > 0) order_clause += ", ";
-      order_clause += std::to_string(c + 1);
+    // Build a per-column flag for which columns are floating-point.
+    std::vector<bool> col_is_float(gpu_result->ColumnCount());
+    for (duckdb::idx_t c = 0; c < gpu_result->ColumnCount(); c++) {
+      col_is_float[c] = is_floating_point(gpu_result->types[c].id());
     }
 
-    auto clean_query = query;
-    while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
-      clean_query.pop_back();
+    // Collect and sort rows from already-materialized results for deterministic comparison.
+    auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto gpu_rows = collect_rows(gpu_mat);
+    auto cpu_rows = collect_rows(cpu_mat);
 
-    auto gpu_sorted =
-      con->Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
-    auto cpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
-    REQUIRE(gpu_sorted);
-    if (gpu_sorted->HasError()) { UNSCOPED_INFO("gpu sorted error: " << gpu_sorted->GetError()); }
-    REQUIRE_FALSE(gpu_sorted->HasError());
-    REQUIRE(cpu_sorted);
-    if (cpu_sorted->HasError()) { UNSCOPED_INFO("cpu sorted error: " << cpu_sorted->GetError()); }
-    REQUIRE_FALSE(cpu_sorted->HasError());
-
-    for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-      for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-        auto gpu_value = gpu_sorted->GetValue(c, r);
-        auto cpu_value = cpu_sorted->GetValue(c, r);
-
-        if (float_tolerance.has_value() && is_floating_point(gpu_value.type().id())) {
-          double gpu_d = gpu_value.GetValue<double>();
-          double cpu_d = cpu_value.GetValue<double>();
+    for (duckdb::idx_t r = 0; r < gpu_rows.size(); r++) {
+      for (duckdb::idx_t c = 0; c < gpu_rows[r].size(); c++) {
+        if (float_tolerance.has_value() && col_is_float[c]) {
+          double gpu_d = std::stod(gpu_rows[r][c]);
+          double cpu_d = std::stod(cpu_rows[r][c]);
           double diff  = std::fabs(gpu_d - cpu_d);
           if (diff > static_cast<double>(float_tolerance.value())) {
             UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=[" << gpu_d
-                                 << "] CPU=[" << cpu_d << "] diff=" << diff);
+                                 << "] CPU=[" << cpu_d << "] diff=" << diff
+                                 << " tolerance=" << float_tolerance.value());
+            REQUIRE(diff <= static_cast<double>(float_tolerance.value()));
           }
-          REQUIRE(diff <= static_cast<double>(float_tolerance.value()));
         } else {
-          auto gpu_str = gpu_value.ToString();
-          auto cpu_str = cpu_value.ToString();
-          if (gpu_str != cpu_str) {
-            UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_str << "] CPU=["
-                                 << cpu_str << "]");
+          if (gpu_rows[r][c] != cpu_rows[r][c]) {
+            UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
+                                 << "] CPU=[" << cpu_rows[r][c] << "]");
           }
-          REQUIRE(gpu_str == cpu_str);
+          REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
         }
       }
     }
@@ -776,4 +789,78 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqStressFixture,
   check_eq(*con,
            "SELECT fruit, count FROM iceberg_scan('" + multi_data_path + "') ORDER BY count",
            {{"apple", 1}, {"cherry", 3}, {"date", 4}, {"fig", 6}});
+}
+
+//===----------------------------------------------------------------------===//
+// Hive-partitioned parquet scan tests
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Test fixture for hive-partitioned parquet scans via gpu_execution.
+ *
+ * Dataset: test/cpp/integration/data/hive_partitioned/
+ *   year=2024/month=01/data.parquet  (id=1, name=alice, amount=100.5)
+ *   year=2024/month=02/data.parquet  (id=2, name=bob,   amount=200.75)
+ *   year=2025/month=01/data.parquet  (id=3, name=charlie, amount=300.25)
+ *
+ * Partition columns (year, month) are NOT in the parquet files — their
+ * values come from the directory paths.
+ */
+class GPUExecutionHivePartitionFixture : public MultiFormatFixtureBase {
+ public:
+  GPUExecutionHivePartitionFixture()
+  {
+    hive_path =
+      (get_project_root() / "test/cpp/integration/data/hive_partitioned/**/*.parquet").string();
+  }
+
+  std::string hive_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - basic scan with partition columns",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT * FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - filter on data column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT * FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) WHERE id >= 2 ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - filter on partition column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT id, name, year FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) WHERE year = 2024 ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - group by partition column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT year, SUM(amount) as total FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) GROUP BY year ORDER BY year");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - reversed column order",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT year, month, amount, name, id FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true) ORDER BY id");
+}
+
+TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
+                 "gpu_execution hive partition - aggregation on data column",
+                 "[integration][gpu_execution][hive_partition]")
+{
+  compare_gpu_vs_cpu("SELECT SUM(amount) as total FROM read_parquet('" + hive_path +
+                     "', hive_partitioning=true)");
 }

@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -49,7 +50,7 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
 
 }  // namespace
 
-sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
+sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
                                                      std::size_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build,

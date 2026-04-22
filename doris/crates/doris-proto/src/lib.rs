@@ -33,7 +33,7 @@ pub mod nixl {
     include!(concat!(env!("OUT_DIR"), "/doris.nixl.rs"));
 
     // Service traits (server + client)
+    pub use nixl_metadata_service_client::NixlMetadataServiceClient;
     pub use nixl_metadata_service_server::NixlMetadataService;
     pub use nixl_metadata_service_server::NixlMetadataServiceServer;
-    pub use nixl_metadata_service_client::NixlMetadataServiceClient;
 }

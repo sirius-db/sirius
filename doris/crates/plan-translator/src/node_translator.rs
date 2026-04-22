@@ -9,13 +9,13 @@ use anyhow::{bail, Context, Result};
 
 use doris_thrift::exprs::{TExpr, TExprNode, TExprNodeType};
 use doris_thrift::plan_nodes::{TFileScanRangeParams, TJoinOp, TPlan, TPlanNode, TPlanNodeType};
-use substrait::proto::r#type;
 use substrait::proto::expression::field_reference;
 use substrait::proto::expression::reference_segment;
+use substrait::proto::r#type;
 use substrait::proto::{
-    aggregate_rel, expression, fetch_rel, join_rel, rel, rel_common, sort_field,
-    AggregateFunction, AggregateRel, CrossRel, Expression, FetchRel, FilterRel, FunctionArgument,
-    JoinRel, ProjectRel, Rel, RelCommon, SortField, SortRel, Type,
+    aggregate_rel, expression, fetch_rel, join_rel, rel, rel_common, sort_field, AggregateFunction,
+    AggregateRel, CrossRel, Expression, FetchRel, FilterRel, FunctionArgument, JoinRel, ProjectRel,
+    Rel, RelCommon, SortField, SortRel, Type,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -196,7 +196,9 @@ fn translate_node(
                             (false, false) => sort_field::SortDirection::DescNullsLast,
                         };
                         let sort_expr = if let Some(tuples) = tuples {
-                            expr_translator::translate_expr_in_context(expr, desc, registry, tuples)?
+                            expr_translator::translate_expr_in_context(
+                                expr, desc, registry, tuples,
+                            )?
                         } else {
                             expr_translator::translate_expr(expr, desc, registry)?
                         };
@@ -217,7 +219,11 @@ fn translate_node(
                 }
             }
             // Apply LIMIT if present on the exchange node.
-            let offset = node.exchange_node.as_ref().and_then(|e| e.offset).unwrap_or(0);
+            let offset = node
+                .exchange_node
+                .as_ref()
+                .and_then(|e| e.offset)
+                .unwrap_or(0);
             if node.limit >= 0 || offset > 0 {
                 rel = Rel {
                     rel_type: Some(rel::RelType::Fetch(Box::new(FetchRel {
@@ -234,21 +240,22 @@ fn translate_node(
             }
             return Ok(rel);
         }
-        bail!("EXCHANGE_NODE with {} children not yet supported", children.len())
+        bail!(
+            "EXCHANGE_NODE with {} children not yet supported",
+            children.len()
+        )
     } else if node.node_type == TPlanNodeType::EMPTY_SET_NODE {
         Rel {
-            rel_type: Some(rel::RelType::Read(Box::new(
-                substrait::proto::ReadRel {
-                    read_type: Some(substrait::proto::read_rel::ReadType::VirtualTable(
-                        #[allow(deprecated)]
-                        substrait::proto::read_rel::VirtualTable {
-                            values: vec![],
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                },
-            ))),
+            rel_type: Some(rel::RelType::Read(Box::new(substrait::proto::ReadRel {
+                read_type: Some(substrait::proto::read_rel::ReadType::VirtualTable(
+                    #[allow(deprecated)]
+                    substrait::proto::read_rel::VirtualTable {
+                        values: vec![],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }))),
         }
     } else if node.node_type == TPlanNodeType::UNION_NODE {
         translate_union_node(node, children)?
@@ -266,17 +273,17 @@ fn translate_node(
     } else if node.node_type == TPlanNodeType::HASH_JOIN_NODE {
         return translate_hash_join_node(node, children, first_child_node.as_ref(), desc, registry);
     } else if node.node_type == TPlanNodeType::AGGREGATION_NODE {
-        return translate_aggregation_node(node, children, first_child_node.as_ref(), desc, registry);
-    } else if node.node_type == TPlanNodeType::SORT_NODE {
-        return translate_sort_node(node, children, first_child_node.as_ref(), desc, registry);
-    } else if node.node_type == TPlanNodeType::CROSS_JOIN_NODE {
-        return translate_nested_loop_join_node(
+        return translate_aggregation_node(
             node,
             children,
-            &child_root_nodes,
+            first_child_node.as_ref(),
             desc,
             registry,
         );
+    } else if node.node_type == TPlanNodeType::SORT_NODE {
+        return translate_sort_node(node, children, first_child_node.as_ref(), desc, registry);
+    } else if node.node_type == TPlanNodeType::CROSS_JOIN_NODE {
+        return translate_nested_loop_join_node(node, children, &child_root_nodes, desc, registry);
     } else {
         bail!("unsupported plan node type: {}", node.node_type.0)
     };
@@ -356,31 +363,41 @@ fn expr_node_to_literal(nodes: &[TExprNode], idx: &mut usize) -> Result<expressi
 
     match node.node_type {
         TExprNodeType::INT_LITERAL => {
-            let v = node.int_literal.as_ref().context("INT_LITERAL missing data")?;
+            let v = node
+                .int_literal
+                .as_ref()
+                .context("INT_LITERAL missing data")?;
             Ok(expression::Literal {
                 literal_type: Some(expression::literal::LiteralType::I64(v.value)),
                 ..Default::default()
             })
         }
         TExprNodeType::FLOAT_LITERAL => {
-            let v = node.float_literal.as_ref().context("FLOAT_LITERAL missing data")?;
+            let v = node
+                .float_literal
+                .as_ref()
+                .context("FLOAT_LITERAL missing data")?;
             Ok(expression::Literal {
                 literal_type: Some(expression::literal::LiteralType::Fp64(*v.value)),
                 ..Default::default()
             })
         }
-        TExprNodeType::DECIMAL_LITERAL => {
-            crate::expr_translator::decimal_literal_to_literal(node)
-        }
+        TExprNodeType::DECIMAL_LITERAL => crate::expr_translator::decimal_literal_to_literal(node),
         TExprNodeType::STRING_LITERAL => {
-            let v = node.string_literal.as_ref().context("STRING_LITERAL missing data")?;
+            let v = node
+                .string_literal
+                .as_ref()
+                .context("STRING_LITERAL missing data")?;
             Ok(expression::Literal {
                 literal_type: Some(expression::literal::LiteralType::String(v.value.clone())),
                 ..Default::default()
             })
         }
         TExprNodeType::BOOL_LITERAL => {
-            let v = node.bool_literal.as_ref().context("BOOL_LITERAL missing data")?;
+            let v = node
+                .bool_literal
+                .as_ref()
+                .context("BOOL_LITERAL missing data")?;
             Ok(expression::Literal {
                 literal_type: Some(expression::literal::LiteralType::Boolean(v.value)),
                 ..Default::default()
@@ -451,9 +468,7 @@ fn apply_conjuncts(
                     arguments: conditions
                         .into_iter()
                         .map(|c| FunctionArgument {
-                            arg_type: Some(
-                                substrait::proto::function_argument::ArgType::Value(c),
-                            ),
+                            arg_type: Some(substrait::proto::function_argument::ArgType::Value(c)),
                         })
                         .collect(),
                     output_type: Some(Type {
@@ -488,19 +503,13 @@ pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
             .as_ref()
             .map(|s| s.names.len())
             .unwrap_or(0),
-        Some(rel::RelType::Filter(filter)) => filter
-            .input
-            .as_deref()
-            .map(count_rel_columns)
-            .unwrap_or(0),
-        Some(rel::RelType::Sort(sort)) => {
-            sort.input.as_deref().map(count_rel_columns).unwrap_or(0)
+        Some(rel::RelType::Filter(filter)) => {
+            filter.input.as_deref().map(count_rel_columns).unwrap_or(0)
         }
-        Some(rel::RelType::Fetch(fetch)) => fetch
-            .input
-            .as_deref()
-            .map(count_rel_columns)
-            .unwrap_or(0),
+        Some(rel::RelType::Sort(sort)) => sort.input.as_deref().map(count_rel_columns).unwrap_or(0),
+        Some(rel::RelType::Fetch(fetch)) => {
+            fetch.input.as_deref().map(count_rel_columns).unwrap_or(0)
+        }
         Some(rel::RelType::Join(join)) => {
             let left = join.left.as_deref().map(count_rel_columns).unwrap_or(0);
             let right = join.right.as_deref().map(count_rel_columns).unwrap_or(0);
@@ -513,11 +522,7 @@ pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
         }
         Some(rel::RelType::Cross(cross)) => {
             let left = cross.left.as_deref().map(count_rel_columns).unwrap_or(0);
-            let right = cross
-                .right
-                .as_deref()
-                .map(count_rel_columns)
-                .unwrap_or(0);
+            let right = cross.right.as_deref().map(count_rel_columns).unwrap_or(0);
             left + right
         }
         Some(rel::RelType::Aggregate(agg)) => {
@@ -529,11 +534,7 @@ pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
             groups + agg.measures.len()
         }
         Some(rel::RelType::Project(proj)) => {
-            let input_cols = proj
-                .input
-                .as_deref()
-                .map(count_rel_columns)
-                .unwrap_or(0);
+            let input_cols = proj.input.as_deref().map(count_rel_columns).unwrap_or(0);
             // Check for Emit mapping which selects a subset of columns.
             if let Some(common) = &proj.common {
                 if let Some(rel_common::EmitKind::Emit(emit)) = &common.emit_kind {
@@ -757,7 +758,8 @@ fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
                     );
                 }
                 let mut desired_input_names = input_names.clone();
-                for (idx, (expr, desired_name)) in expressions.iter().zip(new_names.iter()).enumerate()
+                for (idx, (expr, desired_name)) in
+                    expressions.iter().zip(new_names.iter()).enumerate()
                 {
                     if *desired_name == current_output_names[idx] {
                         continue;
@@ -768,13 +770,20 @@ fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
                             current_output_names[idx], desired_name
                         )
                     })?;
-                    desired_input_names =
-                        rename_input_field_names(&desired_input_names, field_idx, desired_name, "ProjectRel")?;
+                    desired_input_names = rename_input_field_names(
+                        &desired_input_names,
+                        field_idx,
+                        desired_name,
+                        "ProjectRel",
+                    )?;
                 }
                 desired_input_names
             };
 
-            project.input = Some(Box::new(rename_rel_output_schema(*input, &desired_input_names)?));
+            project.input = Some(Box::new(rename_rel_output_schema(
+                *input,
+                &desired_input_names,
+            )?));
             Ok(rel)
         }
         Some(rel::RelType::Aggregate(agg)) => {
@@ -799,7 +808,9 @@ fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
             }
 
             let mut desired_input_names = input_names.clone();
-            for (idx, (expr, desired_name)) in grouping_exprs.iter().zip(new_names.iter()).enumerate() {
+            for (idx, (expr, desired_name)) in
+                grouping_exprs.iter().zip(new_names.iter()).enumerate()
+            {
                 if *desired_name == current_names[idx] {
                     continue;
                 }
@@ -809,8 +820,12 @@ fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
                         current_names[idx], desired_name
                     )
                 })?;
-                desired_input_names =
-                    rename_input_field_names(&desired_input_names, field_idx, desired_name, "AggregateRel")?;
+                desired_input_names = rename_input_field_names(
+                    &desired_input_names,
+                    field_idx,
+                    desired_name,
+                    "AggregateRel",
+                )?;
             }
             for (measure_idx, desired_name) in new_names[group_count..].iter().enumerate() {
                 let current_name = &current_names[group_count + measure_idx];
@@ -824,7 +839,10 @@ fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
                 }
             }
 
-            agg.input = Some(Box::new(rename_rel_output_schema(*input, &desired_input_names)?));
+            agg.input = Some(Box::new(rename_rel_output_schema(
+                *input,
+                &desired_input_names,
+            )?));
             Ok(rel)
         }
         Some(rel::RelType::Join(join)) => {
@@ -846,7 +864,10 @@ fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
                     right_width
                 );
             }
-            join.left = Some(Box::new(rename_rel_output_schema(*left, &new_names[..left_width])?));
+            join.left = Some(Box::new(rename_rel_output_schema(
+                *left,
+                &new_names[..left_width],
+            )?));
             join.right = Some(Box::new(rename_rel_output_schema(
                 *right,
                 &new_names[left_width..left_width + right_width],
@@ -872,18 +893,27 @@ fn rename_rel_output_schema(rel: Rel, new_names: &[String]) -> Result<Rel> {
                     right_width
                 );
             }
-            cross.left = Some(Box::new(rename_rel_output_schema(*left, &new_names[..left_width])?));
+            cross.left = Some(Box::new(rename_rel_output_schema(
+                *left,
+                &new_names[..left_width],
+            )?));
             cross.right = Some(Box::new(rename_rel_output_schema(
                 *right,
                 &new_names[left_width..left_width + right_width],
             )?));
             Ok(rel)
         }
-        other => bail!("cannot rename output names for nested-loop child rel {:?}", other),
+        other => bail!(
+            "cannot rename output names for nested-loop child rel {:?}",
+            other
+        ),
     }
 }
 
-fn uniquify_nested_loop_child_names(left: Rel, right: Rel) -> Result<(Rel, Vec<String>, Rel, Vec<String>)> {
+fn uniquify_nested_loop_child_names(
+    left: Rel,
+    right: Rel,
+) -> Result<(Rel, Vec<String>, Rel, Vec<String>)> {
     let left_names = collect_rel_column_names(&left);
     let right_names = collect_rel_column_names(&right);
 
@@ -940,8 +970,8 @@ mod tests {
     use super::projection_source_row_tuples;
     use crate::descriptor_table::DescriptorTable;
     use crate::test_helpers::{make_desc_table, make_hash_join_node};
-    use doris_thrift::plan_nodes::TJoinOp;
     use doris_thrift::plan_nodes::THashJoinNode;
+    use doris_thrift::plan_nodes::TJoinOp;
     use doris_thrift::types::TPrimitiveType;
     use substrait::proto::join_rel;
 
@@ -968,13 +998,7 @@ mod tests {
         });
 
         let desc_tbl = make_desc_table(
-            vec![
-                (4, None),
-                (5, None),
-                (6, None),
-                (7, None),
-                (8, None),
-            ],
+            vec![(4, None), (5, None), (6, None), (7, None), (8, None)],
             vec![
                 (30, 4, 0, "c0", TPrimitiveType::BIGINT),
                 (31, 4, 1, "c1", TPrimitiveType::BIGINT),
@@ -1009,11 +1033,7 @@ pub fn validate_field_refs(rel: &Rel, path: &str) -> Vec<String> {
 
     match rel.rel_type.as_ref() {
         Some(rel::RelType::Filter(filter)) => {
-            let input_cols = filter
-                .input
-                .as_deref()
-                .map(count_rel_columns)
-                .unwrap_or(0);
+            let input_cols = filter.input.as_deref().map(count_rel_columns).unwrap_or(0);
             if let Some(cond) = &filter.condition {
                 check_expr_refs(cond, input_cols, path, "filter.condition", &mut errors);
             }
@@ -1042,7 +1062,9 @@ pub fn validate_field_refs(rel: &Rel, path: &str) -> Vec<String> {
                     pjf,
                     combined,
                     path,
-                    &format!("join({join_type}).post_join_filter [left={left_cols} right={right_cols}]"),
+                    &format!(
+                        "join({join_type}).post_join_filter [left={left_cols} right={right_cols}]"
+                    ),
                     &mut errors,
                 );
             }
@@ -1058,14 +1080,28 @@ pub fn validate_field_refs(rel: &Rel, path: &str) -> Vec<String> {
             if let Some(g) = agg.groupings.first() {
                 #[allow(deprecated)]
                 for (i, expr) in g.grouping_expressions.iter().enumerate() {
-                    check_expr_refs(expr, input_cols, path, &format!("agg.group[{i}]"), &mut errors);
+                    check_expr_refs(
+                        expr,
+                        input_cols,
+                        path,
+                        &format!("agg.group[{i}]"),
+                        &mut errors,
+                    );
                 }
             }
             for (i, m) in agg.measures.iter().enumerate() {
                 if let Some(f) = &m.measure {
                     for (j, arg) in f.arguments.iter().enumerate() {
-                        if let Some(substrait::proto::function_argument::ArgType::Value(v)) = &arg.arg_type {
-                            check_expr_refs(v, input_cols, path, &format!("agg.measure[{i}].arg[{j}]"), &mut errors);
+                        if let Some(substrait::proto::function_argument::ArgType::Value(v)) =
+                            &arg.arg_type
+                        {
+                            check_expr_refs(
+                                v,
+                                input_cols,
+                                path,
+                                &format!("agg.measure[{i}].arg[{j}]"),
+                                &mut errors,
+                            );
                         }
                     }
                 }
@@ -1078,7 +1114,13 @@ pub fn validate_field_refs(rel: &Rel, path: &str) -> Vec<String> {
             let input_cols = sort.input.as_deref().map(count_rel_columns).unwrap_or(0);
             for (i, sf) in sort.sorts.iter().enumerate() {
                 if let Some(expr) = &sf.expr {
-                    check_expr_refs(expr, input_cols, path, &format!("sort.field[{i}]"), &mut errors);
+                    check_expr_refs(
+                        expr,
+                        input_cols,
+                        path,
+                        &format!("sort.field[{i}]"),
+                        &mut errors,
+                    );
                 }
             }
             if let Some(input) = &sort.input {
@@ -1093,7 +1135,13 @@ pub fn validate_field_refs(rel: &Rel, path: &str) -> Vec<String> {
         Some(rel::RelType::Project(proj)) => {
             let input_cols = proj.input.as_deref().map(count_rel_columns).unwrap_or(0);
             for (i, expr) in proj.expressions.iter().enumerate() {
-                check_expr_refs(expr, input_cols, path, &format!("project.expr[{i}]"), &mut errors);
+                check_expr_refs(
+                    expr,
+                    input_cols,
+                    path,
+                    &format!("project.expr[{i}]"),
+                    &mut errors,
+                );
             }
             if let Some(input) = &proj.input {
                 errors.extend(validate_field_refs(input, &format!("{path}/project")));
@@ -1132,8 +1180,7 @@ fn check_expr_refs(
         }
         Some(expression::RexType::ScalarFunction(f)) => {
             for arg in &f.arguments {
-                if let Some(substrait::proto::function_argument::ArgType::Value(v)) =
-                    &arg.arg_type
+                if let Some(substrait::proto::function_argument::ArgType::Value(v)) = &arg.arg_type
                 {
                     check_expr_refs(v, available, path, context, errors);
                 }
@@ -1291,7 +1338,6 @@ fn translate_hash_join_node(
     let left_col_names = collect_rel_column_names(&left);
     let right_col_names = collect_rel_column_names(&right);
 
-
     // Build equality conditions from eq_join_conjuncts.
     let eq_anchor = registry.register_function(crate::URI_COMPARISON, "equal");
     let mut conditions: Vec<Expression> = Vec::new();
@@ -1337,83 +1383,91 @@ fn translate_hash_join_node(
             | TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN
             | TJoinOp::NULL_AWARE_LEFT_SEMI_JOIN
     );
-    let mut translate_other_join_conjuncts = |other_conjuncts: &[TExpr]| -> Result<Vec<Expression>> {
-        let mut translated = Vec::with_capacity(other_conjuncts.len());
-        if needs_swap {
-            // For swapped RIGHT→LEFT joins with self-join (duplicate column
-            // names), resolve each SLOT_REF child separately.
-            //
-            // After swap: our left = Doris's right, our right = Doris's left.
-            // In Doris's binary expression `fn(a, b)`, the first child (a) is
-            // from Doris's left, the second (b) from Doris's right.
-            // After swap: a → our right (offset), b → our left (no offset).
-            for conj in other_conjuncts {
-                let root = conj.nodes.first().context("other_join_conjunct has no nodes")?;
-                let num_children = root.num_children as usize;
-                if num_children == 2 && conj.nodes.len() >= 3 {
-                    let child_0_node = &conj.nodes[1];
-                    let child_1_node = &conj.nodes[2];
+    let mut translate_other_join_conjuncts =
+        |other_conjuncts: &[TExpr]| -> Result<Vec<Expression>> {
+            let mut translated = Vec::with_capacity(other_conjuncts.len());
+            if needs_swap {
+                // For swapped RIGHT→LEFT joins with self-join (duplicate column
+                // names), resolve each SLOT_REF child separately.
+                //
+                // After swap: our left = Doris's right, our right = Doris's left.
+                // In Doris's binary expression `fn(a, b)`, the first child (a) is
+                // from Doris's left, the second (b) from Doris's right.
+                // After swap: a → our right (offset), b → our left (no offset).
+                for conj in other_conjuncts {
+                    let root = conj
+                        .nodes
+                        .first()
+                        .context("other_join_conjunct has no nodes")?;
+                    let num_children = root.num_children as usize;
+                    if num_children == 2 && conj.nodes.len() >= 3 {
+                        let child_0_node = &conj.nodes[1];
+                        let child_1_node = &conj.nodes[2];
 
-                    if !right_col_names.is_empty() {
-                        desc.set_child_rel_column_names(right_col_names.clone());
-                    }
-                    let child_0_expr = TExpr { nodes: vec![child_0_node.clone()] };
-                    let mut arg0 =
-                        expr_translator::translate_expr(&child_0_expr, desc, registry)?;
-                    desc.clear_child_rel_column_names();
-                    expr_translator::offset_field_refs(&mut arg0, left_col_count);
+                        if !right_col_names.is_empty() {
+                            desc.set_child_rel_column_names(right_col_names.clone());
+                        }
+                        let child_0_expr = TExpr {
+                            nodes: vec![child_0_node.clone()],
+                        };
+                        let mut arg0 =
+                            expr_translator::translate_expr(&child_0_expr, desc, registry)?;
+                        desc.clear_child_rel_column_names();
+                        expr_translator::offset_field_refs(&mut arg0, left_col_count);
 
-                    if !left_col_names.is_empty() {
-                        desc.set_child_rel_column_names(left_col_names.clone());
-                    }
-                    let child_1_expr = TExpr { nodes: vec![child_1_node.clone()] };
-                    let arg1 = expr_translator::translate_expr(&child_1_expr, desc, registry)?;
-                    desc.clear_child_rel_column_names();
+                        if !left_col_names.is_empty() {
+                            desc.set_child_rel_column_names(left_col_names.clone());
+                        }
+                        let child_1_expr = TExpr {
+                            nodes: vec![child_1_node.clone()],
+                        };
+                        let arg1 = expr_translator::translate_expr(&child_1_expr, desc, registry)?;
+                        desc.clear_child_rel_column_names();
 
-                    let func_name = root
-                        .fn_
-                        .as_ref()
-                        .map(|f| f.name.function_name.as_str())
-                        .unwrap_or("equal");
-                    let (uri, substrait_name) = match func_name {
-                        "ne" => (crate::URI_COMPARISON, "not_equal"),
-                        "eq" => (crate::URI_COMPARISON, "equal"),
-                        "lt" => (crate::URI_COMPARISON, "lt"),
-                        "le" => (crate::URI_COMPARISON, "lte"),
-                        "gt" => (crate::URI_COMPARISON, "gt"),
-                        "ge" => (crate::URI_COMPARISON, "gte"),
-                        other => (crate::URI_COMPARISON, other),
-                    };
-                    let anchor = registry.register_function(uri, substrait_name);
-                    translated.push(expr_translator::make_scalar_fn(
-                        anchor,
-                        vec![arg0, arg1],
-                        expr_translator::bool_type(),
-                    ));
-                } else {
-                    let mut combined = left_col_names.clone();
-                    combined.extend(right_col_names.clone());
-                    if !combined.is_empty() {
-                        desc.set_child_rel_column_names(combined);
+                        let func_name = root
+                            .fn_
+                            .as_ref()
+                            .map(|f| f.name.function_name.as_str())
+                            .unwrap_or("equal");
+                        let (uri, substrait_name) = match func_name {
+                            "ne" => (crate::URI_COMPARISON, "not_equal"),
+                            "eq" => (crate::URI_COMPARISON, "equal"),
+                            "lt" => (crate::URI_COMPARISON, "lt"),
+                            "le" => (crate::URI_COMPARISON, "lte"),
+                            "gt" => (crate::URI_COMPARISON, "gt"),
+                            "ge" => (crate::URI_COMPARISON, "gte"),
+                            other => (crate::URI_COMPARISON, other),
+                        };
+                        let anchor = registry.register_function(uri, substrait_name);
+                        translated.push(expr_translator::make_scalar_fn(
+                            anchor,
+                            vec![arg0, arg1],
+                            expr_translator::bool_type(),
+                        ));
+                    } else {
+                        let mut combined = left_col_names.clone();
+                        combined.extend(right_col_names.clone());
+                        if !combined.is_empty() {
+                            desc.set_child_rel_column_names(combined);
+                        }
+                        let expr = expr_translator::translate_expr(conj, desc, registry)?;
+                        desc.clear_child_rel_column_names();
+                        translated.push(expr);
                     }
-                    let expr = expr_translator::translate_expr(conj, desc, registry)?;
-                    desc.clear_child_rel_column_names();
-                    translated.push(expr);
                 }
+            } else {
+                let mut combined = left_col_names.clone();
+                combined.extend(right_col_names.clone());
+                if !combined.is_empty() {
+                    desc.set_child_rel_column_names(combined);
+                }
+                for conj in other_conjuncts {
+                    translated.push(expr_translator::translate_expr(conj, desc, registry)?);
+                }
+                desc.clear_child_rel_column_names();
             }
-        } else {
-            let mut combined = left_col_names.clone();
-            combined.extend(right_col_names.clone());
-            if !combined.is_empty() {
-                desc.set_child_rel_column_names(combined);
-            }
-            for conj in other_conjuncts {
-                translated.push(expr_translator::translate_expr(conj, desc, registry)?);
-            }
-            desc.clear_child_rel_column_names();
-        }
-        Ok(translated)
-    };
+            Ok(translated)
+        };
 
     let mut post_join_filters = Vec::new();
     if let Some(other_conjuncts) = &hash_join.other_join_conjuncts {
@@ -1498,8 +1552,16 @@ fn translate_hash_join_node(
                     Some(rel::RelType::Join(j)) => j,
                     _ => unreachable!(),
                 };
-                let left_names_j = join_box.left.as_deref().map(collect_rel_column_names).unwrap_or_default();
-                let right_names_j = join_box.right.as_deref().map(collect_rel_column_names).unwrap_or_default();
+                let left_names_j = join_box
+                    .left
+                    .as_deref()
+                    .map(collect_rel_column_names)
+                    .unwrap_or_default();
+                let right_names_j = join_box
+                    .right
+                    .as_deref()
+                    .map(collect_rel_column_names)
+                    .unwrap_or_default();
                 let mut combined = left_names_j;
                 combined.extend(right_names_j);
                 if !combined.is_empty() {
@@ -1562,10 +1624,7 @@ fn translate_aggregation_node(
     registry: &mut ExtensionRegistry,
 ) -> Result<Rel> {
     if children.len() != 1 {
-        bail!(
-            "AGGREGATION_NODE expected 1 child, got {}",
-            children.len()
-        );
+        bail!("AGGREGATION_NODE expected 1 child, got {}", children.len());
     }
     let agg_node = node
         .agg_node
@@ -1639,30 +1698,27 @@ fn translate_aggregation_node(
                 .unwrap_or(0);
 
             // Find the finalize's input tuple from the first aggregate function's SLOT_REF.
-            let input_tuple_slots = agg_node
-                .aggregate_functions
-                .first()
-                .and_then(|agg_fn| {
-                    let slot_id = agg_fn
-                        .nodes
-                        .iter()
-                        .find(|n| n.node_type == TExprNodeType::SLOT_REF)
-                        .and_then(|n| n.slot_ref.as_ref())
-                        .map(|sr| sr.slot_id)?;
-                    // Look up this slot to find its parent tuple.
-                    let slot = desc.get_slot(slot_id).ok()?;
-                    let tuple = desc.get_tuple(slot.parent_tuple_id).ok()?;
-                    // Get all materialized slots in the tuple (in order).
-                    let mut slots = Vec::new();
-                    for &sid in &tuple.slot_ids {
-                        if let Ok(s) = desc.get_slot(sid) {
-                            if s.is_materialized {
-                                slots.push(sid);
-                            }
+            let input_tuple_slots = agg_node.aggregate_functions.first().and_then(|agg_fn| {
+                let slot_id = agg_fn
+                    .nodes
+                    .iter()
+                    .find(|n| n.node_type == TExprNodeType::SLOT_REF)
+                    .and_then(|n| n.slot_ref.as_ref())
+                    .map(|sr| sr.slot_id)?;
+                // Look up this slot to find its parent tuple.
+                let slot = desc.get_slot(slot_id).ok()?;
+                let tuple = desc.get_tuple(slot.parent_tuple_id).ok()?;
+                // Get all materialized slots in the tuple (in order).
+                let mut slots = Vec::new();
+                for &sid in &tuple.slot_ids {
+                    if let Ok(s) = desc.get_slot(sid) {
+                        if s.is_materialized {
+                            slots.push(sid);
                         }
                     }
-                    Some(slots)
-                });
+                }
+                Some(slots)
+            });
 
             if let Some(input_slots) = input_tuple_slots {
                 // Skip grouping key slots to get measure slots only.
@@ -1915,12 +1971,12 @@ fn apply_node_projections(
     }
 
     let actual_cols = count_rel_columns(&rel);
-    let projection_row_tuples_storage =
-        projection_source_row_tuples(node, desc, actual_cols);
+    let projection_row_tuples_storage = projection_source_row_tuples(node, desc, actual_cols);
     let row_tuples = projection_row_tuples_storage.as_deref();
     let mut expressions = Vec::with_capacity(projections.len());
     for (proj_idx, proj) in projections.iter().enumerate() {
-        let is_pure_slot_ref = proj.nodes.len() == 1 && proj.nodes[0].node_type == TExprNodeType::SLOT_REF;
+        let is_pure_slot_ref =
+            proj.nodes.len() == 1 && proj.nodes[0].node_type == TExprNodeType::SLOT_REF;
         if proj.nodes.len() == 1
             && proj.nodes[0].node_type == TExprNodeType::SLOT_REF
             && proj.nodes[0]
@@ -2032,8 +2088,8 @@ fn apply_node_projections(
     // Substrait ProjectRel appends expressions to the input; emit only the
     // projected outputs so the node's runtime schema matches Doris.
     let num_input = actual_cols;
-    let output_mapping: Vec<i32> = (num_input as i32..num_input as i32 + expressions.len() as i32)
-        .collect();
+    let output_mapping: Vec<i32> =
+        (num_input as i32..num_input as i32 + expressions.len() as i32).collect();
 
     Ok(Rel {
         rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {

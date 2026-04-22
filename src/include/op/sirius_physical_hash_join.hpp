@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cudf/cudf_utils.hpp"
+#include "cudf/join/distinct_hash_join.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
@@ -54,7 +55,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   struct join_projection_columns {
     std::vector<cudf::size_type> col_idxs;
-    duckdb::vector<duckdb::LogicalType> col_types;
+    duckdb::vector<sirius::logical_type> col_types;
   };
 
  public:
@@ -66,7 +67,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::JoinType join_type,
     const duckdb::vector<std::size_t>& left_projection_map,
     const duckdb::vector<std::size_t>& right_projection_map,
-    duckdb::vector<duckdb::LogicalType> delim_types,
+    duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
@@ -87,7 +88,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void initialize_hash_table(duckdb::ClientContext& context) const;
 
   //! The types of the join keys
-  duckdb::vector<duckdb::LogicalType> condition_types;
+  duckdb::vector<sirius::logical_type> condition_types;
   //! The type of the join
   duckdb::JoinType join_type;
 
@@ -99,7 +100,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   join_projection_columns rhs_output_columns;
 
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
-  duckdb::vector<duckdb::LogicalType> delim_types;
+  duckdb::vector<sirius::logical_type> delim_types;
 
   mutable bool unique_build_keys = false;
 
@@ -163,6 +164,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
   uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
+  std::unique_ptr<cudf::distinct_hash_join>
+    _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
   std::shared_ptr<::cucascade::data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>

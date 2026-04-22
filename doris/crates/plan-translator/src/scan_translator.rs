@@ -14,7 +14,9 @@ use anyhow::{Context, Result};
 use doris_thrift::plan_nodes::{TFileScanRangeParams, TPlanNode};
 use substrait::proto::r#type;
 use substrait::proto::read_rel;
-use substrait::proto::read_rel::local_files::file_or_files::{FileFormat, ParquetReadOptions, PathType};
+use substrait::proto::read_rel::local_files::file_or_files::{
+    FileFormat, ParquetReadOptions, PathType,
+};
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::LocalFiles;
 use substrait::proto::{rel, NamedStruct, ReadRel, Rel, Type};
@@ -123,18 +125,12 @@ pub fn translate_file_scan(
 ///
 /// Used by EXCHANGE_NODE(0 children) → ReadRel translation.
 /// Resolves types from the descriptor table, falling back to nullable I64.
-pub fn build_exchange_schema(
-    columns: &[String],
-    desc: &DescriptorTable,
-) -> Result<NamedStruct> {
+pub fn build_exchange_schema(columns: &[String], desc: &DescriptorTable) -> Result<NamedStruct> {
     build_schema_from_columns(columns, desc, 0)
 }
 
 /// Build a NamedStruct from exact column names and already-resolved Substrait types.
-pub fn build_schema_from_exact_types(
-    columns: &[String],
-    types: &[Type],
-) -> Result<NamedStruct> {
+pub fn build_schema_from_exact_types(columns: &[String], types: &[Type]) -> Result<NamedStruct> {
     if columns.len() != types.len() {
         anyhow::bail!(
             "schema column/type count mismatch: {} names vs {} types",

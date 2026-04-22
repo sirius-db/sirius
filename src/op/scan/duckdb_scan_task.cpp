@@ -22,6 +22,7 @@
 #include <cudf/cudf_utils.hpp>
 
 #include <data/data_batch_utils.hpp>
+#include <helper/type_conversions.hpp>
 #include <helper/utils.hpp>
 #include <log/logging.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
@@ -192,13 +193,11 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 //===----------------------------------------------------------------------===//
 // duckdb_scan_task_local_state::column_builder
 //===----------------------------------------------------------------------===//
-duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType t,
+duckdb_scan_task_local_state::column_builder::column_builder(sirius::logical_type t,
                                                              size_t default_varchar_size)
   : type(t)
 {
-  type_size = t.InternalType() == duckdb::PhysicalType::VARCHAR
-                ? default_varchar_size
-                : duckdb::GetTypeIdSize(t.InternalType());
+  type_size = t.is_varchar() ? default_varchar_size : t.fixed_width_byte_size();
 }
 
 void duckdb_scan_task_local_state::column_builder::initialize_accessors(
@@ -209,7 +208,7 @@ void duckdb_scan_task_local_state::column_builder::initialize_accessors(
   assert(allocation != nullptr);
   assert(!allocation->get_blocks().empty());
 
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     // Initialize offset accessor
     offset_blocks_accessor.initialize(byte_offset, allocation);
     // Write the initial offset value of 0
@@ -234,7 +233,7 @@ bool duckdb_scan_task_local_state::column_builder::sufficient_space_for_column(
   duckdb::Vector& vec, duckdb::ValidityMask const& validity, size_t num_rows)
 {
   size_t data_bytes = 0;
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
     for (size_t row = 0; row < num_rows; ++row) {
       if (validity.RowIsValid(row)) { data_bytes += str_data[row].GetSize(); }
@@ -338,7 +337,7 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
   // PRECONDITION: Vector must be flattened
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     size_t data_bytes    = 0;
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
     for (size_t row = 0; row < num_rows; ++row) {
@@ -374,7 +373,7 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
 {
   using cucascade::memory::column_metadata;
 
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     // VARCHAR column: data buffer + offsets child
     column_metadata offsets_child{};
     offsets_child.type_id          = cudf::type_id::INT32;
@@ -403,7 +402,7 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
     return col;
   } else {
     // Fixed-width column
-    auto cudf_type = duckdb::GetCudfType(type);
+    auto cudf_type = sirius::get_cudf_type(type);
 
     column_metadata col{};
     col.type_id          = cudf_type.id();
@@ -489,11 +488,11 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   for (size_t i = 0; i < _num_columns; ++i) {
     auto const col_type = op.scanned_types[i];
     _column_builders.emplace_back(col_type, _default_varchar_size);
-    if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+    if (col_type.is_varchar()) {
       _varchar_indices.push_back(i);
       estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data + mask
     } else {
-      estimated_row_bytes += duckdb::GetTypeIdSize(col_type.InternalType());  // data + mask
+      estimated_row_bytes += col_type.fixed_width_byte_size();  // data + mask
     }
   }
 
@@ -522,7 +521,7 @@ void duckdb_scan_task_local_state::initialize_builders()
     byte_offset = (byte_offset + 7) & ~size_t{7};
     _column_builders[i].initialize_accessors(_estimated_rows_per_batch, byte_offset, _allocation);
     // Update byte_offset for next column
-    if (_column_builders[i].type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+    if (_column_builders[i].type.is_varchar()) {
       // VARCHAR column (offsets + data + mask)
       byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int32_t) +
                      _estimated_rows_per_batch * _default_varchar_size +
@@ -814,7 +813,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
-                            g_state._op.scanned_types);
+                            sirius::to_duckdb_vec(g_state._op.scanned_types));
 
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {

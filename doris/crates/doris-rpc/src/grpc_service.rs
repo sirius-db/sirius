@@ -1152,17 +1152,18 @@ fn execute_exchange_plan_to_location(
     exchange_only: bool,
 ) -> Result<crate::nixl_integration::ExecutionLocation, String> {
     if force_cpu {
-        return Ok(crate::nixl_integration::ExecutionLocation::Cpu(execute_plan(
-            engine,
-            plan,
-            no_cpu_fallback,
-            true,
-        )?));
+        return Ok(crate::nixl_integration::ExecutionLocation::Cpu(
+            execute_plan(engine, plan, no_cpu_fallback, true)?,
+        ));
     }
 
     let partition_spec_ref = partition_spec
         .as_ref()
         .map(|(num_dests, col_indices)| (*num_dests, col_indices.as_slice()));
+    let projection_already_applied = projection_indices
+        .as_ref()
+        .map(|indices| !indices.is_empty())
+        .unwrap_or(false);
 
     match plan {
         ExecPlan::Substrait {
@@ -1200,7 +1201,11 @@ fn execute_exchange_plan_to_location(
                 )?;
                 let artifact = engine
                     .take_exchange_artifact()
-                    .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                    .map_err(|e| format!("take_exchange_artifact: {e}"))?
+                    .map(|mut artifact| {
+                        artifact.set_projection_already_applied(projection_already_applied);
+                        artifact
+                    });
                 Ok(exchange_location_from_artifact(ipc_bytes, artifact))
             }
         }
@@ -1218,7 +1223,11 @@ fn execute_exchange_plan_to_location(
             let ipc_bytes = execute_plan(engine, other, no_cpu_fallback, false)?;
             let artifact = engine
                 .take_exchange_artifact()
-                .map_err(|e| format!("take_exchange_artifact: {e}"))?;
+                .map_err(|e| format!("take_exchange_artifact: {e}"))?
+                .map(|mut artifact| {
+                    artifact.set_projection_already_applied(projection_already_applied);
+                    artifact
+                });
             Ok(exchange_location_from_artifact(ipc_bytes, artifact))
         }
     }
@@ -1802,8 +1811,8 @@ fn concat_ipc_streams(ipc_streams: &[&[u8]]) -> Result<Vec<u8>, String> {
     let schema = schema.ok_or_else(|| "missing IPC schema".to_string())?;
     let mut out = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut out, &schema)
-            .map_err(|e| format!("IPC writer: {e}"))?;
+        let mut writer =
+            StreamWriter::try_new(&mut out, &schema).map_err(|e| format!("IPC writer: {e}"))?;
         for batch in &batches {
             writer
                 .write(batch)
@@ -2009,7 +2018,11 @@ fn extract_fragment_output_layout(params: &TPipelineFragmentParams) -> Vec<Outpu
             aggregate_functions = agg.aggregate_functions.len(),
             "root aggregation metadata"
         );
-        log_tuple_layout(desc_tbl, agg.intermediate_tuple_id, "agg_intermediate_tuple");
+        log_tuple_layout(
+            desc_tbl,
+            agg.intermediate_tuple_id,
+            "agg_intermediate_tuple",
+        );
         log_tuple_layout(desc_tbl, agg.output_tuple_id, "agg_output_tuple");
     }
 
@@ -2178,9 +2191,7 @@ fn maybe_project_location_for_exchange(
     Ok(crate::nixl_integration::ExecutionLocation::Cpu(projected))
 }
 
-fn should_preserve_packed_exchange(
-    location: &crate::nixl_integration::ExecutionLocation,
-) -> bool {
+fn should_preserve_packed_exchange(location: &crate::nixl_integration::ExecutionLocation) -> bool {
     matches!(
         location,
         crate::nixl_integration::ExecutionLocation::PackedExchange { .. }
@@ -2317,10 +2328,12 @@ fn project_values_by_indices<T: Clone>(
     projection_indices
         .iter()
         .map(|&idx| {
-            values
-                .get(idx)
-                .cloned()
-                .ok_or_else(|| format!("projection index {idx} out of range for {} values", values.len()))
+            values.get(idx).cloned().ok_or_else(|| {
+                format!(
+                    "projection index {idx} out of range for {} values",
+                    values.len()
+                )
+            })
         })
         .collect()
 }
@@ -2337,12 +2350,43 @@ fn project_exchange_overrides(
         .collect())
 }
 
+fn registration_projection_indices<'a>(
+    projection_indices: Option<&'a [usize]>,
+    sender_projection_applied: bool,
+) -> Option<&'a [usize]> {
+    if sender_projection_applied {
+        None
+    } else {
+        projection_indices.filter(|indices| !indices.is_empty())
+    }
+}
+
+fn exchange_registration_overrides(
+    base_overrides: &[(usize, String, Option<String>)],
+    projection_indices: Option<&[usize]>,
+    sender_projection_applied: bool,
+) -> Result<Vec<(usize, String, Option<String>)>, String> {
+    match registration_projection_indices(projection_indices, sender_projection_applied) {
+        Some(indices) => project_exchange_overrides(base_overrides, indices),
+        None => Ok(base_overrides.to_vec()),
+    }
+}
+
+fn projected_values_for_exchange_registration<T: Clone>(
+    values: &[T],
+    projection_indices: Option<&[usize]>,
+    sender_projection_applied: bool,
+) -> Result<Vec<T>, String> {
+    match registration_projection_indices(projection_indices, sender_projection_applied) {
+        Some(indices) => project_values_by_indices(values, indices),
+        None => Ok(values.to_vec()),
+    }
+}
+
 fn exchange_finalize_projection_indices(
     params: &TPipelineFragmentParams,
     node_id: i32,
 ) -> Option<Vec<usize>> {
-    use doris_thrift::exprs::TExprNodeType;
-
     let plan = params.fragment.as_ref()?.plan.as_ref()?;
     let nodes = &plan.nodes;
     if nodes.len() != 2 {
@@ -2366,34 +2410,24 @@ fn exchange_finalize_projection_indices(
         return None;
     }
 
-    let num_grouping = agg_node
-        .grouping_exprs
-        .as_ref()
-        .map(|g| g.len())
-        .unwrap_or(0);
     let input_slots = exchange_node_ordered_materialized_slots(params, node_id);
-    if input_slots.len() < num_grouping + agg_node.aggregate_functions.len() {
+    let output_slots =
+        ordered_materialized_tuple_slots(params.desc_tbl.as_ref(), agg_node.output_tuple_id);
+    if input_slots.len() != output_slots.len() {
         tracing::warn!(
             node_id,
             input_slots = input_slots.len(),
-            num_grouping,
-            num_measures = agg_node.aggregate_functions.len(),
-            "exchange finalize projection: input slot count mismatch"
+            output_slots = output_slots.len(),
+            "exchange finalize projection: input/output slot count mismatch"
         );
         return None;
     }
 
-    let measure_slot_ids: Vec<i32> = input_slots[num_grouping..].iter().map(|slot| slot.id).collect();
-    let mut projection_indices: Vec<usize> = (0..num_grouping).collect();
-    for agg_fn in &agg_node.aggregate_functions {
-        let slot_id = agg_fn
-            .nodes
-            .iter()
-            .find(|n| n.node_type == TExprNodeType::SLOT_REF)
-            .and_then(|n| n.slot_ref.as_ref())
-            .map(|sr| sr.slot_id)?;
-        let measure_pos = measure_slot_ids.iter().position(|&id| id == slot_id)?;
-        projection_indices.push(num_grouping + measure_pos);
+    let input_slot_ids: Vec<i32> = input_slots.iter().map(|slot| slot.id).collect();
+    let mut projection_indices = Vec::with_capacity(output_slots.len());
+    for output_slot in output_slots {
+        let input_idx = input_slot_ids.iter().position(|&id| id == output_slot.id)?;
+        projection_indices.push(input_idx);
     }
 
     let is_identity = projection_indices
@@ -2410,8 +2444,6 @@ fn exchange_finalize_projection_indices(
 fn aggregate_root_runtime_to_contract_projection_indices(
     params: &TPipelineFragmentParams,
 ) -> Option<Vec<usize>> {
-    use doris_thrift::exprs::TExprNodeType;
-
     let plan = params.fragment.as_ref()?.plan.as_ref()?;
     let root = plan.nodes.first()?;
     if root.node_type != TPlanNodeType::AGGREGATION_NODE {
@@ -2423,73 +2455,12 @@ fn aggregate_root_runtime_to_contract_projection_indices(
         return None;
     }
 
-    let num_grouping = agg_node
-        .grouping_exprs
-        .as_ref()
-        .map(|g| g.len())
-        .unwrap_or(0);
-
-    let input_tuple_slots = agg_node.aggregate_functions.first().and_then(|agg_fn| {
-        let slot_id = agg_fn
-            .nodes
-            .iter()
-            .find(|n| n.node_type == TExprNodeType::SLOT_REF)
-            .and_then(|n| n.slot_ref.as_ref())
-            .map(|sr| sr.slot_id)?;
-        let desc = params.desc_tbl.as_ref()?;
-        let slots = desc.slot_descriptors.as_ref()?;
-        let parent_tuple_id = slots.iter().find(|s| s.id == slot_id)?.parent;
-        Some(
-            ordered_materialized_tuple_slots(Some(desc), parent_tuple_id)
-                .into_iter()
-                .map(|slot| slot.id)
-                .collect::<Vec<_>>(),
-        )
-    })?;
-
-    if input_tuple_slots.len() < num_grouping + agg_node.aggregate_functions.len() {
-        tracing::warn!(
-            input_slots = input_tuple_slots.len(),
-            num_grouping,
-            num_measures = agg_node.aggregate_functions.len(),
-            "aggregate root sender projection: input slot count mismatch"
-        );
-        return None;
-    }
-
-    let measure_input_slots = &input_tuple_slots[num_grouping..];
-    let mut runtime_measure_positions = Vec::with_capacity(agg_node.aggregate_functions.len());
-    for agg_fn in &agg_node.aggregate_functions {
-        let slot_id = agg_fn
-            .nodes
-            .iter()
-            .find(|n| n.node_type == TExprNodeType::SLOT_REF)
-            .and_then(|n| n.slot_ref.as_ref())
-            .map(|sr| sr.slot_id)?;
-        let pos = measure_input_slots.iter().position(|&id| id == slot_id)?;
-        runtime_measure_positions.push(pos);
-    }
-
-    let mut inverse = vec![0usize; runtime_measure_positions.len()];
-    for (runtime_pos, &contract_pos) in runtime_measure_positions.iter().enumerate() {
-        if contract_pos >= inverse.len() {
-            return None;
-        }
-        inverse[contract_pos] = runtime_pos;
-    }
-
-    let mut projection_indices: Vec<usize> = (0..num_grouping).collect();
-    projection_indices.extend(inverse.into_iter().map(|idx| num_grouping + idx));
-
-    let is_identity = projection_indices
-        .iter()
-        .enumerate()
-        .all(|(idx, &source_idx)| idx == source_idx);
-    if is_identity {
-        None
-    } else {
-        Some(projection_indices)
-    }
+    // Sirius grouped aggregate merge emits group keys followed by aggregate
+    // expressions in logical expression order. Doris finalize aggregate senders
+    // already describe their exchange contract in that same order, so there is
+    // no additional sender-side permutation to apply here.
+    let _ = params;
+    None
 }
 
 fn packed_exchange_entries_from_local_artifacts(
@@ -2497,6 +2468,7 @@ fn packed_exchange_entries_from_local_artifacts(
 ) -> Vec<PackedGpuExchange> {
     let mut packed_list = Vec::new();
     for artifact in local_artifacts {
+        let projection_already_applied = artifact.projection_already_applied();
         let staging_base = artifact.staging_base();
         for partition in artifact.packed_partitions() {
             if partition.packed_size == 0 {
@@ -2511,6 +2483,7 @@ fn packed_exchange_entries_from_local_artifacts(
                 gpu_addr,
                 gpu_size: partition.packed_size,
                 cudf_metadata: partition.metadata.clone(),
+                projection_already_applied,
                 _staging_lease: None,
             });
         }
@@ -2527,11 +2500,48 @@ fn packed_exchange_entries_from_local_artifacts(
                 gpu_addr,
                 gpu_size: entry.packed_size,
                 cudf_metadata: entry.metadata.clone(),
+                projection_already_applied,
                 _staging_lease: None,
             });
         }
     }
     packed_list
+}
+
+fn packed_entries_projection_already_applied(
+    packed_entries: &[PackedGpuExchange],
+) -> Result<bool, String> {
+    let Some(first) = packed_entries.first() else {
+        return Ok(false);
+    };
+    let first_state = first.projection_already_applied;
+    if packed_entries
+        .iter()
+        .any(|entry| entry.projection_already_applied != first_state)
+    {
+        return Err(
+            "inconsistent packed exchange projection state across sender artifacts".to_string(),
+        );
+    }
+    Ok(first_state)
+}
+
+fn local_artifacts_projection_already_applied(
+    local_artifacts: &[LocalGpuArtifact],
+) -> Result<bool, String> {
+    let Some(first) = local_artifacts.first() else {
+        return Ok(false);
+    };
+    let first_state = first.projection_already_applied();
+    if local_artifacts
+        .iter()
+        .any(|artifact| artifact.projection_already_applied() != first_state)
+    {
+        return Err(
+            "inconsistent local exchange projection state across sender artifacts".to_string(),
+        );
+    }
+    Ok(first_state)
 }
 
 fn register_packed_exchange_table(
@@ -2688,12 +2698,108 @@ fn get_num_senders(params: &TPipelineFragmentParams, node_id: i32) -> u32 {
         .unwrap_or(1)
 }
 
+fn is_grouped_exchange_agg_merge_fragment(params: &TPipelineFragmentParams) -> bool {
+    let Some(plan) = params.fragment.as_ref().and_then(|fragment| fragment.plan.as_ref()) else {
+        return false;
+    };
+    let nodes = &plan.nodes;
+    if nodes.len() != 2 {
+        return false;
+    }
+
+    let agg = &nodes[0];
+    let exch = &nodes[1];
+    if agg.node_type != TPlanNodeType::AGGREGATION_NODE || agg.num_children != 1 {
+        return false;
+    }
+    if exch.node_type != TPlanNodeType::EXCHANGE_NODE || exch.num_children != 0 {
+        return false;
+    }
+
+    let Some(agg_node) = agg.agg_node.as_ref() else {
+        return false;
+    };
+    agg_node.need_finalize
+        && agg
+            .projections
+            .as_ref()
+            .is_none_or(|projections| projections.is_empty())
+        && agg_node
+            .grouping_exprs
+            .as_ref()
+            .is_some_and(|grouping| !grouping.is_empty())
+}
+
+fn ipc_stream_has_rows(ipc_bytes: &[u8]) -> bool {
+    if ipc_bytes.is_empty() {
+        return false;
+    }
+    let Ok(reader) = arrow::ipc::reader::StreamReader::try_new(Cursor::new(ipc_bytes), None)
+    else {
+        return true;
+    };
+    reader.flatten().any(|batch| batch.num_rows() > 0)
+}
+
+fn local_gpu_artifacts_have_rows(artifacts: &[LocalGpuArtifact]) -> bool {
+    artifacts.iter().any(|artifact| {
+        artifact
+            .packed_partitions()
+            .iter()
+            .any(|part| part.num_rows > 0)
+            || artifact
+                .packed_broadcast()
+                .iter()
+                .any(|entry| entry.num_rows > 0)
+            || ipc_stream_has_rows(artifact.ipc_bytes())
+    })
+}
+
+async fn send_empty_exchange_eos(
+    exch_info: &ExchangeInfo,
+    query_id: (i64, i64),
+    sender_id: i32,
+    local_brpc_addr: &str,
+    exchange_buffer: &ExchangeBuffer,
+) -> Result<(), String> {
+    let key = ExchangeKey {
+        query_id,
+        node_id: exch_info.dest_node_id,
+    };
+
+    for dest in &exch_info.destinations {
+        if dest.brpc_addr == local_brpc_addr {
+            exchange_buffer.add_block(&key, sender_id, None, true);
+            info!(
+                dest = %dest.brpc_addr,
+                sender_id,
+                node_id = exch_info.dest_node_id,
+                "empty exchange short-circuit: sent local EOS"
+            );
+        } else {
+            crate::exchange_sender::send_eos(dest, query_id, exch_info.dest_node_id, sender_id)
+                .await
+                .map_err(|e| format!("send EOS to {}: {e}", dest.brpc_addr))?;
+            info!(
+                dest = %dest.brpc_addr,
+                sender_id,
+                node_id = exch_info.dest_node_id,
+                "empty exchange short-circuit: sent remote EOS"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Generate SQL for AGG(finalize) over exchange table.
 ///
 /// When an intermediate fragment has AGG(need_finalize=true) → EXCHANGE, the partial
 /// aggregation results are in the exchange table. The finalize needs to apply the
 /// merge function (SUM for count/sum, MIN for min, MAX for max) rather than
-/// re-running the original aggregate.
+/// re-running the original aggregate. When the sender already emitted finalized
+/// AVG values, merge them as weighted averages using the shared partial COUNT
+/// column rather than averaging averages.
 ///
 /// Returns `Some(sql)` if the pattern matches, `None` otherwise.
 fn generate_exchange_agg_merge_sql(
@@ -2717,6 +2823,17 @@ fn generate_exchange_agg_merge_sql(
     }
     let agg_node = agg.agg_node.as_ref()?;
     if !agg_node.need_finalize {
+        return None;
+    }
+    if agg
+        .projections
+        .as_ref()
+        .is_some_and(|projections| !projections.is_empty())
+    {
+        tracing::info!(
+            node_id = agg.node_id,
+            "skipping exchange AGG merge SQL because root projections are present"
+        );
         return None;
     }
 
@@ -2744,13 +2861,40 @@ fn generate_exchange_agg_merge_sql(
         return None;
     }
 
-    // Determine permutation: the exchange table columns may be in a different
-    // order than the AGG_FINAL's aggregate_functions. Compute the mapping from
-    // AGG_FINAL order → exchange table column positions using slot_ref → slot_id
-    // matching (same logic as node_translator.rs reordering).
-    let measure_permutation: Vec<usize> = exchange_finalize_projection_indices(params, exch.node_id)
-        .map(|projection| projection.into_iter().skip(num_grouping).map(|idx| idx - num_grouping).collect())
+    fn agg_func_name(agg_fn_expr: &TExpr) -> Option<&str> {
+        agg_fn_expr
+            .nodes
+            .first()
+            .and_then(|n| n.fn_.as_ref().map(|f| f.name.function_name.as_str()))
+    }
+    let input_slots = exchange_node_ordered_materialized_slots(params, exch.node_id);
+    let input_measure_slot_ids: Vec<i32> = input_slots
+        .iter()
+        .skip(num_grouping)
+        .map(|slot| slot.id)
+        .collect();
+    let measure_permutation: Vec<usize> = agg_node
+        .aggregate_functions
+        .iter()
+        .map(|agg_fn_expr| {
+            let slot_id = agg_fn_expr
+                .nodes
+                .iter()
+                .find(|node| node.node_type == TExprNodeType::SLOT_REF)
+                .and_then(|node| node.slot_ref.as_ref())
+                .map(|slot_ref| slot_ref.slot_id)?;
+            input_measure_slot_ids.iter().position(|&id| id == slot_id)
+        })
+        .collect::<Option<Vec<_>>>()
         .unwrap_or_else(|| (0..num_agg_fns).collect());
+    let count_measure_idx = agg_node
+        .aggregate_functions
+        .iter()
+        .position(|agg_fn_expr| matches!(agg_func_name(agg_fn_expr), Some("count" | "count_star")));
+    let count_merge_col = count_measure_idx.map(|idx| {
+        let col_idx = num_grouping + measure_permutation[idx];
+        columns[col_idx].clone()
+    });
 
     // Build SELECT list.
     let mut select_parts = Vec::new();
@@ -2767,29 +2911,31 @@ fn generate_exchange_agg_merge_sql(
         let col = &columns[col_idx];
 
         // Extract function name from the aggregate expression root node.
-        let func_name = agg_fn_expr
-            .nodes
-            .first()
-            .and_then(|n| n.fn_.as_ref().map(|f| f.name.function_name.as_str()));
+        let func_name = agg_func_name(agg_fn_expr);
 
-        // Map original aggregate → merge function.
-        let merge_fn = match func_name {
-            Some("count") => "SUM",
-            Some("sum") | Some("multi_distinct_sum") => "SUM",
-            Some("min") => "MIN",
-            Some("max") => "MAX",
-            Some("any_value") => "ANY_VALUE",
+        let select_expr = match func_name {
+            Some("count" | "count_star") => format!("SUM(\"{}\") AS \"{}\"", col, col),
+            Some("sum" | "multi_distinct_sum") => format!("SUM(\"{}\") AS \"{}\"", col, col),
+            Some("min") => format!("MIN(\"{}\") AS \"{}\"", col, col),
+            Some("max") => format!("MAX(\"{}\") AS \"{}\"", col, col),
+            Some("any_value") => format!("ANY_VALUE(\"{}\") AS \"{}\"", col, col),
+            Some("avg") => {
+                let count_col = count_merge_col.as_ref()?;
+                format!(
+                    "SUM(CAST(\"{col}\" AS DOUBLE) * CAST(\"{count_col}\" AS DOUBLE)) / SUM(CAST(\"{count_col}\" AS DOUBLE)) AS \"{col}\""
+                )
+            }
             Some(other) => {
                 tracing::warn!(
                     func = other,
-                    "unknown aggregate merge function, defaulting to SUM"
+                    "unsupported aggregate merge function for exchange SQL"
                 );
-                "SUM"
+                return None;
             }
-            None => "SUM",
+            None => return None,
         };
 
-        select_parts.push(format!("{}(\"{}\") AS \"{}\"", merge_fn, col, col));
+        select_parts.push(select_expr);
     }
 
     let select = select_parts.join(", ");
@@ -3113,7 +3259,7 @@ fn should_use_exchange_only_capture(
     local_brpc_addr: &str,
     local_gpu_receivers_by_dest: &std::collections::HashMap<i32, bool>,
 ) -> bool {
-    exchange_infos.len() == 1
+    !exchange_infos.is_empty()
         && exchange_infos_are_all_local(exchange_infos, local_brpc_addr)
         && exchange_infos.iter().all(|info| {
             local_gpu_receivers_by_dest
@@ -3147,38 +3293,13 @@ fn local_exchange_capture_projection_by_dest(
     result
 }
 
-fn root_scalar_aggregate_capture_projection(
+fn root_aggregate_capture_projection(
     params: &TPipelineFragmentParams,
     dest_node_id: i32,
     local_capture_projection_by_dest: &std::collections::HashMap<i32, Vec<usize>>,
 ) -> Option<Vec<usize>> {
-    let plan = params.fragment.as_ref()?.plan.as_ref()?;
-    let root = plan.nodes.first()?;
-    if root.node_type != TPlanNodeType::AGGREGATION_NODE {
-        return None;
-    }
-    let agg_node = root.agg_node.as_ref()?;
-    if agg_node.need_finalize {
-        return None;
-    }
-    if agg_node
-        .grouping_exprs
-        .as_ref()
-        .map(|g| !g.is_empty())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    local_capture_projection_by_dest
-        .get(&dest_node_id)
-        .cloned()
-        .inspect(|indices| {
-            info!(
-                dest_node_id,
-                projection_indices = ?indices,
-                "using receiver-derived capture projection for scalar aggregate sender"
-            );
-        })
+    let _ = (params, dest_node_id, local_capture_projection_by_dest);
+    None
 }
 
 fn exchange_capture_projection_for_sender(
@@ -3188,7 +3309,7 @@ fn exchange_capture_projection_for_sender(
 ) -> Option<Vec<usize>> {
     let info = exchange_infos.first()?;
     info.output_indices.clone().or_else(|| {
-        root_scalar_aggregate_capture_projection(
+        root_aggregate_capture_projection(
             params,
             info.dest_node_id,
             local_capture_projection_by_dest,
@@ -3258,26 +3379,25 @@ fn extract_exchange_destinations(params: &TPipelineFragmentParams) -> Vec<Exchan
             let sink_output_layout = extract_stream_sink_output_layout(params, stream_sink);
             let sender_contract_projection =
                 if sink_output_layout.is_empty() && !fragment_output_layout.is_empty() {
-                    aggregate_root_runtime_to_contract_projection_indices(params)
-                        .map(|indices| {
-                            (
-                                fragment_output_layout
-                                    .iter()
-                                    .map(|entry| entry.name.clone())
-                                    .collect::<Vec<_>>(),
-                                indices,
-                            )
-                        })
+                    aggregate_root_runtime_to_contract_projection_indices(params).map(|indices| {
+                        (
+                            fragment_output_layout
+                                .iter()
+                                .map(|entry| entry.name.clone())
+                                .collect::<Vec<_>>(),
+                            indices,
+                        )
+                    })
                 } else {
                     None
                 };
-            let (output_names, output_indices) = compute_exchange_projection(
-                &fragment_output_layout,
-                &sink_output_layout,
-            )
-            .map(|(names, indices)| (names, Some(indices)))
-            .or_else(|| sender_contract_projection.map(|(names, indices)| (names, Some(indices))))
-            .unwrap_or_else(|| (Vec::new(), None));
+            let (output_names, output_indices) =
+                compute_exchange_projection(&fragment_output_layout, &sink_output_layout)
+                    .map(|(names, indices)| (names, Some(indices)))
+                    .or_else(|| {
+                        sender_contract_projection.map(|(names, indices)| (names, Some(indices)))
+                    })
+                    .unwrap_or_else(|| (Vec::new(), None));
             if let Some(indices) = output_indices.as_ref() {
                 tracing::info!(
                     dest_node_id = stream_sink.dest_node_id,
@@ -3587,8 +3707,7 @@ impl PBackendService for PBackendServiceHandler {
                 let nixl_agent = self.nixl_agent.clone();
                 let local_brpc_addr = self.local_brpc_addr.clone();
                 let local_gpu_receivers_by_dest = local_gpu_receivers_by_dest.clone();
-                let local_capture_projection_by_dest =
-                    local_capture_projection_by_dest.clone();
+                let local_capture_projection_by_dest = local_capture_projection_by_dest.clone();
                 let exchange_buffer = self.exchange_buffer.clone();
 
                 // Spawn async task: wait for exchange data, decode, load, execute.
@@ -3624,41 +3743,61 @@ impl PBackendService for PBackendServiceHandler {
                         std::collections::HashMap::<i32, Vec<LocalGpuArtifact>>::new();
                     let mut registered_any_local_tables = false;
                     let mut any_gpu_registration_failed = false;
+                    let mut exchange_inputs_have_rows = false;
                     for &node_id in &exchange_node_ids {
                         let key = ExchangeKey { query_id, node_id };
                         let table_name = exchange_table_name(query_id.1, node_id);
 
                         let local_artifacts = buffer.take_local_gpu_artifacts(&key);
                         if let Some(local_artifacts) = local_artifacts {
-                            let receiver_projection =
-                                exchange_finalize_projection_indices(&params, node_id);
-                            let projection_indices = receiver_projection;
-                            let base_overrides =
-                                exchange_table_column_overrides(&params, node_id);
-                            let overrides = match projection_indices.as_deref() {
-                                Some(indices) => match project_exchange_overrides(
-                                    &base_overrides,
-                                    indices,
-                                ) {
-                                    Ok(projected) => projected,
+                            exchange_inputs_have_rows |=
+                                local_gpu_artifacts_have_rows(&local_artifacts);
+                            let sender_projection_applied =
+                                match local_artifacts_projection_already_applied(&local_artifacts) {
+                                    Ok(state) => state,
                                     Err(e) => {
                                         warn!(
                                             error = %e,
                                             table = %table_name,
-                                            projection_indices = ?projection_indices,
-                                            "failed to project exchange table overrides"
+                                            "local GPU exchange artifacts disagree on sender projection state"
                                         );
                                         store.store_error(
                                             finst_id,
                                             fragment_finst_id,
                                             format!(
-                                                "project exchange table overrides for {table_name}: {e}"
+                                                "local GPU exchange projection state for {table_name}: {e}"
                                             ),
                                         );
                                         return;
                                     }
-                                },
-                                None => base_overrides,
+                                };
+                            let receiver_projection =
+                                exchange_finalize_projection_indices(&params, node_id);
+                            let projection_indices = receiver_projection;
+                            let base_overrides = exchange_table_column_overrides(&params, node_id);
+                            let overrides = match exchange_registration_overrides(
+                                &base_overrides,
+                                projection_indices.as_deref(),
+                                sender_projection_applied,
+                            ) {
+                                Ok(projected) => projected,
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        table = %table_name,
+                                        projection_indices = ?projection_indices,
+                                        sender_projection_applied,
+                                        "failed to project exchange table overrides"
+                                    );
+                                    store.store_error(
+                                        finst_id,
+                                        fragment_finst_id,
+                                        format!(
+                                            "project exchange table overrides for {table_name}: {e}"
+                                        ),
+                                    );
+                                    return;
+                                }
                             };
                             let packed_entries =
                                 packed_exchange_entries_from_local_artifacts(&local_artifacts);
@@ -3666,7 +3805,11 @@ impl PBackendService for PBackendServiceHandler {
                                 let reg_engine = engine.clone();
                                 let reg_table = table_name.clone();
                                 let reg_overrides = overrides.clone();
-                                let reg_projection = projection_indices.clone();
+                                let reg_projection = registration_projection_indices(
+                                    projection_indices.as_deref(),
+                                    sender_projection_applied,
+                                )
+                                .map(|indices| indices.to_vec());
                                 let reg_result = tokio::task::spawn_blocking(move || {
                                     let eng = reg_engine.lock().unwrap();
                                     let cols = register_packed_exchange_table(
@@ -3705,8 +3848,7 @@ impl PBackendService for PBackendServiceHandler {
                                             table_schema_types
                                                 .insert(table_name.clone(), actual_types);
                                         }
-                                        gpu_capable_exchange_tables
-                                            .insert(table_name.clone());
+                                        gpu_capable_exchange_tables.insert(table_name.clone());
                                         retained_local_gpu_artifacts
                                             .insert(node_id, local_artifacts);
                                         registered_any_local_tables = true;
@@ -3733,95 +3875,101 @@ impl PBackendService for PBackendServiceHandler {
                             }
 
                             match local_artifacts.first() {
-                                Some(first) => match ipc_schema_columns_and_types(first.ipc_bytes()) {
-                                    Ok((cols, types)) => {
-                                        let expected_cols = if !overrides.is_empty() {
-                                            overrides
-                                                .iter()
-                                                .map(|(_, name, _)| name.clone())
-                                                .collect()
-                                        } else if let Some(indices) = projection_indices.as_deref() {
-                                            match project_values_by_indices(&cols, indices) {
-                                                Ok(projected) => projected,
-                                                Err(e) => {
-                                                    warn!(
-                                                        error = %e,
-                                                        table = %table_name,
-                                                        projection_indices = ?projection_indices,
-                                                        "failed to project IPC schema columns for local GPU exchange"
-                                                    );
-                                                    store.store_error(
-                                                        finst_id,
-                                                        fragment_finst_id,
-                                                        format!(
-                                                            "project local GPU IPC schema for {table_name}: {e}"
-                                                        ),
-                                                    );
-                                                    return;
+                                Some(first) => {
+                                    match ipc_schema_columns_and_types(first.ipc_bytes()) {
+                                        Ok((cols, types)) => {
+                                            let expected_cols = if !overrides.is_empty() {
+                                                overrides
+                                                    .iter()
+                                                    .map(|(_, name, _)| name.clone())
+                                                    .collect()
+                                            } else {
+                                                match projected_values_for_exchange_registration(
+                                                    &cols,
+                                                    projection_indices.as_deref(),
+                                                    sender_projection_applied,
+                                                ) {
+                                                    Ok(projected) => projected,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            error = %e,
+                                                            table = %table_name,
+                                                            projection_indices = ?projection_indices,
+                                                            sender_projection_applied,
+                                                            "failed to project IPC schema columns for local GPU exchange"
+                                                        );
+                                                        store.store_error(
+                                                            finst_id,
+                                                            fragment_finst_id,
+                                                            format!(
+                                                                "project local GPU IPC schema for {table_name}: {e}"
+                                                            ),
+                                                        );
+                                                        return;
+                                                    }
                                                 }
-                                            }
-                                        } else {
-                                            cols
-                                        };
-                                        let expected_types = if let Some(indices) =
-                                            projection_indices.as_deref()
-                                        {
-                                            match project_values_by_indices(&types, indices) {
-                                                Ok(projected) => projected,
-                                                Err(e) => {
-                                                    warn!(
-                                                        error = %e,
-                                                        table = %table_name,
-                                                        projection_indices = ?projection_indices,
-                                                        "failed to project IPC schema types for local GPU exchange"
-                                                    );
-                                                    store.store_error(
-                                                        finst_id,
-                                                        fragment_finst_id,
-                                                        format!(
-                                                            "project local GPU IPC types for {table_name}: {e}"
-                                                        ),
-                                                    );
-                                                    return;
-                                                }
-                                            }
-                                        } else {
-                                            types.clone()
-                                        };
+                                            };
+                                            let expected_types =
+                                                match projected_values_for_exchange_registration(
+                                                    &types,
+                                                    projection_indices.as_deref(),
+                                                    sender_projection_applied,
+                                                ) {
+                                                    Ok(projected) => projected,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            error = %e,
+                                                            table = %table_name,
+                                                            projection_indices = ?projection_indices,
+                                                            sender_projection_applied,
+                                                            "failed to project IPC schema types for local GPU exchange"
+                                                        );
+                                                        store.store_error(
+                                                            finst_id,
+                                                            fragment_finst_id,
+                                                            format!(
+                                                                "project local GPU IPC types for {table_name}: {e}"
+                                                            ),
+                                                        );
+                                                        return;
+                                                    }
+                                                };
 
-                                        info!(
-                                            table = %table_name,
-                                            cols = expected_cols.len(),
-                                            projection_indices = ?projection_indices,
-                                            "recorded local GPU exchange schema from IPC fallback"
-                                        );
-                                        let expected_col_count = expected_cols.len();
-                                        table_schemas.insert(table_name.clone(), expected_cols);
-                                        if expected_types.len() == expected_col_count {
-                                            table_schema_types
-                                                .insert(table_name.clone(), expected_types);
+                                            info!(
+                                                table = %table_name,
+                                                cols = expected_cols.len(),
+                                                projection_indices = ?projection_indices,
+                                                sender_projection_applied,
+                                                "recorded local GPU exchange schema from IPC fallback"
+                                            );
+                                            let expected_col_count = expected_cols.len();
+                                            table_schemas.insert(table_name.clone(), expected_cols);
+                                            if expected_types.len() == expected_col_count {
+                                                table_schema_types
+                                                    .insert(table_name.clone(), expected_types);
+                                            }
+                                            pending_local_exchange_artifacts
+                                                .insert(node_id, local_artifacts);
+                                            let _ = buffer.take(&key);
+                                            continue;
                                         }
-                                        pending_local_exchange_artifacts
-                                            .insert(node_id, local_artifacts);
-                                        let _ = buffer.take(&key);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            error = %e,
-                                            table = %table_name,
-                                            "failed to inspect local GPU exchange IPC schema"
-                                        );
-                                        store.store_error(
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                table = %table_name,
+                                                "failed to inspect local GPU exchange IPC schema"
+                                            );
+                                            store.store_error(
                                             finst_id,
                                             fragment_finst_id,
                                             format!(
                                                 "inspect local GPU exchange schema for {table_name}: {e}"
                                             ),
                                         );
-                                        return;
+                                            return;
+                                        }
                                     }
-                                },
+                                }
                                 None => {
                                     table_schemas.insert(table_name.clone(), vec![]);
                                     pending_local_exchange_artifacts
@@ -3832,17 +3980,15 @@ impl PBackendService for PBackendServiceHandler {
                             }
                         }
 
-                        let packed_source = if let Some(packed_list) = buffer.take_packed_gpu(&key) {
-                            Some((
-                                packed_list,
-                                "packed GPU exchange table (zero CPU copies)",
-                            ))
+                        let packed_source = if let Some(packed_list) = buffer.take_packed_gpu(&key)
+                        {
+                            Some((packed_list, "packed GPU exchange table (zero CPU copies)"))
                         } else {
                             None
                         };
 
-                        if let Some((packed_list, source_label)) = packed_source
-                        {
+                        if let Some((packed_list, source_label)) = packed_source {
+                            exchange_inputs_have_rows = true;
                             let first = &packed_list[0];
                             info!(
                                 table = %table_name,
@@ -3859,32 +4005,55 @@ impl PBackendService for PBackendServiceHandler {
                             let projection_indices =
                                 exchange_finalize_projection_indices(&params, node_id);
                             let base_overrides = exchange_table_column_overrides(&params, node_id);
-                            let overrides = match projection_indices.as_deref() {
-                                Some(indices) => match project_exchange_overrides(
-                                    &base_overrides,
-                                    indices,
-                                ) {
-                                    Ok(projected) => projected,
+                            let sender_projection_applied =
+                                match packed_entries_projection_already_applied(&packed_owned) {
+                                    Ok(state) => state,
                                     Err(e) => {
                                         warn!(
                                             error = %e,
                                             table = %table_name,
-                                            projection_indices = ?projection_indices,
-                                            "failed to project packed GPU exchange overrides"
+                                            source = source_label,
+                                            "packed GPU entries disagree on sender projection state"
                                         );
                                         store.store_error(
                                             finst_id,
                                             fragment_finst_id,
                                             format!(
-                                                "project packed GPU exchange overrides for {table_name}: {e}"
+                                                "packed GPU exchange projection state for {table_name}: {e}"
                                             ),
                                         );
                                         return;
                                     }
-                                },
-                                None => base_overrides,
+                                };
+                            let overrides = match exchange_registration_overrides(
+                                &base_overrides,
+                                projection_indices.as_deref(),
+                                sender_projection_applied,
+                            ) {
+                                Ok(projected) => projected,
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        table = %table_name,
+                                        projection_indices = ?projection_indices,
+                                        sender_projection_applied,
+                                        "failed to project packed GPU exchange overrides"
+                                    );
+                                    store.store_error(
+                                        finst_id,
+                                        fragment_finst_id,
+                                        format!(
+                                            "project packed GPU exchange overrides for {table_name}: {e}"
+                                        ),
+                                    );
+                                    return;
+                                }
                             };
-                            let reg_projection = projection_indices.clone();
+                            let reg_projection = registration_projection_indices(
+                                projection_indices.as_deref(),
+                                sender_projection_applied,
+                            )
+                            .map(|indices| indices.to_vec());
                             let reg_result = tokio::task::spawn_blocking(move || {
                                 let eng = reg_engine.lock().unwrap();
                                 register_packed_exchange_table(
@@ -3900,17 +4069,20 @@ impl PBackendService for PBackendServiceHandler {
                             match reg_result {
                                 Ok(Ok(cols)) => {
                                     info!(
-                                        table = %table_name,
-                                        source = source_label,
-                                        cols = cols.len(),
-                                "packed GPU table registered"
-                                    );
+                                            table = %table_name,
+                                            source = source_label,
+                                            cols = cols.len(),
+                                    "packed GPU table registered"
+                                        );
                                     gpu_capable_exchange_tables.insert(table_name.clone());
                                     table_schemas.insert(table_name.clone(), cols);
-                                    if let Ok(schema) = engine.lock().unwrap().get_table_schema(&table_name) {
+                                    if let Ok(schema) =
+                                        engine.lock().unwrap().get_table_schema(&table_name)
+                                    {
                                         let actual_types = table_schema_types_from_duckdb(&schema);
                                         if actual_types.len() == schema.len() {
-                                            table_schema_types.insert(table_name.clone(), actual_types);
+                                            table_schema_types
+                                                .insert(table_name.clone(), actual_types);
                                         }
                                     }
                                     let _ = buffer.take(&key);
@@ -3950,7 +4122,8 @@ impl PBackendService for PBackendServiceHandler {
                             // then resolve column types from the descriptor table.
                             let col_defs: Vec<String> = (|| -> Option<Vec<String>> {
                                 let mut defs = Vec::new();
-                                for slot in exchange_node_ordered_materialized_slots(&params, node_id)
+                                for slot in
+                                    exchange_node_ordered_materialized_slots(&params, node_id)
                                 {
                                     use doris_thrift::types::TPrimitiveType;
                                     let ptype: Option<doris_thrift::types::TPrimitiveType> = slot
@@ -4034,13 +4207,14 @@ impl PBackendService for PBackendServiceHandler {
                                 match engine_guard.get_table_columns(&table_name) {
                                     Ok(cols) => {
                                         table_schemas.insert(table_name.clone(), cols);
-                                        if let Ok(schema) = engine_guard.get_table_schema(&table_name) {
-                                            let actual_types = table_schema_types_from_duckdb(&schema);
+                                        if let Ok(schema) =
+                                            engine_guard.get_table_schema(&table_name)
+                                        {
+                                            let actual_types =
+                                                table_schema_types_from_duckdb(&schema);
                                             if actual_types.len() == schema.len() {
-                                                table_schema_types.insert(
-                                                    table_name.clone(),
-                                                    actual_types,
-                                                );
+                                                table_schema_types
+                                                    .insert(table_name.clone(), actual_types);
                                             }
                                         }
                                     }
@@ -4055,6 +4229,8 @@ impl PBackendService for PBackendServiceHandler {
                             drop(engine_guard);
                             continue;
                         }
+
+                        exchange_inputs_have_rows = true;
 
                         // Log PBlock diagnostic info.
                         let blk0 = &blocks[0];
@@ -4365,6 +4541,10 @@ impl PBackendService for PBackendServiceHandler {
                             gpu_capable_exchange_tables
                                 .contains(&exchange_table_name(query_id.1, nid))
                         });
+                    let all_exchange_tables_local_gpu = !exchange_node_ids.is_empty()
+                        && exchange_node_ids
+                            .iter()
+                            .all(|&nid| retained_local_gpu_artifacts.contains_key(&nid));
 
                     let (mut exec_plan, output_names) = if let Some(union_sql) =
                         generate_exchange_union_sql(&params)
@@ -4372,12 +4552,11 @@ impl PBackendService for PBackendServiceHandler {
                         // 1. UNION_NODE: trivial SQL (DuckDB SetRel broken for Substrait)
                         info!(sql = %union_sql, "exchange fragment using UNION SQL path");
                         (ExecPlan::SqlCpuOnly(union_sql), None)
-                    } else if false {
-                        // AGG merge SQL shortcut disabled: it skips node projections
-                        // (division, CASE expressions) that are critical for correctness.
-                        // Using Substrait path instead, which handles projections via
-                        // build_projection_slot_map + slot expression expansion.
-                        unreachable!()
+                    } else if let Some(agg_sql) =
+                        generate_exchange_agg_merge_sql(&params, &table_schemas)
+                    {
+                        info!(sql = %agg_sql, "exchange fragment using GPU AGG merge SQL path");
+                        (ExecPlan::Sql(agg_sql), None)
                     } else if any_gpu_registration_failed {
                         // GPU table registration failed — some exchange tables are CPU-only.
                         // Must use CPU Substrait to avoid GPU engine hanging on invalid tables.
@@ -4417,7 +4596,12 @@ impl PBackendService for PBackendServiceHandler {
                         ) {
                             Ok(plan) => {
                                 let exec = if plan.force_cpu_substrait || !all_exchange_tables_gpu {
-                                    info!("exchange fragment using CPU Substrait path");
+                                    info!(
+                                        force_cpu = plan.force_cpu_substrait,
+                                        all_gpu = all_exchange_tables_gpu,
+                                        all_local_gpu = all_exchange_tables_local_gpu,
+                                        "exchange fragment using CPU Substrait path",
+                                    );
                                     ExecPlan::SubstraitCpuOnly {
                                         bytes: plan.substrait_bytes,
                                         sort_limit_sql: plan.sort_limit_sql,
@@ -4472,8 +4656,10 @@ impl PBackendService for PBackendServiceHandler {
                                 continue;
                             };
                             let table_name = exchange_table_name(query_id.1, node_id);
-                            let ipc_inputs: Vec<&[u8]> =
-                                local_artifacts.iter().map(|artifact| artifact.ipc_bytes()).collect();
+                            let ipc_inputs: Vec<&[u8]> = local_artifacts
+                                .iter()
+                                .map(|artifact| artifact.ipc_bytes())
+                                .collect();
                             let combined_ipc = match concat_ipc_streams(&ipc_inputs) {
                                 Ok(bytes) => bytes,
                                 Err(e) => {
@@ -4494,8 +4680,8 @@ impl PBackendService for PBackendServiceHandler {
                             };
 
                             let engine_guard = engine.lock().unwrap();
-                            if let Err(e) =
-                                engine_guard.register_exchange_table_from_ipc(&table_name, &combined_ipc)
+                            if let Err(e) = engine_guard
+                                .register_exchange_table_from_ipc(&table_name, &combined_ipc)
                             {
                                 warn!(
                                     error = %e,
@@ -4558,6 +4744,58 @@ impl PBackendService for PBackendServiceHandler {
                         exchange_infos,
                         &local_brpc_addr,
                     );
+                    let short_circuit_empty_grouped_agg =
+                        !exchange_inputs_have_rows
+                            && !exchange_infos.is_empty()
+                            && is_grouped_exchange_agg_merge_fragment(&params);
+                    if short_circuit_empty_grouped_agg {
+                        info!(
+                            %finst_id,
+                            exchange_dest_node_ids = ?exchange_infos
+                                .iter()
+                                .map(|info| info.dest_node_id)
+                                .collect::<Vec<_>>(),
+                            "short-circuiting empty grouped exchange AGG merge fragment"
+                        );
+                        let send_result = if exchange_infos.len() == 1 {
+                            send_empty_exchange_eos(
+                                &exchange_infos[0],
+                                query_id,
+                                sender_id,
+                                &local_brpc_addr,
+                                &exchange_buffer,
+                            )
+                            .await
+                        } else {
+                            let mut result = Ok(());
+                            for exch_info in &exchange_infos {
+                                if let Err(e) = send_empty_exchange_eos(
+                                    exch_info,
+                                    query_id,
+                                    sender_id,
+                                    &local_brpc_addr,
+                                    &exchange_buffer,
+                                )
+                                .await
+                                {
+                                    result = Err(e);
+                                    break;
+                                }
+                            }
+                            result
+                        };
+                        if let Err(e) = send_result {
+                            warn!(error = %e, %finst_id, "empty exchange short-circuit failed");
+                            store.store_error(
+                                finst_id,
+                                fragment_finst_id,
+                                format!("empty exchange short-circuit: {e}"),
+                            );
+                        } else {
+                            info!(%finst_id, sender_id, "exchange fragment forward complete");
+                        }
+                        return;
+                    }
                     let use_exchange_only = should_use_exchange_only_capture(
                         &exchange_infos,
                         &local_brpc_addr,
@@ -4577,12 +4815,14 @@ impl PBackendService for PBackendServiceHandler {
                     // mistakenly detected as the current result's location.
                     let is_cpu_only = !exec_plan_uses_gpu(&exec_plan);
 
-                    // If this exchange fragment has destinations and nixl is available,
-                    // retain GPU buffers so nixl can use them after query cleanup.
+                    // Capture GPU exchange artifact when the plan uses GPU.
+                    // Local exchange doesn't need nixl — the artifact stays in-process.
+                    let all_local_exch =
+                        exchange_infos_are_all_local(&exchange_infos, &local_brpc_addr);
                     let should_retain_exch = should_capture_exchange_artifact(
                         &exchange_infos,
                         &exec_plan,
-                        nixl_agent.is_some(),
+                        nixl_agent.is_some() || all_local_exch,
                     ) && !is_cpu_only;
                     let hash_partition_info_exch = exchange_hash_partition_info(&exchange_infos);
                     let exchange_capture_projection_exch = exchange_capture_projection_for_sender(
@@ -4624,6 +4864,19 @@ impl PBackendService for PBackendServiceHandler {
                                 let query_id = (params.query_id.hi, params.query_id.lo);
                                 let send_result = if exchange_infos.len() == 1 {
                                     if should_preserve_packed_exchange(&location) {
+                                        crate::nixl_integration::send_exchange_with_nixl(
+                                            nixl_agent.as_ref(),
+                                            location,
+                                            &exchange_infos[0],
+                                            query_id,
+                                            sender_id,
+                                            nixl_only,
+                                            &local_brpc_addr,
+                                            &exchange_buffer,
+                                            desc_tbl_slots.as_deref(),
+                                        )
+                                        .await
+                                    } else if all_local_exch {
                                         crate::nixl_integration::send_exchange_with_nixl(
                                             nixl_agent.as_ref(),
                                             location,
@@ -4877,22 +5130,40 @@ impl PBackendService for PBackendServiceHandler {
                             force_cpu = plan.force_cpu_substrait,
                             "translated to Substrait"
                         );
-                        // Force CPU for exchange-only fragments (no file scans,
-                        // only exchange tables). GPU hangs on CPU-registered
-                        // exchange tables.
+                        // Constant-only fragments stay on CPU. Exchange-only
+                        // fragments can remain on GPU when every exchange input
+                        // is backed by a packed GPU table.
                         let has_file_scans = !file_scan_infos.is_empty();
-                        let exec =
-                            if plan.force_cpu_substrait || !has_data_tables || !has_file_scans {
-                                ExecPlan::SubstraitCpuOnly {
-                                    bytes: plan.substrait_bytes,
-                                    sort_limit_sql: plan.sort_limit_sql,
-                                }
-                            } else {
-                                ExecPlan::Substrait {
-                                    bytes: plan.substrait_bytes,
-                                    sort_limit_sql: plan.sort_limit_sql,
-                                }
-                            };
+                        let exchange_node_ids = has_unresolved_exchanges(params);
+                        let all_exchange_inputs_gpu = !exchange_node_ids.is_empty()
+                            && exchange_node_ids.iter().all(|node_id| {
+                                local_gpu_receivers_by_dest
+                                    .get(node_id)
+                                    .copied()
+                                    .unwrap_or(false)
+                            });
+                        let exec = if plan.force_cpu_substrait
+                            || !has_data_tables
+                            || (!has_file_scans && !all_exchange_inputs_gpu)
+                        {
+                            info!(
+                                has_file_scans,
+                                all_exchange_inputs_gpu, "using CPU Substrait for merged fragment"
+                            );
+                            ExecPlan::SubstraitCpuOnly {
+                                bytes: plan.substrait_bytes,
+                                sort_limit_sql: plan.sort_limit_sql,
+                            }
+                        } else {
+                            info!(
+                                has_file_scans,
+                                all_exchange_inputs_gpu, "using GPU Substrait for merged fragment"
+                            );
+                            ExecPlan::Substrait {
+                                bytes: plan.substrait_bytes,
+                                sort_limit_sql: plan.sort_limit_sql,
+                            }
+                        };
                         (exec, Some(plan.output_names), plan.output_column_indices)
                     }
                     Err(e) => {
@@ -4955,6 +5226,9 @@ impl PBackendService for PBackendServiceHandler {
                     &local_brpc_addr,
                 );
 
+                let all_local_exchange =
+                    exchange_infos_are_all_local(&exchange_infos_with_local, &local_brpc_addr);
+
                 if execute_leaf_async {
                     let exec_plan = exec_plan;
                     let output_names = output_names.clone();
@@ -4971,7 +5245,8 @@ impl PBackendService for PBackendServiceHandler {
                             &exchange_infos,
                             &exec_plan,
                             nixl_agent.is_some(),
-                        ) && plan_uses_gpu;
+                        ) && plan_uses_gpu
+                            && !all_local_exchange;
                         let use_exchange_only = should_use_exchange_only_capture(
                             &exchange_infos,
                             &local_brpc_addr,
@@ -5117,6 +5392,7 @@ impl PBackendService for PBackendServiceHandler {
             );
             let all_local_exchange =
                 exchange_infos_are_all_local(&exchange_infos_with_local, &self.local_brpc_addr);
+            let plan_uses_gpu = exec_plan_uses_gpu(&exec_plan);
 
             // Check if this is a hash-partitioned exchange.
             let is_hash_partitioned = exchange_infos.len() == 1
@@ -5130,22 +5406,11 @@ impl PBackendService for PBackendServiceHandler {
                     })
                     .unwrap_or(false);
 
-            // For the synchronous all-local leaf path, capture an exchange
-            // artifact so local exchange can move an owned GPU artifact instead
-            // of falling back to PBlock. Hash still only uses the artifact path
-            // for the current single-destination all-local case.
-            let should_retain = all_local_exchange
-                && should_capture_exchange_artifact(
-                    &exchange_infos_with_local,
-                    &exec_plan,
-                    self.nixl_agent.is_some(),
-                )
-                && self.nixl_agent.is_some();
-            let nixl_agent_for_blocking = if should_retain {
-                self.nixl_agent.clone()
-            } else {
-                None
-            };
+            let should_retain = should_capture_exchange_artifact(
+                &exchange_infos_with_local,
+                &exec_plan,
+                self.nixl_agent.is_some() || all_local_exchange,
+            ) && plan_uses_gpu;
 
             let exchange_output_count = exchange_infos.len();
             let hash_partition_info: Option<(usize, Vec<i32>)> = if is_hash_partitioned {
@@ -5190,49 +5455,65 @@ impl PBackendService for PBackendServiceHandler {
             );
 
             // Sirius/DuckDB execution is blocking — run off the async runtime.
-            let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
-                let t_total = std::time::Instant::now();
-                let engine = engine.lock().unwrap();
-                if should_retain {
-                    let _ = engine.finalize_exchange_tables_direct();
-                    tracing::info!("exchange capture started before GPU execution");
-                    let t_exec = std::time::Instant::now();
-                    let location = execute_exchange_plan_to_location(
-                        &engine,
-                        exec_plan,
-                        no_cpu_fallback,
-                        force_cpu,
-                        hash_partition_info,
-                        exchange_capture_projection,
-                        use_exchange_only,
-                    )?;
-                    tracing::info!(exec_ms = t_exec.elapsed().as_millis() as u64, "execute_exchange_plan completed");
-                    if let Some(names) = exec_output_names {
+            let exec_result = tokio::task::spawn_blocking(
+                move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
+                    let t_total = std::time::Instant::now();
+                    let engine = engine.lock().unwrap();
+                    if should_retain {
+                        let _ = engine.finalize_exchange_tables_direct();
+                        tracing::info!("exchange capture started before GPU execution");
+                        let t_exec = std::time::Instant::now();
+                        let location = execute_exchange_plan_to_location(
+                            &engine,
+                            exec_plan,
+                            no_cpu_fallback,
+                            force_cpu,
+                            hash_partition_info,
+                            exchange_capture_projection,
+                            use_exchange_only,
+                        )?;
                         tracing::info!(
-                            exchange_outputs = exchange_output_count,
-                            output_names = ?names,
-                            output_indices = ?exec_output_indices,
-                            "skipping leaf IPC projection for exchange send"
+                            exec_ms = t_exec.elapsed().as_millis() as u64,
+                            "execute_exchange_plan completed"
                         );
-                    }
-                    tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
-                    Ok(location)
-                } else {
-                    let t_exec = std::time::Instant::now();
-                    let ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
-                    tracing::info!(exec_ms = t_exec.elapsed().as_millis() as u64, ipc_len = ipc_bytes.len(), "execute_plan completed");
-                    if let Some(names) = exec_output_names {
+                        if let Some(names) = exec_output_names {
+                            tracing::info!(
+                                exchange_outputs = exchange_output_count,
+                                output_names = ?names,
+                                output_indices = ?exec_output_indices,
+                                "skipping leaf IPC projection for exchange send"
+                            );
+                        }
                         tracing::info!(
-                            exchange_outputs = exchange_output_count,
-                            output_names = ?names,
-                            output_indices = ?exec_output_indices,
-                            "skipping leaf IPC projection for exchange send"
+                            total_ms = t_total.elapsed().as_millis() as u64,
+                            "leaf spawn_blocking done"
                         );
+                        Ok(location)
+                    } else {
+                        let t_exec = std::time::Instant::now();
+                        let ipc_bytes =
+                            execute_plan(&engine, exec_plan, no_cpu_fallback, force_cpu)?;
+                        tracing::info!(
+                            exec_ms = t_exec.elapsed().as_millis() as u64,
+                            ipc_len = ipc_bytes.len(),
+                            "execute_plan completed"
+                        );
+                        if let Some(names) = exec_output_names {
+                            tracing::info!(
+                                exchange_outputs = exchange_output_count,
+                                output_names = ?names,
+                                output_indices = ?exec_output_indices,
+                                "skipping leaf IPC projection for exchange send"
+                            );
+                        }
+                        tracing::info!(
+                            total_ms = t_total.elapsed().as_millis() as u64,
+                            "leaf spawn_blocking done"
+                        );
+                        Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
                     }
-                    tracing::info!(total_ms = t_total.elapsed().as_millis() as u64, "leaf spawn_blocking done");
-                    Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
-                }
-            })
+                },
+            )
             .await;
 
             match exec_result {
@@ -5275,9 +5556,24 @@ impl PBackendService for PBackendServiceHandler {
                                     desc_tbl_slots.as_deref(),
                                 )
                                 .await
+                            } else if all_local_exchange {
+                                crate::nixl_integration::send_exchange_with_nixl(
+                                    self.nixl_agent.as_ref(),
+                                    location,
+                                    &exchange_infos[0],
+                                    query_id,
+                                    sender_id,
+                                    self.nixl_only,
+                                    &self.local_brpc_addr,
+                                    &self.exchange_buffer,
+                                    desc_tbl_slots.as_deref(),
+                                )
+                                .await
                             } else {
-                                match maybe_project_location_for_exchange(location, &exchange_infos[0])
-                                {
+                                match maybe_project_location_for_exchange(
+                                    location,
+                                    &exchange_infos[0],
+                                ) {
                                     Ok(projected_location) => {
                                         crate::nixl_integration::send_exchange_with_nixl(
                                             self.nixl_agent.as_ref(),
@@ -6265,7 +6561,7 @@ mod tests {
         TNetworkAddress, TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType,
         TUniqueId,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     /// Create a minimal TPipelineFragmentParams with the given plan nodes.
     fn make_params(nodes: Vec<TPlanNode>) -> TPipelineFragmentParams {
@@ -6908,7 +7204,15 @@ mod tests {
     fn test_extract_exchange_destinations_prefers_runtime_row_tuple_order() {
         let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
         params.desc_tbl = Some(make_desc_table());
-        params.fragment.as_mut().unwrap().plan.as_mut().unwrap().nodes[0].row_tuples = vec![7];
+        params
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes[0]
+            .row_tuples = vec![7];
         params.fragment.as_mut().unwrap().output_exprs =
             Some(vec![slot_ref_expr(24), slot_ref_expr(23)]);
 
@@ -7024,7 +7328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exchange_finalize_projection_indices_reorder_q1_style_measures() {
+    fn test_exchange_finalize_projection_indices_finalize_receiver_is_identity() {
         let mut agg = make_node(3, TPlanNodeType::AGGREGATION_NODE, 1);
         agg.agg_node = Some(doris_thrift::plan_nodes::TAggregationNode {
             grouping_exprs: Some(vec![slot_ref_expr(49), slot_ref_expr(50)]),
@@ -7294,14 +7598,11 @@ mod tests {
             table_descriptors: None,
         });
 
-        assert_eq!(
-            exchange_finalize_projection_indices(&params, 4),
-            Some(vec![0, 1, 2, 3, 4, 5, 7, 9, 8, 6])
-        );
+        assert_eq!(exchange_finalize_projection_indices(&params, 4), None);
     }
 
     #[test]
-    fn test_aggregate_root_runtime_to_contract_projection_indices_reorder_q1_style_measures() {
+    fn test_aggregate_root_runtime_to_contract_projection_indices_finalize_sender_is_identity() {
         let mut agg = make_node(3, TPlanNodeType::AGGREGATION_NODE, 1);
         agg.row_tuples = vec![6];
         agg.agg_node = Some(doris_thrift::plan_nodes::TAggregationNode {
@@ -7574,8 +7875,354 @@ mod tests {
 
         assert_eq!(
             aggregate_root_runtime_to_contract_projection_indices(&params),
-            Some(vec![0, 1, 2, 3, 9, 4, 5, 8, 7, 6])
+            None
         );
+    }
+
+    #[test]
+    fn test_exchange_capture_projection_for_sender_does_not_force_receiver_projection() {
+        let mut agg = make_node(1, TPlanNodeType::AGGREGATION_NODE, 1);
+        agg.row_tuples = vec![5];
+        agg.agg_node = Some(doris_thrift::plan_nodes::TAggregationNode {
+            grouping_exprs: Some(vec![slot_ref_expr(49), slot_ref_expr(50)]),
+            aggregate_functions: vec![
+                agg_expr("sum", vec![slot_ref_expr(51)]),
+                agg_expr("sum", vec![slot_ref_expr(52)]),
+                agg_expr("sum", vec![slot_ref_expr(54)]),
+                agg_expr("sum", vec![slot_ref_expr(55)]),
+                agg_expr("avg", vec![slot_ref_expr(58)]),
+                agg_expr("avg", vec![slot_ref_expr(57)]),
+                agg_expr("avg", vec![slot_ref_expr(56)]),
+                agg_expr("count", vec![slot_ref_expr(53)]),
+            ],
+            intermediate_tuple_id: 5,
+            output_tuple_id: 5,
+            need_finalize: false,
+            use_streaming_preaggregation: None,
+            agg_sort_infos: None,
+            is_first_phase: None,
+            is_colocate: None,
+            agg_sort_info_by_group_key: None,
+        });
+
+        let params = make_params(vec![agg]);
+
+        let local_capture_projection_by_dest =
+            std::collections::HashMap::from([(2, vec![0, 1, 2, 3, 9, 4, 7, 8, 5, 6])]);
+        let exchange_infos = vec![ExchangeInfo {
+            dest_node_id: 2,
+            destinations: vec![],
+            partition: crate::hash_partitioner::PartitionStrategy::Broadcast,
+            output_names: vec![],
+            output_indices: None,
+        }];
+
+        assert_eq!(
+            exchange_capture_projection_for_sender(
+                &params,
+                &exchange_infos,
+                &local_capture_projection_by_dest
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_generate_exchange_agg_merge_sql_weights_avg_by_partial_count() {
+        let mut agg = make_node(3, TPlanNodeType::AGGREGATION_NODE, 1);
+        agg.agg_node = Some(doris_thrift::plan_nodes::TAggregationNode {
+            grouping_exprs: Some(vec![slot_ref_expr(49), slot_ref_expr(50)]),
+            aggregate_functions: vec![
+                agg_expr("sum", vec![slot_ref_expr(51)]),
+                agg_expr("sum", vec![slot_ref_expr(52)]),
+                agg_expr("sum", vec![slot_ref_expr(54)]),
+                agg_expr("sum", vec![slot_ref_expr(55)]),
+                agg_expr("avg", vec![slot_ref_expr(56)]),
+                agg_expr("avg", vec![slot_ref_expr(57)]),
+                agg_expr("avg", vec![slot_ref_expr(58)]),
+                agg_expr("count", vec![slot_ref_expr(53)]),
+            ],
+            intermediate_tuple_id: 6,
+            output_tuple_id: 6,
+            need_finalize: true,
+            use_streaming_preaggregation: None,
+            agg_sort_infos: None,
+            is_first_phase: None,
+            is_colocate: None,
+            agg_sort_info_by_group_key: None,
+        });
+
+        let mut exch = make_node(4, TPlanNodeType::EXCHANGE_NODE, 0);
+        exch.row_tuples = vec![5];
+
+        let mut params = make_params(vec![agg, exch]);
+        params.desc_tbl = Some(TDescriptorTable {
+            tuple_descriptors: vec![
+                TTupleDescriptor {
+                    id: 5,
+                    byte_size: 0,
+                    num_null_bytes: 0,
+                    table_id: None,
+                    num_null_slots: None,
+                },
+                TTupleDescriptor {
+                    id: 6,
+                    byte_size: 0,
+                    num_null_bytes: 0,
+                    table_id: None,
+                    num_null_slots: None,
+                },
+            ],
+            slot_descriptors: Some(vec![
+                TSlotDescriptor {
+                    id: 49,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 0,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "l_returnflag".to_string(),
+                    slot_idx: 0,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 50,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 1,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "l_linestatus".to_string(),
+                    slot_idx: 1,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 51,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 2,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_51".to_string(),
+                    slot_idx: 2,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 52,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 3,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_52".to_string(),
+                    slot_idx: 3,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 53,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 4,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_53".to_string(),
+                    slot_idx: 4,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 54,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 5,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_54".to_string(),
+                    slot_idx: 5,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 55,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 6,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_55".to_string(),
+                    slot_idx: 6,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 56,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 7,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_56".to_string(),
+                    slot_idx: 7,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 57,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 8,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_57".to_string(),
+                    slot_idx: 8,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+                TSlotDescriptor {
+                    id: 58,
+                    parent: 5,
+                    slot_type: bigint_type_desc(),
+                    column_pos: 9,
+                    byte_offset: 0,
+                    null_indicator_byte: 0,
+                    null_indicator_bit: 0,
+                    col_name: "col_58".to_string(),
+                    slot_idx: 9,
+                    is_materialized: true,
+                    col_unique_id: None,
+                    is_key: None,
+                    need_materialize: None,
+                    is_auto_increment: None,
+                    column_paths: None,
+                    col_default_value: None,
+                    primitive_type: None,
+                    virtual_column_expr: None,
+                    all_access_paths: None,
+                    predicate_access_paths: None,
+                },
+            ]),
+            table_descriptors: None,
+        });
+
+        let sql = generate_exchange_agg_merge_sql(
+            &params,
+            &HashMap::from([(
+                exchange_table_name(params.query_id.lo, 4),
+                vec![
+                    "l_returnflag".to_string(),
+                    "l_linestatus".to_string(),
+                    "col_51".to_string(),
+                    "col_52".to_string(),
+                    "col_53".to_string(),
+                    "col_54".to_string(),
+                    "col_55".to_string(),
+                    "col_56".to_string(),
+                    "col_57".to_string(),
+                    "col_58".to_string(),
+                ],
+            )]),
+        )
+        .expect("sql");
+
+        assert!(sql.contains("SUM(\"col_51\") AS \"col_51\""));
+        assert!(sql.contains("SUM(CAST(\"col_56\" AS DOUBLE) * CAST(\"col_53\" AS DOUBLE)) / SUM(CAST(\"col_53\" AS DOUBLE)) AS \"col_56\""));
+        assert!(sql.contains("SUM(CAST(\"col_57\" AS DOUBLE) * CAST(\"col_53\" AS DOUBLE)) / SUM(CAST(\"col_53\" AS DOUBLE)) AS \"col_57\""));
+        assert!(sql.contains("SUM(CAST(\"col_58\" AS DOUBLE) * CAST(\"col_53\" AS DOUBLE)) / SUM(CAST(\"col_53\" AS DOUBLE)) AS \"col_58\""));
+        assert!(sql.contains("SUM(\"col_53\") AS \"col_53\""));
     }
 
     #[test]
@@ -7598,6 +8245,31 @@ mod tests {
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].destinations.len(), 1);
         assert_eq!(infos[0].destinations[0].brpc_addr, "127.0.0.1:8060");
+    }
+
+    #[test]
+    fn test_exchange_registration_overrides_skip_projection_when_sender_already_applied() {
+        let base: Vec<(usize, String, Option<String>)> =
+            vec!["g0", "g1", "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"]
+                .into_iter()
+                .enumerate()
+                .map(|(idx, name)| (idx, name.to_string(), None))
+                .collect();
+        let projection = vec![0, 1, 4, 2, 3, 9, 5, 6, 7, 8];
+
+        let preserved = exchange_registration_overrides(&base, Some(&projection), true).unwrap();
+        let preserved_names: Vec<String> = preserved.into_iter().map(|(_, name, _)| name).collect();
+        assert_eq!(
+            preserved_names,
+            vec!["g0", "g1", "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"]
+        );
+
+        let projected = exchange_registration_overrides(&base, Some(&projection), false).unwrap();
+        let projected_names: Vec<String> = projected.into_iter().map(|(_, name, _)| name).collect();
+        assert_eq!(
+            projected_names,
+            vec!["g0", "g1", "m2", "m0", "m1", "m7", "m3", "m4", "m5", "m6"]
+        );
     }
 
     #[test]
@@ -7652,6 +8324,50 @@ mod tests {
                 sort_limit_sql: None,
             },
             true,
+        ));
+    }
+
+    #[test]
+    fn test_should_use_exchange_only_capture_for_local_gpu_receivers() {
+        let infos = vec![ExchangeInfo {
+            dest_node_id: 5,
+            destinations: vec![ExchangeDest {
+                brpc_addr: "127.0.0.1:8060".to_string(),
+                finst_id: (0, 0),
+            }],
+            partition: crate::hash_partitioner::PartitionStrategy::Broadcast,
+            output_names: vec![],
+            output_indices: None,
+        }];
+        let receivers = std::collections::HashMap::from([(5, true)]);
+
+        assert!(should_use_exchange_only_capture(
+            &infos,
+            "127.0.0.1:8060",
+            &receivers,
+        ));
+
+        let non_gpu_receivers = std::collections::HashMap::from([(5, false)]);
+        assert!(!should_use_exchange_only_capture(
+            &infos,
+            "127.0.0.1:8060",
+            &non_gpu_receivers,
+        ));
+
+        let remote_infos = vec![ExchangeInfo {
+            dest_node_id: 5,
+            destinations: vec![ExchangeDest {
+                brpc_addr: "10.0.0.2:8060".to_string(),
+                finst_id: (0, 0),
+            }],
+            partition: crate::hash_partitioner::PartitionStrategy::Broadcast,
+            output_names: vec![],
+            output_indices: None,
+        }];
+        assert!(!should_use_exchange_only_capture(
+            &remote_infos,
+            "127.0.0.1:8060",
+            &receivers,
         ));
     }
 

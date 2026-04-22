@@ -94,10 +94,7 @@ fn test_legacy_format_matched() {
 
 #[test]
 fn test_prefers_exch_over_legacy() {
-    let schemas = schemas_with(&[
-        "__EXCH_12345678_5",
-        "__EXCHANGE_TABLE_5",
-    ]);
+    let schemas = schemas_with(&["__EXCH_12345678_5", "__EXCHANGE_TABLE_5"]);
     assert_eq!(
         resolve_exchange_table_name(5, &schemas),
         "__EXCH_12345678_5",
@@ -107,12 +104,7 @@ fn test_prefers_exch_over_legacy() {
 
 #[test]
 fn test_mixed_tables_ignores_non_exchange() {
-    let schemas = schemas_with(&[
-        "lineitem_1",
-        "orders_2",
-        "__EXCH_abcdef01_3",
-        "nation_4",
-    ]);
+    let schemas = schemas_with(&["lineitem_1", "orders_2", "__EXCH_abcdef01_3", "nation_4"]);
     assert_eq!(
         resolve_exchange_table_name(3, &schemas),
         "__EXCH_abcdef01_3"

@@ -17,6 +17,7 @@
 #include "op/sirius_physical_limit.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/copying.hpp>
 
@@ -28,7 +29,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_streaming_limit::sirius_physical_streaming_limit(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::BoundLimitNode limit_val_p,
   duckdb::BoundLimitNode offset_val_p,
   std::size_t estimated_cardinality,
@@ -72,11 +73,11 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   const auto& input_batches = input.get_data_batches();
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
-    throw duckdb::NotImplementedException("Streaming limit with non-constant limit value");
+    throw not_implemented_exception("Streaming limit with non-constant limit value");
   }
   if (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
       offset_val.Type() != duckdb::LimitNodeType::UNSET) {
-    throw duckdb::NotImplementedException("Streaming limit with non-constant offset value");
+    throw not_implemented_exception("Streaming limit with non-constant offset value");
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;

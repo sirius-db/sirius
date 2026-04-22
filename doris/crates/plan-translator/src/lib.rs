@@ -11,11 +11,13 @@ use prost::Message;
 use tracing::debug;
 
 use doris_thrift::exprs::{TExpr, TExprNodeType};
-use doris_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNodeType};
 use doris_thrift::palo_internal_service::TPipelineFragmentParams;
+use doris_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNodeType};
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUri};
-use substrait::proto::{join_rel, rel, rel_common, Plan, PlanRel, ProjectRel, Rel, RelCommon, RelRoot, Version};
+use substrait::proto::{
+    join_rel, rel, rel_common, Plan, PlanRel, ProjectRel, Rel, RelCommon, RelRoot, Version,
+};
 
 pub mod descriptor_table;
 pub mod expr_translator;
@@ -30,11 +32,18 @@ pub mod type_mapper;
 /// Substrait plans use column indices, so names just need to be unique.
 fn dedup_column_names(names: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashMap::<String, usize>::new();
-    names.into_iter().map(|name| {
-        let count = seen.entry(name.clone()).or_insert(0);
-        *count += 1;
-        if *count == 1 { name } else { format!("{}_{}", name, *count - 1) }
-    }).collect()
+    names
+        .into_iter()
+        .map(|name| {
+            let count = seen.entry(name.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                name
+            } else {
+                format!("{}_{}", name, *count - 1)
+            }
+        })
+        .collect()
 }
 
 fn is_semi_or_anti_join_op(join_op: &TJoinOp) -> bool {
@@ -70,7 +79,9 @@ fn fragment_cpu_substrait_reason(plan: &TPlan) -> Option<&'static str> {
                 if !is_semi_or_anti_join_op(&hash_join.join_op)
                     && (has_other_join_conjuncts || has_vother_join_conjunct)
                 {
-                    return Some("HASH_JOIN_NODE with non-equality predicates on non-SEMI/ANTI join");
+                    return Some(
+                        "HASH_JOIN_NODE with non-equality predicates on non-SEMI/ANTI join",
+                    );
                 }
             }
             _ => {}
@@ -220,9 +231,7 @@ fn rel_output_names(rel: &Rel) -> Vec<String> {
             // SEMI/ANTI joins output only one side's columns.
             match join_rel::JoinType::try_from(j.r#type).ok() {
                 Some(join_rel::JoinType::LeftSemi | join_rel::JoinType::LeftAnti) => left_names,
-                Some(join_rel::JoinType::RightSemi | join_rel::JoinType::RightAnti) => {
-                    right_names
-                }
+                Some(join_rel::JoinType::RightSemi | join_rel::JoinType::RightAnti) => right_names,
                 _ => {
                     let mut names = left_names;
                     names.extend(right_names);
@@ -312,16 +321,24 @@ pub struct SortColumn {
 /// This allows the expression translator to inline computed expressions from scan projections
 /// when downstream nodes (AGG, SORT) reference these computed slots.
 fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::DescriptorTable) {
-    let mut slot_expressions: HashMap<i32, descriptor_table::SlotExpressionInfo> =
-        HashMap::new();
+    let mut slot_expressions: HashMap<i32, descriptor_table::SlotExpressionInfo> = HashMap::new();
 
     for node in &plan.nodes {
         // Log projection info for debugging.
         let proj_count = node.projections.as_ref().map(|p| p.len()).unwrap_or(0);
         if proj_count > 0 {
-            let types: Vec<String> = node.projections.as_ref().unwrap().iter().map(|e| {
-                e.nodes.first().map(|n| format!("{:?}(ch={})", n.node_type, n.num_children)).unwrap_or_default()
-            }).collect();
+            let types: Vec<String> = node
+                .projections
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    e.nodes
+                        .first()
+                        .map(|n| format!("{:?}(ch={})", n.node_type, n.num_children))
+                        .unwrap_or_default()
+                })
+                .collect();
             tracing::warn!(
                 node_id = node.node_id,
                 node_type = ?node.node_type,
@@ -427,7 +444,11 @@ fn extract_sort_limit_from_plan(
     desc: &descriptor_table::DescriptorTable,
     rel_column_names: &[String],
 ) -> (Option<String>, Vec<SortColumn>, Option<i64>) {
-    let sort_plan_node = match plan.nodes.iter().find(|n| n.node_type == TPlanNodeType::SORT_NODE) {
+    let sort_plan_node = match plan
+        .nodes
+        .iter()
+        .find(|n| n.node_type == TPlanNodeType::SORT_NODE)
+    {
         Some(n) => n,
         None => return (None, vec![], None),
     };
@@ -450,11 +471,14 @@ fn extract_sort_limit_from_plan(
             let sr = node.slot_ref.as_ref()?;
             let slot = desc.get_slot(sr.slot_id).ok()?;
             let ordinal = if !sort_plan_node.row_tuples.is_empty() {
-                desc.slot_global_index(sr.slot_id, &sort_plan_node.row_tuples).ok()
+                desc.slot_global_index(sr.slot_id, &sort_plan_node.row_tuples)
+                    .ok()
             } else {
                 None
             };
-            let name = if !slot.col_name.is_empty() && rel_column_names.iter().any(|n| n == &slot.col_name) {
+            let name = if !slot.col_name.is_empty()
+                && rel_column_names.iter().any(|n| n == &slot.col_name)
+            {
                 Some(slot.col_name.clone())
             } else {
                 ordinal
@@ -530,12 +554,7 @@ pub fn translate_fragment(
     table_schemas: &HashMap<String, Vec<String>>,
     file_scan_map: &HashMap<String, FileScanInfo>,
 ) -> Result<TranslatedPlan> {
-    translate_fragment_with_table_types(
-        params,
-        table_schemas,
-        &HashMap::new(),
-        file_scan_map,
-    )
+    translate_fragment_with_table_types(params, table_schemas, &HashMap::new(), file_scan_map)
 }
 
 pub fn translate_fragment_with_table_types(
@@ -606,9 +625,15 @@ pub fn translate_fragment_with_table_types(
     // column dropping even when every expr is a SLOT_REF. Without this, the
     // Substrait plan can keep extra join/agg columns that shift the FE result.
     if let Some(output_exprs) = fragment.output_exprs.as_ref() {
-        let types: Vec<_> = output_exprs.iter().map(|e| {
-            e.nodes.first().map(|n| format!("{:?}", n.node_type)).unwrap_or_default()
-        }).collect();
+        let types: Vec<_> = output_exprs
+            .iter()
+            .map(|e| {
+                e.nodes
+                    .first()
+                    .map(|n| format!("{:?}", n.node_type))
+                    .unwrap_or_default()
+            })
+            .collect();
         tracing::warn!(num_exprs = output_exprs.len(), types = ?types, "output_exprs types");
     }
     let mut filtered_output_exprs: Option<Vec<TExpr>> = None;
@@ -636,7 +661,12 @@ pub fn translate_fragment_with_table_types(
                     })
                     .and_then(|sr| {
                         desc.get_slot(sr.slot_id).ok().map(|slot| {
-                            (sr.slot_id, sr.tuple_id, slot.col_name.clone(), slot.column_pos)
+                            (
+                                sr.slot_id,
+                                sr.tuple_id,
+                                slot.col_name.clone(),
+                                slot.column_pos,
+                            )
                         })
                     });
                 let translated = expr_translator::translate_expr_in_context(
@@ -652,13 +682,12 @@ pub fn translate_fragment_with_table_types(
                     rel_names = ?rel_names,
                     "translated fragment output_expr"
                 );
-                let is_pure_slot_ref =
-                    expr.nodes.len() == 1
-                        && expr
-                            .nodes
-                            .first()
-                            .map(|n| n.node_type == TExprNodeType::SLOT_REF)
-                            .unwrap_or(false);
+                let is_pure_slot_ref = expr.nodes.len() == 1
+                    && expr
+                        .nodes
+                        .first()
+                        .map(|n| n.node_type == TExprNodeType::SLOT_REF)
+                        .unwrap_or(false);
                 if is_pure_slot_ref {
                     if let Some(field_idx) = node_translator::extract_field_ref_index(&translated) {
                         if field_idx >= num_input as i32 {
@@ -681,9 +710,8 @@ pub fn translate_fragment_with_table_types(
             desc.clear_child_rel_column_names();
             filtered_output_exprs = Some(kept_output_exprs);
 
-            let output_mapping: Vec<i32> = (num_input as i32
-                ..num_input as i32 + projections.len() as i32)
-                .collect();
+            let output_mapping: Vec<i32> =
+                (num_input as i32..num_input as i32 + projections.len() as i32).collect();
 
             if !projections.is_empty() {
                 debug!(
@@ -734,7 +762,9 @@ pub fn translate_fragment_with_table_types(
                 format!("Filter({cols})[{child}]")
             }
             Some(rel::RelType::Join(j)) => {
-                let jt = join_rel::JoinType::try_from(j.r#type).map(|t| format!("{t:?}")).unwrap_or_default();
+                let jt = join_rel::JoinType::try_from(j.r#type)
+                    .map(|t| format!("{t:?}"))
+                    .unwrap_or_default();
                 let l = j.left.as_deref().map(dump_rel_flat).unwrap_or_default();
                 let r = j.right.as_deref().map(dump_rel_flat).unwrap_or_default();
                 format!("{jt}({cols})[{l}, {r}]")
@@ -1020,9 +1050,9 @@ mod tests {
             duckdb::types::ValueRef::Float(v) => v.to_string(),
             duckdb::types::ValueRef::Double(v) => v.to_string(),
             duckdb::types::ValueRef::Decimal(v) => v.to_string(),
-            duckdb::types::ValueRef::Text(v) => std::str::from_utf8(v)
-                .expect("utf8 text")
-                .to_string(),
+            duckdb::types::ValueRef::Text(v) => {
+                std::str::from_utf8(v).expect("utf8 text").to_string()
+            }
             other => panic!("unsupported test value type: {:?}", other),
         }
     }
@@ -1030,10 +1060,7 @@ mod tests {
     fn query_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
         let mut stmt = conn.prepare(sql).expect("prepare query");
         let mut rows = stmt.query([]).expect("run query");
-        let col_count = rows
-            .as_ref()
-            .expect("executed statement")
-            .column_count();
+        let col_count = rows.as_ref().expect("executed statement").column_count();
         let mut out = Vec::new();
         while let Some(row) = rows.next().expect("next row") {
             let mut values = Vec::with_capacity(col_count);
@@ -1118,7 +1145,11 @@ mod tests {
         let mut table_schemas = HashMap::new();
         table_schemas.insert(
             "cities_0".to_string(),
-            vec!["city".to_string(), "state".to_string(), "population".to_string()],
+            vec![
+                "city".to_string(),
+                "state".to_string(),
+                "population".to_string(),
+            ],
         );
 
         let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
@@ -1147,7 +1178,11 @@ mod tests {
         let mut table_schemas = HashMap::new();
         table_schemas.insert(
             "cities_0".to_string(),
-            vec!["city".to_string(), "state".to_string(), "population".to_string()],
+            vec![
+                "city".to_string(),
+                "state".to_string(),
+                "population".to_string(),
+            ],
         );
 
         let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
@@ -1162,14 +1197,21 @@ mod tests {
             Some(plan_rel::RelType::Root(r)) => r,
             _ => panic!("expected Root"),
         };
-        assert_eq!(root.names, vec!["city", "state", "population"],
-            "RelRoot.names should be all rel columns (no ProjectRel subset selection)");
+        assert_eq!(
+            root.names,
+            vec!["city", "state", "population"],
+            "RelRoot.names should be all rel columns (no ProjectRel subset selection)"
+        );
         // Root input is the ReadRel directly (no ProjectRel wrapping).
         let input = root.input.as_ref().unwrap();
         match input.rel_type.as_ref().unwrap() {
             rel::RelType::Read(read) => {
                 let schema = read.base_schema.as_ref().unwrap();
-                assert_eq!(schema.names.len(), 3, "ReadRel should have all table columns");
+                assert_eq!(
+                    schema.names.len(),
+                    3,
+                    "ReadRel should have all table columns"
+                );
                 assert_eq!(schema.names, vec!["city", "state", "population"]);
             }
             other => panic!("expected Read, got {:?}", other),
@@ -1234,7 +1276,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         match input.rel_type.as_ref().unwrap() {
             rel::RelType::Project(_) => {}
-            other => panic!("expected ProjectRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected ProjectRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
         assert_eq!(
             node_translator::collect_rel_column_names(input),
@@ -1361,7 +1406,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         match input.rel_type.as_ref().unwrap() {
             rel::RelType::Join(join) => {
-                assert_eq!(join.r#type, substrait::proto::join_rel::JoinType::Inner as i32);
+                assert_eq!(
+                    join.r#type,
+                    substrait::proto::join_rel::JoinType::Inner as i32
+                );
                 assert!(join.expression.is_some(), "should have join expression");
                 assert!(join.left.is_some());
                 assert!(join.right.is_some());
@@ -1405,7 +1453,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         match input.rel_type.as_ref().unwrap() {
             rel::RelType::Join(join) => {
-                assert_eq!(join.r#type, substrait::proto::join_rel::JoinType::Left as i32);
+                assert_eq!(
+                    join.r#type,
+                    substrait::proto::join_rel::JoinType::Left as i32
+                );
             }
             other => panic!("expected JoinRel, got {:?}", std::mem::discriminant(other)),
         }
@@ -1425,7 +1476,11 @@ mod tests {
                 slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
             )],
         );
-        join_node.hash_join_node.as_mut().unwrap().vother_join_conjunct = Some(binary_pred_expr(
+        join_node
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .vother_join_conjunct = Some(binary_pred_expr(
             TExprOpcode::LT,
             slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
             slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
@@ -1465,7 +1520,11 @@ mod tests {
                 slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
             )],
         );
-        join_node.hash_join_node.as_mut().unwrap().vother_join_conjunct = Some(binary_pred_expr(
+        join_node
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .vother_join_conjunct = Some(binary_pred_expr(
             TExprOpcode::LT,
             slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
             slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
@@ -1513,8 +1572,8 @@ mod tests {
                 // COUNT(*) — aggregate with 0 children
                 agg_function_expr("count", type_desc(TPrimitiveType::BIGINT), vec![], vec![]),
             ],
-            1, // intermediate_tuple_id
-            2, // output_tuple_id
+            1,    // intermediate_tuple_id
+            2,    // output_tuple_id
             true, // need_finalize
         );
         let plan = make_plan(vec![agg, scan]);
@@ -1546,9 +1605,15 @@ mod tests {
                 );
                 assert_eq!(agg.measures.len(), 1, "should have 1 measure (count)");
                 let measure = &agg.measures[0].measure.as_ref().unwrap();
-                assert_eq!(measure.phase, 4, "should be INTERMEDIATE_TO_RESULT for exchange finalize");
+                assert_eq!(
+                    measure.phase, 4,
+                    "should be INTERMEDIATE_TO_RESULT for exchange finalize"
+                );
             }
-            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -1560,21 +1625,45 @@ mod tests {
         let partial_agg = make_aggregation_node(
             1,
             vec![1],
-            Some(vec![slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT))]),
-            vec![agg_function_expr("sum", type_desc(TPrimitiveType::BIGINT),
+            Some(vec![slot_ref_expr_in_tuple(
+                0,
+                0,
+                type_desc(TPrimitiveType::BIGINT),
+            )]),
+            vec![agg_function_expr(
+                "sum",
+                type_desc(TPrimitiveType::BIGINT),
                 vec![type_desc(TPrimitiveType::BIGINT)],
-                vec![slot_ref_expr_in_tuple(1, 0, type_desc(TPrimitiveType::BIGINT))])],
-            1, 1,
+                vec![slot_ref_expr_in_tuple(
+                    1,
+                    0,
+                    type_desc(TPrimitiveType::BIGINT),
+                )],
+            )],
+            1,
+            1,
             false, // need_finalize=false (partial)
         );
         let finalize_agg = make_aggregation_node(
             0,
             vec![2],
-            Some(vec![slot_ref_expr_in_tuple(10, 1, type_desc(TPrimitiveType::BIGINT))]),
-            vec![agg_function_expr("sum", type_desc(TPrimitiveType::BIGINT),
+            Some(vec![slot_ref_expr_in_tuple(
+                10,
+                1,
+                type_desc(TPrimitiveType::BIGINT),
+            )]),
+            vec![agg_function_expr(
+                "sum",
+                type_desc(TPrimitiveType::BIGINT),
                 vec![type_desc(TPrimitiveType::BIGINT)],
-                vec![slot_ref_expr_in_tuple(11, 1, type_desc(TPrimitiveType::BIGINT))])],
-            2, 2,
+                vec![slot_ref_expr_in_tuple(
+                    11,
+                    1,
+                    type_desc(TPrimitiveType::BIGINT),
+                )],
+            )],
+            2,
+            2,
             true, // need_finalize=true (finalize)
         );
         let plan = make_plan(vec![finalize_agg, partial_agg, scan]);
@@ -1603,14 +1692,23 @@ mod tests {
             rel::RelType::Aggregate(agg) => {
                 assert_eq!(agg.measures.len(), 1);
                 let measure = agg.measures[0].measure.as_ref().unwrap();
-                assert_eq!(measure.phase, 3, "should be INITIAL_TO_RESULT after collapse");
+                assert_eq!(
+                    measure.phase, 3,
+                    "should be INITIAL_TO_RESULT after collapse"
+                );
                 // Input should be the scan, not another aggregate.
                 match agg.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
                     rel::RelType::Read(_) => {} // Good — the partial was collapsed
-                    other => panic!("expected ReadRel under collapsed AGG, got {:?}", std::mem::discriminant(other)),
+                    other => panic!(
+                        "expected ReadRel under collapsed AGG, got {:?}",
+                        std::mem::discriminant(other)
+                    ),
                 }
             }
-            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -1623,11 +1721,15 @@ mod tests {
         let sort = make_sort_node(
             0,
             vec![0],
-            vec![slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT))],
-            vec![true],  // ASC
-            vec![true],  // NULLS FIRST
-            None,        // no offset
-            -1,          // no limit
+            vec![slot_ref_expr_in_tuple(
+                0,
+                0,
+                type_desc(TPrimitiveType::BIGINT),
+            )],
+            vec![true], // ASC
+            vec![true], // NULLS FIRST
+            None,       // no offset
+            -1,         // no limit
         );
         let plan = make_plan(vec![sort, scan]);
         let desc = make_desc_table(
@@ -1657,7 +1759,10 @@ mod tests {
                 let sort_field = &sort.sorts[0];
                 match sort_field.sort_kind.as_ref().unwrap() {
                     substrait::proto::sort_field::SortKind::Direction(d) => {
-                        assert_eq!(d, &(substrait::proto::sort_field::SortDirection::AscNullsFirst as i32));
+                        assert_eq!(
+                            d,
+                            &(substrait::proto::sort_field::SortDirection::AscNullsFirst as i32)
+                        );
                     }
                     other => panic!("expected Direction, got {:?}", other),
                 }
@@ -1673,7 +1778,11 @@ mod tests {
         let sort = make_sort_node(
             0,
             vec![0],
-            vec![slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT))],
+            vec![slot_ref_expr_in_tuple(
+                0,
+                0,
+                type_desc(TPrimitiveType::BIGINT),
+            )],
             vec![false], // DESC
             vec![false], // NULLS LAST
             Some(5),     // offset
@@ -1713,7 +1822,10 @@ mod tests {
                     rel::RelType::Sort(sort) => {
                         assert_eq!(sort.sorts.len(), 1);
                     }
-                    other => panic!("expected SortRel under Fetch, got {:?}", std::mem::discriminant(other)),
+                    other => panic!(
+                        "expected SortRel under Fetch, got {:?}",
+                        std::mem::discriminant(other)
+                    ),
                 }
             }
             other => panic!("expected FetchRel, got {:?}", std::mem::discriminant(other)),
@@ -1826,59 +1938,45 @@ mod tests {
         let left_scan = make_file_scan_node(1, 0, "nation_left");
         let right_scan = make_file_scan_node(2, 1, "nation_right");
         let mut join_node = make_cross_join_node(0, vec![0, 1]);
-        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
-            compound_pred_expr(
-                TExprOpcode::COMPOUND_OR,
-                vec![
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    11,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                        ],
-                    ),
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    11,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        ]);
+        join_node
+            .nested_loop_join_node
+            .as_mut()
+            .unwrap()
+            .join_conjuncts = Some(vec![compound_pred_expr(
+            TExprOpcode::COMPOUND_OR,
+            vec![
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(11, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                    ],
+                ),
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(11, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                    ],
+                ),
+            ],
+        )]);
 
         let plan = make_plan(vec![join_node, left_scan, right_scan]);
         let desc = make_desc_table(
@@ -1905,7 +2003,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         let filter = match input.rel_type.as_ref().unwrap() {
             rel::RelType::Filter(filter) => filter,
-            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected FilterRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
         match filter.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
             rel::RelType::Cross(_) => {}
@@ -1933,59 +2034,45 @@ mod tests {
         let right_scan = make_file_scan_node(2, 1, "nation_right");
         let mut join_node = make_cross_join_node(0, vec![0, 1]);
         join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
-        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
-            compound_pred_expr(
-                TExprOpcode::COMPOUND_OR,
-                vec![
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    11,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                        ],
-                    ),
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    11,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        ]);
+        join_node
+            .nested_loop_join_node
+            .as_mut()
+            .unwrap()
+            .join_conjuncts = Some(vec![compound_pred_expr(
+            TExprOpcode::COMPOUND_OR,
+            vec![
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(11, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                    ],
+                ),
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(11, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                    ],
+                ),
+            ],
+        )]);
 
         let plan = make_plan(vec![join_node, left_scan, right_scan]);
         let desc = make_desc_table(
@@ -2012,7 +2099,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         let filter = match input.rel_type.as_ref().unwrap() {
             rel::RelType::Filter(filter) => filter,
-            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected FilterRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
         match filter.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
             rel::RelType::Cross(_) => {}
@@ -2043,59 +2133,45 @@ mod tests {
         let right_scan = make_file_scan_node(2, 1, "nation_right");
         let mut join_node = make_cross_join_node(0, vec![0, 1]);
         join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
-        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
-            compound_pred_expr(
-                TExprOpcode::COMPOUND_OR,
-                vec![
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    11,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                        ],
-                    ),
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    11,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    2,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        ]);
+        join_node
+            .nested_loop_join_node
+            .as_mut()
+            .unwrap()
+            .join_conjuncts = Some(vec![compound_pred_expr(
+            TExprOpcode::COMPOUND_OR,
+            vec![
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(11, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                    ],
+                ),
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(11, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 2, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                    ],
+                ),
+            ],
+        )]);
 
         let plan = make_plan(vec![join_node, left_scan, right_scan]);
         let desc = make_desc_table(
@@ -2155,61 +2231,50 @@ mod tests {
         let right_scan = make_file_scan_node(2, 3, "nation");
         let mut join_node = make_cross_join_node(3, vec![5]);
         join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
-        join_node.nested_loop_join_node.as_mut().unwrap().vintermediate_tuple_id_list =
-            Some(vec![4]);
-        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
-            compound_pred_expr(
-                TExprOpcode::COMPOUND_OR,
-                vec![
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    4,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    15,
-                                    4,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                        ],
-                    ),
-                    compound_pred_expr(
-                        TExprOpcode::COMPOUND_AND,
-                        vec![
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    13,
-                                    4,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("GERMANY"),
-                            ),
-                            binary_pred_expr(
-                                TExprOpcode::EQ,
-                                slot_ref_expr_in_tuple(
-                                    15,
-                                    4,
-                                    type_desc(TPrimitiveType::VARCHAR),
-                                ),
-                                string_literal_expr("FRANCE"),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        ]);
+        join_node
+            .nested_loop_join_node
+            .as_mut()
+            .unwrap()
+            .vintermediate_tuple_id_list = Some(vec![4]);
+        join_node
+            .nested_loop_join_node
+            .as_mut()
+            .unwrap()
+            .join_conjuncts = Some(vec![compound_pred_expr(
+            TExprOpcode::COMPOUND_OR,
+            vec![
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 4, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(15, 4, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                    ],
+                ),
+                compound_pred_expr(
+                    TExprOpcode::COMPOUND_AND,
+                    vec![
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(13, 4, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("GERMANY"),
+                        ),
+                        binary_pred_expr(
+                            TExprOpcode::EQ,
+                            slot_ref_expr_in_tuple(15, 4, type_desc(TPrimitiveType::VARCHAR)),
+                            string_literal_expr("FRANCE"),
+                        ),
+                    ],
+                ),
+            ],
+        )]);
         join_node.projections = Some(vec![
             slot_ref_expr_in_tuple(12, 4, type_desc(TPrimitiveType::BIGINT)),
             slot_ref_expr_in_tuple(13, 4, type_desc(TPrimitiveType::VARCHAR)),
@@ -2336,13 +2401,15 @@ mod tests {
         );
         let mut join_node = make_cross_join_node(0, vec![0, 2]);
         join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
-        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
-            binary_pred_expr(
-                doris_thrift::opcodes::TExprOpcode::EQ,
-                slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
-                slot_ref_expr_in_tuple(20, 2, type_desc(TPrimitiveType::BIGINT)),
-            ),
-        ]);
+        join_node
+            .nested_loop_join_node
+            .as_mut()
+            .unwrap()
+            .join_conjuncts = Some(vec![binary_pred_expr(
+            doris_thrift::opcodes::TExprOpcode::EQ,
+            slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+            slot_ref_expr_in_tuple(20, 2, type_desc(TPrimitiveType::BIGINT)),
+        )]);
 
         let plan = make_plan(vec![join_node, left_scan, right_agg, right_scan]);
         let desc = make_desc_table(
@@ -2366,7 +2433,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         let filter = match input.rel_type.as_ref().unwrap() {
             rel::RelType::Filter(filter) => filter,
-            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected FilterRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
         assert_eq!(
             node_translator::collect_rel_column_names(input),
@@ -2415,13 +2485,15 @@ mod tests {
         );
         let mut join_node = make_cross_join_node(0, vec![0, 2]);
         join_node.nested_loop_join_node.as_mut().unwrap().join_op = TJoinOp::INNER_JOIN;
-        join_node.nested_loop_join_node.as_mut().unwrap().join_conjuncts = Some(vec![
-            binary_pred_expr(
-                doris_thrift::opcodes::TExprOpcode::EQ,
-                slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
-                slot_ref_expr_in_tuple(20, 2, type_desc(TPrimitiveType::BIGINT)),
-            ),
-        ]);
+        join_node
+            .nested_loop_join_node
+            .as_mut()
+            .unwrap()
+            .join_conjuncts = Some(vec![binary_pred_expr(
+            doris_thrift::opcodes::TExprOpcode::EQ,
+            slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+            slot_ref_expr_in_tuple(20, 2, type_desc(TPrimitiveType::BIGINT)),
+        )]);
 
         let plan = make_plan(vec![join_node, left_scan, right_agg, right_scan]);
         let desc = make_desc_table(
@@ -2510,7 +2582,10 @@ mod tests {
                     other => panic!("expected ReadRel, got {:?}", std::mem::discriminant(other)),
                 }
             }
-            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected FilterRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -2519,7 +2594,12 @@ mod tests {
     #[test]
     fn test_exchange_passthrough_with_child() {
         // EXCHANGE_NODE(1 child) = sender wrapping scan → should pass through.
-        let exchange = make_plan_node(0, doris_thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE, 1, vec![0]);
+        let exchange = make_plan_node(
+            0,
+            doris_thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE,
+            1,
+            vec![0],
+        );
         let scan = make_file_scan_node(1, 0, "data");
         let plan = make_plan(vec![exchange, scan]);
         let desc = make_desc_table(
@@ -2538,7 +2618,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         match input.rel_type.as_ref().unwrap() {
             rel::RelType::Read(_) => {}
-            other => panic!("expected ReadRel (pass-through), got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected ReadRel (pass-through), got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -2546,7 +2629,12 @@ mod tests {
 
     #[test]
     fn test_materialization_passthrough() {
-        let mat_node = make_plan_node(0, doris_thrift::plan_nodes::TPlanNodeType::MATERIALIZATION_NODE, 1, vec![0]);
+        let mat_node = make_plan_node(
+            0,
+            doris_thrift::plan_nodes::TPlanNodeType::MATERIALIZATION_NODE,
+            1,
+            vec![0],
+        );
         let scan = make_file_scan_node(1, 0, "data");
         let plan = make_plan(vec![mat_node, scan]);
         let desc = make_desc_table(
@@ -2653,8 +2741,8 @@ mod tests {
                 (17, 0, 7, "s_comment", TPrimitiveType::VARCHAR),
                 // Tuple 1 slots (exchange order — different from FE order)
                 (20, 1, 0, "s_acctbal", TPrimitiveType::DOUBLE),
-                (21, 1, 1, "n_name", TPrimitiveType::VARCHAR),  // n_name before s_name
-                (22, 1, 2, "s_name", TPrimitiveType::VARCHAR),  // s_name after n_name
+                (21, 1, 1, "n_name", TPrimitiveType::VARCHAR), // n_name before s_name
+                (22, 1, 2, "s_name", TPrimitiveType::VARCHAR), // s_name after n_name
                 (23, 1, 3, "p_partkey", TPrimitiveType::INT),
             ],
         );
@@ -2666,7 +2754,7 @@ mod tests {
             "__EXCHANGE_TABLE_1".to_string(),
             vec![
                 "s_acctbal".to_string(),
-                "n_name".to_string(),  // sort-key order
+                "n_name".to_string(), // sort-key order
                 "s_name".to_string(),
                 "p_partkey".to_string(),
             ],
@@ -2689,8 +2777,11 @@ mod tests {
             Some(plan_rel::RelType::Root(r)) => r,
             _ => panic!("expected Root"),
         };
-        assert_eq!(root.names, vec!["s_acctbal", "n_name", "s_name", "p_partkey"],
-            "Root.names should be in rel_names order (exchange table order)");
+        assert_eq!(
+            root.names,
+            vec!["s_acctbal", "n_name", "s_name", "p_partkey"],
+            "Root.names should be in rel_names order (exchange table order)"
+        );
     }
 
     // ---- EMPTY_SET_NODE test ----
@@ -2789,8 +2880,14 @@ mod tests {
 
         // Provide table schemas for both scans.
         let table_schemas: HashMap<String, Vec<String>> = [
-            ("table_a_1".to_string(), vec!["city".to_string(), "pop".to_string()]),
-            ("table_b_2".to_string(), vec!["city".to_string(), "pop".to_string()]),
+            (
+                "table_a_1".to_string(),
+                vec!["city".to_string(), "pop".to_string()],
+            ),
+            (
+                "table_b_2".to_string(),
+                vec!["city".to_string(), "pop".to_string()],
+            ),
         ]
         .into_iter()
         .collect();
@@ -2814,8 +2911,8 @@ mod tests {
     #[test]
     fn test_count_rel_columns_for_set_rel() {
         use crate::node_translator::count_rel_columns;
-        use substrait::proto::{set_rel, Rel, SetRel};
         use substrait::proto::rel::RelType;
+        use substrait::proto::{set_rel, Rel, SetRel};
 
         // SetRel with first input having 3 columns (ReadRel with 3-field named_struct).
         let read_rel = Rel {
@@ -2848,8 +2945,8 @@ mod tests {
     #[test]
     fn test_count_rel_columns_for_empty_set() {
         use crate::node_translator::count_rel_columns;
-        use substrait::proto::{Rel, SetRel};
         use substrait::proto::rel::RelType;
+        use substrait::proto::{Rel, SetRel};
 
         let set_rel = Rel {
             rel_type: Some(RelType::Set(SetRel {
@@ -2864,8 +2961,8 @@ mod tests {
 
     #[test]
     fn test_rel_output_names_for_set() {
-        use substrait::proto::{set_rel, Rel, SetRel};
         use substrait::proto::rel::RelType;
+        use substrait::proto::{set_rel, Rel, SetRel};
 
         let read = Rel {
             rel_type: Some(RelType::Read(Box::new(substrait::proto::ReadRel {
@@ -2948,10 +3045,15 @@ mod tests {
                     "sum",
                     type_desc(TPrimitiveType::DOUBLE),
                     vec![type_desc(TPrimitiveType::DOUBLE)],
-                    vec![slot_ref_expr_in_tuple(32, 3, type_desc(TPrimitiveType::DOUBLE))],
+                    vec![slot_ref_expr_in_tuple(
+                        32,
+                        3,
+                        type_desc(TPrimitiveType::DOUBLE),
+                    )],
                 ),
             ],
-            3, 3,
+            3,
+            3,
             true, // need_finalize (single-phase)
         );
         let plan = make_plan(vec![agg, join_node, left_scan, right_scan]);
@@ -2982,7 +3084,10 @@ mod tests {
         let input = root.input.as_ref().unwrap();
         let agg = match input.rel_type.as_ref().unwrap() {
             rel::RelType::Aggregate(agg) => agg,
-            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
 
         // Verify the measure's argument is a field reference.
@@ -3117,7 +3222,10 @@ mod tests {
 
         let agg = match input.rel_type.as_ref().unwrap() {
             rel::RelType::Aggregate(agg) => agg,
-            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
 
         let grouping_expr = &agg.groupings[0].grouping_expressions[0];
@@ -3137,11 +3245,7 @@ mod tests {
         };
         assert_eq!(group_field_idx, 0);
 
-        let measure_arg = match agg.measures[0]
-            .measure
-            .as_ref()
-            .unwrap()
-            .arguments[0]
+        let measure_arg = match agg.measures[0].measure.as_ref().unwrap().arguments[0]
             .arg_type
             .as_ref()
             .unwrap()
@@ -3247,7 +3351,10 @@ mod tests {
 
         let outer_agg = match input.rel_type.as_ref().unwrap() {
             rel::RelType::Aggregate(agg) => agg,
-            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
         let grouping_expr = &outer_agg.groupings[0].grouping_expressions[0];
         let group_field_idx = match grouping_expr.rex_type.as_ref().unwrap() {
@@ -3292,39 +3399,55 @@ mod tests {
         let partial_agg = make_aggregation_node(
             3,
             vec![2], // partial output tuple
-            Some(vec![
-                slot_ref_expr_in_tuple(30, 2, type_desc(TPrimitiveType::VARCHAR)),
-            ]),
-            vec![
-                agg_function_expr(
-                    "sum",
+            Some(vec![slot_ref_expr_in_tuple(
+                30,
+                2,
+                type_desc(TPrimitiveType::VARCHAR),
+            )]),
+            vec![agg_function_expr(
+                "sum",
+                type_desc(TPrimitiveType::DOUBLE),
+                vec![type_desc(TPrimitiveType::DOUBLE)],
+                vec![slot_ref_expr_in_tuple(
+                    31,
+                    2,
                     type_desc(TPrimitiveType::DOUBLE),
-                    vec![type_desc(TPrimitiveType::DOUBLE)],
-                    vec![slot_ref_expr_in_tuple(31, 2, type_desc(TPrimitiveType::DOUBLE))],
-                ),
-            ],
-            2, 2,
+                )],
+            )],
+            2,
+            2,
             false, // partial
         );
         // Finalize AGG: references partial output tuple 2
         let finalize_agg = make_aggregation_node(
             2,
             vec![3], // finalize output tuple
-            Some(vec![
-                slot_ref_expr_in_tuple(40, 2, type_desc(TPrimitiveType::VARCHAR)),
-            ]),
-            vec![
-                agg_function_expr(
-                    "sum",
+            Some(vec![slot_ref_expr_in_tuple(
+                40,
+                2,
+                type_desc(TPrimitiveType::VARCHAR),
+            )]),
+            vec![agg_function_expr(
+                "sum",
+                type_desc(TPrimitiveType::DOUBLE),
+                vec![type_desc(TPrimitiveType::DOUBLE)],
+                vec![slot_ref_expr_in_tuple(
+                    41,
+                    2,
                     type_desc(TPrimitiveType::DOUBLE),
-                    vec![type_desc(TPrimitiveType::DOUBLE)],
-                    vec![slot_ref_expr_in_tuple(41, 2, type_desc(TPrimitiveType::DOUBLE))],
-                ),
-            ],
-            3, 3,
+                )],
+            )],
+            3,
+            3,
             true, // finalize
         );
-        let plan = make_plan(vec![finalize_agg, partial_agg, join_node, left_scan, right_scan]);
+        let plan = make_plan(vec![
+            finalize_agg,
+            partial_agg,
+            join_node,
+            left_scan,
+            right_scan,
+        ]);
         let desc = make_desc_table(
             vec![(0, Some(100)), (1, Some(200)), (2, None), (3, None)],
             vec![
@@ -3353,12 +3476,18 @@ mod tests {
         // After collapse, should be a single AggregateRel with INITIAL_TO_RESULT.
         let agg = match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
             rel::RelType::Aggregate(agg) => agg,
-            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
 
         assert_eq!(agg.measures.len(), 1);
         let measure = agg.measures[0].measure.as_ref().unwrap();
-        assert_eq!(measure.phase, 3, "should be INITIAL_TO_RESULT after collapse");
+        assert_eq!(
+            measure.phase, 3,
+            "should be INITIAL_TO_RESULT after collapse"
+        );
 
         // The collapsed measure should use the partial's expression (which references
         // the JOIN's output schema). Verify the field ref is correct.
@@ -3391,7 +3520,10 @@ mod tests {
         // The input to the collapsed AGG should be the JoinRel (not another AGG).
         match agg.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
             rel::RelType::Join(_) => {}
-            other => panic!("expected JoinRel under collapsed AGG, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected JoinRel under collapsed AGG, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -3542,7 +3674,10 @@ mod tests {
         };
         let agg = match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
             rel::RelType::Aggregate(agg) => agg,
-            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected AggregateRel, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
 
         assert!(
@@ -3550,11 +3685,7 @@ mod tests {
             "Q03-style partial agg should not leave invalid field refs"
         );
 
-        let measure_arg = match agg.measures[0]
-            .measure
-            .as_ref()
-            .unwrap()
-            .arguments[0]
+        let measure_arg = match agg.measures[0].measure.as_ref().unwrap().arguments[0]
             .arg_type
             .as_ref()
             .unwrap()
@@ -3626,7 +3757,10 @@ mod tests {
                         }
                         other => panic!("expected UriFile, got {:?}", other),
                     }
-                    assert!(item.file_format.is_some(), "should have parquet file format");
+                    assert!(
+                        item.file_format.is_some(),
+                        "should have parquet file format"
+                    );
                 }
                 other => panic!("expected LocalFiles, got {:?}", other),
             },
@@ -3798,7 +3932,11 @@ mod tests {
         let mut table_schemas = HashMap::new();
         table_schemas.insert(
             "cities_0".to_string(),
-            vec!["city".to_string(), "state".to_string(), "population".to_string()],
+            vec![
+                "city".to_string(),
+                "state".to_string(),
+                "population".to_string(),
+            ],
         );
 
         // No file_scan_map entry → NamedTable path → all 3 columns preserved.
@@ -3912,7 +4050,12 @@ mod tests {
         for entry in fs::read_dir("/tmp/sirius-cluster/").unwrap() {
             let path = entry.unwrap().path();
             if path.extension().map(|e| e == "bin").unwrap_or(false)
-                && path.file_name().unwrap().to_str().unwrap().starts_with("substrait-exchange")
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("substrait-exchange")
             {
                 let data = fs::read(&path).unwrap();
                 let plan = Plan::decode(data.as_slice()).unwrap();

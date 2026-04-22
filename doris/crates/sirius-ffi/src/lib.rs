@@ -34,8 +34,10 @@ type TakeExchangeArtifactFn = unsafe extern "C" fn() -> *mut c_void;
 type DestroyExchangeArtifactFn = unsafe extern "C" fn(*mut c_void);
 type ArtifactStagingBaseFn = unsafe extern "C" fn(*const c_void) -> u64;
 type ArtifactCountFn = unsafe extern "C" fn(*const c_void) -> u64;
-type ArtifactGetPartitionFn = unsafe extern "C" fn(*const c_void, usize, *mut RawPackedPartitionView) -> i32;
-type ArtifactGetBroadcastFn = unsafe extern "C" fn(*const c_void, usize, *mut RawPackedBroadcastEntryView) -> i32;
+type ArtifactGetPartitionFn =
+    unsafe extern "C" fn(*const c_void, usize, *mut RawPackedPartitionView) -> i32;
+type ArtifactGetBroadcastFn =
+    unsafe extern "C" fn(*const c_void, usize, *mut RawPackedBroadcastEntryView) -> i32;
 
 #[derive(Clone, Copy)]
 struct ExchangeApi {
@@ -131,9 +133,12 @@ unsafe fn load_symbol<T: Copy>(
     lib: &'static libloading::Library,
     name: &[u8],
 ) -> Result<T, EngineError> {
-    let symbol: libloading::Symbol<T> = lib
-        .get(name)
-        .map_err(|e| EngineError::InitFailed(format!("load symbol {}: {e}", String::from_utf8_lossy(name))))?;
+    let symbol: libloading::Symbol<T> = lib.get(name).map_err(|e| {
+        EngineError::InitFailed(format!(
+            "load symbol {}: {e}",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
     Ok(*symbol)
 }
 
@@ -322,7 +327,11 @@ impl SiriusEngine {
 
     /// Execute a Substrait plan via Sirius GPU (`gpu_execution_substrait`),
     /// optionally with a SQL ORDER BY / LIMIT suffix.
-    pub fn execute_substrait(&self, plan_bytes: &[u8], order_sql: Option<&str>) -> Result<Vec<u8>, EngineError> {
+    pub fn execute_substrait(
+        &self,
+        plan_bytes: &[u8],
+        order_sql: Option<&str>,
+    ) -> Result<Vec<u8>, EngineError> {
         use arrow::record_batch::RecordBatch;
 
         let sql = if let Some(suffix) = order_sql {
@@ -335,20 +344,30 @@ impl SiriusEngine {
             .conn
             .prepare(&sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        eprintln!("[sirius-ffi] execute_substrait: prepare took {}ms", t0.elapsed().as_millis());
+        eprintln!(
+            "[sirius-ffi] execute_substrait: prepare took {}ms",
+            t0.elapsed().as_millis()
+        );
         let t1 = std::time::Instant::now();
         let arrow_result = stmt
             .query_arrow(duckdb::params![plan_bytes])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         let schema = arrow_result.get_schema();
         let batches: Vec<RecordBatch> = arrow_result.collect();
-        eprintln!("[sirius-ffi] execute_substrait: query_arrow took {}ms, {} batches", t1.elapsed().as_millis(), batches.len());
+        eprintln!(
+            "[sirius-ffi] execute_substrait: query_arrow took {}ms, {} batches",
+            t1.elapsed().as_millis(),
+            batches.len()
+        );
         if batches.is_empty() {
             return schema_to_ipc(&schema);
         }
         let t2 = std::time::Instant::now();
         let result = batches_to_ipc(batches);
-        eprintln!("[sirius-ffi] execute_substrait: batches_to_ipc took {}ms", t2.elapsed().as_millis());
+        eprintln!(
+            "[sirius-ffi] execute_substrait: batches_to_ipc took {}ms",
+            t2.elapsed().as_millis()
+        );
         result
     }
 
@@ -380,7 +399,11 @@ impl SiriusEngine {
     ///
     /// DuckDB's `from_substrait()` doesn't reliably preserve sort order, so this
     /// wraps the call: `SELECT * FROM from_substrait(?::blob) ORDER BY 1 DESC LIMIT 10`.
-    pub fn from_substrait_sorted(&self, plan_bytes: &[u8], order_sql: &str) -> Result<Vec<u8>, EngineError> {
+    pub fn from_substrait_sorted(
+        &self,
+        plan_bytes: &[u8],
+        order_sql: &str,
+    ) -> Result<Vec<u8>, EngineError> {
         use arrow::record_batch::RecordBatch;
 
         let sql = format!("SELECT * FROM from_substrait(?::blob) {}", order_sql);
@@ -409,14 +432,22 @@ impl SiriusEngine {
     ///
     /// This is used as a fallback for CPU paths where DuckDB's Substrait SortRel
     /// or `SELECT * FROM from_substrait(...) ORDER BY ...` produce incorrect results.
-    pub fn sort_ipc_result(&self, ipc_bytes: &[u8], sql_suffix: &str) -> Result<Vec<u8>, EngineError> {
+    pub fn sort_ipc_result(
+        &self,
+        ipc_bytes: &[u8],
+        sql_suffix: &str,
+    ) -> Result<Vec<u8>, EngineError> {
         const TEMP_TABLE: &str = "__SIRIUS_POSTSORT";
 
-        let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", TEMP_TABLE));
+        let _ = self
+            .conn
+            .execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", TEMP_TABLE));
         self.register_exchange_table_from_ipc(TEMP_TABLE, ipc_bytes)?;
         let sql = format!("SELECT * FROM \"{}\" {}", TEMP_TABLE, sql_suffix);
         let result = self.execute_sql(&sql);
-        let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", TEMP_TABLE));
+        let _ = self
+            .conn
+            .execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", TEMP_TABLE));
         result
     }
 
@@ -424,7 +455,11 @@ impl SiriusEngine {
     ///
     /// Uses `LIMIT 0` + `query_arrow().get_schema()` to extract the schema from
     /// the prepared statement metadata, without reading any data rows.
-    pub fn get_file_schema_ipc(&self, file_path: &str, format: &str) -> Result<Vec<u8>, EngineError> {
+    pub fn get_file_schema_ipc(
+        &self,
+        file_path: &str,
+        format: &str,
+    ) -> Result<Vec<u8>, EngineError> {
         use arrow::ipc::writer::StreamWriter;
 
         let reader_fn = match format {
@@ -432,7 +467,11 @@ impl SiriusEngine {
             "csv" => "read_csv_auto",
             "json" => "read_json_auto",
             "orc" => "read_parquet",
-            other => return Err(EngineError::ExecFailed(format!("unsupported file format: {other}"))),
+            other => {
+                return Err(EngineError::ExecFailed(format!(
+                    "unsupported file format: {other}"
+                )))
+            }
         };
         let sql = format!("SELECT * FROM {}('{}') LIMIT 0", reader_fn, file_path);
         let mut stmt = self
@@ -461,21 +500,37 @@ impl SiriusEngine {
     /// When `columns` is non-empty, only those columns are loaded (in order),
     /// ensuring DuckDB's table schema matches the Substrait ReadRel field references.
     /// This must be called before executing a plan that references the table.
-    pub fn register_file_table(&self, table_name: &str, file_path: &str, format: &str, columns: &[String]) -> Result<(), EngineError> {
+    pub fn register_file_table(
+        &self,
+        table_name: &str,
+        file_path: &str,
+        format: &str,
+        columns: &[String],
+    ) -> Result<(), EngineError> {
         let reader_fn = match format {
             "parquet" => "read_parquet",
             "csv" => "read_csv_auto",
             "json" => "read_json_auto",
             "orc" => "read_parquet", // DuckDB doesn't have read_orc, parquet reader handles it
-            other => return Err(EngineError::ExecFailed(format!("unsupported file format: {other}"))),
+            other => {
+                return Err(EngineError::ExecFailed(format!(
+                    "unsupported file format: {other}"
+                )))
+            }
         };
         let select = if columns.is_empty() {
             "*".to_string()
         } else {
-            columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ")
+            columns
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         // Drop any existing VIEW with this name first — DuckDB can't replace a VIEW with a TABLE.
-        let _ = self.conn.execute_batch(&format!("DROP VIEW IF EXISTS \"{}\"", table_name));
+        let _ = self
+            .conn
+            .execute_batch(&format!("DROP VIEW IF EXISTS \"{}\"", table_name));
         let sql = format!(
             "CREATE OR REPLACE TABLE \"{}\" AS SELECT {} FROM {}('{}')",
             table_name, select, reader_fn, file_path
@@ -491,14 +546,20 @@ impl SiriusEngine {
     /// Creates `CREATE OR REPLACE VIEW "name" AS SELECT * FROM parquet_scan([file1, ...])`.
     /// DuckDB resolves views to parquet_scan at plan time, which Sirius routes to
     /// sirius_physical_parquet_scan for GPU-native parquet reading.
-    pub fn register_parquet_view(&self, table_name: &str, file_paths: &[String]) -> Result<(), EngineError> {
+    pub fn register_parquet_view(
+        &self,
+        table_name: &str,
+        file_paths: &[String],
+    ) -> Result<(), EngineError> {
         let file_list = file_paths
             .iter()
             .map(|p| format!("'{}'", p))
             .collect::<Vec<_>>()
             .join(", ");
         // Drop any existing TABLE with this name first — DuckDB can't replace a TABLE with a VIEW.
-        let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", table_name));
+        let _ = self
+            .conn
+            .execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", table_name));
         let sql = format!(
             "CREATE OR REPLACE VIEW \"{}\" AS SELECT * FROM parquet_scan([{}])",
             table_name, file_list
@@ -523,8 +584,13 @@ impl SiriusEngine {
             .query([])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         let mut columns = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let name: String = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+        {
+            let name: String = row
+                .get(0)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             columns.push(name);
         }
         Ok(columns)
@@ -541,15 +607,23 @@ impl SiriusEngine {
             .query([])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         let mut columns = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let name: String = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+        {
+            let name: String = row
+                .get(0)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             columns.push(name);
         }
         Ok(columns)
     }
 
     /// Get column names and SQL types of a registered DuckDB table, in ordinal order.
-    pub fn get_table_schema(&self, table_name: &str) -> Result<Vec<TableColumnSchema>, EngineError> {
+    pub fn get_table_schema(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<TableColumnSchema>, EngineError> {
         let sql = format!("DESCRIBE \"{}\"", table_name);
         let mut stmt = self
             .conn
@@ -559,10 +633,16 @@ impl SiriusEngine {
             .query([])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         let mut columns = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let name: String = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let sql_type: String =
-                row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+        {
+            let name: String = row
+                .get(0)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let sql_type: String = row
+                .get(1)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             columns.push(TableColumnSchema { name, sql_type });
         }
         Ok(columns)
@@ -626,14 +706,10 @@ impl SiriusEngine {
                 }
                 rows.push(format!("({})", vals.join(", ")));
             }
-            let insert_sql = format!(
-                "INSERT INTO \"{}\" VALUES {}",
-                table_name,
-                rows.join(", ")
-            );
-            self.conn
-                .execute_batch(&insert_sql)
-                .map_err(|e| EngineError::ExecFailed(format!("register_exchange_table insert: {e}")))?;
+            let insert_sql = format!("INSERT INTO \"{}\" VALUES {}", table_name, rows.join(", "));
+            self.conn.execute_batch(&insert_sql).map_err(|e| {
+                EngineError::ExecFailed(format!("register_exchange_table insert: {e}"))
+            })?;
         }
 
         Ok(())
@@ -662,26 +738,34 @@ impl SiriusEngine {
         // Create the table with the right schema.
         // Sanitize column names: expression text (e.g. `sum("if"((...))`) from
         // Doris PBlock metadata breaks SQL parsing. Use positional aliases.
-        let cols: Vec<String> = schema.fields().iter().enumerate().map(|(i, f)| {
-            let dt = arrow_type_to_duckdb_sql(f.data_type());
-            let name = f.name();
-            let safe_name = if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
-                name.to_string()
-            } else {
-                format!("col_{}", i)
-            };
-            format!("\"{}\" {}", safe_name, dt)
-        }).collect();
+        let cols: Vec<String> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let dt = arrow_type_to_duckdb_sql(f.data_type());
+                let name = f.name();
+                let safe_name =
+                    if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("col_{}", i)
+                    };
+                format!("\"{}\" {}", safe_name, dt)
+            })
+            .collect();
         let create_sql = format!(
             "CREATE OR REPLACE TABLE \"{}\" ({})",
-            table_name, cols.join(", ")
+            table_name,
+            cols.join(", ")
         );
         self.conn
             .execute_batch(&create_sql)
             .map_err(|e| EngineError::ExecFailed(format!("create exchange table: {e}")))?;
 
         // Use DuckDB's Arrow Appender for bulk insertion.
-        let mut appender = self.conn
+        let mut appender = self
+            .conn
             .appender(table_name)
             .map_err(|e| EngineError::ExecFailed(format!("create appender: {e}")))?;
 
@@ -728,13 +812,16 @@ impl SiriusEngine {
             table_name,
             cols.join(", ")
         );
-        self.conn
-            .execute_batch(&create_sql)
-            .map_err(|e| EngineError::ExecFailed(format!("register_gpu_exchange_table create: {e}")))?;
+        self.conn.execute_batch(&create_sql).map_err(|e| {
+            EngineError::ExecFailed(format!("register_gpu_exchange_table create: {e}"))
+        })?;
 
         // Try to use gpu_register_table to point DuckDB at GPU memory directly.
         // Format: gpu_register_table('table_name', [ptr1, ptr2, ...], [len1, len2, ...], num_rows)
-        let ptrs_str: Vec<String> = gpu_ptrs.iter().map(|(addr, _)| format!("{}", addr)).collect();
+        let ptrs_str: Vec<String> = gpu_ptrs
+            .iter()
+            .map(|(addr, _)| format!("{}", addr))
+            .collect();
         let lens_str: Vec<String> = gpu_ptrs.iter().map(|(_, len)| format!("{}", len)).collect();
         let sql = format!(
             "SELECT * FROM gpu_register_table('{}', [{}], [{}], {})",
@@ -745,7 +832,10 @@ impl SiriusEngine {
         );
         match self.conn.execute_batch(&sql) {
             Ok(()) => {
-                tracing::info!(table = table_name, "registered GPU exchange table via gpu_register_table");
+                tracing::info!(
+                    table = table_name,
+                    "registered GPU exchange table via gpu_register_table"
+                );
             }
             Err(e) => {
                 tracing::warn!(
@@ -760,7 +850,11 @@ impl SiriusEngine {
     }
 
     /// Initialize GPU buffer manager. Must be called before `execute_gpu`.
-    pub fn init_gpu_buffers(&self, cache_size: &str, processing_size: &str) -> Result<(), EngineError> {
+    pub fn init_gpu_buffers(
+        &self,
+        cache_size: &str,
+        processing_size: &str,
+    ) -> Result<(), EngineError> {
         let sql = format!(
             "SELECT * FROM gpu_buffer_init('{}', '{}')",
             cache_size, processing_size
@@ -798,9 +892,16 @@ impl SiriusEngine {
             .map_err(|e| EngineError::ExecFailed(format!("query allocated buffers: {e}")))?;
 
         let mut result = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
-            let addr: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-            let len: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+        {
+            let addr: i64 = row
+                .get(1)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let len: i64 = row
+                .get(2)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             result.push((addr as usize, len as usize, device_id));
         }
 
@@ -814,7 +915,9 @@ impl SiriusEngine {
     pub fn finalize_exchange_tables_direct(&self) -> Result<(), EngineError> {
         let ok = unsafe { (self.exchange_api.finalize_exchange_tables_direct)() };
         if ok == 0 {
-            return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+            return Err(EngineError::ExecFailed(exchange_last_error(
+                self.exchange_api,
+            )));
         }
         Ok(())
     }
@@ -853,7 +956,9 @@ impl SiriusEngine {
             )
         };
         if session_id == 0 {
-            return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+            return Err(EngineError::ExecFailed(exchange_last_error(
+                self.exchange_api,
+            )));
         }
         Ok(session_id)
     }
@@ -886,9 +991,15 @@ impl SiriusEngine {
             schema_fields = schema.fields().len(),
             "exchange-only execute_substrait completed"
         );
-        self.take_exchange_artifact()?.ok_or_else(|| {
+        let mut artifact = self.take_exchange_artifact()?.ok_or_else(|| {
             EngineError::ExecFailed("exchange-only execution produced no artifact".to_string())
-        })
+        })?;
+        artifact.set_projection_already_applied(
+            projection_indices
+                .map(|indices| !indices.is_empty())
+                .unwrap_or(false),
+        );
+        Ok(artifact)
     }
 
     /// Move the active exchange capture into a Rust-owned artifact.
@@ -906,9 +1017,9 @@ impl SiriusEngine {
             unsafe { (self.exchange_api.exchange_artifact_staging_base)(handle as *const c_void) }
                 as usize;
 
-        let partition_count =
-            unsafe { (self.exchange_api.exchange_artifact_partition_count)(handle as *const c_void) }
-                as usize;
+        let partition_count = unsafe {
+            (self.exchange_api.exchange_artifact_partition_count)(handle as *const c_void)
+        } as usize;
         let mut packed_partitions = Vec::with_capacity(partition_count);
         for index in 0..partition_count {
             let mut raw = RawPackedPartitionView::default();
@@ -921,7 +1032,9 @@ impl SiriusEngine {
             };
             if ok == 0 {
                 unsafe { (self.exchange_api.exchange_artifact_destroy)(handle) };
-                return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+                return Err(EngineError::ExecFailed(exchange_last_error(
+                    self.exchange_api,
+                )));
             }
             packed_partitions.push(PackedPartition {
                 partition_id: raw.partition_id as usize,
@@ -933,9 +1046,9 @@ impl SiriusEngine {
             });
         }
 
-        let broadcast_count =
-            unsafe { (self.exchange_api.exchange_artifact_broadcast_count)(handle as *const c_void) }
-                as usize;
+        let broadcast_count = unsafe {
+            (self.exchange_api.exchange_artifact_broadcast_count)(handle as *const c_void)
+        } as usize;
         let mut packed_broadcast = Vec::with_capacity(broadcast_count);
         for index in 0..broadcast_count {
             let mut raw = RawPackedBroadcastEntryView::default();
@@ -948,7 +1061,9 @@ impl SiriusEngine {
             };
             if ok == 0 {
                 unsafe { (self.exchange_api.exchange_artifact_destroy)(handle) };
-                return Err(EngineError::ExecFailed(exchange_last_error(self.exchange_api)));
+                return Err(EngineError::ExecFailed(exchange_last_error(
+                    self.exchange_api,
+                )));
             }
             packed_broadcast.push(PackedBroadcastEntry {
                 entry_id: raw.entry_id as usize,
@@ -966,17 +1081,23 @@ impl SiriusEngine {
             staging_base,
             packed_partitions,
             packed_broadcast,
+            projection_already_applied: false,
         }))
     }
 
     /// Finalize a single exchange table's pending views.
     /// Must be called while the packed buffer data is still valid (leases alive).
     pub fn finalize_exchange_table(&self, table_name: &str) -> Result<(), EngineError> {
-        let sql = format!("SELECT * FROM sirius_finalize_exchange_table('{}')", table_name);
-        let mut stmt = self.conn
+        let sql = format!(
+            "SELECT * FROM sirius_finalize_exchange_table('{}')",
+            table_name
+        );
+        let mut stmt = self
+            .conn
             .prepare(&sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow([])
+        let _: Vec<_> = stmt
+            .query_arrow([])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?
             .collect();
         Ok(())
@@ -987,11 +1108,16 @@ impl SiriusEngine {
     /// After this, GPU results will be packed directly into the staging buffer
     /// via cudf::chunked_pack — zero per-query nixl registrations.
     pub fn set_staging_buffer(&self, addr: usize, size: usize) -> Result<(), EngineError> {
-        let sql = format!("SELECT * FROM sirius_set_staging_buffer({}, {})", addr as i64, size as i64);
-        let mut stmt = self.conn
+        let sql = format!(
+            "SELECT * FROM sirius_set_staging_buffer({}, {})",
+            addr as i64, size as i64
+        );
+        let mut stmt = self
+            .conn
             .prepare(&sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let _: Vec<_> = stmt.query_arrow([])
+        let _: Vec<_> = stmt
+            .query_arrow([])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?
             .collect();
         Ok(())
@@ -1019,26 +1145,33 @@ impl SiriusEngine {
         // Step 1: C++ cudf::unpack → registers in GPUBufferManager::tables (zero-copy).
         // Returns the CREATE TABLE SQL for us to execute (can't run inside the bind).
         let sql = "SELECT * FROM sirius_register_packed_table(?, ?, ?, ?)";
-        let mut stmt = self.conn
+        let mut stmt = self
+            .conn
             .prepare(sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut rows = stmt.query(duckdb::params![
-            table_name,
-            gpu_addr as i64,
-            gpu_size as i64,
-            cudf_metadata,
-        ])
+        let mut rows = stmt
+            .query(duckdb::params![
+                table_name,
+                gpu_addr as i64,
+                gpu_size as i64,
+                cudf_metadata,
+            ])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let row = rows.next()
+        let row = rows
+            .next()
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?
-            .ok_or_else(|| EngineError::ExecFailed("register_packed_table returned no rows".into()))?;
-        let create_table_sql: String = row.get(2)
+            .ok_or_else(|| {
+                EngineError::ExecFailed("register_packed_table returned no rows".into())
+            })?;
+        let create_table_sql: String = row
+            .get(2)
             .map_err(|e| EngineError::ExecFailed(format!("get create_table_sql: {e}")))?;
         drop(rows);
         drop(stmt);
 
         // Step 2: Create schema-only DuckDB table on THIS connection.
-        self.conn.execute_batch(&create_table_sql)
+        self.conn
+            .execute_batch(&create_table_sql)
             .map_err(|e| EngineError::ExecFailed(format!("CREATE TABLE for GPU exchange: {e}")))?;
 
         Ok(())
@@ -1077,9 +1210,7 @@ impl SiriusEngine {
             .next()
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?
             .ok_or_else(|| {
-                EngineError::ExecFailed(
-                    "register_projected_packed_table returned no rows".into(),
-                )
+                EngineError::ExecFailed("register_projected_packed_table returned no rows".into())
             })?;
         let create_table_sql: String = row
             .get(2)
@@ -1101,15 +1232,20 @@ impl SiriusEngine {
     /// separate CUDA runtimes for C++ and Rust).
     pub fn cuda_alloc(&self, size: usize) -> Result<usize, EngineError> {
         let sql = format!("SELECT * FROM sirius_cuda_alloc({})", size as i64);
-        let mut stmt = self.conn
+        let mut stmt = self
+            .conn
             .prepare(&sql)
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let mut rows = stmt.query([])
+        let mut rows = stmt
+            .query([])
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let row = rows.next()
+        let row = rows
+            .next()
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?
             .ok_or_else(|| EngineError::ExecFailed("sirius_cuda_alloc: no result".into()))?;
-        let addr: i64 = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+        let addr: i64 = row
+            .get(0)
+            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
         Ok(addr as usize)
     }
 }
@@ -1125,6 +1261,7 @@ pub struct ExchangeArtifact {
     staging_base: usize,
     packed_partitions: Vec<PackedPartition>,
     packed_broadcast: Vec<PackedBroadcastEntry>,
+    projection_already_applied: bool,
 }
 
 impl ExchangeArtifact {
@@ -1142,6 +1279,14 @@ impl ExchangeArtifact {
 
     pub fn has_exchange_data(&self) -> bool {
         !self.packed_partitions.is_empty() || !self.packed_broadcast.is_empty()
+    }
+
+    pub fn projection_already_applied(&self) -> bool {
+        self.projection_already_applied
+    }
+
+    pub fn set_projection_already_applied(&mut self, applied: bool) {
+        self.projection_already_applied = applied;
     }
 }
 
@@ -1240,7 +1385,13 @@ fn arrow_type_to_duckdb_sql(dt: &arrow::datatypes::DataType) -> String {
         DataType::Struct(fields) => {
             let cols: Vec<String> = fields
                 .iter()
-                .map(|f| format!("\"{}\" {}", f.name(), arrow_type_to_duckdb_sql(f.data_type())))
+                .map(|f| {
+                    format!(
+                        "\"{}\" {}",
+                        f.name(),
+                        arrow_type_to_duckdb_sql(f.data_type())
+                    )
+                })
                 .collect();
             format!("STRUCT({})", cols.join(", "))
         }
@@ -1350,12 +1501,10 @@ mod tests {
         assert_eq!(artifact.staging_base(), staging_addr);
         assert!(artifact.packed_partitions().is_empty());
         assert!(!artifact.packed_broadcast().is_empty());
-        assert!(
-            artifact
-                .packed_broadcast()
-                .iter()
-                .any(|entry| entry.packed_size > 0 && !entry.metadata.is_empty())
-        );
+        assert!(artifact
+            .packed_broadcast()
+            .iter()
+            .any(|entry| entry.packed_size > 0 && !entry.metadata.is_empty()));
     }
 
     #[test]
@@ -1419,7 +1568,12 @@ mod tests {
         };
 
         engine
-            .register_packed_table("__ART_Q1_SCHEMA", gpu_addr, entry.packed_size, &entry.metadata)
+            .register_packed_table(
+                "__ART_Q1_SCHEMA",
+                gpu_addr,
+                entry.packed_size,
+                &entry.metadata,
+            )
             .expect("register_packed_table");
         let packed_schema = engine
             .get_table_schema("__ART_Q1_SCHEMA")

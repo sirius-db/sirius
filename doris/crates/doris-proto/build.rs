@@ -67,9 +67,6 @@ fn main() {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(
-            &[nixl_service_proto.as_path()],
-            &[brpc_proto_dir.as_path()],
-        )
+        .compile_protos(&[nixl_service_proto.as_path()], &[brpc_proto_dir.as_path()])
         .expect("Failed to compile NIXL service proto");
 }

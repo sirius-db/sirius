@@ -463,6 +463,7 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                     gpu_addr: dst_buf.addr as usize,
                     gpu_size: dst_buf.len as usize,
                     cudf_metadata: req.packed_cudf_metadata.clone(),
+                    projection_already_applied: req.projection_already_applied,
                     _staging_lease: staging_lease,
                 },
             );

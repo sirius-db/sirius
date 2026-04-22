@@ -42,7 +42,6 @@ pub fn translate_expr_in_context(
     translate_expr_node(&expr.nodes, &mut idx, desc, registry, Some(row_tuples))
 }
 
-
 /// Parse an aggregate function TExpr and return (func_name, arguments, output_type, is_distinct).
 pub fn translate_agg_expr(
     expr: &TExpr,
@@ -69,7 +68,9 @@ pub fn translate_agg_expr(
     for _ in 0..num_children {
         let arg_expr = translate_expr_node(&expr.nodes, &mut idx, desc, registry, row_tuples)?;
         args.push(FunctionArgument {
-            arg_type: Some(substrait::proto::function_argument::ArgType::Value(arg_expr)),
+            arg_type: Some(substrait::proto::function_argument::ArgType::Value(
+                arg_expr,
+            )),
         });
     }
 
@@ -147,10 +148,7 @@ pub(crate) fn translate_expr_node(
     } else if node.node_type == TExprNodeType::DECIMAL_LITERAL {
         translate_decimal_literal(node)
     } else {
-        bail!(
-            "unsupported expression node type: {}",
-            node.node_type.0
-        )
+        bail!("unsupported expression node type: {}", node.node_type.0)
     }
 }
 
@@ -228,12 +226,12 @@ fn translate_slot_ref(
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(
                 ReferenceSegment {
-                    reference_type: Some(reference_segment::ReferenceType::StructField(
-                        Box::new(reference_segment::StructField {
+                    reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                        reference_segment::StructField {
                             field: col_idx as i32,
                             child: None,
-                        }),
-                    )),
+                        },
+                    ))),
                 },
             )),
             root_type: Some(field_reference::RootType::RootReference(
@@ -343,9 +341,7 @@ pub(crate) fn make_scalar_fn(
                 arguments: children
                     .into_iter()
                     .map(|c| FunctionArgument {
-                        arg_type: Some(
-                            substrait::proto::function_argument::ArgType::Value(c),
-                        ),
+                        arg_type: Some(substrait::proto::function_argument::ArgType::Value(c)),
                     })
                     .collect(),
                 output_type: Some(output_type),
@@ -411,7 +407,10 @@ fn encode_decimal_value(value: &str, scale: i32) -> Result<[u8; 16]> {
     let int_part = parts.next().unwrap_or("");
     let frac_part = parts.next().unwrap_or("");
     if parts.next().is_some() {
-        bail!("invalid decimal literal with multiple decimal points: {}", value);
+        bail!(
+            "invalid decimal literal with multiple decimal points: {}",
+            value
+        );
     }
 
     if !int_part.chars().all(|c| c.is_ascii_digit()) {
@@ -479,10 +478,7 @@ fn translate_binary_pred(
     if children.len() != 2 {
         bail!("BINARY_PRED expected 2 children, got {}", children.len());
     }
-    let opcode = node
-        .opcode
-        .as_ref()
-        .context("BINARY_PRED missing opcode")?;
+    let opcode = node.opcode.as_ref().context("BINARY_PRED missing opcode")?;
     let func_name = if *opcode == TExprOpcode::EQ {
         "equal"
     } else if *opcode == TExprOpcode::NE {
@@ -529,11 +525,17 @@ fn translate_function_call(
     children: Vec<Expression>,
     registry: &mut ExtensionRegistry,
 ) -> Result<Expression> {
-    let fn_ = node.fn_.as_ref().context("FUNCTION_CALL missing fn_ data")?;
+    let fn_ = node
+        .fn_
+        .as_ref()
+        .context("FUNCTION_CALL missing fn_ data")?;
     let func_name = &fn_.name.function_name;
     if func_name == "if" {
         if children.len() != 3 {
-            bail!("FUNCTION_CALL if expected 3 children, got {}", children.len());
+            bail!(
+                "FUNCTION_CALL if expected 3 children, got {}",
+                children.len()
+            );
         }
         let output_type = type_mapper::map_type_desc(&node.type_)?;
         tracing::info!(
@@ -614,7 +616,9 @@ fn translate_in_pred(children: Vec<Expression>) -> Result<Expression> {
 
 fn translate_decimal_literal(node: &TExprNode) -> Result<Expression> {
     Ok(Expression {
-        rex_type: Some(expression::RexType::Literal(decimal_literal_to_literal(node)?)),
+        rex_type: Some(expression::RexType::Literal(decimal_literal_to_literal(
+            node,
+        )?)),
     })
 }
 
@@ -717,11 +721,8 @@ fn translate_case_expr(
             let when_val = chunk[0].clone();
             let then_val = make_cast_expr(chunk[1].clone(), output_type.clone());
             // Generate: case_value = when_val
-            let condition = make_scalar_fn(
-                eq_anchor,
-                vec![case_value.clone(), when_val],
-                bool_type(),
-            );
+            let condition =
+                make_scalar_fn(eq_anchor, vec![case_value.clone(), when_val], bool_type());
             ifs.push(expression::if_then::IfClause {
                 r#if: Some(condition),
                 then: Some(then_val),
@@ -1029,7 +1030,11 @@ mod tests {
             doris_thrift::exprs::TExprNodeType::DATE_LITERAL,
             type_desc(TPrimitiveType::DATEV2),
             0,
-            |n| n.date_literal = Some(TDateLiteral { value: "2024-01-15".to_string() }),
+            |n| {
+                n.date_literal = Some(TDateLiteral {
+                    value: "2024-01-15".to_string(),
+                })
+            },
         )];
         let expr = doris_thrift::exprs::TExpr { nodes };
         let desc = make_test_desc();
@@ -1113,19 +1118,17 @@ mod tests {
         let mut reg = ExtensionRegistry::new();
         let result = translate_expr(&expr, &desc, &mut reg).unwrap();
         match result.rex_type.unwrap() {
-            expression::RexType::Selection(field_ref) => {
-                match field_ref.reference_type.unwrap() {
-                    field_reference::ReferenceType::DirectReference(seg) => {
-                        match seg.reference_type.unwrap() {
-                            reference_segment::ReferenceType::StructField(sf) => {
-                                assert_eq!(sf.field, 0);
-                            }
-                            other => panic!("expected StructField, got {:?}", other),
+            expression::RexType::Selection(field_ref) => match field_ref.reference_type.unwrap() {
+                field_reference::ReferenceType::DirectReference(seg) => {
+                    match seg.reference_type.unwrap() {
+                        reference_segment::ReferenceType::StructField(sf) => {
+                            assert_eq!(sf.field, 0);
                         }
+                        other => panic!("expected StructField, got {:?}", other),
                     }
-                    other => panic!("expected DirectReference, got {:?}", other),
                 }
-            }
+                other => panic!("expected DirectReference, got {:?}", other),
+            },
             other => panic!("expected Selection, got {:?}", other),
         }
     }
@@ -1137,19 +1140,17 @@ mod tests {
         let mut reg = ExtensionRegistry::new();
         let result = translate_expr(&expr, &desc, &mut reg).unwrap();
         match result.rex_type.unwrap() {
-            expression::RexType::Selection(field_ref) => {
-                match field_ref.reference_type.unwrap() {
-                    field_reference::ReferenceType::DirectReference(seg) => {
-                        match seg.reference_type.unwrap() {
-                            reference_segment::ReferenceType::StructField(sf) => {
-                                assert_eq!(sf.field, 1);
-                            }
-                            other => panic!("expected StructField, got {:?}", other),
+            expression::RexType::Selection(field_ref) => match field_ref.reference_type.unwrap() {
+                field_reference::ReferenceType::DirectReference(seg) => {
+                    match seg.reference_type.unwrap() {
+                        reference_segment::ReferenceType::StructField(sf) => {
+                            assert_eq!(sf.field, 1);
                         }
+                        other => panic!("expected StructField, got {:?}", other),
                     }
-                    other => panic!("expected DirectReference, got {:?}", other),
                 }
-            }
+                other => panic!("expected DirectReference, got {:?}", other),
+            },
             other => panic!("expected Selection, got {:?}", other),
         }
     }
@@ -1320,7 +1321,11 @@ mod tests {
                             false
                         }
                     });
-                    assert!(func.is_some(), "expected function '{}' registered", expected_name);
+                    assert!(
+                        func.is_some(),
+                        "expected function '{}' registered",
+                        expected_name
+                    );
                 }
                 other => panic!("expected ScalarFunction for {:?}, got {:?}", opcode, other),
             }
@@ -1334,8 +1339,16 @@ mod tests {
         let expr = compound_pred_expr(
             TExprOpcode::COMPOUND_AND,
             vec![
-                binary_pred_expr(TExprOpcode::GT, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(5)),
-                binary_pred_expr(TExprOpcode::LT, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(100)),
+                binary_pred_expr(
+                    TExprOpcode::GT,
+                    slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                    int_literal_expr(5),
+                ),
+                binary_pred_expr(
+                    TExprOpcode::LT,
+                    slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                    int_literal_expr(100),
+                ),
             ],
         );
         let desc = make_test_desc();
@@ -1354,8 +1367,16 @@ mod tests {
         let expr = compound_pred_expr(
             TExprOpcode::COMPOUND_OR,
             vec![
-                binary_pred_expr(TExprOpcode::EQ, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(1)),
-                binary_pred_expr(TExprOpcode::EQ, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(2)),
+                binary_pred_expr(
+                    TExprOpcode::EQ,
+                    slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                    int_literal_expr(1),
+                ),
+                binary_pred_expr(
+                    TExprOpcode::EQ,
+                    slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                    int_literal_expr(2),
+                ),
             ],
         );
         let desc = make_test_desc();
@@ -1394,10 +1415,7 @@ mod tests {
 
     #[test]
     fn test_cast_expr() {
-        let expr = cast_expr(
-            type_desc(TPrimitiveType::DOUBLE),
-            int_literal_expr(42),
-        );
+        let expr = cast_expr(type_desc(TPrimitiveType::DOUBLE), int_literal_expr(42));
         let desc = make_test_desc();
         let mut reg = ExtensionRegistry::new();
         let result = translate_expr(&expr, &desc, &mut reg).unwrap();
@@ -1432,7 +1450,11 @@ mod tests {
     fn test_in_pred() {
         let expr = in_pred_expr(
             slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
-            vec![int_literal_expr(1), int_literal_expr(2), int_literal_expr(3)],
+            vec![
+                int_literal_expr(1),
+                int_literal_expr(2),
+                int_literal_expr(3),
+            ],
         );
         let desc = make_test_desc();
         let mut reg = ExtensionRegistry::new();
@@ -1453,7 +1475,10 @@ mod tests {
         let expr = function_call_expr(
             "add",
             type_desc(TPrimitiveType::BIGINT),
-            vec![type_desc(TPrimitiveType::BIGINT), type_desc(TPrimitiveType::BIGINT)],
+            vec![
+                type_desc(TPrimitiveType::BIGINT),
+                type_desc(TPrimitiveType::BIGINT),
+            ],
             vec![
                 slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
                 int_literal_expr(1),
@@ -1475,7 +1500,11 @@ mod tests {
         let expr = function_call_expr(
             "substring",
             type_desc(TPrimitiveType::VARCHAR),
-            vec![type_desc(TPrimitiveType::VARCHAR), type_desc(TPrimitiveType::INT), type_desc(TPrimitiveType::INT)],
+            vec![
+                type_desc(TPrimitiveType::VARCHAR),
+                type_desc(TPrimitiveType::INT),
+                type_desc(TPrimitiveType::INT),
+            ],
             vec![
                 slot_ref_expr(1, type_desc(TPrimitiveType::VARCHAR)),
                 int_literal_expr(1),
@@ -1520,7 +1549,14 @@ mod tests {
             expression::RexType::IfThen(if_then) => {
                 assert_eq!(if_then.ifs.len(), 1);
                 assert!(if_then.r#else.is_some());
-                match if_then.ifs[0].then.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                match if_then.ifs[0]
+                    .then
+                    .as_ref()
+                    .unwrap()
+                    .rex_type
+                    .as_ref()
+                    .unwrap()
+                {
                     expression::RexType::Cast(_) => {}
                     other => panic!("expected casted THEN branch, got {:?}", other),
                 }
@@ -1575,22 +1611,33 @@ mod tests {
             TExprNodeType::CASE_EXPR,
             type_desc(TPrimitiveType::VARCHAR),
             5, // 2 when/then pairs + 1 else = 5 children
-            |n| n.case_expr = Some(TCaseExpr { has_case_expr: false, has_else_expr: true }),
+            |n| {
+                n.case_expr = Some(TCaseExpr {
+                    has_case_expr: false,
+                    has_else_expr: true,
+                })
+            },
         )];
         // WHEN col_a > 10
-        nodes.extend(binary_pred_expr(
-            TExprOpcode::GT,
-            slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
-            int_literal_expr(10),
-        ).nodes);
+        nodes.extend(
+            binary_pred_expr(
+                TExprOpcode::GT,
+                slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                int_literal_expr(10),
+            )
+            .nodes,
+        );
         // THEN 'big'
         nodes.extend(string_literal_expr("big").nodes);
         // WHEN col_a > 5
-        nodes.extend(binary_pred_expr(
-            TExprOpcode::GT,
-            slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
-            int_literal_expr(5),
-        ).nodes);
+        nodes.extend(
+            binary_pred_expr(
+                TExprOpcode::GT,
+                slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                int_literal_expr(5),
+            )
+            .nodes,
+        );
         // THEN 'medium'
         nodes.extend(string_literal_expr("medium").nodes);
         // ELSE 'small'
@@ -1626,13 +1673,21 @@ mod tests {
             TExprNodeType::CASE_EXPR,
             type_desc(TPrimitiveType::VARCHAR),
             2, // 1 when/then pair
-            |n| n.case_expr = Some(TCaseExpr { has_case_expr: false, has_else_expr: false }),
+            |n| {
+                n.case_expr = Some(TCaseExpr {
+                    has_case_expr: false,
+                    has_else_expr: false,
+                })
+            },
         )];
-        nodes.extend(binary_pred_expr(
-            TExprOpcode::EQ,
-            slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
-            int_literal_expr(1),
-        ).nodes);
+        nodes.extend(
+            binary_pred_expr(
+                TExprOpcode::EQ,
+                slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                int_literal_expr(1),
+            )
+            .nodes,
+        );
         nodes.extend(string_literal_expr("one").nodes);
         let expr = doris_thrift::exprs::TExpr { nodes };
 
@@ -1642,7 +1697,10 @@ mod tests {
         match result.rex_type.unwrap() {
             expression::RexType::IfThen(if_then) => {
                 assert_eq!(if_then.ifs.len(), 1);
-                assert!(if_then.r#else.is_some(), "should synthesize typed NULL ELSE");
+                assert!(
+                    if_then.r#else.is_some(),
+                    "should synthesize typed NULL ELSE"
+                );
                 match if_then.r#else.as_ref().unwrap().rex_type.as_ref().unwrap() {
                     expression::RexType::Literal(lit) => match lit.literal_type.as_ref().unwrap() {
                         expression::literal::LiteralType::Null(_) => {}
@@ -1662,7 +1720,12 @@ mod tests {
             TExprNodeType::CASE_EXPR,
             type_desc(TPrimitiveType::VARCHAR),
             6, // case_value + 2*(when+then) + else = 6
-            |n| n.case_expr = Some(TCaseExpr { has_case_expr: true, has_else_expr: true }),
+            |n| {
+                n.case_expr = Some(TCaseExpr {
+                    has_case_expr: true,
+                    has_else_expr: true,
+                })
+            },
         )];
         // case value: col_a
         nodes.extend(slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)).nodes);
@@ -1730,19 +1793,17 @@ mod tests {
         };
         offset_field_refs(&mut expr, 3);
         match expr.rex_type.unwrap() {
-            expression::RexType::Selection(field_ref) => {
-                match field_ref.reference_type.unwrap() {
-                    field_reference::ReferenceType::DirectReference(seg) => {
-                        match seg.reference_type.unwrap() {
-                            reference_segment::ReferenceType::StructField(sf) => {
-                                assert_eq!(sf.field, 3, "field should be offset by 3");
-                            }
-                            other => panic!("expected StructField, got {:?}", other),
+            expression::RexType::Selection(field_ref) => match field_ref.reference_type.unwrap() {
+                field_reference::ReferenceType::DirectReference(seg) => {
+                    match seg.reference_type.unwrap() {
+                        reference_segment::ReferenceType::StructField(sf) => {
+                            assert_eq!(sf.field, 3, "field should be offset by 3");
                         }
+                        other => panic!("expected StructField, got {:?}", other),
                     }
-                    other => panic!("expected DirectReference, got {:?}", other),
                 }
-            }
+                other => panic!("expected DirectReference, got {:?}", other),
+            },
             other => panic!("expected Selection, got {:?}", other),
         }
     }
@@ -1770,19 +1831,17 @@ mod tests {
         offset_field_refs(&mut expr, 0);
         // Should be unchanged.
         match expr.rex_type.unwrap() {
-            expression::RexType::Selection(field_ref) => {
-                match field_ref.reference_type.unwrap() {
-                    field_reference::ReferenceType::DirectReference(seg) => {
-                        match seg.reference_type.unwrap() {
-                            reference_segment::ReferenceType::StructField(sf) => {
-                                assert_eq!(sf.field, 5);
-                            }
-                            _ => panic!("unexpected"),
+            expression::RexType::Selection(field_ref) => match field_ref.reference_type.unwrap() {
+                field_reference::ReferenceType::DirectReference(seg) => {
+                    match seg.reference_type.unwrap() {
+                        reference_segment::ReferenceType::StructField(sf) => {
+                            assert_eq!(sf.field, 5);
                         }
+                        _ => panic!("unexpected"),
                     }
-                    _ => panic!("unexpected"),
                 }
-            }
+                _ => panic!("unexpected"),
+            },
             _ => panic!("unexpected"),
         }
     }

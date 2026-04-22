@@ -79,9 +79,9 @@ impl ResultEntry {
         let schema = match self {
             ResultEntry::Ok { schema, .. } => schema,
             ResultEntry::Error(msg) => {
-                return Err(arrow::error::ArrowError::InvalidArgumentError(
-                    format!("result is an error: {msg}"),
-                ));
+                return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "result is an error: {msg}"
+                )));
             }
         };
         let mut buf = Vec::new();
@@ -198,8 +198,7 @@ impl ResultStore {
         let schema = reader.schema();
         let mut batches = Vec::new();
         for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| format!("failed to read Arrow batch: {e}"))?;
+            let batch = batch_result.map_err(|e| format!("failed to read Arrow batch: {e}"))?;
             batches.push(batch);
         }
 
@@ -251,7 +250,11 @@ impl ResultStore {
     }
 
     /// Wait for a result to become available, with timeout.
-    pub async fn wait_for(&self, id: &FinstId, timeout: std::time::Duration) -> Option<Arc<ResultEntry>> {
+    pub async fn wait_for(
+        &self,
+        id: &FinstId,
+        timeout: std::time::Duration,
+    ) -> Option<Arc<ResultEntry>> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if let Some(entry) = self.get(id) {
@@ -287,7 +290,9 @@ impl ResultStore {
     /// Remove all results for a given query, including any aliases.
     pub fn remove_query(&self, query_hi: i64, query_lo: i64) {
         // Collect alias partners before removing, so we clean up both sides.
-        let alias_partners: Vec<FinstId> = self.aliases.iter()
+        let alias_partners: Vec<FinstId> = self
+            .aliases
+            .iter()
             .filter(|e| {
                 let k = e.key();
                 k.hi == query_hi && k.lo == query_lo
@@ -295,8 +300,10 @@ impl ResultStore {
             .map(|e| *e.value())
             .collect();
 
-        self.results.retain(|id, _| id.hi != query_hi || id.lo != query_lo);
-        self.aliases.retain(|id, _| id.hi != query_hi || id.lo != query_lo);
+        self.results
+            .retain(|id, _| id.hi != query_hi || id.lo != query_lo);
+        self.aliases
+            .retain(|id, _| id.hi != query_hi || id.lo != query_lo);
 
         // Remove partner entries (they may have different hi/lo).
         for partner in alias_partners {

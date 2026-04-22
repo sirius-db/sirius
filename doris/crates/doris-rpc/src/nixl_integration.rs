@@ -407,6 +407,7 @@ pub async fn send_exchange_with_nixl(
                             gpu_addr: owned_addr,
                             gpu_size: entry.packed_size,
                             cudf_metadata: entry.metadata.clone(),
+                            projection_already_applied: artifact.projection_already_applied(),
                             _staging_lease: None,
                         },
                     );
@@ -456,6 +457,7 @@ pub async fn send_exchange_with_nixl(
                         gpu_addr: owned_addr,
                         gpu_size: entry.packed_size,
                         cudf_metadata: entry.metadata.clone(),
+                        projection_already_applied: false,
                         _staging_lease: None,
                     },
                 );
@@ -594,6 +596,7 @@ pub async fn send_exchange_with_nixl(
                             sender_id,
                             true,
                             Some(&entry.metadata),
+                            false,
                         )
                         .await
                         {
@@ -637,6 +640,7 @@ pub async fn send_exchange_with_nixl(
                     sender_id,
                     staged,
                     None,
+                    false,
                 )
                 .await
                 {
@@ -734,6 +738,7 @@ pub async fn send_exchange_with_nixl(
                             sender_id,
                             entry.overflow_gpu_addr == 0,
                             Some(&entry.metadata),
+                            artifact.projection_already_applied(),
                         )
                         .await
                         {
@@ -866,6 +871,8 @@ async fn send_hash_partitioned(
                                     gpu_addr: owned_addr,
                                     gpu_size: p.packed_size,
                                     cudf_metadata: p.metadata.clone(),
+                                    projection_already_applied: artifact
+                                        .projection_already_applied(),
                                     _staging_lease: None,
                                 },
                             );
@@ -889,6 +896,7 @@ async fn send_hash_partitioned(
                                 sender_id,
                                 is_staged,
                                 Some(&p.metadata),
+                                artifact.projection_already_applied(),
                             )
                             .await
                             {
@@ -1031,6 +1039,7 @@ async fn send_hash_partitioned(
                                     gpu_addr: owned_addr,
                                     gpu_size: p.packed_size,
                                     cudf_metadata: p.metadata.clone(),
+                                    projection_already_applied: false,
                                     _staging_lease: None,
                                 },
                             );
@@ -1057,6 +1066,7 @@ async fn send_hash_partitioned(
                                 sender_id,
                                 is_staged,
                                 Some(&p.metadata),
+                                false,
                             )
                             .await
                             {
@@ -1299,6 +1309,7 @@ pub async fn send_nixl_to_peer(
     sender_id: i32,
     staged: bool,
     packed_metadata: Option<&[u8]>,
+    projection_already_applied: bool,
 ) -> Result<(), String> {
     use doris_proto::nixl::{
         NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest, PGpuBufferDesc,
@@ -1552,6 +1563,7 @@ pub async fn send_nixl_to_peer(
         dst_offsets: response.dst_offsets,
         null_counts,
         packed_cudf_metadata: packed_metadata.map(|m| m.to_vec()).unwrap_or_default(),
+        projection_already_applied,
     };
 
     let channel2 = tonic::transport::Endpoint::from_shared(grpc_addr.clone())

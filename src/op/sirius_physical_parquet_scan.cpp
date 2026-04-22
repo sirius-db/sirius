@@ -17,6 +17,7 @@
 #include "op/sirius_physical_parquet_scan.hpp"
 
 #include "expression_executor/gpu_expression_translator.hpp"
+#include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
@@ -53,10 +54,10 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table
 }
 
 sirius_physical_parquet_scan::sirius_physical_parquet_scan(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::TableFunction function_p,
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
-  duckdb::vector<duckdb::LogicalType> returned_types_p,
+  duckdb::vector<sirius::logical_type> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
   duckdb::vector<std::size_t> projection_ids_p,
   duckdb::vector<std::string> names_p,

@@ -69,6 +69,8 @@ message PNixlTransferCompleteRequest {
   repeated int32 null_counts = 11;            // Null count per column
   // cudf::pack() metadata (when packed transfer was used).
   bytes packed_cudf_metadata = 12;
+  // True when the sender already packed the table in receiver/projected order.
+  bool projection_already_applied = 13;
 }
 
 message PNixlTransferCompleteResponse {

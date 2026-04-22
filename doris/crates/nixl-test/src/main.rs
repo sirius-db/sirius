@@ -159,7 +159,10 @@ fn test_dram_transfer() -> Result<(), String> {
     let dst_data = storage_dst.as_slice();
     for i in 0..xfer_size {
         if dst_data[i] != 0xAA {
-            return Err(format!("byte {i}: expected 0xAA, got 0x{:02X}", dst_data[i]));
+            return Err(format!(
+                "byte {i}: expected 0xAA, got 0x{:02X}",
+                dst_data[i]
+            ));
         }
     }
     if buf_size > xfer_size && dst_data[xfer_size] != 0x00 {
@@ -275,10 +278,8 @@ fn test_vram_transfer() -> Result<(), String> {
     println!("  GPU buffers initialized (src=0xBE, dst=0x00)");
 
     // Create nixl agents.
-    let agent_src =
-        Agent::new("vram-src").map_err(|e| format!("create src agent: {e}"))?;
-    let agent_dst =
-        Agent::new("vram-dst").map_err(|e| format!("create dst agent: {e}"))?;
+    let agent_src = Agent::new("vram-src").map_err(|e| format!("create src agent: {e}"))?;
+    let agent_dst = Agent::new("vram-dst").map_err(|e| format!("create dst agent: {e}"))?;
 
     let (_, params_src) = agent_src
         .get_plugin_params("UCX")
@@ -358,8 +359,7 @@ fn test_vram_transfer() -> Result<(), String> {
     println!("  posted GPU transfer: {} bytes", xfer_size);
 
     let (elapsed, _) = poll_transfer(&agent_src, &xfer_req)?;
-    let throughput_gbps =
-        (xfer_size as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0 * 1024.0);
+    let throughput_gbps = (xfer_size as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0 * 1024.0);
     println!("  transfer complete in {elapsed:?} ({throughput_gbps:.1} GB/s)");
 
     // Verify: copy dst GPU buffer back to host and check.
@@ -393,10 +393,7 @@ fn test_vram_transfer() -> Result<(), String> {
     Ok(())
 }
 
-fn poll_transfer(
-    agent: &Agent,
-    req: &nixl_sys::XferRequest,
-) -> Result<(Duration, ()), String> {
+fn poll_transfer(agent: &Agent, req: &nixl_sys::XferRequest) -> Result<(Duration, ()), String> {
     let start = Instant::now();
     let timeout = Duration::from_secs(10);
     loop {

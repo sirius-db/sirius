@@ -18,13 +18,14 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "sirius/exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
 
-sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
+sirius_physical_order::sirius_physical_order(duckdb::vector<sirius::logical_type> types,
                                              duckdb::vector<duckdb::BoundOrderByNode> orders,
                                              duckdb::vector<std::size_t> projections_p,
                                              std::size_t estimated_cardinality,
@@ -54,7 +55,7 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
 
   for (auto const& ord : orders) {
     if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
-      throw duckdb::NotImplementedException("Order by only supports bound reference expressions");
+      throw not_implemented_exception("Order by only supports bound reference expressions");
     }
     auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     order_key_idx.push_back(idx);

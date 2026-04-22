@@ -19,16 +19,13 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
-#include "duckdb/common/enums/order_preservation_type.hpp"
-#include "duckdb/common/exception.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/execution/execution_context.hpp"
-#include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
+#include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -171,7 +168,7 @@ class sirius_physical_operator {
 
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
-                           duckdb::vector<duckdb::LogicalType> types,
+                           duckdb::vector<sirius::logical_type> types,
                            std::size_t estimated_cardinality)
     : type(type),
       types(std::move(types)),
@@ -187,17 +184,13 @@ class sirius_physical_operator {
   //! The set of children of the operator
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
-  duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<sirius::logical_type> types;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
   size_t operator_id;
 
-  //! The global sink state of this operator
-  duckdb::unique_ptr<duckdb::GlobalSinkState> sink_state;
-  //! The global state of this operator
-  duckdb::unique_ptr<duckdb::GlobalOperatorState> op_state;
-  //! Lock for (re)setting any of the operator states
+  //! Lock for concurrent access to operator state
   std::mutex lock;
 
  public:
@@ -212,7 +205,7 @@ class sirius_physical_operator {
   virtual duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_children() const;
 
   //! Return a vector of the types that will be returned by this operator
-  const duckdb::vector<duckdb::LogicalType>& get_types() const { return types; }
+  const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }
@@ -223,45 +216,27 @@ class sirius_physical_operator {
 
  public:
   // Operator interface
-  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(
-    duckdb::ExecutionContext& context) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
-    duckdb::ClientContext& context) const;
-
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
-  virtual duckdb::OrderPreservationType operator_order() const
+  virtual sirius::OrderPreservationType operator_order() const
   {
-    return duckdb::OrderPreservationType::INSERTION_ORDER;
+    return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Source interface
-  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
-    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
-    duckdb::ClientContext& context) const;
-
   virtual bool is_source() const { return false; }
 
   //! The type of order emitted by the operator (as a source)
-  virtual duckdb::OrderPreservationType source_order() const
+  virtual sirius::OrderPreservationType source_order() const
   {
-    return duckdb::OrderPreservationType::INSERTION_ORDER;
+    return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Sink interface
-  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
-    duckdb::ExecutionContext& context) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
-    duckdb::ClientContext& context) const;
-
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }
@@ -287,7 +262,7 @@ class sirius_physical_operator {
   {
     // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw duckdb::InternalException(
+      throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<TARGET&>(*this);
@@ -297,7 +272,7 @@ class sirius_physical_operator {
   const TARGET& Cast() const
   {
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw duckdb::InternalException(
+      throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<const TARGET&>(*this);
