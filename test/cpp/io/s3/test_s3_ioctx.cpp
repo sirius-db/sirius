@@ -20,6 +20,7 @@
 #include "io/s3/s3_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "sirius_config.hpp"
+#include "utils/s3_live_test.hpp"
 
 #include <cstdlib>
 #include <memory>
@@ -61,16 +62,12 @@ struct env_cfg {
 env_cfg read_env()
 {
   env_cfg c;
-  auto getenv_safe = [](char const* k) -> std::string {
-    auto const* v = std::getenv(k);
-    return v ? v : "";
-  };
-  c.endpoint   = getenv_safe("SIRIUS_TEST_S3_ENDPOINT");
-  c.region     = getenv_safe("SIRIUS_TEST_S3_REGION");
-  c.access_key = getenv_safe("SIRIUS_TEST_S3_ACCESS_KEY");
-  c.secret_key = getenv_safe("SIRIUS_TEST_S3_SECRET_KEY");
-  c.bucket     = getenv_safe("SIRIUS_TEST_S3_BUCKET");
-  c.key        = getenv_safe("SIRIUS_TEST_S3_KEY");
+  c.endpoint   = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ENDPOINT");
+  c.region     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_REGION");
+  c.access_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  c.secret_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_SECRET_KEY");
+  c.bucket     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_BUCKET");
+  c.key        = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_KEY");
   return c;
 }
 
@@ -125,8 +122,9 @@ TEST_CASE("s3_ioctx: HEAD + range GET against live endpoint", "[s3][ioctx][integ
   try {
     obj_size = ctx->head_object_size(e.bucket, e.key);
   } catch (std::exception const& ex) {
-    WARN("HEAD failed: " << ex.what());
-    SUCCEED("Skipping: endpoint unreachable or object missing");
+    sirius::test::s3::handle_live_runtime_failure("HEAD failed",
+                                                  ex,
+                                                  "Skipping: endpoint unreachable or object missing");
     return;
   }
   REQUIRE(obj_size > 0);
@@ -161,8 +159,8 @@ TEST_CASE("datasource_factory: end-to-end s3:// via live endpoint",
   try {
     ds = datasource_factory::create("s3://" + e.bucket + "/" + e.key, reg, cfg);
   } catch (std::exception const& ex) {
-    WARN("factory::create failed: " << ex.what());
-    SUCCEED("Skipping: endpoint unreachable or auth misconfigured");
+    sirius::test::s3::handle_live_runtime_failure(
+      "factory::create failed", ex, "Skipping: endpoint unreachable or auth misconfigured");
     return;
   }
   REQUIRE(ds != nullptr);

@@ -36,6 +36,7 @@
 #include "io/s3/s3_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "sirius_config.hpp"
+#include "utils/s3_live_test.hpp"
 
 #include <array>
 #include <cstdint>
@@ -72,21 +73,15 @@ struct env_cfg {
   }
 };
 
-std::string getenv_or(char const* k, char const* dflt = "")
-{
-  auto const* v = std::getenv(k);
-  return (v && *v) ? v : dflt;
-}
-
 env_cfg read_env()
 {
   env_cfg c;
-  c.endpoint   = getenv_or("SIRIUS_TEST_S3_ENDPOINT");
-  c.region     = getenv_or("SIRIUS_TEST_S3_REGION", "us-east-1");
-  c.access_key = getenv_or("SIRIUS_TEST_S3_ACCESS_KEY");
-  c.secret_key = getenv_or("SIRIUS_TEST_S3_SECRET_KEY");
-  c.bucket     = getenv_or("SIRIUS_TEST_S3_BUCKET");
-  c.local_dir  = getenv_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  c.endpoint   = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ENDPOINT");
+  c.region     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  c.access_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  c.secret_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_SECRET_KEY");
+  c.bucket     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_BUCKET");
+  c.local_dir  = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_LOCAL_DIR");
   return c;
 }
 
@@ -147,8 +142,8 @@ TEST_CASE("s3_integration: hello.txt bytes match local fixture exactly",
   try {
     object_size = ctx->head_object_size(e.bucket, "hello.txt");
   } catch (std::exception const& ex) {
-    WARN("HEAD hello.txt failed: " << ex.what());
-    SUCCEED("Skipping: MinIO unreachable or fixture missing");
+    sirius::test::s3::handle_live_runtime_failure(
+      "HEAD hello.txt failed", ex, "Skipping: MinIO unreachable or fixture missing");
     return;
   }
   REQUIRE(object_size == local.size());
@@ -178,8 +173,8 @@ TEST_CASE("s3_integration: small.bin bit-equal via factory",
   try {
     ds = datasource_factory::create("s3://" + e.bucket + "/small.bin", reg, cfg);
   } catch (std::exception const& ex) {
-    WARN("factory::create failed: " << ex.what());
-    SUCCEED("Skipping: MinIO unreachable or small.bin missing");
+    sirius::test::s3::handle_live_runtime_failure(
+      "factory::create failed", ex, "Skipping: MinIO unreachable or small.bin missing");
     return;
   }
   REQUIRE(ds != nullptr);
@@ -212,7 +207,14 @@ TEST_CASE("s3_integration: multi-range reads on medium.bin match local bytes",
   REQUIRE(local.size() > 4 * 1024 * 1024);  // expect at least 4 MiB
 
   auto ctx = make_ctx(e);
-  std::size_t const object_size = ctx->head_object_size(e.bucket, "medium.bin");
+  std::size_t object_size = 0;
+  try {
+    object_size = ctx->head_object_size(e.bucket, "medium.bin");
+  } catch (std::exception const& ex) {
+    sirius::test::s3::handle_live_runtime_failure(
+      "HEAD medium.bin failed", ex, "Skipping: MinIO unreachable or medium.bin missing");
+    return;
+  }
   REQUIRE(object_size == local.size());
 
   auto obj = std::make_unique<s3_io_object>(e.bucket, "medium.bin", object_size);

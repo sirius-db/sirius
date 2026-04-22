@@ -123,4 +123,4 @@ s3-cpp-test:
 	  echo "s3-cpp-test: $(S3_TEST_BIN) not found — run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@source test/integration/s3/env.sh && $(S3_TEST_BIN) "[s3][integration]"
+	@source test/integration/s3/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"

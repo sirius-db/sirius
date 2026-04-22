@@ -17,6 +17,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
+#include <utils/s3_live_test.hpp>
 
 #include <cstdint>
 #include <cstdio>
@@ -69,21 +70,15 @@ struct env_cfg {
   }
 };
 
-std::string getenv_or(char const* key, char const* dflt = "")
-{
-  auto const* value = std::getenv(key);
-  return (value && *value) ? value : dflt;
-}
-
 env_cfg read_env()
 {
   env_cfg cfg;
-  cfg.endpoint   = getenv_or("SIRIUS_TEST_S3_ENDPOINT");
-  cfg.region     = getenv_or("SIRIUS_TEST_S3_REGION", "us-east-1");
-  cfg.access_key = getenv_or("SIRIUS_TEST_S3_ACCESS_KEY");
-  cfg.secret_key = getenv_or("SIRIUS_TEST_S3_SECRET_KEY");
-  cfg.bucket     = getenv_or("SIRIUS_TEST_S3_BUCKET");
-  cfg.local_dir  = getenv_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  cfg.endpoint   = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ENDPOINT");
+  cfg.region     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  cfg.access_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  cfg.secret_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_SECRET_KEY");
+  cfg.bucket     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_BUCKET");
+  cfg.local_dir  = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_LOCAL_DIR");
   return cfg;
 }
 
@@ -151,6 +146,8 @@ class s3_gpu_execution_fixture {
 
   void configure_s3(env_cfg const& cfg)
   {
+    require_ok("SET autoload_known_extensions = false;");
+    require_ok("SET autoinstall_known_extensions = false;");
     require_ok("SET enable_duckdb_fallback = false;");
     require_ok("SET s3_transport = 'http';");
     require_ok("SET s3_endpoint = '" + sql_quote(cfg.endpoint) + "';");
@@ -161,9 +158,10 @@ class s3_gpu_execution_fixture {
 
   std::unique_ptr<duckdb::MaterializedQueryResult> run_gpu(std::string const& inner_sql)
   {
-    // Intentionally route through gpu_execution only; do not install/use httpfs
-    // or run a CPU-side s3:// read. If this query succeeds, it is exercising
-    // Sirius's own S3 datasource path rather than DuckDB's native remote I/O.
+    // Intentionally route through gpu_execution only. The companion guard test
+    // below proves the plain CPU s3:// path is unavailable in the same
+    // connection, so success here must be coming from Sirius's own S3
+    // datasource path rather than DuckDB's native remote I/O.
     auto result = con->Query("SELECT * FROM gpu_execution(\"" + inner_sql + "\")");
     REQUIRE(result);
     if (result->HasError()) { UNSCOPED_INFO("gpu_execution error: " << result->GetError()); }
@@ -187,6 +185,30 @@ class s3_gpu_execution_fixture {
 };
 
 }  // namespace
+
+TEST_CASE_METHOD(s3_gpu_execution_fixture,
+                 "gpu_execution s3 - cpu s3 read stays unavailable without httpfs",
+                 "[integration][gpu_execution][s3][parquet]")
+{
+  auto cfg = read_env();
+  if (skip_if_env_missing(cfg)) return;
+
+  configure_s3(cfg);
+
+  auto cpu = con->Query("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.small_parquet_uri() + "')");
+  REQUIRE(cpu);
+  if (!cpu->HasError()) {
+    UNSCOPED_INFO("Plain CPU s3:// read unexpectedly succeeded without httpfs guard");
+  }
+  REQUIRE(cpu->HasError());
+
+  auto gpu = run_gpu("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.small_parquet_uri() +
+                     "')");
+  REQUIRE(gpu->ColumnCount() == 1);
+  REQUIRE(gpu->RowCount() == 1);
+  CHECK(gpu->GetValue(0, 0).GetValue<std::int64_t>() ==
+        static_cast<std::int64_t>(PARQUET_ROWS));
+}
 
 TEST_CASE_METHOD(s3_gpu_execution_fixture,
                  "gpu_execution s3 - basic scan end-to-end",

@@ -35,7 +35,8 @@
 //   - SIRIUS_TEST_S3_* env vars unset (same pattern as test_s3_integration)
 //   - small.parquet missing locally — pyarrow wasn't installed when
 //     `make s3-up` generated fixtures, so the object also isn't in S3
-//   - factory::create throws — MinIO unreachable mid-test
+//   - factory::create throws — skipped in best-effort mode, failed in
+//     SIRIUS_TEST_S3_STRICT=1 mode
 
 // IMPORTANT: include order mirrors test_parquet_scan_via_factory.cpp.
 // liburing.h (pulled transitively by sirius io headers) defines BLOCK_SIZE as
@@ -49,6 +50,7 @@
 #include "io/datasource_factory.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "sirius_config.hpp"
+#include "utils/s3_live_test.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -85,21 +87,15 @@ struct env_cfg {
   }
 };
 
-std::string getenv_or(char const* k, char const* dflt = "")
-{
-  auto const* v = std::getenv(k);
-  return (v && *v) ? v : dflt;
-}
-
 env_cfg read_env()
 {
   env_cfg c;
-  c.endpoint   = getenv_or("SIRIUS_TEST_S3_ENDPOINT");
-  c.region     = getenv_or("SIRIUS_TEST_S3_REGION", "us-east-1");
-  c.access_key = getenv_or("SIRIUS_TEST_S3_ACCESS_KEY");
-  c.secret_key = getenv_or("SIRIUS_TEST_S3_SECRET_KEY");
-  c.bucket     = getenv_or("SIRIUS_TEST_S3_BUCKET");
-  c.local_dir  = getenv_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  c.endpoint   = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ENDPOINT");
+  c.region     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  c.access_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  c.secret_key = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_SECRET_KEY");
+  c.bucket     = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_BUCKET");
+  c.local_dir  = sirius::test::s3::getenv_or("SIRIUS_TEST_S3_LOCAL_DIR");
   return c;
 }
 
@@ -164,8 +160,10 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
   try {
     ds = datasource_factory::create("s3://" + e.bucket + "/small.parquet", reg, cfg);
   } catch (std::exception const& ex) {
-    WARN("factory::create failed: " << ex.what());
-    SUCCEED("Skipping: MinIO unreachable or small.parquet missing in bucket");
+    sirius::test::s3::handle_live_runtime_failure(
+      "factory::create failed",
+      ex,
+      "Skipping: MinIO unreachable or small.parquet missing in bucket");
     return;
   }
   REQUIRE(ds != nullptr);

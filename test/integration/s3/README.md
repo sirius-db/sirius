@@ -23,6 +23,9 @@ including both:
   `test/cpp/io/s3/test_s3_ioctx.cpp`, `test_s3_integration.cpp`,
   `test_s3_parquet_integration.cpp`, and the S3 `gpu_execution` integration
   tests under `test/cpp/integration/`.
+- A strict-mode toggle (`SIRIUS_TEST_S3_STRICT`) that keeps ad-hoc local runs
+  best-effort while making `make s3-test` fail hard if live S3 access breaks
+  after the environment is present.
 
 ## Requirements
 
@@ -47,6 +50,9 @@ make s3-cpp-test        # equivalent
 # Or run manually:
 source test/integration/s3/env.sh
 build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
+
+# Force runtime S3 failures to fail instead of skipping:
+SIRIUS_TEST_S3_STRICT=1 build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
 
 # Tear down (the `-v` in `down -v` also removes the named volume).
 make s3-down
@@ -101,9 +107,17 @@ A sha256 manifest is written to `fixtures/local/MANIFEST.sha256`.
 - When `SIRIUS_TEST_S3_*` is not set the integration tests `SUCCEED` with a
   skip message rather than failing — this is intentional so the default
   `sirius_unittest` run stays green on CI runners without docker.
+- When `SIRIUS_TEST_S3_STRICT=1`, once the env/fixture preconditions are met,
+  live failures such as `HEAD` or `datasource_factory::create` errors fail the
+  test instead of downgrading to a skip. `make s3-test` enables this mode.
 - The `[s3][parquet][integration]` test additionally skips when
   `small.parquet` is missing locally (pyarrow was not installed at
   `make s3-up` time). Install pyarrow and rerun `make s3-up` to enable it.
+- The `gpu_execution` S3 suite explicitly disables DuckDB extension
+  autoload/autoinstall and asserts that plain CPU
+  `read_parquet('s3://...')` fails in the same connection before verifying the
+  Sirius query path succeeds. This keeps the end-to-end test honest about not
+  using DuckDB `httpfs`.
 - `env.sh` also exports `SIRIUS_CONFIG_FILE` pointing at `sirius.yaml` in this
   directory. It caps Super Sirius's startup GPU/host reservation at 256/128
   MiB so `require sirius` in SQL tests in this area won't OOM on GPUs that

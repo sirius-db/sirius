@@ -13,6 +13,9 @@ export SIRIUS_TEST_S3_ACCESS_KEY="${SIRIUS_TEST_S3_ACCESS_KEY:-minioadmin}"
 export SIRIUS_TEST_S3_SECRET_KEY="${SIRIUS_TEST_S3_SECRET_KEY:-minioadmin}"
 export SIRIUS_TEST_S3_BUCKET="${SIRIUS_TEST_S3_BUCKET:-sirius-test}"
 export SIRIUS_TEST_S3_KEY="${SIRIUS_TEST_S3_KEY:-hello.txt}"
+# Default to best-effort skips for manual runs; make s3-test overrides this to 1
+# so runtime S3 failures turn the job red instead of going green with a skip.
+export SIRIUS_TEST_S3_STRICT="${SIRIUS_TEST_S3_STRICT:-0}"
 
 # The new integration test also wants the local fixtures dir so it can
 # bit-compare S3 bytes against the local copy.
