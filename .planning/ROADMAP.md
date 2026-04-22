@@ -28,7 +28,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. `gpu_pipeline_task::compute_task` receives its input batches from `prepare_for_processing` as `vector<read_only_data_batch>`
   4. `run_one_operator` signature accepts `vector<read_only_data_batch>`
   5. `read_only_pipelineable_operator_data` and `read_only_partitioned_operator_data` types exist and are compilable
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Define new RAII types and rewrite lock_or_prepare_batch
+- [ ] 01-02-PLAN.md — Wire read_only_pipelineable_operator_data through pipeline execution path
 
 ### Phase 2: Mutation Paths and Lifecycle
 **Goal**: All conversion and downgrade code uses `to_mutable()` for exclusive access, and the old batch_state machine (`task_created`, `in_transit`, `processing`) and its associated lock functions are fully removed
@@ -61,6 +65,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Pipeline Data Path | 0/TBD | Not started | - |
+| 1. Pipeline Data Path | 0/2 | Planning complete | - |
 | 2. Mutation Paths and Lifecycle | 0/TBD | Not started | - |
 | 3. Operator Sweep and Clean Build | 0/TBD | Not started | - |
