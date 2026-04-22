@@ -36,6 +36,9 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+// cuda runtime (FIX-02 carryover: cudaGetLastError sticky-state consume)
+#include <cuda_runtime_api.h>
+
 // standard library
 #include <algorithm>
 #include <cassert>
@@ -51,6 +54,24 @@ namespace detail {
 
 /**
  * @brief Convert host_parquet_representation to gpu_table_representation
+ *
+ * FIX-02 carryover (Plan 08-06): the prior implementation set
+ *   rmm::cuda_set_device_raii target_device_raii(target_device_id)
+ * but then called `cudf::io::read_parquet(opts, stream, mr_ref)` using the
+ * CALLER-supplied `stream`. Under `num_gpus == 2`, the caller's stream may be
+ * bound to a non-target device (e.g. the pipeline-executor's GPU-0 stream
+ * while `target_device_id == 1`), producing `cudaErrorInvalidValue` inside
+ * cudf's internal H2D path. Same bug shape as 08-02 Branch B's
+ * `sirius_host_to_gpu_converter.cpp` before the fix; template for this site
+ * is that file.
+ *
+ * Fix pattern (mirrors sirius_host_to_gpu_converter.cpp):
+ *   1. Sync caller's stream so any upstream work on it is flushed.
+ *   2. Enter `rmm::cuda_set_device_raii` for the target device.
+ *   3. Acquire a target-bound stream from `target_memory_space->acquire_stream()`.
+ *   4. Use the TARGET-bound stream for read_parquet + apply_post_convert +
+ *      apply_partition_inject + final sync (never the caller's stream).
+ *   5. Consume sticky cuda errors before returning.
  */
 std::unique_ptr<cucascade::idata_representation>
 convert_host_parquet_to_gpu_with_prefetched_data_source(
@@ -63,7 +84,19 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
 
   rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
   rmm::cuda_device_id target_device_id(target_memory_space->get_device_id());
+
+  // --- Sync caller stream BEFORE switching device. The caller's stream may
+  // --- be bound to a different device than target_device_id; syncing it
+  // --- under its own device is safe (cuda_stream_view::synchronize wraps
+  // --- cudaStreamSynchronize which is cross-device tolerant for the WAIT
+  // --- itself). This flushes any upstream work that produced the source.
+  stream.synchronize();
+
+  // --- Enter target device, then acquire a target-bound stream from the
+  // --- target memory space's pool. From this point on we use target_stream
+  // --- for every cudf H2D/compute call.
   rmm::cuda_set_device_raii target_device_raii(target_device_id);
+  auto target_stream = target_memory_space->acquire_stream();
 
   // Build a cache_ranges from the packed host blocks and the column-chunk byte-range descriptors.
   // The block pointers are raw std::byte* owned by the allocation; cache_ranges does not take
@@ -89,19 +122,23 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   opts.set_row_groups({std::vector<cudf::size_type>(host_src.get_row_group_indices().begin(),
                                                     host_src.get_row_group_indices().end())});
 
-  auto [table, md] = cudf::io::read_parquet(opts, stream, mr_ref);
+  auto [table, md] = cudf::io::read_parquet(opts, target_stream, mr_ref);
 
   // Apply the post-convert hook (used by iceberg scan for V2 delete filtering).
   if (host_src.has_post_convert_fn()) {
-    table = host_src.apply_post_convert(std::move(table), stream);
+    table = host_src.apply_post_convert(std::move(table), target_stream);
   }
 
   // Inject hive partition columns (constant values from file path).
   if (host_src.has_partition_inject_fn()) {
-    table = host_src.apply_partition_inject(std::move(table), stream);
+    table = host_src.apply_partition_inject(std::move(table), target_stream);
   }
 
-  stream.synchronize();
+  target_stream.synchronize();
+
+  // Consume any sticky CUDA state before returning so a later call-site does
+  // not surface a stray error against us (matches Pattern 2 hygiene).
+  (void)cudaGetLastError();
 
   // Now we need to prune the post-filter columns from the table, if there are any.
   if (!post_filter_projection_ids.empty()) {
