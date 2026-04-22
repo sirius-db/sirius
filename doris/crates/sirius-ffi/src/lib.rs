@@ -265,6 +265,12 @@ impl SiriusEngine {
             "CREATE MACRO \"if\"(cond, then_val, else_val) AS CASE WHEN cond THEN then_val ELSE else_val END"
         ).ok(); // Non-fatal if it fails
 
+        // Disable the transparent GPU optimizer hook. The BE dispatches GPU work
+        // explicitly via `gpu_execution(sql)` (see `execute_gpu`); the hook
+        // intercepts *every* query (including LIMIT 0 schema fetches) and its
+        // CPU_SOURCE pipeline deadlocks inside DuckDB's own pipeline executor.
+        conn.execute_batch("SET gpu_execution = false").ok();
+
         let exchange_api = load_exchange_api(&sirius_ext)?;
 
         Ok(Self {

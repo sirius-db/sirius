@@ -143,6 +143,17 @@ void SiriusContext::QueryEnd()
   // Suppress state mutations triggered by internal connections (e.g. iceberg metadata lookups).
   if (is_internal_query_active()) { return; }
 
+  // Skip if we never acquired the slot for this query. Happens when the extension
+  // registers the SiriusContext state mid-query (during LOAD) — DuckDB then calls
+  // QueryEnd without a matching QueryBegin. Releasing here would underflow the
+  // lifecycle counter and deadlock the next query.
+  {
+    std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+    if (active_query_depth_ == 0 || active_query_owner_ != std::this_thread::get_id()) {
+      return;
+    }
+  }
+
   try {
     spdlog::info("QueryEnd");
     captured_logical_plan_.reset();

@@ -624,6 +624,12 @@ impl NixlExchange {
         remote_agent: &str,
         data_bytes: usize,
     ) -> Result<(), String> {
+        // Defense in depth: ensure this thread has the CUDA primary context before
+        // UCX inspects the descriptors. All current call sites already do this, but
+        // keeping it here prevents a future caller from tripping the UCX "memory is
+        // detected as host" SEGV path inside nixlUcxEngine::sendXferRange.
+        ensure_cuda_context()?;
+
         let req = self
             .agent
             .create_xfer_req(XferOp::Write, src_descs, dst_descs, remote_agent, None)
