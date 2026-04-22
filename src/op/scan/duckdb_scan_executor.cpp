@@ -54,8 +54,24 @@ duckdb_scan_executor::duckdb_scan_executor(
   }
   // Keep backward compat: _gpu_memory_space points to first GPU for stream pool init
   _gpu_memory_space = _gpu_memory_spaces.empty() ? nullptr : _gpu_memory_spaces[0];
-  _stream_pool      = std::make_unique<cucascade::memory::exclusive_stream_pool>(
-    rmm::cuda_device_id(_gpu_memory_space->get_device_id()), config.num_threads);
+
+  // FIX-01 (v1.2): construct one exclusive_stream_pool per GPU, keyed by
+  // device_id. Each pool's streams are created under that device's
+  // rmm::cuda_set_device_raii so acquired streams are correctly bound to the
+  // target GPU when select_target_gpu() picks a non-zero device. Mirrors
+  // gpu_pipeline_executor's per-executor pool shape
+  // (src/pipeline/gpu_pipeline_executor.cpp:45) lifted to the multi-GPU scan
+  // case — duckdb_scan_executor is shared across all GPUs, so it needs a map
+  // rather than a single pool. Closes the root cause of the v1.1 E2E
+  // cudaErrorInvalidValue at cuda_memcpy.cu (see Pattern 1 in 08-RESEARCH.md).
+  for (auto* space : _gpu_memory_spaces) {
+    auto const dev_id = space->get_device_id();
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{dev_id}};
+    _gpu_stream_pools.emplace(
+      dev_id,
+      std::make_unique<cucascade::memory::exclusive_stream_pool>(
+        rmm::cuda_device_id{dev_id}, config.num_threads));
+  }
 }
 
 duckdb_scan_executor::~duckdb_scan_executor()
