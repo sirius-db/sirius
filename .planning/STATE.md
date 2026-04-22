@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.2
-milestone_name: multi-gpu-sql-pipeline-fix
-status: roadmap-defined
-stopped_at: Roadmap defined — Phase 8 scoped, plans pending
-last_updated: "2026-04-21T23:45:00.000Z"
-last_activity: 2026-04-21
+milestone_name: Multi-GPU SQL Pipeline Fix
+status: executing
+stopped_at: Completed 08-01-PLAN.md (build-gated; N=2 runtime reproduction deferred to 08-06)
+last_updated: "2026-04-22T01:21:01.187Z"
+last_activity: 2026-04-22
 progress:
   total_phases: 1
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  total_plans: 6
+  completed_plans: 1
+  percent: 17
 ---
 
 # Project State
@@ -21,16 +21,28 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Milestone v1.2 Phase 8 — Multi-GPU SQL Pipeline Fix. Roadmap defined; plans to be generated via `/gsd:plan-phase 8`.
+**Current focus:** Phase 08 — multi-gpu-sql-pipeline-fix
 
 ## Current Position
 
-Phase: 8 — Multi-GPU SQL Pipeline Fix (not started)
-Plan: —
-Status: Roadmap defined; awaiting plan-phase
-Last activity: 2026-04-21 — v1.2 roadmap created (single phase, 11 requirements mapped)
+Phase: 08 (multi-gpu-sql-pipeline-fix) — EXECUTING
+Plan: 2 of 6
+Status: 08-01 complete (FIX-01 build-gated); 08-02 (FIX-02 probe) next
+Last activity: 2026-04-22 — 08-01 landed
 
-Progress: [░░░░░░░░░░] 0% (0/1 phases complete)
+Progress: [██░░░░░░░░] 17% (1/6 plans complete)
+
+## Performance Metrics
+
+| Phase | Plan | Duration | Tasks | Files | Completed           |
+| ----- | ---- | -------- | ----- | ----- | ------------------- |
+| 08    | 01   | 6min     | 3     | 3     | 2026-04-22T01:19:13Z |
+
+## Decisions
+
+- **[08-01]** FIX-01: Per-GPU stream pool map in duckdb_scan_executor replaces singular GPU-0-bound pool. Dispatch lambda opens with rmm::cuda_set_device_raii pinned to target_gpu_id. Pattern 2 idiom extended from p2p converter to scan executor.
+- **[08-01]** Hoisted select_target_gpu() from parquet-only block to top of manager_loop so the dispatch lambda can capture target_gpu_id. Non-parquet scan tasks (cpu_source_task, duckdb_scan_task) now also route through a well-defined target device.
+- **[08-01]** Single-GPU host runtime reproduction deferred to Plan 08-06 ship gate (verification hardware has 2 × RTX 6000 Ada). Static invariants + MCP build gate verified here.
 
 ## Accumulated Context
 
@@ -68,6 +80,6 @@ Progress: [░░░░░░░░░░] 0% (0/1 phases complete)
 
 ## Session Continuity
 
-Last session: 2026-04-21 — v1.2 roadmap defined (Phase 8, 11 requirements, 5 success criteria)
-Stopped at: Roadmap written; plans pending
-Resume file: .planning/ROADMAP.md → then `/gsd:plan-phase 8`
+Last session: 2026-04-22T01:21:01.185Z
+Stopped at: Completed 08-01-PLAN.md (build-gated; N=2 runtime reproduction deferred to 08-06)
+Resume file: None
