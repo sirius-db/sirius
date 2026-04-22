@@ -25,9 +25,9 @@
 
 ### AUDIT — `[mgpu-audit]` Acceptance Gate
 
-- [ ] **AUDIT-01**: A dedicated TEST_CASE (or check inside an existing TPC-H TEST_CASE) runs TPC-H SF1 on `num_gpus: 2` with `[mgpu-audit]` logging enabled, captures the log, and asserts `pipeline_task` count > 0 on **both** GPU 0 and GPU 1.
-- [ ] **AUDIT-02**: Same assertion for `scan_batch` count > 0 on both GPUs.
-- [ ] **AUDIT-03**: Audit gate is checked by the default `unit-tests` run — i.e., regressions to single-GPU-only distribution break the build.
+- [x] **AUDIT-01**: A dedicated TEST_CASE (or check inside an existing TPC-H TEST_CASE) runs TPC-H SF1 on `num_gpus: 2` with `[mgpu-audit]` logging enabled, captures the log, and asserts `pipeline_task` count > 0 on **both** GPU 0 and GPU 1.
+- [x] **AUDIT-02**: Same assertion for `scan_batch` count > 0 on both GPUs.
+- [x] **AUDIT-03**: Audit gate is checked by the default `unit-tests` run — i.e., regressions to single-GPU-only distribution break the build.
 
 ---
 
@@ -57,9 +57,9 @@
 | TEST-02 | Phase 8 | Pending |
 | TEST-03 | Phase 8 | Pending |
 | TEST-04 | Phase 8 | Pending |
-| AUDIT-01 | Phase 8 | Pending |
-| AUDIT-02 | Phase 8 | Pending |
-| AUDIT-03 | Phase 8 | Pending |
+| AUDIT-01 | Phase 8 | Complete |
+| AUDIT-02 | Phase 8 | Complete |
+| AUDIT-03 | Phase 8 | Complete |
 
 **Coverage:**
 - v1.2 requirements: 11 total (4 FIX + 4 TEST + 3 AUDIT)

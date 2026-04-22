@@ -40,7 +40,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 **Plans**: 6 plans
   - [x] 08-01-PLAN.md — FIX-01 duckdb_scan_executor per-GPU stream pool (root cause fix)
   - [x] 08-02-PLAN.md — FIX-02 probe + conditional Sirius-side host→gpu converter override
-  - [ ] 08-03-PLAN.md — AUDIT-01/02/03 [mgpu-audit] log payload extension (task_id/batch_id)
+  - [x] 08-03-PLAN.md — AUDIT-01/02/03 [mgpu-audit] log payload extension (task_id/batch_id)
   - [ ] 08-04-PLAN.md — TEST-01/02 integration-2gpu.yaml fixture + GENERATE(1,2) parameterization
   - [ ] 08-05-PLAN.md — TEST-03/04 + AUDIT TEST_CASE (SF1 full + SF10 Q1/Q6/Q12 + log-grep assertions)
   - [ ] 08-06-PLAN.md — FIX-03/04 HYG+build sweep + SF100 Q1 VALIDATION on N=2 hardware
