@@ -121,7 +121,7 @@ TIME ═══> [ GPU compute+partition batch 1 ][ GPU compute+partition batch 2
 | `communication_executor` | Sirius Core (C++) | New sender-side executor (manager loop + worker pool) |
 | `communication_task` | Sirius Core (C++) | New per-partition transfer task |
 | NIXL agent (direct C++ calls) | Sirius Core (C++) | New C++ wrapper — NIXL is a native C++ library |
-| Staging buffer management | Sirius Core (C++) | cuCascade reservations replace Rust bump allocator |
+| Bounce buffers (send + recv) | Sirius Core (C++) | Pre-allocated from cuCascade (GPU or HOST tier), pre-registered with NIXL at startup, bump-allocated per transfer |
 | Receiver C API | Sirius Core (C++) | New `extern "C"` functions for reserve + ingest |
 | Hash partitioning | Sirius Core (C++) | Moved from result_collector post-processing to pipeline operator |
 | gRPC client (sender) | Sirius Backend (Rust) | Stays — tonic client, called from C++ via FFI |
@@ -182,15 +182,18 @@ The manager loop stays lightweight — it only reserves memory and dispatches wo
 while (_running):
   1. slot = _bounded_pool->reserve()          // Block until worker slot available
   2. task = _task_queue.pop()                  // Block until communication task queued
-  3. estimate staging_bytes from task input    // Size of cudf::chunked_pack output
-  4. reservation = _staging_mem_space->make_reservation(staging_bytes)
-  5. if partial and _downgrade_executor:       // Same pattern as GPU executor
-       trigger downgrade, retry reservation
-  6. attach reservation to task local state
+  3. estimate packed_bytes from task input     // Size of cudf::chunked_pack output
+  4. lease = _send_bounce_buffer->try_allocate(packed_bytes)
+     // Bump allocator within pre-registered bounce buffer
+     // NOT a cuCascade reservation — just mutex + offset increment
+  5. if lease fails (bounce buffer full):
+       option A: block until leases are released, retry
+       option B: fall back to per-transfer cuCascade reservation + NIXL registration (slow path)
+  6. attach lease to task local state
   7. _bounded_pool->dispatch(slot, worker_fn)  // Hand off to worker thread
 ```
 
-The manager does **not** pack data — packing happens in the worker thread so the manager stays responsive for the next task.
+The manager does **not** pack data — packing happens in the worker thread so the manager stays responsive for the next task. The bounce buffer sub-allocation is lightweight (bump pointer increment under a mutex) — no cuCascade reservation or NIXL registration on the per-transfer path.
 
 ### Worker Thread Protocol
 
@@ -198,15 +201,18 @@ Each worker thread executes a 4-phase transfer lifecycle:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ Phase 1 — Pack (C++ direct, uses CUDA stream)           │
+│ Phase 1 — Pack into bounce buffer (CUDA stream)         │
 │   Acquire stream from _stream_pool                      │
-│   cudf::chunked_pack into staging buffer (GPU kernel)   │
+│   cudf::chunked_pack into bounce buffer sub-region      │
+│   (GPU bounce: D2D pack directly)                       │
+│   (Host bounce: pack to GPU temp, then cudaMemcpyDtoH)  │
 │   cudaStreamSynchronize — wait for pack to complete     │
-│   Register staging buffer with NIXL agent               │
-│   Release stream back to pool                           │
+│   No NIXL registration needed — bounce buffer is        │
+│   pre-registered at startup                             │
 ├─────────────────────────────────────────────────────────┤
 │ Phase 2 — Metadata Exchange (FFI → Rust tonic)          │
 │   Send ExchangeMetadata gRPC to receiver                │
+│   Include pre-cached NIXL metadata (no fresh packing)   │
 │   Wait for response: dst buffer addresses + NIXL meta   │
 ├─────────────────────────────────────────────────────────┤
 │ Phase 3 — RDMA Transfer (C++ direct — no stream needed) │
@@ -217,11 +223,13 @@ Each worker thread executes a 4-phase transfer lifecycle:
 ├─────────────────────────────────────────────────────────┤
 │ Phase 4 — Completion (FFI → Rust tonic)                 │
 │   Send TransferComplete gRPC to receiver                │
-│   Release staging reservation + deregister NIXL buffer  │
+│   Release bounce buffer lease (no deregistration)       │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Stream usage:** Only Phase 1 needs a CUDA stream — `cudf::chunked_pack` runs GPU kernels to serialize table data into a contiguous buffer. The NIXL API is entirely stream-agnostic; transfers are driven by the RDMA NIC hardware (via UCX/GPUDirect RDMA), not GPU kernels.
+**Stream usage:** Only Phase 1 needs a CUDA stream — `cudf::chunked_pack` runs GPU kernels to serialize table data into a contiguous buffer. For host bounce buffers, an additional `cudaMemcpyDtoH` is needed after packing. The NIXL API is entirely stream-agnostic; transfers are driven by the RDMA NIC hardware (via UCX/GPUDirect RDMA), not GPU kernels.
+
+**No per-transfer registration:** The bounce buffer is pre-registered with NIXL at `SiriusContext` startup. Worker threads only need the pre-cached NIXL metadata — no `registerMem()`, `ucp_mem_map()`, or `ucp_rkey_pack()` calls during the transfer hot path.
 
 **Boundary crossing summary:** NIXL operations (phases 1, 3) are called directly from C++ — NIXL is a native C++ library (`doris/thirdparty/nixl/src/api/cpp/`). gRPC operations (phases 2, 4) cross into Rust via `extern "C"` FFI. The RDMA hot path stays in C++; only the metadata RPCs (small messages, two round-trips per transfer) cross the boundary.
 
@@ -270,11 +278,11 @@ The gRPC server stays in Rust as `NixlMetadataService` in `nixl_service.rs`. It 
 1. Rust receives ExchangeMetadata gRPC request
 2. Parse buffer descriptors and sender NIXL metadata
 3. FFI into C++: sirius_exchange_reserve_recv_buffer()
-   ├── memory_space->make_reservation_or_null(total_recv_size)
-   ├── If fail: return error code → Rust sends NACK response
-   ├── Allocate receive buffer from reservation
-   ├── Register receive buffer with NIXL agent (C++ API)
-   └── Return dst buffer addresses through FFI
+   ├── lease = _recv_bounce_buffer->try_allocate(total_recv_size)
+   ├── If lease fails (bounce buffer full):
+   │     fall back to per-transfer reservation + registration (slow path)
+   ├── Return pre-registered bounce buffer addresses (no NIXL registration)
+   └── Return pre-cached NIXL metadata through FFI
 4. Rust loads sender NIXL metadata (cached per peer)
 5. Return gRPC response with dst addresses + local NIXL metadata
 ```
@@ -284,9 +292,10 @@ The gRPC server stays in Rust as `NixlMetadataService` in `nixl_service.rs`. It 
 ```
 1. Rust receives TransferComplete gRPC notification
 2. FFI into C++: sirius_exchange_ingest_transfer()
-   ├── cudf::unpack() with packed metadata → cuDF table
-   ├── Wrap as cucascade::data_batch
+   ├── cudf::unpack() from bounce buffer sub-region → cuDF table
+   ├── Wrap as cucascade::data_batch (data copied out of bounce buffer)
    ├── Push into shared_data_repository
+   ├── Release bounce buffer lease
    └── task_creator->schedule(output_consumer)
 3. Return gRPC success response
 ```
@@ -352,7 +361,7 @@ class communication_task : public sirius::parallel::sirius_pipeline_itask {
   int _partition_id;
   int _retry_count{0};
   uint64_t _original_task_id;
-  std::unique_ptr<cucascade::memory::reservation> _staging_reservation;
+  bounce_buffer_lease _bounce_lease;                     // Sub-region in pre-registered bounce buffer
 
   // Global state (shared across tasks for same query)
   nixl_agent* _nixl_agent;    // NIXL C++ agent handle
@@ -387,51 +396,121 @@ GPU pipeline task
 | `pipeline_executor` | `src/pipeline/pipeline_executor.hpp` | Add `communication_executor` alongside `_gpu_executors` |
 | `task_creator` | `src/creator/task_creator.cpp` | New branch: exchange data repo ready → create `communication_task` |
 | `completion_handler` | `src/pipeline/completion_handler.hpp` | Track per-partition per-destination completion |
-| `SiriusContext` | `src/sirius_context.cpp` | Initialize NIXL agent, register receiver FFI functions |
-| `sirius_config` | `src/config.cpp` / `src/include/config.hpp` | New config: comm executor threads, staging limits, retry policy |
+| `SiriusContext` | `src/sirius_context.cpp` | Initialize NIXL agent, allocate + register bounce buffers at startup |
+| `sirius_config` | `src/config.cpp` / `src/include/config.hpp` | New config: bounce buffer location/size, comm executor threads, retry policy |
 | `sirius_physical_plan_generator` | `src/planner/sirius_physical_plan_generator.cpp` | Register `exchange_partition` for exchange sink plans |
 
 ## Memory Architecture
 
-### Staging via cuCascade
+### Bounce Buffer Design
 
-The Rust bump allocator (`gpu_staging_buffer.rs`) is replaced by per-transfer cuCascade reservations:
+A **bounce buffer** is a pre-allocated, pre-registered memory region that eliminates per-transfer NIXL registration overhead. Data is packed (or copied) into the bounce buffer, then RDMA'd from there. The bounce buffer is registered with NIXL once at `SiriusContext` initialization and stays registered for the process lifetime — matching the pattern established in PR #652 (`ExchangeMemoryManager`) and the current Rust staging buffer (`gpu_staging_buffer.rs`).
 
-| Aspect | Current (Rust) | Proposed (C++) |
-|--------|----------------|----------------|
-| Allocation | Pre-allocated bump pool (1GB default) | Pre-allocated region from cuCascade, sub-allocated per transfer |
-| NIXL registration | Once at startup, shared across transfers | Once at startup — avoids per-transfer `ucp_mem_map()` overhead |
-| Memory pressure | Invisible to cuCascade | Region reserved via cuCascade, but not reclaimable by downgrade |
-| Lifetime | Epoch-based reset when all leases drop | Bump/slab allocator within pre-registered region |
-| Overflow | Fallback to individual `cuMemAlloc` + per-transfer registration | Fallback to per-transfer cuCascade reservation + registration (slow path) |
+#### GPU vs Host Bounce Buffer
 
-### Sender Reservation Flow
+The bounce buffer can reside in GPU memory (`VRAM_SEG`) or host-pinned memory (`DRAM_SEG`). The optimal choice depends on the hardware architecture:
+
+| System | Recommended | Why |
+|--------|-------------|-----|
+| **NVL72 / GB200** | GPU (`vram`) | NVSwitch provides 1.8 TB/s GPU-to-GPU. GPUDirect RDMA sends directly from GPU memory via dedicated per-GPU NIC. Copying to host wastes bandwidth. |
+| **A100 / H100** | GPU (`vram`) | Large BAR1 (16+ GB) supports GPUDirect RDMA for large registrations. GPU-to-NIC path bypasses CPU entirely. |
+| **T4** | Host (`dram`) | BAR1 is only 256 MB — too small for large GPU RDMA registrations. Host-pinned memory avoids the BAR1 constraint. |
+| **L4** | Host (`dram`) | PCIe-only, constrained BAR1. Same rationale as T4. |
+| **No RDMA NIC** | Host (`dram`) | Must stage through host for TCP/socket transport. |
+
+This is configurable via `sirius.yaml` so deployments can tune per-cluster.
+
+#### Bounce Buffer Lifecycle
+
+```
+SiriusContext::initialize()
+  │
+  ├─ GPU bounce buffer path (bounce_buffer.location = "vram"):
+  │    memory_space = GPU tier memory space from cuCascade
+  │    reservation = memory_space->make_reservation(bounce_buffer.size)
+  │    buffer_ptr = allocate from reservation (contiguous GPU region)
+  │    nixl_agent->registerMem(buffer_ptr, size, VRAM_SEG)
+  │    cache NIXL metadata for this buffer
+  │
+  └─ Host bounce buffer path (bounce_buffer.location = "dram"):
+       memory_space = HOST tier memory space from cuCascade
+       reservation = memory_space->make_reservation(bounce_buffer.size)
+       buffer_ptr = allocate from reservation (pinned host memory)
+       nixl_agent->registerMem(buffer_ptr, size, DRAM_SEG)
+       cache NIXL metadata for this buffer
+
+  → Bounce buffer lives for SiriusContext lifetime
+  → Sub-allocated per transfer via bump allocator (same pattern as gpu_staging_buffer.rs)
+  → Deregistered in SiriusContext::terminate()
+```
+
+#### Sender and Receiver Bounce Buffers
+
+Following PR #652's pattern, the system allocates **two** bounce buffers at startup — one for sending and one for receiving:
+
+| Buffer | Purpose | Used by |
+|--------|---------|---------|
+| **Send bounce buffer** | Holds packed data before RDMA write to remote | `communication_executor` worker threads (Phase 1: pack into bounce buffer) |
+| **Recv bounce buffer** | Destination for incoming RDMA writes | `exchange_receiver_service` (ExchangeMetadata handler allocates sub-region) |
+
+Both are pre-registered with NIXL at startup. NIXL metadata is cached once and reused for all transfers.
+
+#### Bump Allocator (per-transfer sub-allocation within the bounce buffer)
+
+A single bounce buffer is shared across all worker threads in the communication executor. To support multiple concurrent transfers, each transfer sub-allocates a region from the bounce buffer using a **bump allocator** — a separate, lightweight allocation mechanism independent of cuCascade's reservation system.
+
+Per-transfer sub-allocation does **not** go through cuCascade reservations. The bounce buffer is reserved from cuCascade once at startup; after that, the bump allocator manages space within the bounce buffer directly (mutex + offset increment).
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  Bounce Buffer (4 GB)                 │
+│          (one cuCascade reservation at startup)       │
+│          (one NIXL registration at startup)           │
+│                                                      │
+│  ┌──────────┬──────────┬──────────┬────────────────┐ │
+│  │ Worker 1 │ Worker 2 │ Worker 3 │    Free        │ │
+│  │ (RDMA    │ (packing)│ (RDMA    │                │ │
+│  │  in-flgt)│          │  in-flgt)│                │ │
+│  └──────────┴──────────┴──────────┴────────────────┘ │
+│  ^                                ^                  │
+│  base                          offset                │
+│                                                      │
+│  Leases: 3 active                                    │
+│  When all leases drop → offset resets to 0           │
+└──────────────────────────────────────────────────────┘
+```
+
+- 256-byte aligned sub-allocations
+- Epoch-based reset: when all active leases are released, offset resets to 0
+- Overflow: if the bump allocator is full, fall back to per-transfer cuCascade reservation + NIXL registration (slow path, logged as warning)
+
+### Sender Flow (with bounce buffer)
 
 ```
 task_creator creates communication_task with packed partition data
   → communication_executor manager_loop
-    → _staging_mem_space->make_reservation(staging_bytes)
-    → if partial: trigger downgrade, retry
-    → attach reservation to task local state
+    → sub-allocate from send bounce buffer (bump allocator)
+    → if overflow: fall back to per-transfer reservation + registration
+    → attach bounce buffer lease to task local state
     → dispatch to worker thread
-      → worker: allocate staging buffer from reservation
-      → worker: cudf::chunked_pack into staging
-      → worker: register with NIXL, do RDMA transfer
-      → worker: release reservation after transfer complete
+      → worker: cudf::chunked_pack into bounce buffer sub-region (CUDA stream)
+      → worker: if host bounce buffer: cudaMemcpyDtoH from GPU to bounce sub-region
+      → worker: NIXL transfer from pre-registered bounce buffer (no registration needed)
+      → worker: release lease after transfer complete
 ```
 
-### Receiver Reservation Flow
+### Receiver Flow (with bounce buffer)
 
 ```
 ExchangeMetadata RPC arrives (Rust → C++ FFI)
-  → memory_space->make_reservation_or_null(recv_size)
-  → if fail: return error → Rust sends NACK → sender retries
-  → allocate receive buffer from reservation
-  → register with NIXL, return addresses
-  → ... RDMA transfer happens (sender-initiated) ...
+  → sub-allocate from recv bounce buffer (bump allocator)
+  → if overflow: fall back to per-transfer reservation + registration
+  → return pre-registered bounce buffer addresses (no NIXL registration)
+  → ... RDMA transfer writes directly into bounce buffer sub-region ...
 TransferComplete RPC arrives (Rust → C++ FFI)
-  → cudf::unpack() → cuDF table → data_batch
-  → push to shared_data_repository (reservation ownership transfers to batch)
+  → cudf::unpack() from bounce buffer sub-region → cuDF table → data_batch
+  → push to shared_data_repository (data copied out of bounce buffer)
+  → release bounce buffer lease
   → task_creator->schedule(downstream operator)
 ```
 
@@ -443,8 +522,6 @@ New entries in `sirius.yaml`:
 communication:
   # Worker thread count for the communication executor
   thread_count: 4
-  # Maximum staging reservation per transfer (bytes)
-  max_staging_reservation: 1073741824  # 1GB
   # Retry limits
   max_reservation_retries: 10
   max_receiver_nack_retries: 5
@@ -454,12 +531,30 @@ communication:
   nack_retry_initial_backoff_ms: 10
   nack_retry_max_backoff_ms: 1000
 
+bounce_buffer:
+  # Where the bounce buffer is allocated.
+  #   "vram" — GPU memory, pre-registered as NIXL VRAM_SEG
+  #            Best for NVL72, A100, H100 (GPUDirect RDMA, large BAR1)
+  #   "dram" — Host-pinned memory, pre-registered as NIXL DRAM_SEG
+  #            Best for T4, L4 (small BAR1), or systems without RDMA NICs
+  location: vram
+
+  # Size of the send bounce buffer (bytes). Default 1GB.
+  send_size: 4294967296
+
+  # Size of the recv bounce buffer (bytes). Default 4GB.
+  recv_size: 4294967296
+
 nixl:
   # NIXL transport backend
   transport: ucx
   # gRPC port for the receiver metadata service
   receiver_grpc_port: 9099
 ```
+
+The `bounce_buffer.location` setting controls which cuCascade memory tier is used:
+- `vram`: Allocates from the GPU tier `memory_space`, registers as `VRAM_SEG` with NIXL. Data is packed directly into GPU bounce buffer via `cudf::chunked_pack`, then RDMA'd via GPUDirect RDMA.
+- `dram`: Allocates from the HOST tier `memory_space` (pinned memory via `fixed_size_host_memory_resource`), registers as `DRAM_SEG` with NIXL. Data is packed on GPU, then `cudaMemcpyDtoH` to the host bounce buffer before RDMA.
 
 ## Migration Path
 
@@ -473,28 +568,33 @@ nixl:
 
 5. **Phase 5**: Remove deprecated Rust code (`nixl_exchange.rs`, `gpu_staging_buffer.rs`, NIXL Rust bindings). Replace `sirius_exchange_c_api.cpp` with new receiver C API.
 
+## NIXL Registration Overhead Analysis
+
+The bounce buffer design resolves the per-transfer registration overhead. For reference, here is the analysis that motivated this approach:
+
+**Registration cost per call** (all under exclusive agent lock, `nixl_agent.cpp:427`):
+- `ucp_mem_map()` — kernel-level page pinning and RDMA memory key creation
+- `ucp_mem_query()` — additional syscall to verify GPU VRAM type
+- `ucp_rkey_pack()` — serialize the remote access key into a transferable blob
+- NIXL bookkeeping — section maps, metadata allocation
+
+The exclusive agent lock serializes all concurrent registrations. UCX's RCACHE (configured with 1024 entries at `ucx_utils.cpp:458`) only hits on exact `(addr, size)` matches — dynamic allocations give different addresses each time.
+
+UCX's pool-level registration cache (`UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES=cuda`) cannot help either: cuCascade uses RMM's `cuda_async_memory_resource` (`cudaMallocAsync`), which UCX classifies as `UCS_MEMORY_TYPE_CUDA_MANAGED` — the bitmap only matches `UCS_MEMORY_TYPE_CUDA`, so the optimization is silently skipped.
+
+**Solution**: The bounce buffer is pre-registered once at startup. All transfers sub-allocate from the pre-registered region — zero `ucp_mem_map()` calls during the transfer hot path.
+
 ## Open Questions
 
-1. **Per-transfer NIXL registration overhead**: Registering memory with NIXL is expensive. The full `registerMem()` path (under exclusive agent lock) involves:
-   - `ucp_mem_map()` — kernel-level page pinning and RDMA memory key creation
-   - `ucp_mem_query()` — additional syscall to verify GPU VRAM type
-   - `ucp_rkey_pack()` — serialize the remote access key into a transferable blob
-   - NIXL bookkeeping — section maps, metadata allocation
+1. **Avoiding dedicated pre-partitioned NIXL memory**: The current design reserves a fixed 4GB send + 4GB recv bounce buffer at startup, which is memory that cannot be used for compute. Is there a way to avoid dedicating memory to NIXL — for example, by leveraging cuCascade's memory pool directly with a registration caching layer, or by using a transport that doesn't require explicit pre-registration?
 
-   The exclusive agent lock (`NIXL_LOCK_GUARD` in `nixl_agent.cpp:427`) serializes all concurrent registrations on the same agent, creating contention when multiple worker threads register simultaneously. UCX's registration cache (RCACHE, configured with 1024 entries at `ucx_utils.cpp:458`) helps with re-registering the same address range, but with dynamic cuCascade allocations the addresses change each time, so RCACHE provides no benefit.
+2. **Is NIXL the right transfer library?**: NIXL provides one-sided RDMA semantics with explicit memory registration. Alternatives worth evaluating:
+   - **UCXX**: Tag-based API avoids explicit registration entirely — UCX handles it internally via rcache. Two-sided (requires matching send/recv), but may be simpler. Already used by RAPIDS/Dask-CUDA for GPU shuffle.
+   - **NCCL**: Optimized for collective communication. Supports user buffer registration (`ncclCommRegister`) for zero-copy. Well-tuned for NVLink/NVSwitch topologies. But designed for collectives, not point-to-point exchange.
+   - Each has different trade-offs around registration overhead, API model (one-sided vs two-sided), and hardware optimization. Experimentation would clarify which fits the exchange pattern best.
 
-   The current Rust code solves this by pre-registering staging buffers once at startup and sub-allocating per transfer — sender skips registration entirely when staged (`nixl_integration.rs:1320`), receiver tries pre-registered staging first and only falls back to per-transfer registration on overflow (`nixl_service.rs:164-208`).
-
-   UCX's pool-level registration cache (`UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES=cuda`) cannot help here either. cuCascade uses RMM's `cuda_async_memory_resource` (`cudaMallocAsync` underneath), which UCX classifies as `UCS_MEMORY_TYPE_CUDA_MANAGED` — the `reg_whole_alloc_bitmap` only matches `UCS_MEMORY_TYPE_CUDA`, so the whole-allocation registration optimization silently skips these allocations. While `ucp_mem_map()` does check the rcache, it only hits on exact `(addr, size)` matches — dynamic cuCascade allocations give different addresses each time.
-
-   **Recommendation**: Allocate a staging region from cuCascade at init time, register it with NIXL once, and sub-allocate per transfer (bump allocator or slab). This preserves cuCascade memory pressure management while avoiding per-transfer `ucp_mem_map()` cost. The trade-off is that the staging region has a fixed reservation size that cannot be reclaimed by the downgrade executor.
-
-2. **Staging memory space**: Should staging use a dedicated cuCascade memory space (separate capacity/thresholds) or share the GPU compute space? A dedicated space prevents exchange from starving compute, but reduces total available GPU memory.
-
-3. **NIXL agent lifecycle**: One per `SiriusContext` (shared across queries) or one per query? Per-context is simpler but requires thread-safe access. Per-query provides isolation but increases NIXL initialization overhead.
+3. **Adaptive bounce buffer placement (CPU vs GPU)**: The optimal bounce buffer location depends on hardware topology and workload — GPU for NVL72/A100 (GPUDirect RDMA, large BAR1), host for T4/L4 (small BAR1). Currently this is a static config (`bounce_buffer.location`). Could we make it adaptive — for example, by querying BAR1 size and NIC topology at startup to auto-select, or by dynamically switching based on transfer patterns and memory pressure at runtime?
 
 4. **STRING column offset corruption**: The known NIXL RDMA bug that corrupts STRING column offsets (see `.planning/codebase/CONCERNS.md`) needs to be addressed regardless of C++ vs Rust. The current workaround uses `cudf::pack` instead of `cudf::chunked_pack` for STRING columns — this workaround carries over to the C++ implementation.
 
 5. **bRPC fallback**: Should the bRPC CPU fallback path also move to C++ eventually, or remain in Rust as a separate code path?
-
-6. **Host-pinned receive buffers**: Should the receiver support allocating host-pinned memory (via cuCascade HOST tier) as a fallback when GPU memory is exhausted, instead of NACK-ing the sender?
