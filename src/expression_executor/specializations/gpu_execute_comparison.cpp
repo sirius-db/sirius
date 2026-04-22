@@ -15,10 +15,10 @@
  */
 
 // sirius
-#include "duckdb/common/enums/expression_type.hpp"
-
+#include <duckdb/common/enums/expression_type.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <operator/empty_str_check.cuh>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
@@ -35,7 +35,6 @@
 
 // standard library
 #include <memory>
-#include <type_traits>
 
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
@@ -58,7 +57,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpressio
         case COMPARE_DISTINCT_FROM:  // Fallthrough: special handling below
         case COMPARE_NOT_DISTINCT_FROM: return cudf::ast::ast_operator::NULL_EQUAL;
         default:
-          throw duckdb::InternalException(
+          throw invalid_input_exception(
             "[expression_executor:comparison] Unrecognized comparison type : {}",
             static_cast<int>(expr.GetExpressionType()));
       }
@@ -110,7 +109,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpressio
       case COMPARE_DISTINCT_FROM: return cudf::binary_operator::NULL_NOT_EQUALS;
       case COMPARE_NOT_DISTINCT_FROM: return cudf::binary_operator::NULL_EQUALS;
       default:
-        throw duckdb::InternalException(
+        throw invalid_input_exception(
           "[expression_executor:comparison] Unrecognized comparison type : {}",
           static_cast<int>(expr.GetExpressionType()));
     }

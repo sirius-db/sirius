@@ -16,6 +16,7 @@
 
 // sirius
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
@@ -24,7 +25,6 @@
 
 // cudf
 #include <cudf/ast/expressions.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
@@ -77,7 +77,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
       }
       if (throw_error) {
         // Assume that this arises for the stated error
-        throw duckdb::InternalException(
+        throw internal_exception(
           "[gpu_expression_executor:case]: More than one row returned by a subquery used as an "
           "expression.");
       }
@@ -119,7 +119,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
   if (mode == execution_mode::AST) {
     // The caller wants an AST node.
     // Since at least one copy_if_else has been executed, current_result must have an owned column.
-    D_ASSERT(current_result.is_owned_column());
+    if (!current_result.is_owned_column()) {
+      throw internal_exception(
+        "[gpu_expression_executor:case]: Expected an owned column after executing CASE "
+        "expression.");
+    }
     return materialize_as_ast_column(std::move(current_result.release_column()));
   }
   return current_result;

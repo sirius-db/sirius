@@ -17,6 +17,7 @@
 // sirius
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/assert.hpp>
@@ -250,11 +251,12 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
             not_expr, output.get_temp_scalar_indices(), output.get_temp_column_indices()));
         }
         case duckdb::ExpressionType::OPERATOR_COALESCE:
-          throw std::runtime_error(
-            "[gpu_expression_executor] execute called in AST mode with COALESCE operator.");
+          // Should be unreachable
+          throw internal_exception(
+            "[gpu_expression_executor] AST mode with COALESCE operator is not supported.");
         case duckdb::ExpressionType::OPERATOR_TRY:
-          throw duckdb::NotImplementedException(
-            "[gpu_expression_executor] execute called on an unsupported TRY operator expression.");
+          throw not_implemented_exception(
+            "[gpu_expression_executor] AST mode with TRY operator is not implemented.");
         case duckdb::ExpressionType::OPERATOR_NOT: {
           D_ASSERT(expr.children.size() == 1);
           auto child = execute(*expr.children[0], execution_mode::AST);
@@ -280,10 +282,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
           }
         }
         default:
-          throw duckdb::InternalException(
-            "[gpu_expression_executor] execute called on an operator expression [{}] with "
-            "unknown/unsupported operator type: {}",
-            expr.ToString(),
+          throw internal_exception(
+            "[gpu_expression_executor] AST mode with unknown/unsupported operator type: {}",
             static_cast<int>(expr.type));
       }
     };
@@ -306,7 +306,13 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
   if (mode == execution_mode::AST) {
     auto result = execute(expr, execution_mode::MATERIALIZE);
-    D_ASSERT(result.is_owned_column());
+    // Executing an operator expression in MATERIALIZE mode should produce an owned column.
+    // Otherwise, something went wrong.
+    if (!result.is_owned_column()) {
+      throw internal_exception(
+        "[gpu_expression_executor:operator]: Expected an owned column after executing operator "
+        "expression.");
+    }
     return materialize_as_ast_column(result.release_column());
   }
   switch (expr.type) {
@@ -404,7 +410,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
             contains_column = execute_string_in(expr, test.get_column_view(), _mr, _stream);
             break;
           default:
-            throw duckdb::NotImplementedException(
+            throw not_implemented_exception(
               "[gpu_expression_executor] execute IN called with unsupported scalar haystack type "
               "{}",
               static_cast<int>(test.get_column_view().type().id()));
@@ -476,7 +482,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
       return current_result;
     }
     case duckdb::ExpressionType::OPERATOR_TRY:
-      throw duckdb::NotImplementedException(
+      throw not_implemented_exception(
         "[gpu_expression_executor] execute called on an unsupported TRY operator expression.");
     case duckdb::ExpressionType::OPERATOR_NOT: {
       D_ASSERT(expr.children.size() == 1);
@@ -496,7 +502,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
         cudf::unary_operation(is_null_result->view(), cudf::unary_operator::NOT, _stream, _mr));
     }
     default:
-      throw duckdb::InternalException(
+      throw internal_exception(
         "[gpu_expression_executor] execute called on an operator expression [{}] with "
         "unknown/unsupported operator type: {}",
         expr.ToString(),
