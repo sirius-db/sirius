@@ -170,40 +170,44 @@ schema_info diverse_table_schema()
 /// Returns all output data_batches.
 std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   std::vector<std::string> const& file_paths,
-  duckdb::vector<duckdb::LogicalType> output_types,
-  duckdb::vector<duckdb::ColumnIndex> column_ids,
-  duckdb::vector<duckdb::idx_t> projection_ids,
-  duckdb::vector<std::string> names,
+  const duckdb::vector<duckdb::LogicalType>& output_types,
+  const duckdb::vector<duckdb::LogicalType>& returned_types,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<duckdb::idx_t>& projection_ids,
+  const duckdb::vector<std::string>& names,
   std::size_t approximate_batch_size,
   cucascade::memory::memory_space& gpu_space,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr,
   rmm::cuda_stream_view stream                             = cudf::get_default_stream())
 {
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(output_types),
+                                                            0);
+
   // --- Pipeline 1: metadata scan ---
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
+    &gpu_op,
     sirius::from_duckdb_vec(output_types),
+    sirius::from_duckdb_vec(returned_types),
     0,
     file_paths,
     column_ids,
     projection_ids,
     names,
-    approximate_batch_size,
-    std::move(table_filters));
+    std::move(table_filters),
+    {},
+    approximate_batch_size);
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
-    sirius::from_duckdb_vec(output_types), 0, gpu_space);
-
-  // Execute all metadata tasks and sink results into the GPU operator.
+  // Execute all metadata tasks and sink results into the GPU operator via metadata_op.sink().
   while (!metadata_op.all_ports_empty()) {
     auto input = metadata_op.get_next_task_input_data();
     if (!input) { break; }
     auto output = metadata_op.execute(*input, stream);
     REQUIRE(output);
-    gpu_op.sink(*output, stream);
+    metadata_op.sink(*output, stream);
   }
 
   // --- Pipeline 1 → Pipeline 2 transition ---
-  gpu_op.finalize_metadata();
+  metadata_op.finalize_operator();
 
   // --- Pipeline 2: GPU scan ---
   std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
@@ -212,6 +216,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     if (!hint) { break; }
     auto input = gpu_op.get_next_task_input_data();
     if (!input) { break; }
+    input->prepare_for_processing(&gpu_space, stream);
     auto output = gpu_op.execute(*input, stream);
     REQUIRE(output);
     auto* pipelineable = dynamic_cast<sirius::op::pipelineable_operator_data*>(output.get());
@@ -283,13 +288,16 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(sirius::from_duckdb_vec(schema.types),
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
+                                                            0);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             sirius::from_duckdb_vec(schema.types),
+                                                             sirius::from_duckdb_vec(schema.types),
                                                              0,
                                                              files,
                                                              schema.column_ids,
                                                              no_projection,
-                                                             schema.names,
-                                                             1024 * 1024);
+                                                             schema.names);
 
   REQUIRE(op.is_source());
   REQUIRE_FALSE(op.all_ports_empty());
@@ -320,13 +328,16 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(sirius::from_duckdb_vec(schema.types),
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
+                                                            0);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             sirius::from_duckdb_vec(schema.types),
+                                                             sirius::from_duckdb_vec(schema.types),
                                                              0,
                                                              files,
                                                              schema.column_ids,
                                                              no_projection,
-                                                             schema.names,
-                                                             1024 * 1024);
+                                                             schema.names);
 
   auto input = op.get_next_task_input_data();
   REQUIRE(input);
@@ -357,8 +368,14 @@ TEST_CASE("two-pipeline scan - basic scan with all columns", "[two_pipeline_scan
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  auto batches = run_two_pipeline_scan(
-    files, schema.types, schema.column_ids, no_projection, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
 
@@ -397,8 +414,14 @@ TEST_CASE("two-pipeline scan - projection selects subset of columns",
   output_types.push_back(schema.types[0]);
   output_types.push_back(schema.types[2]);
 
-  auto batches = run_two_pipeline_scan(
-    files, output_types, schema.column_ids, projection_ids, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       output_types,
+                                       schema.types,
+                                       schema.column_ids,
+                                       projection_ids,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -431,8 +454,14 @@ TEST_CASE("two-pipeline scan - diverse types (VARCHAR, DECIMAL, DATE)",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  auto batches = run_two_pipeline_scan(
-    files, schema.types, schema.column_ids, no_projection, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
 
@@ -479,6 +508,7 @@ TEST_CASE("two-pipeline scan - filter pushdown with integer filter",
 
   auto batches = run_two_pipeline_scan(files,
                                        schema.types,
+                                       schema.types,
                                        schema.column_ids,
                                        no_projection,
                                        schema.names,
@@ -523,6 +553,7 @@ TEST_CASE("two-pipeline scan - filter on BIGINT column",
                                               duckdb::Value::BIGINT(50000)));
 
   auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
                                        schema.types,
                                        schema.column_ids,
                                        no_projection,
@@ -574,6 +605,7 @@ TEST_CASE("two-pipeline scan - projection with filter",
 
   auto batches = run_two_pipeline_scan(files,
                                        output_types,
+                                       schema.types,
                                        schema.column_ids,
                                        projection_ids,
                                        schema.names,
@@ -614,8 +646,14 @@ TEST_CASE("two-pipeline scan - multiple files", "[two_pipeline_scan][multi_file]
   std::vector<std::string> files = {path_a.string(), path_b.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  auto batches = run_two_pipeline_scan(
-    files, schema.types, schema.column_ids, no_projection, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       schema.types,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
@@ -645,6 +683,7 @@ TEST_CASE("two-pipeline scan - small batch size creates multiple partitions",
   // Very small batch size to force multiple partitions
   auto batches = run_two_pipeline_scan(files,
                                        schema.types,
+                                       schema.types,
                                        schema.column_ids,
                                        no_projection,
                                        schema.names,
@@ -669,21 +708,21 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType::INTEGER);
-  sirius::op::scan::sirius_gpu_parquet_scan_operator op(
-    sirius::from_duckdb_vec(types), 0, *gpu_space);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator op(sirius::from_duckdb_vec(types), 0);
 
-  REQUIRE(op.is_sink());
   REQUIRE(op.is_source());
 
-  // Before finalization, source methods should indicate not ready.
-  REQUIRE_FALSE(op.all_ports_empty());
+  // With no metadata accumulated and no "handoff" port wired to an upstream
+  // pipeline, the gpu scan operator has nothing to claim and nothing to defer
+  // to — all_ports_empty() is true and get_next_task_hint() returns nullopt.
+  REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_hint() == std::nullopt);
   REQUIRE(op.get_next_task_input_data() == nullptr);
 
-  // Finalize with no metadata → no partitions.
-  op.finalize_metadata();
+  // Finalize with no metadata → no partitions, still idle.
+  op.finalize_partitions();
   REQUIRE(op.all_ports_empty());
-  REQUIRE(op.get_total_partitions() == 0);
+  REQUIRE(op.get_next_task_hint() == std::nullopt);
 }
 
 TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",
@@ -711,6 +750,7 @@ TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",
                                               duckdb::Value::INTEGER(100)));
 
   auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
                                        schema.types,
                                        schema.column_ids,
                                        no_projection,
@@ -759,8 +799,14 @@ TEST_CASE("two-pipeline scan - projection on diverse types",
   output_types.push_back(schema.types[3]);
   output_types.push_back(schema.types[4]);
 
-  auto batches = run_two_pipeline_scan(
-    files, output_types, schema.column_ids, projection_ids, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       output_types,
+                                       schema.types,
+                                       schema.column_ids,
+                                       projection_ids,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
@@ -797,6 +843,7 @@ TEST_CASE("two-pipeline scan - empty result from filter",
                                               duckdb::Value::INTEGER(99999)));
 
   auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
                                        schema.types,
                                        schema.column_ids,
                                        no_projection,
@@ -862,6 +909,7 @@ TEST_CASE("two-pipeline scan - pure filter column pruning",
 
   auto batches = run_two_pipeline_scan(files,
                                        output_types,
+                                       schema.types,
                                        schema.column_ids,
                                        projection_ids,
                                        schema.names,
@@ -913,6 +961,7 @@ TEST_CASE("two-pipeline scan - DECIMAL filter falls back to DuckDB expression ex
                                               duckdb::Value::DECIMAL(10000, 12, 2)));
 
   auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
                                        schema.types,
                                        schema.column_ids,
                                        no_projection,

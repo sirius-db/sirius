@@ -138,6 +138,8 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/downgrade/downgrade_task.cpp
+    src/expression/expression.cpp
+    src/expression/join_condition.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
@@ -166,6 +168,7 @@ set(EXTENSION_SOURCES
     src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
+    src/op/scan/hive_partition.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_metadata_reader.cpp
@@ -358,6 +361,8 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_join_condition.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -391,6 +396,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
+    test/cpp/pipeline/test_metadata_gpu_pipeline_task_counting.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp

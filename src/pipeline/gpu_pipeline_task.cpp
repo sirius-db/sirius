@@ -88,10 +88,19 @@ void log_operator_data(const op::sirius_physical_operator& op,
                        const char* label,
                        const std::string& extra_info = "")
 {
-  auto& pipelineable_data = dynamic_cast<const op::pipelineable_operator_data&>(data);
-  std::string batch_rows  = "";
-  size_t total_bytes      = 0;
-  for (auto& batch : pipelineable_data.get_data_batches()) {
+  auto const* pipelineable_data = dynamic_cast<const op::pipelineable_operator_data*>(&data);
+  if (!pipelineable_data) {
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) {} non-pipelineable data. {}",
+                     pipeline->get_pipeline_id(),
+                     op.get_name(),
+                     op.get_operator_id(),
+                     label,
+                     extra_info);
+    return;
+  }
+  std::string batch_rows = "";
+  size_t total_bytes     = 0;
+  for (auto& batch : pipelineable_data->get_data_batches()) {
     auto view = get_cudf_table_view(*batch);
     batch_rows += std::to_string(view.num_rows()) + "  ";
     total_bytes += batch->get_data()->get_size_in_bytes();
@@ -103,7 +112,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
     op.get_name(),
     op.get_operator_id(),
     label,
-    pipelineable_data.get_data_batches().size(),
+    pipelineable_data->get_data_batches().size(),
     batch_rows,
     total_bytes,
     static_cast<double>(total_bytes) / (1024.0 * 1024.0),
@@ -313,16 +322,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
-  auto* pipelineable_input =
-    dynamic_cast<op::pipelineable_operator_data*>(local_state._input_data.get());
-  if (!pipelineable_input) {
-    throw std::runtime_error(
-      "gpu_pipeline_task::execute: input_data is not pipelineable_operator_data");
-  }
 
   std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
   try {
-    handles_opt = pipelineable_input->prepare_for_processing(requested_memory_space, stream);
+    handles_opt =
+      local_state._input_data.get()->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();

@@ -10,7 +10,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
-QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
+QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 CONFIG_FILE="$PROJECT_DIR/test/cpp/integration/integration.yaml"
 
 export SIRIUS_CONFIG_FILE="$CONFIG_FILE"
