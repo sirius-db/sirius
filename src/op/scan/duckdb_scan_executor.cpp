@@ -292,11 +292,18 @@ void duckdb_scan_executor::manager_loop()
     }
 
     auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
+
+    // FIX-01 (v1.2): select the target GPU BEFORE dispatch so both the parquet
+    // reservation path AND the stream-acquire path below see the same device.
+    // Hoisted from the inner parquet-scan-task block so the dispatch lambda can
+    // capture target_gpu_id into its rmm::cuda_set_device_raii guard. For
+    // non-parquet scan tasks (duckdb_scan_task, cpu_source_task) this still
+    // produces a well-defined target device — cpu_source_task ignores the
+    // stream anyway, and duckdb_scan_task runs on the host side until handoff.
+    int target_gpu_id = select_target_gpu();
+
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
-
-      // Select target GPU for this scan batch (proportional to available memory)
-      int target_gpu_id = select_target_gpu();
 
       if (_cache_level != cache_level::NONE) {
         bool wrap_batch_data     = _cache_level != cache_level::TABLE_GPU;
@@ -335,14 +342,44 @@ void duckdb_scan_executor::manager_loop()
       }
     }
 
-    auto exc_stream = _stream_pool->acquire_stream(
-      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+    // FIX-01 (v1.2): acquire exec_stream from the target GPU's pool (not from
+    // the former single GPU-0-bound pool). This ensures the scan task's H2D
+    // copies + cudf::io::read_parquet allocations run on a stream bound to
+    // target_gpu_id — eliminates the cudaErrorInvalidValue reported at
+    // cuda_memcpy.cu from v1.1 E2E verification.
+    auto pool_iter = _gpu_stream_pools.find(target_gpu_id);
+    if (pool_iter == _gpu_stream_pools.end()) {
+      SIRIUS_LOG_ERROR(
+        "duckdb_scan_executor: no stream pool for GPU {} (FIX-01 invariant violated)",
+        target_gpu_id);
+      if (_completion_handler) {
+        _completion_handler->report_error(
+          "duckdb_scan_executor: missing stream pool for target GPU " +
+          std::to_string(target_gpu_id));
+      }
+      break;
+    }
+    // acquire_stream() may lazily create a new rmm::cuda_stream on GROW
+    // policy; wrap the call in a device guard so the new stream binds to
+    // target_gpu_id (see 08-RESEARCH.md Open Questions Q4).
+    cucascade::memory::borrowed_stream exc_stream = [&] {
+      rmm::cuda_set_device_raii acquire_guard{rmm::cuda_device_id{target_gpu_id}};
+      return pool_iter->second->acquire_stream(
+        cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+    }();
+
     _bounded_pool->dispatch(
       std::move(slot),
       [this,
-       stream    = std::move(exc_stream),
-       t         = std::move(task),
-       scan_task = std::move(scan_task)]() mutable {
+       stream        = std::move(exc_stream),
+       t             = std::move(task),
+       scan_task     = std::move(scan_task),
+       target_gpu_id = target_gpu_id]() mutable {
+        // Pitfall 1 (08-RESEARCH.md): _bounded_pool workers are GPU-agnostic;
+        // cudaSetDevice is thread-local. Pin this worker to target_gpu_id
+        // BEFORE any cudf/RMM call so the (stream, current_device) pair stays
+        // consistent through the entire scan task lifetime.
+        rmm::cuda_set_device_raii dispatch_guard{rmm::cuda_device_id{target_gpu_id}};
         try {
           auto consumers = scan_task->get_output_consumers();
           {
