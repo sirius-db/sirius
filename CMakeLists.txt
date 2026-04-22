@@ -138,6 +138,8 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/downgrade/downgrade_task.cpp
+    src/expression/expression.cpp
+    src/expression/join_condition.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
@@ -359,6 +361,8 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_join_condition.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
