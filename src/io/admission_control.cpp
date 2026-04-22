@@ -18,19 +18,17 @@
 
 namespace sirius::io {
 
-admission_control::admission_control(size_t budget) noexcept
-    : _budget(budget) {}
+admission_control::admission_control(size_t budget) noexcept : _budget(budget) {}
 
-admission_control::slot admission_control::acquire(size_t size,
-                                                   std::stop_token stop) {
+admission_control::slot admission_control::acquire(size_t size, std::stop_token stop)
+{
   std::unique_lock lk(_mtx);
 
   // Wait until either the request fits within the remaining budget, or we
   // are the only one in line (deadlock-avoidance branch — no slots will
   // release to free up space).
-  bool fits = _cv.wait(lk, stop, [&] {
-    return (_in_use + size <= _budget) || (_active_slots == 0);
-  });
+  bool fits =
+    _cv.wait(lk, stop, [&] { return (_in_use + size <= _budget) || (_active_slots == 0); });
   if (!fits) {
     // Stop requested and predicate still not satisfied.
     return {};
@@ -49,7 +47,8 @@ admission_control::slot admission_control::acquire(size_t size,
   return slot{this, reserved};
 }
 
-void admission_control::release(size_t reserved) noexcept {
+void admission_control::release(size_t reserved) noexcept
+{
   {
     std::lock_guard lk(_mtx);
     _in_use -= reserved;
@@ -58,28 +57,27 @@ void admission_control::release(size_t reserved) noexcept {
   _cv.notify_all();
 }
 
-admission_control::slot::~slot() {
-  if (_ctrl)
-    _ctrl->release(_reserved);
+admission_control::slot::~slot()
+{
+  if (_ctrl) _ctrl->release(_reserved);
 }
 
-admission_control::slot::slot(slot &&o) noexcept
-    : _ctrl(o._ctrl), _reserved(o._reserved) {
-  o._ctrl = nullptr;
+admission_control::slot::slot(slot&& o) noexcept : _ctrl(o._ctrl), _reserved(o._reserved)
+{
+  o._ctrl     = nullptr;
   o._reserved = 0;
 }
 
-admission_control::slot &
-admission_control::slot::operator=(slot &&o) noexcept {
+admission_control::slot& admission_control::slot::operator=(slot&& o) noexcept
+{
   if (this != &o) {
-    if (_ctrl)
-      _ctrl->release(_reserved);
-    _ctrl = o._ctrl;
-    _reserved = o._reserved;
-    o._ctrl = nullptr;
+    if (_ctrl) _ctrl->release(_reserved);
+    _ctrl       = o._ctrl;
+    _reserved   = o._reserved;
+    o._ctrl     = nullptr;
     o._reserved = 0;
   }
   return *this;
 }
 
-} // namespace sirius::io
+}  // namespace sirius::io

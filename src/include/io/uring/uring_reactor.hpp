@@ -16,11 +16,11 @@
 
 #pragma once
 
-#include "concurrentqueue.h"
 #include "io/types.hpp"
 
 #include <cuda_runtime.h>
 
+#include <concurrentqueue.h>
 #include <liburing.h>
 
 #include <array>
@@ -30,13 +30,13 @@
 #include <thread>
 
 namespace {
-inline void cuda_check(cudaError_t e, char const *file, int line) {
+inline void cuda_check(cudaError_t e, char const* file, int line)
+{
   if (e != cudaSuccess)
-    throw std::runtime_error(std::string("CUDA error ") + file + ":" +
-                             std::to_string(line) + " – " +
-                             cudaGetErrorString(e));
+    throw std::runtime_error(std::string("CUDA error ") + file + ":" + std::to_string(line) +
+                             " – " + cudaGetErrorString(e));
 }
-} // namespace
+}  // namespace
 
 #define CUDA_CHECK(call) cuda_check((call), __FILE__, __LINE__)
 
@@ -53,17 +53,17 @@ struct file_descriptor {
   int fd{-1};
   file_descriptor() = default;
   explicit file_descriptor(int f) noexcept : fd(f) {}
-  ~file_descriptor() noexcept {
-    if (fd >= 0)
-      ::close(fd);
+  ~file_descriptor() noexcept
+  {
+    if (fd >= 0) ::close(fd);
   }
-  file_descriptor(file_descriptor const &) = delete;
-  file_descriptor &operator=(file_descriptor const &) = delete;
-  file_descriptor(file_descriptor &&o) noexcept : fd(std::exchange(o.fd, -1)) {}
-  file_descriptor &operator=(file_descriptor &&o) noexcept {
+  file_descriptor(file_descriptor const&)            = delete;
+  file_descriptor& operator=(file_descriptor const&) = delete;
+  file_descriptor(file_descriptor&& o) noexcept : fd(std::exchange(o.fd, -1)) {}
+  file_descriptor& operator=(file_descriptor&& o) noexcept
+  {
     if (this != &o) {
-      if (fd >= 0)
-        ::close(fd);
+      if (fd >= 0) ::close(fd);
       fd = std::exchange(o.fd, -1);
     }
     return *this;
@@ -77,7 +77,8 @@ struct file_descriptor {
  *        before freeing the allocation.
  */
 struct ring_deleter {
-  void operator()(io_uring *r) const noexcept {
+  void operator()(io_uring* r) const noexcept
+  {
     io_uring_queue_exit(r);
     delete r;
   }
@@ -89,14 +90,15 @@ using unique_ring = std::unique_ptr<io_uring, ring_deleter>;
  *        @c cudaHostAlloc.
  */
 struct pinned_deleter {
-  void operator()(void *p) const noexcept { cudaFreeHost(p); }
+  void operator()(void* p) const noexcept { cudaFreeHost(p); }
 };
 using unique_pinned_buf = std::unique_ptr<void, pinned_deleter>;
 
 /**
  * @brief Converts a byte count to mebibytes.
  */
-inline double to_mb(size_t bytes) noexcept {
+inline double to_mb(size_t bytes) noexcept
+{
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
@@ -122,12 +124,10 @@ struct bounce_slot {
  * descriptors are the native handles consumed by @c uring_reactor.
  */
 class uring_io_object : public sirius_io_object {
-public:
+ public:
   explicit uring_io_object(std::string path);
 
-  [[nodiscard]] const std::string &raw_file_cache_id() const noexcept override {
-    return _path;
-  }
+  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
@@ -137,7 +137,7 @@ public:
   [[nodiscard]] int host_handle() const noexcept { return _fd.get(); }
   [[nodiscard]] int device_handle() const noexcept { return _fd_direct.get(); }
 
-private:
+ private:
   std::string _path;
   file_descriptor _fd;
   file_descriptor _fd_direct;
@@ -156,19 +156,18 @@ private:
  * consumed by @c templated_ioctx.
  */
 class uring_reactor {
-public:
-  using native_handle_type = int;
-  using io_object_type = uring_io_object;
+ public:
+  using native_handle_type   = int;
+  using io_object_type       = uring_io_object;
   using device_read_req_type = device_read_req<native_handle_type>;
-  using host_read_req_type = host_read_req<native_handle_type>;
+  using host_read_req_type   = host_read_req<native_handle_type>;
 
-  explicit uring_reactor(unsigned ring_entries = 64,
-                         size_t bounce_slot_size = CHUNK_SIZE);
+  explicit uring_reactor(unsigned ring_entries = 64, size_t bounce_slot_size = CHUNK_SIZE);
 
   ~uring_reactor();
 
-  uring_reactor(uring_reactor const &) = delete;
-  uring_reactor &operator=(uring_reactor const &) = delete;
+  uring_reactor(uring_reactor const&)            = delete;
+  uring_reactor& operator=(uring_reactor const&) = delete;
 
   void interrupt();
   void shutdown();
@@ -179,24 +178,24 @@ public:
   void enqueue_bulk(std::vector<device_read_req_type> batch);
 
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
-  size_t host_read(int fd, size_t offset, size_t size, uint8_t *dst);
+  size_t host_read(int fd, size_t offset, size_t size, uint8_t* dst);
 
   /// Async buffered host read.  Request completion fires via
   /// @c req.ctx->chunk_done / chunk_failed.
   void host_read_async(host_read_req_type req);
 
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
-  static cudf::io::text::byte_range_info
-  align_to_physical(cudf::io::text::byte_range_info logical, size_t file_size);
+  static cudf::io::text::byte_range_info align_to_physical(cudf::io::text::byte_range_info logical,
+                                                           size_t file_size);
 
-private:
+ private:
   void worker_loop();
 
   struct cb_arg {
-    uring_reactor *self;
+    uring_reactor* self;
     int slot;
   };
-  static void cuda_copy_cb(void *p) noexcept;
+  static void cuda_copy_cb(void* p) noexcept;
 
   std::array<bounce_slot, NUM_CHUNKS> _bounce;
   std::array<cb_arg, NUM_CHUNKS> _cb_args;
@@ -204,9 +203,9 @@ private:
   std::atomic<uint64_t> _wake_seq{0};
   std::atomic<bool> _stop{false};
   std::thread _worker;
-  moodycamel::ConcurrentQueue<device_read_req_type> _queue;
-  moodycamel::ConcurrentQueue<host_read_req_type> _host_queue;
+  duckdb_moodycamel::ConcurrentQueue<device_read_req_type> _queue;
+  duckdb_moodycamel::ConcurrentQueue<host_read_req_type> _host_queue;
   std::atomic<uint64_t> _cuda_seq{0};
 };
 
-} // namespace sirius::io
+}  // namespace sirius::io

@@ -16,13 +16,15 @@
 
 #pragma once
 
-#include "concurrentqueue.h"
 #include "io/admission_control.hpp"
 #include "io/types.hpp"
 
+#include <cudf/io/datasource.hpp>
+
+#include <concurrentqueue.h>
+
 #include <array>
 #include <atomic>
-#include <cudf/io/datasource.hpp>
 #include <future>
 #include <map>
 #include <memory>
@@ -49,58 +51,53 @@ namespace sirius::io {
 // and returns the chunk to that slab's free list.
 
 class buffer_pool {
-public:
-  static constexpr size_t CHUNK_BYTES = 1UL << 20; // 1MB
-  static constexpr uint32_t CHUNKS_PER_SLAB = 500; // 500 chunks per slab
-  static constexpr size_t SLAB_BYTES =
-      static_cast<size_t>(CHUNKS_PER_SLAB) * CHUNK_BYTES;
+ public:
+  static constexpr size_t CHUNK_BYTES       = 1UL << 20;  // 1MB
+  static constexpr uint32_t CHUNKS_PER_SLAB = 500;        // 500 chunks per slab
+  static constexpr size_t SLAB_BYTES        = static_cast<size_t>(CHUNKS_PER_SLAB) * CHUNK_BYTES;
 
   explicit buffer_pool(uint32_t max_slabs);
   ~buffer_pool();
 
-  buffer_pool(buffer_pool const &) = delete;
-  buffer_pool &operator=(buffer_pool const &) = delete;
+  buffer_pool(buffer_pool const&)            = delete;
+  buffer_pool& operator=(buffer_pool const&) = delete;
 
   /// Allocate a single 1MB chunk.  Returns nullptr when all slabs are
   /// exhausted and no new slab can be allocated.
-  std::byte *allocate();
+  std::byte* allocate();
 
   /// Bulk-allocate up to @p n chunks, appending pointers to @p out.
   /// Returns the number actually allocated (may be < n if pool is exhausted
   /// and cannot grow).  Uses try_dequeue_bulk internally to minimise
   /// per-chunk overhead.
-  size_t allocate_bulk(size_t n, std::vector<std::byte *> &out);
+  size_t allocate_bulk(size_t n, std::vector<std::byte*>& out);
 
   /// Return a chunk to the pool.
-  void deallocate(std::byte *p);
+  void deallocate(std::byte* p);
 
-  size_t capacity() const noexcept {
-    return static_cast<size_t>(_total_chunks.load(std::memory_order_relaxed)) *
-           CHUNK_BYTES;
+  size_t capacity() const noexcept
+  {
+    return static_cast<size_t>(_total_chunks.load(std::memory_order_relaxed)) * CHUNK_BYTES;
   }
-  uint32_t free_count() const noexcept {
-    return _total_free.load(std::memory_order_relaxed);
-  }
-  uint32_t total_chunks() const noexcept {
-    return _total_chunks.load(std::memory_order_relaxed);
-  }
+  uint32_t free_count() const noexcept { return _total_free.load(std::memory_order_relaxed); }
+  uint32_t total_chunks() const noexcept { return _total_chunks.load(std::memory_order_relaxed); }
 
-private:
+ private:
   struct slab {
-    std::byte *base{nullptr};
-    moodycamel::ConcurrentQueue<std::byte *> free_chunks;
+    std::byte* base{nullptr};
+    duckdb_moodycamel::ConcurrentQueue<std::byte*> free_chunks;
     std::atomic<uint32_t> free_count{0};
   };
 
   bool grow();
-  slab *find_slab(std::byte *p);
+  slab* find_slab(std::byte* p);
 
   uint32_t _max_slabs;
 
   // Protected by _grow_mtx (exclusive for grow, shared for find_slab).
   mutable std::shared_mutex _grow_mtx;
   std::vector<std::unique_ptr<slab>> _slabs;
-  std::map<std::byte *, slab *> _slab_map;
+  std::map<std::byte*, slab*> _slab_map;
 
   std::atomic<uint32_t> _total_free{0};
   std::atomic<uint32_t> _total_chunks{0};
@@ -131,59 +128,57 @@ private:
 //     └────┘ try_start_evicting()  (only from cached, pin_count==0)
 
 class entry_state {
-public:
-  enum value : uint8_t {
-    empty = 0,
-    queued = 1,
-    loading = 2,
-    cached = 3,
-    in_use = 4,
-    evicting = 5
-  };
+ public:
+  enum value : uint8_t { empty = 0, queued = 1, loading = 2, cached = 3, in_use = 4, evicting = 5 };
 
   entry_state() noexcept = default;
 
-  [[nodiscard]] value get_state() const noexcept {
+  [[nodiscard]] value get_state() const noexcept
+  {
     return unpack_state(_packed.load(std::memory_order_acquire));
   }
 
-  [[nodiscard]] uint32_t get_pin_count() const noexcept {
+  [[nodiscard]] uint32_t get_pin_count() const noexcept
+  {
     return unpack_pins(_packed.load(std::memory_order_acquire));
   }
 
   /// empty → queued.  Returns false if not empty.
   /// Called by insert() to claim responsibility for scheduling a load.
-  bool try_start_queueing() noexcept {
+  bool try_start_queueing() noexcept
+  {
     auto expected = pack(empty, 0);
-    return _packed.compare_exchange_strong(expected, pack(queued, 0),
-                                           std::memory_order_acq_rel);
+    return _packed.compare_exchange_strong(expected, pack(queued, 0), std::memory_order_acq_rel);
   }
 
   /// queued → loading.  Returns false if not queued.
   /// Called by the worker when it picks up a work item.
-  bool try_start_loading() noexcept {
+  bool try_start_loading() noexcept
+  {
     auto expected = pack(queued, 0);
-    return _packed.compare_exchange_strong(expected, pack(loading, 0),
-                                           std::memory_order_acq_rel);
+    return _packed.compare_exchange_strong(expected, pack(loading, 0), std::memory_order_acq_rel);
   }
 
   /// loading → cached.  Caller must ensure state is loading.
   /// Wakes any readers parked in @c wait_while_loading().
-  void mark_cached() noexcept {
+  void mark_cached() noexcept
+  {
     _packed.store(pack(cached, 0), std::memory_order_release);
     _packed.notify_all();
   }
 
   /// loading → empty.  IO failed, chunks already freed by caller.
   /// Wakes any readers parked in @c wait_while_loading().
-  void mark_load_failed() noexcept {
+  void mark_load_failed() noexcept
+  {
     _packed.store(pack(empty, 0), std::memory_order_release);
     _packed.notify_all();
   }
 
   /// Block while state == loading.  Returns when the state transitions
   /// out of loading (either cached on success or empty on failure).
-  void wait_while_loading() noexcept {
+  void wait_while_loading() noexcept
+  {
     uint32_t cur = _packed.load(std::memory_order_acquire);
     while (unpack_state(cur) == loading) {
       _packed.wait(cur, std::memory_order_relaxed);
@@ -193,63 +188,62 @@ public:
 
   /// (cached | in_use) → in_use with pin_count+1.
   /// Returns false if the entry is not in a readable state.
-  bool try_acquire_read() noexcept {
+  bool try_acquire_read() noexcept
+  {
     uint32_t cur = _packed.load(std::memory_order_acquire);
     while (true) {
       auto st = unpack_state(cur);
-      if (st != cached && st != in_use)
-        return false;
+      if (st != cached && st != in_use) return false;
       auto pins = unpack_pins(cur);
       auto next = pack(in_use, pins + 1);
-      if (_packed.compare_exchange_weak(cur, next, std::memory_order_acq_rel,
-                                        std::memory_order_acquire))
+      if (_packed.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
         return true;
     }
   }
 
   /// Decrement pin_count.  If it reaches 0, transition in_use → cached.
   /// Returns true if this was the last reader.
-  bool release_read() noexcept {
+  bool release_read() noexcept
+  {
     uint32_t cur = _packed.load(std::memory_order_acquire);
     assert(unpack_state(cur) == in_use && unpack_pins(cur) > 0);
     while (true) {
-      auto pins = unpack_pins(cur);
-      auto new_pins = pins - 1;
+      auto pins      = unpack_pins(cur);
+      auto new_pins  = pins - 1;
       auto new_state = new_pins == 0 ? cached : in_use;
-      auto next = pack(new_state, new_pins);
-      if (_packed.compare_exchange_weak(cur, next, std::memory_order_acq_rel,
-                                        std::memory_order_acquire))
+      auto next      = pack(new_state, new_pins);
+      if (_packed.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
         return new_pins == 0;
     }
   }
 
   /// cached (pin_count==0) → evicting.
   /// Returns false if state != cached or readers are present.
-  bool try_start_evicting() noexcept {
+  bool try_start_evicting() noexcept
+  {
     auto expected = pack(cached, 0);
-    return _packed.compare_exchange_strong(expected, pack(evicting, 0),
-                                           std::memory_order_acq_rel);
+    return _packed.compare_exchange_strong(expected, pack(evicting, 0), std::memory_order_acq_rel);
   }
 
   /// evicting → empty.  Caller must ensure state is evicting.
-  void mark_evicted() noexcept {
-    _packed.store(pack(empty, 0), std::memory_order_release);
-  }
+  void mark_evicted() noexcept { _packed.store(pack(empty, 0), std::memory_order_release); }
 
-private:
+ private:
   static constexpr uint32_t STATE_BITS = 4;
   static constexpr uint32_t STATE_MASK = (1U << STATE_BITS) - 1;
-  static constexpr uint32_t PIN_SHIFT = STATE_BITS;
+  static constexpr uint32_t PIN_SHIFT  = STATE_BITS;
 
-  static constexpr uint32_t pack(value s, uint32_t pins) noexcept {
+  static constexpr uint32_t pack(value s, uint32_t pins) noexcept
+  {
     return static_cast<uint32_t>(s) | (pins << PIN_SHIFT);
   }
-  static constexpr value unpack_state(uint32_t v) noexcept {
+  static constexpr value unpack_state(uint32_t v) noexcept
+  {
     return static_cast<value>(v & STATE_MASK);
   }
-  static constexpr uint32_t unpack_pins(uint32_t v) noexcept {
-    return v >> PIN_SHIFT;
-  }
+  static constexpr uint32_t unpack_pins(uint32_t v) noexcept { return v >> PIN_SHIFT; }
 
   std::atomic<uint32_t> _packed{pack(empty, 0)};
 };
@@ -266,7 +260,7 @@ struct alignas(64) cache_entry {
   cudf::io::text::byte_range_info physical_range;
 
   /// Pointers to 1MB chunks from buffer_pool backing this range.
-  std::vector<std::byte *> chunks;
+  std::vector<std::byte*> chunks;
 
   /// Packed state + pin_count.  All state transitions go through this.
   entry_state state;
@@ -288,17 +282,18 @@ struct alignas(64) cache_entry {
   /// or -1 if not in any bucket.  Written only by the evictor thread.
   std::atomic<int> bucket_idx{-1};
 
-  cache_entry(cudf::io::text::byte_range_info logical,
-              cudf::io::text::byte_range_info physical)
-      : logical_range(logical), physical_range(physical) {}
+  cache_entry(cudf::io::text::byte_range_info logical, cudf::io::text::byte_range_info physical)
+    : logical_range(logical), physical_range(physical)
+  {
+  }
 
   /// True iff this entry is safe to evict under the current cache age:
   /// either it has been read at or after its most recent insert (consumed),
   /// or its most recent request was made in an earlier epoch (stale — the
   /// caller has already moved on and no longer needs this range).
-  [[nodiscard]] bool
-  is_consumed_or_stale(uint64_t cache_age) const noexcept {
-    auto req = request_ts.load(std::memory_order_acquire);
+  [[nodiscard]] bool is_consumed_or_stale(uint64_t cache_age) const noexcept
+  {
+    auto req  = request_ts.load(std::memory_order_acquire);
     auto cons = consumption_ts.load(std::memory_order_acquire);
     return cons >= req || req < cache_age;
   }
@@ -340,17 +335,17 @@ struct eviction_request {
 // span.  Instead the view exposes individual chunk spans via operator[].
 
 class pinned_view {
-public:
+ public:
   pinned_view() = default;
   pinned_view(std::shared_ptr<cache_entry> entry,
-              moodycamel::ConcurrentQueue<eviction_candidate> &candidate_queue);
+              duckdb_moodycamel::ConcurrentQueue<eviction_candidate>& candidate_queue);
   ~pinned_view();
 
-  pinned_view(pinned_view &&o) noexcept;
-  pinned_view &operator=(pinned_view &&o) noexcept;
+  pinned_view(pinned_view&& o) noexcept;
+  pinned_view& operator=(pinned_view&& o) noexcept;
 
-  pinned_view(pinned_view const &) = delete;
-  pinned_view &operator=(pinned_view const &) = delete;
+  pinned_view(pinned_view const&)            = delete;
+  pinned_view& operator=(pinned_view const&) = delete;
 
   /// Number of 1MB chunks backing this range.
   [[nodiscard]] size_t num_chunks() const noexcept;
@@ -371,16 +366,16 @@ public:
   /// Slice the cached data at logical [offset, offset+size) into a vector of
   /// non_owning_buffers, one per chunk boundary crossed.  The caller must
   /// ensure [offset, offset+size) lies within the entry's logical range.
-  [[nodiscard]] std::vector<cudf::io::datasource::non_owning_buffer>
-  slice(size_t offset, size_t size) const;
+  [[nodiscard]] std::vector<cudf::io::datasource::non_owning_buffer> slice(size_t offset,
+                                                                           size_t size) const;
 
   explicit operator bool() const noexcept { return _entry != nullptr; }
 
-private:
+ private:
   void unpin();
 
   std::shared_ptr<cache_entry> _entry;
-  moodycamel::ConcurrentQueue<eviction_candidate> *_candidate_queue{nullptr};
+  duckdb_moodycamel::ConcurrentQueue<eviction_candidate>* _candidate_queue{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -393,7 +388,7 @@ private:
 //   (independent): cache_entry atomics — lock-free
 
 class prefetching_cache {
-public:
+ public:
   /// @p inflight_budget_chunks caps the number of 1MB chunks the worker
   /// may have submitted to the IO backend at once.  The worker acquires N
   /// tokens before each dispatch and releases them in the completion
@@ -401,31 +396,30 @@ public:
   ///
   /// @p io_ctx is a non-owning pointer; the owning ioctx must outlive this
   /// cache (the ioctx itself owns the cache via initialize_cache()).
-  explicit prefetching_cache(buffer_pool &pool, sirius_ioctx *io_ctx,
+  explicit prefetching_cache(buffer_pool& pool,
+                             sirius_ioctx* io_ctx,
                              size_t inflight_budget_chunks = 2048);
   ~prefetching_cache();
 
-  prefetching_cache(prefetching_cache const &) = delete;
-  prefetching_cache &operator=(prefetching_cache const &) = delete;
+  prefetching_cache(prefetching_cache const&)            = delete;
+  prefetching_cache& operator=(prefetching_cache const&) = delete;
 
   /// Register ranges for a file and trigger background prefetch.
   /// Ranges must be sorted by offset.
-  void insert(const sirius_io_object &obj,
+  void insert(const sirius_io_object& obj,
               std::shared_ptr<sirius_io_object_metadata> metadata,
-              const std::vector<cudf::io::text::byte_range_info> &ranges);
+              const std::vector<cudf::io::text::byte_range_info>& ranges);
 
   /// Non-blocking read of a single range.
   /// Returns an empty pinned_view if the range is not cached or the cached
   /// entry does not fully cover [offset, offset+size).  Updates hit / miss
   /// counters (see summary()).
-  [[nodiscard]] pinned_view read(const sirius_io_object &obj, size_t offset,
-                                 size_t size);
+  [[nodiscard]] pinned_view read(const sirius_io_object& obj, size_t offset, size_t size);
 
   /// Non-blocking batch read. Returns one pinned_view per input range
   /// (empty if that range is not yet cached).
-  [[nodiscard]] std::vector<pinned_view>
-  read_ranges(const sirius_io_object &obj,
-              const std::vector<cudf::io::text::byte_range_info> &ranges);
+  [[nodiscard]] std::vector<pinned_view> read_ranges(
+    const sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges);
 
   /// Increment _cache_age by 1.  The evictor uses
   /// (n_total_read_request - _cache_age) to score entries into buckets.
@@ -435,12 +429,12 @@ public:
   /// pool utilisation, and pending chunks.
   [[nodiscard]] std::string summary() const;
 
-private:
+ private:
   // ---- work items dispatched through the queue ------------------------------
 
   struct prefetch_req {
     std::string file_key;
-    const sirius_io_object *io_obj;
+    const sirius_io_object* io_obj;
     std::vector<std::shared_ptr<cache_entry>> entries;
   };
   using work_item = prefetch_req;
@@ -448,11 +442,11 @@ private:
   // ---- per-file state -------------------------------------------------------
 
   struct file_entry {
-    mutable std::shared_mutex mtx; ///< Level-1 lock.
-    const sirius_io_object *io_obj{nullptr};
+    mutable std::shared_mutex mtx;  ///< Level-1 lock.
+    const sirius_io_object* io_obj{nullptr};
     size_t file_size{0};
     std::shared_ptr<sirius_io_object_metadata> metadata;
-    std::vector<std::shared_ptr<cache_entry>> entries; ///< Sorted by offset.
+    std::vector<std::shared_ptr<cache_entry>> entries;  ///< Sorted by offset.
   };
 
   // ---- helpers --------------------------------------------------------------
@@ -462,20 +456,20 @@ private:
   void enqueue_work(work_item item);
 
   /// Release all chunks held by an entry back to the pool.
-  void release_chunks(cache_entry &entry);
+  void release_chunks(cache_entry& entry);
 
   /// Binary search for an entry whose logical range fully covers
   /// [offset, offset+size).  Returns nullptr on miss.  Updates
   /// _partial_miss_count / _full_miss_count based on the classification.
   /// The caller updates _hit_count on successful pin.
-  std::shared_ptr<cache_entry>
-  find_entry(const std::vector<std::shared_ptr<cache_entry>> &entries,
-             size_t offset, size_t size);
+  std::shared_ptr<cache_entry> find_entry(const std::vector<std::shared_ptr<cache_entry>>& entries,
+                                          size_t offset,
+                                          size_t size);
 
   // ---- members (destruction order matters: worker joined first) -------------
 
-  buffer_pool &_pool;
-  sirius_ioctx *_io_ctx;
+  buffer_pool& _pool;
+  sirius_ioctx* _io_ctx;
   std::atomic<size_t> _allocated_bytes{0};
   std::atomic<size_t> _pending_chunks{0};
   /// Monotonic age counter.  Advanced only by refresh_cache() — caller
@@ -494,8 +488,8 @@ private:
   /// Evictor inputs.  Candidate pushes are silent; request pushes bump the
   /// semaphore.  Evictor polls with a timeout to still drain candidates
   /// when no requests arrive.
-  moodycamel::ConcurrentQueue<eviction_candidate> _candidate_queue;
-  moodycamel::ConcurrentQueue<eviction_request> _request_queue;
+  duckdb_moodycamel::ConcurrentQueue<eviction_candidate> _candidate_queue;
+  duckdb_moodycamel::ConcurrentQueue<eviction_request> _request_queue;
   std::counting_semaphore<> _request_sem{0};
   static constexpr auto EVICTOR_POLL_INTERVAL = std::chrono::milliseconds(50);
 
@@ -507,14 +501,13 @@ private:
   /// Tiered eviction buckets, managed exclusively by the evictor thread.
   /// Bucket 0 = coldest (lowest diff), bucket 4 = hottest.
   static constexpr size_t NUM_LRU_BUCKETS = 5;
-  std::array<std::vector<std::weak_ptr<cache_entry>>, NUM_LRU_BUCKETS>
-      _lru_buckets;
+  std::array<std::vector<std::weak_ptr<cache_entry>>, NUM_LRU_BUCKETS> _lru_buckets;
 
-  moodycamel::ConcurrentQueue<work_item> _work_queue;
+  duckdb_moodycamel::ConcurrentQueue<work_item> _work_queue;
   std::atomic<uint64_t> _work_seq{0};
 
   std::jthread _evictor_thread;
   std::jthread _worker_thread;
 };
 
-} // namespace sirius::io
+}  // namespace sirius::io

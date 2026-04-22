@@ -37,17 +37,17 @@ namespace sirius::io {
 // making progress instead of stalling forever.
 
 class admission_control {
-public:
+ public:
   class slot {
-  public:
+   public:
     slot() = default;
     ~slot();
 
-    slot(slot &&o) noexcept;
-    slot &operator=(slot &&o) noexcept;
+    slot(slot&& o) noexcept;
+    slot& operator=(slot&& o) noexcept;
 
-    slot(slot const &) = delete;
-    slot &operator=(slot const &) = delete;
+    slot(slot const&)            = delete;
+    slot& operator=(slot const&) = delete;
 
     /// Amount actually reserved from the budget.  May exceed the requested
     /// size in the deadlock-avoidance case.
@@ -56,20 +56,19 @@ public:
     /// True if this slot holds a live reservation.
     explicit operator bool() const noexcept { return _ctrl != nullptr; }
 
-  private:
+   private:
     friend class admission_control;
-    slot(admission_control *ctrl, size_t reserved) noexcept
-        : _ctrl(ctrl), _reserved(reserved) {}
+    slot(admission_control* ctrl, size_t reserved) noexcept : _ctrl(ctrl), _reserved(reserved) {}
 
-    admission_control *_ctrl{nullptr};
+    admission_control* _ctrl{nullptr};
     size_t _reserved{0};
   };
 
   explicit admission_control(size_t budget) noexcept;
   ~admission_control() = default;
 
-  admission_control(admission_control const &) = delete;
-  admission_control &operator=(admission_control const &) = delete;
+  admission_control(admission_control const&)            = delete;
+  admission_control& operator=(admission_control const&) = delete;
 
   /// Reserve @p size units of budget and return a slot.  Blocks until either:
   ///   - normal:   in_use + size <= budget  →  reserves exactly @p size
@@ -81,7 +80,7 @@ public:
 
   [[nodiscard]] size_t budget() const noexcept { return _budget; }
 
-private:
+ private:
   void release(size_t reserved) noexcept;
 
   const size_t _budget;
@@ -91,4 +90,4 @@ private:
   std::condition_variable_any _cv;
 };
 
-} // namespace sirius::io
+}  // namespace sirius::io

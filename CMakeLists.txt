@@ -69,6 +69,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
+pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -157,6 +158,13 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
+    src/fallback.cpp
+    src/gpu_buffer_manager.cpp
+    src/io/admission_control.cpp
+    src/io/prefetching_cache.cpp
+    src/io/sirius_datasource.cpp
+    src/io/uring/uring_ioctx.cpp
+    src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -305,7 +313,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
+                      yaml-cpp::yaml-cpp absl::any_invocable)
+
+target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)

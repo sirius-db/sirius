@@ -21,6 +21,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda_runtime.h>
+
 #include <atomic>
 #include <cstddef>
 #include <exception>
@@ -31,8 +33,6 @@
 #include <span>
 #include <string>
 #include <vector>
-
-#include <cuda_runtime.h>
 
 namespace sirius::io {
 
@@ -48,19 +48,15 @@ class buffer_pool;
 /// Boost.Asio-style completion handler for async I/O.
 /// @param bytes_transferred  Total bytes read on success.
 /// @param ep                 Non-null on failure.
-using io_completion_handler =
-    std::function<void(size_t bytes_transferred, std::exception_ptr ep)>;
+using io_completion_handler = std::function<void(size_t bytes_transferred, std::exception_ptr ep)>;
 
 // ---------------------------------------------------------------------------
 // IO constants
 // ---------------------------------------------------------------------------
 
-static constexpr size_t CHUNK_SIZE =
-    1UL << 20; ///< Bounce-buffer chunk size (1 MiB).
-static constexpr size_t NUM_CHUNKS =
-    32; ///< Number of bounce slots per reactor.
-static constexpr size_t IO_BLOCK_SIZE =
-    4096; ///< O_DIRECT alignment requirement (bytes).
+static constexpr size_t CHUNK_SIZE    = 1UL << 20;  ///< Bounce-buffer chunk size (1 MiB).
+static constexpr size_t NUM_CHUNKS    = 32;         ///< Number of bounce slots per reactor.
+static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requirement (bytes).
 
 // ---------------------------------------------------------------------------
 // sirius_io_object
@@ -72,16 +68,15 @@ static constexpr size_t IO_BLOCK_SIZE =
  * Decouples file location / cache-key logic from I/O mechanics.
  */
 class sirius_io_object {
-public:
+ public:
   virtual ~sirius_io_object() = default;
 
-  [[nodiscard]] virtual const std::string &
-  raw_file_cache_id() const noexcept = 0;
-  [[nodiscard]] virtual size_t size() const noexcept = 0;
+  [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
+  [[nodiscard]] virtual size_t size() const noexcept                          = 0;
 };
 
 class sirius_io_object_metadata {
-public:
+ public:
   virtual ~sirius_io_object_metadata() = default;
 };
 
@@ -103,7 +98,8 @@ struct request_context {
   std::mutex exc_mtx;
   std::exception_ptr exc;
 
-  void chunk_done() {
+  void chunk_done()
+  {
     if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       std::lock_guard lk{exc_mtx};
       if (failed.load(std::memory_order_relaxed))
@@ -113,7 +109,8 @@ struct request_context {
     }
   }
 
-  void chunk_failed(std::exception_ptr e) {
+  void chunk_failed(std::exception_ptr e)
+  {
     if (!failed.exchange(true, std::memory_order_relaxed)) {
       std::lock_guard lk{exc_mtx};
       exc = std::move(e);
@@ -131,13 +128,14 @@ struct request_context {
  *        a device (GPU) read.  Templated on the backend's native handle type
  *        (e.g. @c int for a POSIX file descriptor).
  */
-template <typename Handle> struct device_read_req {
+template <typename Handle>
+struct device_read_req {
   Handle handle{};
   size_t file_off{0};
   size_t io_size{0};
   size_t data_off{0};
   size_t data_size{0};
-  uint8_t *dst{nullptr};
+  uint8_t* dst{nullptr};
   cudaStream_t stream{nullptr};
   /// CUDA device index that owns @c dst and @c stream.  The reactor thread
   /// may be running with a different current device, so it must
@@ -151,11 +149,12 @@ template <typename Handle> struct device_read_req {
  * @brief Descriptor for one buffered host read pushed to a reactor.
  *        Templated on the backend's native handle type.
  */
-template <typename Handle> struct host_read_req {
+template <typename Handle>
+struct host_read_req {
   Handle handle{};
   size_t offset{0};
   size_t size{0};
-  uint8_t *dst{nullptr};
+  uint8_t* dst{nullptr};
   std::shared_ptr<request_context> ctx;
 };
 
@@ -170,81 +169,86 @@ template <typename Handle> struct host_read_req {
  * reactor threads, ...). Extend this class to provide a concrete I/O backend.
  */
 class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
-public:
+ public:
   sirius_ioctx();
   virtual ~sirius_ioctx();
 
   virtual void shutdown() = 0;
 
-  virtual std::unique_ptr<cudf::io::datasource>
-  make_datasource(std::unique_ptr<sirius_io_object> io_object) = 0;
+  virtual std::unique_ptr<cudf::io::datasource> make_datasource(
+    std::unique_ptr<sirius_io_object> io_object) = 0;
 
   /// Construct the owned prefetching_cache.  Must be called before any
   /// read that should consult the cache; until then device_read falls
   /// through directly to device_read_io.
-  void initialize_cache(buffer_pool &pool,
-                        size_t inflight_budget_chunks = 2048);
+  void initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks = 2048);
 
-  [[nodiscard]] prefetching_cache *cache() noexcept { return _cache.get(); }
+  [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
 
   // -- Read API ---------------------------------------------------------------
 
-  virtual size_t host_read(sirius_io_object &obj, size_t offset, size_t size,
-                           uint8_t *dst) = 0;
+  virtual size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 
-  virtual std::unique_ptr<cudf::io::datasource::buffer>
-  host_read(sirius_io_object &obj, size_t offset, size_t size) = 0;
+  virtual std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object& obj,
+                                                                  size_t offset,
+                                                                  size_t size) = 0;
 
-  virtual void host_read_async(sirius_io_object &obj, size_t offset,
-                               size_t size, uint8_t *dst,
+  virtual void host_read_async(sirius_io_object& obj,
+                               size_t offset,
+                               size_t size,
+                               uint8_t* dst,
                                io_completion_handler handler) = 0;
 
   // device_read / device_read_async: concrete in the base; consult the
   // cache first, fall through to device_read_io{,_async} on miss.
-  std::unique_ptr<cudf::io::datasource::buffer>
-  device_read(sirius_io_object &obj, size_t offset, size_t size,
-              rmm::cuda_stream_view stream);
+  std::unique_ptr<cudf::io::datasource::buffer> device_read(sirius_io_object& obj,
+                                                            size_t offset,
+                                                            size_t size,
+                                                            rmm::cuda_stream_view stream);
 
-  size_t device_read(sirius_io_object &obj, size_t offset, size_t size,
-                     uint8_t *dst, rmm::cuda_stream_view stream);
+  size_t device_read(
+    sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
-  void device_read_async(sirius_io_object &obj, size_t offset, size_t size,
-                         uint8_t *dst, rmm::cuda_stream_view stream,
+  void device_read_async(sirius_io_object& obj,
+                         size_t offset,
+                         size_t size,
+                         uint8_t* dst,
+                         rmm::cuda_stream_view stream,
                          io_completion_handler handler);
 
   // Backend-specific IO path (no cache lookup).  Implementations read
   // directly from the underlying device (e.g. O_DIRECT + cuFile).
-  virtual std::unique_ptr<cudf::io::datasource::buffer>
-  device_read_io(sirius_io_object &obj, size_t offset, size_t size,
-                 rmm::cuda_stream_view stream) = 0;
+  virtual std::unique_ptr<cudf::io::datasource::buffer> device_read_io(
+    sirius_io_object& obj, size_t offset, size_t size, rmm::cuda_stream_view stream) = 0;
 
-  virtual size_t device_read_io(sirius_io_object &obj, size_t offset,
-                                size_t size, uint8_t *dst,
+  virtual size_t device_read_io(sirius_io_object& obj,
+                                size_t offset,
+                                size_t size,
+                                uint8_t* dst,
                                 rmm::cuda_stream_view stream) = 0;
 
-  virtual void device_read_io_async(sirius_io_object &obj, size_t offset,
-                                    size_t size, uint8_t *dst,
+  virtual void device_read_io_async(sirius_io_object& obj,
+                                    size_t offset,
+                                    size_t size,
+                                    uint8_t* dst,
                                     rmm::cuda_stream_view stream,
                                     io_completion_handler handler) = 0;
 
-  virtual void host_read_ranges_async(
-      sirius_io_object &obj,
-      std::vector<cudf::io::text::byte_range_info> const &ranges,
-      std::span<cudf::host_span<std::byte>> dst,
-      io_completion_handler handler) = 0;
+  virtual void host_read_ranges_async(sirius_io_object& obj,
+                                      std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                      std::span<cudf::host_span<std::byte>> dst,
+                                      io_completion_handler handler) = 0;
 
-  virtual size_t
-  host_read_ranges(sirius_io_object &obj,
-                   std::vector<cudf::io::text::byte_range_info> const &ranges,
-                   std::span<cudf::host_span<std::byte>> dst) = 0;
+  virtual size_t host_read_ranges(sirius_io_object& obj,
+                                  std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                  std::span<cudf::host_span<std::byte>> dst) = 0;
 
   // -- Physical range alignment ------------------------------------------------
 
-  virtual cudf::io::text::byte_range_info
-  compute_physical_range(cudf::io::text::byte_range_info logical,
-                         size_t file_size) const = 0;
+  virtual cudf::io::text::byte_range_info compute_physical_range(
+    cudf::io::text::byte_range_info logical, size_t file_size) const = 0;
 
-protected:
+ protected:
   std::unique_ptr<prefetching_cache> _cache;
 };
 
@@ -256,15 +260,13 @@ protected:
  * @brief Extended datasource with batch range-read support.
  */
 class io_datasource : public cudf::io::datasource {
-public:
-  virtual void host_read_ranges_async(
-      std::vector<cudf::io::text::byte_range_info> const &ranges,
-      std::span<cudf::host_span<std::byte>> dst,
-      io_completion_handler handler) = 0;
+ public:
+  virtual void host_read_ranges_async(std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                      std::span<cudf::host_span<std::byte>> dst,
+                                      io_completion_handler handler) = 0;
 
-  virtual size_t
-  host_read_ranges(std::vector<cudf::io::text::byte_range_info> const &ranges,
-                   std::span<cudf::host_span<std::byte>> dst) = 0;
+  virtual size_t host_read_ranges(std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                  std::span<cudf::host_span<std::byte>> dst) = 0;
 };
 
-} // namespace sirius::io
+}  // namespace sirius::io

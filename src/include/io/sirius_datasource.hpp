@@ -31,7 +31,7 @@ namespace sirius::io {
  * owned @c sirius_io_object by reference.
  */
 class sirius_datasource : public io_datasource {
-public:
+ public:
   static constexpr size_t NUM_BUFFERS = NUM_CHUNKS;
   static constexpr size_t BUFFER_SIZE = CHUNK_SIZE;
 
@@ -40,8 +40,8 @@ public:
 
   ~sirius_datasource() override = default;
 
-  sirius_datasource(sirius_datasource const &) = delete;
-  sirius_datasource &operator=(sirius_datasource const &) = delete;
+  sirius_datasource(sirius_datasource const&)            = delete;
+  sirius_datasource& operator=(sirius_datasource const&) = delete;
 
   // ---- Context accessors ---------------------------------------------------
 
@@ -55,41 +55,40 @@ public:
 
   [[nodiscard]] bool is_device_read_preferred(size_t) const override;
 
-  size_t host_read(size_t offset, size_t size, uint8_t *dst) override;
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override;
 
-  std::unique_ptr<datasource::buffer> host_read(size_t offset,
-                                                size_t size) override;
+  std::unique_ptr<datasource::buffer> host_read(size_t offset, size_t size) override;
 
-  std::future<size_t> host_read_async(size_t offset, size_t size,
-                                      uint8_t *dst) override;
+  std::future<size_t> host_read_async(size_t offset, size_t size, uint8_t* dst) override;
 
-  std::future<std::unique_ptr<datasource::buffer>>
-  host_read_async(size_t offset, size_t size) override;
+  std::future<std::unique_ptr<datasource::buffer>> host_read_async(size_t offset,
+                                                                   size_t size) override;
 
-  std::unique_ptr<datasource::buffer>
-  device_read(size_t offset, size_t size,
-              rmm::cuda_stream_view stream) override;
-  size_t device_read(size_t offset, size_t size, uint8_t *dst,
+  std::unique_ptr<datasource::buffer> device_read(size_t offset,
+                                                  size_t size,
+                                                  rmm::cuda_stream_view stream) override;
+  size_t device_read(size_t offset,
+                     size_t size,
+                     uint8_t* dst,
                      rmm::cuda_stream_view stream) override;
 
-  std::future<size_t> device_read_async(size_t offset, size_t size,
-                                        uint8_t *dst,
+  std::future<size_t> device_read_async(size_t offset,
+                                        size_t size,
+                                        uint8_t* dst,
                                         rmm::cuda_stream_view stream) override;
 
   // ---- sirius_datasource overrides ------------------------------------------
 
-  void host_read_ranges_async(
-      std::vector<cudf::io::text::byte_range_info> const &ranges,
-      std::span<cudf::host_span<std::byte>> dst,
-      io_completion_handler handler) override;
+  void host_read_ranges_async(std::vector<cudf::io::text::byte_range_info> const& ranges,
+                              std::span<cudf::host_span<std::byte>> dst,
+                              io_completion_handler handler) override;
 
-  size_t
-  host_read_ranges(std::vector<cudf::io::text::byte_range_info> const &ranges,
-                   std::span<cudf::host_span<std::byte>> dst) override;
+  size_t host_read_ranges(std::vector<cudf::io::text::byte_range_info> const& ranges,
+                          std::span<cudf::host_span<std::byte>> dst) override;
 
-private:
+ private:
   std::shared_ptr<sirius_ioctx> _io_ctx;
   std::unique_ptr<sirius_io_object> _io_object;
 };
 
-} // namespace sirius::io
+}  // namespace sirius::io

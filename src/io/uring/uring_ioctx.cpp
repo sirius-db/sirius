@@ -27,10 +27,11 @@ namespace sirius::io {
 // ring_pool
 // ---------------------------------------------------------------------------
 
-void ring_pool::init(size_t n_rings, unsigned ring_entries) {
-  _rings = std::make_unique<io_uring[]>(n_rings);
+void ring_pool::init(size_t n_rings, unsigned ring_entries)
+{
+  _rings  = std::make_unique<io_uring[]>(n_rings);
   _in_use = std::make_unique<bool[]>(n_rings);
-  _n = n_rings;
+  _n      = n_rings;
 
   for (auto i : std::views::iota(size_t{0}, _n)) {
     int ret = io_uring_queue_init(ring_entries, &_rings[i], 0);
@@ -40,27 +41,28 @@ void ring_pool::init(size_t n_rings, unsigned ring_entries) {
   }
 }
 
-ring_pool::~ring_pool() {
-  std::for_each_n(_rings.get(), _n,
-                  [](io_uring &r) { io_uring_queue_exit(&r); });
+ring_pool::~ring_pool()
+{
+  std::for_each_n(_rings.get(), _n, [](io_uring& r) { io_uring_queue_exit(&r); });
 }
 
-ring_pool::guard ring_pool::acquire() {
+ring_pool::guard ring_pool::acquire()
+{
   std::unique_lock lk{_mtx};
   size_t found = _n;
   _cv.wait(lk, [&] {
-    auto *first = _in_use.get();
-    auto *it = std::find(first, first + _n, false);
-    if (it == first + _n)
-      return false;
-    *it = true;
+    auto* first = _in_use.get();
+    auto* it    = std::find(first, first + _n, false);
+    if (it == first + _n) return false;
+    *it   = true;
     found = static_cast<size_t>(it - first);
     return true;
   });
   return guard{this, found};
 }
 
-void ring_pool::release(size_t idx) {
+void ring_pool::release(size_t idx)
+{
   {
     std::lock_guard lk{_mtx};
     _in_use[idx] = false;
@@ -72,11 +74,14 @@ void ring_pool::release(size_t idx) {
 // uring_ioctx
 // ---------------------------------------------------------------------------
 
-uring_ioctx::uring_ioctx(unsigned host_ring_depth, unsigned ring_entries,
-                         size_t n_reactors, size_t bounce_slot_size)
-    : templated_ioctx<uring_reactor>(n_reactors, [ring_entries,
-                                                  bounce_slot_size] {
-        return std::make_unique<uring_reactor>(ring_entries, bounce_slot_size);
-      }) {}
+uring_ioctx::uring_ioctx(unsigned host_ring_depth,
+                         unsigned ring_entries,
+                         size_t n_reactors,
+                         size_t bounce_slot_size)
+  : templated_ioctx<uring_reactor>(n_reactors, [ring_entries, bounce_slot_size] {
+      return std::make_unique<uring_reactor>(ring_entries, bounce_slot_size);
+    })
+{
+}
 
-} // namespace sirius::io
+}  // namespace sirius::io

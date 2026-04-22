@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "ctrack.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 
@@ -42,11 +41,10 @@ namespace sirius::io {
 //   - expose device_handle() / host_handle() returning Handle
 
 template <class O, class Handle>
-concept io_object_c = std::derived_from<O, sirius_io_object> &&
-    requires(O o) {
-      { o.device_handle() } -> std::convertible_to<Handle>;
-      { o.host_handle() } -> std::convertible_to<Handle>;
-    };
+concept io_object_c = std::derived_from<O, sirius_io_object> && requires(O o) {
+  { o.device_handle() } -> std::convertible_to<Handle>;
+  { o.host_handle() } -> std::convertible_to<Handle>;
+};
 
 // ---------------------------------------------------------------------------
 // Concept: io_reactor_c
@@ -54,11 +52,12 @@ concept io_object_c = std::derived_from<O, sirius_io_object> &&
 
 template <class R>
 concept io_reactor_c = requires(R r,
-                                std::vector<typename R::device_read_req_type>
-                                    dbatch,
+                                std::vector<typename R::device_read_req_type> dbatch,
                                 typename R::host_read_req_type hreq,
                                 typename R::native_handle_type handle,
-                                size_t offset, size_t size, uint8_t *dst,
+                                size_t offset,
+                                size_t size,
+                                uint8_t* dst,
                                 cudf::io::text::byte_range_info logical,
                                 size_t file_size) {
   typename R::native_handle_type;
@@ -66,15 +65,13 @@ concept io_reactor_c = requires(R r,
   typename R::device_read_req_type;
   typename R::host_read_req_type;
 
-  requires io_object_c<typename R::io_object_type,
-                       typename R::native_handle_type>;
+  requires io_object_c<typename R::io_object_type, typename R::native_handle_type>;
 
   { r.enqueue_bulk(std::move(dbatch)) };
   { r.host_read(handle, offset, size, dst) } -> std::same_as<size_t>;
   { r.host_read_async(std::move(hreq)) };
   { r.shutdown() };
-  { R::align_to_physical(logical, file_size) }
-      -> std::same_as<cudf::io::text::byte_range_info>;
+  { R::align_to_physical(logical, file_size) } -> std::same_as<cudf::io::text::byte_range_info>;
 };
 
 // ---------------------------------------------------------------------------
@@ -87,60 +84,64 @@ concept io_reactor_c = requires(R r,
 // and io_object_c.  Backends plug in by providing a Reactor + io_object type
 // pair that satisfies those concepts.
 
-template <io_reactor_c Reactor> class templated_ioctx : public sirius_ioctx {
-public:
-  using reactor_type = Reactor;
-  using native_handle_type = typename Reactor::native_handle_type;
-  using io_object_type = typename Reactor::io_object_type;
+template <io_reactor_c Reactor>
+class templated_ioctx : public sirius_ioctx {
+ public:
+  using reactor_type         = Reactor;
+  using native_handle_type   = typename Reactor::native_handle_type;
+  using io_object_type       = typename Reactor::io_object_type;
   using device_read_req_type = typename Reactor::device_read_req_type;
-  using host_read_req_type = typename Reactor::host_read_req_type;
+  using host_read_req_type   = typename Reactor::host_read_req_type;
 
   /// Construct with a pre-built vector of reactors (most flexible).
   explicit templated_ioctx(std::vector<std::unique_ptr<Reactor>> reactors)
-      : _reactors(std::move(reactors)) {}
+    : _reactors(std::move(reactors))
+  {
+  }
 
   /// Construct by invoking @p factory @p n_reactors times to build the pool.
   template <class Factory>
-    requires std::invocable<Factory &> &&
-             std::convertible_to<std::invoke_result_t<Factory &>,
-                                 std::unique_ptr<Reactor>>
-  templated_ioctx(size_t n_reactors, Factory factory) {
+    requires std::invocable<Factory&> &&
+             std::convertible_to<std::invoke_result_t<Factory&>, std::unique_ptr<Reactor>>
+  templated_ioctx(size_t n_reactors, Factory factory)
+  {
     _reactors.reserve(n_reactors);
     for (size_t i = 0; i < n_reactors; ++i)
       _reactors.emplace_back(factory());
   }
 
-  void shutdown() override {
-    for (auto &r : _reactors)
+  void shutdown() override
+  {
+    for (auto& r : _reactors)
       r->shutdown();
   }
 
-  std::unique_ptr<cudf::io::datasource>
-  make_datasource(std::unique_ptr<sirius_io_object> io_object) override {
-    return std::make_unique<sirius_datasource>(shared_from_this(),
-                                               std::move(io_object));
+  std::unique_ptr<cudf::io::datasource> make_datasource(
+    std::unique_ptr<sirius_io_object> io_object) override
+  {
+    return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
   }
 
-  Reactor &next_reactor() {
-    size_t idx =
-        _next.fetch_add(1, std::memory_order_relaxed) % _reactors.size();
+  Reactor& next_reactor()
+  {
+    size_t idx = _next.fetch_add(1, std::memory_order_relaxed) % _reactors.size();
     return *_reactors.at(idx);
   }
 
   // -- Host reads (generic: delegate to io_object_type + std::async) --------
 
-  size_t host_read(sirius_io_object &obj, size_t offset, size_t size,
-                   uint8_t *dst) override {
-    auto &tobj = as_typed(obj);
-    size = std::min(size,
-                    tobj.size() > offset ? tobj.size() - offset : size_t{0});
-    if (size == 0)
-      return 0;
+  size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) override
+  {
+    auto& tobj = as_typed(obj);
+    size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
+    if (size == 0) return 0;
     return next_reactor().host_read(tobj.host_handle(), offset, size, dst);
   }
 
-  std::unique_ptr<cudf::io::datasource::buffer>
-  host_read(sirius_io_object &obj, size_t offset, size_t size) override {
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object& obj,
+                                                          size_t offset,
+                                                          size_t size) override
+  {
     size = std::min(size, obj.size() > offset ? obj.size() - offset : size_t{0});
     std::vector<uint8_t> buf(size);
     size_t n = host_read(obj, offset, size, buf.data());
@@ -148,67 +149,78 @@ public:
     return cudf::io::datasource::buffer::create(std::move(buf));
   }
 
-  void host_read_async(sirius_io_object &obj, size_t offset, size_t size,
-                       uint8_t *dst, io_completion_handler handler) override {
-    auto &tobj = as_typed(obj);
-    size = std::min(size,
-                    tobj.size() > offset ? tobj.size() - offset : size_t{0});
+  void host_read_async(sirius_io_object& obj,
+                       size_t offset,
+                       size_t size,
+                       uint8_t* dst,
+                       io_completion_handler handler) override
+  {
+    auto& tobj = as_typed(obj);
+    size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
     if (size == 0) {
       handler(0, nullptr);
       return;
     }
-    auto ctx = std::make_shared<request_context>();
-    ctx->handler = std::move(handler);
+    auto ctx         = std::make_shared<request_context>();
+    ctx->handler     = std::move(handler);
     ctx->total_bytes = size;
     ctx->pending.store(1, std::memory_order_relaxed);
 
     host_read_req_type req;
     req.handle = tobj.host_handle();
     req.offset = offset;
-    req.size = size;
-    req.dst = dst;
-    req.ctx = std::move(ctx);
+    req.size   = size;
+    req.dst    = dst;
+    req.ctx    = std::move(ctx);
     next_reactor().host_read_async(std::move(req));
   }
 
   // -- Device reads (generic chunking; reactor-backed) ----------------------
 
-  std::unique_ptr<cudf::io::datasource::buffer>
-  device_read_io(sirius_io_object &obj, size_t offset, size_t size,
-                 rmm::cuda_stream_view stream) override {
+  std::unique_ptr<cudf::io::datasource::buffer> device_read_io(
+    sirius_io_object& obj, size_t offset, size_t size, rmm::cuda_stream_view stream) override
+  {
     rmm::device_buffer dbuf(size, stream);
     sync_via_promise([&](io_completion_handler h) {
-      enqueue_device_read(as_typed(obj), offset, size,
-                          static_cast<uint8_t *>(dbuf.data()), stream.value(),
+      enqueue_device_read(as_typed(obj),
+                          offset,
+                          size,
+                          static_cast<uint8_t*>(dbuf.data()),
+                          stream.value(),
                           std::move(h));
     });
     return cudf::io::datasource::buffer::create(std::move(dbuf));
   }
 
-  size_t device_read_io(sirius_io_object &obj, size_t offset, size_t size,
-                        uint8_t *dst, rmm::cuda_stream_view stream) override {
+  size_t device_read_io(sirius_io_object& obj,
+                        size_t offset,
+                        size_t size,
+                        uint8_t* dst,
+                        rmm::cuda_stream_view stream) override
+  {
     return sync_via_promise([&](io_completion_handler h) {
-      enqueue_device_read(as_typed(obj), offset, size, dst, stream.value(),
-                          std::move(h));
+      enqueue_device_read(as_typed(obj), offset, size, dst, stream.value(), std::move(h));
     });
   }
 
-  void device_read_io_async(sirius_io_object &obj, size_t offset, size_t size,
-                            uint8_t *dst, rmm::cuda_stream_view stream,
-                            io_completion_handler handler) override {
-    enqueue_device_read(as_typed(obj), offset, size, dst, stream.value(),
-                        std::move(handler));
+  void device_read_io_async(sirius_io_object& obj,
+                            size_t offset,
+                            size_t size,
+                            uint8_t* dst,
+                            rmm::cuda_stream_view stream,
+                            io_completion_handler handler) override
+  {
+    enqueue_device_read(as_typed(obj), offset, size, dst, stream.value(), std::move(handler));
   }
 
   // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
 
-  void host_read_ranges_async(
-      sirius_io_object &obj,
-      std::vector<cudf::io::text::byte_range_info> const &ranges,
-      std::span<cudf::host_span<std::byte>> dst,
-      io_completion_handler handler) override {
-    CTRACK_NAME("ioctx::host_read_ranges_async");
-    auto &tobj = as_typed(obj);
+  void host_read_ranges_async(sirius_io_object& obj,
+                              std::vector<cudf::io::text::byte_range_info> const& ranges,
+                              std::span<cudf::host_span<std::byte>> dst,
+                              io_completion_handler handler) override
+  {
+    auto& tobj     = as_typed(obj);
     auto file_size = tobj.size();
 
     if (ranges.empty()) {
@@ -216,10 +228,10 @@ public:
       return;
     }
 
-    size_t total = 0;
+    size_t total    = 0;
     size_t n_active = 0;
     for (size_t i = 0; i < ranges.size(); ++i) {
-      auto off = static_cast<size_t>(ranges[i].offset());
+      auto off  = static_cast<size_t>(ranges[i].offset());
       size_t sz = std::min(static_cast<size_t>(ranges[i].size()),
                            file_size > off ? file_size - off : size_t{0});
       if (sz > 0 && sz <= dst[i].size()) {
@@ -232,65 +244,67 @@ public:
       return;
     }
 
-    auto ctx = std::make_shared<request_context>();
-    ctx->handler = std::move(handler);
+    auto ctx         = std::make_shared<request_context>();
+    ctx->handler     = std::move(handler);
     ctx->total_bytes = total;
     ctx->pending.store(n_active, std::memory_order_relaxed);
 
     for (size_t i = 0; i < ranges.size(); ++i) {
-      auto off = static_cast<size_t>(ranges[i].offset());
+      auto off  = static_cast<size_t>(ranges[i].offset());
       size_t sz = std::min(static_cast<size_t>(ranges[i].size()),
                            file_size > off ? file_size - off : size_t{0});
-      if (sz == 0 || sz > dst[i].size())
-        continue;
+      if (sz == 0 || sz > dst[i].size()) continue;
       host_read_req_type req;
       req.handle = tobj.host_handle();
       req.offset = off;
-      req.size = sz;
-      req.dst = reinterpret_cast<uint8_t *>(dst[i].data());
-      req.ctx = ctx;
+      req.size   = sz;
+      req.dst    = reinterpret_cast<uint8_t*>(dst[i].data());
+      req.ctx    = ctx;
       next_reactor().host_read_async(std::move(req));
     }
   }
 
-  size_t
-  host_read_ranges(sirius_io_object &obj,
-                   std::vector<cudf::io::text::byte_range_info> const &ranges,
-                   std::span<cudf::host_span<std::byte>> dst) override {
+  size_t host_read_ranges(sirius_io_object& obj,
+                          std::vector<cudf::io::text::byte_range_info> const& ranges,
+                          std::span<cudf::host_span<std::byte>> dst) override
+  {
     std::promise<size_t> p;
     auto fut = p.get_future();
-    host_read_ranges_async(obj, ranges, dst,
-                           [&p](size_t bytes, std::exception_ptr ep) {
-                             if (ep)
-                               p.set_exception(ep);
-                             else
-                               p.set_value(bytes);
-                           });
+    host_read_ranges_async(obj, ranges, dst, [&p](size_t bytes, std::exception_ptr ep) {
+      if (ep)
+        p.set_exception(ep);
+      else
+        p.set_value(bytes);
+    });
     return fut.get();
   }
 
-  cudf::io::text::byte_range_info
-  compute_physical_range(cudf::io::text::byte_range_info logical,
-                         size_t file_size) const override {
+  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
+                                                         size_t file_size) const override
+  {
     return Reactor::align_to_physical(logical, file_size);
   }
 
-protected:
+ protected:
   std::vector<std::unique_ptr<Reactor>> _reactors;
   std::atomic<size_t> _next{0};
 
-private:
-  static io_object_type &as_typed(sirius_io_object &obj) {
+ private:
+  static io_object_type& as_typed(sirius_io_object& obj)
+  {
     // make_datasource() only accepts sirius_io_object subclasses; backends
     // are expected to hand in an io_object_type instance.  A misuse here is
     // a programmer error, not runtime user input.
-    return static_cast<io_object_type &>(obj);
+    return static_cast<io_object_type&>(obj);
   }
 
-  void enqueue_device_read(io_object_type &obj, size_t offset, size_t size,
-                           uint8_t *dst, cudaStream_t stream,
-                           io_completion_handler handler) {
-    CTRACK_NAME("ioctx::enqueue_device_read");
+  void enqueue_device_read(io_object_type& obj,
+                           size_t offset,
+                           size_t size,
+                           uint8_t* dst,
+                           cudaStream_t stream,
+                           io_completion_handler handler)
+  {
     auto file_size = obj.size();
     if (size == 0 || offset >= file_size) {
       handler(0, nullptr);
@@ -299,15 +313,15 @@ private:
     size = std::min(size, file_size - offset);
 
     auto phys = Reactor::align_to_physical(
-        {static_cast<int64_t>(offset), static_cast<int64_t>(size)}, file_size);
+      {static_cast<int64_t>(offset), static_cast<int64_t>(size)}, file_size);
     size_t a_start = static_cast<size_t>(phys.offset());
-    size_t a_end = a_start + static_cast<size_t>(phys.size());
-    size_t prefix = offset - a_start;
+    size_t a_end   = a_start + static_cast<size_t>(phys.size());
+    size_t prefix  = offset - a_start;
 
     size_t n_chunks = (a_end - a_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-    auto ctx = std::make_shared<request_context>();
-    ctx->handler = std::move(handler);
+    auto ctx         = std::make_shared<request_context>();
+    ctx->handler     = std::move(handler);
     ctx->total_bytes = size;
     ctx->pending.store(n_chunks, std::memory_order_relaxed);
 
@@ -324,23 +338,22 @@ private:
     // still fan out across reactors when M >= chunk count, preserving
     // cross-reactor parallelism for large requests.
     auto const m = _reactors.size();
-    size_t start =
-        _next.fetch_add(1, std::memory_order_relaxed) % m;
+    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
     std::vector<std::vector<device_read_req_type>> groups(m);
 
     size_t produced = 0;
-    size_t chunk_k = 0;
+    size_t chunk_k  = 0;
     for (size_t cur = a_start; cur < a_end; cur += CHUNK_SIZE) {
       device_read_req_type req;
-      req.handle = obj.device_handle();
-      req.file_off = cur;
-      req.io_size = std::min(CHUNK_SIZE, a_end - cur);
-      req.data_off = (cur == a_start) ? prefix : 0;
+      req.handle    = obj.device_handle();
+      req.file_off  = cur;
+      req.io_size   = std::min(CHUNK_SIZE, a_end - cur);
+      req.data_off  = (cur == a_start) ? prefix : 0;
       req.data_size = std::min(req.io_size - req.data_off, size - produced);
-      req.dst = dst + produced;
-      req.stream = stream;
+      req.dst       = dst + produced;
+      req.stream    = stream;
       req.device_id = device_id;
-      req.ctx = ctx;
+      req.ctx       = ctx;
       produced += req.data_size;
 
       groups[(start + chunk_k) % m].push_back(std::move(req));
@@ -348,13 +361,13 @@ private:
     }
 
     for (size_t i = 0; i < m; ++i) {
-      if (!groups[i].empty())
-        _reactors[i]->enqueue_bulk(std::move(groups[i]));
+      if (!groups[i].empty()) _reactors[i]->enqueue_bulk(std::move(groups[i]));
     }
   }
 
   template <class Enqueue>
-  static size_t sync_via_promise(Enqueue &&enqueue) {
+  static size_t sync_via_promise(Enqueue&& enqueue)
+  {
     std::promise<size_t> p;
     auto f = p.get_future();
     enqueue([&p](size_t n, std::exception_ptr e) {
@@ -367,4 +380,4 @@ private:
   }
 };
 
-} // namespace sirius::io
+}  // namespace sirius::io

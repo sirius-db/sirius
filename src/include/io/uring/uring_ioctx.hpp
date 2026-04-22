@@ -33,36 +33,35 @@ namespace sirius::io {
  * @brief Pool of @c io_uring instances for host (buffered) reads.
  */
 class ring_pool {
-public:
+ public:
   struct guard {
-    guard(ring_pool *p, size_t i) noexcept : _pool(p), _idx(i) {}
+    guard(ring_pool* p, size_t i) noexcept : _pool(p), _idx(i) {}
 
-    io_uring &ring() const { return _pool->_rings[_idx]; }
+    io_uring& ring() const { return _pool->_rings[_idx]; }
 
-    ~guard() {
-      if (_pool)
-        _pool->release(_idx);
+    ~guard()
+    {
+      if (_pool) _pool->release(_idx);
     }
 
-    guard(guard const &) = delete;
-    guard &operator=(guard const &) = delete;
-    guard(guard &&o) noexcept
-        : _pool(std::exchange(o._pool, nullptr)), _idx(o._idx) {}
+    guard(guard const&)            = delete;
+    guard& operator=(guard const&) = delete;
+    guard(guard&& o) noexcept : _pool(std::exchange(o._pool, nullptr)), _idx(o._idx) {}
 
-  private:
-    ring_pool *_pool{nullptr};
+   private:
+    ring_pool* _pool{nullptr};
     size_t _idx{0};
   };
 
-  ring_pool() = default;
-  ring_pool(ring_pool const &) = delete;
-  ring_pool &operator=(ring_pool const &) = delete;
+  ring_pool()                            = default;
+  ring_pool(ring_pool const&)            = delete;
+  ring_pool& operator=(ring_pool const&) = delete;
 
   void init(size_t n_rings, unsigned ring_entries);
   ~ring_pool();
   guard acquire();
 
-private:
+ private:
   void release(size_t idx);
 
   std::unique_ptr<io_uring[]> _rings;
@@ -82,10 +81,11 @@ private:
  *        @c ring_pool for callers that need direct access to a host ring.
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
-public:
+ public:
   explicit uring_ioctx(unsigned host_ring_depth = 16,
-                       unsigned ring_entries = 64, size_t n_reactors = 4,
-                       size_t bounce_slot_size = 1UL * 1024 * 1024);
+                       unsigned ring_entries    = 64,
+                       size_t n_reactors        = 4,
+                       size_t bounce_slot_size  = 1UL * 1024 * 1024);
 };
 
-} // namespace sirius::io
+}  // namespace sirius::io
