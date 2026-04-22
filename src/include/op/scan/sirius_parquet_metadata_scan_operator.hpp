@@ -191,7 +191,10 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
  private:
   /// The list of parquet files to scan.
   std::vector<std::string> _file_paths;
-  /// Column indices to read (after projection), indices into parquet schema.
+  /// DuckDB primary indices of the columns to read, in column_ids order (virtuals and
+  /// duplicates removed). Parallel to _projected_column_names when _is_projected; used to
+  /// translate _pure_filter_column_indices (keyed by DuckDB primary index) into parquet
+  /// chunk indices at execute() time after name-based schema resolution.
   std::vector<std::size_t> _selected_column_indices;
   /// Whether projection is applied.
   bool _is_projected;

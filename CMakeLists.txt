@@ -175,6 +175,7 @@ set(EXTENSION_SOURCES
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/parquet_scan_task.cpp
+    src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
@@ -402,6 +403,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
+    test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/unittest.cpp

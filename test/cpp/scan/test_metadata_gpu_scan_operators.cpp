@@ -398,6 +398,112 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   REQUIRE(meta->reader_options != nullptr);
 }
 
+TEST_CASE("metadata_scan_operator - projection restricts byte accounting to selected chunks",
+          "[metadata_scan][projection][shared_context]")
+{
+  // Regression test for the name-based DuckDB→parquet column-chunk mapping in the
+  // metadata-scan operator.  Constructs a table whose first column ("heavy") holds
+  // large VARCHAR payloads and whose remaining columns are small INTEGERs.
+  // When projecting only the small columns, the per-partition uncompressed byte
+  // count must reflect just those chunks — the VARCHAR chunk must not be included.
+  // The loop resolves each projected column name to its parquet chunk index via
+  // detail::leaf_indices_for_column; this test verifies that resolution is actually
+  // applied and used for byte accounting.
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+
+  std::string const table = "meta_proj_bytes";
+  auto create = con.Query("CREATE TABLE " + table + " (heavy VARCHAR, a INTEGER, b INTEGER)");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  // 500 rows of ~200-char VARCHAR; small ints. Single row group so there is one
+  // row-group partition and the byte totals are easy to reason about.  Each row
+  // gets a unique string so that dictionary encoding cannot collapse the VARCHAR
+  // column to near-zero uncompressed bytes.
+  constexpr std::size_t NUM_ROWS = 500;
+  auto insert                    = con.Query("INSERT INTO " + table +
+                          " SELECT lpad(cast(i AS VARCHAR), 200, 'x'), i, i * 2 "
+                                             "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, NUM_ROWS);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{
+    duckdb::ColumnIndex(0), duckdb::ColumnIndex(1), duckdb::ColumnIndex(2)};
+  duckdb::vector<std::string> names{"heavy", "a", "b"};
+  duckdb::vector<duckdb::LogicalType> full_types{
+    duckdb::LogicalType::VARCHAR, duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+
+  std::vector<std::string> files = {path.string()};
+  // Use a very large batch target so the whole file fits in one partition — then
+  // the reported byte count reflects the full scanned dataset.
+  constexpr std::size_t BIG_BATCH = 1ull << 30;
+
+  // --- Full scan (no projection): all chunks contribute. ---
+  std::size_t full_uncompressed_bytes = 0;
+  {
+    sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(full_types),
+                                                              0);
+    sirius::op::scan::sirius_parquet_metadata_scan_operator op(
+      &gpu_op,
+      sirius::from_duckdb_vec(full_types),
+      sirius::from_duckdb_vec(full_types),
+      0,
+      files,
+      column_ids,
+      /*projection_ids=*/duckdb::vector<duckdb::idx_t>{},
+      names,
+      /*table_filter_set=*/nullptr,
+      /*partition_indices=*/{},
+      BIG_BATCH);
+    auto input = op.get_next_task_input_data();
+    REQUIRE(input);
+    auto output = op.execute(*input, cudf::get_default_stream());
+    auto* meta  = dynamic_cast<sirius::op::scan::partitioned_parquet_metadata*>(output.get());
+    REQUIRE(meta);
+    REQUIRE(meta->row_group_partitions.size() == 1);
+    full_uncompressed_bytes = meta->row_group_partitions[0].reserved_uncompressed_bytes;
+  }
+
+  // --- Projected scan: only the two INTEGER columns ("a", "b"). ---
+  std::size_t projected_uncompressed_bytes = 0;
+  {
+    duckdb::vector<duckdb::LogicalType> projected_types{duckdb::LogicalType::INTEGER,
+                                                        duckdb::LogicalType::INTEGER};
+    duckdb::vector<duckdb::idx_t> projection_ids{1, 2};
+    sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+      sirius::from_duckdb_vec(projected_types), 0);
+    sirius::op::scan::sirius_parquet_metadata_scan_operator op(
+      &gpu_op,
+      sirius::from_duckdb_vec(projected_types),
+      sirius::from_duckdb_vec(full_types),
+      0,
+      files,
+      column_ids,
+      projection_ids,
+      names,
+      /*table_filter_set=*/nullptr,
+      /*partition_indices=*/{},
+      BIG_BATCH);
+    auto input = op.get_next_task_input_data();
+    REQUIRE(input);
+    auto output = op.execute(*input, cudf::get_default_stream());
+    auto* meta  = dynamic_cast<sirius::op::scan::partitioned_parquet_metadata*>(output.get());
+    REQUIRE(meta);
+    REQUIRE(meta->row_group_partitions.size() == 1);
+    projected_uncompressed_bytes = meta->row_group_partitions[0].reserved_uncompressed_bytes;
+  }
+
+  // Two 4-byte ints × 500 rows = 4000 bytes of column payload, plus some per-page
+  // overhead. The VARCHAR payload alone is ~100 KB, so the projected byte count
+  // must be at least an order of magnitude smaller than the full-scan count.
+  REQUIRE(projected_uncompressed_bytes > 0);
+  REQUIRE(full_uncompressed_bytes > 10 * projected_uncompressed_bytes);
+}
+
 TEST_CASE("two-pipeline scan - basic scan with all columns", "[two_pipeline_scan][shared_context]")
 {
   auto memory_manager = initialize_memory_manager();
