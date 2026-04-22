@@ -42,6 +42,7 @@ class telemetry_context {
 
   [[nodiscard]] const uuid::UUID& engine_id() const { return engine_uuid_; }
   [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
+  [[nodiscard]] const quent::Context& context() const { return *context_; }
 
  private:
   uuid::UUID engine_uuid_;
@@ -52,7 +53,7 @@ class telemetry_context {
 };
 
 // A POD to hold common identifiers for useful telemetry.
-struct telemetry_info {
+struct query_telemetry_info {
   uuid::UUID query_id;
   uuid::UUID worker_id;
 };
@@ -60,8 +61,9 @@ struct telemetry_info {
 /// Emit plan-level telemetry (operator declarations, port declarations, edges)
 /// for the given set of pipelines. Called once during query construction.
 void emit_plan_telemetry(
+const quent::Context& context,
   const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
   uuid::UUID plan_id,
-  telemetry_info telemetry_info);
+  query_telemetry_info telemetry_info);
 
 }  // namespace sirius::telemetry

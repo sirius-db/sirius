@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-quent-attributes = { git = "https://github.com/rapidsai/quent.git", branch = "main" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", branch = "main" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", branch = "main" }
-quent-stdlib = { git = "https://github.com/rapidsai/quent.git", branch = "main" }
+quent-attributes = { path = "/home/dvats/repos/quent/crates/attributes" }
+quent-model = { path = "/home/dvats/repos/quent/crates/model" }
+quent-query-engine-model = { path = "/home/dvats/repos/quent/domains/query_engine/model" }
+quent-stdlib = { path = "/home/dvats/repos/quent/crates/stdlib" }
 uuid = { workspace = true, features = ["serde", "v7"] }

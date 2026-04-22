@@ -377,10 +377,12 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
 
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-  sirius::telemetry::telemetry_info telemetry_info)
+  const quent::Context& context,
+  sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
-  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), telemetry_info);
+  query_ =
+    duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), context, telemetry_info);
   pipeline_executor_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
 }
@@ -404,14 +406,10 @@ bool SiriusContext::is_query_lifecycle_active() const noexcept
 }
 
 void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
-{
-  captured_logical_plan_ = std::move(plan);
-}
+{ captured_logical_plan_ = std::move(plan); }
 
 unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
-{
-  return std::move(captured_logical_plan_);
-}
+{ return std::move(captured_logical_plan_); }
 
 void SiriusContext::set_transparent_original_disabled_optimizers(std::set<OptimizerType> disabled)
 {
@@ -445,19 +443,13 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
 }
 
 void SiriusContext::record_transparent_rebind_success() noexcept
-{
-  transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);
-}
+{ transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed); }
 
 void SiriusContext::record_transparent_fallback() noexcept
-{
-  transparent_fallback_count_.fetch_add(1, std::memory_order_relaxed);
-}
+{ transparent_fallback_count_.fetch_add(1, std::memory_order_relaxed); }
 
 void SiriusContext::record_transparent_execution() noexcept
-{
-  transparent_execution_count_.fetch_add(1, std::memory_order_relaxed);
-}
+{ transparent_execution_count_.fetch_add(1, std::memory_order_relaxed); }
 
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,

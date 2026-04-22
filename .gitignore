@@ -36,5 +36,5 @@ compile_commands.json
 # Zed editor settings
 .zed
 
-log/
+runs/
 telemetry_data/

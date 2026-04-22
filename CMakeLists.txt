@@ -240,9 +240,9 @@ set(EXTENSION_SOURCES
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp
-    src/telemetry_context.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/telemetry/telemetry_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp

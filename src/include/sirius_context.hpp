@@ -115,9 +115,7 @@ class SiriusContext : public ClientContextState {
    */
   struct InternalQueryGuard {
     explicit InternalQueryGuard(SiriusContext& ctx) noexcept : ctx_(ctx)
-    {
-      ctx_.enter_internal_query();
-    }
+    { ctx_.enter_internal_query(); }
     ~InternalQueryGuard() noexcept { ctx_.exit_internal_query(); }
     InternalQueryGuard(const InternalQueryGuard&)            = delete;
     InternalQueryGuard& operator=(const InternalQueryGuard&) = delete;
@@ -127,25 +125,17 @@ class SiriusContext : public ClientContextState {
   };
 
   void enter_internal_query() noexcept
-  {
-    _internal_query_depth.fetch_add(1, std::memory_order_relaxed);
-  }
+  { _internal_query_depth.fetch_add(1, std::memory_order_relaxed); }
   void exit_internal_query() noexcept
-  {
-    _internal_query_depth.fetch_sub(1, std::memory_order_relaxed);
-  }
+  { _internal_query_depth.fetch_sub(1, std::memory_order_relaxed); }
   [[nodiscard]] bool is_internal_query_active() const noexcept
-  {
-    return _internal_query_depth.load(std::memory_order_relaxed) > 0;
-  }
+  { return _internal_query_depth.load(std::memory_order_relaxed) > 0; }
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
-  {
-    return config_.get_hw_topology();
-  }
+  { return config_.get_hw_topology(); }
 
   /// \brief Get the memory reservation manager.
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
@@ -175,7 +165,8 @@ class SiriusContext : public ClientContextState {
   /// \param pipelines The ordered pipelines for the query.
   /// \param telemetry_info Info useful for emitting identifiable telemetry.
   void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-                    sirius::telemetry::telemetry_info telemetry_info);
+                    const quent::Context& context,
+                    sirius::telemetry::query_telemetry_info telemetry_info);
 
   /// \brief Get the current query.
   [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();

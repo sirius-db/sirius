@@ -44,7 +44,8 @@ class query {
    * @param telemetry_info Info useful for emitting identifiable telemetry.
    */
   query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
-        telemetry::telemetry_info telemetry_info);
+        const quent::Context& context,
+        telemetry::query_telemetry_info telemetry_info);
 
   ~query() = default;
 

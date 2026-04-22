@@ -33,8 +33,8 @@ telemetry_context::telemetry_context()
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
     context_(quent::create_context(uuid::now_v7(), "ndjson", "telemetry_data")),
-    engine_observer_(quent::engine::create_observer()),
-    worker_observer_(quent::worker::create_observer())
+    engine_observer_(quent::engine::create_observer(*context_)),
+    worker_observer_(quent::worker::create_observer(*context_))
 {
   // Engine init
   const char* env_name    = std::getenv("SIRIUS_ENGINE_NAME");
@@ -67,13 +67,14 @@ telemetry_context::~telemetry_context()
 }
 
 void emit_plan_telemetry(
+const quent::Context& context,
   const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
   const uuid::UUID plan_id,
-  const telemetry_info telemetry_info)
+  const query_telemetry_info telemetry_info)
 {
-  auto operator_obs = quent::operator_::create_observer();
-  auto port_obs     = quent::port::create_observer();
-  auto plan_obs     = quent::plan::create_observer();
+  auto operator_obs = quent::operator_::create_observer(context);
+  auto port_obs     = quent::port::create_observer(context);
+  auto plan_obs     = quent::plan::create_observer(context);
 
   // Collect edges while iterating
   rust::Vec<quent::plan::Edges> edges;

@@ -23,11 +23,12 @@
 namespace sirius::planner {
 
 query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
-             telemetry::telemetry_info telemetry_info)
+             const quent::Context& context,
+             telemetry::query_telemetry_info telemetry_info)
   : _plan_id(uuid::now_v7()), _pipelines(std::move(pipelines))
 {
   build_indices();
-  telemetry::emit_plan_telemetry(_pipelines, _plan_id, telemetry_info);
+  telemetry::emit_plan_telemetry(context, _pipelines, _plan_id, telemetry_info);
 }
 
 void query::build_indices()
