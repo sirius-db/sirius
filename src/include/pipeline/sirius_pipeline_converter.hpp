@@ -61,6 +61,7 @@ class sirius_pipeline_converter {
 
   // Phase 2: Split pipelines by operator type
   void split_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled);
+  void split_parquet_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_cpu_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);

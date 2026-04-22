@@ -87,8 +87,7 @@ Environment variables:
 
 ## Query Files
 
-- `tpch_queries/orig/q*.sql` — Plain SQL queries (used by duckdb engine)
-- `tpch_queries/gpu/q*.sql` — Queries wrapped in `call gpu_execution('...');` (used by sirius engine)
+- `tpch_queries/orig/q*.sql` — Plain SQL queries used by both Sirius and DuckDB runners
 
 ## Sirius Configuration
 

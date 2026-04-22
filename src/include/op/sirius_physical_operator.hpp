@@ -74,6 +74,47 @@ class operator_data {
   operator_data& operator=(const operator_data&) = default;
   operator_data(operator_data&&)                 = default;
   operator_data& operator=(operator_data&&)      = default;
+
+  /**
+   * @brief Per-task preparation hook invoked before the operator consumes this data.
+   *
+   * Called by the pipeline task machinery after the GPU pipeline executor has acquired
+   * a memory reservation for the task, and before the operator's execute() runs. This
+   * gives the data object a chance to perform any per-task setup that needs to happen
+   * in the context of the task's reserved memory space, including:
+   *   - Locking (or converting-then-locking) owned data batches into the requested
+   *     memory space — see pipelineable_operator_data::prepare_for_processing.
+   *   - Capturing the memory space for later use by execute() in operators that
+   *     produce output but own no input batches — e.g. source operators such as
+   *     parquet_scan_data, which need a target memory space for their output tables
+   *     but have no upstream batch to inherit one from.
+   *
+   * @param requested_memory_space  The memory space associated with the task's
+   *                                reservation. Any locking, conversion, or
+   *                                allocation performed during preparation should
+   *                                target this space. May be nullptr when the
+   *                                caller has no target preference, in which case
+   *                                implementations should fall back to each batch's
+   *                                current space (see pipelineable_operator_data).
+   * @param stream                  CUDA stream available for any data-movement
+   *                                kernels triggered by preparation.
+   * @return  A vector of data_batch_processing_handles that must remain alive for
+   *          the duration of the task; these handles keep locked batches locked
+   *          until processing completes. An empty vector is valid and appropriate
+   *          when there is nothing to lock. Returns std::nullopt to signal a
+   *          preparation failure that should trigger task reschedule/retry
+   *          (for example, a batch lock that returned null).
+   *
+   * The default implementation is a no-op that returns an empty handle vector.
+   * It is appropriate for operator_data subclasses that own no data requiring
+   * locking and need no per-task setup. Override when either condition changes.
+   */
+  virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                         rmm::cuda_stream_view stream)
+  {
+    return std::vector<::cucascade::data_batch_processing_handle>{};
+  };
 };
 
 /**
@@ -125,9 +166,9 @@ class pipelineable_operator_data : public operator_data {
    * @param stream                  CUDA stream used for any data-movement kernels.
    * @return Processing handles for all batches, or std::nullopt on lock failure.
    */
-  virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
-  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                         rmm::cuda_stream_view stream);
+  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space,
+    rmm::cuda_stream_view stream) override;
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
@@ -280,6 +321,9 @@ class sirius_physical_operator {
 
   struct port {
     MemoryBarrierType type;
+    /// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").
+    /// Null repos are treated as "empty, not data-gating" by the base-class port handling methods
+    /// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).
     ::cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;

@@ -31,7 +31,7 @@ namespace sirius {
 namespace op {
 
 //===--------------------------------------------------------------------===//
-// pipelineable_operator_data
+// operator_data
 //===--------------------------------------------------------------------===//
 
 std::optional<std::vector<::cucascade::data_batch_processing_handle>>
@@ -239,6 +239,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   // if no unfinished barriers, then is this operator ready to create a task?
   if (std::all_of(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
+        if (!p->repo) { return true; }  // dependency-only port; not data-gating
         return (p->type != MemoryBarrierType::FULL && p->repo->total_size() > 0) ||
                (p->type == MemoryBarrierType::FULL && p->repo->total_size() > 0 &&
                 p->src_pipeline && p->src_pipeline->is_pipeline_finished());
@@ -268,6 +269,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   for (auto& [port_name, port_ptr] : ports) {
+    if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
     auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
@@ -280,6 +282,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
 bool sirius_physical_operator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
+    if (!port_ptr->repo) { continue; }  // dependency-only port; always empty
     if (port_ptr->repo->total_size() != 0) { return false; }
   }
   return true;

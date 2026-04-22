@@ -99,3 +99,10 @@ jobs:
             cat "$RUN_DIR/comparison.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          ERRORS=$(tail -n +2 "$RUN_DIR/validation.csv" | grep -cE ',error$' || true)
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::TPC-H snapshot: $ERRORS queries errored"
+            if [ "${{ github.event_name }}" = "merge_group" ]; then
+              exit 1
+            fi
+          fi

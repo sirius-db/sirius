@@ -138,8 +138,10 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/downgrade/downgrade_task.cpp
+    src/expression/expression.cpp
+    src/expression/join_condition.cpp
+    src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
-    src/expression_executor/gpu_expression_executor_state.cpp
     src/expression_executor/gpu_expression_translator.cpp
     src/expression_executor/regex/regex_playground.cpp
     src/expression_executor/specializations/gpu_execute_between.cpp
@@ -166,6 +168,7 @@ set(EXTENSION_SOURCES
     src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
+    src/op/scan/hive_partition.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_metadata_reader.cpp
@@ -240,6 +243,8 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/transparent/physical_sirius_execution.cpp
+    src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
 
@@ -261,9 +266,6 @@ set(CUDA_SOURCES
     src/cuda/cudf/cudf_join.cu
     src/cuda/cudf/cudf_orderby.cu
     src/cuda/cudf/cudf_utils.cu
-    src/cuda/expression_executor/gpu_dispatch_materialize.cu
-    src/cuda/expression_executor/gpu_dispatch_select.cu
-    src/cuda/expression_executor/gpu_dispatch_string.cu
     src/cuda/operator/arbitrary_expression.cu
     src/cuda/operator/comparison_expression.cu
     src/cuda/operator/hash_join_inner.cu
@@ -278,6 +280,10 @@ set(CUDA_SOURCES
     src/cuda/print.cu
     src/cuda/utils.cu)
 # cmake-format: on
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
+  list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
+endif()
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -351,16 +357,19 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/data/test_host_parquet_representation.cpp
-    test/cpp/debug/test_debug_utils.cpp
+    test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_join_condition.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_transparent_execution.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory_management/test_cpu_cache.cpp
@@ -388,6 +397,8 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
+    test/cpp/pipeline/test_metadata_gpu_pipeline_task_counting.cpp
+    test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_pipeline_executor.cpp
     test/cpp/scan/test_column_builder.cpp
