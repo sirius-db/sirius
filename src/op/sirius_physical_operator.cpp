@@ -18,7 +18,6 @@
 
 #include "gpu_executor.hpp"
 #include "log/logging.hpp"
-#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -35,11 +34,11 @@ namespace op {
 // pipelineable_operator_data
 //===--------------------------------------------------------------------===//
 
-std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+std::optional<std::vector<::cucascade::read_only_data_batch>>
 pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
-  std::vector<::cucascade::data_batch_processing_handle> handles;
+  std::vector<::cucascade::read_only_data_batch> handles;
   handles.reserve(_data_batches.size());
 
   for (const auto& batch : _data_batches) {
@@ -47,7 +46,7 @@ pipelineable_operator_data::prepare_for_processing(
       SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
       return std::nullopt;
     }
-    std::optional<::cucascade::data_batch_processing_handle> handle;
+    std::optional<::cucascade::read_only_data_batch> handle;
     try {
       handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory&) {
