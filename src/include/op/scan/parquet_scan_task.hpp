@@ -277,16 +277,19 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return _footer_offsets[file_idx];
   }
 
-  /** @brief Get a shared_ptr that pins the translated AST filter expression alive.
+  /** @brief Get a shared_ptr holding the per-GPU translated AST filter expressions alive.
    *
-   * This is passed to host_parquet_representation so the filter expression (which
-   * parquet_reader_options stores as a reference) survives until materialization.
+   * This is passed to host_parquet_representation so filter scalars survive until
+   * materialization. Keyed by device_id so the converter can pick the entry that
+   * matches its task's target device — per-device scalar device buffers are required
+   * for multi-GPU correctness (MGPU-07).
    *
-   * @return A shared_ptr to the translated filter expression (may be null if no filter). */
-  [[nodiscard]] std::shared_ptr<gpu_expression_translator::translated_expression>
-  get_filter_expression() const
+   * @return A shared_ptr to the per-device filter map (may be null / empty if no filter). */
+  [[nodiscard]] std::shared_ptr<
+    std::unordered_map<int, gpu_expression_translator::translated_expression>>
+  get_filter_expression_by_device() const
   {
-    return _translated_filter;
+    return _translated_filter_by_device;
   }
 
   /**
@@ -430,9 +433,12 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<std::size_t> _metadata_byte_sizes;  ///< Per-file header+footer+trailer bytes
   std::vector<std::size_t> _footer_offsets;       ///< Per-file offset where footer begins
 
-  std::shared_ptr<gpu_expression_translator::translated_expression>
-    _translated_filter;  ///< The translated filter expression, if any, to keep alive for
-                         ///< materialization
+  std::shared_ptr<std::unordered_map<int, gpu_expression_translator::translated_expression>>
+    _translated_filter_by_device;  ///< Per-GPU translated filter expressions, keyed by
+                                    ///< device_id. Each entry's cudf::scalar device buffers
+                                    ///< live on that specific device so tasks dispatched
+                                    ///< across GPUs can evaluate the AST against memory
+                                    ///< accessible from the task's current device.
   std::vector<std::size_t>
     _post_filter_projection_ids;  ///< The indices of projected columns in the reader output
 

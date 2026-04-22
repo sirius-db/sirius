@@ -231,7 +231,19 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
     auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
     if (scan_physical_op.function.name == "parquet_scan" ||
         scan_physical_op.function.name == "read_parquet") {
-      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
+      // Gather the configured GPU device ids so the parquet-scan op can build
+      // one translated filter tree per GPU (scalars end up on the right device
+      // for each task's dispatch target). Falls back to the current device if
+      // SiriusContext is not yet registered.
+      std::vector<int> gpu_device_ids;
+      auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      if (ctx != nullptr) {
+        for (auto const& kv : ctx->get_gpu_io_backends()) {
+          gpu_device_ids.push_back(kv.first);
+        }
+      }
+      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op,
+                                                                 std::move(gpu_device_ids));
     } else if (scan_physical_op.function.name == "iceberg_scan") {
       return construct_iceberg_scan_operator(scan_physical_op);
     } else if (scan_physical_op.function.name == "seq_scan") {

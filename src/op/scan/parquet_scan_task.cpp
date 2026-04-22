@@ -358,7 +358,7 @@ void parquet_scan_task_global_state::initialize_from_files()
   _reader_options = cudf::io::parquet_reader_options::builder().build();
 
   // If filtering or projecting, we need column names
-  bool const do_filter    = _scan_op->translated_filter.has_value();
+  bool const do_filter    = !_scan_op->translated_filter_by_device.empty();
   bool const is_projected = !_scan_op->projection_ids.empty();
   if (do_filter || is_projected) {
     if (_scan_op->names.empty()) {
@@ -453,12 +453,17 @@ void parquet_scan_task_global_state::initialize_from_files()
 
   //===----------Filters----------===//
   if (do_filter) {
-    // The filter was attempted in the physical operator constructor.
-    // If translation failed, the table scan operator will execute the filter, otherwise the table
-    // scan operator will be a no-op passthrough.
-    _translated_filter = std::make_shared<gpu_expression_translator::translated_expression>(
-      std::move(*_scan_op->translated_filter));
-    _reader_options.set_filter(_translated_filter->back());
+    // Per-GPU filter expressions were built by the physical operator constructor
+    // (one per configured GPU). We move the whole map into shared ownership so
+    // host_parquet_representation can keep it alive across all tasks. The filter is
+    // NOT set on _reader_options here because a single _reader_options instance is
+    // shared by all tasks regardless of target GPU; set_filter with a device-
+    // specific tree here would bind everyone to one device. Instead, each converter
+    // call selects the right per-device tree and calls set_filter on its own opts
+    // copy under target_device_raii.
+    _translated_filter_by_device = std::make_shared<
+      std::unordered_map<int, gpu_expression_translator::translated_expression>>(
+      std::move(_scan_op->translated_filter_by_device));
   }
 
   // Verify projected columns are flat (we don't support nested projections yet).
@@ -485,9 +490,23 @@ void parquet_scan_task_global_state::initialize_from_files()
   // self-contained (no other work queued on this stream). User rule
   // forbids the default-stream sentinel everywhere in Sirius.
   rmm::cuda_stream planning_stream;
+  // Pick the per-device filter entry that matches the current device for
+  // planning-time row-group pruning. Tasks will later pick their own entry at
+  // converter time; this planning-time set_filter is just for the metadata
+  // stats evaluation on this thread.
+  cudf::io::parquet_reader_options planning_options = _reader_options;
+  if (_translated_filter_by_device && !_translated_filter_by_device->empty()) {
+    int planning_device = 0;
+    (void)::cudaGetDevice(&planning_device);
+    auto it = _translated_filter_by_device->find(planning_device);
+    if (it == _translated_filter_by_device->end()) {
+      it = _translated_filter_by_device->begin();  // fallback to any device
+    }
+    planning_options.set_filter(it->second.back());
+  }
   for (std::size_t file_idx = 0; file_idx < _file_paths.size(); ++file_idx) {
-    auto row_group_indices = readers[file_idx]->all_row_groups(_reader_options);
-    if (_translated_filter) {
+    auto row_group_indices = readers[file_idx]->all_row_groups(planning_options);
+    if (_translated_filter_by_device && !_translated_filter_by_device->empty()) {
       auto const row_groups_before_pruning = row_group_indices.size();
       // clang-format off
       SIRIUS_LOG_INFO("[parquet_scan_task_global_state] Row group pruning: file: {}\n" \
@@ -497,7 +516,7 @@ void parquet_scan_task_global_state::initialize_from_files()
       // clang-format on
       // Prune row groups with filter pushdown using metadata statistics.
       row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
-        row_group_indices, _reader_options, planning_stream.view());
+        row_group_indices, planning_options, planning_stream.view());
       auto const row_groups_after_pruning = row_group_indices.size();
       auto const pruned_row_groups        = row_groups_before_pruning - row_groups_after_pruning;
       // clang-format off
@@ -854,7 +873,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   file_size,
                                                   _datasource,
-                                                  g_state.get_filter_expression(),
+                                                  g_state.get_filter_expression_by_device(),
                                                   g_state.get_post_filter_projection_ids());
 
   // Propagate hooks and data-file path to the converter.
@@ -909,6 +928,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     result->get_data_batches().size(),
     num_rgs,
     task_duration.count() / 1000.0);
+
   return result;
 }
 

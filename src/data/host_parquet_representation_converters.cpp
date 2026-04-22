@@ -141,6 +141,18 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   opts.set_row_groups({std::vector<cudf::size_type>(host_src.get_row_group_indices().begin(),
                                                     host_src.get_row_group_indices().end())});
 
+  // Pick the filter-tree entry whose cudf::scalar device buffers live on the
+  // target device. The planner built one tree per configured GPU; here we
+  // select the one that matches this task's target so cudf's AST evaluation
+  // (inside cudf::io::read_parquet) reads scalars from memory the current
+  // device can address.
+  auto const& filter_by_device = host_src.get_filter_expression_by_device();
+  if (filter_by_device && !filter_by_device->empty()) {
+    auto it = filter_by_device->find(target_device_id.value());
+    if (it == filter_by_device->end()) { it = filter_by_device->begin(); }
+    opts.set_filter(it->second.back());
+  }
+
   auto [table, md] = cudf::io::read_parquet(opts, target_stream, mr_ref);
 
   // Apply the post-convert hook (used by iceberg scan for V2 delete filtering).
@@ -254,7 +266,7 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     host_src.get_uncompressed_data_size_in_bytes(),
     host_src.get_file_size(),
     host_src.get_fallback_datasource(),
-    host_src.get_filter_expression(),
+    host_src.get_filter_expression_by_device(),
     host_src.get_post_filter_projection_ids());
   if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
   if (host_src.has_partition_inject_fn()) {

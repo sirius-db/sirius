@@ -21,6 +21,9 @@
 #include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -35,7 +38,8 @@ duckdb::ExtraOperatorInfo copy_extra_info_parquet_scan(const duckdb::ExtraOperat
   return copy;
 }
 
-sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table_scan* table_scan)
+sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table_scan* table_scan,
+                                                           std::vector<int> gpu_device_ids)
   : sirius_physical_parquet_scan(
       table_scan->types,
       table_scan->function,
@@ -49,7 +53,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table
       copy_extra_info_parquet_scan(table_scan->extra_info),
       table_scan->parameters,
       table_scan->virtual_columns,
-      table_scan)  // Pass pointer to the table scan for filter pushdown
+      table_scan,  // Pass pointer to the table scan for filter pushdown
+      std::move(gpu_device_ids))
 {
 }
 
@@ -66,7 +71,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p,
-  sirius_physical_table_scan* table_scan)
+  sirius_physical_table_scan* table_scan,
+  std::vector<int> gpu_device_ids)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARQUET_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
@@ -89,11 +95,40 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
     auto duckdb_expression = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, batch_column_map);
     if (duckdb_expression) {
-      gpu_expression_translator translator(rmm::cuda_stream_default,
-                                           cudf::get_current_device_resource_ref());
-      translated_filter =
-        translator.translate_expression_with_names(*duckdb_expression, name_resolver);
-      if (!translated_filter) {
+      // Build one translated filter tree PER GPU. Each tree's cudf::scalar
+      // device buffers live on the tree's own device, so a task dispatched to
+      // device N evaluates the filter's AST entirely against device-N memory.
+      // Without this, a single translation at planner-time would bind scalars
+      // to the planner's current device (typically GPU 0), and tasks on other
+      // GPUs would hit cudaErrorInvalidValue / cudaErrorIllegalAddress when
+      // cudf::io::read_parquet evaluates the AST against per-rowgroup stats.
+      std::vector<int> device_ids_for_translation = gpu_device_ids;
+      if (device_ids_for_translation.empty()) {
+        // Fallback: translate for the current device only when no explicit
+        // device list is provided (e.g. operator constructed outside the
+        // multi-GPU engine path). Preserves single-GPU semantics.
+        int current_device = 0;
+        (void)::cudaGetDevice(&current_device);
+        device_ids_for_translation.push_back(current_device);
+      }
+
+      bool all_translations_ok = true;
+      for (int device_id : device_ids_for_translation) {
+        rmm::cuda_set_device_raii device_raii{rmm::cuda_device_id{device_id}};
+        gpu_expression_translator translator(
+          rmm::cuda_stream_default,
+          rmm::mr::get_per_device_resource_ref(rmm::cuda_device_id{device_id}));
+        auto translated =
+          translator.translate_expression_with_names(*duckdb_expression, name_resolver);
+        if (!translated) {
+          all_translations_ok = false;
+          break;
+        }
+        translated_filter_by_device.emplace(device_id, std::move(*translated));
+      }
+
+      if (!all_translations_ok) {
+        translated_filter_by_device.clear();
         SIRIUS_LOG_INFO(
           "[sirius_physical_parquet_scan] Failed to translate filter expression for pushdown. "
           "Filter will be applied in the table scan operator.");
@@ -104,8 +139,6 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
       // Move the duckdb_expression into the table scan
       if (table_scan) { table_scan->filter_expr = std::move(duckdb_expression); }
     }
-  } else {
-    translated_filter = std::nullopt;
   }
 }
 
