@@ -78,7 +78,59 @@ class GPUExecutionFixtureBase {
     }
   }
 
-  ~GPUExecutionFixtureBase() = default;
+  virtual ~GPUExecutionFixtureBase() { release_env(); }
+
+  /**
+   * @brief Subclass hook — called after each env swap to re-establish views /
+   * attach databases on the new connection. Default no-op; DuckDB-fixture
+   * attaches the tpch database, Parquet-fixture creates views over read_parquet.
+   */
+  virtual void setup_schema() {}
+
+  /**
+   * @brief Bind the fixture's connection to the shared env for the given
+   * num_gpus configuration. Pauses the previously-active env (if any) first
+   * so at most one Sirius context is live. Returns false if the requested
+   * env is unavailable on this host (e.g., num_gpus=2 on a single-GPU host);
+   * caller should WARN+return per Catch2 v2 convention.
+   */
+  bool bind_env(int num_gpus)
+  {
+    release_env();
+    auto* env = sirius::test::acquire_integration_env_for(num_gpus);
+    if (env == nullptr) { return false; }
+    if (!env->is_active()) { env->resume(); }
+    active_env_ = env;
+    con         = std::make_unique<duckdb::Connection>(env->make_connection());
+    setup_schema();
+    return true;
+  }
+
+  /**
+   * @brief Pauses the currently-bound env (if any) and drops the connection.
+   * Safe to call multiple times. Called automatically from the destructor.
+   */
+  void release_env()
+  {
+    con.reset();
+    if (active_env_ != nullptr) {
+      active_env_->pause();
+      active_env_ = nullptr;
+    }
+  }
+
+  /**
+   * @brief Runs compare_gpu_vs_cpu on the chosen num_gpus config. Returns false
+   * if the 2-GPU path is unavailable (single-GPU host) — caller should WARN+return.
+   */
+  bool compare_gpu_vs_cpu_for(int num_gpus,
+                              const std::string& query,
+                              std::optional<float> float_tolerance = std::nullopt)
+  {
+    if (!bind_env(num_gpus)) { return false; }
+    compare_gpu_vs_cpu(query, float_tolerance);
+    return true;
+  }
 
   /**
    * @brief Run a query through gpu_execution and through DuckDB CPU, then compare results.
@@ -177,6 +229,7 @@ class GPUExecutionFixtureBase {
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
   std::unique_ptr<sirius_config_env_guard> config_guard;
+  sirius::test::shared_test_env* active_env_ = nullptr;
 };
 
 /**
@@ -187,7 +240,9 @@ class GPUExecutionFixtureBase {
  */
 class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
  public:
-  GPUExecutionDuckDBFixture()
+  GPUExecutionDuckDBFixture() { setup_schema(); }
+
+  void setup_schema() override
   {
     auto db_path = get_tpch_db_path().string();
     auto result  = con->Query("ATTACH IF NOT EXISTS '" + db_path + "' AS tpch (READ_ONLY);");
@@ -208,7 +263,9 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
  */
 class GPUExecutionParquetFixture : public GPUExecutionFixtureBase {
  public:
-  GPUExecutionParquetFixture()
+  GPUExecutionParquetFixture() { setup_schema(); }
+
+  void setup_schema() override
   {
     auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
     auto result = con->Query("CREATE VIEW IF NOT EXISTS nation AS SELECT * FROM read_parquet('" +
@@ -3225,12 +3282,29 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 //===----------------------------------------------------------------------===//
 // TPC-H queries
+//
+// TEST-01/02 (v1.2): each TPC-H TEST_CASE is parameterized on num_gpus ∈ {1, 2}
+// via Catch2's GENERATE. The RUN_TPCH_MGPU macro:
+//   - picks num_gpus = 1 then 2 (two Catch2 sections per TEST_CASE)
+//   - CAPTUREs num_gpus so failures report which variant failed
+//   - acquires the matching shared_test_env (integration.yaml for 1,
+//     integration-2gpu.yaml for 2) via compare_gpu_vs_cpu_for()
+//   - WARN+returns when num_gpus == 2 on a single-GPU host
+// This expands each TEST_CASE to run twice; per AUDIT-03, the 2-GPU variant
+// MUST execute in the default unit-tests run, so no [.] hide-tag is applied.
 //===----------------------------------------------------------------------===//
+#define RUN_TPCH_MGPU(...)                                                \
+  do {                                                                    \
+    auto const num_gpus = GENERATE(1, 2);                                 \
+    CAPTURE(num_gpus);                                                    \
+    if (!compare_gpu_vs_cpu_for(num_gpus, __VA_ARGS__)) { return; }       \
+  } while (0)
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 1",
                  "[integration][gpu_execution][TPC-H][Q1]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
     "sum(l_extendedprice) as sum_base_price, "
     "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price, "
@@ -3248,7 +3322,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 1 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q1]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
     "sum(l_extendedprice) as sum_base_price, "
     "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price, "
@@ -3266,7 +3340,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 2",
                  "[integration][gpu_execution][TPC-H][Q2]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
     "s.s_address, s.s_phone, s.s_comment "
     "from part p, supplier s, partsupp ps, nation n, region r "
@@ -3289,7 +3363,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 2 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q2]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
     "s.s_address, s.s_phone, s.s_comment "
     "from part p, supplier s, partsupp ps, nation n, region r "
@@ -3312,7 +3386,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 3",
                  "[integration][gpu_execution][TPC-H][Q3]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select l.l_orderkey, "
     "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
     "o.o_orderdate, o.o_shippriority "
@@ -3330,7 +3404,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 3 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q3]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select l.l_orderkey, "
     "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
     "o.o_orderdate, o.o_shippriority "
@@ -3348,7 +3422,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 4",
                  "[integration][gpu_execution][TPC-H][Q4]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select o.o_orderpriority, count(*) as order_count "
     "from orders o "
     "where o.o_orderdate >= date '1996-10-01' "
@@ -3366,7 +3440,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 4 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q4]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select o.o_orderpriority, count(*) as order_count "
     "from orders o "
     "where o.o_orderdate >= date '1996-10-01' "
@@ -3384,7 +3458,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 5",
                  "[integration][gpu_execution][TPC-H][Q5]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select n.n_name, "
     "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue "
     "from orders o, lineitem l, supplier s, nation n, region r, customer c "
@@ -3402,7 +3476,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 5 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q5]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select n.n_name, "
     "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue "
     "from orders o, lineitem l, supplier s, nation n, region r, customer c "
@@ -3420,7 +3494,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 6",
                  "[integration][gpu_execution][TPC-H][Q6]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select sum(l_extendedprice * l_discount) as revenue "
     "from lineitem "
     "where l_shipdate >= date '1997-01-01' "
@@ -3433,7 +3507,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 6 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q6]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select sum(l_extendedprice * l_discount) as revenue "
     "from lineitem "
     "where l_shipdate >= date '1997-01-01' "
@@ -3446,7 +3520,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 7",
                  "[integration][gpu_execution][TPC-H][Q7]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select supp_nation, cust_nation, l_year, sum(volume) as revenue "
     "from ("
     "  select n1.n_name as supp_nation, n2.n_name as cust_nation, "
@@ -3468,7 +3542,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 7 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q7]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select supp_nation, cust_nation, l_year, sum(volume) as revenue "
     "from ("
     "  select n1.n_name as supp_nation, n2.n_name as cust_nation, "
@@ -3490,7 +3564,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 8",
                  "[integration][gpu_execution][TPC-H][Q8]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select o_year, "
     "sum(case when nation = 'EGYPT' then volume else 0 end) / sum(volume) as mkt_share "
     "from ("
@@ -3514,7 +3588,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 8 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q8]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select o_year, "
     "sum(case when nation = 'EGYPT' then volume else 0 end) / sum(volume) as mkt_share "
     "from ("
@@ -3538,7 +3612,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 9",
                  "[integration][gpu_execution][TPC-H][Q9]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select nation, o_year, sum(amount) as sum_profit "
     "from ("
     "  select n.n_name as nation, "
@@ -3558,7 +3632,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 9 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q9]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select nation, o_year, sum(amount) as sum_profit "
     "from ("
     "  select n.n_name as nation, "
@@ -3578,7 +3652,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 10",
                  "[integration][gpu_execution][TPC-H][Q10]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select c.c_custkey, c.c_name, "
     "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
     "c.c_acctbal, n.n_name, c.c_address, c.c_phone, c.c_comment "
@@ -3598,7 +3672,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 10 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q10]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select c.c_custkey, c.c_name, "
     "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
     "c.c_acctbal, n.n_name, c.c_address, c.c_phone, c.c_comment "
@@ -3618,7 +3692,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 11",
                  "[integration][gpu_execution][TPC-H][Q11]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select ps.ps_partkey, "
     "sum(ps.ps_supplycost * ps.ps_availqty) as value "
     "from partsupp ps, supplier s, nation n "
@@ -3640,7 +3714,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 11 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q11]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select ps.ps_partkey, "
     "sum(ps.ps_supplycost * ps.ps_availqty) as value "
     "from partsupp ps, supplier s, nation n "
@@ -3662,7 +3736,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 12",
                  "[integration][gpu_execution][TPC-H][Q12]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select l.l_shipmode, "
     "sum(case when o.o_orderpriority = '1-URGENT' "
     "  or o.o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, "
@@ -3683,7 +3757,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 12 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q12]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select l.l_shipmode, "
     "sum(case when o.o_orderpriority = '1-URGENT' "
     "  or o.o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, "
@@ -3704,7 +3778,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 13",
                  "[integration][gpu_execution][TPC-H][Q13]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select c_count, count(*) as custdist "
     "from ("
     "  select c.c_custkey, count(o.o_orderkey) "
@@ -3722,7 +3796,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 13 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q13]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select c_count, count(*) as custdist "
     "from ("
     "  select c.c_custkey, count(o.o_orderkey) "
@@ -3740,7 +3814,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 14",
                  "[integration][gpu_execution][TPC-H][Q14]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select 100.00 * sum(case when p.p_type like 'PROMO%' "
     "  then l.l_extendedprice * (1 - l.l_discount) else 0 end) "
     "  / sum(l.l_extendedprice * (1 - l.l_discount)) as promo_revenue "
@@ -3754,7 +3828,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 14 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q14]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select 100.00 * sum(case when p.p_type like 'PROMO%' "
     "  then l.l_extendedprice * (1 - l.l_discount) else 0 end) "
     "  / sum(l.l_extendedprice * (1 - l.l_discount)) as promo_revenue "
@@ -3768,7 +3842,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 15",
                  "[integration][gpu_execution][TPC-H][Q15]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "with revenue_view as ("
     "  select l_suppkey as supplier_no, "
     "  sum(l_extendedprice * (1 - l_discount)) as total_revenue "
@@ -3790,7 +3864,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 15 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q15]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "with revenue_view as ("
     "  select l_suppkey as supplier_no, "
     "  sum(l_extendedprice * (1 - l_discount)) as total_revenue "
@@ -3812,7 +3886,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 16",
                  "[integration][gpu_execution][TPC-H][Q16]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select p.p_brand, p.p_type, p.p_size, "
     "count(distinct ps.ps_suppkey) as supplier_cnt "
     "from partsupp ps, part p "
@@ -3832,7 +3906,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 16 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q16]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select p.p_brand, p.p_type, p.p_size, "
     "count(distinct ps.ps_suppkey) as supplier_cnt "
     "from partsupp ps, part p "
@@ -3852,7 +3926,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 17",
                  "[integration][gpu_execution][TPC-H][Q17]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
     "from lineitem l, part p "
     "where p.p_partkey = l.l_partkey "
@@ -3869,7 +3943,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 17 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q17]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
     "from lineitem l, part p "
     "where p.p_partkey = l.l_partkey "
@@ -3886,7 +3960,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 18",
                  "[integration][gpu_execution][TPC-H][Q18]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, "
     "o.o_totalprice, sum(l.l_quantity) "
     "from customer c, orders o, lineitem l "
@@ -3905,7 +3979,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 18 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q18]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, "
     "o.o_totalprice, sum(l.l_quantity) "
     "from customer c, orders o, lineitem l "
@@ -3924,7 +3998,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 19",
                  "[integration][gpu_execution][TPC-H][Q19]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select sum(l.l_extendedprice* (1 - l.l_discount)) as revenue "
     "from lineitem l, part p "
     "where ("
@@ -3958,7 +4032,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 19 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q19]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select sum(l.l_extendedprice* (1 - l.l_discount)) as revenue "
     "from lineitem l, part p "
     "where ("
@@ -3992,7 +4066,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 20",
                  "[integration][gpu_execution][TPC-H][Q20]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select s.s_name, s.s_address "
     "from supplier s, nation n "
     "where s.s_suppkey in ("
@@ -4018,7 +4092,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 20 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q20]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select s.s_name, s.s_address "
     "from supplier s, nation n "
     "where s.s_suppkey in ("
@@ -4044,7 +4118,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 21",
                  "[integration][gpu_execution][TPC-H][Q21]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select s.s_name, count(*) as numwait "
     "from supplier s, lineitem l1, orders o, nation n "
     "where s.s_suppkey = l1.l_suppkey "
@@ -4073,7 +4147,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 21 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q21]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select s.s_name, count(*) as numwait "
     "from supplier s, lineitem l1, orders o, nation n "
     "where s.s_suppkey = l1.l_suppkey "
@@ -4102,7 +4176,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 22",
                  "[integration][gpu_execution][TPC-H][Q22]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal "
     "from ("
     "  select substring(c_phone from 1 for 2) as cntrycode, c_acctbal "
@@ -4127,7 +4201,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 22 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q22]")
 {
-  compare_gpu_vs_cpu(
+  RUN_TPCH_MGPU(
     "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal "
     "from ("
     "  select substring(c_phone from 1 for 2) as cntrycode, c_acctbal "
