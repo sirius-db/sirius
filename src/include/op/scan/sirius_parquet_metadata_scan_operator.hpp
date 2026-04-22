@@ -56,10 +56,9 @@ namespace sirius::op::scan {
  *     sirius_gpu_parquet_scan_operator via its accumulate_metadata() entry point.
  *     This is a direct handoff — no inter-pipeline port or data repository is
  *     involved; the metadata never flows through the generic pipeline data path.
- *   - finalize_operator() (invoked once after pipeline 1 completes) calls
- *     gpu_scan::finalize_partitions(), which freezes the partition index and
- *     unblocks the downstream scan pipeline (pipeline 2), where gpu_scan serves
- *     as the source.
+ *   - When this pipeline finishes, the downstream gpu_scan pipeline detects
+ *     completion via the handoff port's src_pipeline status — no explicit
+ *     finalization call is needed.
  *
  * @pre The caller must validate before construction that:
  *   - The table function is NOT an in-out function (in_out_function == false).
@@ -184,17 +183,6 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    */
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  /**
-   * @brief Finalize the paired gpu_scan's partition index, unblocking the downstream pipeline.
-   *
-   * Invoked by the pipeline framework exactly once, after every sink() call for this pipeline
-   * has returned. Delegates to gpu_scan::finalize_partitions(), which freezes the accumulated
-   * metadata into a flat partition index and publishes it with release semantics. Until this
-   * call completes, gpu_scan's source methods report "not ready" and the downstream scan
-   * pipeline cannot begin dispatching tasks.
-   */
-  void finalize_operator() override;
-
   //===----------Accessors----------===//
   [[nodiscard]] std::size_t get_total_files() const { return _total_files; }
   [[nodiscard]] std::size_t get_max_file_processed() const { return _max_file_processed; }
@@ -234,6 +222,12 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
 
   /// Atomic file-batch counter; incremented by get_next_task_input_data().
   std::atomic<std::size_t> _next_file_idx{0};
+
+  /// Number of metadata tasks that have been claimed (get_next_task_input_data returned non-null)
+  /// but whose sink() has not yet completed. all_ports_empty() returns false while this is > 0,
+  /// preventing premature pipeline closure when the file index has been fully consumed but tasks
+  /// are still in flight.
+  std::atomic<std::size_t> _in_flight_tasks{0};
 
   /// Paired GPU parquet scan operator — the source of the downstream pipeline. sink() forwards
   /// accumulated metadata into it; finalize_operator() freezes its partition index. Set at

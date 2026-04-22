@@ -171,18 +171,18 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
 //     metadata_scan_op is both source and sink. Its execute() parses parquet
 //     footers and produces partitioned_parquet_metadata; its sink() override
 //     forwards each result directly into the paired gpu_scan_op via
-//     accumulate_metadata(). finalize_operator() calls finalize_partitions()
-//     on gpu_scan_op once the pipeline completes.
+//     accumulate_metadata().
 //
 //   current_pipeline (rewritten):
-//     gpu_scan_op replaces the DuckDB table scan as the source. It cannot
-//     dispatch tasks until its partition index has been finalized by the
-//     upstream metadata_pipeline.
+//     gpu_scan_op replaces the DuckDB table scan as the source. It detects
+//     metadata pipeline completion via the handoff port's src_pipeline status.
 //
-// The handoff is a direct function call — no data repository is wired
-// between the two pipelines. A null-repo "dependency" port on gpu_scan_op
-// exists only so setup_pipeline_parents() can discover the
-// metadata_pipeline -> current_pipeline scheduling dependency.
+// The metadata handoff is via accumulate_metadata() — no data repository
+// is wired between the two pipelines. A null-repo "handoff" port on
+// gpu_scan_op serves two purposes: (1) setup_pipeline_parents() discovers
+// the metadata_pipeline -> current_pipeline scheduling dependency, and
+// (2) gpu_scan checks the port's src_pipeline status to detect when the
+// metadata pipeline has finished.
 //===----------------------------------------------------------------------===//
 void sirius_pipeline_converter::split_parquet_scan_source(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
@@ -202,7 +202,7 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
 
   // Construct the pair. metadata_scan_op holds a raw pointer back to gpu_scan_op for the direct
-  // accumulate_metadata() / finalize_partitions() handoff.
+  // accumulate_metadata() handoff.
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality);
   auto metadata_scan_op = duckdb::make_uniq<op::scan::sirius_parquet_metadata_scan_operator>(
@@ -1018,11 +1018,12 @@ void sirius_pipeline_converter::wire_data_repositories()
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // No action needed for RESULT_COLLECTOR sinks
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN) {
-      // Scheduling-only dependency port. The metadata handoff itself happens through
-      // accumulate_metadata() / finalize_partitions(); no data batches flow through this port
-      // (repo is null). setup_pipeline_parents() walks metadata_scan's next_port_after_sink list
+      // Scheduling and completion-detection port. The metadata handoff itself happens
+      // through accumulate_metadata(); no data batches flow through this port (repo is
+      // null). setup_pipeline_parents() walks metadata_scan's next_port_after_sink list
       // and reads this port's dest_pipeline to register current_pipeline as a parent of
-      // metadata_pipeline.
+      // metadata_pipeline. gpu_scan also checks this port's src_pipeline status to
+      // detect when the metadata pipeline has finished.
       for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
         auto* next_op            = dependent_pipeline->get_operators().size() == 0
                                      ? dependent_pipeline->get_sink().get()

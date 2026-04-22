@@ -206,9 +206,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     metadata_op.sink(*output, stream);
   }
 
-  // --- Pipeline 1 → Pipeline 2 transition ---
-  metadata_op.finalize_operator();
-
   // --- Pipeline 2: GPU scan ---
   std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
   while (!gpu_op.all_ports_empty()) {
@@ -308,12 +305,61 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
     if (!hint) { break; }
     auto input = op.get_next_task_input_data();
     if (!input) { break; }
+    auto output = op.execute(*input, cudf::get_default_stream());
+    REQUIRE(output);
+    op.sink(*output, cudf::get_default_stream());
     ++task_count;
   }
 
   REQUIRE(task_count > 0);
   REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("metadata_scan_operator - all_ports_empty blocked by in-flight tasks",
+          "[metadata_scan][shared_context]")
+{
+  // Regression test for the race condition where get_next_task_input_data() bumps
+  // _next_file_idx past _total_files, causing all_ports_empty() to return true
+  // before the task has completed (sink() called). The _in_flight_tasks counter
+  // must prevent premature pipeline closure.
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  create_synthetic_table(con, "inflight_test", 100);
+  auto path = write_parquet(con, "inflight_test");
+  parquet_file_cleanup cleanup{{path}};
+
+  auto schema                    = synthetic_table_schema();
+  std::vector<std::string> files = {path.string()};
+  duckdb::vector<duckdb::idx_t> no_projection;
+
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
+                                                            0);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             sirius::from_duckdb_vec(schema.types),
+                                                             sirius::from_duckdb_vec(schema.types),
+                                                             0,
+                                                             files,
+                                                             schema.column_ids,
+                                                             no_projection,
+                                                             schema.names);
+
+  // With 1 file and default max_file_processed=8, one call claims everything.
+  REQUIRE_FALSE(op.all_ports_empty());
+
+  auto input = op.get_next_task_input_data();
+  REQUIRE(input);
+
+  // _next_file_idx is now >= _total_files, but sink() has not been called.
+  // all_ports_empty() must return false because the task is still in flight.
+  REQUIRE_FALSE(op.all_ports_empty());
+
+  // Execute and sink the task.
+  auto output = op.execute(*input, cudf::get_default_stream());
+  REQUIRE(output);
+  op.sink(*output, cudf::get_default_stream());
+
+  // Now the in-flight counter is zero and all files are dispatched.
+  REQUIRE(op.all_ports_empty());
 }
 
 TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
@@ -719,8 +765,7 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
   REQUIRE(op.get_next_task_hint() == std::nullopt);
   REQUIRE(op.get_next_task_input_data() == nullptr);
 
-  // Finalize with no metadata → no partitions, still idle.
-  op.finalize_partitions();
+  // No metadata and no handoff port → still idle.
   REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_hint() == std::nullopt);
 }

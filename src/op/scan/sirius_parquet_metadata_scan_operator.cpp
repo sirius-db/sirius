@@ -154,13 +154,23 @@ std::optional<task_creation_hint> sirius_parquet_metadata_scan_operator::get_nex
 
 bool sirius_parquet_metadata_scan_operator::all_ports_empty()
 {
-  return _next_file_idx.load(std::memory_order_relaxed) >= _total_files;
+  return _next_file_idx.load(std::memory_order_acquire) >= _total_files &&
+         _in_flight_tasks.load(std::memory_order_acquire) == 0;
 }
 
 std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::get_next_task_input_data()
 {
+  // Increment in-flight counter BEFORE advancing the file index. This ensures
+  // all_ports_empty() cannot return true between the index bump and task completion,
+  // preventing premature pipeline closure.
+  _in_flight_tasks.fetch_add(1, std::memory_order_acq_rel);
+
   auto const start = _next_file_idx.fetch_add(_max_file_processed, std::memory_order_relaxed);
-  if (start >= _total_files) { return nullptr; }
+  if (start >= _total_files) {
+    // No work to claim — undo the in-flight increment.
+    _in_flight_tasks.fetch_sub(1, std::memory_order_acq_rel);
+    return nullptr;
+  }
 
   auto const end = std::min(start + _max_file_processed, _total_files);
   std::vector<std::string> batch_files(_file_paths.begin() + static_cast<ptrdiff_t>(start),
@@ -346,11 +356,7 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
       "expected partitioned_parquet_metadata.");
   }
   _gpu_scan->accumulate_metadata(*metadata);
-}
-
-void sirius_parquet_metadata_scan_operator::finalize_operator()
-{
-  _gpu_scan->finalize_partitions();
+  _in_flight_tasks.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 }  // namespace sirius::op::scan

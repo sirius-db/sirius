@@ -54,14 +54,15 @@ namespace sirius::op::scan {
  *        the metadata into a shared_ptr and appends one partition_entry per
  *        row_group_range to _partition_index under _metadata_mutex. Partitions become
  *        claimable by the scan pipeline the moment they are appended.
- *      - When the upstream pipeline finishes, its finalize_operator() calls
- *        finalize_partitions() on this operator, which sets _finalized to signal that
- *        no further partitions will arrive.
+ *      - When the upstream metadata pipeline finishes (all tasks completed), the
+ *        pipeline framework sets its pipeline_finished flag. This operator detects
+ *        completion by checking the handoff port's src_pipeline status — no explicit
+ *        finalization call is needed.
  *
  *   2. Scan (this pipeline, GPU):
  *      - get_next_task_hint() returns READY as soon as _partition_index contains an
- *        unclaimed entry, regardless of _finalized. If no entry is currently claimable
- *        and _finalized is false, it surfaces the upstream metadata scan as
+ *        unclaimed entry. If no entry is currently claimable and the metadata pipeline
+ *        is still running, it surfaces the upstream metadata scan as
  *        WAITING_FOR_INPUT_DATA so task_creator can schedule it.
  *      - get_next_task_input_data() claims one partition from the index under
  *        _metadata_mutex and returns it as parquet_scan_data. Each partition maps 1:1
@@ -74,18 +75,15 @@ namespace sirius::op::scan {
  *   The upstream → downstream pipeline edge is expressed via a null-repo "handoff"
  *   port on this operator (MemoryBarrierType::PARTIAL). setup_pipeline_parents() uses
  *   that port to discover the dependency so the metadata pipeline is registered as a
- *   parent of this pipeline. No data flows through the port — the handoff is via
- *   accumulate_metadata() / finalize_partitions().
+ *   parent of this pipeline. No data flows through the port — the metadata handoff
+ *   is via accumulate_metadata(). Pipeline completion is detected through the
+ *   handoff port's src_pipeline status (is_pipeline_finished / is_source_pipeline_finished).
  *
  * Thread-safety:
  *   - accumulate_metadata() is called from upstream worker threads; _metadata_mutex
  *     serializes its appends to _partition_index against concurrent claims by
  *     get_next_task_input_data() and size reads by get_next_task_hint() /
  *     all_ports_empty().
- *   - finalize_partitions() must be called exactly once, after ALL accumulate_metadata()
- *     calls have returned. It sets _finalized with release semantics; get_next_task_hint()
- *     reads it with acquire semantics to decide whether to return nullopt or to defer
- *     to the upstream pipeline.
  *   - get_next_task_input_data() / get_next_task_hint() / all_ports_empty() are safe to
  *     call from multiple worker threads and serve partitions as soon as they are
  *     appended; returning "no work right now" does not imply the scan is finished.
@@ -117,16 +115,6 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   void accumulate_metadata(const partitioned_parquet_metadata& metadata);
 
   /**
-   * @brief Signal that no more metadata will arrive.
-   *
-   * Must be called exactly once, after all accumulate_metadata() calls have returned.
-   * Invoked from metadata_scan.finalize_operator(). Sets _finalized under
-   * _metadata_mutex so get_next_task_hint() can return std::nullopt once the partition
-   * index is fully drained instead of continuing to defer to the upstream pipeline.
-   */
-  void finalize_partitions();
-
-  /**
    * @brief Install a hive-partition injection function.
    *
    * Called once by the paired metadata scan operator at construction time when the scan
@@ -150,13 +138,13 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    *         unclaimed entry (regardless of whether accumulation is still in
    *         progress);
    *         WAITING_FOR_INPUT_DATA pointing at the upstream metadata scan when no
-   *         entry is currently claimable and the metadata pipeline has not yet
-   *         been finalized (surfaces the upstream dependency to
+   *         entry is currently claimable and the metadata pipeline is still
+   *         running (surfaces the upstream dependency to
    *         task_creator::get_operator_for_next_task, which otherwise cannot
    *         discover it — the metadata handoff is a side channel, not a data
    *         repo);
-   *         nullopt once all partitions have been claimed AND
-   *         finalize_partitions() has been called.
+   *         nullopt once all partitions have been claimed and the metadata
+   *         pipeline has finished.
    */
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -207,13 +195,8 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   //                         metadata's row_group_partitions.
   //   _next_partition_idx— counter of the next unclaimed entry; advanced under
   //                         _metadata_mutex by get_next_task_input_data().
-  //   _finalized         — set once by finalize_partitions() under _metadata_mutex
-  //                         to signal that no more accumulate_metadata() calls will
-  //                         arrive. Read by get_next_task_hint() under _metadata_mutex
-  //                         to decide nullopt vs. WAITING.
   // ===----------------------------------------------------------------------===//
   std::mutex _metadata_mutex;
-  bool _finalized{false};
   partition_inject_fn_t _hive_partition_inject_fn;
 
   struct partition_entry {
