@@ -404,7 +404,7 @@ GPU pipeline task
 
 ### Bounce Buffer Design
 
-A **bounce buffer** is a pre-allocated, pre-registered memory region that eliminates per-transfer NIXL registration overhead. Data is packed (or copied) into the bounce buffer, then RDMA'd from there. The bounce buffer is registered with NIXL once at `SiriusContext` initialization and stays registered for the process lifetime — matching the pattern established in PR #652 (`ExchangeMemoryManager`) and the current Rust staging buffer (`gpu_staging_buffer.rs`).
+A **bounce buffer** is a memory region **pre-allocated from cuCascade** and **pre-registered with NIXL** at `SiriusContext` startup, eliminating per-transfer NIXL registration overhead. The bounce buffer is allocated from cuCascade's GPU tier (`memory_space` for VRAM) or HOST tier (`memory_space` for pinned DRAM) depending on configuration, ensuring it participates in cuCascade's memory accounting. Once allocated, it is registered with NIXL once and stays registered for the process lifetime. Data is packed (or copied) into the bounce buffer, then RDMA'd from there — matching the pattern established in PR #652 (`ExchangeMemoryManager`) and the current Rust staging buffer (`gpu_staging_buffer.rs`).
 
 #### GPU vs Host Bounce Buffer
 
@@ -426,22 +426,22 @@ This is configurable via `sirius.yaml` so deployments can tune per-cluster.
 SiriusContext::initialize()
   │
   ├─ GPU bounce buffer path (bounce_buffer.location = "vram"):
-  │    memory_space = GPU tier memory space from cuCascade
+  │    memory_space = cuCascade GPU tier memory space (memory_reservation_manager)
   │    reservation = memory_space->make_reservation(bounce_buffer.size)
-  │    buffer_ptr = allocate from reservation (contiguous GPU region)
-  │    nixl_agent->registerMem(buffer_ptr, size, VRAM_SEG)
-  │    cache NIXL metadata for this buffer
+  │    buffer_ptr = allocate from cuCascade GPU tier (contiguous GPU region)
+  │    nixl_agent->registerMem(buffer_ptr, size, VRAM_SEG)   // one-time
+  │    cache NIXL metadata for this buffer                    // one-time
   │
   └─ Host bounce buffer path (bounce_buffer.location = "dram"):
-       memory_space = HOST tier memory space from cuCascade
+       memory_space = cuCascade HOST tier memory space (fixed_size_host_memory_resource)
        reservation = memory_space->make_reservation(bounce_buffer.size)
-       buffer_ptr = allocate from reservation (pinned host memory)
-       nixl_agent->registerMem(buffer_ptr, size, DRAM_SEG)
-       cache NIXL metadata for this buffer
+       buffer_ptr = allocate from cuCascade HOST tier (pinned host memory)
+       nixl_agent->registerMem(buffer_ptr, size, DRAM_SEG)   // one-time
+       cache NIXL metadata for this buffer                    // one-time
 
-  → Bounce buffer lives for SiriusContext lifetime
-  → Sub-allocated per transfer via bump allocator (same pattern as gpu_staging_buffer.rs)
-  → Deregistered in SiriusContext::terminate()
+  → cuCascade reservation held for SiriusContext lifetime (not reclaimable by downgrade)
+  → Per-transfer: bump allocator sub-allocates within bounce buffer (no cuCascade calls)
+  → SiriusContext::terminate(): deregister from NIXL, release cuCascade reservation
 ```
 
 #### Sender and Receiver Bounce Buffers
