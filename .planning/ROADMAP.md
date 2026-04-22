@@ -39,7 +39,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
   6. **Bench evidence on N=2 hardware**: a recorded TPC-H SF100 Q1 run (`.planning/phases/08-*/*-VALIDATION.md` or similar) captures the full `[mgpu-audit]` log showing `scan_batch` distribution across both GPUs (batch count per GPU listed) and wall-clock. No specific regression threshold vs SF10 baseline required — just "it runs and completes correctly". SF300 if it completes cleanly is icing, not required.
 **Plans**: 6 plans
   - [x] 08-01-PLAN.md — FIX-01 duckdb_scan_executor per-GPU stream pool (root cause fix)
-  - [ ] 08-02-PLAN.md — FIX-02 probe + conditional Sirius-side host→gpu converter override
+  - [x] 08-02-PLAN.md — FIX-02 probe + conditional Sirius-side host→gpu converter override
   - [ ] 08-03-PLAN.md — AUDIT-01/02/03 [mgpu-audit] log payload extension (task_id/batch_id)
   - [ ] 08-04-PLAN.md — TEST-01/02 integration-2gpu.yaml fixture + GENERATE(1,2) parameterization
   - [ ] 08-05-PLAN.md — TEST-03/04 + AUDIT TEST_CASE (SF1 full + SF10 Q1/Q6/Q12 + log-grep assertions)

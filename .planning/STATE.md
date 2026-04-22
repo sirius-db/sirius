@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: executing
-stopped_at: Completed 08-01-PLAN.md (build-gated; N=2 runtime reproduction deferred to 08-06)
-last_updated: "2026-04-22T01:21:01.187Z"
+stopped_at: "Completed 08-02-PLAN.md (Branch B: Sirius host->gpu converter override landed; num_gpus=1 regression clean; distinct fix-site on host_parquet path handed off to 08-06)"
+last_updated: "2026-04-22T02:07:05.898Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 6
-  completed_plans: 1
+  completed_plans: 2
   percent: 17
 ---
 
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 08 (multi-gpu-sql-pipeline-fix) — EXECUTING
-Plan: 2 of 6
-Status: 08-01 complete (FIX-01 build-gated); 08-02 (FIX-02 probe) next
-Last activity: 2026-04-22 — 08-01 landed
+Plan: 3 of 6
+Status: Ready to execute
+Last activity: 2026-04-22
 
 Progress: [██░░░░░░░░] 17% (1/6 plans complete)
 
@@ -37,12 +37,15 @@ Progress: [██░░░░░░░░] 17% (1/6 plans complete)
 | Phase | Plan | Duration | Tasks | Files | Completed           |
 | ----- | ---- | -------- | ----- | ----- | ------------------- |
 | 08    | 01   | 6min     | 3     | 3     | 2026-04-22T01:19:13Z |
+| Phase 08 P02 | 15min | 3 tasks | 5 files |
 
 ## Decisions
 
 - **[08-01]** FIX-01: Per-GPU stream pool map in duckdb_scan_executor replaces singular GPU-0-bound pool. Dispatch lambda opens with rmm::cuda_set_device_raii pinned to target_gpu_id. Pattern 2 idiom extended from p2p converter to scan executor.
 - **[08-01]** Hoisted select_target_gpu() from parquet-only block to top of manager_loop so the dispatch lambda can capture target_gpu_id. Non-parquet scan tasks (cpu_source_task, duckdb_scan_task) now also route through a well-defined target device.
 - **[08-01]** Single-GPU host runtime reproduction deferred to Plan 08-06 ship gate (verification hardware has 2 × RTX 6000 Ada). Static invariants + MCP build gate verified here.
+- [Phase 08]: FIX-02 Branch B authored — Sirius-side host_data_representation -> gpu_table_representation converter override with target-bound stream + target-device RAII, using public-API-only column-tree reconstruction. cucascade submodule pin unchanged.
+- [Phase 08]: Distinct fix-site discovered during verification: Sirius's own convert_host_parquet_to_gpu_with_prefetched_data_source has same bug shape as cucascade's convert_host_fast_to_gpu but on host_parquet_representation path. Handed off to 08-06 per plan scope; Branch B is canonical template.
 
 ## Accumulated Context
 
@@ -80,6 +83,6 @@ Progress: [██░░░░░░░░] 17% (1/6 plans complete)
 
 ## Session Continuity
 
-Last session: 2026-04-22T01:21:01.185Z
-Stopped at: Completed 08-01-PLAN.md (build-gated; N=2 runtime reproduction deferred to 08-06)
+Last session: 2026-04-22T02:07:05.896Z
+Stopped at: Completed 08-02-PLAN.md (Branch B: Sirius host->gpu converter override landed; num_gpus=1 regression clean; distinct fix-site on host_parquet path handed off to 08-06)
 Resume file: None
