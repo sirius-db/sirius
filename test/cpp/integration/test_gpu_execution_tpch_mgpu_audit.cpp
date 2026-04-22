@@ -111,27 +111,32 @@ constexpr auto kTpchQ1 =
   "group by l_returnflag, l_linestatus "
   "order by l_returnflag, l_linestatus;";
 
-// Build the parquet-view DDL the regular parquet fixture uses (mirrors
-// GPUExecutionParquetFixture::setup_schema); invoked on the fresh connection
-// after the env resume so TPC-H queries can read lineitem.
-void attach_integration_parquet_views(duckdb::Connection& con)
+// ATTACH the DuckDB-format integration database on the fresh connection so
+// TPC-H Q1 runs through the DuckDB->cpu_source_task scan path closed by
+// FIX-01 in Plan 08-01. This path does NOT route through
+// host_parquet_representation_converters.cpp (the distinct 08-06 fix-site),
+// so the audit assertion is decoupled from that known-open bug.
+void attach_integration_duckdb(duckdb::Connection& con)
 {
-  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
-  static const char* kTables[] = {
-    "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
-  for (auto* t : kTables) {
-    auto r = con.Query("CREATE VIEW IF NOT EXISTS " + std::string{t} +
-                       " AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/" +
-                       std::string{t} + ".parquet');");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
+  fs::path db_path;
+  if (const char* env = std::getenv("SIRIUS_INTEGRATION_TEST_DB_PATH")) {
+    db_path = fs::path(env);
+  } else {
+    db_path = fs::path(__FILE__).parent_path() / "data/duckdb/integration.duckdb";
   }
+  REQUIRE(fs::exists(db_path));
+  auto attach = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
+  REQUIRE(attach);
+  REQUIRE_FALSE(attach->HasError());
+  auto use_db = con.Query("USE tpch;");
+  REQUIRE(use_db);
+  REQUIRE_FALSE(use_db->HasError());
 }
 
 }  // namespace
 
 TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
-          "[integration][mgpu-audit][gpu_execution][parquet][TPC-H][Q1]")
+          "[integration][mgpu-audit][gpu_execution][TPC-H][Q1]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -181,7 +186,12 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   std::string last_error;
   {
     auto con = std::make_unique<duckdb::Connection>(env->make_connection());
-    attach_integration_parquet_views(*con);
+    // Use the DuckDB-format integration database (same path as
+    // GPUExecutionDuckDBFixture) so Q1 flows through the FIX-01-covered
+    // cpu_source_task path rather than host_parquet_representation (the open
+    // 08-06 fix-site). This decouples the AUDIT assertion from the known-open
+    // parquet converter bug.
+    attach_integration_duckdb(*con);
 
     auto disable_fallback = con->Query("SET enable_duckdb_fallback = false;");
     REQUIRE(disable_fallback);
