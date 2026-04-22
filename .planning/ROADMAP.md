@@ -42,13 +42,14 @@ Plans:
   1. `convertible_data_batch::convert` and `convertible_gpu_pipeline_task::convert` both acquire a `mutable_data_batch` via `to_mutable()` before calling `convert_to`
   2. `result_collector` convert_to calls use the `to_mutable()` pattern
   3. `subscribe()` is called at task creation and `unsubscribe()` is called in the task destructor for all input batches
-  4. No references to `batch_state::task_created`, `batch_state::in_transit`, or `batch_state::processing` remain in the codebase
+  4. No references to `batch_state::task_created`, `batch_state::in_transit`, or `batch_state::processing` remain in conversion and lifecycle files (`convertible_data.hpp`, `convertible_data_batch.hpp`, `convertible_gpu_pipeline_task.hpp`, `gpu_pipeline_task.hpp`, `gpu_pipeline_task.cpp`, `downgrade_executor.cpp`, `sirius_physical_result_collector.cpp`). Operator-level references (`pop_data_batch(batch_state::task_created)` in `src/op/` files) are deferred to Phase 3 (OPER-02).
   5. `try_to_lock_for_in_transit`, `try_to_release_in_transit`, and `wait_to_lock_for_processing` calls are all removed
-**Plans:** 2 plans
+**Plans:** 3 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Rewrite conversion/downgrade path to use to_mutable() RAII and remove old state machine
-- [ ] 02-02-PLAN.md — Result collector clone_to pattern and subscribe/unsubscribe lifecycle wiring
+- [x] 02-01-PLAN.md — Rewrite conversion/downgrade path to use to_mutable() RAII and remove old state machine
+- [x] 02-02-PLAN.md — Result collector clone_to pattern and subscribe/unsubscribe lifecycle wiring
+- [ ] 02-03-PLAN.md — Gap closure: scope SC4 and fix [[nodiscard]] to_idle() discards
 
 ### Phase 3: Operator Sweep and Clean Build
 **Goal**: Every operator casts to the correct new type, every legacy accessor call site on idle batches uses `to_read_only()`, and the project compiles cleanly against cucascade d9dc331
@@ -70,5 +71,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Pipeline Data Path | 0/2 | Planning complete | - |
-| 2. Mutation Paths and Lifecycle | 0/2 | Planning complete | - |
+| 2. Mutation Paths and Lifecycle | 2/3 | Gap closure planned | - |
 | 3. Operator Sweep and Clean Build | 0/TBD | Not started | - |
