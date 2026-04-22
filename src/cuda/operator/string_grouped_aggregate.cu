@@ -164,7 +164,6 @@ __global__ void compact_string_offset(uint64_t* group_idx, uint64_t** group_byte
             } else if ((offset < (N - 1)) && (group_idx[offset] != group_idx[offset + 1])) {
                 uint64_t out_idx = group_idx[offset];
                 for (uint64_t key = 0; key < num_keys; key ++) {
-                    cudaAssert(group_byte_offset[key][offset] != group_byte_offset[key][offset + 1]);
                     result_offset[key][out_idx] = group_byte_offset[key][offset];
                 }
             }
@@ -195,7 +194,6 @@ __global__ void rows_to_columns_string(uint64_t* group_idx, sort_keys_type_strin
                 uint64_t out_idx = group_idx[offset];
                 uint64_t key_length_bytes = 0;
                 for (uint64_t key = 0; key < num_keys; key ++) {
-                    cudaAssert(group_byte_offset[key][offset] != group_byte_offset[key][offset + 1]);
                     uint64_t out_offset = group_byte_offset[key][offset];
                     uint64_t actual_key_length = group_byte_offset[key][offset + 1] - group_byte_offset[key][offset];
                     uint8_t* ptr = reinterpret_cast<uint8_t*>(row_keys[out_idx].keys);
@@ -797,7 +795,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     uint64_t** offset_dev_result;
     cudaMalloc((void**) &offset_dev_result, num_keys * sizeof(uint64_t*));
     for (uint64_t i = 0; i < num_keys; i++) {
-        offset[i] = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+        offset[i] = gpuBufferManager->customCudaMalloc<uint64_t>(count[0] + 1, 0, 0);
     }
     cudaMemcpy(offset_dev_result, offset, num_keys * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     CHECK_ERROR();

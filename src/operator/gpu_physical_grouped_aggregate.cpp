@@ -619,6 +619,10 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 
 	for (int col = 0; col < group_by_result->columns.size(); col++) {
 		printf("Writing group by result to column %d\n", col);
+		if (group_by_result->columns[col] == nullptr) {
+			printf("Warning: group_by_result column %d is null, skipping\n", col);
+			continue;
+		}
 		// output_relation.columns[col] = group_by_result->columns[col];
 		bool old_unique = group_by_result->columns[col]->is_unique;
 		if (group_by_result->columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
