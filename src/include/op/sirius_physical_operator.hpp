@@ -39,10 +39,6 @@
 
 namespace sirius {
 
-namespace memory {
-class sirius_memory_reservation_manager;
-}  // namespace memory
-
 namespace op {
 class sirius_physical_operator;
 }  // namespace op
@@ -129,7 +125,7 @@ class pipelineable_operator_data : public operator_data {
    * @param stream                  CUDA stream used for any data-movement kernels.
    * @return Processing handles for all batches, or std::nullopt on lock failure.
    */
-  virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+  virtual std::optional<std::vector<::cucascade::read_only_data_batch>>
   prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                          rmm::cuda_stream_view stream);
 
@@ -151,6 +147,94 @@ class partitioned_operator_data : public pipelineable_operator_data {
     : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
   }
+
+  /**
+   * @brief Get the partition index.
+   * @return Partition index
+   */
+  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
+
+ private:
+  std::size_t _partition_idx = 0;
+};
+
+/**
+ * @brief Operator data carrying a collection of read-only locked data batches.
+ *
+ * This is the RAII accessor-based sibling of pipelineable_operator_data. It stores
+ * already-locked read_only_data_batch objects (from the new 3-class cucascade API),
+ * ensuring that the shared lock is held for the lifetime of this object.
+ *
+ * Move-only — copying is not permitted because read_only_data_batch is move-only.
+ */
+class read_only_pipelineable_operator_data : public operator_data {
+ public:
+  read_only_pipelineable_operator_data() = default;
+  explicit read_only_pipelineable_operator_data(
+    std::vector<::cucascade::read_only_data_batch> batches)
+    : _read_only_batches(std::move(batches))
+  {
+  }
+
+  ~read_only_pipelineable_operator_data() override = default;
+
+  // Move-only — read_only_data_batch is move-only
+  read_only_pipelineable_operator_data(read_only_pipelineable_operator_data&&)            = default;
+  read_only_pipelineable_operator_data& operator=(read_only_pipelineable_operator_data&&) = default;
+  read_only_pipelineable_operator_data(const read_only_pipelineable_operator_data&)       = delete;
+  read_only_pipelineable_operator_data& operator=(
+    const read_only_pipelineable_operator_data&) = delete;
+
+  /**
+   * @brief Get the locked read-only data batches.
+   * @return Const reference to vector of read_only_data_batch accessors
+   */
+  [[nodiscard]] const std::vector<::cucascade::read_only_data_batch>& get_read_only_batches()
+    const
+  {
+    return _read_only_batches;
+  }
+
+  /**
+   * @brief Move the read-only batches out of this container, leaving it empty.
+   * @return Vector of read_only_data_batch accessors (moved out).
+   */
+  std::vector<::cucascade::read_only_data_batch> release_read_only_batches()
+  {
+    return std::move(_read_only_batches);
+  }
+
+ private:
+  std::vector<::cucascade::read_only_data_batch> _read_only_batches;
+};
+
+/**
+ * @brief Operator data with partition index for partitioned pipeline execution, using
+ * read-only locked batches.
+ *
+ * Extends read_only_pipelineable_operator_data to include partition index information,
+ * mirroring the partitioned_operator_data -> pipelineable_operator_data relationship
+ * but using the new RAII read_only_data_batch accessor type.
+ *
+ * Move-only — read_only_data_batch is move-only.
+ */
+class read_only_partitioned_operator_data : public read_only_pipelineable_operator_data {
+ public:
+  read_only_partitioned_operator_data() = default;
+  read_only_partitioned_operator_data(std::vector<::cucascade::read_only_data_batch> batches,
+                                      std::size_t partition_idx)
+    : read_only_pipelineable_operator_data(std::move(batches)), _partition_idx(partition_idx)
+  {
+  }
+
+  ~read_only_partitioned_operator_data() override = default;
+
+  // Move-only
+  read_only_partitioned_operator_data(read_only_partitioned_operator_data&&)            = default;
+  read_only_partitioned_operator_data& operator=(read_only_partitioned_operator_data&&) = default;
+  read_only_partitioned_operator_data(const read_only_partitioned_operator_data&)       = delete;
+  read_only_partitioned_operator_data& operator=(
+    const read_only_partitioned_operator_data&) = delete;
 
   /**
    * @brief Get the partition index.
@@ -324,6 +408,7 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
+    return true;
   }
 
   /// \brief check if all tasks have been processed
@@ -331,6 +416,7 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
+    return true;
   }
 
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
@@ -340,6 +426,8 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
+  //! Check if the pipeline is finished
+  bool check_pipeline_finished();
 
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
