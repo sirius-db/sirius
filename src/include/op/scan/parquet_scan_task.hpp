@@ -20,6 +20,7 @@
 #include <config.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
+#include <op/scan/hive_partition.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
@@ -313,12 +314,6 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   // -------------------------------------------------------------------------
   // Hive partition column support
   // -------------------------------------------------------------------------
-
-  /// Metadata for a hive partition column (not present in parquet files).
-  struct hive_partition_column {
-    std::string column_name;     ///< Partition column name (e.g. "year")
-    size_t duckdb_column_index;  ///< Index in scan_op->names / column_ids
-  };
 
   /// True if this scan involves hive-partitioned files.
   [[nodiscard]] bool has_hive_partitions() const { return !_hive_partition_columns.empty(); }
