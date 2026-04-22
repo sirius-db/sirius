@@ -1,0 +1,101 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <memory>
+#include <vector>
+
+namespace duckdb {
+class Expression;
+}
+
+namespace sirius {
+
+/**
+ * @brief Opaque, move-only wrapper around a duckdb::Expression*.
+ *
+ * Lets Super Sirius operator headers, the expression-executor public header, and the
+ * physical-plan-generator header avoid including any duckdb/planner/expression/... header.
+ *
+ * Internally stores a std::unique_ptr<impl>, where `impl` is forward-declared here and
+ * defined in expression_internal.hpp. Code that needs to reach the underlying
+ * duckdb::Expression includes expression_internal.hpp and uses the free `unwrap` / `release`
+ * helpers; no friend declarations are required.
+ *
+ * Semantics mirror std::unique_ptr<duckdb::Expression>: unique ownership, move-only.
+ */
+class expression {
+ public:
+  struct impl;
+
+  /// Constructs a null expression.
+  expression() noexcept = default;
+
+  /// Takes ownership of an impl instance. Usable only at translation units that can form a
+  /// complete `impl` (i.e., those including expression_internal.hpp).
+  explicit expression(std::unique_ptr<impl> p) noexcept;
+
+  ~expression();
+
+  expression(expression&&) noexcept;
+  expression& operator=(expression&&) noexcept;
+
+  expression(const expression&)            = delete;
+  expression& operator=(const expression&) = delete;
+
+  /// Returns true if this wrapper does not hold a duckdb::Expression.
+  [[nodiscard]] bool is_null() const noexcept { return !_impl; }
+
+  /// Returns true if this wrapper holds a duckdb::Expression.
+  explicit operator bool() const noexcept { return static_cast<bool>(_impl); }
+
+  /**
+   * @brief Opaque access to the internal impl.
+   *
+   * The returned pointer is only useful in translation units that also include
+   * expression_internal.hpp (which completes the `impl` type). Everywhere else, the
+   * returned pointer is inert.
+   */
+  [[nodiscard]] impl* get_impl() noexcept { return _impl.get(); }
+  [[nodiscard]] impl const* get_impl() const noexcept { return _impl.get(); }
+
+ private:
+  std::unique_ptr<impl> _impl;
+};
+
+//===----------------------------------------------------------------------===//
+// Boundary factories
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Wraps a duckdb::Expression unique_ptr in a sirius::expression.
+ *
+ * @param expr  The DuckDB expression to wrap. May be null; a null input produces a null
+ *              sirius::expression.
+ * @return The wrapped sirius::expression.
+ */
+expression wrap(std::unique_ptr<duckdb::Expression> expr);
+
+/**
+ * @brief Wraps each element of a DuckDB expression vector.
+ *
+ * @param exprs  The DuckDB expressions to wrap. The input vector is drained.
+ * @return A vector of sirius::expression, preserving size and order.
+ */
+std::vector<expression> wrap_many(std::vector<std::unique_ptr<duckdb::Expression>> exprs);
+
+}  // namespace sirius
