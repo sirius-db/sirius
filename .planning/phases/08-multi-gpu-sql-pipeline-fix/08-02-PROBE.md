@@ -82,6 +82,85 @@ for the target GPU, and consume a target-bound stream acquired from
 
 Task 3 of 08-02-PLAN.md is UNBLOCKED by this decision.
 
+## Post-Override Re-Probe on 2026-04-21
+
+After landing Branch B (commit `96481df`), the orchestrator flipped
+`test/cpp/integration/integration.yaml` back to `num_gpus: 2` and re-ran
+`mcp__project-commands__run_command unit-tests`.
+
+### Result
+
+- **Exit code:** 1
+- **Tests:** 316 run, 315 passed, **1 FAILED** (SAME test, SAME signature)
+- **Failing test:** `gpu_execution hive partition - filter on data column`
+- **Error verbatim:**
+
+```
+CUDA error encountered at:
+/tmp/conda-bld-output/.../cuda_memcpy.cu:42:
+1 cudaErrorInvalidValue invalid argument
+```
+
+### Interpretation — Branch B Did Not Close the Hive-Partition Failure
+
+Branch B was designed to close the `host_data_representation →
+gpu_table_representation` converter path (Site C from the static audit,
+cucascade's `convert_host_fast_to_gpu`). The hive-partition failing test
+does NOT go through that path — it uses `host_parquet_representation` and
+routes through Sirius's OWN converter
+`convert_host_parquet_to_gpu_with_prefetched_data_source` at
+`src/data/host_parquet_representation_converters.cpp:55-119`.
+
+That Sirius-owned converter has the SAME bug shape as cucascade's
+`convert_host_fast_to_gpu`:
+
+- Line 66 opens `rmm::cuda_set_device_raii{ target_device_id }` (correct).
+- Line 92 calls `cudf::io::read_parquet(opts, stream, mr_ref)` with the
+  CALLER's stream. Under `num_gpus == 2` the caller's stream may be bound
+  to a different device than `target_device_id`, raising
+  `cudaErrorInvalidValue` inside cudf's internal H2D path.
+
+### This is a Distinct Fix-Site — Not Recharged Here
+
+Per 08-02-PLAN's `<resume_instructions>` step 3: "If a different test fails
+instead, document but do NOT chase it here — that's 08-06 ship-gate scope."
+Interpretation for this probe: the TEST is the same, but the FIX-SITE is
+different (host_parquet_representation, not host_data_representation).
+Branch B is scoped to `host_data_representation → gpu_table_representation`
+per the plan's `files_modified` and acceptance criteria; it cannot close
+a separate-representation converter. The plan explicitly called out only
+Site C (cucascade's convert_host_fast_to_gpu) as the Branch B target.
+
+**Handoff for 08-06 (or a future FIX-02-extension plan):** Apply the same
+"acquire target-bound stream + RAII on target device" pattern to
+`convert_host_parquet_to_gpu_with_prefetched_data_source` in
+`src/data/host_parquet_representation_converters.cpp`. This fix is
+structurally identical to Branch B: acquire the target stream from
+`target_memory_space->acquire_stream()`, replace the caller's `stream`
+with it for the `cudf::io::read_parquet` call and all subsequent
+`apply_post_convert` / `apply_partition_inject` / `stream.synchronize()`
+calls, and add a final sync. Branch B's
+`src/data/sirius_host_to_gpu_converter.cpp` is the canonical template.
+
+### What Branch B DID Accomplish
+
+- Closed the `host_data_representation → gpu_table_representation` path
+  structurally (the failure site that cucascade's body exposed at L849).
+- Established the Pattern 2 idiom for any Sirius-owned host→gpu conversion,
+  including the public-API-only column-tree reconstruction approach used
+  by `sirius_host_fast_to_gpu_factory`.
+- Registered cleanly at converter_registry::initialize() after the MGPU-06
+  block; MCP build exits 0; num_gpus=1 unit-tests full-suite passes (979
+  test cases, 78789857 assertions — no regression).
+- HYG-02 baseline preserved (41 `rmm::cuda_stream_default` matches across
+  `src/`, 0 introduced by new file).
+
+### HYG-02 Recheck
+
+`grep -rn 'rmm::cuda_stream_default' src/` → 41 matches across 12 files
+(unchanged from baseline). `src/data/sirius_host_to_gpu_converter.{hpp,cpp}`
+contains 0 matches.
+
 ## Hardware Availability
 
 ```
