@@ -18,8 +18,8 @@
 
 ### TEST — Integration Suite Multi-GPU Coverage
 
-- [ ] **TEST-01**: `test/cpp/integration/test_gpu_execution_tpch.cpp` parameterized on `num_gpus ∈ {1, 2}` (or equivalent — e.g., run both configs per TEST_CASE, or two TEST_CASE flavors per query).
-- [ ] **TEST-02**: `test/cpp/integration/integration.yaml` (or fixture config) supports `num_gpus: 2` at test runtime; no permanent flip of the default if that's too aggressive — but the 2-GPU variant MUST execute in the default `mcp__project-commands__run_command unit-tests` run.
+- [x] **TEST-01**: `test/cpp/integration/test_gpu_execution_tpch.cpp` parameterized on `num_gpus ∈ {1, 2}` (or equivalent — e.g., run both configs per TEST_CASE, or two TEST_CASE flavors per query).
+- [x] **TEST-02**: `test/cpp/integration/integration.yaml` (or fixture config) supports `num_gpus: 2` at test runtime; no permanent flip of the default if that's too aggressive — but the 2-GPU variant MUST execute in the default `mcp__project-commands__run_command unit-tests` run.
 - [ ] **TEST-03**: All 22 TPC-H queries pass at SF1 on `num_gpus: 2` — results bitwise identical to the `num_gpus: 1` baseline.
 - [ ] **TEST-04**: TPC-H Q1, Q6, Q12 pass at SF10 on `num_gpus: 2` (smoke-test scale, matches v1.1 Phase-5 evidence set).
 
@@ -53,8 +53,8 @@
 | FIX-02 | Phase 8 | Complete |
 | FIX-03 | Phase 8 | Pending |
 | FIX-04 | Phase 8 | Pending |
-| TEST-01 | Phase 8 | Pending |
-| TEST-02 | Phase 8 | Pending |
+| TEST-01 | Phase 8 | Complete |
+| TEST-02 | Phase 8 | Complete |
 | TEST-03 | Phase 8 | Pending |
 | TEST-04 | Phase 8 | Pending |
 | AUDIT-01 | Phase 8 | Complete |

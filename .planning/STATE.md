@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: executing
-stopped_at: "Completed 08-03-PLAN.md (AUDIT log payload: task_id + batch_id appended to [mgpu-audit] INFO emissions; HYG-02 baseline preserved at 41)"
-last_updated: "2026-04-22T02:38:26.891Z"
+stopped_at: "Completed 08-04-PLAN.md (TEST-01/02 infra: integration-2gpu.yaml + shared_test_env wiring + RUN_TPCH_MGPU parameterization of 44 TPC-H TEST_CASEs)"
+last_updated: "2026-04-22T02:45:12.409Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 6
-  completed_plans: 3
+  completed_plans: 4
   percent: 50
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 08 (multi-gpu-sql-pipeline-fix) — EXECUTING
-Plan: 4 of 6
+Plan: 5 of 6
 Status: Ready to execute
 Last activity: 2026-04-22
 
@@ -39,6 +39,7 @@ Progress: [█████░░░░░] 50% (3/6 plans complete)
 | 08    | 01   | 6min     | 3     | 3     | 2026-04-22T01:19:13Z |
 | Phase 08 P02 | 15min | 3 tasks | 5 files |
 | Phase 08 P03 | 6min | 2 tasks | 2 files |
+| Phase 08 P04 | 20min | 3 tasks | 5 files |
 
 ## Decisions
 
@@ -49,6 +50,9 @@ Progress: [█████░░░░░] 50% (3/6 plans complete)
 - [Phase 08]: Distinct fix-site discovered during verification: Sirius's own convert_host_parquet_to_gpu_with_prefetched_data_source has same bug shape as cucascade's convert_host_fast_to_gpu but on host_parquet_representation path. Handed off to 08-06 per plan scope; Branch B is canonical template.
 - [Phase 08]: [08-03] AUDIT payload extension: append task_id (from gpu_pipeline_task::get_task_id()) and batch_id (from existing _scan_round_robin counter) to the two [mgpu-audit] INFO emissions. No new atomics added; counter reused. Accessor VARIANT A applied; pointer fallback not needed.
 - [Phase 08]: [08-03] Grep-stable payload shape locked — emissions end with `GPU N task_id=K` / `GPU N batch_id=K` suffixes. Plan 08-05 grep pattern: grep the prefix, extract the `key=value` with `grep -oE`, then `sort -u | wc -l` for unique-count assertion. Backward-compat preserved with v1.1 verification greps.
+- [Phase 08]: [08-04] TEST-01/02: added integration-2gpu.yaml + g_integration_env_2gpu + acquire_integration_env_for() helper + RUN_TPCH_MGPU macro. All 44 TPC-H TEST_CASEs parameterized on num_gpus in {1,2} via Catch2 GENERATE. integration.yaml unchanged (1-GPU default preserved).
+- [Phase 08]: [08-04] Chose research-recommended Option A (Catch2 GENERATE inside TEST_CASE body) over Option B (TEMPLATE_TEST_CASE_METHOD) and Option C (duplicated flavors). Lowest-churn: zero TEST_CASE_METHOD header edits, 44 mechanical one-line call-site substitutions.
+- [Phase 08]: [08-04] Virtual setup_schema() hook on GPUExecutionFixtureBase re-runs subclass DDL on fresh connection after each bind_env(num_gpus); avoids leaking 1-GPU schema into 2-GPU connection when bind_env(2) reassigns con.
 
 ## Accumulated Context
 
@@ -86,6 +90,6 @@ Progress: [█████░░░░░] 50% (3/6 plans complete)
 
 ## Session Continuity
 
-Last session: 2026-04-22T02:12:11.672Z
-Stopped at: Completed 08-03-PLAN.md (AUDIT log payload: task_id + batch_id appended to [mgpu-audit] INFO emissions; HYG-02 baseline preserved at 41)
+Last session: 2026-04-22T02:45:12.407Z
+Stopped at: Completed 08-04-PLAN.md (TEST-01/02 infra: integration-2gpu.yaml + shared_test_env wiring + RUN_TPCH_MGPU parameterization of 44 TPC-H TEST_CASEs)
 Resume file: None
