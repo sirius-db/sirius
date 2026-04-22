@@ -727,6 +727,29 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
 
+  // [mgpu-probe] entry instrumentation (08-07 gap-closure).
+  // Captures the device/stream context AT THE UPSTREAM H2D frame boundary,
+  // before the read_range_into_allocation -> prefetched_data_source H2D chain
+  // runs. If current_device != preferred_device_id at this point, the
+  // hazard is hypothesis A (upstream is wrong-device) and the subsequent
+  // converter entry will observe the same mismatch. If current_device matches
+  // here but mismatches at the converter entry breadcrumb in
+  // host_parquet_representation_converters.cpp:~89, a frame between
+  // compute_task and lock_or_prepare_batch is switching device context.
+  {
+    int current_device = -1;
+    (void)cudaGetDevice(&current_device);
+    auto const preferred_probe = g_state.get_preferred_device_id();
+    auto* memspace_probe       = l_state.get_memory_space();
+    SIRIUS_LOG_INFO(
+      "[mgpu-probe] parquet_scan_task::compute_task entry current_device={} stream={} "
+      "preferred_device_id={} memspace_device_id={}",
+      current_device,
+      static_cast<void*>(stream.value()),
+      preferred_probe.value_or(-1),
+      memspace_probe != nullptr ? memspace_probe->get_device_id() : -1);
+  }
+
   if (!_datasource) {
     // IO-05 + IO-04: route the per-task datasource construction to the
     // per-GPU cucascade backend selected by preferred_device_id.
