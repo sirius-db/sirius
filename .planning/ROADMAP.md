@@ -37,7 +37,13 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
   4. At least one Catch2 TEST_CASE runs a multi-batch TPC-H query (Q1 at SF1 or larger, lineitem-scanning) on `num_gpus: 2` with `[mgpu-audit]` logging enabled and asserts **`pipeline_task` count ≥ 5 on BOTH GPU 0 and GPU 1** AND **`scan_batch` count ≥ 5 on BOTH GPUs** — higher than the `> 0` floor so edge cases where one task happens to land on each GPU don't mask regressions. Regressions to single-GPU-only distribution break the default `unit-tests` build.
   5. A code-verifiable pattern match proves the fix shape: `grep -rnE 'cuda_set_device_raii.*source|pack.*source_stream|copy.*target_stream' src/pipeline/` or equivalent returns the Pattern 2 idiom in whatever file `lock_or_prepare_batch` lives in — mirrors the `src/data/sirius_p2p_converter.cpp` structure from Plan 07-02.
   6. **Bench evidence on N=2 hardware**: a recorded TPC-H SF100 Q1 run (`.planning/phases/08-*/*-VALIDATION.md` or similar) captures the full `[mgpu-audit]` log showing `scan_batch` distribution across both GPUs (batch count per GPU listed) and wall-clock. No specific regression threshold vs SF10 baseline required — just "it runs and completes correctly". SF300 if it completes cleanly is icing, not required.
-**Plans**: TBD
+**Plans**: 6 plans
+  - [ ] 08-01-PLAN.md — FIX-01 duckdb_scan_executor per-GPU stream pool (root cause fix)
+  - [ ] 08-02-PLAN.md — FIX-02 probe + conditional Sirius-side host→gpu converter override
+  - [ ] 08-03-PLAN.md — AUDIT-01/02/03 [mgpu-audit] log payload extension (task_id/batch_id)
+  - [ ] 08-04-PLAN.md — TEST-01/02 integration-2gpu.yaml fixture + GENERATE(1,2) parameterization
+  - [ ] 08-05-PLAN.md — TEST-03/04 + AUDIT TEST_CASE (SF1 full + SF10 Q1/Q6/Q12 + log-grep assertions)
+  - [ ] 08-06-PLAN.md — FIX-03/04 HYG+build sweep + SF100 Q1 VALIDATION on N=2 hardware
 
 ## Progress
 
@@ -47,4 +53,4 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 5. Cucascade-Backed Parquet I/O Migration | v1.1 | 6/6 | Complete | 2026-04-21 |
 | 6. Multi-GPU Gap Closure | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 7. P2P Direct Transfer + Adaptive Scan | v1.1 | 4/4 | Complete | 2026-04-21 |
-| 8. Multi-GPU SQL Pipeline Fix | v1.2 | 0/0 | Not started | - |
+| 8. Multi-GPU SQL Pipeline Fix | v1.2 | 0/6 | Not started | - |
