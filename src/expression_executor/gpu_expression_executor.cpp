@@ -264,9 +264,8 @@ void gpu_expression_executor::release_temporaries(
 }
 
 std::shared_ptr<data_batch> gpu_expression_executor::execute(
-  std::shared_ptr<data_batch> input_batch)
+  const ::cucascade::read_only_data_batch& input_batch)
 {
-  if (!input_batch) { return input_batch; }
   D_ASSERT(!_expressions.empty());
   _output_columns.clear();
   _output_columns.reserve(_expressions.size());
@@ -278,7 +277,9 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   _temp_columns.clear();
 
   // Get the table_view from the input_batch
-  auto const& input_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto* input_data = input_batch.get_data();
+  if (!input_data) { return nullptr; }
+  auto const& input_rep = input_data->cast<cucascade::gpu_table_representation>();
   _input_table          = input_rep.get_table_view();
 
   // Execute the expressions and emit results into _output_columns
@@ -321,17 +322,19 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   }
 
   // Create the data representation
+  auto* space = input_batch.get_memory_space();
+  if (!space) { return nullptr; }
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr),
-      *input_batch->get_memory_space());
+      std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr), *space);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
 }
 
-std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data_batch> input_batch)
+std::shared_ptr<data_batch> gpu_expression_executor::select(
+  const ::cucascade::read_only_data_batch& input_batch)
 {
   D_ASSERT(_expressions.size() == 1);
   auto const& expr = *_expressions[0];
@@ -339,14 +342,17 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data
 
   // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
   auto mask_batch = execute(input_batch);
-  auto& mask_repr = mask_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  if (!mask_batch) { return nullptr; }
+  auto mask_ro    = mask_batch->to_read_only();
+  auto& mask_repr = mask_ro.get_data()->cast<cucascade::gpu_table_representation>();
   auto mask_view  = mask_repr.get_table_view().column(0);
 
   // Apply the boolean mask to filter the input batch
   auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);
+  auto* space       = input_batch.get_memory_space();
+  if (!space) { return nullptr; }
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
-                                                          *input_batch->get_memory_space());
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();

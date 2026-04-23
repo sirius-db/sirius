@@ -331,9 +331,6 @@ cucascade::host_data_representation const& convert_to_host_table(
   std::shared_ptr<cucascade::data_batch> const& batch,
   rmm::cuda_stream_view stream)
 {
-  auto* data = batch->get_data();
-  if (!data) { throw std::runtime_error("data_batch has no data representation"); }
-
   auto& manager = sirius_ctx->get_memory_manager();
 
   auto reservation =
@@ -347,9 +344,13 @@ cucascade::host_data_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  }
 
-  data = batch->get_data();
+  auto ro    = batch->to_read_only();
+  auto* data = ro.get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
   return data->cast<cucascade::host_data_representation>();
 }
@@ -479,7 +480,10 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(num_rows));
@@ -606,7 +610,10 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(rows_fit));
@@ -648,11 +655,6 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
   std::vector<uint8_t> expected_int64_mask;
   std::vector<uint8_t> expected_string_mask;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
     auto const gpu_view  = sirius::get_cudf_table_view(*batch);
     expected             = extract_expected_data(gpu_view);
     expected_int64_mask  = extract_mask_bytes(gpu_view.column(1));

@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_order.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "sirius/exception.hpp"
@@ -42,8 +43,8 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
                                                               rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -72,12 +73,13 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    auto* space = batch->get_memory_space();
+    auto* space = batch.get_memory_space();
     if (!space) { continue; }
 
+    // local_order_by needs a shared_ptr<data_batch>; clone() returns an idle handle
+    auto idle_batch   = batch.clone(sirius::get_next_batch_id(), stream);
     auto sorted_batch = gpu_order_impl::local_order_by(
-      batch, order_key_idx, column_order, null_precedence, proj_idx, stream, *space);
+      idle_batch, order_key_idx, column_order, null_precedence, proj_idx, stream, *space);
     if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
   }
 

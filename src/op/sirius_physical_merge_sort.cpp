@@ -62,8 +62,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   if (_current_partition_index < repo->num_partitions()) {
     std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
     while (true) {
-      auto batch =
-        repo->pop_data_batch(cucascade::batch_state::task_created, _current_partition_index);
+      auto batch = repo->pop_next_data_batch(_current_partition_index);
       if (!batch) { break; }
       all_batches.push_back(std::move(batch));
     }
@@ -81,16 +80,15 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
 
   // Collect valid batches and find memory space
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    if (!space) { space = batch->get_memory_space(); }
-    valid_batches.push_back(batch);
+    if (!space) { space = batch.get_memory_space(); }
+    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
   }
 
   if (valid_batches.empty() || !space) {

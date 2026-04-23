@@ -388,11 +388,14 @@ exec_result run_execute(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  auto output_batch = executor.execute(input_batch);
+  auto input_ro     = input_batch->to_read_only();
+  auto output_batch = executor.execute(input_ro);
   REQUIRE(output_batch != nullptr);
-  auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
-  auto& out_repr = output_batch->get_data()->cast<gpu_table_representation>();
-  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
+  // table_views remain valid as long as the batches (input_batch, output_batch) are alive.
+  // get_cudf_table_view acquires a temporary lock to read the view, then releases it.
+  auto in_view  = sirius::get_cudf_table_view(*input_batch);
+  auto out_view = sirius::get_cudf_table_view(*output_batch);
+  return {input_batch, output_batch, in_view, out_view};
 }
 
 exec_result run_select(memory_space& space,
@@ -402,11 +405,13 @@ exec_result run_select(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  auto output_batch = executor.select(input_batch);
+  auto input_ro     = input_batch->to_read_only();
+  auto output_batch = executor.select(input_ro);
   REQUIRE(output_batch != nullptr);
-  auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
-  auto& out_repr = output_batch->get_data()->cast<gpu_table_representation>();
-  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
+  // table_views remain valid as long as the batches (input_batch, output_batch) are alive.
+  auto in_view  = sirius::get_cudf_table_view(*input_batch);
+  auto out_view = sirius::get_cudf_table_view(*output_batch);
+  return {input_batch, output_batch, in_view, out_view};
 }
 
 // Helper: make a BoundFunctionExpression with the given name, arg types, return type, and children.

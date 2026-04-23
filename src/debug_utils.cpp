@@ -70,9 +70,10 @@ host_column_nulls copy_null_mask_to_host(cudf::column_view const& col, rmm::cuda
 
 namespace {
 
-bool is_gpu_tier(cucascade::data_batch const& batch, const char* func_name)
+bool is_gpu_tier(cucascade::data_batch& batch, const char* func_name)
 {
-  auto* data = batch.get_data();
+  auto ro    = batch.to_read_only();
+  auto* data = ro.get_data();
   if (data == nullptr) {
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] {}: batch has no data", func_name);
     return false;
@@ -688,7 +689,7 @@ void format_rows_to_output(std::string& output,
 // debug_schema
 // ---------------------------------------------------------------------------
 
-void debug_schema(cucascade::data_batch const& batch,
+void debug_schema(cucascade::data_batch& batch,
                   rmm::cuda_stream_view stream,
                   std::vector<std::string> const& col_names)
 {
@@ -741,7 +742,7 @@ void debug_schema(cucascade::data_batch const& batch,
 // debug_nulls
 // ---------------------------------------------------------------------------
 
-void debug_nulls(cucascade::data_batch const& batch,
+void debug_nulls(cucascade::data_batch& batch,
                  rmm::cuda_stream_view stream,
                  std::vector<std::string> const& col_names)
 {
@@ -788,7 +789,7 @@ void debug_nulls(cucascade::data_batch const& batch,
 // debug_head
 // ---------------------------------------------------------------------------
 
-void debug_head(cucascade::data_batch const& batch,
+void debug_head(cucascade::data_batch& batch,
                 cudf::size_type n,
                 rmm::cuda_stream_view stream,
                 DebugFormat format,
@@ -852,7 +853,7 @@ void debug_head(cucascade::data_batch const& batch,
 // debug_stats
 // ---------------------------------------------------------------------------
 
-void debug_stats(cucascade::data_batch const& batch,
+void debug_stats(cucascade::data_batch& batch,
                  rmm::cuda_stream_view stream,
                  std::vector<std::string> const& col_names)
 {
@@ -946,7 +947,7 @@ void debug_stats(cucascade::data_batch const& batch,
 // debug_checksum
 // ---------------------------------------------------------------------------
 
-void debug_checksum(cucascade::data_batch const& batch,
+void debug_checksum(cucascade::data_batch& batch,
                     rmm::cuda_stream_view stream,
                     std::vector<std::string> const& col_names)
 {
@@ -1020,8 +1021,8 @@ void debug_checksum(cucascade::data_batch const& batch,
 // debug_diff
 // ---------------------------------------------------------------------------
 
-void debug_diff(cucascade::data_batch const& batch_a,
-                cucascade::data_batch const& batch_b,
+void debug_diff(cucascade::data_batch& batch_a,
+                cucascade::data_batch& batch_b,
                 rmm::cuda_stream_view stream,
                 cudf::size_type max_diff_rows,
                 cudf::size_type max_rows,
@@ -1274,7 +1275,7 @@ void debug_diff(cucascade::data_batch const& batch_a,
 // debug_sample
 // ---------------------------------------------------------------------------
 
-void debug_sample(cucascade::data_batch const& batch,
+void debug_sample(cucascade::data_batch& batch,
                   cudf::size_type n,
                   rmm::cuda_stream_view stream,
                   DebugFormat format,

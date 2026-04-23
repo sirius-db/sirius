@@ -112,12 +112,12 @@ class parquet_scan_data : public op::operator_data {
    *                                for this source input.
    * @return  Always an empty handle vector; there are no batches to keep locked.
    */
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+  std::optional<std::vector<::cucascade::read_only_data_batch>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,
     rmm::cuda_stream_view stream) override
   {
     gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
-    return std::vector<::cucascade::data_batch_processing_handle>{};
+    return std::vector<::cucascade::read_only_data_batch>{};
   };
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override

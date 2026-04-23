@@ -40,8 +40,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_projection::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
 
   /// TODO: the operator should choose the execution strategy based on statistics and a deeper
   /// understand of the trade-offs between the different strategies. See:
@@ -53,7 +53,6 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
     auto projected_batch = gpu_expression_executor.execute(batch);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }

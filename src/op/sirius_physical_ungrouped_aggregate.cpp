@@ -323,8 +323,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -335,11 +335,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   outputs.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    auto* space = batch->get_memory_space();
+    auto* space = batch.get_memory_space();
     if (!space) { continue; }
 
-    auto view = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -480,8 +479,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -490,14 +489,14 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {
-    if (batch) { valid_batches.push_back(batch); }
+    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
   }
   if (valid_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
+  cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -517,8 +516,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
 
+  // Acquire read access to merged batch to extract table
+  auto merged_ro = merged_batch->to_read_only();
   auto merged_view =
-    merged_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();  
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
   output_cols.reserve(layout.aggregates.size());
@@ -553,8 +554,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   bool found_batch = true;
   while (found_batch) {
-    auto batch =
-      ports.begin()->second->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    auto batch = ports.begin()->second->repo->pop_next_data_batch();
     if (batch) {
       input_batch.push_back(std::move(batch));
     } else {

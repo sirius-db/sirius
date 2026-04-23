@@ -33,11 +33,11 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
-std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+std::optional<std::vector<::cucascade::read_only_data_batch>>
 pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
-  std::vector<::cucascade::data_batch_processing_handle> handles;
+  std::vector<::cucascade::read_only_data_batch> handles;
   handles.reserve(_data_batches.size());
 
   for (const auto& batch : _data_batches) {
@@ -45,7 +45,7 @@ pipelineable_operator_data::prepare_for_processing(
       SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
       return std::nullopt;
     }
-    std::optional<::cucascade::data_batch_processing_handle> handle;
+    std::optional<::cucascade::read_only_data_batch> handle;
     try {
       handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory&) {
@@ -271,7 +271,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    auto batch_and_handle = port_ptr->repo->pop_next_data_batch();
     if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
   if (input_batch.empty()) { return nullptr; }
