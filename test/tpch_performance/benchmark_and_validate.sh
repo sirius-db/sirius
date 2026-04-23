@@ -20,16 +20,18 @@
 #     timings.csv
 #
 # Before running benchmarks, a tiny read-only filesystem benchmark is run on the
-# input parquet directory and results are recorded in run_info.txt.
+# input location (parquet directory or DuckDB database file) and recorded in run_info.txt.
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
 #   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
+#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --report <run_dir>
 #   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results <run_dir> <scale_factor>
 #
 # Example:
 #   ./test/tpch_performance/benchmark_and_validate.sh 1
+#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./performance_test.duckdb 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf1_2iter
 #   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results runs/2026-03-10_12-00-00_sf1_2iter 1
 
@@ -37,6 +39,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Set by --data-source (default: parquet → run_tpch_parquet.sh).
+DATA_SOURCE="parquet"
 RUN_SCRIPT="$SCRIPT_DIR/run_tpch_parquet.sh"
 
 # ---------------------------------------------------------------------------
@@ -267,12 +271,29 @@ fi
 
 # Parse optional flags
 DUCKDB_RESULTS_DIR=""
+DUCKDB_FILE=""
 MULTI_SESSION=false
 CACHE_LEVEL=""
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
             export SIRIUS_CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --data-source)
+            case "$2" in
+                parquet | duckdb)
+                    DATA_SOURCE="$2"
+                    ;;
+                *)
+                    echo "ERROR: --data-source must be 'parquet' or 'duckdb' (got: $2)"
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        --duckdb-file)
+            DUCKDB_FILE="$2"
             shift 2
             ;;
         --parquet-dir)
@@ -313,11 +334,15 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] <scale_factor>"
+    echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb] [--parquet-dir <path>] [--duckdb-file <path>]"
+    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] <scale_factor>"
     echo "       $0 --report <run_dir>"
+    echo "  --data-source parquet  (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
+    echo "  --data-source duckdb             → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file"
     echo "Example: $0 --config ~/.sirius/sirius.yaml --engines sirius --iterations 3 --timeout 120 1000"
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
+    echo "         $0 --data-source duckdb --duckdb-file ./performance_test.duckdb 1"
     exit 1
 fi
 
@@ -378,9 +403,35 @@ if [ -n "$DUCKDB_RESULTS_DIR" ]; then
 fi
 
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
-PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
+
+if [ "$DATA_SOURCE" = "duckdb" ]; then
+    RUN_SCRIPT="$SCRIPT_DIR/run_tpch_duckdb.sh"
+    if [ ! -f "$RUN_SCRIPT" ]; then
+        echo "ERROR: DuckDB run script not found: $RUN_SCRIPT"
+        exit 1
+    fi
+    DUCKDB_FILE="${DUCKDB_FILE:-$PROJECT_DIR/performance_test.duckdb}"
+    DUCKDB_FILE="$(cd "$(dirname "$DUCKDB_FILE")" && pwd)/$(basename "$DUCKDB_FILE")"
+    if [ ! -f "$DUCKDB_FILE" ]; then
+        echo "ERROR: DuckDB database not found: $DUCKDB_FILE"
+        exit 1
+    fi
+else
+    RUN_SCRIPT="$SCRIPT_DIR/run_tpch_parquet.sh"
+    if [ ! -f "$RUN_SCRIPT" ]; then
+        echo "ERROR: Parquet run script not found: $RUN_SCRIPT"
+        exit 1
+    fi
+    PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
+fi
 
 echo "Scale factor: SF${SF}   Iterations: ${NUM_ITERATIONS} (1 cold + $((NUM_ITERATIONS - 1)) warm)"
+echo "Data source: $DATA_SOURCE   Run script: $(basename "$RUN_SCRIPT")"
+if [ "$DATA_SOURCE" = "duckdb" ]; then
+    echo "DuckDB file: $DUCKDB_FILE"
+else
+    echo "Parquet dir: $PARQUET_DIR"
+fi
 echo "Run directory: $RUN_DIR"
 if [ -n "${DUCKDB_RESULTS_DIR:-}" ]; then
     echo "DuckDB results: reusing from $DUCKDB_RESULTS_DIR"
@@ -410,6 +461,15 @@ echo "=== Collecting run info and filesystem benchmark ==="
         echo "source: $DUCKDB_RESULTS_DIR (copied, not re-run)"
         echo ""
     fi
+
+    echo "--- Benchmark input ---"
+    echo "data_source: $DATA_SOURCE"
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        echo "duckdb_file: $DUCKDB_FILE"
+    else
+        echo "parquet_dir: $PARQUET_DIR"
+    fi
+    echo ""
 
     echo "--- Git ---"
     if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
@@ -478,7 +538,28 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo ""
 
     echo "--- Filesystem benchmark (read-only, input location) ---"
-    if [ -d "$PARQUET_DIR" ]; then
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        if [ -f "$DUCKDB_FILE" ]; then
+            SIZE_BYTES=$(stat -c %s "$DUCKDB_FILE" 2>/dev/null || stat -f %z "$DUCKDB_FILE" 2>/dev/null)
+            SIZE_MB=$((SIZE_BYTES / 1048576))
+            READ_MB=$((SIZE_MB < 100 ? SIZE_MB : 100))
+            echo "file: $DUCKDB_FILE"
+            echo "read_size_mb: $READ_MB"
+            START=$(date +%s.%N)
+            dd if="$DUCKDB_FILE" of=/dev/null bs=1M count="$READ_MB" 2>/dev/null
+            END=$(date +%s.%N)
+            ELAPSED=$(echo "$END - $START" | bc 2>/dev/null || echo "?")
+            if [ "$ELAPSED" != "?" ] && [ "$(echo "$ELAPSED > 0" | bc 2>/dev/null)" -eq 1 ]; then
+                THROUGHPUT=$(echo "scale=2; $READ_MB / $ELAPSED" | bc 2>/dev/null)
+                echo "elapsed_s: $ELAPSED"
+                echo "throughput_mb_s: $THROUGHPUT"
+            else
+                echo "elapsed_s: $ELAPSED (could not compute throughput)"
+            fi
+        else
+            echo "duckdb file not found: $DUCKDB_FILE (benchmark skipped)"
+        fi
+    elif [ -d "$PARQUET_DIR" ]; then
         FIRST_PARQUET=""
         for f in "$PARQUET_DIR"/lineitem.parquet \
                  "$PARQUET_DIR"/lineitem_*.parquet \
@@ -523,7 +604,9 @@ for engine in $ENGINES; do
     echo ""
     echo "=== Running $engine ==="
     EXTRA_ARGS=()
-    if [ -n "${PARQUET_DIR:-}" ]; then
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        EXTRA_ARGS+=(--duckdb-file "$DUCKDB_FILE")
+    elif [ -n "${PARQUET_DIR:-}" ]; then
         EXTRA_ARGS+=(--parquet-dir "$PARQUET_DIR")
     fi
     EXTRA_ARGS+=(--iterations "$NUM_ITERATIONS")

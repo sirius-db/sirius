@@ -92,8 +92,7 @@ Scripts are in `test/tpch_performance/`.
 
 ## TPC-H Query Files
 
-- **Sirius (GPU):** `test/tpch_performance/tpch_queries/gpu/q*.sql` — wrapped with `call gpu_execution('...');`
-- **DuckDB (CPU):** `test/tpch_performance/tpch_queries/orig/q*.sql` — plain SQL
+- **Sirius and DuckDB runners:** `test/tpch_performance/tpch_queries/orig/q*.sql` — plain TPC-H SQL (used by `run_tpch_parquet.sh`, `run_tpch_duckdb.sh`, `benchmark_and_validate.sh`)
 
 ## Workflow H-A: Generate TPC-H Data
 
