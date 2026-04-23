@@ -39,6 +39,19 @@ inline void set_current_gpu_resource(gpu_pool_memory_resource& mr)
   cudf::set_current_device_resource_ref(rmm::device_async_resource_ref{mr});
 }
 
+inline gpu_pool_memory_resource* make_gpu_pool_memory_resource(
+  rmm::mr::cuda_memory_resource* upstream,
+  std::size_t initial_pool_size,
+  std::size_t maximum_pool_size)
+{
+#if (RMM_VERSION_MAJOR > 26) || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
+  return new gpu_pool_memory_resource(
+    rmm::device_async_resource_ref{*upstream}, initial_pool_size, maximum_pool_size);
+#else
+  return new gpu_pool_memory_resource(upstream, initial_pool_size, maximum_pool_size);
+#endif
+}
+
 }  // namespace
 using sirius::AggregationType;
 using sirius::OrderByType;
@@ -180,8 +193,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   available_gpu_cache_size.resize(NUM_GPUS);
 
   cuda_mr = new rmm::mr::cuda_memory_resource();
-  mr      = new gpu_pool_memory_resource(
-    rmm::device_async_resource_ref{*cuda_mr}, processing_size_per_gpu, processing_size_per_gpu);
+  mr      = make_gpu_pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_gpu);
   set_current_gpu_resource(*mr);
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
@@ -213,6 +225,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
     }
 
     gpuProcessingPointer[gpu] = 0;
+    gpuProcessing[gpu]        = nullptr;
     gpuCachingPointer[gpu]    = 0;
     cpuCachingPointer[gpu]    = 0;
   }
@@ -229,11 +242,12 @@ GPUBufferManager::~GPUBufferManager()
       callCudaFree<uint8_t>(gpuCache[gpu], gpu);
       if (cpuCache[gpu] != nullptr) { freePinnedCPUMemory(cpuCache[gpu]); }
     }
-    // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
-    mr->deallocate(rmm::cuda_stream_view{},
-                   (void*)gpuProcessing[gpu],
-                   processing_size_per_gpu,
-                   rmm::CUDA_ALLOCATION_ALIGNMENT);
+    if (gpuProcessing[gpu] != nullptr) {
+      mr->deallocate(rmm::cuda_stream_view{},
+                     static_cast<void*>(gpuProcessing[gpu]),
+                     processing_size_per_gpu,
+                     rmm::CUDA_ALLOCATION_ALIGNMENT);
+    }
   }
   Config::USE_PIN_MEM_FOR_CPU_PROCESSING ? freePinnedCPUMemory(cpuProcessing)
                                          : freePageableCPUMemory(cpuProcessing);

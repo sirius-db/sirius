@@ -274,15 +274,15 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
 //
 // Memory layout:
 //   GPU capacity  = 500 MB
-//   Reservation   = 200 MB
-//   Pre-alloc     = 250 MB (leaves ~50 MB free GPU)
-//   Input data    = ~300 MB host_data_representation (will go over its reservation and over the 50
-//   MB free GPU)
+//   Reservation   = 50 MB
+//   Pre-alloc     = 400 MB (leaves ~100 MB free GPU)
+//   Input data    = ~300 MB host_data_representation (will exceed its reservation and the
+//   remaining free GPU memory)
 //
 // When execute() tries to convert the host data to GPU via lock_or_prepare_batch,
-// the 300 MB allocation exceeds the remaining ~50 MB → rmm::out_of_memory.
+// the 300 MB allocation exceeds the remaining ~100 MB -> rmm::out_of_memory.
 //
-// In the OOM catch handler, peak_bytes ≈ 300 MB (requested) should be recorded to memory history.
+// In the OOM catch handler, peak_bytes ~= 300 MB (requested) should be recorded to memory history.
 // ---------------------------------------------------------------------------
 
 TEST_CASE(
