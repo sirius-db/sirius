@@ -193,7 +193,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   available_gpu_cache_size.resize(NUM_GPUS);
 
   cuda_mr = new rmm::mr::cuda_memory_resource();
-  mr      = make_gpu_pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_gpu);
+  mr = make_gpu_pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_gpu);
   set_current_gpu_resource(*mr);
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
