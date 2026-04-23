@@ -270,7 +270,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   for (auto& [port_name, port_ptr] : ports) {
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    auto batch_and_handle = port_ptr->repo->pop_idle_data_batch();
     if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
   if (input_batch.empty()) { return nullptr; }

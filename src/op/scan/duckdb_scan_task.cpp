@@ -538,7 +538,10 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
     auto& pipelineable_output_data = dynamic_cast<op::pipelineable_operator_data&>(*output_data);
     std::size_t output_bytes       = 0;
     for (const auto& batch : pipelineable_output_data.get_data_batches()) {
-      if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+      if (batch) {
+        auto ro = batch->to_read_only();
+        if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
+      }
     }
     auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
     // Use the raw task consumption basis from local state when recording history

@@ -154,8 +154,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator " +
                              std::to_string(this->get_operator_id()));
@@ -164,11 +164,23 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     throw std::runtime_error("Num partitions was not set in sirius_physical_partition operator " +
                              std::to_string(this->get_operator_id()));
   }
+
+  auto const& input_batch_ro = input_batches[0];
+  auto* space                = input_batch_ro.get_memory_space();
+
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    // Passthrough: release read lock and return idle batches
+    auto ro_vec = const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
+    std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
+    idle_batches.reserve(ro_vec.size());
+    for (auto& ro : ro_vec) {
+      idle_batches.push_back(::cucascade::data_batch::to_idle(std::move(ro)));
+    }
+    return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
   }
 
-  auto input_batch = input_batches[0];
+  // Re-acquire idle handle for partition impls that need shared_ptr<data_batch>
+  auto input_batch = ::cucascade::data_batch::to_idle(input_batch_ro.clone(sirius::get_next_batch_id(), stream));
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
@@ -177,13 +189,13 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                _partition_key_cast_types,
                                                                _num_partitions.value(),
                                                                stream,
-                                                               *input_batch->get_memory_space());
+                                                               *space);
       break;
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
     case PartitionType::EVENLY:
-      partitioned_results = gpu_partition_impl::evenly_partition(
-        input_batch, _num_partitions.value(), stream, *input_batch->get_memory_space());
+      partitioned_results =
+        gpu_partition_impl::evenly_partition(input_batch, _num_partitions.value(), stream, *space);
       break;
     case PartitionType::NONE: partitioned_results = {input_batch}; break;
     case PartitionType::CUSTOM:
@@ -230,8 +242,11 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
   for (auto batch_id : batch_ids) {
-    auto batch = repo->get_data_batch_by_id(batch_id, std::nullopt, 0);
-    if (batch && batch->get_data()) { total_bytes += batch->get_data()->get_size_in_bytes(); }
+    auto batch = repo->get_data_batch_by_id(batch_id, 0);
+    if (batch) {
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+    }
   }
   int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
   return std::make_pair(num_partitions, total_bytes);

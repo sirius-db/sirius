@@ -43,16 +43,35 @@ inline std::atomic<uint64_t> g_next_batch_id{0};
 inline uint64_t get_next_batch_id() { return g_next_batch_id++; }
 
 /**
- * @brief Get a cudf::table_view from a data_batch.
+ * @brief Get a cudf::table_view from a read_only_data_batch.
  *
- * Assumes the data_batch contains a gpu_table_representation.
+ * Assumes the batch contains a gpu_table_representation.
  *
- * @param batch The data batch to extract the table view from.
+ * @param batch The read-only locked data batch to extract the table view from.
  * @return cudf::table_view The underlying cudf table view.
  */
-inline cudf::table_view get_cudf_table_view(const cucascade::data_batch& batch)
+inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batch& batch)
 {
   auto* data = batch.get_data();
+  if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
+  return data->cast<cucascade::gpu_table_representation>().get_table();
+}
+
+/**
+ * @brief Get a cudf::table_view from an idle data_batch (shared_ptr overload).
+ *
+ * Acquires a temporary read-only lock to access the data. The table_view is valid
+ * as long as the data_batch is alive (the lock is released after the view is obtained).
+ * This overload is provided for compatibility with impl functions that hold shared_ptr<data_batch>.
+ *
+ * @param batch The idle data batch to extract the table view from.
+ * @return cudf::table_view The underlying cudf table view.
+ */
+// NOLINTNEXTLINE(readability-non-const-parameter) -- to_read_only() is non-const
+inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
+{
+  auto ro    = batch.to_read_only();
+  auto* data = ro.get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
   return data->cast<cucascade::gpu_table_representation>().get_table();
 }
