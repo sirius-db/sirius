@@ -273,7 +273,7 @@ fi
 DUCKDB_RESULTS_DIR=""
 DUCKDB_FILE=""
 MULTI_SESSION=false
-CACHE_LEVEL=""
+DROP_OS_CACHE=false
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
@@ -320,9 +320,9 @@ while [ $# -gt 1 ]; do
             MULTI_SESSION=true
             shift
             ;;
-        --cache-level)
-            CACHE_LEVEL="$2"
-            shift 2
+        --drop-os-cache)
+            DROP_OS_CACHE=true
+            shift
             ;;
         *)
             break
@@ -335,7 +335,7 @@ QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 if [ $# -ne 1 ]; then
     echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb] [--parquet-dir <path>] [--duckdb-file <path>]"
-    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] <scale_factor>"
+    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] [--drop-os-cache] <scale_factor>"
     echo "       $0 --report <run_dir>"
     echo "  --data-source parquet  (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
     echo "  --data-source duckdb             → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file"
@@ -343,6 +343,7 @@ if [ $# -ne 1 ]; then
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
     echo "         $0 --data-source duckdb --duckdb-file ./performance_test.duckdb 1"
+    echo "         $0 --multi-session --drop-os-cache --engines sirius 1000  # cold-run with OS cache drops"
     exit 1
 fi
 
@@ -461,6 +462,11 @@ echo "=== Collecting run info and filesystem benchmark ==="
         echo "source: $DUCKDB_RESULTS_DIR (copied, not re-run)"
         echo ""
     fi
+
+    echo "--- Benchmark settings ---"
+    echo "multi_session: $MULTI_SESSION"
+    echo "drop_os_cache: $DROP_OS_CACHE"
+    echo ""
 
     echo "--- Benchmark input ---"
     echo "data_source: $DATA_SOURCE"
@@ -614,8 +620,8 @@ for engine in $ENGINES; do
     if [ "$MULTI_SESSION" = true ]; then
         EXTRA_ARGS+=(--multi-session)
     fi
-    if [ -n "$CACHE_LEVEL" ]; then
-        EXTRA_ARGS+=(--cache-level "$CACHE_LEVEL")
+    if [ "$DROP_OS_CACHE" = true ]; then
+        EXTRA_ARGS+=(--drop-os-cache)
     fi
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log"

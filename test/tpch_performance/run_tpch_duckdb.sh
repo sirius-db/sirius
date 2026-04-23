@@ -41,9 +41,9 @@ SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 DUCKDB_FILE=""
 NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
-SCAN_CACHE_LEVEL=""
+DROP_OS_CACHE=false
 MULTI_SESSION=false
-while [ "${1:-}" = "--duckdb-file" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--cache-level" ] || [ "${1:-}" = "--multi-session" ]; do
+while [ "${1:-}" = "--duckdb-file" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ]; do
     if [ "$1" = "--duckdb-file" ]; then
         DUCKDB_FILE="$2"
         shift 2
@@ -53,9 +53,9 @@ while [ "${1:-}" = "--duckdb-file" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
     elif [ "$1" = "--timeout" ]; then
         SESSION_TIMEOUT="$2"
         shift 2
-    elif [ "$1" = "--cache-level" ]; then
-        SCAN_CACHE_LEVEL="$2"
-        shift 2
+    elif [ "$1" = "--drop-os-cache" ]; then
+        DROP_OS_CACHE=true
+        shift
     elif [ "$1" = "--multi-session" ]; then
         MULTI_SESSION=true
         shift
@@ -63,13 +63,28 @@ while [ "${1:-}" = "--duckdb-file" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
 done
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--duckdb-file <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--duckdb-file <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 1 \`seq 1 22\`"
     echo "  Default database: \$PROJECT_DIR/performance_test.duckdb"
     echo "  --iterations N    Number of iterations per query (default: 2, 1 cold + N-1 warm)"
     echo "  --timeout N       Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     echo "  --multi-session   Run each query in its own DuckDB process (fresh state per query)"
+    echo "  --drop-os-cache   Drop OS filesystem cache before each query (requires --multi-session and sudo)"
     exit 1
+fi
+
+if [ "$DROP_OS_CACHE" = true ] && [ "$MULTI_SESSION" = false ]; then
+    echo "ERROR: --drop-os-cache requires --multi-session (each query must run in its own process)"
+    exit 1
+fi
+
+if [ "$DROP_OS_CACHE" = true ]; then
+    if ! sudo -n -l /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+        echo "ERROR: --drop-os-cache requires passwordless sudo for /usr/bin/tee."
+        echo "Configure it with:"
+        echo "  echo '\$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches' | sudo tee /etc/sudoers.d/drop_caches"
+        exit 1
+    fi
 fi
 
 ENGINE="$1"
@@ -106,12 +121,16 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.conf"
+# Load per-query scan cache level overrides from YAML config.
+# Used in multi-session mode only — in single-session, the Sirius config YAML controls cache level.
+CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.yaml"
 declare -A QUERY_CACHE_LEVEL
-if [ "$SF" -ge 1000 ] 2>/dev/null && [ -f "$CACHE_CONFIG" ]; then
-    while IFS=' ' read -r qnum level; do
-        [[ -z "$qnum" || "$qnum" == \#* ]] && continue
-        QUERY_CACHE_LEVEL[$qnum]="$level"
+if [ -f "$CACHE_CONFIG" ]; then
+    while IFS=': ' read -r key value; do
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        value="${value## }"
+        [[ -z "$value" ]] && continue
+        QUERY_CACHE_LEVEL[$key]="$value"
     done < "$CACHE_CONFIG"
 fi
 
@@ -134,6 +153,9 @@ echo "Running TPC-H queries from DuckDB file (sf label: ${SF})"
 echo "Engine: $ENGINE"
 echo "Database: $DUCKDB_FILE"
 echo "Session: $SESSION_MODE"
+if [ "$DROP_OS_CACHE" = true ]; then
+    echo "Drop OS cache: enabled"
+fi
 echo "Iterations: $NUM_ITERATIONS (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Queries: ${QUERIES[*]}"
 if [ "$SESSION_TIMEOUT" -gt 0 ] 2>/dev/null; then
@@ -153,10 +175,6 @@ run_single_session() {
 
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
-        if [ "$ENGINE" = "sirius" ]; then
-            local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
-            printf ".timer off\nSET scan_cache_level = '%s';\n.timer on\n" "$qlevel" >> "$TEMP_SQL"
-        fi
         echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
         for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
             cat "$QUERY_FILE" >> "$TEMP_SQL"
@@ -296,12 +314,24 @@ run_multi_session() {
         echo ""
         echo "========== Q${q} =========="
 
+        # Drop OS filesystem cache for true cold-run benchmarking.
+        if [ "$DROP_OS_CACHE" = true ]; then
+            echo "  Dropping OS filesystem cache..."
+            sync
+            if echo 3 | sudo -n /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+                echo "  OS cache dropped."
+            else
+                echo "  ERROR: Failed to drop OS cache. Configure passwordless sudo:"
+                echo "    echo '\$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches' | sudo tee /etc/sudoers.d/drop_caches"
+                exit 1
+            fi
+        fi
+
         local TEMP_SQL
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
-            if [ "$ENGINE" = "sirius" ]; then
-                local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
-                printf "SET scan_cache_level = '%s';\n" "$qlevel"
+            if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
+                printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
             fi
             printf ".timer on\n"
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
