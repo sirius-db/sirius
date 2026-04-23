@@ -340,9 +340,9 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
 {
   size_t alloc = (size * sizeof(T));
   // always ensure that it aligns with RMM's CUDA allocation alignment
-  //  int alignment = alignof(double);
-  int alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  alloc         = alloc + (alignment - alloc % alignment);
+  //  size_t alignment = alignof(double);
+  size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
+  alloc += (alignment - (alloc % alignment)) % alignment;
   if (caching) {
     size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
     T* ptr       = nullptr;
