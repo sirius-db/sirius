@@ -273,17 +273,7 @@ void gpu_pipeline_executor::manager_loop()
           // The rescheduled task will handle completion instead.
           gpu_task->mark_as_rescheduled();
 
-          // Prepare intermediate data batches for re-processing.
-          // Operator outputs are in idle state; transition to task_created so
-          // lock_or_prepare_batch() can lock them for the rescheduled task.
           auto intermediate_data = oom.release_intermediate_data();
-          auto* pipelineable_intermediate =
-            dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get());
-          if (pipelineable_intermediate) {
-            for (auto& batch : pipelineable_intermediate->get_data_batches()) {
-              if (batch) { batch->try_to_create_task(); }
-            }
-          }
 
           // Build the rescheduled task via virtual factory (preserves derived type).
           auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
