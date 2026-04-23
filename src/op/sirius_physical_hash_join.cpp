@@ -845,9 +845,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         // Clone the build batch into an idle shared_ptr so it stays alive for probe lookups.
-        // Using to_idle(clone(...)) yields an idle data_batch that we own independently.
-        _build_table =
-          ::cucascade::data_batch::to_idle(build_batch_ro.clone(sirius::get_next_batch_id(), stream));
+        // clone() on read_only_data_batch returns an already-idle shared_ptr<data_batch>.
+        _build_table = build_batch_ro.clone(sirius::get_next_batch_id(), stream);
         if (unique_build_keys &&
             (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
           _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(

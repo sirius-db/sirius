@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 
@@ -177,7 +178,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
     // Re-acquire idle handle for impl functions that need shared_ptr<data_batch>
-    auto idle_batch = ::cucascade::data_batch::to_idle(input_batch.clone(sirius::get_next_batch_id(), stream));
+    auto idle_batch = input_batch.clone(sirius::get_next_batch_id(), stream);
     auto result     = gpu_aggregate_impl::local_grouped_aggregate(idle_batch,
                                                               group_idx,
                                                               cudf_aggregates,

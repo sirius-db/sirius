@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
@@ -179,8 +180,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
   }
 
-  // Re-acquire idle handle for partition impls that need shared_ptr<data_batch>
-  auto input_batch = ::cucascade::data_batch::to_idle(input_batch_ro.clone(sirius::get_next_batch_id(), stream));
+  // Clone the read_only batch; clone() returns an already-idle shared_ptr<data_batch>
+  auto input_batch = input_batch_ro.clone(sirius::get_next_batch_id(), stream);
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:

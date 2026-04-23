@@ -104,12 +104,9 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = limiter.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->cast<gpu_table_representation>()
-                        .get_table();
-  auto host_vals = copy_column_to_host<typename Traits::type>(output_table.view().column(0));
+  auto output_table = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  auto host_vals = copy_column_to_host<typename Traits::type>(output_table.column(0));
 
   std::vector<typename Traits::type> expected = {values[2], values[3], values[4]};
   REQUIRE(host_vals == expected);
@@ -132,8 +129,8 @@ static std::vector<int64_t> collect_all_rows(
 {
   std::vector<int64_t> all_rows;
   for (auto const& b : batches) {
-    auto table = b->get_data()->cast<gpu_table_representation>().get_table();
-    auto col   = sirius::test::operator_utils::copy_column_to_host<int64_t>(table.view().column(0));
+    auto table = sirius::get_cudf_table_view(*b);
+    auto col   = sirius::test::operator_utils::copy_column_to_host<int64_t>(table.column(0));
     all_rows.insert(all_rows.end(), col.begin(), col.end());
   }
   return all_rows;

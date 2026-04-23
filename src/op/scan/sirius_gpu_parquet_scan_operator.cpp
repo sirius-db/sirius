@@ -189,7 +189,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       auto input_batch    = sirius::make_data_batch(std::move(table), _gpu_memory_space);
       auto input_batch_ro = input_batch->to_read_only();
       auto output_batch   = gpu_expression_executor.select(input_batch_ro);
-      input_batch_ro      = {};  // release read lock
+      // input_batch_ro RAII destructor releases the read lock automatically
       if (!output_batch) { return std::make_unique<operator_data>(); }
       // Need mutable access to release_table() (mutating op)
       auto output_mut = output_batch->to_mutable();

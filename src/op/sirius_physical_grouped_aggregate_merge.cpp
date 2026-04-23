@@ -205,7 +205,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
   idle_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {
-    idle_batches.push_back(::cucascade::data_batch::to_idle(batch.clone(sirius::get_next_batch_id(), stream)));
+    idle_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
   }
 
   // Fast path: single batch with no post-processing needed

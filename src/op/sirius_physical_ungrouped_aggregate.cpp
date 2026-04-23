@@ -497,7 +497,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {
-    valid_batches.push_back(::cucascade::data_batch::to_idle(batch.clone(sirius::get_next_batch_id(), stream)));
+    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
   }
   if (valid_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(

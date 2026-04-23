@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_concat.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -184,7 +185,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {
-    valid_batches.push_back(::cucascade::data_batch::to_idle(batch.clone(sirius::get_next_batch_id(), stream)));
+    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
   }
   if (valid_batches.empty()) {
     return std::make_unique<partitioned_operator_data>(

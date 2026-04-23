@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_order.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "sirius/exception.hpp"
@@ -75,8 +76,8 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
     auto* space = batch.get_memory_space();
     if (!space) { continue; }
 
-    // local_order_by needs a shared_ptr<data_batch>; re-acquire idle handle from read_only ref
-    auto idle_batch   = ::cucascade::data_batch::to_idle(batch.clone(sirius::get_next_batch_id(), stream));
+    // local_order_by needs a shared_ptr<data_batch>; clone() returns an idle handle
+    auto idle_batch   = batch.clone(sirius::get_next_batch_id(), stream);
     auto sorted_batch = gpu_order_impl::local_order_by(
       idle_batch, order_key_idx, column_order, null_precedence, proj_idx, stream, *space);
     if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }

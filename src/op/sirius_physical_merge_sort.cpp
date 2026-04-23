@@ -88,7 +88,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
     if (!space) { space = batch.get_memory_space(); }
-    valid_batches.push_back(::cucascade::data_batch::to_idle(batch.clone(sirius::get_next_batch_id(), stream)));
+    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
   }
 
   if (valid_batches.empty() || !space) {
