@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "pipeline/pipeline_executor.hpp"
+#include "pipeline/task_scheduler.hpp"
 
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
@@ -34,7 +34,7 @@
 namespace sirius {
 namespace pipeline {
 
-pipeline_executor::pipeline_executor(
+task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   const exec::thread_pool_config& scan_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
@@ -42,7 +42,7 @@ pipeline_executor::pipeline_executor(
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
 {
   // Create the scan executor with memory manager for host allocations
-  // Pass a publisher so it can submit task requests without depending on pipeline_executor
+  // Pass a publisher so it can submit task requests without depending on task_scheduler
   _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
     scan_executor_config, &mem_mgr, _task_request_channel.make_publisher());
 
@@ -81,9 +81,9 @@ pipeline_executor::pipeline_executor(
   }
 }
 
-pipeline_executor::~pipeline_executor() { stop(); }
+task_scheduler::~task_scheduler() { stop(); }
 
-void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
+void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
     _scan_executor->schedule(std::move(task));
@@ -96,7 +96,7 @@ void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
   }
 }
 
-void pipeline_executor::start()
+void task_scheduler::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
@@ -104,10 +104,10 @@ void pipeline_executor::start()
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->start();
   }
-  _management_thread = std::thread(&pipeline_executor::management_eventloop, this);
+  _management_thread = std::thread(&task_scheduler::management_eventloop, this);
 }
 
-void pipeline_executor::stop()
+void task_scheduler::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
@@ -120,7 +120,7 @@ void pipeline_executor::stop()
   if (_management_thread.joinable()) { _management_thread.join(); }
 }
 
-void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
+void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creator)
 {
   _task_creator = &task_creator;
 
@@ -130,24 +130,23 @@ void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_cre
   }
 }
 
-[[nodiscard]] sirius::op::scan::duckdb_scan_executor&
-pipeline_executor::get_scan_executor() noexcept
+[[nodiscard]] sirius::op::scan::duckdb_scan_executor& task_scheduler::get_scan_executor() noexcept
 {
   return *_scan_executor;
 }
 
-[[nodiscard]] const sirius::op::scan::duckdb_scan_executor& pipeline_executor::get_scan_executor()
+[[nodiscard]] const sirius::op::scan::duckdb_scan_executor& task_scheduler::get_scan_executor()
   const noexcept
 {
   return *_scan_executor;
 }
 
-void pipeline_executor::set_scan_caching_config(sirius::op::scan::cache_level level)
+void task_scheduler::set_scan_caching_config(sirius::op::scan::cache_level level)
 {
   _scan_executor->set_scan_caching_enabled(level);
 }
 
-void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
+void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
   // Drain leftover tasks from previous query
   _scan_executor->drain_leftover_tasks();
@@ -167,7 +166,7 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
   }
 }
 
-std::future<void> pipeline_executor::start_query()
+std::future<void> task_scheduler::start_query()
 {
   // Create a new completion handler for this query
   _completion_handler      = std::make_unique<completion_handler>();
@@ -190,15 +189,15 @@ std::future<void> pipeline_executor::start_query()
   return future;
 }
 
-void pipeline_executor::terminate_query(std::exception_ptr error)
+void task_scheduler::terminate_query(std::exception_ptr error)
 {
   _completion_handler->report_error(error);
   stop();
 }
 
-void pipeline_executor::drain_after_error()
+void task_scheduler::drain_after_error()
 {
-  SIRIUS_LOG_INFO("pipeline_executor: draining after error");
+  SIRIUS_LOG_INFO("task_scheduler: draining after error");
   // Drain the task creator first so no thread is inside get_next_task_input_data()/
   // pop_data_batch() when QueryEnd() clears repositories (avoids use-after-free).
   if (_task_creator) { _task_creator->stop_thread_pool(); }
@@ -219,10 +218,10 @@ void pipeline_executor::drain_after_error()
     gpu_exec->drain_and_wait();
   }
   if (_task_creator) { _task_creator->start_thread_pool(); }
-  SIRIUS_LOG_INFO("pipeline_executor: DONE draining after error");
+  SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
 }
 
-void pipeline_executor::management_eventloop()
+void task_scheduler::management_eventloop()
 {
   while (_running.load()) {
     auto request = _task_request_channel.get();

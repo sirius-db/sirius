@@ -61,10 +61,10 @@ class gpu_pipeline_executor;
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
-class pipeline_executor {
+class task_scheduler {
  public:
   /**
-   * @brief Constructs a new pipeline_executor with task execution configuration
+   * @brief Constructs a new task_scheduler with task execution configuration
    *
    * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
    * @param scan_executor_config Configuration for the scan executor thread pool
@@ -72,24 +72,23 @@ class pipeline_executor {
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
-  explicit pipeline_executor(
-    const exec::thread_pool_config& gpu_executor_config,
-    const exec::thread_pool_config& scan_executor_config,
-    sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-    const cucascade::memory::system_topology_info* sys_topology = nullptr,
-    const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors =
-      nullptr);
+  explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
+                          const exec::thread_pool_config& scan_executor_config,
+                          sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                          const cucascade::memory::system_topology_info* sys_topology = nullptr,
+                          const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
+                            downgrade_executors = nullptr);
 
   /**
-   * @brief Destructor for the gpu_pipeline_executor.
+   * @brief Destructor for the task_scheduler.
    */
-  ~pipeline_executor();
+  ~task_scheduler();
 
   // Non-copyable but movable
-  pipeline_executor(const pipeline_executor&)            = delete;
-  pipeline_executor& operator=(const pipeline_executor&) = delete;
-  pipeline_executor(pipeline_executor&&)                 = delete;
-  pipeline_executor& operator=(pipeline_executor&&)      = delete;
+  task_scheduler(const task_scheduler&)            = delete;
+  task_scheduler& operator=(const task_scheduler&) = delete;
+  task_scheduler(task_scheduler&&)                 = delete;
+  task_scheduler& operator=(task_scheduler&&)      = delete;
 
   /**
    * @brief Schedules a task for execution with GPU-specific logic

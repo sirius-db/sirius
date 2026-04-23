@@ -211,7 +211,7 @@ set(EXTENSION_SOURCES
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp
-    src/pipeline/pipeline_executor.cpp
+    src/pipeline/task_scheduler.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
@@ -400,7 +400,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_metadata_gpu_pipeline_task_counting.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_plan_printer.cpp
-    test/cpp/pipeline/test_pipeline_executor.cpp
+    test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp

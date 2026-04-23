@@ -18,8 +18,8 @@
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "sirius_interface.hpp"
 
 #include <cucascade/data/data_repository.hpp>
@@ -153,14 +153,14 @@ class testable_task_creator : public task_creator {
  public:
   testable_task_creator(int num_threads,
                         duckdb::ClientContext& client_context,
-                        pipeline_executor& pipeline_executor,
+                        task_scheduler& task_sched,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
     : task_creator(
         exec::thread_pool_config{.num_threads = num_threads, .thread_name_prefix = "task_creator"},
         mem_res_mgr)
   {
     this->set_client_context(client_context);
-    this->set_pipeline_executor(pipeline_executor);
+    this->set_task_scheduler(task_sched);
   }
 
   void schedule(op::sirius_physical_operator* request) override
@@ -259,7 +259,7 @@ class test_fixture {
   sirius_interface sirius_iface;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   sirius_engine engine;
-  pipeline_executor pipeline_exec;
+  task_scheduler pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
 };
 

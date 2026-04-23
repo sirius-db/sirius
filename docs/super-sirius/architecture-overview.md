@@ -10,7 +10,7 @@ graph TD
     EXT --> IFACE["sirius_interface"]
     IFACE --> ENGINE["sirius_engine"]
     ENGINE -->|"build pipelines"| PLANNER["sirius_physical_plan_generator"]
-    ENGINE -->|"execute"| PE["pipeline_executor"]
+    ENGINE -->|"execute"| PE["task_scheduler"]
 
     PE --> GPE["gpu_pipeline_executor(s)"]
     PE --> SE["duckdb_scan_executor"]
@@ -45,7 +45,7 @@ SiriusContext
 ├── sirius_memory_reservation_manager   # GPU/Host/Disk memory management via cuCascade
 ├── small_pinned_host_memory_resource   # Pinned host memory allocator
 ├── shared_data_repository_manager      # Central registry of all data repositories
-├── pipeline_executor                   # Top-level executor (owns GPU + scan executors)
+├── task_scheduler                      # Top-level executor (owns GPU + scan executors)
 ├── downgrade_executor[]                # Per-memory-space monitors for GPU→Host spilling
 ├── task_creator                        # Creates scan and GPU tasks based on data availability
 └── query                               # Current query context (pipeline hashmap)
@@ -67,7 +67,7 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 │  - Parses SQL, generates logical plan                           │
 │  - Calls sirius_interface → sirius_engine                       │
 │  - Builds pipelines (single-threaded)                           │
-│  - Calls pipeline_executor.start_query()                        │
+│  - Calls task_scheduler.start_query()                           │
 │  - Blocks on future until query completes                       │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -119,8 +119,8 @@ A query through Super Sirius follows these steps:
    - Splits operators (TABLE_SCAN, joins, aggregates, sorts) into multiple pipelines
    - Injects PARTITION, CONCAT, MERGE operators at pipeline boundaries
    - Wires data repositories between pipelines with barrier types
-4. **Query Preparation** — `pipeline_executor::prepare_for_query()` drains leftover state, prepares scan cache, queues initial scan operators
-5. **Query Start** — `pipeline_executor::start_query()` creates a `completion_handler`, distributes it to all sub-executors, and schedules initial scan tasks
+4. **Query Preparation** — `task_scheduler::prepare_for_query()` drains leftover state, prepares scan cache, queues initial scan operators
+5. **Query Start** — `task_scheduler::start_query()` creates a `completion_handler`, distributes it to all sub-executors, and schedules initial scan tasks
 6. **Scan Phase** — Scan executor pulls data from storage (DuckDB tables or Parquet files), converts to GPU-compatible format, and publishes to data repositories
 7. **Pipeline Execution** — GPU executor threads pull tasks from the queue, acquire memory reservations, and call `execute()` on every operator in the pipeline (source through sink) on CUDA streams, then call the sink's `sink()` to push results downstream
 8. **Task Creation** — After each task completes, the task creator is notified to schedule downstream consumers based on data availability in ports
@@ -137,7 +137,7 @@ A query through Super Sirius follows these steps:
 | `src/sirius_interface.cpp` | DuckDB-facing API, query lifecycle |
 | `src/sirius_engine.cpp` | Pipeline construction, execution orchestration |
 | `src/planner/sirius_physical_plan_generator.cpp` | Logical-to-physical plan translation |
-| `src/include/pipeline/pipeline_executor.hpp` | Top-level executor |
+| `src/include/pipeline/task_scheduler.hpp` | Top-level executor |
 | `src/include/pipeline/gpu_pipeline_executor.hpp` | Per-GPU task executor |
 | `src/include/creator/task_creator.hpp` | Task creation and scheduling |
 | `src/include/op/scan/duckdb_scan_executor.hpp` | Scan task executor |

@@ -19,8 +19,8 @@
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
 #include "sirius_config.hpp"
 
@@ -150,8 +150,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const cucascade::shared_data_repository_manager& get_data_repository_manager()
     const;
 
-  [[nodiscard]] sirius::pipeline::pipeline_executor& get_pipeline_executor();
-  [[nodiscard]] const sirius::pipeline::pipeline_executor& get_pipeline_executor() const;
+  [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
+  [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
   /// \brief Get the downgrade executor for a specific memory space.
   [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor(
@@ -237,7 +237,7 @@ class SiriusContext : public ClientContextState {
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
-  std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
+  std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   duckdb::shared_ptr<sirius::planner::query> query_;

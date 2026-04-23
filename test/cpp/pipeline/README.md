@@ -4,9 +4,9 @@ This directory contains unit tests for the pipeline executor and GPU pipeline ex
 
 ## Test Coverage
 
-### `test_pipeline_executor.cpp`
+### `test_task_scheduler.cpp`
 
-This test file validates the functionality of the pipeline execution framework without executing actual GPU operations. The tests focus on:
+This test file validates the functionality of the task scheduling framework without executing actual GPU operations. The tests focus on:
 
 #### Thread Pool Functionality
 - **Start/Stop Lifecycle**: Verifies that executors can be started and stopped gracefully without hanging or crashing
@@ -20,8 +20,8 @@ This test file validates the functionality of the pipeline execution framework w
 - **Rapid Submission**: Tests queue behavior under heavy load with many tasks submitted quickly
 - **Synchronization**: Validates proper coordination between task queue and request queue
 
-#### Pipeline Executor & GPU Pipeline Executor Interaction
-- **Task Dispatching**: Tests that the pipeline_executor correctly dispatches tasks to GPU executors
+#### Task Scheduler & GPU Pipeline Executor Interaction
+- **Task Dispatching**: Tests that the task_scheduler correctly dispatches tasks to GPU executors
 - **Multi-GPU Support**: Verifies tasks can be routed to different GPU executors based on device_id
 - **Task-Request Pairing**: Ensures tasks and their corresponding requests are properly synchronized
 - **Task Execution**: Validates that scheduled tasks are actually executed by the GPU executors
@@ -42,8 +42,8 @@ These tests are integrated into the main test suite and will run as part of the 
 # Build and run all tests
 make test
 
-# Or run just the pipeline executor tests using catch2 tags
-./build/release/test/unittest "[pipeline_executor]"
+# Or run just the task scheduler tests using catch2 tags
+./build/release/test/unittest "[task_scheduler]"
 ./build/release/test/unittest "[gpu_pipeline_executor]"
 ```
 

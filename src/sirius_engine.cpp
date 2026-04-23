@@ -206,7 +206,7 @@ void sirius_engine::execute()
 
   // Create the query with the pipelines
   sirius_ctx->create_query(std::move(new_scheduled));
-  auto future = sirius_ctx->get_pipeline_executor().start_query();
+  auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
     future.get();
   } catch (const std::exception& e) {
@@ -215,11 +215,11 @@ void sirius_engine::execute()
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_pipeline_executor().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
-    sirius_ctx->get_pipeline_executor().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   }
 }

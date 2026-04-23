@@ -156,7 +156,7 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
 
  private:
   /**
-   * @brief Submit a scan task request to pipeline_executor
+   * @brief Submit a scan task request to task_scheduler
    */
   void submit_scan_request();
 

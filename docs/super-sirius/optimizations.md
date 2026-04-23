@@ -91,7 +91,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 1. At query startup, at most 2 scans are scheduled initially
 2. In `task_creator::manager_loop`, scan exhaustion (continuous creation) only runs when `_num_scans_in_plan == 1`. For 2+ scans, the `get_next_task_hint()` topology-driven mechanism controls task creation instead.
 
-**Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/pipeline_executor.cpp` — `schedule_next_scan_tasks()`
+**Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 

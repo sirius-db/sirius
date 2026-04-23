@@ -230,7 +230,7 @@ void downgrade_executor::processing_loop()
       if (pool_interrupted) break;
     }
 
-    // === TIER 2: pipeline_executor task queue ===
+    // === TIER 2: task_scheduler task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
       while (!req->satisfied.load()) {

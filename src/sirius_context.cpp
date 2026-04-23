@@ -126,9 +126,9 @@ void SiriusContext::QueryBegin(ClientContext& context)
     spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
     bool query_cache_hit = false;
     if (config_.is_scan_caching_enabled()) {
-      query_cache_hit = pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+      query_cache_hit = task_scheduler_->get_scan_executor().cache_scan_results_for_query(query);
     }
-    pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
+    task_scheduler_->set_scan_caching_config(config_.get_cache_level());
 
     task_creator_->reset(query_cache_hit);
     task_creator_->set_client_context(context);
@@ -219,7 +219,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
-  // Create one downgrade executor per GPU memory space BEFORE pipeline_executor,
+  // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
   // so pointers are available for injection into gpu_pipeline_executors.
   // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
@@ -233,29 +233,29 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         const_cast<cucascade::memory::memory_space*>(space),
         *memory_manager_);
       // NOTE: do not call executor->start() here -- deferred until after
-      // pipeline_executor_ and task_creator_ are constructed.
+      // task_scheduler_ and task_creator_ are constructed.
       downgrade_executors_.push_back(std::move(executor));
     }
   };
   create_executors_for_tier(cucascade::memory::Tier::GPU);
   create_executors_for_tier(cucascade::memory::Tier::HOST);
 
-  pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    config_.get_gpu_pipeline_executor_config(),
-    config_.get_duckdb_scan_executor_config(),
-    *memory_manager_,
-    &config_.get_hw_topology(),
-    &downgrade_executors_);
+  task_scheduler_ =
+    std::make_unique<sirius::pipeline::task_scheduler>(config_.get_gpu_pipeline_executor_config(),
+                                                       config_.get_duckdb_scan_executor_config(),
+                                                       *memory_manager_,
+                                                       &config_.get_hw_topology(),
+                                                       &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_config(),
                                                                   *memory_manager_);
-  task_creator_->set_pipeline_executor(*pipeline_executor_);
-  pipeline_executor_->set_task_creator(*task_creator_);
+  task_creator_->set_task_scheduler(*task_scheduler_);
+  task_scheduler_->set_task_creator(*task_creator_);
 
-  // Wire the pipeline task queue into downgrade executors now that pipeline_executor_
+  // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
   for (auto& executor : downgrade_executors_) {
-    executor->set_pipeline_task_queue(pipeline_executor_->get_pipeline_task_queue());
+    executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
   }
 
   // Start everything -- downgrade executors deferred until now
@@ -263,10 +263,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     executor->start();
   }
   task_creator_->start_thread_pool();
-  pipeline_executor_->start();
+  task_scheduler_->start();
 
   // Configure scan caching based on config
-  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
+  task_scheduler_->set_scan_caching_config(config_.get_cache_level());
 
   is_initialized_ = true;
 }
@@ -275,8 +275,8 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
-  pipeline_executor_->stop();
-  pipeline_executor_.reset();
+  task_scheduler_->stop();
+  task_scheduler_.reset();
   task_creator_->stop_thread_pool();
   task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
@@ -333,16 +333,16 @@ const cucascade::shared_data_repository_manager& SiriusContext::get_data_reposit
   return *data_repository_manager_;
 }
 
-sirius::pipeline::pipeline_executor& SiriusContext::get_pipeline_executor()
+sirius::pipeline::task_scheduler& SiriusContext::get_task_scheduler()
 {
   throw_if_not_initialized();
-  return *pipeline_executor_;
+  return *task_scheduler_;
 }
 
-const sirius::pipeline::pipeline_executor& SiriusContext::get_pipeline_executor() const
+const sirius::pipeline::task_scheduler& SiriusContext::get_task_scheduler() const
 {
   throw_if_not_initialized();
-  return *pipeline_executor_;
+  return *task_scheduler_;
 }
 
 sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor(
@@ -389,7 +389,7 @@ void SiriusContext::create_query(
 {
   throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
-  pipeline_executor_->prepare_for_query(query_);
+  task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
 }
 

@@ -29,7 +29,7 @@ We use **2 of 3** modules. Primary integration points:
 | `src/sirius_context.cpp` | memory | `fixed_size_host_memory_resource`, `small_pinned_host_memory_resource` |
 | `src/sirius_config.cpp` | memory | `config`, `reservation_manager_configurator` |
 | `src/pipeline/gpu_pipeline_task.cpp` | data, memory | `data_batch`, `gpu_table_representation`, `cpu_data_representation`, `memory_space`, `reservation_aware_resource_adaptor` |
-| `src/pipeline/pipeline_executor.cpp` | memory | `memory_reservation`, `memory_space`, `common` |
+| `src/pipeline/task_scheduler.cpp` | memory | `memory_reservation`, `memory_space`, `common` |
 | `src/pipeline/gpu_pipeline_executor.cpp` | memory | `stream_pool`, `memory_reservation`, `memory_space` |
 | `src/memory/sirius_memory_reservation_manager.cpp` | memory | `memory_reservation_manager`, `Tier` |
 | `src/op/scan/duckdb_scan_task.cpp` | data, memory | `cpu_data_representation`, `data_batch`, `memory_space`, `memory_reservation` |
