@@ -23,7 +23,7 @@ operator->get_next_task_hint() → READY or WAITING_FOR_INPUT_DATA
     ↓
 Create task (duckdb_scan_task, parquet_scan_task, or gpu_pipeline_task)
     ↓
-Dispatch to executor (scan_executor or pipeline_executor)
+Dispatch to executor (scan_executor or task_scheduler)
 ```
 
 ## Global State Maps
@@ -238,7 +238,7 @@ while running:
            - Loop while (!node.all_ports_empty()):
              - pipeline.mark_task_created()  // BEFORE popping data
              - data = node.get_next_task_input_data()
-             - If data: create gpu_pipeline_task, dispatch to pipeline_executor
+             - If data: create gpu_pipeline_task, dispatch to task_scheduler
              - If no data: pipeline.mark_task_completed()
 ```
 

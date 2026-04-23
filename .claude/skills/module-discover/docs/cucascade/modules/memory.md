@@ -420,7 +420,7 @@ public:
 
 **Our usage**:
 - `src/include/sirius_config.hpp:25` — sirius config uses topology for memory setup
-- `src/include/pipeline/pipeline_executor.hpp:33` — pipeline executor reads topology
+- `src/include/pipeline/task_scheduler.hpp:33` — task scheduler reads topology
 
 ---
 

@@ -113,9 +113,9 @@ The **destructor** calls `pipeline->mark_task_completed()` to update pipeline co
 
 ## Pipeline Executor
 
-**File:** `src/include/pipeline/pipeline_executor.hpp`, `src/pipeline/pipeline_executor.cpp`
+**File:** `src/include/pipeline/task_scheduler.hpp`, `src/pipeline/task_scheduler.cpp`
 
-The `pipeline_executor` is the top-level orchestrator that owns GPU and scan sub-executors.
+The `task_scheduler` is the top-level orchestrator that owns GPU and scan sub-executors.
 
 ### Key Methods
 
@@ -203,7 +203,7 @@ The completion check happens **before** scheduling downstream tasks to prevent s
 GPU executors communicate with the pipeline executor via `exec::channel<task_request>`:
 
 ```
-gpu_executor → task_request_publisher.send() → pipeline_executor.management_eventloop()
+gpu_executor → task_request_publisher.send() → task_scheduler.management_eventloop()
              ← task_queue.push()              ← task_creator.schedule()
 ```
 
@@ -246,7 +246,7 @@ If max retries are exceeded, the error propagates and terminates the query.
 
 ## Error Handling and Draining
 
-**File:** `src/pipeline/pipeline_executor.cpp`
+**File:** `src/pipeline/task_scheduler.cpp`
 
 `drain_after_error()` performs a multi-stage clean shutdown:
 
@@ -262,8 +262,8 @@ This ensures that when `drain_after_error()` returns, no tasks are referencing o
 
 | File | Purpose |
 |------|---------|
-| `src/include/pipeline/pipeline_executor.hpp` | Top-level executor |
-| `src/pipeline/pipeline_executor.cpp` | Event loop, query lifecycle |
+| `src/include/pipeline/task_scheduler.hpp` | Top-level executor |
+| `src/pipeline/task_scheduler.cpp` | Event loop, query lifecycle |
 | `src/include/pipeline/gpu_pipeline_executor.hpp` | Per-GPU executor |
 | `src/pipeline/gpu_pipeline_executor.cpp` | Manager loop, OOM handling |
 | `src/include/pipeline/gpu_pipeline_task.hpp` | GPU task class |

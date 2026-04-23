@@ -117,7 +117,7 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 **File:** `src/sirius_engine.cpp` — `execute()`
 
 1. Creates a `query` object from `new_scheduled` pipelines with a pipeline hashmap
-2. Calls `pipeline_executor.start_query(query)` which:
+2. Calls `task_scheduler.start_query(query)` which:
    - Creates a `completion_handler` with promise/future
    - Distributes the handler to all sub-executors
    - Schedules initial scan tasks from the priority queue
@@ -204,7 +204,7 @@ sequenceDiagram
     participant Ext as sirius_extension
     participant Iface as sirius_interface
     participant Engine as sirius_engine
-    participant PE as pipeline_executor
+    participant PE as task_scheduler
     participant SE as scan_executor
     participant GPE as gpu_pipeline_executor
     participant TC as task_creator

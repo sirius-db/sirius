@@ -132,7 +132,7 @@ class downgrade_executor {
    * Must be called before start(). Allows deferred wiring when the queue
    * is not available at construction time.
    *
-   * @param pipeline_task_queue Pointer to the pipeline_executor's task queue
+   * @param pipeline_task_queue Pointer to the task_scheduler's task queue
    */
   void set_pipeline_task_queue(
     sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue);

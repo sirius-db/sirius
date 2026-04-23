@@ -23,7 +23,7 @@
 #include <helper/type_conversions.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
-#include <pipeline/pipeline_executor.hpp>
+#include <pipeline/task_scheduler.hpp>
 
 // cucascade
 #include <cucascade/data/data_repository.hpp>
@@ -143,13 +143,13 @@ static void run_scan_test(std::string const& table_name,
   auto physical_scan = make_physical_table_scan(client_ctx, table_name);
   REQUIRE(physical_scan);
 
-  // Get pipeline executor from sirius context (owns the scan executor)
-  auto& pipeline_executor = sirius_ctx->get_pipeline_executor();
-  auto& scan_executor     = pipeline_executor.get_scan_executor();
+  // Get task scheduler from sirius context (owns the scan executor)
+  auto& task_sched    = sirius_ctx->get_task_scheduler();
+  auto& scan_executor = task_sched.get_scan_executor();
 
   // Create global state
   auto global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-    nullptr, pipeline_executor, client_ctx, physical_scan.get());
+    nullptr, task_sched, client_ctx, physical_scan.get());
 
   // Create data repository manager (empty, unused for this test)
   cucascade::shared_data_repository data_repo;
@@ -163,20 +163,20 @@ static void run_scan_test(std::string const& table_name,
   // The shared env's SiriusContext already started it, and stopping it would
   // permanently break the interruptible_mpmc queue (no reset on restart).
   bool const manage_executor = !sirius::test::g_shared_env;
-  if (manage_executor) { pipeline_executor.start(); }
+  if (manage_executor) { task_sched.start(); }
 
   for (int i = 0; i < scan_executor.get_num_threads(); ++i) {
     auto local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
       *global_state, *execution_context, batch_size);
     auto task = std::make_unique<op::scan::duckdb_scan_task>(
       static_cast<uint64_t>(i + 1), &data_repo, std::move(local_state), global_state);
-    pipeline_executor.schedule(std::move(task));
+    task_sched.schedule(std::move(task));
   }
   while (!global_state->is_source_drained()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  if (manage_executor) { pipeline_executor.stop(); }
+  if (manage_executor) { task_sched.stop(); }
 
   // Validate repository data batches.
   // The stream must be declared before batches so it outlives GPU data allocated on it.
