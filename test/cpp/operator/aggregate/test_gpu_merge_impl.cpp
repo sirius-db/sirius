@@ -48,15 +48,14 @@ memory_space* get_shared_mem_space()
 }
 
 /**
- * @brief Container for batches with their processing handles.
+ * @brief Container for data batches.
  *
- * In production, tasks hold processing handles while operating on batches
- * to prevent them from being downgraded. This struct keeps batches and handles
- * together so the handles remain in scope during processing.
+ * Groups related batches together for convenience. In the new cucascade API,
+ * locking is managed via RAII read_only_data_batch / mutable_data_batch accessors
+ * rather than explicit processing handles.
  */
 struct batches_with_handles {
   std::vector<std::shared_ptr<data_batch>> batches;
-  std::vector<data_batch_processing_handle> handles;
 };
 
 batches_with_handles create_batches_with_random_data(
@@ -74,19 +73,13 @@ batches_with_handles create_batches_with_random_data(
                                                     cudf::get_default_stream(),
                                                     mem_space.get_default_allocator());
     auto batch = sirius::make_data_batch(std::move(table), mem_space);
-
-    // Acquire processing handle (like the old pin() call)
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   return result;
 }
 
 void validate_concat(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                     const data_batch& output)
+                     data_batch& output)
 {
   std::vector<cudf::table_view> input_table_views;
   int expected_num_rows = 0;
@@ -276,14 +269,8 @@ batches_with_handles create_batches_with_local_ungrouped_agg_result(
   for (int i = 0; i < num_batches; ++i) {
     auto batch = gpu_aggregate_impl::local_ungrouped_aggregate(
       base_input.batches[i], aggregates, aggregate_idx, cudf::get_default_stream(), mem_space);
-    // Acquire processing handle for the output batch
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
-  // base_input.handles will release when going out of scope (base batches no longer needed)
   return result;
 }
 
@@ -361,7 +348,7 @@ void validate_ungrouped_aggregate_numeric(const std::vector<cudf::table_view>& i
 }
 
 void validate_ungrouped_aggregate(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                                  const data_batch& output,
+                                  data_batch& output,
                                   const std::vector<cudf::aggregation::Kind>& aggregates)
 {
   std::vector<cudf::table_view> input_table_views;
@@ -529,10 +516,6 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
                                                              {},
                                                              cudf::get_default_stream(),
                                                              mem_space);
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
 
@@ -574,7 +557,7 @@ void copy_data_to_host(cudf::table_view table, std::vector<std::vector<int64_t>>
 }
 
 void validate_grouped_aggregate(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                                const data_batch& output,
+                                data_batch& output,
                                 int num_group_cols,
                                 const std::vector<cudf::aggregation::Kind>& aggregates)
 {
@@ -815,17 +798,13 @@ batches_with_handles create_batches_with_local_orderby_result(
                                                 projections,
                                                 cudf::get_default_stream(),
                                                 mem_space);
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   return result;
 }
 
 void validate_order_by(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                       const data_batch& output,
+                       data_batch& output,
                        const std::vector<int>& order_key_idx,
                        const std::vector<cudf::order>& column_order)
 {

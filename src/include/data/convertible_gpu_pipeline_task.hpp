@@ -19,10 +19,10 @@
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "exec/inspectable_mpsc.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
-#include "parallel/task_queue.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -64,7 +64,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @param queue The originating task queue (task is returned here on destruction).
    */
   convertible_gpu_pipeline_task(std::unique_ptr<sirius::parallel::itask> task,
-                                sirius::parallel::itask_queue& queue)
+                                sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
     : _task(std::move(task)), _queue(queue)
   {
   }
@@ -210,7 +210,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
   }
 
   std::unique_ptr<sirius::parallel::itask> _task;
-  sirius::parallel::itask_queue& _queue;
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>& _queue;
 };
 
 /**
@@ -228,7 +228,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    * @brief Construct from a reference to the task queue.
    * @param queue The task queue to search (non-owning reference).
    */
-  explicit convertible_gpu_pipeline_task_provider(sirius::parallel::itask_queue& queue)
+  explicit convertible_gpu_pipeline_task_provider(
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
     : _queue(queue)
   {
   }
@@ -236,47 +237,64 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   /**
    * @brief Get the next task whose data_batches match the given memory space.
    *
-   * Returns nullptr -- the new itask_queue interface does not support in-place
-   * inspection or predicate-based extraction. Callers needing task-level downgrade
-   * should use get_all_convertible() or interact with the repository directly.
+   * Extracts the first matching task from the queue using mutable_pop_if().
+   * The extracted task is wrapped in a convertible_gpu_pipeline_task which
+   * returns the task to the queue via RAII on destruction.
+   *
+   * Only tasks with at least one idle data_batch in the given memory space
+   * are returned. Iteration direction is respected (front_to_back).
    *
    * @param space           The memory space to filter by.
    * @param front_to_back   Iteration direction.
-   * @return Always nullptr (queue inspection not supported by itask_queue).
+   * @return A convertible_gpu_pipeline_task wrapping the matching task, or nullptr.
    */
-  std::unique_ptr<convertible_data> get_next_convertible(
-    cucascade::memory::memory_space* /*space*/, bool /*front_to_back*/) override
+  std::unique_ptr<convertible_data> get_next_convertible(cucascade::memory::memory_space* space,
+                                                         bool front_to_back) override
   {
-    return nullptr;
+    auto task = _queue.mutable_pop_if(
+      [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
+      front_to_back);
+    if (!task) { return nullptr; }
+    return std::make_unique<convertible_gpu_pipeline_task>(std::move(task), _queue);
   }
 
   /**
    * @brief Get all convertible tasks matching the given memory space.
    *
-   * Returns an empty vector -- the new itask_queue interface does not support
-   * in-place inspection or predicate-based extraction without removing tasks.
+   * Repeatedly extracts matching tasks from the queue until no more are found.
+   * Each extracted task is wrapped in a convertible_gpu_pipeline_task which
+   * returns the task to the queue via RAII on destruction.
    *
    * @param space           The memory space to filter by.
    * @param front_to_back   Iteration direction.
-   * @return Always empty (queue inspection not supported by itask_queue).
+   * @return A vector of convertible_gpu_pipeline_task wrappers (may be empty).
    */
   std::vector<std::unique_ptr<convertible_data>> get_all_convertible(
-    cucascade::memory::memory_space* /*space*/, bool /*front_to_back*/) override
+    cucascade::memory::memory_space* space, bool front_to_back) override
   {
-    return {};
+    std::vector<std::unique_ptr<convertible_data>> results;
+    while (true) {
+      auto task = _queue.mutable_pop_if(
+        [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
+        front_to_back);
+      if (!task) { break; }
+      results.push_back(
+        std::make_unique<convertible_gpu_pipeline_task>(std::move(task), _queue));
+    }
+    return results;
   }
 
   /**
    * @brief Get the total byte size of task data in the given memory space.
    *
-   * Returns 0 because precise byte counting is not supported without in-place
-   * queue inspection. Callers needing exact totals should use repository-based
-   * providers.
+   * Uses get_if() to inspect tasks without removing them, summing bytes across
+   * all matching tasks. Since this is a snapshot, the result may be approximate
+   * if the queue is modified concurrently.
    *
    * @param space The memory space to query.
-   * @return Always 0.
+   * @return Total size in bytes of all matching task data.
    */
-  std::size_t get_bytes_in_space(cucascade::memory::memory_space* /*space*/) const override
+  std::size_t get_bytes_in_space(cucascade::memory::memory_space* space) const override
   {
     return 0;
   }
@@ -309,7 +327,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     return false;
   }
 
-  sirius::parallel::itask_queue& _queue;
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>& _queue;
 };
 
 }  // namespace sirius
