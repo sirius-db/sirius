@@ -91,9 +91,12 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   // execute() so that a task-local CUDA stream can be used.
   _has_filter = false;
   if (table_filter_set && !table_filter_set->filters.empty()) {
-    auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
+    auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
+    // Drop filters on hive-partition columns — they aren't in the parquet file, so pushing
+    // them into the reader crashes libcudf. DuckDB already prunes partitions at the file-list
+    // level when hive_partitioning is enabled.
     auto duckdb_expression = convert_table_filters_to_expression(
-      *table_filter_set, column_ids, returned_types, batch_column_map);
+      *table_filter_set, column_ids, returned_types, batch_column_map, _hive_partition_index_set);
     if (duckdb_expression) {
       _has_filter               = true;
       _duckdb_filter_expression = std::move(duckdb_expression);
