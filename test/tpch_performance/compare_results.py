@@ -55,7 +55,9 @@ def parse_result(path: Path) -> ParsedResult:
 
     for idx, row in enumerate(rows):
         if len(row) != width:
-            raise ValueError(f"{path}: row {idx} has {len(row)} columns, expected {width}")
+            raise ValueError(
+                f"{path}: row {idx} has {len(row)} columns, expected {width}"
+            )
 
     return ParsedResult(headers=headers, types=types, rows=rows)
 
@@ -65,7 +67,9 @@ def is_float_type(type_name: str) -> bool:
     return normalized in {"float", "double"}
 
 
-def compare_results(lhs: ParsedResult, rhs: ParsedResult, float_tolerance: float) -> tuple[bool, str]:
+def compare_results(
+    lhs: ParsedResult, rhs: ParsedResult, float_tolerance: float
+) -> tuple[bool, str]:
     if lhs.headers != rhs.headers:
         return False, f"header mismatch: {lhs.headers!r} != {rhs.headers!r}"
 
@@ -94,7 +98,9 @@ def compare_results(lhs: ParsedResult, rhs: ParsedResult, float_tolerance: float
                         )
                     continue
 
-                if not math.isclose(lhs_float, rhs_float, rel_tol=0.0, abs_tol=float_tolerance):
+                if not math.isclose(
+                    lhs_float, rhs_float, rel_tol=0.0, abs_tol=float_tolerance
+                ):
                     column = lhs.headers[col_idx]
                     diff = abs(lhs_float - rhs_float)
                     return False, (
