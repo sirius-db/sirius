@@ -18,6 +18,7 @@
 
 // sirius
 #include <cudf/cudf_utils.hpp>
+#include <expression/join_condition.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -142,18 +143,18 @@ class gpu_expression_translator {
     duckdb::Expression const& expr, column_name_resolver_fxn column_name_resolver);
 
   /**
-   * @brief Try to translate a DuckDB join condition into a cuDF AST.
+   * @brief Try to translate a sirius join condition into a cuDF AST.
    *
-   * @param condition The DuckDB join condition to translate.
+   * @param condition The sirius join condition to translate.
    * @return An optional containing the translated expression and its owned scalar literals if
    * translation succeeded, or std::nullopt if translation failed because it encountered an
    * expression that could not be translated to cuDF AST.
    */
   std::optional<translated_expression> translate_join_condition(
-    duckdb::JoinCondition const& condition);
+    sirius::join_condition const& condition);
 
   /**
-   * @brief Try to translate a contiguous range of DuckDB join conditions into a single cuDF AST,
+   * @brief Try to translate a contiguous range of sirius join conditions into a single cuDF AST,
    * combining them with logical AND.
    *
    * Intended for translating the inequality conditions of a mixed join into a binary predicate.
@@ -167,7 +168,7 @@ class gpu_expression_translator {
    * condition could not be translated.
    */
   std::optional<translated_expression> translate_join_conditions(
-    duckdb::vector<duckdb::JoinCondition> const& conditions,
+    duckdb::vector<sirius::join_condition> const& conditions,
     std::size_t start_idx,
     std::size_t end_idx,
     bool swap_sides = false);
@@ -215,7 +216,7 @@ class gpu_expression_translator {
   /// @brief Add a single join condition to the current AST tree without resetting it.
   /// @param condition The join condition to translate.
   /// @param swap_sides If true, swap LEFT/RIGHT table references in the column references.
-  std::optional<expr_ref> add_join_condition(duckdb::JoinCondition const& condition,
+  std::optional<expr_ref> add_join_condition(sirius::join_condition const& condition,
                                              bool swap_sides = false);
 
   /// @brief Helper function for adding a binary function expression (e.g. addition) to the AST.

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "expression/expression.hpp"
 #include "helper/type_conversions.hpp"
 #include "operator/operator_type_traits.hpp"
 #include "utils/data_utils.hpp"
@@ -44,8 +45,8 @@ namespace test {
  */
 struct AggregateExpressionResult {
   duckdb::vector<sirius::logical_type> output_types;
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
+  duckdb::vector<sirius::expression> groups;
+  duckdb::vector<sirius::expression> aggregates;
 };
 
 /**
@@ -102,8 +103,8 @@ AggregateExpressionResult create_aggregate_expressions(
 
   // Create group by expressions
   for (std::size_t group_idx : group_indexes) {
-    result.groups.push_back(
-      duckdb::make_uniq<duckdb::BoundReferenceExpression>(Traits::logical_type(), group_idx));
+    result.groups.push_back(sirius::wrap(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(Traits::logical_type(), group_idx)));
   }
 
   // Create aggregate expressions
@@ -140,7 +141,7 @@ AggregateExpressionResult create_aggregate_expressions(
                                                           nullptr,  // bind_info
                                                           duckdb::AggregateType::NON_DISTINCT);
 
-    result.aggregates.push_back(std::move(agg_expr));
+    result.aggregates.push_back(sirius::wrap(std::move(agg_expr)));
   }
 
   return result;
@@ -434,8 +435,8 @@ AggregateExpressionResult create_count_distinct_expressions(
 
   // Group expressions
   for (std::size_t group_idx : group_indexes) {
-    result.groups.push_back(
-      duckdb::make_uniq<duckdb::BoundReferenceExpression>(KeyTraits::logical_type(), group_idx));
+    result.groups.push_back(sirius::wrap(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(KeyTraits::logical_type(), group_idx)));
   }
 
   // COUNT(DISTINCT agg_col_idx) aggregate expression
@@ -453,7 +454,7 @@ AggregateExpressionResult create_count_distinct_expressions(
                                                         nullptr,  // bind_info
                                                         duckdb::AggregateType::DISTINCT);
 
-  result.aggregates.push_back(std::move(agg_expr));
+  result.aggregates.push_back(sirius::wrap(std::move(agg_expr)));
   return result;
 }
 
@@ -482,7 +483,8 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   // Group expressions
   for (const auto& [type, idx] : key_col_infos) {
-    result.groups.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, idx));
+    result.groups.push_back(
+      sirius::wrap(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, idx)));
   }
 
   // Build struct_pack(col1, col2, ...) as a BoundFunctionExpression
@@ -507,11 +509,11 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   auto agg_fn = MakeDummyAggregate("count", {struct_return_type}, duckdb::LogicalType::BIGINT);
   result.aggregates.push_back(
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
-                                                        std::move(agg_children),
-                                                        nullptr,  // filter
-                                                        nullptr,  // bind_info
-                                                        duckdb::AggregateType::DISTINCT));
+    sirius::wrap(duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
+                                                                     std::move(agg_children),
+                                                                     nullptr,  // filter
+                                                                     nullptr,  // bind_info
+                                                                     duckdb::AggregateType::DISTINCT)));
   return result;
 }
 

@@ -28,6 +28,14 @@
 
 // duckdb
 #include <duckdb/common/helper.hpp>
+#include <duckdb/planner/expression/bound_between_expression.hpp>
+#include <duckdb/planner/expression/bound_case_expression.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf, etc.
 #include <cudf/column/column_factories.hpp>
@@ -375,10 +383,11 @@ struct exec_result {
 
 exec_result run_execute(memory_space& space,
                         std::shared_ptr<data_batch> const& input_batch,
-                        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs,
+                        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs,
                         exp_strategy_enum strategy = MAT)
 {
-  exp_executor executor(exprs, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  auto wrapped = sirius::wrap_many(std::move(exprs));
+  exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto output_batch = executor.execute(input_batch);
   REQUIRE(output_batch != nullptr);
   auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
@@ -388,10 +397,11 @@ exec_result run_execute(memory_space& space,
 
 exec_result run_select(memory_space& space,
                        std::shared_ptr<data_batch> const& input_batch,
-                       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs,
+                       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs,
                        exp_strategy_enum strategy = MAT)
 {
-  exp_executor executor(exprs, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  auto wrapped = sirius::wrap_many(std::move(exprs));
+  exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto output_batch = executor.select(input_batch);
   REQUIRE(output_batch != nullptr);
   auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
@@ -446,7 +456,7 @@ TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 3);
     REQUIRE(ov.num_rows() == iv.num_rows());
 
@@ -481,7 +491,7 @@ TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_LESSTHAN, std::move(lhs), std::move(rhs)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 3);
     REQUIRE(ov.num_rows() == iv.num_rows());
 
@@ -512,7 +522,7 @@ TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 3);
     REQUIRE(ov.num_rows() == iv.num_rows());
 
@@ -555,7 +565,7 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
@@ -575,7 +585,7 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_rows() == 0);
     REQUIRE(ov.num_columns() == iv.num_columns());
   }
@@ -593,7 +603,7 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     auto in_vals                       = copy_column_to_host<int64_t>(iv.column(0));
     std::vector<int64_t> expected;
     for (auto v : in_vals) {
@@ -613,7 +623,7 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
       ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& v : in_strs) {
@@ -655,7 +665,7 @@ TEMPLATE_TEST_CASE("execute arithmetic functions",
                      {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
                      std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 1);
     auto in0  = copy_column_to_host<int32_t>(iv.column(0));
     auto out0 = copy_column_to_host<int32_t>(ov.column(0));
@@ -678,7 +688,7 @@ TEMPLATE_TEST_CASE("execute arithmetic functions",
                      {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
                      std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     auto in0                           = copy_column_to_host<int32_t>(iv.column(0));
     auto in1                           = copy_column_to_host<int32_t>(iv.column(1));
     auto out0                          = copy_column_to_host<int32_t>(ov.column(0));
@@ -700,7 +710,7 @@ TEMPLATE_TEST_CASE("execute arithmetic functions",
                      {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
                      std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     auto in0                           = copy_column_to_host<int32_t>(iv.column(0));
     auto out0                          = copy_column_to_host<int32_t>(ov.column(0));
     for (size_t i = 0; i < in0.size(); ++i) {
@@ -746,7 +756,7 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
     REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -771,7 +781,7 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(make_func_expr("-", dec_type, {dec_type, dec_type}, std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
     REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
 
@@ -800,7 +810,7 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(make_func_expr("*", dec_type, {dec_type, dec_int_type}, std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
     REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
 
@@ -843,7 +853,7 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL32)",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL32);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -897,7 +907,7 @@ TEMPLATE_TEST_CASE("execute nested decimal arithmetic (col + 1.00) * 2",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(make_func_expr("*", dec_type, {dec_type, dec_int}, std::move(mul_children)));
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -941,7 +951,7 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL128)",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL128);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -986,7 +996,7 @@ TEMPLATE_TEST_CASE("execute decimal DIV (DECIMAL64)",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(make_func_expr("/", dec_type, {dec_type, dec_int}, std::move(children)));
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -1047,7 +1057,7 @@ TEMPLATE_TEST_CASE("execute decimal TPC-H Q1 shape price * (1 - discount)",
   exprs.push_back(
     make_func_expr("*", mul_ret_type, {price_type, discount_t}, std::move(mul_children)));
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale4));
@@ -1097,7 +1107,7 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
                      {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
                      std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& s : in_strs) {
@@ -1120,7 +1130,7 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
                      {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
                      std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_rows() == iv.num_rows());
   }
 
@@ -1138,7 +1148,7 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
                      {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
                      std::move(children)));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& s : in_strs) {
@@ -1183,7 +1193,7 @@ TEMPLATE_TEST_CASE("execute CASE expression",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(case_expr));
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.num_rows() == iv.num_rows());
 
@@ -1231,7 +1241,7 @@ TEMPLATE_TEST_CASE("execute CASE with multiple WHEN branches",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(case_expr));
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   auto out_vals                      = copy_column_to_host<int32_t>(ov.column(0));
   for (size_t i = 0; i < in_vals.size(); ++i) {
@@ -1265,7 +1275,7 @@ TEMPLATE_TEST_CASE(
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(between));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1304,7 +1314,7 @@ TEMPLATE_TEST_CASE("select IN and NOT IN",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(in_expr));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
@@ -1327,7 +1337,7 @@ TEMPLATE_TEST_CASE("select IN and NOT IN",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(not_in_expr));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
@@ -1365,7 +1375,7 @@ TEMPLATE_TEST_CASE("select IS NULL and IS NOT NULL",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(is_null));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     // Null rows should pass the IS NULL filter
     REQUIRE(ov.num_rows() == 2);
   }
@@ -1380,7 +1390,7 @@ TEMPLATE_TEST_CASE("select IS NULL and IS NOT NULL",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(is_not_null));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
     // Non-null rows should pass
     REQUIRE(ov.num_rows() == 3);
     auto out_vals = copy_column_to_host<int32_t>(ov.column(0));
@@ -1633,7 +1643,7 @@ TEMPLATE_TEST_CASE("select respects null mask under plain comparison",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(cmp));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
 
   std::vector<int32_t> expected;
   for (size_t i = 0; i < values.size(); ++i) {
@@ -1667,7 +1677,7 @@ TEMPLATE_TEST_CASE("select COMPARE_NOT_DISTINCT_FROM",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(cmp));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_rows() == 1);
   REQUIRE(ov.column(0).null_count() == 0);
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30});
@@ -1696,7 +1706,7 @@ TEMPLATE_TEST_CASE("select COMPARE_DISTINCT_FROM",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(cmp));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_rows() == 4);
   REQUIRE(ov.column(0).null_count() == 2);
 }
@@ -1727,7 +1737,7 @@ TEMPLATE_TEST_CASE("select NOT operator",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(not_expr));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1780,7 +1790,7 @@ TEMPLATE_TEST_CASE("select conjunction with AST breaker",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(conjunction));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   auto in_col0                       = copy_column_to_host<int32_t>(iv.column(0));
   auto in_col1                       = copy_string_column_to_host(iv.column(1));
 
@@ -1822,7 +1832,7 @@ TEMPLATE_TEST_CASE("select OR conjunction",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(disjunction));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1869,7 +1879,7 @@ TEMPLATE_TEST_CASE("select with nested CASE in predicate",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(outer_cmp));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1920,7 +1930,7 @@ TEMPLATE_TEST_CASE("select IN with conjunction multi-column",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(conjunction));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   auto in_col0                       = copy_column_to_host<int32_t>(iv.column(0));
   auto in_col1                       = copy_column_to_host<int64_t>(iv.column(1));
   std::vector<int32_t> expected_col0;
@@ -1997,7 +2007,7 @@ TEMPLATE_TEST_CASE("execute mixed arithmetic and CASE projection",
     exprs.push_back(std::move(case_expr));
   }
 
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_columns() == 2);
   REQUIRE(ov.num_rows() == iv.num_rows());
 

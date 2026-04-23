@@ -14,14 +14,15 @@
  * limitations under the License.
  */
 
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "expression/expression.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-// #include "duckdb/common/types.hpp"
 
 namespace sirius::planner {
 
@@ -126,8 +127,22 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto column_id = column_ids[c].GetPrimaryIndex();
         filter_types.push_back(op.returned_types[column_id]);
       }
+      // sirius_physical_filter owns a single expression; AND-merge predicates when there are many.
+      duckdb::unique_ptr<duckdb::Expression> combined;
+      if (select_list.size() > 1) {
+        auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
+          duckdb::ExpressionType::CONJUNCTION_AND);
+        for (auto& expr : select_list) {
+          conjunction->children.push_back(std::move(expr));
+        }
+        combined = std::move(conjunction);
+      } else {
+        combined = std::move(select_list[0]);
+      }
       filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(
-        sirius::from_duckdb_vec(filter_types), std::move(select_list), op.estimated_cardinality);
+        sirius::from_duckdb_vec(filter_types),
+        sirius::wrap(std::move(combined)),
+        op.estimated_cardinality);
     }
   }
   op.ResolveOperatorTypes();
@@ -181,7 +196,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
     duckdb::unique_ptr<sirius::op::sirius_physical_projection> projection =
       duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-        sirius::from_duckdb_vec(types), std::move(expressions), op.estimated_cardinality);
+        sirius::from_duckdb_vec(types),
+        sirius::wrap_many(std::move(expressions)),
+        op.estimated_cardinality);
     if (filter) {
       filter->children.push_back(std::move(node));
       projection->children.push_back(std::move(filter));

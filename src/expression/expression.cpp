@@ -23,6 +23,8 @@
 
 namespace sirius {
 
+expression::expression() noexcept = default;
+
 expression::expression(std::unique_ptr<impl> p) noexcept : _impl(std::move(p)) {}
 
 expression::~expression() = default;
@@ -40,6 +42,17 @@ expression wrap(std::unique_ptr<duckdb::Expression> expr)
 std::vector<expression> wrap_many(std::vector<std::unique_ptr<duckdb::Expression>> exprs)
 {
   std::vector<expression> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(wrap(std::move(e)));
+  }
+  return out;
+}
+
+duckdb::vector<expression> wrap_many(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+{
+  duckdb::vector<expression> out;
   out.reserve(exprs.size());
   for (auto& e : exprs) {
     out.push_back(wrap(std::move(e)));
