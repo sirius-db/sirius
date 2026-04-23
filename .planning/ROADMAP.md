@@ -66,7 +66,7 @@ Plans:
 Plans:
 - [x] 03-01-PLAN.md — Sweep all operator casts, data repository signatures, idle batch accessors, and verify clean build
 - [x] 03-02-PLAN.md — Gap closure: migrate legacy expression executor accessors and verify clean build
-- [ ] 03-03-PLAN.md — Gap closure: commit uncommitted API fixes and verify clean build from committed HEAD
+- [x] 03-03-PLAN.md — Gap closure: commit uncommitted API fixes and verify clean build from committed HEAD
 
 ## Progress
 
