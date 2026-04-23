@@ -47,70 +47,51 @@ TIME ═══> [ GPU compute+partition batch 1 ][ GPU compute+partition batch 2
 
 ### Current Architecture (Blocking)
 
+```mermaid
+graph LR
+    subgraph core["Sirius Core (C++)"]
+        GPU["GPU Pipeline\nExecutor"] --> RC["Result Collector\n(partitions + packs)"] --> CAPI["C API\n(blocking)"]
+    end
+    subgraph rust["Sirius Backend (Rust)"]
+        GRPC["gRPC Service"] --> NIXL["NIXL Exchange"] --> BUMP["Staging Bump\nAllocator"]
+    end
+    CAPI -->|"blocking FFI"| GRPC
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Sirius Core (C++)                       │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ GPU Pipeline  │───>│   Result     │───>│  C API       │  │
-│  │ Executor      │    │  Collector   │    │  (blocking)  │──┼──┐
-│  │               │    │ (partitions  │    │              │  │  │
-│  │               │    │  + packs)    │    │              │  │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │  │
-└─────────────────────────────────────────────────────────────┘  │
-                                                                 │
-┌─────────────────────────────────────────────────────────────┐  │
-│                  Sirius Backend (Rust)                       │  │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │  │
-│  │ Staging Bump  │<───│  NIXL        │<───│  gRPC        │<─┼──┘
-│  │ Allocator     │───>│  Exchange    │───>│  Service     │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+
+```
+TIME ═══> [  GPU compute  ][  BLOCKING  ][  NIXL transfer  ][  BLOCKING  ]
 ```
 
 ### Proposed Architecture (Overlapped)
 
+```mermaid
+graph TB
+    subgraph core["Sirius Core (C++)"]
+        GPU["GPU Pipeline Executor\noperators → exchange_partition (sink)"]
+        GPU -->|publish| REPO["shared_data_repo\n(per-partition)"]
+        REPO -->|"task_creator\nschedules"| COMM
+
+        subgraph COMM["Communication Executor"]
+            ML["Manager Loop\n(bounce buffer sub-alloc)"] -->|dispatch| WP["Worker Pool"]
+        end
+
+        WP -->|"Phase 1: pack into bounce buffer"| WP
+        WP -->|"Phase 3: RDMA transfer"| NIXL_CPP["NIXL C++ API\n(direct call)"]
+    end
+
+    subgraph rust["Sirius Backend (Rust)"]
+        TC["tonic gRPC Client\n(ExchangeMetadata,\nTransferComplete)"]
+        TS["tonic gRPC Server\n→ FFI into C++:\nreserve_recv_buffer()\ningest_transfer()"]
+    end
+
+    WP -->|"Phase 2: send metadata\nPhase 4: send complete\n(FFI)"| TC
+    TS -->|"FFI"| core
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                          Sirius Core (C++)                            │
-│                                                                       │
-│  GPU Pipeline Executor                                                │
-│  ┌────────────────────────────────────────────┐                       │
-│  │ operators... → exchange_partition (sink)    │                       │
-│  │   (hash_partition + pack per partition)     │                       │
-│  └─────────────────────┬──────────────────────┘                       │
-│                        │ publish to                                    │
-│                        v                                              │
-│              ┌────────────────────┐                                    │
-│              │  shared_data_repo   │  (per-partition exchange repos)   │
-│              └────────┬───────────┘                                    │
-│                       │ task_creator watches repos,                    │
-│                       │ creates communication_task per partition       │
-│                       v                                               │
-│  Communication Executor                                               │
-│  ┌────────────────────────────────────────────┐                       │
-│  │ Manager Loop         Worker Pool            │                       │
-│  │ ┌─────────────┐     ┌────────────────────┐ │                       │
-│  │ │ reserve slot │────>│ 1. pack to staging │ │                       │
-│  │ │ make reserv. │     │ 2. register (NIXL) │ │  C++ direct           │
-│  │ │ dispatch     │     │ 3. send metadata ──┼─┼──── FFI ──> Rust     │
-│  │ └─────────────┘     │ 4. RDMA transfer   │ │  C++ direct (NIXL)   │
-│  │                      │ 5. send complete ──┼─┼──── FFI ──> Rust     │
-│  │                      └────────────────────┘ │                       │
-│  └────────────────────────────────────────────┘                       │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
-┌───────────────────────────────────────────────────────────────────────┐
-│                      Sirius Backend (Rust)                            │
-│  gRPC Client (tonic)           gRPC Server (tonic)                    │
-│  ┌──────────────────┐         ┌──────────────────────────────┐        │
-│  │ ExchangeMetadata  │         │ ExchangeMetadata handler     │        │
-│  │ TransferComplete  │         │   → FFI into C++:            │        │
-│  │ (called by C++    │         │     reserve_recv_buffer()    │        │
-│  │  worker threads)  │         │ TransferComplete handler     │        │
-│  └──────────────────┘         │   → FFI into C++:            │        │
-│                                │     ingest_transfer()        │        │
-│                                └──────────────────────────────┘        │
-└───────────────────────────────────────────────────────────────────────┘
+
+```
+TIME ═══> [ GPU compute+partition batch1 ][ GPU compute+partition batch2 ]
+                  [ staging+RDMA batch1  ][ staging+RDMA batch2  ]
+                          ^^^ OVERLAPPED ^^^
 ```
 
 ### Component Ownership
@@ -199,39 +180,42 @@ The manager does **not** pack data — packing happens in the worker thread so t
 
 Each worker thread executes a 4-phase transfer lifecycle:
 
+```mermaid
+sequenceDiagram
+    participant W as Worker Thread (C++)
+    participant BB as Bounce Buffer<br/>(pre-registered)
+    participant NIXL as NIXL C++ API
+    participant R as Rust tonic (FFI)
+    participant RX as Remote Receiver
+
+    Note over W,BB: Phase 1 — Pack (CUDA stream)
+    W->>BB: cudf::chunked_pack into sub-region
+    Note right of BB: GPU bounce: D2D pack<br/>Host bounce: pack + cudaMemcpyDtoH
+    W->>W: cudaStreamSynchronize
+
+    Note over W,R: Phase 2 — Metadata Exchange (FFI → Rust)
+    W->>R: sirius_exchange_send_metadata()
+    R->>RX: ExchangeMetadata gRPC
+    RX-->>R: dst addresses + NIXL metadata
+    R-->>W: response
+
+    Note over W,NIXL: Phase 3 — RDMA Transfer (C++ direct)
+    W->>NIXL: createXferReq() + postXferReq()
+    loop Poll
+        W->>NIXL: getXferStatus()
+    end
+    Note right of NIXL: NIC-driven, no GPU involved
+
+    Note over W,R: Phase 4 — Completion (FFI → Rust)
+    W->>R: sirius_exchange_send_complete()
+    R->>RX: TransferComplete gRPC
+    W->>BB: release lease (no deregistration)
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Phase 1 — Pack into bounce buffer (CUDA stream)         │
-│   Acquire stream from _stream_pool                      │
-│   cudf::chunked_pack into bounce buffer sub-region      │
-│   (GPU bounce: D2D pack directly)                       │
-│   (Host bounce: pack to GPU temp, then cudaMemcpyDtoH)  │
-│   cudaStreamSynchronize — wait for pack to complete     │
-│   No NIXL registration needed — bounce buffer is        │
-│   pre-registered at startup                             │
-├─────────────────────────────────────────────────────────┤
-│ Phase 2 — Metadata Exchange (FFI → Rust tonic)          │
-│   Send ExchangeMetadata gRPC to receiver                │
-│   Include pre-cached NIXL metadata (no fresh packing)   │
-│   Wait for response: dst buffer addresses + NIXL meta   │
-├─────────────────────────────────────────────────────────┤
-│ Phase 3 — RDMA Transfer (C++ direct — no stream needed) │
-│   Load receiver NIXL metadata (cached per peer)         │
-│   createXferReq() + postXferReq()                       │
-│   Poll getXferStatus() until complete                   │
-│   (RDMA NIC drives transfer, GPU not involved)          │
-├─────────────────────────────────────────────────────────┤
-│ Phase 4 — Completion (FFI → Rust tonic)                 │
-│   Send TransferComplete gRPC to receiver                │
-│   Release bounce buffer lease (no deregistration)       │
-└─────────────────────────────────────────────────────────┘
-```
 
-**Stream usage:** Only Phase 1 needs a CUDA stream — `cudf::chunked_pack` runs GPU kernels to serialize table data into a contiguous buffer. For host bounce buffers, an additional `cudaMemcpyDtoH` is needed after packing. The NIXL API is entirely stream-agnostic; transfers are driven by the RDMA NIC hardware (via UCX/GPUDirect RDMA), not GPU kernels.
-
-**No per-transfer registration:** The bounce buffer is pre-registered with NIXL at `SiriusContext` startup. Worker threads only need the pre-cached NIXL metadata — no `registerMem()`, `ucp_mem_map()`, or `ucp_rkey_pack()` calls during the transfer hot path.
-
-**Boundary crossing summary:** NIXL operations (phases 1, 3) are called directly from C++ — NIXL is a native C++ library (`doris/thirdparty/nixl/src/api/cpp/`). gRPC operations (phases 2, 4) cross into Rust via `extern "C"` FFI. The RDMA hot path stays in C++; only the metadata RPCs (small messages, two round-trips per transfer) cross the boundary.
+**Key points:**
+- Only Phase 1 uses a CUDA stream. NIXL is stream-agnostic (RDMA NIC-driven).
+- No per-transfer NIXL registration — bounce buffer is pre-registered at startup.
+- NIXL (phases 1, 3) called directly from C++. gRPC (phases 2, 4) crosses FFI into Rust.
 
 ### FFI Surface (C++ → Rust, sender side)
 
@@ -379,14 +363,13 @@ In `task_creator` (`src/creator/task_creator.cpp`):
 - Routes the task to `communication_executor` instead of `gpu_pipeline_executor`
 
 Data flow:
-```
-GPU pipeline task
-  → operators... → exchange_partition (sink)
-    → cudf::hash_partition + cudf::pack
-    → publish per-partition data to exchange data repos
-      → task_creator detects ready partition
-        → creates communication_task
-          → communication_executor handles transfer
+
+```mermaid
+graph LR
+    GPU["GPU pipeline task"] --> EXP["exchange_partition\n(hash_partition + pack)"]
+    EXP --> REPO["exchange data repos\n(per-partition)"]
+    REPO -->|"task_creator\ndetects ready"| CT["communication_task"]
+    CT --> CE["communication_executor\n(bounce buffer → RDMA)"]
 ```
 
 ## Integration Points
@@ -422,27 +405,28 @@ This is configurable via `sirius.yaml` so deployments can tune per-cluster.
 
 #### Bounce Buffer Lifecycle
 
-```
-SiriusContext::initialize()
-  │
-  ├─ GPU bounce buffer path (bounce_buffer.location = "vram"):
-  │    memory_space = cuCascade GPU tier memory space (memory_reservation_manager)
-  │    reservation = memory_space->make_reservation(bounce_buffer.size)
-  │    buffer_ptr = allocate from cuCascade GPU tier (contiguous GPU region)
-  │    nixl_agent->registerMem(buffer_ptr, size, VRAM_SEG)   // one-time
-  │    cache NIXL metadata for this buffer                    // one-time
-  │
-  └─ Host bounce buffer path (bounce_buffer.location = "dram"):
-       memory_space = cuCascade HOST tier memory space (fixed_size_host_memory_resource)
-       reservation = memory_space->make_reservation(bounce_buffer.size)
-       buffer_ptr = allocate from cuCascade HOST tier (pinned host memory)
-       nixl_agent->registerMem(buffer_ptr, size, DRAM_SEG)   // one-time
-       cache NIXL metadata for this buffer                    // one-time
+```mermaid
+flowchart TD
+    INIT["SiriusContext::initialize()"]
+    INIT --> CHECK{bounce_buffer.location?}
 
-  → cuCascade reservation held for SiriusContext lifetime (not reclaimable by downgrade)
-  → Per-transfer: bump allocator sub-allocates within bounce buffer (no cuCascade calls)
-  → SiriusContext::terminate(): deregister from NIXL, release cuCascade reservation
+    CHECK -->|vram| GPU_ALLOC["cuCascade GPU tier\nmemory_space→make_reservation(size)"]
+    CHECK -->|dram| HOST_ALLOC["cuCascade HOST tier\nmemory_space→make_reservation(size)"]
+
+    GPU_ALLOC --> GPU_REG["nixl_agent→registerMem(ptr, VRAM_SEG)\n+ cache NIXL metadata"]
+    HOST_ALLOC --> HOST_REG["nixl_agent→registerMem(ptr, DRAM_SEG)\n+ cache NIXL metadata"]
+
+    GPU_REG --> READY["Bounce buffer ready\n(send + recv)"]
+    HOST_REG --> READY
+
+    READY -->|per-transfer| BUMP["Bump allocator sub-allocates\n(mutex + offset increment,\nno cuCascade calls)"]
+    BUMP -->|all leases released| RESET["Offset resets to 0"]
+    RESET --> BUMP
+
+    READY -->|SiriusContext::terminate| CLEANUP["Deregister from NIXL\nRelease cuCascade reservation"]
 ```
+
+The cuCascade reservation is held for the process lifetime and is **not reclaimable** by the downgrade executor.
 
 #### Sender and Receiver Bounce Buffers
 
@@ -461,57 +445,75 @@ A single bounce buffer is shared across all worker threads in the communication 
 
 Per-transfer sub-allocation does **not** go through cuCascade reservations. The bounce buffer is reserved from cuCascade once at startup; after that, the bump allocator manages space within the bounce buffer directly (mutex + offset increment).
 
-```
-┌──────────────────────────────────────────────────────┐
-│                  Bounce Buffer (4 GB)                 │
-│          (one cuCascade reservation at startup)       │
-│          (one NIXL registration at startup)           │
-│                                                      │
-│  ┌──────────┬──────────┬──────────┬────────────────┐ │
-│  │ Worker 1 │ Worker 2 │ Worker 3 │    Free        │ │
-│  │ (RDMA    │ (packing)│ (RDMA    │                │ │
-│  │  in-flgt)│          │  in-flgt)│                │ │
-│  └──────────┴──────────┴──────────┴────────────────┘ │
-│  ^                                ^                  │
-│  base                          offset                │
-│                                                      │
-│  Leases: 3 active                                    │
-│  When all leases drop → offset resets to 0           │
-└──────────────────────────────────────────────────────┘
+```mermaid
+block-beta
+    columns 6
+    block:header:6
+        columns 1
+        h["Bounce Buffer (4 GB) — 1 cuCascade reservation, 1 NIXL registration at startup"]
+    end
+    w1["Worker 1\n(RDMA in-flight)"]:1
+    w2["Worker 2\n(packing)"]:1
+    w3["Worker 3\n(RDMA in-flight)"]:1
+    free["Free"]:3
+
+    style w1 fill:#4a9,color:#fff
+    style w2 fill:#49a,color:#fff
+    style w3 fill:#4a9,color:#fff
+    style free fill:#ddd,color:#333
 ```
 
-- 256-byte aligned sub-allocations
-- Epoch-based reset: when all active leases are released, offset resets to 0
-- Overflow: if the bump allocator is full, fall back to per-transfer cuCascade reservation + NIXL registration (slow path, logged as warning)
+- 256-byte aligned sub-allocations, managed by bump pointer (mutex + offset increment)
+- Epoch-based reset: when all active leases release → offset resets to 0
+- Overflow: fall back to per-transfer cuCascade reservation + NIXL registration (slow path)
 
 ### Sender Flow (with bounce buffer)
 
-```
-task_creator creates communication_task with packed partition data
-  → communication_executor manager_loop
-    → sub-allocate from send bounce buffer (bump allocator)
-    → if overflow: fall back to per-transfer reservation + registration
-    → attach bounce buffer lease to task local state
-    → dispatch to worker thread
-      → worker: cudf::chunked_pack into bounce buffer sub-region (CUDA stream)
-      → worker: if host bounce buffer: cudaMemcpyDtoH from GPU to bounce sub-region
-      → worker: NIXL transfer from pre-registered bounce buffer (no registration needed)
-      → worker: release lease after transfer complete
+```mermaid
+sequenceDiagram
+    participant TC as task_creator
+    participant ML as Manager Loop
+    participant BB as Send Bounce Buffer
+    participant W as Worker Thread
+
+    TC->>ML: communication_task (packed partition)
+    ML->>BB: try_allocate(packed_bytes)
+    alt bounce buffer has space
+        BB-->>ML: lease
+    else overflow
+        Note over ML: fall back to per-transfer<br/>cuCascade reservation + NIXL reg
+    end
+    ML->>W: dispatch(task + lease)
+    W->>BB: cudf::chunked_pack into sub-region
+    W->>W: NIXL transfer (pre-registered, no reg needed)
+    W->>BB: release lease
 ```
 
 ### Receiver Flow (with bounce buffer)
 
-```
-ExchangeMetadata RPC arrives (Rust → C++ FFI)
-  → sub-allocate from recv bounce buffer (bump allocator)
-  → if overflow: fall back to per-transfer reservation + registration
-  → return pre-registered bounce buffer addresses (no NIXL registration)
-  → ... RDMA transfer writes directly into bounce buffer sub-region ...
-TransferComplete RPC arrives (Rust → C++ FFI)
-  → cudf::unpack() from bounce buffer sub-region → cuDF table → data_batch
-  → push to shared_data_repository (data copied out of bounce buffer)
-  → release bounce buffer lease
-  → task_creator->schedule(downstream operator)
+```mermaid
+sequenceDiagram
+    participant S as Sender (remote)
+    participant R as Rust gRPC Server
+    participant CPP as C++ (FFI)
+    participant BB as Recv Bounce Buffer
+    participant REPO as shared_data_repo
+
+    S->>R: ExchangeMetadata gRPC
+    R->>CPP: sirius_exchange_reserve_recv_buffer()
+    CPP->>BB: try_allocate(total_size)
+    BB-->>CPP: lease (pre-registered addr)
+    CPP-->>R: dst addresses + cached NIXL metadata
+    R-->>S: response
+
+    Note over S,BB: RDMA writes directly into bounce buffer sub-region
+
+    S->>R: TransferComplete gRPC
+    R->>CPP: sirius_exchange_ingest_transfer()
+    CPP->>CPP: cudf::unpack() → data_batch
+    CPP->>REPO: push data_batch
+    CPP->>BB: release lease
+    CPP->>CPP: task_creator→schedule(downstream)
 ```
 
 ## Configuration
