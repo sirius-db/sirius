@@ -170,9 +170,9 @@ class pipelineable_operator_data : public operator_data {
    * @param stream                  CUDA stream used for any data-movement kernels.
    * @return Processing handles for all batches, or std::nullopt on lock failure.
    */
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>>
-  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                         rmm::cuda_stream_view stream) override;
+  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space,
+    rmm::cuda_stream_view stream) override;
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
