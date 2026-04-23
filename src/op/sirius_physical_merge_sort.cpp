@@ -83,15 +83,13 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
-  // Collect valid batches and find memory space
-  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
+  // Find memory space
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
     if (!space) { space = batch.get_memory_space(); }
-    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
   }
 
-  if (valid_batches.empty() || !space) {
+  if (input_batches.empty() || !space) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
@@ -99,9 +97,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   // Helper lambda to apply final projection to a batch (removes sort-key-only columns)
   auto apply_final_projection =
     [this, stream, space](
-      std::shared_ptr<cucascade::data_batch> batch) -> std::shared_ptr<cucascade::data_batch> {
-    if (_final_projections.empty() || !batch) { return batch; }
-    auto table_view = sirius::get_cudf_table_view(*batch);
+      const cucascade::read_only_data_batch& ro) -> std::shared_ptr<cucascade::data_batch> {
+    auto table_view = sirius::get_cudf_table_view(ro);
     std::vector<cudf::column_view> projected_cols;
     for (auto idx : _final_projections) {
       projected_cols.push_back(table_view.column(static_cast<cudf::size_type>(idx)));
@@ -112,9 +109,15 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   };
 
   // Single batch: no merge needed
-  if (valid_batches.size() == 1) {
+  if (input_batches.size() == 1) {
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
-    outputs.push_back(apply_final_projection(valid_batches[0]));
+    if (_final_projections.empty()) {
+      auto ro_vec =
+        const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
+      outputs.push_back(cucascade::data_batch::to_idle(std::move(ro_vec[0])));
+    } else {
+      outputs.push_back(apply_final_projection(input_batches[0]));
+    }
     return std::make_unique<pipelineable_operator_data>(outputs);
   }
 
@@ -140,10 +143,17 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   }
 
   auto merged_batch = gpu_merge_impl::merge_order_by(
-    valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
+    input_batches, order_key_idx, column_order, null_precedence, stream, *space);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
-  if (merged_batch) { outputs.push_back(apply_final_projection(std::move(merged_batch))); }
+  if (merged_batch) {
+    if (_final_projections.empty()) {
+      outputs.push_back(std::move(merged_batch));
+    } else {
+      auto ro = merged_batch->to_read_only();
+      outputs.push_back(apply_final_projection(ro));
+    }
+  }
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 

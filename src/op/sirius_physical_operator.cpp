@@ -47,6 +47,8 @@ pipelineable_operator_data::prepare_for_processing(
     }
     std::optional<::cucascade::read_only_data_batch> handle;
     try {
+      // WSM TODO: this should not return a nullopt, if it does, we should throw an exception
+      // instead of returning std::nullopt
       handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory&) {
       SIRIUS_LOG_ERROR(

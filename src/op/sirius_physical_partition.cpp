@@ -182,12 +182,10 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
   }
 
-  // Clone the read_only batch; clone() returns an already-idle shared_ptr<data_batch>
-  auto input_batch = input_batch_ro.clone(sirius::get_next_batch_id(), stream);
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
-      partitioned_results = gpu_partition_impl::hash_partition(input_batch,
+      partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
                                                                _partition_keys,
                                                                _partition_key_cast_types,
                                                                _num_partitions.value(),
@@ -197,10 +195,13 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
     case PartitionType::EVENLY:
-      partitioned_results =
-        gpu_partition_impl::evenly_partition(input_batch, _num_partitions.value(), stream, *space);
+      partitioned_results = gpu_partition_impl::evenly_partition(
+        input_batch_ro, _num_partitions.value(), stream, *space);
       break;
-    case PartitionType::NONE: partitioned_results = {input_batch}; break;
+    case PartitionType::NONE: {
+      partitioned_results = {input_batch_ro.clone(sirius::get_next_batch_id(), stream)};
+      break;
+    }
     case PartitionType::CUSTOM:
       throw std::runtime_error("Custom partitioning is not implemented yet");
     default:

@@ -153,11 +153,14 @@ TEST_CASE("Hash partition basic", "[operator][hash_partition]")
   std::vector<int> partition_key_idx        = {0, 1};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
-  // Create batch and acquire processing handle (replaces old pin() call)
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches = gpu_partition_impl::hash_partition(
-    input_batch, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::hash_partition(
+      ro, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
   validate_hash_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -175,10 +178,13 @@ TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  REQUIRE_THROWS_AS(
-    gpu_partition_impl::hash_partition(
-      input_batch, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space),
-    std::runtime_error);
+  {
+    auto ro = input_batch->to_read_only();
+    REQUIRE_THROWS_AS(
+      gpu_partition_impl::hash_partition(
+        ro, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space),
+      std::runtime_error);
+  }
 }
 
 TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
@@ -195,8 +201,12 @@ TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
 
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches = gpu_partition_impl::hash_partition(
-    input_batch, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::hash_partition(
+      ro, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
   validate_hash_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -218,8 +228,12 @@ TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash
 
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches = gpu_partition_impl::hash_partition(
-    input_batch, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::hash_partition(
+      ro, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
   validate_hash_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -237,8 +251,12 @@ TEST_CASE("Hash partition with num partitions larger than input size", "[operato
 
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches = gpu_partition_impl::hash_partition(
-    input_batch, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::hash_partition(
+      ro, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
   validate_hash_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -303,8 +321,12 @@ TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches = gpu_partition_impl::evenly_partition(
-    input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::evenly_partition(
+      ro, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
   validate_evenly_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -321,8 +343,12 @@ TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partitio
 
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches = gpu_partition_impl::evenly_partition(
-    input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::evenly_partition(
+      ro, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
   validate_evenly_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -340,7 +366,11 @@ TEST_CASE("Evenly partition basic with num partitions larger than input size",
 
   auto input_batch =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches = gpu_partition_impl::evenly_partition(
-    input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::evenly_partition(
+      ro, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
   validate_evenly_partition(*input_batch, output_batches, num_partitions);
 }

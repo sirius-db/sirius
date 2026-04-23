@@ -84,9 +84,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
-    // Re-acquire idle handle for impl functions that need shared_ptr<data_batch>
-    auto idle_batch = input_batch.clone(sirius::get_next_batch_id(), stream);
-    auto result     = gpu_aggregate_impl::local_grouped_aggregate(idle_batch,
+    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,

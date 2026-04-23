@@ -486,12 +486,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
-  valid_batches.reserve(input_batches.size());
-  for (auto const& batch : input_batches) {
-    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
-  }
-  if (valid_batches.empty()) {
+  if (input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
@@ -504,11 +499,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
 
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
-  if (valid_batches.size() == 1) {
-    merged_batch = valid_batches[0];
+  if (input_batches.size() == 1) {
+    merged_batch = input_batches[0].clone(sirius::get_next_batch_id(), stream);
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-      valid_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
+      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
   }
 
   if (!layout.has_avg) {

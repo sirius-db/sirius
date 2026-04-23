@@ -182,13 +182,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   }
   const auto& input_batches = partitioned_input_data->get_read_only_batches();
   auto partition_idx        = partitioned_input_data->get_partition_idx();
-  // Collect valid batches as idle handles for downstream processing
-  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
-  valid_batches.reserve(input_batches.size());
-  for (auto const& batch : input_batches) {
-    valid_batches.push_back(batch.clone(sirius::get_next_batch_id(), stream));
-  }
-  if (valid_batches.empty()) {
+  if (input_batches.empty()) {
     return std::make_unique<partitioned_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
   }
@@ -198,10 +192,10 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
-  if (valid_batches.size() == 1) {
-    output_batches.push_back(valid_batches[0]);
+  if (input_batches.size() == 1) {
+    output_batches.push_back(input_batches[0].clone(sirius::get_next_batch_id(), stream));
   } else {
-    auto merged_batch = gpu_merge_impl::concat(valid_batches, stream, *space);
+    auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space);
     output_batches.push_back(std::move(merged_batch));
   }
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
