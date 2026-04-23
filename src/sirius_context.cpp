@@ -20,6 +20,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "log/logging.hpp"
+#include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -207,8 +208,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       if (fsmr != nullptr) {
         small_pinned_allocator_ =
           std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr);
+        small_pinned_allocator_view_.emplace(
+          sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
         prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
-        prev_pinned_mr_        = cudf::set_pinned_memory_resource(*small_pinned_allocator_);
+        prev_pinned_mr_        = cudf::set_pinned_memory_resource(
+          rmm::host_device_async_resource_ref{*small_pinned_allocator_view_});
         cudf::set_allocate_host_as_pinned_threshold(
           cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
         spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
@@ -301,6 +305,7 @@ void SiriusContext::terminate()
 
   // Release the slab allocator before tearing down the memory manager, since
   // its owned_allocations_ will return blocks back to the fixed_size_host_memory_resource.
+  small_pinned_allocator_view_.reset();
   small_pinned_allocator_.reset();
 
   memory_manager_->shutdown();

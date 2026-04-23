@@ -55,7 +55,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalExpr
   // }
   // return std::move(chunk_scan);
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
   for (idx_t expression_idx = 0; expression_idx < op.expressions.size(); expression_idx++) {
     SIRIUS_LOG_DEBUG("Expression idx: {}", expression_idx);
     if (op.expressions[expression_idx].size() > 1) {

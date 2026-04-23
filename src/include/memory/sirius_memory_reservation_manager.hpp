@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -36,7 +36,7 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
  private:
   // Previous cuDF device resources, saved in constructor and restored in destructor
   // to prevent dangling references after our custom GPU allocators are torn down.
-  std::vector<rmm::mr::device_memory_resource*> prev_device_mrs_;
+  std::vector<rmm::device_async_resource_ref> prev_device_mrs_;
 };
 
 }  // namespace memory

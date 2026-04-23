@@ -23,7 +23,15 @@
 #include "helper/common.h"
 #include "utils.hpp"
 
+#include <rmm/version_config.hpp>
+
 namespace duckdb {
+
+#if (RMM_VERSION_MAJOR > 26) || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
+using gpu_pool_memory_resource = rmm::mr::pool_memory_resource;
+#else
+using gpu_pool_memory_resource = rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>;
+#endif
 
 // Declaration of the CUDA kernel
 template <typename T>
@@ -112,7 +120,12 @@ class GPUBufferManager {
   vector<size_t> available_gpu_cache_size;
 
   rmm::mr::cuda_memory_resource* cuda_mr;
-  rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>* mr;
+  gpu_pool_memory_resource* mr;
+
+  [[nodiscard]] rmm::device_async_resource_ref get_mr_ref() const
+  {
+    return rmm::device_async_resource_ref{*mr};
+  }
 
   template <typename T>
   T* customCudaMalloc(size_t size, int gpu, bool caching);

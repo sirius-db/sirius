@@ -25,6 +25,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
@@ -217,7 +218,7 @@ inline bool expect_data_batches_equivalent(const std::shared_ptr<cucascade::data
 
   // If sort is requested, sort both tables by all columns
   if (sort) {
-    auto mr     = rmm::mr::get_current_device_resource();
+    auto mr     = cudf::get_current_device_resource_ref();
     auto stream = cudf::get_default_stream();
 
     // Create column indices for sorting (all columns)
@@ -274,7 +275,7 @@ inline bool expect_data_batch_equivalent_to_table(
 
   // If sort is requested, sort both tables by all columns
   if (sort) {
-    auto mr     = rmm::mr::get_current_device_resource();
+    auto mr     = cudf::get_current_device_resource_ref();
     auto stream = cudf::get_default_stream();
 
     // Create column indices for sorting (all columns)

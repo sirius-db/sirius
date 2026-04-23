@@ -1874,7 +1874,7 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
         }
 
         // Create and execute the expression
-        sirius::GpuExpressionExecutor executor(*filter_expr, gpuBufferManager->mr);
+        sirius::GpuExpressionExecutor executor(*filter_expr, gpuBufferManager->get_mr_ref());
         executor.SetInputColumns(filter_input_relation);
 
         // Execute the boolean filter expression
@@ -1888,7 +1888,7 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
 
         // Convert boolean bitmap to row_ids using DispatchSelect
         auto [selected_row_ids, selected_count] =
-          sirius::GpuDispatcher::DispatchSelect(bitmap->view(), gpuBufferManager->mr);
+          sirius::GpuDispatcher::DispatchSelect(bitmap->view(), gpuBufferManager->get_mr_ref());
         row_ids  = selected_row_ids;
         count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = selected_count;

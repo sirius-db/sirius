@@ -94,7 +94,7 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
                                                       size_t num_rows = 1000)
 {
   auto stream = cudf::get_default_stream();
-  auto* mr    = gpu_space.get_default_allocator();
+  auto mr     = gpu_space.get_default_allocator();
 
   std::vector<cudf::data_type> col_types                 = {cudf::data_type{cudf::type_id::INT32}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};

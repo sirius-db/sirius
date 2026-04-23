@@ -37,6 +37,7 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
+#include <cstddef>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -206,7 +207,7 @@ stub_operator::execute_fn make_allocating_execute_fn(cucascade::memory::memory_s
     auto* mr =
       gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
     REQUIRE(mr != nullptr);
-    void* scratch = mr->allocate(s, exec_size);
+    void* scratch = mr->allocate(s, exec_size, alignof(std::max_align_t));
 
     auto& pipelineable_input = dynamic_cast<const sirius::op::pipelineable_operator_data&>(input);
     std::vector<std::shared_ptr<cucascade::data_batch>> pass_through;
@@ -216,9 +217,22 @@ stub_operator::execute_fn make_allocating_execute_fn(cucascade::memory::memory_s
     }
     auto out = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(pass_through));
     s.synchronize();
-    mr->deallocate(s, scratch, exec_size);
+    mr->deallocate(s, scratch, exec_size, alignof(std::max_align_t));
     s.synchronize();
     return out;
+  };
+}
+
+stub_operator::execute_fn make_passthrough_execute_fn()
+{
+  return [](const sirius::op::operator_data& input, rmm::cuda_stream_view) {
+    auto& pipelineable_input = dynamic_cast<const sirius::op::pipelineable_operator_data&>(input);
+    std::vector<std::shared_ptr<cucascade::data_batch>> pass_through;
+    pass_through.reserve(pipelineable_input.get_data_batches().size());
+    for (auto const& batch : pipelineable_input.get_data_batches()) {
+      if (batch) { pass_through.push_back(batch); }
+    }
+    return std::make_unique<sirius::op::pipelineable_operator_data>(std::move(pass_through));
   };
 }
 
@@ -260,23 +274,23 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
 //
 // Memory layout:
 //   GPU capacity  = 500 MB
-//   Reservation   = 200 MB
-//   Pre-alloc     = 250 MB (leaves ~50 MB free GPU)
-//   Input data    = ~300 MB host_data_representation (will go over its reservation and over the 50
-//   MB free GPU)
+//   Reservation   = 50 MB
+//   Pre-alloc     = 400 MB (leaves ~100 MB free GPU)
+//   Input data    = ~300 MB host_data_representation (will exceed its reservation and the
+//   remaining free GPU memory)
 //
 // When execute() tries to convert the host data to GPU via lock_or_prepare_batch,
-// the 300 MB allocation exceeds the remaining ~50 MB → rmm::out_of_memory.
+// the 300 MB allocation exceeds the remaining ~100 MB -> rmm::out_of_memory.
 //
-// In the OOM catch handler, peak_bytes ≈ 300 MB (requested) should be recorded to memory history.
+// In the OOM catch handler, peak_bytes ~= 300 MB (requested) should be recorded to memory history.
 // ---------------------------------------------------------------------------
 
 TEST_CASE(
   "gpu_pipeline_task execute OOM in lock_or_prepare_batch records to pipeline memory history",
   "[gpu_pipeline_task][history]")
 {
-  constexpr std::size_t kReservationSize   = 200ULL * 1024 * 1024;  // 200 MB
-  constexpr std::size_t kPreAllocationSize = 250ULL * 1024 * 1024;  // 250 MB
+  constexpr std::size_t kReservationSize   = 50ULL * 1024 * 1024;   // 50 MB
+  constexpr std::size_t kPreAllocationSize = 400ULL * 1024 * 1024;  // 400 MB
   constexpr std::size_t kInputDataSize     = 300ULL * 1024 * 1024;  // 300 MB
   constexpr std::size_t kInputNumRows      = kInputDataSize / sizeof(int64_t);
 
@@ -290,7 +304,7 @@ TEST_CASE(
 
   auto input_batch = f.create_host_data_batch(kInputNumRows, stream_data_init);
 
-  // Pre-allocate GPU memory to create memory pressure
+  // Pre-allocate almost the full device budget so input materialization must overflow.
   auto pressure_reservation = f.manager->request_reservation(
     cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kPreAllocationSize);
   REQUIRE(pressure_reservation != nullptr);
@@ -302,23 +316,24 @@ TEST_CASE(
 
   pressure_allocator->attach_reservation_to_tracker(
     stream, std::move(pressure_reservation), nullptr, nullptr);
-  void* pressure_alloc = pressure_allocator->allocate(stream, kPreAllocationSize);
+  void* pressure_alloc =
+    pressure_allocator->allocate(stream, kPreAllocationSize, alignof(std::max_align_t));
 
   stream.synchronize();
   pressure_allocator->reset_stream_reservation(stream);
 
-  // Build pipeline (no custom on_execute — OOM happens during lock_or_prepare_batch)
-  auto ctx = create_pipeline_context();
+  // Build pipeline with a no-op operator so any failure comes from input materialization.
+  auto ctx                = create_pipeline_context();
+  ctx.stub_op->on_execute = make_passthrough_execute_fn();
   auto global_state =
     std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
+  // This unit test constructs a minimal pipeline shell, so never run the completion path.
+  task->mark_as_rescheduled();
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
-  task->mark_as_rescheduled();
 
   // Verify: memory history should have one record with the OOM peak_bytes
   REQUIRE(global_state->get_memory_history().size() == 1);
@@ -327,7 +342,8 @@ TEST_CASE(
   REQUIRE(*estimate == kInputDataSize);
 
   // Cleanup: release the pressure allocation
-  pressure_allocator->deallocate(stream, pressure_alloc, kPreAllocationSize);
+  pressure_allocator->deallocate(
+    stream, pressure_alloc, kPreAllocationSize, alignof(std::max_align_t));
   pressure_allocator->reset_stream_reservation(stream);
 }
 
@@ -373,11 +389,9 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
+  task->mark_as_rescheduled();
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
-  task->mark_as_rescheduled();
 
   // Verify: memory history should have one record with the OOM peak_bytes
   REQUIRE(global_state->get_memory_history().size() == 1);
@@ -543,10 +557,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/1);
-    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-    // Mark as rescheduled so the destructor does not call mark_task_completed()
-    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 
   REQUIRE(global_state->get_memory_history().size() == 1);
@@ -564,10 +576,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/2);
-    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-    // Mark as rescheduled so the destructor does not call mark_task_completed()
-    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 
   REQUIRE(global_state->get_memory_history().size() == 1);
@@ -585,10 +595,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/3);
-    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-    // Mark as rescheduled so the destructor does not call mark_task_completed()
-    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 
   REQUIRE(global_state->get_memory_history().size() == 1);
@@ -606,10 +614,8 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/4);
-    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
-    // Mark as rescheduled so the destructor does not call mark_task_completed()
-    // (which would dereference the pipeline's null source operator).
     task->mark_as_rescheduled();
+    REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 
   REQUIRE(global_state->get_memory_history().size() == 2);
