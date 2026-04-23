@@ -79,8 +79,8 @@ if [ "$DROP_OS_CACHE" = true ] && [ "$MULTI_SESSION" = false ]; then
 fi
 
 if [ "$DROP_OS_CACHE" = true ]; then
-    if ! sudo -n true 2>/dev/null; then
-        echo "ERROR: --drop-os-cache requires passwordless sudo."
+    if ! sudo -n -l /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+        echo "ERROR: --drop-os-cache requires passwordless sudo for /usr/bin/tee."
         echo "Configure it with:"
         echo "  echo '\$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches' | sudo tee /etc/sudoers.d/drop_caches"
         exit 1
@@ -318,7 +318,7 @@ run_multi_session() {
         if [ "$DROP_OS_CACHE" = true ]; then
             echo "  Dropping OS filesystem cache..."
             sync
-            if echo 3 | sudo -n tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+            if echo 3 | sudo -n /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
                 echo "  OS cache dropped."
             else
                 echo "  ERROR: Failed to drop OS cache. Configure passwordless sudo:"
