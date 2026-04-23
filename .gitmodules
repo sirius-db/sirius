@@ -13,7 +13,7 @@
 	branch = main
 [submodule "cucascade"]
 	path = cucascade
-	url = https://github.com/mbrobbel/cuCascade.git
+	url = https://github.com/NVIDIA/cuCascade.git
 	branch = main
 [submodule "duckdb-python"]
 	path = duckdb-python
