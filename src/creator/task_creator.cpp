@@ -116,8 +116,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
             op_params.scan_task_batch_size));
       }
     } else {
-      _gpu_operator_global_state_map.emplace(
-        operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
+      auto gs = std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
+      _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
     }
   }
   _num_scans_in_plan =

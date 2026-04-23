@@ -230,7 +230,7 @@ std::string format_decimal128_value(__int128_t raw, int abs_scale)
 }
 
 // ---------------------------------------------------------------------------
-// Timestamp/Date formatting helpers (D-06, D-07, D-08, D-09)
+// Timestamp/Date formatting helpers
 // ---------------------------------------------------------------------------
 
 // Howard Hinnant's civil_from_days algorithm (public domain).
@@ -289,7 +289,7 @@ std::string format_timestamp_ms(int64_t raw_ms)
     fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm_t, ss);
   if (frac_ms != 0) {
     std::string frac = fmt::format(".{:03d}", frac_ms);
-    // Trim trailing zeros from fractional part (D-08)
+    // Trim trailing zeros from fractional part
     while (frac.back() == '0') {
       frac.pop_back();
     }
@@ -316,7 +316,7 @@ std::string format_timestamp_us(int64_t raw_us)
     fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
   if (frac_us != 0) {
     std::string frac = fmt::format(".{:06d}", frac_us);
-    // Trim trailing zeros from fractional part (D-08)
+    // Trim trailing zeros from fractional part
     while (frac.back() == '0') {
       frac.pop_back();
     }
@@ -344,7 +344,7 @@ std::string format_timestamp_ns(int64_t raw_ns)
     fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
   if (frac_ns != 0) {
     std::string frac = fmt::format(".{:09d}", frac_ns);
-    // Trim trailing zeros from fractional part (D-08)
+    // Trim trailing zeros from fractional part
     while (frac.back() == '0') {
       frac.pop_back();
     }
@@ -900,7 +900,7 @@ void debug_stats(cucascade::data_batch const& batch,
       auto type_name   = cudf::type_to_name(col.type());
 
       if (!is_stats_numeric(col.type().id())) {
-        // D-08: Non-numeric columns skipped
+        // Non-numeric columns skipped
         output += fmt::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
                               static_cast<int>(c),
                               name,
@@ -1246,7 +1246,7 @@ void debug_diff(cucascade::data_batch const& batch_a,
           continue;
       }
 
-      // D-01: Report per-column diffs (only if any found)
+      // Report per-column diffs (only if any found)
       if (diff_count > 0) {
         all_identical = false;
         std::string idx_list;
@@ -1325,7 +1325,7 @@ void debug_sample(cucascade::data_batch const& batch,
       return;
     }
 
-    // D-07, D-08: Generate random indices on host via std::mt19937
+    // Generate random indices on host via std::mt19937
     std::mt19937 gen(seed.has_value() ? static_cast<std::mt19937::result_type>(*seed)
                                       : std::random_device{}());
     std::uniform_int_distribution<cudf::size_type> dist(0, tv.num_rows() - 1);

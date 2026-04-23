@@ -18,7 +18,6 @@
 
 // sirius
 #include "downgrade/downgrade_executor.hpp"
-#include "downgrade/downgrade_task.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 // data utilities
