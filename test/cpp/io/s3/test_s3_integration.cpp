@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-// PR15 integration scaffolding — exercises the S3 backend against a live
-// MinIO started by test/integration/s3/docker-compose.yml. Tests are skipped
+// PR15 integration scaffolding - exercises the S3 backend against a live
+// MinIO started by test/cpp/integration/s3/docker-compose.yml. Tests are skipped
 // (SUCCEED) when the SIRIUS_TEST_S3_* env vars are absent so the default
 // `sirius_unittest` run on a dockerless CI runner stays green.
 //
@@ -26,7 +26,7 @@
 // rather than re-covering HEAD / small range GETs already in test_s3_ioctx.
 //
 // The `small.bin` / `medium.bin` fixtures are opaque deterministic blobs (not
-// real parquet) — see test/integration/s3/generate_fixtures.py. The bit-equal
+// real parquet) - see test/cpp/integration/s3/generate_fixtures.py. The bit-equal
 // checks below do not care about file format, only that local and remote
 // bytes match.
 
@@ -115,11 +115,11 @@ std::vector<std::uint8_t> read_file_bytes(std::filesystem::path const& p)
 bool skip_if_env_missing(env_cfg const& e)
 {
   if (!e.present()) {
-    SUCCEED("Skipping: SIRIUS_TEST_S3_* not set (see test/integration/s3/README.md)");
+    SUCCEED("Skipping: SIRIUS_TEST_S3_* not set (see test/cpp/integration/s3/README.md)");
     return true;
   }
   if (!std::filesystem::is_directory(e.local_dir)) {
-    SUCCEED("Skipping: SIRIUS_TEST_S3_LOCAL_DIR not present — run `make s3-up` first");
+    SUCCEED("Skipping: SIRIUS_TEST_S3_LOCAL_DIR not present - run `make s3-up` first");
     return true;
   }
   return false;
@@ -180,7 +180,7 @@ TEST_CASE("s3_integration: small.bin bit-equal via factory",
   REQUIRE(ds != nullptr);
   REQUIRE(ds->size() == local.size());
 
-  // Full-object read — this is the byte sequence a downstream reader would
+  // Full-object read - this is the byte sequence a downstream reader would
   // see. If it diverges from the local file the scan would yield different
   // bytes than the local fixture.
   auto buf = ds->host_read(0, local.size());

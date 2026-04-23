@@ -19,9 +19,9 @@
 #include <utils/sirius_test_env.hpp>
 #include <utils/s3_live_test.hpp>
 
-#include <cstdint>
+#include <array>
 #include <cctype>
-#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
@@ -64,14 +64,17 @@ struct env_cfg {
            !bucket.empty() && !local_dir.empty();
   }
 
-  [[nodiscard]] fs::path small_parquet_path() const { return local_dir / "small.parquet"; }
-
-  [[nodiscard]] std::string small_parquet_uri() const
+  [[nodiscard]] fs::path nation_parquet_path() const
   {
-    return "s3://" + bucket + "/small.parquet";
+    return local_dir / "parquet" / "nation.parquet";
   }
 
-  [[nodiscard]] std::string parquet_uri(std::string const& key) const
+  [[nodiscard]] std::string nation_parquet_uri() const
+  {
+    return "s3://" + bucket + "/parquet/nation.parquet";
+  }
+
+  [[nodiscard]] std::string object_uri(std::string const& key) const
   {
     return "s3://" + bucket + "/" + key;
   }
@@ -92,15 +95,15 @@ env_cfg read_env()
 bool skip_if_env_missing(env_cfg const& cfg)
 {
   if (!cfg.present()) {
-    SUCCEED("Skipping: SIRIUS_TEST_S3_* not set (see test/integration/s3/README.md)");
+    SUCCEED("Skipping: SIRIUS_TEST_S3_* not set (see test/cpp/integration/s3/README.md)");
     return true;
   }
   if (!fs::is_directory(cfg.local_dir)) {
     SUCCEED("Skipping: SIRIUS_TEST_S3_LOCAL_DIR not present - run `make s3-up` first");
     return true;
   }
-  if (!fs::exists(cfg.small_parquet_path())) {
-    SUCCEED("Skipping: small.parquet not generated (install pyarrow and rerun `make s3-up`)");
+  if (!fs::exists(cfg.nation_parquet_path())) {
+    SUCCEED("Skipping: parquet/nation.parquet fixture missing - run `make s3-up` first");
     return true;
   }
   return false;
@@ -117,22 +120,22 @@ std::string sql_quote(std::string value)
   return out;
 }
 
-constexpr std::size_t PARQUET_ROWS  = 256;
-constexpr std::int64_t PARQUET_KNUTH = 2654435761LL;
+constexpr std::size_t NATION_ROWS = 25;
+constexpr std::array<std::int32_t, NATION_ROWS> EXPECTED_REGION_KEYS{
+  0, 1, 1, 1, 4, 0, 3, 3, 2, 2, 4, 4, 2, 4, 0, 0, 0, 1, 2, 3, 4, 2, 3, 3, 1};
+constexpr std::array<char const*, NATION_ROWS> EXPECTED_NATION_NAMES{
+  "ALGERIA", "ARGENTINA", "BRAZIL", "CANADA", "EGYPT", "ETHIOPIA", "FRANCE",
+  "GERMANY", "INDIA", "INDONESIA", "IRAN", "IRAQ", "JAPAN", "JORDAN", "KENYA",
+  "MOROCCO", "MOZAMBIQUE", "PERU", "CHINA", "ROMANIA", "SAUDI ARABIA", "VIETNAM",
+  "RUSSIA", "UNITED KINGDOM", "UNITED STATES"};
 
-std::int64_t expected_v(std::int32_t id) { return static_cast<std::int64_t>(id) * PARQUET_KNUTH; }
-
-std::string expected_s(std::int32_t id)
+std::int64_t expected_sum_regionkeys()
 {
-  char buf[16];
-  std::snprintf(buf, sizeof(buf), "row-%04d", id);
-  return std::string(buf);
-}
-
-std::int64_t expected_sum_v()
-{
-  // Sum_{id=0}^{255} id * K = K * (255 * 256 / 2)
-  return PARQUET_KNUTH * static_cast<std::int64_t>((PARQUET_ROWS - 1) * PARQUET_ROWS / 2);
+  std::int64_t sum = 0;
+  for (auto region_key : EXPECTED_REGION_KEYS) {
+    sum += region_key;
+  }
+  return sum;
 }
 
 std::string lowercase(std::string value)
@@ -161,7 +164,8 @@ class s3_gpu_execution_fixture {
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
-      auto cfg_path = get_project_root() / "test" / "integration" / "s3" / "sirius.yaml";
+      auto cfg_path =
+        get_project_root() / "test" / "cpp" / "integration" / "s3" / "sirius.yaml";
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
       db           = std::make_unique<duckdb::DuckDB>(nullptr);
@@ -240,9 +244,10 @@ TEST_CASE_METHOD(s3_gpu_execution_fixture,
 
   configure_s3(cfg);
 
-  auto const missing_key = "definitely-does-not-exist-" + std::to_string(std::rand()) + ".parquet";
+  auto const missing_key =
+    "parquet/definitely-does-not-exist-" + std::to_string(std::rand()) + ".parquet";
   run_gpu_expect_error(
-    "SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.parquet_uri(missing_key) + "')",
+    "SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.object_uri(missing_key) + "')",
     {"404", "missing", "not found", "no such"});
 }
 
@@ -256,7 +261,7 @@ TEST_CASE_METHOD(s3_gpu_execution_fixture,
   cfg.secret_key = "not-the-right-secret-key";
   configure_s3(cfg);
 
-  run_gpu_expect_error("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.small_parquet_uri() +
+  run_gpu_expect_error("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.nation_parquet_uri() +
                          "')",
                        {"403", "signature", "forbidden", "access denied"});
 }
@@ -270,19 +275,20 @@ TEST_CASE_METHOD(s3_gpu_execution_fixture,
 
   configure_s3(cfg);
 
-  auto cpu = con->Query("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.small_parquet_uri() + "')");
+  auto cpu =
+    con->Query("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.nation_parquet_uri() + "')");
   REQUIRE(cpu);
   if (!cpu->HasError()) {
     UNSCOPED_INFO("Plain CPU s3:// read unexpectedly succeeded without httpfs guard");
   }
   REQUIRE(cpu->HasError());
 
-  auto gpu = run_gpu("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.small_parquet_uri() +
+  auto gpu = run_gpu("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.nation_parquet_uri() +
                      "')");
   REQUIRE(gpu->ColumnCount() == 1);
   REQUIRE(gpu->RowCount() == 1);
   CHECK(gpu->GetValue(0, 0).GetValue<std::int64_t>() ==
-        static_cast<std::int64_t>(PARQUET_ROWS));
+        static_cast<std::int64_t>(NATION_ROWS));
 }
 
 TEST_CASE_METHOD(s3_gpu_execution_fixture,
@@ -294,19 +300,20 @@ TEST_CASE_METHOD(s3_gpu_execution_fixture,
 
   configure_s3(cfg);
 
-  auto result = run_gpu("SELECT id::INTEGER, v::BIGINT, s FROM read_parquet('" +
-                        cfg.small_parquet_uri() + "') ORDER BY id");
+  auto result = run_gpu("SELECT n_nationkey::INTEGER, n_regionkey::INTEGER, n_name "
+                        "FROM read_parquet('" +
+                        cfg.nation_parquet_uri() + "') ORDER BY n_nationkey");
 
   REQUIRE(result->ColumnCount() == 3);
-  REQUIRE(result->RowCount() == PARQUET_ROWS);
-  for (std::size_t i = 0; i < PARQUET_ROWS; ++i) {
-    auto const id = result->GetValue(0, i).GetValue<std::int32_t>();
-    auto const v  = result->GetValue(1, i).GetValue<std::int64_t>();
-    auto const s  = result->GetValue(2, i).GetValue<std::string>();
+  REQUIRE(result->RowCount() == NATION_ROWS);
+  for (std::size_t i = 0; i < NATION_ROWS; ++i) {
+    auto const nation_key = result->GetValue(0, i).GetValue<std::int32_t>();
+    auto const region_key = result->GetValue(1, i).GetValue<std::int32_t>();
+    auto const name       = result->GetValue(2, i).GetValue<std::string>();
 
-    REQUIRE(id == static_cast<std::int32_t>(i));
-    REQUIRE(v == expected_v(id));
-    REQUIRE(s == expected_s(id));
+    REQUIRE(nation_key == static_cast<std::int32_t>(i));
+    REQUIRE(region_key == EXPECTED_REGION_KEYS[i]);
+    REQUIRE(name == EXPECTED_NATION_NAMES[i]);
   }
 }
 
@@ -319,20 +326,22 @@ TEST_CASE_METHOD(s3_gpu_execution_fixture,
 
   configure_s3(cfg);
 
-  auto result = run_gpu("SELECT id::INTEGER, v::BIGINT, s FROM read_parquet('" +
-                        cfg.small_parquet_uri() + "') WHERE id % 17 = 0 ORDER BY id");
+  auto result = run_gpu("SELECT n_nationkey::INTEGER, n_regionkey::INTEGER, n_name "
+                        "FROM read_parquet('" +
+                        cfg.nation_parquet_uri() +
+                        "') WHERE n_regionkey = 1 ORDER BY n_nationkey");
 
   REQUIRE(result->ColumnCount() == 3);
-  REQUIRE(result->RowCount() == 16);
+  constexpr std::array<std::int32_t, 5> expected_keys{1, 2, 3, 17, 24};
+  REQUIRE(result->RowCount() == expected_keys.size());
   for (std::size_t i = 0; i < result->RowCount(); ++i) {
-    auto const expected_id = static_cast<std::int32_t>(i * 17);
-    auto const id          = result->GetValue(0, i).GetValue<std::int32_t>();
-    auto const v           = result->GetValue(1, i).GetValue<std::int64_t>();
-    auto const s           = result->GetValue(2, i).GetValue<std::string>();
+    auto const nation_key = result->GetValue(0, i).GetValue<std::int32_t>();
+    auto const region_key = result->GetValue(1, i).GetValue<std::int32_t>();
+    auto const name       = result->GetValue(2, i).GetValue<std::string>();
 
-    REQUIRE(id == expected_id);
-    REQUIRE(v == expected_v(id));
-    REQUIRE(s == expected_s(id));
+    REQUIRE(nation_key == expected_keys[i]);
+    REQUIRE(region_key == 1);
+    REQUIRE(name == EXPECTED_NATION_NAMES[static_cast<std::size_t>(nation_key)]);
   }
 }
 
@@ -345,15 +354,17 @@ TEST_CASE_METHOD(s3_gpu_execution_fixture,
 
   configure_s3(cfg);
 
-  auto result = run_gpu("SELECT COUNT(*)::BIGINT, MIN(id)::INTEGER, MAX(id)::INTEGER, "
-                        "SUM(v)::BIGINT FROM read_parquet('" + cfg.small_parquet_uri() + "')");
+  auto result = run_gpu("SELECT COUNT(*)::BIGINT, MIN(n_nationkey)::INTEGER, "
+                        "MAX(n_nationkey)::INTEGER, SUM(n_regionkey)::BIGINT "
+                        "FROM read_parquet('" +
+                        cfg.nation_parquet_uri() + "')");
 
   REQUIRE(result->ColumnCount() == 4);
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).GetValue<std::int64_t>() ==
-        static_cast<std::int64_t>(PARQUET_ROWS));
+        static_cast<std::int64_t>(NATION_ROWS));
   CHECK(result->GetValue(1, 0).GetValue<std::int32_t>() == 0);
   CHECK(result->GetValue(2, 0).GetValue<std::int32_t>() ==
-        static_cast<std::int32_t>(PARQUET_ROWS - 1));
-  CHECK(result->GetValue(3, 0).GetValue<std::int64_t>() == expected_sum_v());
+        static_cast<std::int32_t>(NATION_ROWS - 1));
+  CHECK(result->GetValue(3, 0).GetValue<std::int64_t>() == expected_sum_regionkeys());
 }

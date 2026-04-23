@@ -1,7 +1,7 @@
 # Source this file to point the [s3][integration] / [s3][ioctx][integration]
 # tests at the local MinIO container:
 #
-#   source test/integration/s3/env.sh
+#   source test/cpp/integration/s3/env.sh
 #   build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
 #
 # The variable names match what read_env() consumes in
@@ -17,8 +17,8 @@ export SIRIUS_TEST_S3_KEY="${SIRIUS_TEST_S3_KEY:-hello.txt}"
 # so runtime S3 failures turn the job red instead of going green with a skip.
 export SIRIUS_TEST_S3_STRICT="${SIRIUS_TEST_S3_STRICT:-0}"
 
-# The new integration test also wants the local fixtures dir so it can
-# bit-compare S3 bytes against the local copy.
+# Integration tests also want the local fixtures dir so they can bit-compare
+# S3 bytes against the local copy.
 SIRIUS_TEST_S3_LOCAL_DIR_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/local"
 export SIRIUS_TEST_S3_LOCAL_DIR="${SIRIUS_TEST_S3_LOCAL_DIR:-${SIRIUS_TEST_S3_LOCAL_DIR_DEFAULT}}"
 

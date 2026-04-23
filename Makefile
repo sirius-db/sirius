@@ -94,22 +94,23 @@ list-presets: $(PRESETS_LINK)
 # S3 integration test scaffolding (PR15)
 # -----------------------------------------------------------------------------
 # `make s3-up`        starts the pinned MinIO container and populates fixtures
-#                     (binary blobs always; small.parquet if pyarrow is
-#                     installed — drives [s3][parquet][integration]).
+#                     (binary blobs plus the standard integration parquet
+#                     fixtures under test/cpp/integration/data/parquet).
 # `make s3-down`      tears it down (including the data volume).
 # `make s3-test`      alias for `s3-cpp-test`; kept for forward compatibility
 #                     if SQL-level integration returns via a new target later.
 # `make s3-cpp-test`  runs the Catch2 [s3][integration] tag, which also
 #                     selects tests tagged [s3][parquet][integration].
 #
-# See test/integration/s3/README.md for details.
+# See test/cpp/integration/s3/README.md for details.
 
-S3_COMPOSE := test/integration/s3/docker-compose.yml
+S3_DIR := test/cpp/integration/s3
+S3_COMPOSE := $(S3_DIR)/docker-compose.yml
 S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
 
 s3-up:
 	docker compose -f $(S3_COMPOSE) up -d
-	test/integration/s3/fixtures.sh
+	$(S3_DIR)/fixtures.sh
 
 s3-down:
 	docker compose -f $(S3_COMPOSE) down -v
@@ -120,7 +121,7 @@ s3-test: s3-cpp-test
 s3-cpp-test: SHELL := /bin/bash
 s3-cpp-test:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-cpp-test: $(S3_TEST_BIN) not found — run \`make release\` first" >&2; \
+	  echo "s3-cpp-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@source test/integration/s3/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"
+	@source $(S3_DIR)/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"

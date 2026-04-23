@@ -5,8 +5,8 @@
 # commit produces reproducible test behavior over time; bump when a newer
 # stable release is known to work with our SigV4 flow.
 #
-# Bring up:  docker compose -f test/integration/s3/docker-compose.yml up -d
-# Tear down: docker compose -f test/integration/s3/docker-compose.yml down -v
+# Bring up:  docker compose -f test/cpp/integration/s3/docker-compose.yml up -d
+# Tear down: docker compose -f test/cpp/integration/s3/docker-compose.yml down -v
 
 services:
   minio:

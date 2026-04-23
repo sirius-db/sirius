@@ -4,15 +4,17 @@
 # Prerequisites (handled by `make s3-up`):
 #   - MinIO container running at http://127.0.0.1:9000 with credentials
 #     minioadmin/minioadmin (see docker-compose.yml).
-#   - Python 3 (stdlib only — no extra deps).
+#   - Python 3 (stdlib only - no extra deps).
 #
 # Usage:
-#   test/integration/s3/fixtures.sh            # generate + upload
-#   BUCKET=other test/integration/s3/fixtures.sh
+#   test/cpp/integration/s3/fixtures.sh            # generate + upload
+#   BUCKET=other test/cpp/integration/s3/fixtures.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 FIXTURE_DIR="${SCRIPT_DIR}/fixtures/local"
+PARQUET_SOURCE="${SIRIUS_TEST_S3_PARQUET_SOURCE:-${PROJECT_ROOT}/test/cpp/integration/data/parquet}"
 ENDPOINT="${SIRIUS_TEST_S3_ENDPOINT:-http://127.0.0.1:9000}"
 ACCESS_KEY="${SIRIUS_TEST_S3_ACCESS_KEY:-minioadmin}"
 SECRET_KEY="${SIRIUS_TEST_S3_SECRET_KEY:-minioadmin}"
@@ -20,7 +22,9 @@ BUCKET="${SIRIUS_TEST_S3_BUCKET:-sirius-test}"
 MC_IMAGE="${MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
 
 echo "[fixtures] generating local fixtures under ${FIXTURE_DIR}"
-python3 "${SCRIPT_DIR}/generate_fixtures.py" --out "${FIXTURE_DIR}"
+python3 "${SCRIPT_DIR}/generate_fixtures.py" \
+  --out "${FIXTURE_DIR}" \
+  --parquet-source "${PARQUET_SOURCE}"
 
 echo "[fixtures] waiting for MinIO at ${ENDPOINT}"
 for _ in $(seq 1 30); do

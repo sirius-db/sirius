@@ -16,7 +16,7 @@
 
 // Semantic end-to-end test for the Sirius S3 read path:
 //
-//   pyarrow -> small.parquet -> mc cp -> MinIO -> datasource_factory
+//   standard parquet fixture -> mc cp -> MinIO -> datasource_factory
 //     -> sirius s3_ioctx bytes -> DuckDB parquet reader -> row assertions
 //
 // This complements test_s3_integration.cpp which only proves byte equality.
@@ -24,18 +24,15 @@
 // correct, complete, readable object (not e.g. a truncated fetch that still
 // hashes fine against a truncated local copy).
 //
-// The parquet fixture has a closed-form content pattern — see
-// test/integration/s3/generate_fixtures.py: 256 rows of
-//   id INT32  = row index
-//   v  INT64  = (id * Knuth's 2654435761) & INT64_MAX
-//   s  VARCHAR = f"row-{id:04d}"
-// so the expected values are regenerated here without reading the local file.
+// The parquet fixture is copied from test/cpp/integration/data/parquet, so the
+// semantic assertions use the same fixed TPCH content as the regular C++
+// integration tests without needing DuckDB httpfs.
 //
 // Skip conditions (all SUCCEED with a reason):
 //   - SIRIUS_TEST_S3_* env vars unset (same pattern as test_s3_integration)
-//   - small.parquet missing locally — pyarrow wasn't installed when
-//     `make s3-up` generated fixtures, so the object also isn't in S3
-//   - factory::create throws — skipped in best-effort mode, failed in
+//   - parquet/nation.parquet missing locally - `make s3-up` did not populate
+//     fixtures successfully
+//   - factory::create throws - skipped in best-effort mode, failed in
 //     SIRIUS_TEST_S3_STRICT=1 mode
 
 // IMPORTANT: include order mirrors test_parquet_scan_via_factory.cpp.
@@ -52,8 +49,8 @@
 #include "sirius_config.hpp"
 #include "utils/s3_live_test.hpp"
 
+#include <array>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -109,24 +106,22 @@ std::shared_ptr<s3_ioctx> make_ctx(env_cfg const& e)
   return std::make_shared<s3_ioctx>(std::move(cfg));
 }
 
-// Closed-form regeneration of the fixture's patterned columns. Must stay in
-// sync with test/integration/s3/generate_fixtures.py::write_patterned_parquet.
-// The Python mask `& INT64_MAX` only affects overflow > 2^63; for id in
-// [0, 256) and KNUTH ≈ 2.65e9 the product fits in ~40 bits so no mask is
-// needed here.
-constexpr std::size_t PARQUET_ROWS = 256;
-constexpr std::int64_t PARQUET_KNUTH = 2654435761LL;
+constexpr std::size_t NATION_ROWS = 25;
+constexpr std::array<std::int32_t, NATION_ROWS> EXPECTED_REGION_KEYS{
+  0, 1, 1, 1, 4, 0, 3, 3, 2, 2, 4, 4, 2, 4, 0, 0, 0, 1, 2, 3, 4, 2, 3, 3, 1};
+constexpr std::array<char const*, NATION_ROWS> EXPECTED_NATION_NAMES{
+  "ALGERIA", "ARGENTINA", "BRAZIL", "CANADA", "EGYPT", "ETHIOPIA", "FRANCE",
+  "GERMANY", "INDIA", "INDONESIA", "IRAN", "IRAQ", "JAPAN", "JORDAN", "KENYA",
+  "MOROCCO", "MOZAMBIQUE", "PERU", "CHINA", "ROMANIA", "SAUDI ARABIA", "VIETNAM",
+  "RUSSIA", "UNITED KINGDOM", "UNITED STATES"};
 
-std::int64_t expected_v(std::int32_t id)
+std::int64_t expected_sum_regionkeys()
 {
-  return static_cast<std::int64_t>(id) * PARQUET_KNUTH;
-}
-
-std::string expected_s(std::int32_t id)
-{
-  char buf[16];
-  std::snprintf(buf, sizeof(buf), "row-%04d", id);
-  return std::string(buf);
+  std::int64_t sum = 0;
+  for (auto region_key : EXPECTED_REGION_KEYS) {
+    sum += region_key;
+  }
+  return sum;
 }
 
 }  // namespace
@@ -136,16 +131,16 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
 {
   auto e = read_env();
   if (!e.present()) {
-    SUCCEED("Skipping: SIRIUS_TEST_S3_* not set (see test/integration/s3/README.md)");
+    SUCCEED("Skipping: SIRIUS_TEST_S3_* not set (see test/cpp/integration/s3/README.md)");
     return;
   }
   if (!std::filesystem::is_directory(e.local_dir)) {
-    SUCCEED("Skipping: SIRIUS_TEST_S3_LOCAL_DIR not present — run `make s3-up` first");
+    SUCCEED("Skipping: SIRIUS_TEST_S3_LOCAL_DIR not present - run `make s3-up` first");
     return;
   }
-  auto const local_path = e.local_dir / "small.parquet";
+  auto const local_path = e.local_dir / "parquet" / "nation.parquet";
   if (!std::filesystem::exists(local_path)) {
-    SUCCEED("Skipping: small.parquet not generated (install pyarrow and rerun `make s3-up`)");
+    SUCCEED("Skipping: parquet/nation.parquet fixture missing; run `make s3-up` first");
     return;
   }
 
@@ -158,12 +153,12 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
 
   std::unique_ptr<io_datasource> ds;
   try {
-    ds = datasource_factory::create("s3://" + e.bucket + "/small.parquet", reg, cfg);
+    ds = datasource_factory::create("s3://" + e.bucket + "/parquet/nation.parquet", reg, cfg);
   } catch (std::exception const& ex) {
     sirius::test::s3::handle_live_runtime_failure(
       "factory::create failed",
       ex,
-      "Skipping: MinIO unreachable or small.parquet missing in bucket");
+      "Skipping: MinIO unreachable or parquet/nation.parquet missing in bucket");
     return;
   }
   REQUIRE(ds != nullptr);
@@ -190,8 +185,8 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
 
   // ---- stage 3: materialize the remote bytes to a temp file and hand them
   // to DuckDB's parquet reader. This validates the semantic end-to-end path:
-  // if the reader observes different rows than the pattern we seeded in
-  // pyarrow, the s3 pipeline is returning wrong or truncated data.
+  // if the reader observes different rows than the checked-in TPCH fixture,
+  // the s3 pipeline is returning wrong or truncated data.
   auto const tmp_path = std::filesystem::temp_directory_path() /
                         ("sirius_s3_parquet_integration_" +
                          std::to_string(std::rand()) + ".parquet");
@@ -211,51 +206,57 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
 
   auto const parquet_ref = "read_parquet('" + tmp_path.string() + "')";
 
-  // Row count + id range.
-  auto agg = con.Query("SELECT COUNT(*)::BIGINT, MIN(id)::INTEGER, MAX(id)::INTEGER FROM " +
+  // Row count + key range + region distribution.
+  auto agg = con.Query("SELECT COUNT(*)::BIGINT, MIN(n_nationkey)::INTEGER, "
+                       "MAX(n_nationkey)::INTEGER, SUM(n_regionkey)::BIGINT FROM " +
                        parquet_ref);
   REQUIRE(agg);
   REQUIRE(!agg->HasError());
   REQUIRE(agg->RowCount() == 1);
-  CHECK(agg->GetValue(0, 0).GetValue<std::int64_t>() == PARQUET_ROWS);
+  CHECK(agg->GetValue(0, 0).GetValue<std::int64_t>() ==
+        static_cast<std::int64_t>(NATION_ROWS));
   CHECK(agg->GetValue(1, 0).GetValue<std::int32_t>() == 0);
-  CHECK(agg->GetValue(2, 0).GetValue<std::int32_t>() == PARQUET_ROWS - 1);
+  CHECK(agg->GetValue(2, 0).GetValue<std::int32_t>() ==
+        static_cast<std::int32_t>(NATION_ROWS - 1));
+  CHECK(agg->GetValue(3, 0).GetValue<std::int64_t>() == expected_sum_regionkeys());
 
-  // Spot-check the patterned columns at boundary rows. Full-row scan below
-  // then verifies every row — the spot check isolates failures when the full
+  // Spot-check boundary rows. Full-row scan below
+  // then verifies every row - the spot check isolates failures when the full
   // scan reports a mismatch.
-  auto first = con.Query("SELECT id::INTEGER, v::BIGINT, s FROM " + parquet_ref +
-                         " ORDER BY id LIMIT 1");
+  auto first = con.Query("SELECT n_nationkey::INTEGER, n_regionkey::INTEGER, n_name FROM " +
+                         parquet_ref + " ORDER BY n_nationkey LIMIT 1");
   REQUIRE(first);
   REQUIRE(!first->HasError());
   REQUIRE(first->RowCount() == 1);
   CHECK(first->GetValue(0, 0).GetValue<std::int32_t>() == 0);
-  CHECK(first->GetValue(1, 0).GetValue<std::int64_t>() == expected_v(0));
-  CHECK(first->GetValue(2, 0).GetValue<std::string>() == expected_s(0));
+  CHECK(first->GetValue(1, 0).GetValue<std::int32_t>() == EXPECTED_REGION_KEYS[0]);
+  CHECK(first->GetValue(2, 0).GetValue<std::string>() == EXPECTED_NATION_NAMES[0]);
 
-  auto last = con.Query("SELECT id::INTEGER, v::BIGINT, s FROM " + parquet_ref +
-                        " ORDER BY id DESC LIMIT 1");
+  auto last = con.Query("SELECT n_nationkey::INTEGER, n_regionkey::INTEGER, n_name FROM " +
+                        parquet_ref + " ORDER BY n_nationkey DESC LIMIT 1");
   REQUIRE(last);
   REQUIRE(!last->HasError());
   REQUIRE(last->RowCount() == 1);
-  auto const last_id = static_cast<std::int32_t>(PARQUET_ROWS - 1);
+  auto const last_id = static_cast<std::int32_t>(NATION_ROWS - 1);
   CHECK(last->GetValue(0, 0).GetValue<std::int32_t>() == last_id);
-  CHECK(last->GetValue(1, 0).GetValue<std::int64_t>() == expected_v(last_id));
-  CHECK(last->GetValue(2, 0).GetValue<std::string>() == expected_s(last_id));
+  CHECK(last->GetValue(1, 0).GetValue<std::int32_t>() ==
+        EXPECTED_REGION_KEYS[static_cast<std::size_t>(last_id)]);
+  CHECK(last->GetValue(2, 0).GetValue<std::string>() ==
+        EXPECTED_NATION_NAMES[static_cast<std::size_t>(last_id)]);
 
-  // Full-row verification. Stream every row in id order and compare against
-  // the closed-form pattern; a single mismatch fails the test.
-  auto all = con.Query("SELECT id::INTEGER, v::BIGINT, s FROM " + parquet_ref +
-                       " ORDER BY id");
+  // Full-row verification. Stream every row in key order and compare against
+  // the fixed TPCH nation fixture; a single mismatch fails the test.
+  auto all = con.Query("SELECT n_nationkey::INTEGER, n_regionkey::INTEGER, n_name FROM " +
+                       parquet_ref + " ORDER BY n_nationkey");
   REQUIRE(all);
   REQUIRE(!all->HasError());
-  REQUIRE(all->RowCount() == PARQUET_ROWS);
-  for (std::size_t i = 0; i < PARQUET_ROWS; ++i) {
-    auto const id = all->GetValue(0, i).GetValue<std::int32_t>();
-    auto const v  = all->GetValue(1, i).GetValue<std::int64_t>();
-    auto const s  = all->GetValue(2, i).GetValue<std::string>();
-    REQUIRE(id == static_cast<std::int32_t>(i));
-    REQUIRE(v == expected_v(id));
-    REQUIRE(s == expected_s(id));
+  REQUIRE(all->RowCount() == NATION_ROWS);
+  for (std::size_t i = 0; i < NATION_ROWS; ++i) {
+    auto const nation_key = all->GetValue(0, i).GetValue<std::int32_t>();
+    auto const region_key = all->GetValue(1, i).GetValue<std::int32_t>();
+    auto const name       = all->GetValue(2, i).GetValue<std::string>();
+    REQUIRE(nation_key == static_cast<std::int32_t>(i));
+    REQUIRE(region_key == EXPECTED_REGION_KEYS[i]);
+    REQUIRE(name == EXPECTED_NATION_NAMES[i]);
   }
 }
