@@ -295,8 +295,58 @@ executing on a thread).
 No Sirius changes needed to pick up the fix; cucascade submodule bump
 required.
 
+## 7. Follow-up #17 cross-GPU stale-pointer hazard — PARTIAL FIX
+
+The original follow-up #17 (SF100 parquet cache=table_gpu + num_gpus=2
+Q11 failure) has a partial fix plus a dedicated resume handoff:
+
+### Partial fix landed
+
+`src/pipeline/gpu_pipeline_executor.cpp` — `MAX_OOM_RETRIES` 10 → 100,
+per-retry backoff 5 ms → 50 ms. The old 50 ms total budget was too
+short for cross-GPU BUILD_PROBE contention where a batch is held in
+`processing` on one GPU while a probe task on the other GPU needs to
+convert it; the new ~5 s budget is enough for typical SF100 probe
+tasks to release before the retry cap trips.
+
+Effect: Q1–Q11 cold now all complete at SF100 with cache=table_gpu.
+Previously the sweep crashed at Q11 cold within 75 ms.
+
+### Remaining work
+
+The real cross-GPU illegal-address hazard still terminates the SF100
+Q11 run — now with the symptoms the original resume note actually
+described (`cudaErrorIllegalAddress` surfacing via
+`rmm::cuda_stream_view::synchronize`, Fatal CUDA error at
+`cudf/utilities/cuda_memcpy.cu:42`). See
+[08-FU17-RESUME-HANDOFF.md](./08-FU17-RESUME-HANDOFF.md) for the full
+resume plan including the `CUDA_LAUNCH_BLOCKING=1` localization recipe
+and the three candidate root-cause hypotheses (stale cache pointer,
+BUILD_PROBE `_build_table` cross-device, parquet `_datasource` pinned
+to wrong GPU).
+
+### New bugs surfaced
+
+- **HASH_JOIN SEMI column-index out-of-bounds.** DuckDB compiles small
+  ORDER BY + LIMIT into a TOP_N → SEMI-JOIN plan whose schema carries
+  1–2 fewer columns through the pipeline than the HASH_JOIN's key
+  indices expect. Not MGPU-specific; caught by the new
+  `test_physical_order_mgpu - small sort stays single-GPU` TEST_CASE.
+  The comment at `gpu_pipeline_task.cpp:54` ("bobbi (todo): delim
+  join will return this warning for now, but there is no bug here")
+  signals the Sirius team already flagged this region.
+
+### MGPU regression test infrastructure
+
+`test/cpp/operator/mgpu_test_utils.hpp` plus four `*_mgpu.cpp`
+TEST_CASE files (hash_join, grouped_aggregate_merge, order,
+table_gpu cache warm) give deterministic per-operator coverage on
+num_gpus=2. 12/13 tests green at HEAD; the one red test is the
+HASH_JOIN SEMI column-index bug above.
+
 ---
 
 *Phase: 08-multi-gpu-sql-pipeline-fix*
 *Authored: 2026-04-22T21:30:00Z*
 *Parent commit: f7847f8*
+*Updated: 2026-04-23T09:15:00Z (follow-up #17 partial fix + MGPU tests)*

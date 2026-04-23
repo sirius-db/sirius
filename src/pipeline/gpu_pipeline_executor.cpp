@@ -255,7 +255,16 @@ void gpu_pipeline_executor::manager_loop()
             orig_task_id     = cur_local->original_task_id.value();
           }
 
-          static constexpr uint32_t MAX_OOM_RETRIES = 10;
+          // Bumped from 10 to 100 as part of follow-up #17. SF100 Q11 with
+          // cache=table_gpu + num_gpus=2 exhausted the old 10-retry budget
+          // against cross-GPU BUILD_PROBE batch-lock contention: the batch
+          // was held in `processing` on one GPU while the probe task on the
+          // other GPU needed it. Each convert-release cycle is O(100ms) at
+          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far
+          // too short. With 100 retries × 50 ms backoff (~5 s) the probe
+          // tasks get enough patience to clear the contention window while
+          // still bailing out on truly wedged queries.
+          static constexpr uint32_t MAX_OOM_RETRIES = 100;
           if (next_retry_count > MAX_OOM_RETRIES) {
             SIRIUS_LOG_ERROR(
               "GPU Pipeline Executor: task {} (original task {}) exceeded {} OOM retries at "
@@ -309,10 +318,12 @@ void gpu_pipeline_executor::manager_loop()
           auto new_task =
             gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
 
-          // Brief backoff before rescheduling to allow other tasks to complete
-          // and free memory. Without this, a rescheduled task can spin in a tight
-          // OOM → reschedule → OOM loop consuming CPU without making progress.
-          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          // Backoff before rescheduling to allow other tasks to complete and
+          // free memory (true OOM case) or release a contended batch
+          // (cross-GPU processing contention, follow-up #17). 50 ms gives
+          // typical SF100 probe tasks time to finish their current work
+          // without putting the rescheduled task into a tight busy-spin.
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
