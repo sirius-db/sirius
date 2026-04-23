@@ -55,8 +55,7 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
     return;
   }
   duckdb::ExpressionIterator::EnumerateChildren(
-    expr,
-    [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
+    expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
 }
 
 static bool is_equality(sirius::comparison_type c)

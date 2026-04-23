@@ -49,8 +49,7 @@ std::vector<expression> wrap_many(std::vector<std::unique_ptr<duckdb::Expression
   return out;
 }
 
-duckdb::vector<expression> wrap_many(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+duckdb::vector<expression> wrap_many(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
 {
   duckdb::vector<expression> out;
   out.reserve(exprs.size());

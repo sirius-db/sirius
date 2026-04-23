@@ -508,12 +508,12 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
   agg_children.push_back(std::move(struct_expr));
 
   auto agg_fn = MakeDummyAggregate("count", {struct_return_type}, duckdb::LogicalType::BIGINT);
-  result.aggregates.push_back(
-    sirius::wrap(duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
-                                                                     std::move(agg_children),
-                                                                     nullptr,  // filter
-                                                                     nullptr,  // bind_info
-                                                                     duckdb::AggregateType::DISTINCT)));
+  result.aggregates.push_back(sirius::wrap(
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
+                                                        std::move(agg_children),
+                                                        nullptr,  // filter
+                                                        nullptr,  // bind_info
+                                                        duckdb::AggregateType::DISTINCT)));
   return result;
 }
 

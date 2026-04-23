@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include <duckdb/common/vector.hpp>
 #include <duckdb/common/unique_ptr.hpp>
+#include <duckdb/common/vector.hpp>
 
 #include <memory>
 #include <vector>
@@ -108,7 +108,6 @@ std::vector<expression> wrap_many(std::vector<std::unique_ptr<duckdb::Expression
  * `duckdb::vector<sirius::expression>` (not `std::vector<...>`). Semantics identical to the
  * std::vector overload.
  */
-duckdb::vector<expression> wrap_many(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs);
+duckdb::vector<expression> wrap_many(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs);
 
 }  // namespace sirius

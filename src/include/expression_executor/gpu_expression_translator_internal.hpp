@@ -18,6 +18,7 @@
 
 // sirius
 #include <cudf/cudf_utils.hpp>
+
 #include <expression/join_condition.hpp>
 
 // duckdb

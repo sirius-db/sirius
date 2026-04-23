@@ -139,10 +139,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       } else {
         combined = std::move(select_list[0]);
       }
-      filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(
-        sirius::from_duckdb_vec(filter_types),
-        sirius::wrap(std::move(combined)),
-        op.estimated_cardinality);
+      filter =
+        duckdb::make_uniq<sirius::op::sirius_physical_filter>(sirius::from_duckdb_vec(filter_types),
+                                                              sirius::wrap(std::move(combined)),
+                                                              op.estimated_cardinality);
     }
   }
   op.ResolveOperatorTypes();

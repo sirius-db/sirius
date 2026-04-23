@@ -109,8 +109,7 @@ struct aggregate_layout {
   bool has_avg = false;
 };
 
-aggregate_layout build_aggregate_layout(
-  const duckdb::vector<sirius::expression>& aggregates)
+aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>& aggregates)
 {
   aggregate_layout layout;
   size_t local_idx = 0;
