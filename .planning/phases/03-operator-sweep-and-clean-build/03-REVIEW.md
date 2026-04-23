@@ -1,35 +1,31 @@
 ---
 phase: 03-operator-sweep-and-clean-build
-reviewed: 2026-04-22T21:30:00Z
+reviewed: 2026-04-23T15:22:48Z
 depth: standard
-files_reviewed: 65
+files_reviewed: 63
 files_reviewed_list:
-  - src/include/data/convertible_data_batch.hpp
-  - src/include/data/convertible_data.hpp
-  - src/include/data/convertible_gpu_pipeline_task.hpp
-  - src/include/data/data_batch_utils.hpp
-  - src/include/debug_utils.hpp
-  - src/include/exec/inspectable_mpsc.hpp
-  - src/include/expression_executor/gpu_expression_executor.hpp
-  - src/include/op/sirius_physical_operator.hpp
-  - src/include/parallel/task_executor.hpp
-  - src/include/pipeline/batch_lock_utils.hpp
-  - src/include/pipeline/gpu_pipeline_task.hpp
-  - src/include/pipeline/pipeline_executor.hpp
-  - src/include/pipeline/sirius_pipeline_task_states.hpp
-  - src/include/pipeline/sirius_plan_printer.hpp
-  - src/include/downgrade/downgrade_executor.hpp
   - src/creator/task_creator.cpp
+  - src/cuda/print.cu
   - src/debug_utils.cpp
   - src/downgrade/downgrade_executor.cpp
   - src/expression_executor/gpu_expression_executor.cpp
+  - src/include/data/convertible_data.hpp
+  - src/include/data/convertible_data_batch.hpp
+  - src/include/data/convertible_gpu_pipeline_task.hpp
+  - src/include/data/data_batch_utils.hpp
+  - src/include/debug_utils.hpp
+  - src/include/downgrade/downgrade_executor.hpp
+  - src/include/expression_executor/gpu_expression_executor.hpp
+  - src/include/op/sirius_physical_operator.hpp
+  - src/include/pipeline/gpu_pipeline_task.hpp
+  - src/include/pipeline/pipeline_executor.hpp
+  - src/include/print.hpp
   - src/legacy/expression_executor/gpu_expression_executor.cpp
   - src/op/scan/cpu_source_task.cpp
   - src/op/scan/duckdb_scan_executor.cpp
   - src/op/scan/duckdb_scan_task.cpp
   - src/op/scan/parquet_scan_task.cpp
   - src/op/scan/sirius_gpu_parquet_scan_operator.cpp
-  - src/op/sirius_physical_column_data_scan.cpp
   - src/op/sirius_physical_concat.cpp
   - src/op/sirius_physical_cte.cpp
   - src/op/sirius_physical_delim_join.cpp
@@ -50,61 +46,55 @@ files_reviewed_list:
   - src/op/sirius_physical_table_scan.cpp
   - src/op/sirius_physical_top_n.cpp
   - src/op/sirius_physical_ungrouped_aggregate.cpp
-  - src/parallel/task_executor.cpp
   - src/pipeline/gpu_pipeline_executor.cpp
   - src/pipeline/gpu_pipeline_task.cpp
   - src/sirius_context.cpp
   - src/sirius_engine.cpp
-  - test/cpp/data/test_convertible_data_batch.cpp
-  - test/cpp/debug/test_debug_utils.cpp
   - test/cpp/downgrade/test_downgrade_executor.cpp
+  - test/cpp/expression_executor/test_gpu_expression_executor.cpp
+  - test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
+  - test/cpp/operator/operator_test_utils.hpp
+  - test/cpp/operator/test_physical_filter.cpp
+  - test/cpp/operator/test_physical_limit.cpp
+  - test/cpp/operator/test_physical_mark_join.cpp
+  - test/cpp/operator/test_physical_merge_sort.cpp
+  - test/cpp/operator/test_physical_order.cpp
+  - test/cpp/operator/test_physical_partition.cpp
+  - test/cpp/operator/test_physical_projection.cpp
+  - test/cpp/operator/test_physical_table_scan.cpp
+  - test/cpp/operator/test_physical_top_n.cpp
+  - test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+  - test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
+  - test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
+  - test/cpp/scan/test_utils.hpp
 findings:
   critical: 2
-  warning: 5
-  info: 4
-  total: 11
+  warning: 3
+  info: 3
+  total: 8
 status: issues_found
 ---
 
 # Phase 03: Code Review Report
 
-**Reviewed:** 2026-04-22T21:30:00Z
+**Reviewed:** 2026-04-23T15:22:48Z
 **Depth:** standard
-**Files Reviewed:** 65
+**Files Reviewed:** 63 (2 files from the original 65 do not exist: `src/downgrade/downgrade_task.cpp`, `src/include/downgrade/downgrade_task.hpp`)
 **Status:** issues_found
 
 ## Summary
 
-This review covers the cucascade 3-class data_batch API migration across 65 files in the Sirius GPU SQL engine. The migration is largely well-executed: operators consistently receive `read_only_pipelineable_operator_data` with pre-locked batches, the RAII accessor pattern is applied throughout, and the subscribe/unsubscribe lifecycle in `gpu_pipeline_task` is clean.
+This review covers the data_batch API migration in Phase 03, where Sirius operators were updated to use cucascade's new 3-class data_batch API (idle handle, `read_only_data_batch` shared lock, `mutable_data_batch` exclusive lock). The migration is largely correct across operators, pipeline infrastructure, and test code. Most operators correctly receive `read_only_pipelineable_operator_data`, use `clone()` to obtain idle handles where needed, and use `data_batch::to_idle()` to convert read-only accessors back to idle state.
 
-However, two critical issues were found: (1) a dangling `cudf::table_view` returned from `get_cudf_table_view(data_batch&)` where the read-only lock is released before the caller uses the view, and (2) a use-after-move in `request_downgrade()` that accesses a moved-from `unique_ptr`. Five warnings cover `release_table()` called under read-only locks (should be mutable), a repeated `const_cast` pattern that undermines the const-correctness of the API, the `get_bytes_in_space()` stub returning 0, and a TOCTOU gap in the convertible batch provider. Four informational items note commented-out code, a typo, and test coverage gaps.
+Two critical issues were found: a use-after-move bug in `downgrade_executor::request_downgrade()` and mutating `release_table()` calls made through read-only accessor locks. Three warnings relate to the `get_cudf_table_view(data_batch&)` overload that returns a `cudf::table_view` after the temporary read-only lock is released, creating a dangling reference risk.
 
 ## Critical Issues
 
-### CR-01: Dangling table_view from get_cudf_table_view(data_batch&)
+### CR-01: Use-after-move in `request_downgrade()`
 
-**File:** `src/include/data/data_batch_utils.hpp:71-77`
-**Issue:** The `get_cudf_table_view(data_batch&)` overload acquires a temporary `read_only_data_batch` via `batch.to_read_only()`, extracts a `cudf::table_view`, then the `read_only_data_batch` destructor releases the shared lock when the function returns. The returned `cudf::table_view` references GPU memory that is no longer protected by any lock. If a concurrent thread (e.g., the downgrade executor) acquires a mutable lock and converts the data to a different memory space, the `table_view` becomes a dangling reference to freed/reallocated GPU memory.
-
-The comment claims "The table_view is valid as long as the data_batch is alive" but this is incorrect under the new API -- the data_batch being alive does not prevent a concurrent `to_mutable()` from moving the underlying data.
-
-This function is called in at least 4 operator files: `sirius_physical_merge_sort.cpp:104`, `sirius_physical_nested_loop_join.cpp:404-405`, `sirius_physical_sort_partition.cpp:106`, and `sirius_physical_sort_sample.cpp:142-143`.
-
-**Fix:** The callers already hold `read_only_data_batch` accessors via `read_only_pipelineable_operator_data`. The overload taking `data_batch&` should be removed or deprecated. Use the existing `get_cudf_table_view(const read_only_data_batch&)` overload instead, which takes a reference to a live lock. For the `data_batch&` callers in `apply_final_projection` (merge_sort) and similar, either pass the `read_only_data_batch` or hold the lock in the caller's scope:
-```cpp
-// Instead of:
-auto table_view = sirius::get_cudf_table_view(*batch);
-// Use:
-auto ro = batch->to_read_only();
-auto table_view = sirius::get_cudf_table_view(ro);
-// ... use table_view while ro is alive ...
-```
-
-### CR-02: Use-after-move in request_downgrade()
-
-**File:** `src/downgrade/downgrade_executor.cpp:383-394`
-**Issue:** When `_request_queue.push()` returns false (queue inactive), the code attempts `req->result.set_value(0)` on line 390. However, `req` was already moved from on line 388 via `std::move(req)`. Accessing a moved-from `unique_ptr` is undefined behavior -- it is typically null after move, so this would dereference a null pointer and crash.
-**Fix:** Capture the future and set the exception/value before attempting the push, or restructure the code:
+**File:** `src/downgrade/downgrade_executor.cpp:388-391`
+**Issue:** After `std::move(req)` into `_request_queue.push()`, the code accesses `req->result.set_value(0)` on the moved-from unique_ptr. If `push()` returns false (queue inactive), `req` is in a moved-from state and dereferencing it is undefined behavior.
+**Fix:**
 ```cpp
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
@@ -113,125 +103,146 @@ std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> 
   auto future    = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
-    // req is moved-from here, so we need a new promise to fulfill the future
-    // Actually, the future is already obtained from req->result above.
-    // Since push failed and req was moved into push(), the promise is gone.
-    // Fix: check push result before moving, or create a separate promise.
-    std::promise<size_t> fallback;
-    fallback.set_value(0);
-    return fallback.get_future();
+    // req has been moved -- create a new promise to fulfill the future
+    std::promise<size_t> fallback_promise;
+    auto fallback_future = fallback_promise.get_future();
+    fallback_promise.set_value(0);
+    return fallback_future;
   }
   return future;
 }
 ```
-Note: The exact fix depends on how `push()` handles the moved-from value on failure. If push returns false without consuming the unique_ptr, then req is still valid. However, the standard move semantics make this fragile. The safest fix is to test pushability first or use the already-obtained future and set the value on a separate promise.
 
-## Warnings
+Note: the `future` variable was obtained from `req->result` before the move, so it is still valid. However, the `set_value(0)` call on the moved `req` is the problem. An alternative simpler fix: capture `future` before the push and, on failure, use a standalone promise:
 
-### WR-01: release_table() called under read-only lock (should be mutable)
-
-**File:** `src/op/sirius_physical_grouped_aggregate_merge.cpp:241`
-**Issue:** The code calls `gpu_rep.release_table()` while holding a `read_only_data_batch` lock (acquired on line 237). `release_table()` is a mutating operation that moves ownership of the underlying `cudf::table` out of the representation. Calling it under a shared (read-only) lock violates the RAII contract: another concurrent reader could also be accessing the same data. The same pattern appears in `sirius_physical_table_scan.cpp:224` where `release_table()` is called under a second read-only lock.
-**Fix:** Use `to_mutable()` instead of `to_read_only()` when the intent is to release/modify the underlying table:
 ```cpp
-auto merged_mut = merged->to_mutable();
-auto* space     = merged_mut.get_memory_space();
-auto mr         = space->get_default_allocator();
-auto& gpu_rep   = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
-auto merged_cols = gpu_rep.release_table()->release();
+  auto future = req->result.get_future();
+  auto* promise_ptr = &req->result;  // save raw pointer before move
+  if (!_request_queue.push(std::move(req))) {
+    // If push consumed req (moved ownership), promise_ptr is dangling.
+    // If push rejected without consuming, req is still valid.
+    // Safe approach: always use a separate promise for the failure path.
+    ...
+  }
 ```
 
-### WR-02: Repeated const_cast pattern to release read-only batches
+The cleanest fix is to get the future before the push and, on failure, set a separate promise:
 
-**Files:**
-- `src/op/sirius_physical_column_data_scan.cpp`
-- `src/op/sirius_physical_cte.cpp`
-- `src/op/sirius_physical_delim_join.cpp`
-- `src/op/sirius_physical_result_collector.cpp:67`
-- `src/op/sirius_physical_partition.cpp:174`
-- `src/op/sirius_physical_sort_partition.cpp:66`
-- `src/op/sirius_physical_sort_sample.cpp:91`
-- `src/op/sirius_physical_table_scan.cpp:118`
-
-**Issue:** Multiple operators use the pattern:
 ```cpp
-auto ro_vec = const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
-```
-The `execute()` method signature is `const operator_data&`, but these operators need to move the read-only batches out of the input data. The `const_cast` undermines the const-correctness guarantee and is a code smell that could mask real bugs if `execute()` is ever called with truly shared input data. This pattern appears in 8+ operators.
-
-**Fix:** Either (a) change the `execute()` signature for operators that consume their input to take `operator_data&` (non-const), or (b) make `release_read_only_batches()` a `const` method using `mutable` storage internally, or (c) provide a `consume()` method pattern where ownership transfer is explicit. The cleanest approach is (a), but it requires a base-class API change. A minimal fix is to add a comment documenting the contract that `execute()` takes exclusive ownership of its input data.
-
-### WR-03: get_bytes_in_space() stub returns 0 in convertible_gpu_pipeline_task_provider
-
-**File:** `src/include/data/convertible_gpu_pipeline_task.hpp:297-300`
-**Issue:** The `get_bytes_in_space()` method always returns 0, which means any caller relying on this for memory accounting (e.g., the downgrade executor's monitor loop deciding how much to downgrade) will undercount available bytes in the pipeline task queue. The docstring on lines 287-295 describes the intended behavior of summing bytes across matching tasks, but the implementation is a stub.
-**Fix:** Implement the method using `get_if()` to inspect tasks without removing them:
-```cpp
-std::size_t get_bytes_in_space(cucascade::memory::memory_space* space) const override
+std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
-  std::size_t total = 0;
-  _queue.get_if(
-    [space, &total](sirius::parallel::itask& t) {
-      auto* p = convertible_gpu_pipeline_task::get_pipelineable_data(t);
-      if (!p) return false;
-      for (const auto& batch : p->get_data_batches()) {
-        if (!batch || batch->get_state() != cucascade::batch_state::idle) continue;
-        auto ro = batch->to_read_only();
-        if (ro.get_memory_space() == space) {
-          total += ro.get_data()->get_size_in_bytes();
-        }
-      }
-      return false;  // don't remove, just inspect
-    },
-    true);
-  return total;
+  auto req       = std::make_unique<downgrade_request>();
+  req->predicate = std::move(predicate);
+  auto future    = req->result.get_future();
+  if (!_request_queue.push(std::move(req))) {
+    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
+    // future is already connected to the moved promise.
+    // We cannot set_value on it. Return a resolved future instead.
+    std::promise<size_t> p;
+    p.set_value(0);
+    return p.get_future();
+  }
+  return future;
 }
 ```
 
-### WR-04: TOCTOU gap in convertible_data_batch_provider::try_get_batch
+### CR-02: Mutating `release_table()` called through read-only accessor
 
-**File:** `src/include/data/convertible_data_batch.hpp` (around lines 288-303 based on summary)
-**Issue:** The `try_get_batch()` method checks `batch->get_state() != idle` before calling `batch->to_read_only()`. Between the state check and the lock acquisition, another thread could change the batch state (e.g., from idle to mutable via a concurrent `to_mutable()` call). This is a time-of-check-to-time-of-use (TOCTOU) race. While `to_read_only()` would likely throw or block in this case (which is safe), the preliminary state check gives a false sense of filtering.
-**Fix:** Remove the preliminary `get_state()` check and rely directly on `try_to_read_only()` (if available) or just call `to_read_only()` with appropriate exception handling. The state check is an optimization that introduces a race -- the lock acquisition itself is the authoritative check.
+**File:** `src/op/sirius_physical_grouped_aggregate_merge.cpp:237-241`
+**Issue:** `gpu_rep.release_table()` is called on a `gpu_table_representation` obtained through a `read_only_data_batch` accessor (`merged_ro`). `release_table()` is a mutating operation that moves ownership of the internal `unique_ptr<cudf::table>` out of the representation, leaving it in an empty state. This violates the semantic contract of a read-only lock -- other concurrent readers (if any) would see a null table. While cucascade's `get_data()` returns a non-const pointer even from `read_only_data_batch`, calling mutating methods through it breaks the data_batch API's safety guarantees.
 
-### WR-05: Nested loop join resolve_join_col leaks read-only accessor lifetime
+**File:** `src/op/sirius_physical_table_scan.cpp:223-227`
+**Issue:** Same pattern. `gpu_rep.release_table()` is called inside a `to_read_only()` scope. The comment even says "Re-acquire read lock to extract table and metadata" but then calls a mutating method.
 
-**File:** `src/op/sirius_physical_nested_loop_join.cpp:497-513`
-**Issue:** In the `resolve_join_col` lambda, when the expression is not a simple column reference, a `gpu_expression_executor` is invoked which produces a result batch. A `read_only_data_batch` (`expr_result_ro`) is obtained on line 499, a `column_view` is extracted from it and pushed into `col_views` on line 512, and then `expr_result_batch` (the idle handle) is saved in `expression_res_scope_hodler` on line 513 to keep it alive. However, `expr_result_ro` (the read-only accessor) goes out of scope at the end of the `if (!get_column_index...)` block, releasing the read lock. The `column_view` in `col_views` then points to data no longer protected by a lock. If the batch were concurrently modified, this would be unsafe. In practice, since the batch is locally created and not shared with other threads, this is safe in the current execution model, but it breaks the RAII contract.
-**Fix:** Store the `read_only_data_batch` accessor alongside the batch to keep the lock alive:
+**Fix:** Use `to_mutable()` instead of `to_read_only()` when you intend to call `release_table()`:
+
+For `sirius_physical_grouped_aggregate_merge.cpp:237`:
 ```cpp
-// Change expression_res_scope_hodler to hold both:
-std::vector<std::pair<std::shared_ptr<cucascade::data_batch>,
-                      cucascade::read_only_data_batch>> expression_scope_holder;
+  // Acquire EXCLUSIVE lock since release_table() is a mutating operation
+  auto merged_mut    = merged->to_mutable();
+  auto* space        = merged_mut.get_memory_space();
+  auto mr            = space->get_default_allocator();
+  auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
+  auto merged_cols   = gpu_rep.release_table()->release();
 ```
+
+For `sirius_physical_table_scan.cpp:223`:
+```cpp
+      {
+        auto output_mut = output_batch->to_mutable();
+        auto& gpu_rep   = output_mut.get_data()->cast<cucascade::gpu_table_representation>();
+        space           = output_mut.get_memory_space();
+        table           = gpu_rep.release_table();
+      }  // exclusive lock released here
+```
+
+Note: `sirius_gpu_parquet_scan_operator.cpp:194-196` already does this correctly -- it explicitly comments "Need mutable access to release_table() (mutating op)" and uses `to_mutable()`.
+
+## Warnings
+
+### WR-01: `get_cudf_table_view(data_batch&)` returns table_view after lock release
+
+**File:** `src/include/data/data_batch_utils.hpp:71-77`
+**Issue:** The `get_cudf_table_view(data_batch&)` overload acquires a temporary `read_only_data_batch`, extracts the `cudf::table_view`, then returns it after the RAII lock is released. The returned `table_view` references GPU memory that is only guaranteed stable while the read-only lock is held. If another thread downgrades or mutates the batch between lock release and table_view usage, the view could reference freed/moved memory. The docstring acknowledges this ("valid as long as the data_batch is alive") but this is weaker than "valid as long as the lock is held."
+
+**Callers affected:**
+- `src/pipeline/gpu_pipeline_task.cpp:52` (`validate_operator_output_types`) - diagnostic only, low risk
+- `src/pipeline/gpu_pipeline_task.cpp:108-113` (`log_operator_data`) - diagnostic only, low risk
+- `test/cpp/operator/operator_test_utils.hpp:116` (`concatenate_batches_horizontal`) - test-only, low risk
+
+**Fix:** For production code, prefer the `get_cudf_table_view(const read_only_data_batch&)` overload which requires the caller to hold the lock. For the diagnostic functions (`validate_operator_output_types`, `log_operator_data`), the risk is low because these run synchronously within the pipeline task while the batch is still exclusively owned by the task. Consider adding a comment acknowledging the assumption, or refactoring to accept `read_only_data_batch&`.
+
+### WR-02: `const_cast` on `read_only_pipelineable_operator_data` in sort operators
+
+**File:** `src/op/sirius_physical_sort_partition.cpp:66`
+**File:** `src/op/sirius_physical_sort_sample.cpp:91`
+**File:** `src/op/sirius_physical_result_collector.cpp:67`
+**Issue:** These operators use `const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches()` to release the read-only batches from the input. The `const_cast` is needed because the input is received as `const operator_data&` but `release_read_only_batches()` is non-const (it moves the internal vector). While this works correctly because each task has exclusive ownership of its input data, `const_cast` bypasses const-correctness and could mask bugs if the execution model changes.
+
+**Fix:** Consider making `release_read_only_batches()` available through a non-const path. The cleanest approach would be to change `execute()` signature to take `operator_data&` (non-const), or to provide a consuming overload that takes `operator_data&&`. Since this is a broader API design change, it can be deferred -- but document the assumption that const_cast is safe here because the operator has unique access to the input.
+
+### WR-03: Commented-out code block in `sirius_physical_grouped_aggregate.cpp`
+
+**File:** `src/op/sirius_physical_grouped_aggregate.cpp:28-48` and `89-158`
+**Issue:** Large block of commented-out code (70+ lines) for grouping sets implementation that is flagged as "TODO: for now commenting out this code because we are not using grouping sets yet." This represents dead code that increases maintenance burden and makes the file harder to read. The same commented-out function `create_group_chunk_types` appears in `sirius_physical_grouped_aggregate_merge.cpp:33-52` as live code, suggesting the merge file has diverged.
+
+**Fix:** Remove the commented-out code from `sirius_physical_grouped_aggregate.cpp`. The grouping sets implementation can be recovered from git history when needed. If the `create_group_chunk_types` function in the merge file is also unused, remove it there as well.
 
 ## Info
 
-### IN-01: Large block of commented-out code in grouped_aggregate
+### IN-01: Unused helper functions in `sirius_physical_grouped_aggregate_merge.cpp`
 
-**File:** `src/op/sirius_physical_grouped_aggregate.cpp:28-158`
-**Issue:** Over 130 lines of commented-out code with TODO comments. This is dead code from a pre-migration implementation of grouping sets.
-**Fix:** Remove the commented-out code and track the grouping sets feature in an issue tracker. The TODO comments can be preserved as a single-line reference to the issue.
+**File:** `src/op/sirius_physical_grouped_aggregate_merge.cpp:33-80`
+**Issue:** Three static helper functions (`create_group_chunk_types`, `copy_expressions`, `convert_grouping_functions`) are defined but never called within this file. They appear to be scaffolding for future grouping sets support.
 
-### IN-02: Typo in variable name
+**Fix:** Remove unused static functions or add `[[maybe_unused]]` annotations. These can be recovered from version control when grouping sets are implemented.
 
-**File:** `src/op/sirius_physical_nested_loop_join.cpp:477`
-**Issue:** Variable `expression_res_scope_hodler` should be `expression_res_scope_holder` (misspelling of "holder").
-**Fix:** Rename to `expression_res_scope_holder`.
+### IN-02: Duplicate `pipelineable_operator_data` used where `read_only_pipelineable_operator_data` is expected
 
-### IN-03: Test coverage gap for pipeline task conversion
+**File:** `src/op/sirius_physical_grouped_aggregate.cpp:88`
+**File:** `test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp:88,144,204`
+**Issue:** In both the operator's `execute()` and the test code, `pipelineable_operator_data` (containing idle `shared_ptr<data_batch>`) is passed to `execute()`. Inside `execute()`, the code calls `dynamic_cast<const read_only_pipelineable_operator_data&>(input_data)` which would fail at runtime if the actual type is `pipelineable_operator_data`, not `read_only_pipelineable_operator_data`. However, looking at the pipeline execution path in `gpu_pipeline_task.cpp:396-399`, the input is converted to `read_only_pipelineable_operator_data` before calling `execute()`. The test code appears to pass `pipelineable_operator_data` directly, which means the `dynamic_cast` either succeeds (if the type hierarchy allows it) or the tests exercise a different code path. This inconsistency should be verified.
 
-**Issue:** There are no test files for `convertible_gpu_pipeline_task` or `convertible_gpu_pipeline_task_provider`. The `test/cpp/data/test_convertible_data_batch.cpp` tests only cover the repository-based conversion path. The pipeline task queue conversion path (TIER 2 in `downgrade_executor.cpp`) is untested at the unit level.
-**Fix:** Add unit tests that create mock `gpu_pipeline_task` instances in an `inspectable_mpsc` queue, wrap them in `convertible_gpu_pipeline_task_provider`, and verify conversion and RAII queue return behavior.
+**Fix:** Verify that operator unit tests correctly exercise the `read_only_pipelineable_operator_data` path that production code uses. If `pipelineable_operator_data` inherits from `read_only_pipelineable_operator_data`, document this relationship. Otherwise, update tests to wrap input in `read_only_pipelineable_operator_data`.
 
-### IN-04: Test files only test REQUIRE_NOTHROW, not actual behavior
+### IN-03: Test helper uses unsafe `get_cudf_table_view(data_batch&)` overload
 
-**File:** `test/cpp/debug/test_debug_utils.cpp`
-**Issue:** All 45 debug_utils tests only assert `REQUIRE_NOTHROW`. They verify that the functions do not crash, but do not verify the correctness of the output (e.g., that the correct number of rows were printed, that NULL positions are correctly identified, that checksums are deterministic). While this is acceptable for debug/diagnostic utilities, it means regressions in output correctness would not be caught.
-**Fix:** No action needed for v1 -- this is informational. Consider adding output capture assertions for critical functions like `debug_diff` and `debug_checksum` in a future pass.
+**File:** `test/cpp/operator/operator_test_utils.hpp:116`
+**Issue:** `concatenate_batches_horizontal()` calls `sirius::get_cudf_table_view(*batch)` which uses the temporary-lock overload. The returned `table_view` is used to copy columns, which involves GPU memory access. In a single-threaded test context this is safe, but it sets a pattern that could be copied into production code.
+
+**Fix:** Consider acquiring `to_read_only()` explicitly in the test helper to hold the lock during column access:
+```cpp
+for (const auto& batch : batches) {
+  auto ro = batch->to_read_only();
+  auto table_view = sirius::get_cudf_table_view(ro);
+  for (cudf::size_type i = 0; i < table_view.num_columns(); ++i) {
+    all_columns.push_back(std::make_unique<cudf::column>(table_view.column(i), stream, mr));
+  }
+}
+```
 
 ---
 
-_Reviewed: 2026-04-22T21:30:00Z_
+_Reviewed: 2026-04-23T15:22:48Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
