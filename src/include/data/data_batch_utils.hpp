@@ -58,11 +58,16 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 }
 
 /**
- * @brief Get a cudf::table_view from an idle data_batch (shared_ptr overload).
+ * @brief Get a cudf::table_view from an idle data_batch (convenience overload).
  *
- * Acquires a temporary read-only lock to access the data. The table_view is valid
- * as long as the data_batch is alive (the lock is released after the view is obtained).
- * This overload is provided for compatibility with impl functions that hold shared_ptr<data_batch>.
+ * Acquires a temporary read-only lock, extracts the table_view, then releases the lock.
+ *
+ * @warning The returned table_view references GPU memory that is only guaranteed stable while a
+ * read-only lock is held. Since this function releases the lock before returning, the view can
+ * become dangling if another thread downgrades or mutates the batch concurrently. Only use this
+ * overload in contexts where the caller has exclusive ownership of the batch (e.g., diagnostic
+ * functions running synchronously within a pipeline task). Prefer the
+ * get_cudf_table_view(const read_only_data_batch&) overload when the caller can hold the lock.
  *
  * @param batch The idle data batch to extract the table view from.
  * @return cudf::table_view The underlying cudf table view.
