@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <duckdb/common/unique_ptr.hpp>
+#include <duckdb/common/vector.hpp>
+
 #include <memory>
 #include <vector>
 
@@ -43,7 +46,7 @@ class expression {
   struct impl;
 
   /// Constructs a null expression.
-  expression() noexcept = default;
+  expression() noexcept;
 
   /// Takes ownership of an impl instance. Usable only at translation units that can form a
   /// complete `impl` (i.e., those including expression_internal.hpp).
@@ -97,5 +100,14 @@ expression wrap(std::unique_ptr<duckdb::Expression> expr);
  * @return A vector of sirius::expression, preserving size and order.
  */
 std::vector<expression> wrap_many(std::vector<std::unique_ptr<duckdb::Expression>> exprs);
+
+/**
+ * @brief duckdb::vector overload of wrap_many.
+ *
+ * Matches the container convention used by Super Sirius operator headers, which hold
+ * `duckdb::vector<sirius::expression>` (not `std::vector<...>`). Semantics identical to the
+ * std::vector overload.
+ */
+duckdb::vector<expression> wrap_many(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs);
 
 }  // namespace sirius

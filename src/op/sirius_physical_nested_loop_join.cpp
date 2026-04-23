@@ -21,7 +21,9 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression_internal.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -45,13 +47,17 @@
 namespace sirius {
 namespace op {
 
-void reorder_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
+static bool nlj_is_equality(sirius::comparison_type c)
+{
+  return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
+}
+
+void reorder_conditions(duckdb::vector<sirius::join_condition>& conditions)
 {
   bool is_ordered     = true;
   bool seen_non_equal = false;
   for (auto& cond : conditions) {
-    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    if (nlj_is_equality(cond.comparison)) {
       if (seen_non_equal) {
         is_ordered = false;
         break;
@@ -61,11 +67,10 @@ void reorder_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
     }
   }
   if (is_ordered) { return; }
-  duckdb::vector<duckdb::JoinCondition> equal_conditions;
-  duckdb::vector<duckdb::JoinCondition> other_conditions;
+  duckdb::vector<sirius::join_condition> equal_conditions;
+  duckdb::vector<sirius::join_condition> other_conditions;
   for (auto& cond : conditions) {
-    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    if (nlj_is_equality(cond.comparison)) {
       equal_conditions.push_back(std::move(cond));
     } else {
       other_conditions.push_back(std::move(cond));
@@ -84,7 +89,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<duckdb::JoinCondition> cond,
+  duckdb::vector<sirius::join_condition> cond,
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
@@ -113,7 +118,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<duckdb::JoinCondition> cond,
+  duckdb::vector<sirius::join_condition> cond,
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
@@ -143,7 +148,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<duckdb::JoinCondition> cond,
+  duckdb::vector<sirius::join_condition> cond,
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality,
   duckdb::vector<std::size_t> left_projection_map,
@@ -180,13 +185,14 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
 }
 
 bool sirius_physical_nested_loop_join::is_supported(
-  const duckdb::vector<duckdb::JoinCondition>& conditions, duckdb::JoinType join_type)
+  const duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
 {
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
-    if (cond.left->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
-        cond.left->return_type.InternalType() == duckdb::PhysicalType::LIST ||
-        cond.left->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
+    auto const* left_expr = sirius::unwrap(cond.left);
+    if (left_expr->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
+        left_expr->return_type.InternalType() == duckdb::PhysicalType::LIST ||
+        left_expr->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
       return false;
     }
   }
@@ -200,7 +206,7 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
 {
   duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
-    result.push_back(sirius::from_duckdb(op.right->return_type));
+    result.push_back(sirius::from_duckdb(sirius::unwrap(op.right)->return_type));
   }
   return result;
 }
@@ -337,23 +343,19 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
 
 namespace {
 
-cudf::ast::ast_operator to_ast_operator(duckdb::ExpressionType comparison)
+cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
 {
   switch (comparison) {
-    case duckdb::ExpressionType::COMPARE_EQUAL: return cudf::ast::ast_operator::EQUAL;
-    case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM:
-      return cudf::ast::ast_operator::NULL_EQUAL;
-    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
-    case duckdb::ExpressionType::COMPARE_DISTINCT_FROM: return cudf::ast::ast_operator::NOT_EQUAL;
-    case duckdb::ExpressionType::COMPARE_LESSTHAN: return cudf::ast::ast_operator::LESS;
-    case duckdb::ExpressionType::COMPARE_GREATERTHAN: return cudf::ast::ast_operator::GREATER;
-    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-      return cudf::ast::ast_operator::LESS_EQUAL;
-    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-      return cudf::ast::ast_operator::GREATER_EQUAL;
-    default:
-      throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
+    case sirius::comparison_type::equal: return cudf::ast::ast_operator::EQUAL;
+    case sirius::comparison_type::not_distinct_from: return cudf::ast::ast_operator::NULL_EQUAL;
+    case sirius::comparison_type::not_equal:
+    case sirius::comparison_type::distinct_from: return cudf::ast::ast_operator::NOT_EQUAL;
+    case sirius::comparison_type::lt: return cudf::ast::ast_operator::LESS;
+    case sirius::comparison_type::gt: return cudf::ast::ast_operator::GREATER;
+    case sirius::comparison_type::le: return cudf::ast::ast_operator::LESS_EQUAL;
+    case sirius::comparison_type::ge: return cudf::ast::ast_operator::GREATER_EQUAL;
   }
+  throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
 }
 
 // Resolve table column index: BOUND_REF, BOUND_CAST(BOUND_REF), or BOUND_SUBQUERY (scalar
@@ -539,10 +541,18 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     };
 
     for (const auto& cond : conditions) {
-      cudf::size_type left_join_input_index = resolve_join_col(
-        *cond.left, left_expressions_to_idx, left_batch, left, left_col_views, "left");
-      cudf::size_type right_join_input_index = resolve_join_col(
-        *cond.right, right_expressions_to_idx, right_batch, right, right_col_views, "right");
+      cudf::size_type left_join_input_index  = resolve_join_col(*sirius::unwrap(cond.left),
+                                                               left_expressions_to_idx,
+                                                               left_batch,
+                                                               left,
+                                                               left_col_views,
+                                                               "left");
+      cudf::size_type right_join_input_index = resolve_join_col(*sirius::unwrap(cond.right),
+                                                                right_expressions_to_idx,
+                                                                right_batch,
+                                                                right,
+                                                                right_col_views,
+                                                                "right");
 
       left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);

@@ -96,7 +96,7 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
     *fixture.logical_join,
     std::move(left_child),
     std::move(right_child),
-    std::move(conditions),
+    sirius::wrap_join_conditions(std::move(conditions)),
     join_type,
     duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (empty = all)

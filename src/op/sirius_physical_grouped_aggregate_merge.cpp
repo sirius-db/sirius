@@ -30,38 +30,10 @@
 namespace sirius {
 namespace op {
 
-static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
-{
-  duckdb::set<std::size_t> group_indices;
-
-  if (groups.empty()) { return {}; }
-
-  for (auto& group : groups) {
-    D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
-    auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
-    group_indices.insert(bound_ref.index);
-  }
-  std::size_t highest_index = *group_indices.rbegin();
-  duckdb::vector<duckdb::LogicalType> types(highest_index + 1, duckdb::LogicalType::SQLNULL);
-  for (auto& group : groups) {
-    auto& bound_ref        = group->Cast<duckdb::BoundReferenceExpression>();
-    types[bound_ref.index] = bound_ref.return_type;
-  }
-  return types;
-}
-
-// Helper to deep copy a vector of Expression unique_ptrs
-static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& src)
-{
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> result;
-  result.reserve(src.size());
-  for (const auto& expr : src) {
-    result.push_back(expr->Copy());
-  }
-  return result;
-}
+// Helpers create_group_chunk_types / copy_expressions were used by the original grouping-sets
+// initialization path (now dead) and by the merge clone-from-parent ctor (which now takes pre-
+// converted cuDF definitions instead of DuckDB expressions). Both helpers have no remaining
+// callers in Super Sirius and have been removed.
 
 // Helper to convert vector<vector<idx_t>> to vector<unsafe_vector<idx_t>>
 static duckdb::vector<duckdb::unsafe_vector<std::size_t>> convert_grouping_functions(
@@ -119,8 +91,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::ClientContext& context,
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<sirius::expression> groups_p,
   std::size_t estimated_cardinality)
   : sirius_physical_grouped_aggregate_merge(context,
                                             std::move(types),
@@ -142,15 +114,15 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 // the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  duckdb::ClientContext& context,
+  duckdb::ClientContext& /*context*/,
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<sirius::expression> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
-  duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
+  duckdb::vector<duckdb::unsafe_vector<std::size_t>> /*grouping_functions_p*/,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType group_validity,
-  duckdb::TupleDataValidityType distinct_validity)
+  duckdb::TupleDataValidityType /*group_validity*/,
+  duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))

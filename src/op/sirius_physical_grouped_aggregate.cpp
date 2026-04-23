@@ -49,8 +49,8 @@ namespace op {
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::ClientContext& context,
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<sirius::expression> groups_p,
   std::size_t estimated_cardinality)
   : sirius_physical_grouped_aggregate(context,
                                       std::move(types),
@@ -74,13 +74,13 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::ClientContext& context,
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<sirius::expression> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
   duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType group_validity,
-  duckdb::TupleDataValidityType distinct_validity)
+  duckdb::TupleDataValidityType /*group_validity*/,
+  duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))

@@ -20,7 +20,7 @@
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>

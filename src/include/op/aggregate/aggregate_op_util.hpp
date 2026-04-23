@@ -17,7 +17,7 @@
 #pragma once
 
 #include "duckdb/common/vector.hpp"
-#include "duckdb/planner/expression.hpp"
+#include "expression/expression.hpp"
 
 #include <cudf/aggregation.hpp>
 
@@ -74,8 +74,8 @@ struct CudfAggregateDefinitions {
  * @throws std::runtime_error if an unsupported aggregate function is encountered
  */
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups_p,
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& expressions);
+  const duckdb::vector<sirius::expression>& groups_p,
+  const duckdb::vector<sirius::expression>& expressions);
 
 }  // namespace op
 }  // namespace sirius

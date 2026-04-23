@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/regex/regex_playground.hpp>
 #include <operator/gpu_physical_strings_matching.hpp>
@@ -371,7 +372,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
-          return ::sirius::expression::regex_playground::jit_transform_clickbench_q28_regex(
+          return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
             input.get_column_view());
         }
       }

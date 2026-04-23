@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <sirius/exception.hpp>
 

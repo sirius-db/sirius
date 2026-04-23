@@ -426,14 +426,14 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
 
   sirius_physical_grouped_aggregate local_op(context,
                                              std::move(output_types),
-                                             std::move(aggregates),
-                                             std::move(groups),
+                                             sirius::wrap_many(std::move(aggregates)),
+                                             sirius::wrap_many(std::move(groups)),
                                              2 /*estimated_cardinality*/);
 
   sirius_physical_grouped_aggregate_merge merge_op(context,
                                                    std::move(output_types2),
-                                                   std::move(aggregates2),
-                                                   std::move(groups2),
+                                                   sirius::wrap_many(std::move(aggregates2)),
+                                                   sirius::wrap_many(std::move(groups2)),
                                                    2 /*estimated_cardinality*/);
 
   auto local1 = run_local(local_op, batch1);

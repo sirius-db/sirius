@@ -78,4 +78,18 @@ std::vector<join_condition> wrap_join_conditions(std::vector<duckdb::JoinConditi
   return out;
 }
 
+duckdb::vector<join_condition> wrap_join_conditions(duckdb::vector<duckdb::JoinCondition> conds)
+{
+  duckdb::vector<join_condition> out;
+  out.reserve(conds.size());
+  for (auto& c : conds) {
+    out.push_back(join_condition{
+      wrap(std::move(c.left)),
+      wrap(std::move(c.right)),
+      from_duckdb(c.comparison),
+    });
+  }
+  return out;
+}
+
 }  // namespace sirius

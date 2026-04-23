@@ -201,7 +201,7 @@ TEST_CASE("expression - wrap_many preserves size, order, and per-element identit
 
 TEST_CASE("expression - wrap_many on empty input returns empty vector", "[expression]")
 {
-  auto wrapped = sirius::wrap_many({});
+  auto wrapped = sirius::wrap_many(std::vector<std::unique_ptr<duckdb::Expression>>{});
   REQUIRE(wrapped.empty());
 }
 

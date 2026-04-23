@@ -17,7 +17,7 @@
 #include "expression_executor/regex/regex_playground.hpp"
 
 namespace sirius {
-namespace expression {
+namespace regex {
 
 std::unique_ptr<cudf::column> regex_playground::jit_transform_clickbench_q28_regex(
   const cudf::column_view& input)
@@ -84,5 +84,5 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
                                   cudf::null_aware::YES);
 }
 
-}  // namespace expression
+}  // namespace regex
 }  // namespace sirius

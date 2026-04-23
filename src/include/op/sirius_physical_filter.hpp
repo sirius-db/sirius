@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "expression/expression.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
@@ -30,11 +31,11 @@ class sirius_physical_filter : public sirius_physical_operator {
 
  public:
   sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
-                         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+                         sirius::expression expression,
                          std::size_t estimated_cardinality);
 
   //! The filter expression
-  duckdb::unique_ptr<duckdb::Expression> expression;
+  sirius::expression expression;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;

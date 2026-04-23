@@ -18,19 +18,8 @@
 
 // sirius
 #include <config.hpp>
+#include <expression/expression.hpp>
 #include <expression_executor/expression_executor_strategy.hpp>
-
-// duckdb
-#include <duckdb/planner/expression.hpp>
-#include <duckdb/planner/expression/bound_between_expression.hpp>
-#include <duckdb/planner/expression/bound_case_expression.hpp>
-#include <duckdb/planner/expression/bound_cast_expression.hpp>
-#include <duckdb/planner/expression/bound_comparison_expression.hpp>
-#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
-#include <duckdb/planner/expression/bound_constant_expression.hpp>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
-#include <duckdb/planner/expression/bound_operator_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cucascades
 #include <cucascade/data/data_batch.hpp>
@@ -46,20 +35,24 @@
 #include <rmm/resource_ref.hpp>
 
 // standard library
-#include <array>
 #include <memory>
-#include <string_view>
 #include <variant>
 #include <vector>
 
-namespace sirius {
+namespace duckdb {
+class Expression;
+class BoundBetweenExpression;
+class BoundCaseExpression;
+class BoundCastExpression;
+class BoundComparisonExpression;
+class BoundConjunctionExpression;
+class BoundConstantExpression;
+class BoundFunctionExpression;
+class BoundOperatorExpression;
+class BoundReferenceExpression;
+}  // namespace duckdb
 
-// The currently supported CAST return types for cuDF ASTs
-static std::array<duckdb::LogicalTypeId, 3> constexpr supported_ast_cast_types{
-  {duckdb::LogicalTypeId::UBIGINT, duckdb::LogicalTypeId::BIGINT, duckdb::LogicalTypeId::DOUBLE}};
-// The strings representing the currently supported BOUND_FUNCTION types for cuDF ASTs
-static std::array<std::string_view, 6> constexpr supported_ast_functions{
-  "+", "-", "*", "/", "//", "%"};
+namespace sirius {
 
 /**
  * @brief Returns the current default expression_executor_strategy configured via
@@ -287,7 +280,7 @@ class gpu_expression_executor {
    * adding nodes to the AST tree.
    */
   gpu_expression_executor(
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
+    duckdb::vector<sirius::expression> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_executor_strategy strategy       = strategy_from_config(),
@@ -306,6 +299,18 @@ class gpu_expression_executor {
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
    * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
    * adding nodes to the AST tree.
+   */
+  gpu_expression_executor(
+    sirius::expression const& expression,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
+    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
+    std::size_t min_ast_size                    = 2);
+
+  /**
+   * @brief Non-owning ctor for internal call sites that already hold a raw duckdb::Expression
+   * pointer (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown). The caller
+   * retains ownership; the executor only reads from the expression.
    */
   gpu_expression_executor(
     duckdb::Expression const* expression,

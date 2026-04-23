@@ -17,13 +17,13 @@
 #pragma once
 
 #include "duckdb/common/value_operations/value_operations.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
 namespace sirius {
@@ -46,7 +46,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius_physical_operator> left,
     duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p);
@@ -54,20 +54,20 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   sirius_physical_nested_loop_join(duckdb::LogicalOperator& op,
                                    duckdb::unique_ptr<sirius_physical_operator> left,
                                    duckdb::unique_ptr<sirius_physical_operator> right,
-                                   duckdb::vector<duckdb::JoinCondition> cond,
+                                   duckdb::vector<sirius::join_condition> cond,
                                    duckdb::JoinType join_type,
                                    std::size_t estimated_cardinality);
 
   sirius_physical_nested_loop_join(duckdb::LogicalOperator& op,
                                    duckdb::unique_ptr<sirius_physical_operator> left,
                                    duckdb::unique_ptr<sirius_physical_operator> right,
-                                   duckdb::vector<duckdb::JoinCondition> cond,
+                                   duckdb::vector<sirius::join_condition> cond,
                                    duckdb::JoinType join_type,
                                    std::size_t estimated_cardinality,
                                    duckdb::vector<std::size_t> left_projection_map,
                                    duckdb::vector<std::size_t> right_projection_map);
 
-  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::vector<sirius::join_condition> conditions;
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
   //! The type of the join
@@ -111,7 +111,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   // Sink Interface
   bool is_sink() const override { return true; }
 
-  static bool is_supported(const duckdb::vector<duckdb::JoinCondition>& conditions,
+  static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);
 
  public:

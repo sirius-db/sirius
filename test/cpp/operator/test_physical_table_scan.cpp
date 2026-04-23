@@ -413,7 +413,7 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
   // INT64 > 3 should translate successfully
   REQUIRE(table_scan.passthrough == true);
   REQUIRE(parquet_scan.translated_filter.has_value());
-  REQUIRE(table_scan.filter_expr != nullptr);
+  REQUIRE(!table_scan.filter_expr.is_null());
 
   // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
@@ -520,7 +520,7 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
   // DECIMAL64 > 3.00 should translate successfully
   REQUIRE(table_scan.passthrough == true);
   REQUIRE(parquet_scan.translated_filter.has_value());
-  REQUIRE(table_scan.filter_expr != nullptr);
+  REQUIRE(!table_scan.filter_expr.is_null());
 
   // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};

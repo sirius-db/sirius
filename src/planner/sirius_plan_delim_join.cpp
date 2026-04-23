@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -95,8 +96,8 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   delim_join->distinct = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
     context,
     sirius::from_duckdb_vec(delim_types),
-    std::move(distinct_expressions),
-    std::move(distinct_groups),
+    sirius::wrap_many(std::move(distinct_expressions)),
+    sirius::wrap_many(std::move(distinct_groups)),
     op.estimated_cardinality);
 
   return std::move(delim_join);

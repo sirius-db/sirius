@@ -18,7 +18,7 @@
 #include <catch.hpp>
 
 // sirius
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 
 // duckdb
 #include <duckdb/common/helper.hpp>
@@ -236,7 +236,7 @@ std::unique_ptr<cudf::table> make_string_table(std::vector<std::string> const& v
   return ::sirius::gpu_expression_translator(stream, mr);
 }
 
-duckdb::JoinCondition make_reference_join_condition(duckdb::ExpressionType comparison)
+sirius::join_condition make_reference_join_condition(duckdb::ExpressionType comparison)
 {
   duckdb::JoinCondition condition;
   condition.left =
@@ -244,7 +244,9 @@ duckdb::JoinCondition make_reference_join_condition(duckdb::ExpressionType compa
   condition.right =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
   condition.comparison = comparison;
-  return condition;
+  return sirius::join_condition{sirius::wrap(std::move(condition.left)),
+                                sirius::wrap(std::move(condition.right)),
+                                sirius::from_duckdb(condition.comparison)};
 }
 
 }  // namespace
