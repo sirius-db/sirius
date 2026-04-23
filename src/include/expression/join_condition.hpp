@@ -19,6 +19,9 @@
 // sirius
 #include <expression/expression.hpp>
 
+// duckdb
+#include <duckdb/common/vector.hpp>
+
 // standard library
 #include <cstdint>
 #include <vector>
@@ -82,5 +85,13 @@ duckdb::ExpressionType to_duckdb(comparison_type c);
  * input vector is drained. Order and size are preserved.
  */
 std::vector<join_condition> wrap_join_conditions(std::vector<duckdb::JoinCondition> conds);
+
+/**
+ * @brief duckdb::vector overload of wrap_join_conditions.
+ *
+ * Matches the container convention used by Super Sirius operator headers, which hold
+ * `duckdb::vector<sirius::join_condition>` (not `std::vector<...>`).
+ */
+duckdb::vector<join_condition> wrap_join_conditions(duckdb::vector<duckdb::JoinCondition> conds);
 
 }  // namespace sirius

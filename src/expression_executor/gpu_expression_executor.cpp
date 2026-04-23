@@ -17,6 +17,8 @@
 // sirius
 #include <cudf/cudf_utils.hpp>
 
+#include <expression/expression_internal.hpp>
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <operator/gpu_materialize.hpp>
 
@@ -27,6 +29,16 @@
 // duckdb
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>
+#include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/expression/bound_between_expression.hpp>
+#include <duckdb/planner/expression/bound_case_expression.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -154,16 +166,27 @@ std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::release_c
 //===----------------------------------------------------------------------===//
 
 gpu_expression_executor::gpu_expression_executor(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
+  duckdb::vector<sirius::expression> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   rmm::cuda_stream_view stream,
   expression_executor_strategy strategy,
   std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
+  _expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
-    _expressions.push_back(expr.get());
+    _expressions.push_back(sirius::unwrap(expr));
   }
+}
+
+gpu_expression_executor::gpu_expression_executor(sirius::expression const& expression,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
+                                                 std::size_t min_ast_size)
+  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+{
+  _expressions.push_back(sirius::unwrap(expression));
 }
 
 gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expression,
@@ -436,12 +459,7 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
           }
           return count;
         }
-        case duckdb::ExpressionType::OPERATOR_COALESCE:
-          /// TODO: Implement COALESCE operator
-          /// GitHub issue ticket: https://github.com/sirius-db/sirius/issues/635
-          throw duckdb::NotImplementedException(
-            "[gpu_expression_executor] count_ast_ops called on an unsupported COALESCE operator "
-            "expression.");
+        case duckdb::ExpressionType::OPERATOR_COALESCE: return 0;
         case duckdb::ExpressionType::OPERATOR_TRY:
           throw duckdb::NotImplementedException(
             "[gpu_expression_executor] count_ast_ops called on an unsupported TRY operator "

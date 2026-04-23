@@ -80,7 +80,7 @@ mark_join_fixture create_mark_join()
     *f.logical_join,
     std::move(left_child),
     std::move(right_child),
-    std::move(conditions),
+    sirius::wrap_join_conditions(std::move(conditions)),
     duckdb::JoinType::MARK,
     duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)

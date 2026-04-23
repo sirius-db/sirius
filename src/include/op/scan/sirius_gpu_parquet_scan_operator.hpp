@@ -26,7 +26,6 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
-#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -121,8 +120,8 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    * @brief Signal that no more metadata will arrive.
    *
    * Must be called exactly once, after all accumulate_metadata() calls have returned.
-   * Invoked from metadata_scan.finalize_operator(). Sets _finalized with release
-   * semantics so get_next_task_hint() can return std::nullopt once the partition
+   * Invoked from metadata_scan.finalize_operator(). Sets _finalized under
+   * _metadata_mutex so get_next_task_hint() can return std::nullopt once the partition
    * index is fully drained instead of continuing to defer to the upstream pipeline.
    */
   void finalize_partitions();
@@ -208,13 +207,13 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   //                         metadata's row_group_partitions.
   //   _next_partition_idx— counter of the next unclaimed entry; advanced under
   //                         _metadata_mutex by get_next_task_input_data().
-  //   _finalized         — set once by finalize_partitions() with release semantics
+  //   _finalized         — set once by finalize_partitions() under _metadata_mutex
   //                         to signal that no more accumulate_metadata() calls will
-  //                         arrive. Read with acquire semantics by
-  //                         get_next_task_hint() to decide nullopt vs. WAITING.
+  //                         arrive. Read by get_next_task_hint() under _metadata_mutex
+  //                         to decide nullopt vs. WAITING.
   // ===----------------------------------------------------------------------===//
   std::mutex _metadata_mutex;
-  std::atomic<bool> _finalized{false};
+  bool _finalized{false};
   partition_inject_fn_t _hive_partition_inject_fn;
 
   struct partition_entry {

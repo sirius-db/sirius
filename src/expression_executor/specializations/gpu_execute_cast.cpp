@@ -15,7 +15,9 @@
  */
 
 // sirius
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -43,7 +45,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
         case BIGINT: return cudf::ast::ast_operator::CAST_TO_INT64;
         case DOUBLE: return cudf::ast::ast_operator::CAST_TO_FLOAT64;
         default:
-          throw duckdb::InternalException(
+          throw invalid_input_exception(
             "[gpu_expression_executor] execute called on a CAST expression with unsupported return "
             "type for AST execution: {}",
             duckdb::LogicalTypeIdToString(type_id));

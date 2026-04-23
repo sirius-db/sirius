@@ -71,10 +71,10 @@ class sirius_plan_printer {
   /// Convert MemoryBarrierType to a human-readable string.
   static std::string barrier_type_to_string(op::MemoryBarrierType type);
 
-  /// Format operator name with ID suffix: "HASH_JOIN (id=2)" (per D-04)
+  /// Format operator name with ID suffix: "HASH_JOIN (id=2)"
   static std::string format_operator_with_id(const op::sirius_physical_operator& op);
 
-  /// Get enrichment detail lines for an operator (per D-01, D-02, D-03).
+  /// Get enrichment detail lines for an operator.
   /// Returns empty vector for operators without enrichable properties.
   static std::vector<std::string> get_operator_detail_lines(const op::sirius_physical_operator& op);
 

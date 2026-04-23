@@ -151,9 +151,9 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Motivation:** The previous downgrade retry loop over-freed memory and caused contention between concurrent downgrade requests competing for the same batches.
 
-**Mechanism:** `request_downgrade(target_bytes, predicate)` enqueues a `downgrade_request` struct onto an MPMC queue. A single processing thread handles requests sequentially, collecting `weak_ptr` candidates up to `target_bytes`, dispatching them to a thread pool one-by-one, and evaluating the caller-supplied `predicate` after each completion. The predicate defines "done" (e.g., "memory reservation succeeded") — no retry loop, no over-freeing.
+**Mechanism:** `request_downgrade(predicate)` enqueues a `downgrade_request` struct onto an MPMC queue. A single processing thread handles requests sequentially, lazily fetching candidates from data repositories, then task queues, dispatching them to a thread pool one-by-one via `convertible_data::convert()`, and evaluating the caller-supplied `predicate` after each completion. The predicate defines "done" (e.g., "memory reservation succeeded") -- no retry loop, no over-freeing.
 
-**Code path:** `src/downgrade/downgrade_executor.cpp` — `request_downgrade()`, `process_request()`
+**Code path:** `src/downgrade/downgrade_executor.cpp` -- `request_downgrade()`, `processing_loop()`
 
 ### Pinned Host Memory Caching (PR #437)
 

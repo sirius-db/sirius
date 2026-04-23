@@ -19,7 +19,7 @@
 #include "config.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
+#include "exec/inspectable_mpsc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/config.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
@@ -143,6 +143,14 @@ class pipeline_executor {
   void set_scan_caching_config(sirius::op::scan::cache_level level);
 
   /**
+   * @brief Get a pointer to the pipeline-level task queue.
+   */
+  [[nodiscard]] exec::inspectable_mpsc<sirius::parallel::itask>* get_pipeline_task_queue() noexcept
+  {
+    return &_task_queue;
+  }
+
+  /**
    * @brief Set the priority scan operators
    *
    * Sets the scan operators that should be executed with priority.
@@ -188,8 +196,7 @@ class pipeline_executor {
   std::mutex _priority_scans_mutex;
   std::queue<op::sirius_physical_operator*> _priority_scans;
 
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>>
-    _task_queue;  ///< Queue for GPU pipeline tasks
+  exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
   std::thread _management_thread;
   std::atomic<bool> _running{false};

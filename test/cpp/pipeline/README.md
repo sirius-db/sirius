@@ -45,7 +45,6 @@ make test
 # Or run just the pipeline executor tests using catch2 tags
 ./build/release/test/unittest "[pipeline_executor]"
 ./build/release/test/unittest "[gpu_pipeline_executor]"
-./build/release/test/unittest "[pipeline_queue]"
 ```
 
 ## Test Timeouts

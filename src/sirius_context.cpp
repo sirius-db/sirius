@@ -242,6 +242,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   };
   create_executors_for_tier(cucascade::memory::Tier::GPU);
+  create_executors_for_tier(cucascade::memory::Tier::HOST);
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
     config_.get_gpu_pipeline_executor_config(),
@@ -254,6 +255,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                                   *memory_manager_);
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
+
+  // Wire the pipeline task queue into downgrade executors now that pipeline_executor_
+  // has been constructed.
+  for (auto& executor : downgrade_executors_) {
+    executor->set_pipeline_task_queue(pipeline_executor_->get_pipeline_task_queue());
+  }
 
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {

@@ -18,7 +18,7 @@
 
 // sirius
 #include <config.hpp>
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>

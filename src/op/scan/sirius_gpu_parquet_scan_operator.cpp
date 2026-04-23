@@ -63,7 +63,8 @@ void sirius_gpu_parquet_scan_operator::accumulate_metadata(
 
 void sirius_gpu_parquet_scan_operator::finalize_partitions()
 {
-  _finalized.store(true, std::memory_order_release);
+  std::lock_guard<std::mutex> lock(_metadata_mutex);
+  _finalized = true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -71,27 +72,26 @@ void sirius_gpu_parquet_scan_operator::finalize_partitions()
 //===----------------------------------------------------------------------===//
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
-  // 1. Work available right now? Dispatch immediately, even if metadata pipeline
-  //    is still producing. Hold the mutex so size() is consistent with
-  //    accumulate_metadata()'s growth.
   {
     std::lock_guard<std::mutex> lock(_metadata_mutex);
+
+    // 1. Work available? Dispatch immediately, even if metadata pipeline
+    //    is still producing.
     if (_next_partition_idx < _partition_index.size()) {
       return task_creation_hint{TaskCreationHint::READY, this};
     }
+
+    // 2. No work and metadata pipeline is done — we are finished.
+    if (_finalized) { return std::nullopt; }
   }
 
-  // 2. No work right now. If metadata pipeline is still running, defer to it.
-  if (!_finalized.load(std::memory_order_acquire)) {
-    auto it = ports.find("handoff");
-    if (it != ports.end() && it->second && it->second->src_pipeline) {
-      if (auto upstream = it->second->src_pipeline->get_source()) {
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, upstream.get()};
-      }
+  // 3. Metadata pipeline is still running — defer to it.
+  auto it = ports.find("handoff");
+  if (it != ports.end() && it->second && it->second->src_pipeline) {
+    if (auto upstream = it->second->src_pipeline->get_source()) {
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, upstream.get()};
     }
   }
-
-  // 3. Finalized and exhausted (or no upstream) — done.
   return std::nullopt;
 }
 

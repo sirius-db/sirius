@@ -143,7 +143,6 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/downgrade/downgrade_task.cpp
     src/expression/expression.cpp
     src/expression/join_condition.cpp
     src/expression_executor/expression_executor_strategy.cpp
@@ -217,10 +216,8 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
-    src/pipeline/gpu_pipeline_queue.cpp
     src/pipeline/gpu_pipeline_task.cpp
     src/pipeline/pipeline_executor.cpp
-    src/pipeline/pipeline_queue.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
@@ -362,11 +359,14 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/data/test_convertible_data_batch.cpp
+    test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_join_condition.cpp

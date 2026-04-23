@@ -15,8 +15,8 @@
  */
 
 // sirius
-
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
@@ -31,9 +31,6 @@
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
-
-// standard library
-#include <type_traits>
 
 namespace {
 using execute_result = ::sirius::gpu_expression_executor::execute_result;
@@ -174,8 +171,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression 
       return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     default:
-      throw duckdb::NotImplementedException("[gpu_expression_executor] Unsupported scalar type: %s",
-                                            expr.return_type.ToString());
+      throw not_implemented_exception("[gpu_expression_executor] Unsupported scalar type: %s",
+                                      expr.return_type.ToString());
   }
 }
 
