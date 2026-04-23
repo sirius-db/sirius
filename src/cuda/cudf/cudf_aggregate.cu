@@ -47,7 +47,7 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
                     AggregationType* agg_mode)
 {
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
   if (column[0]->column_length == 0) {
     SIRIUS_LOG_DEBUG("Input size is 0");
     for (int agg_idx = 0; agg_idx < num_aggregates; agg_idx++) {
@@ -136,7 +136,8 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
         int32_t scale = to_cudf_type.scale();
         to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL64, scale);
         auto casted_col =
-          cudf::cast(cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->mr);
+          cudf::cast(
+            cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->get_mr_ref());
         auto casted_result = cudf::reduce(casted_col->view(), *aggregate, to_cudf_type);
         column[agg]->setFromCudfScalar(*casted_result, gpuBufferManager);
         continue;
@@ -144,7 +145,8 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
         int32_t scale = to_cudf_type.scale();
         to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL128, scale);
         auto casted_col =
-          cudf::cast(cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->mr);
+          cudf::cast(
+            cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->get_mr_ref());
         auto casted_result = cudf::reduce(casted_col->view(), *aggregate, to_cudf_type);
         column[agg]->setFromCudfScalar(*casted_result, gpuBufferManager);
         continue;
@@ -166,7 +168,7 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
         auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                          to_cudf_type,
                                          rmm::cuda_stream_default,
-                                         GPUBufferManager::GetInstance().mr);
+                                         GPUBufferManager::GetInstance().get_mr_ref());
         column[agg]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
       }
       auto cudf_column = column[agg]->convertToCudfColumn();

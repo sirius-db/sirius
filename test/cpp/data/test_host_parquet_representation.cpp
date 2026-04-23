@@ -23,6 +23,7 @@
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <memory/resource_ref_utils.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // cucascade
@@ -75,7 +76,9 @@ static std::vector<memory_space_config> create_test_configs()
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
     .set_gpu_memory_resource_factory(
-      [](int, size_t) { return std::make_unique<rmm::mr::cuda_memory_resource>(); })
+      [](int device_id, size_t capacity) {
+        return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
+      })
     .use_host_per_gpu()
     .set_per_host_capacity(4096ull * 1024 * 1024);
   return builder.build();
@@ -487,8 +490,9 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
     host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   REQUIRE(fsmr != nullptr);
   cucascade::memory::small_pinned_host_memory_resource slab_mr(*fsmr);
+  auto slab_mr_view = sirius::memory::make_host_device_resource_view_checked(&slab_mr);
   // RAII guard: restores previous cuDF state before slab_mr is destroyed.
-  // Declared AFTER slab_mr so it is destroyed FIRST (reverse construction order).
+  // Declared AFTER slab_mr/slab_mr_view so it is destroyed FIRST (reverse construction order).
   struct cudf_pinned_guard {
     rmm::host_device_async_resource_ref prev_mr;
     std::size_t prev_threshold;
@@ -497,7 +501,7 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
       cudf::set_pinned_memory_resource(prev_mr);
       cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
     }
-  } pinned_guard{cudf::set_pinned_memory_resource(slab_mr),
+  } pinned_guard{cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
                  cudf::get_allocate_host_as_pinned_threshold()};
   cudf::set_allocate_host_as_pinned_threshold(
     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
@@ -651,6 +655,7 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
     host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   REQUIRE(fsmr != nullptr);
   cucascade::memory::small_pinned_host_memory_resource slab_mr(*fsmr);
+  auto slab_mr_view = sirius::memory::make_host_device_resource_view_checked(&slab_mr);
   struct cudf_pinned_guard {
     rmm::host_device_async_resource_ref prev_mr;
     std::size_t prev_threshold;
@@ -659,7 +664,7 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
       cudf::set_pinned_memory_resource(prev_mr);
       cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
     }
-  } pinned_guard{cudf::set_pinned_memory_resource(slab_mr),
+  } pinned_guard{cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
                  cudf::get_allocate_host_as_pinned_threshold()};
   cudf::set_allocate_host_as_pinned_threshold(
     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
@@ -766,7 +771,9 @@ TEST_CASE("host_parquet_representation cross-host copy converter",
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
     .set_gpu_memory_resource_factory(
-      [](int, size_t) { return std::make_unique<rmm::mr::cuda_memory_resource>(); })
+      [](int device_id, size_t capacity) {
+        return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
+      })
     .use_host_per_gpu()
     .set_per_host_capacity(4096ull * 1024 * 1024);
 

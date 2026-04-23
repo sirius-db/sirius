@@ -25,13 +25,12 @@
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
-#include <rmm/mr/device_memory_resource.hpp>
-
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -218,7 +217,7 @@ class oom_test_task : public oom_test_task_base {
 
     void* allocation = nullptr;
     try {
-      allocation = allocator->allocate(stream, kAllocationBytes);
+      allocation = allocator->allocate(stream, kAllocationBytes, alignof(std::max_align_t));
     } catch (const rmm::out_of_memory&) {
       global.oom_count.fetch_add(1, std::memory_order_relaxed);
       throw sirius::pipeline::oom_reschedule_exception(
@@ -228,7 +227,7 @@ class oom_test_task : public oom_test_task_base {
     // Hold the memory for a while to create pressure on concurrent tasks.
     std::this_thread::sleep_for(kHoldDuration);
 
-    allocator->deallocate(stream, allocation, kAllocationBytes);
+    allocator->deallocate(stream, allocation, kAllocationBytes, alignof(std::max_align_t));
     global.completed_count.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -262,8 +261,9 @@ class small_task : public oom_test_task_base {
     if (!guard) { return; }
     auto* allocator = guard->allocator;
 
-    void* allocation = allocator->allocate(stream, kSmallAllocationBytes);
-    allocator->deallocate(stream, allocation, kSmallAllocationBytes);
+    void* allocation =
+      allocator->allocate(stream, kSmallAllocationBytes, alignof(std::max_align_t));
+    allocator->deallocate(stream, allocation, kSmallAllocationBytes, alignof(std::max_align_t));
     global.completed_count.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -299,7 +299,7 @@ class xl_task : public oom_test_task_base {
     if (!guard) { return; }
 
     try {
-      guard->allocator->allocate(stream, kXlAllocationBytes);
+      guard->allocator->allocate(stream, kXlAllocationBytes, alignof(std::max_align_t));
     } catch (const rmm::out_of_memory&) {
       global.oom_count.fetch_add(1, std::memory_order_relaxed);
       throw sirius::pipeline::oom_reschedule_exception(
