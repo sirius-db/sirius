@@ -20,9 +20,11 @@
 #include <utils/s3_live_test.hpp>
 
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <string>
 
@@ -67,6 +69,11 @@ struct env_cfg {
   [[nodiscard]] std::string small_parquet_uri() const
   {
     return "s3://" + bucket + "/small.parquet";
+  }
+
+  [[nodiscard]] std::string parquet_uri(std::string const& key) const
+  {
+    return "s3://" + bucket + "/" + key;
   }
 };
 
@@ -128,6 +135,24 @@ std::int64_t expected_sum_v()
   return PARQUET_KNUTH * static_cast<std::int64_t>((PARQUET_ROWS - 1) * PARQUET_ROWS / 2);
 }
 
+std::string lowercase(std::string value)
+{
+  for (char& ch : value) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return value;
+}
+
+bool contains_any_token(std::string const& message,
+                        std::initializer_list<char const*> expected_tokens)
+{
+  auto const normalized = lowercase(message);
+  for (auto const* token : expected_tokens) {
+    if (normalized.find(lowercase(token)) != std::string::npos) return true;
+  }
+  return false;
+}
+
 class s3_gpu_execution_fixture {
  public:
   s3_gpu_execution_fixture()
@@ -158,18 +183,38 @@ class s3_gpu_execution_fixture {
 
   std::unique_ptr<duckdb::MaterializedQueryResult> run_gpu(std::string const& inner_sql)
   {
-    // Intentionally route through gpu_execution only. The companion guard test
-    // below proves the plain CPU s3:// path is unavailable in the same
-    // connection, so success here must be coming from Sirius's own S3
-    // datasource path rather than DuckDB's native remote I/O.
-    auto result = con->Query("SELECT * FROM gpu_execution(\"" + inner_sql + "\")");
+    auto result = run_gpu_raw(inner_sql);
     REQUIRE(result);
     if (result->HasError()) { UNSCOPED_INFO("gpu_execution error: " << result->GetError()); }
     REQUIRE_FALSE(result->HasError());
     return result;
   }
 
+  std::unique_ptr<duckdb::MaterializedQueryResult> run_gpu_expect_error(
+    std::string const& inner_sql, std::initializer_list<char const*> expected_tokens)
+  {
+    auto result = run_gpu_raw(inner_sql);
+    REQUIRE(result);
+    if (!result->HasError()) {
+      UNSCOPED_INFO("gpu_execution unexpectedly succeeded");
+    }
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    UNSCOPED_INFO("gpu_execution error: " << error);
+    REQUIRE(contains_any_token(error, expected_tokens));
+    return result;
+  }
+
  private:
+  std::unique_ptr<duckdb::MaterializedQueryResult> run_gpu_raw(std::string const& inner_sql)
+  {
+    // Intentionally route through gpu_execution only. The companion guard test
+    // below proves the plain CPU s3:// path is unavailable in the same
+    // connection, so success here must be coming from Sirius's own S3
+    // datasource path rather than DuckDB's native remote I/O.
+    return con->Query("SELECT * FROM gpu_execution(\"" + inner_sql + "\")");
+  }
+
   void require_ok(std::string const& sql)
   {
     auto result = con->Query(sql);
@@ -185,6 +230,36 @@ class s3_gpu_execution_fixture {
 };
 
 }  // namespace
+
+TEST_CASE_METHOD(s3_gpu_execution_fixture,
+                 "gpu_execution s3 - missing object surfaces query error",
+                 "[integration][gpu_execution][s3][parquet]")
+{
+  auto cfg = read_env();
+  if (skip_if_env_missing(cfg)) return;
+
+  configure_s3(cfg);
+
+  auto const missing_key = "definitely-does-not-exist-" + std::to_string(std::rand()) + ".parquet";
+  run_gpu_expect_error(
+    "SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.parquet_uri(missing_key) + "')",
+    {"404", "missing", "not found", "no such"});
+}
+
+TEST_CASE_METHOD(s3_gpu_execution_fixture,
+                 "gpu_execution s3 - bad credentials surface query error",
+                 "[integration][gpu_execution][s3][parquet]")
+{
+  auto cfg = read_env();
+  if (skip_if_env_missing(cfg)) return;
+
+  cfg.secret_key = "not-the-right-secret-key";
+  configure_s3(cfg);
+
+  run_gpu_expect_error("SELECT COUNT(*)::BIGINT FROM read_parquet('" + cfg.small_parquet_uri() +
+                         "')",
+                       {"403", "signature", "forbidden", "access denied"});
+}
 
 TEST_CASE_METHOD(s3_gpu_execution_fixture,
                  "gpu_execution s3 - cpu s3 read stays unavailable without httpfs",
