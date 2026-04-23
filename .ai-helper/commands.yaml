@@ -18,10 +18,15 @@ commands:
 
   test:
     - name: unit-tests
-      description: "Run C++ unit tests (abort on first failure)"
-      command: "./build/release/extension/sirius/test/cpp/sirius_unittest --abort"
-      timeout: 300
+      description: "Run C++ unit tests (abort on first failure). Pass filter= to restrict to a Catch2 test-spec."
+      command: "./build/release/extension/sirius/test/cpp/sirius_unittest --abort {filter}"
+      timeout: 1800
       output_parser: gtest
+      args:
+        - name: filter
+          description: "Catch2 test-spec filter (e.g. '*per-GPU distribution*'). Empty string runs all tests."
+          type: string
+          default: ""
       # command IS the binary here, so debug_command is not needed.
       # valgrind will wrap it directly:
       #   valgrind ./build/release/extension/sirius/test/cpp/sirius_unittest --abort

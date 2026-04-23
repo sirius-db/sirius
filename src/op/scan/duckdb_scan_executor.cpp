@@ -36,6 +36,8 @@
 
 #include <cucascade/memory/common.hpp>
 
+#include <algorithm>
+#include <limits>
 #include <mutex>
 
 namespace sirius::op::scan {
@@ -183,9 +185,19 @@ int duckdb_scan_executor::select_target_gpu()
     return _gpu_memory_spaces[idx]->get_device_id();
   }
 
-  // Weighted selection: use round-robin counter as deterministic distribution seed
+  // Weighted selection: use round-robin counter as deterministic distribution
+  // seed. Stride the counter by ~min(avail)/num_gpus so the cumulative walk
+  // actually rotates between GPUs on consecutive calls — a raw `counter %
+  // total_available` stays inside the first GPU's range for billions of calls
+  // when GPUs have comparable free memory. Proportional weighting is preserved:
+  // a GPU with 2x the memory of the smallest still wins 2x the slots per cycle.
+  size_t min_available = std::numeric_limits<size_t>::max();
+  for (auto* space : _gpu_memory_spaces) {
+    min_available = std::min(min_available, space->get_available_memory());
+  }
+  size_t stride     = std::max<size_t>(1, min_available / _gpu_memory_spaces.size());
   auto counter      = _scan_round_robin.fetch_add(1);
-  size_t target     = counter % total_available;
+  size_t target     = (counter * stride) % total_available;
   size_t cumulative = 0;
   for (auto* space : _gpu_memory_spaces) {
     cumulative += space->get_available_memory();

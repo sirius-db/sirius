@@ -4,7 +4,7 @@ sirius:
     num_gpus: 2
   memory:
     gpu:
-      usage_limit_fraction: 0.5
+      usage_limit_fraction: 0.4
       reservation_limit_fraction: 1.0
     host:
       capacity_bytes: 32000000000

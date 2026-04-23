@@ -67,6 +67,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   setup_pipeline_parents();
   finalize_pipeline_structure();
   link_join_partition_siblings();
+  configure_partition_min_partitions();
   log_pipeline_debug_info();
 
   return {std::move(scheduled_), std::move(pipeline_breakers_), meta_pipeline_count_};
@@ -762,6 +763,39 @@ void sirius_pipeline_converter::split_pipelines(
     } else {
       scheduled_.push_back(current_pipeline);
     }
+  }
+}
+
+void sirius_pipeline_converter::configure_partition_min_partitions()
+{
+  // Pull num_gpus from the SiriusContext's topology. Single-GPU runs keep
+  // the default min of 1 (no-op). For multi-GPU we force a floor equal to
+  // num_gpus on big-enough inputs; `small_table_bytes` keeps tiny
+  // aggregations on a single GPU to avoid cross-device overhead.
+  auto ctx = engine_.context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!ctx) return;
+  auto num_gpus = static_cast<int>(ctx->get_config().get_hw_topology().gpus.size());
+  if (num_gpus <= 1) return;
+  // Heuristic threshold: below ~16 MiB per GPU the partition overhead
+  // dominates. Configurable later if we find a workload where this matters.
+  const uint64_t small_table_bytes =
+    static_cast<uint64_t>(num_gpus) * uint64_t{16} * 1024 * 1024;
+
+  auto apply_to_op = [&](op::sirius_physical_operator* op) {
+    if (op && op->type == op::SiriusPhysicalOperatorType::PARTITION) {
+      static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(
+        num_gpus, small_table_bytes);
+    }
+  };
+  for (auto& breaker : pipeline_breakers_) {
+    apply_to_op(breaker.get());
+  }
+  for (auto& pipe : scheduled_) {
+    if (!pipe) continue;
+    auto sink   = pipe->get_sink();
+    auto source = pipe->get_source();
+    if (sink) apply_to_op(sink.get());
+    if (source) apply_to_op(source.get());
   }
 }
 

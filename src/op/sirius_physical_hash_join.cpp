@@ -476,7 +476,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     input_batch.push_back(std::move(probe_batch));
     input_batch.push_back(std::move(build_batch));
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // BUILD_PROBE mode uses a single cuco hash table shared across every probe
+    // task for this join. All such tasks must land on the same GPU, so we tag
+    // them with operator_id as the partition index (hash joins get spread
+    // across GPUs at the query level, but each individual join stays pinned).
+    return std::make_unique<partitioned_operator_data>(
+      std::move(input_batch), this->get_operator_id());
 
   } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
     if (probe_port->repo->num_partitions() != 1) {
@@ -497,7 +502,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "batch from the default port but got none in operator " +
         std::to_string(this->get_operator_id()));
     }
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // Subsequent probe-only tasks share the hash table that was built under
+    // the initial SCHEDULING task above. They MUST run on the same GPU, so
+    // tag with the same operator_id partition key used there.
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                       this->get_operator_id());
   } else {
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
@@ -566,7 +575,13 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
             input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(
               right_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
-          return std::make_unique<pipelineable_operator_data>(input_batch);
+          // Tag with partition_idx so task_creator's SCHED-00 pins the whole
+          // task to partition_idx % num_gpus — cuco hash tables inside the
+          // join must live on one device, and without the tag task dispatch
+          // falls back to data locality, which can route the probe side to a
+          // different GPU than the build side for the same partition.
+          return std::make_unique<partitioned_operator_data>(input_batch,
+                                                             partition_idx);
         }
         right_counter++;
         counter++;

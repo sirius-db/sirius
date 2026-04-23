@@ -234,6 +234,14 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
     if (batch && batch->get_data()) { total_bytes += batch->get_data()->get_size_in_bytes(); }
   }
   int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+  // Multi-GPU floor: if the input is big enough to justify using the second
+  // GPU, force at least num_gpus partitions so partition-based operators
+  // (hash_join, merge_group_by) get work on every GPU. Below the small-table
+  // threshold we keep num_partitions at its natural value — tiny tables run
+  // on a single GPU to avoid cross-device overhead.
+  if (_min_num_partitions > 1 && total_bytes >= _small_table_bytes) {
+    num_partitions = std::max(num_partitions, _min_num_partitions);
+  }
   return std::make_pair(num_partitions, total_bytes);
 }
 

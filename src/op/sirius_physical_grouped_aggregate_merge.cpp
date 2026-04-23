@@ -173,7 +173,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
   std::lock_guard<std::mutex> lg(lock);
   if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
     std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-    bool found_batch = true;
+    bool found_batch       = true;
+    auto this_partition_id = current_partition_index;
     while (found_batch) {
       auto batch = ports.begin()->second->repo->pop_data_batch(
         ::cucascade::batch_state::task_created, current_partition_index);
@@ -185,7 +186,12 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // Tag with the source partition index so task_creator's SCHED-00 pins this
+    // task to partition_idx % num_gpus. merge_group_by materializes a cuco
+    // hash table to combine its input batches, so — like hash_join — every
+    // task of a given partition must stay on a single GPU.
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                       this_partition_id);
   } else {
     return nullptr;
   }

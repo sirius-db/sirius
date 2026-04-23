@@ -90,6 +90,12 @@ class sirius_pipeline_converter {
   // Phase 5: Debug logging
   void log_pipeline_debug_info() const;
 
+  // Configure every sirius_physical_partition operator with the multi-GPU
+  // partition floor so partition-consumer tasks (hash_join, merge_group_by)
+  // have at least num_gpus partitions to spread across devices for big
+  // inputs. Small tables stay at their natural partition count.
+  void configure_partition_min_partitions();
+
   sirius_engine& engine_;
   const sirius::operator_params& op_params_;
 

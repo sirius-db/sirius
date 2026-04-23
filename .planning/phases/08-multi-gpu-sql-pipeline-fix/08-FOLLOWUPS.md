@@ -114,56 +114,186 @@ can't pass `--engines sirius`, `SIRIUS_CONFIG_FILE`, or `PARQUET_DIR`.
 needing `dangerouslyDisableSandbox: true` (when/if MCP sandbox gets
 GPU access).
 
-## 5. mgpu-audit TEST_CASE — TWO problems, the second is the real one
+## 5. mgpu-audit TEST_CASE — partial fix applied, remainder blocked by bug
 
-### 5a. 24 GB pool-prime OOM (workaround found, not applied)
+### 5a. 24 GB pool-prime OOM — WORKAROUND APPLIED
 
 `test_gpu_execution_tpch_mgpu_audit.cpp:150` originally fails with
 `std::bad_alloc: out_of_memory: CUDA error (failed to allocate
 25433702400 bytes) at .../rmm/mr/cuda_async_view_memory_resource.hpp:86`.
 
-Reproduces in complete isolation. GPU is 15 MB used per nvidia-smi.
-Not a regression from 93fea6f — audit TEST_CASE was authored but never
-ran green at Phase 8 verification (blocked by the residual failure our
-fix closed).
+**Applied:** `usage_limit_fraction` lowered from 0.5 → 0.4 in
+`test/cpp/integration/integration-2gpu.yaml`. Bypasses the OOM. The
+root cause of the pool-prime behavior at 0.5 is still not understood —
+kept as a workaround so downstream assertions can run.
 
-**Workaround verified:** lowering `usage_limit_fraction` from 0.5 → 0.4
-in `test/cpp/integration/integration-2gpu.yaml` fixes the OOM. Not
-applied — exposes a second failure (5b below) that is the real issue.
+### 5b. Scan dispatch never rotated under equal available memory — FIXED
 
-### 5b. Pipeline tasks and scan tasks don't co-distribute across GPUs
+`duckdb_scan_executor::select_target_gpu()` computed
+`target = counter % total_available` where `counter` increments by 1
+and `total_available` is cumulative *bytes*. With both GPUs at 20 GB
+free, the first 20 billion calls all fell in GPU 0's range.
 
-With 5a worked around, the audit test next fails at line 243:
-`REQUIRE(counts[0].pipeline_ids.size() >= min_count)` with
-`0 >= 1` and diagnostic:
+**Fix** (this session): stride the counter by `min(avail)/num_gpus` so
+the target rotates between GPUs in O(num_gpus) calls while preserving
+proportional weighting (`src/op/scan/duckdb_scan_executor.cpp:194-200`).
+Post-fix: `GPU0{scan=3}, GPU1{scan=1}` on SF1 Q1 (vs baseline 4:0).
+
+### 5c. Single-NUMA SCHED-02 never fired — FIXED (blocks on 5d now)
+
+`task_creator.cpp` built `_numa_to_gpu` with a `numa >= 0` guard that
+skipped every GPU on single-NUMA / non-NUMA hosts (where topology
+reports `numa_node=-1` per the Linux
+`/sys/bus/pci/devices/*/numa_node` convention). The SCHED-02 branch
+then saw an empty map and never assigned `preferred_device_id`, so
+every host-sourced pipeline task fell back to
+`_gpu_executors.begin()->first` — one deterministic GPU.
+
+**Fix applied this session:**
+1. Normalize `numa_node=-1 → 0` when building `_numa_to_gpu`.
+2. Store **all** GPUs per NUMA (vector), not just the first.
+3. SCHED-02 round-robins across the vector when multiple GPUs share
+   one NUMA.
+4. Normalize the host memory space's `device_id=-1 → 0` at the
+   `host_bytes` aggregation site so the lookup matches the normalized
+   map key.
+
+Files: `src/include/creator/task_creator.hpp`,
+`src/creator/task_creator.cpp`.
+
+Post-fix distribution on the audit host (2 GPUs, 1 NUMA node with
+all devices reporting -1):
+
+| before | after |
+|--------|-------|
+| `GPU0{pipeline=0, scan=4}` | `GPU0{pipeline=4, scan=2}` |
+| `GPU1{pipeline=3, scan=0}` | `GPU1{pipeline=6, scan=2}` |
+
+SCHED-02 log from a clean run (counter cycles correctly):
 ```
-per-GPU audit counts from /tmp/sirius-mgpu-audit-XXXX:
-  GPU0{pipeline=0, scan=4} GPU1{pipeline=3, scan=0}
+[sched-02] top_host=0 vec_size=2 counter=0 idx=0 -> GPU 0
+[sched-02] top_host=0 vec_size=2 counter=1 idx=1 -> GPU 1
+[sched-02] top_host=0 vec_size=2 counter=2 idx=0 -> GPU 0
+[sched-02] top_host=0 vec_size=2 counter=3 idx=1 -> GPU 1
 ```
 
-**All scan tasks landed on GPU 0; all pipeline tasks landed on GPU 1.**
-The audit's invariant is that *both* task kinds must be distributed
-across *both* GPUs (>=1 of each on each). This is a legitimate
-dispatch-policy question, not a test-config tweak:
+The audit test still fails — but the assertion that fails is now
+`REQUIRE(gpu_query_ok)`, not the distribution REQUIRE. The failure
+mode moved from "scheduler doesn't distribute" to "scheduler
+distributes and downstream execution OOMs" (5d below).
 
-- Is the scan_executor deliberately pinning scans to one GPU when the
-  total scan count is small (SF1 lineitem has ~6 batches)?
-- Does the pipeline_executor's round-robin dispatcher prefer a single
-  GPU when the scan output all lands on one GPU?
-- Is this an actual invariant violation (the audit is right and
-  dispatch is broken) or is the audit's >=1 threshold too strict for
-  SF1-small-batch-count workloads?
+**Regression warning:** because the fix makes pipelines actually
+distribute on single-NUMA hosts, queries that touch ORDER_BY (or any
+pattern that triggers the 5d underflow) will now OOM where they
+previously succeeded as single-GPU executions. Multi-GPU correctness
+is blocked by 5d until the reservation-counter underflow is fixed.
 
-**Estimate:** 1-2 hours investigation (trace scan and pipeline
-dispatch decisions) to classify as dispatch bug vs audit over-spec.
-If the threshold is right, fix is in dispatch logic; if the threshold
-is too strict, scope-constrain the assertion (e.g. require >=1 of
-*either* type on both GPUs, not both types on both GPUs).
+### 5d. Cross-GPU pipeline execution OOM — ROOT CAUSE, new follow-up
 
-**Scope note:** the `93fea6f` fix makes the AUDIT test able to *run*
-for the first time. The fact that it runs-and-fails-on-assertion is
-progress — it exposes a distribution question that was hidden behind
-the earlier crash.
+When pipeline tasks distribute across both GPUs during a single query,
+`Pipeline 4: OOM at operator ORDER_BY` fires with a nonsensical
+`global usage 18446744073709547520 bytes` (= `(size_t)-4096`). The
+reservation-aware adaptor's per-GPU `_total_allocated_bytes` counter
+has underflowed below zero.
+
+The task asks for 16 bytes; the allocator rejects because the
+counter-underflowed-comparison `upper_bound < current` is true. Ten
+retries, then `exceeded maximum OOM retry limit (10)`, query fails.
+Repro is deterministic: run SF1 Q1 with both scan fix in place and
+any change that makes pipelines land on both GPUs.
+
+Not a regression from this session — the underflow is pre-existing
+and was hidden by the fact that pipelines only ever ran on one GPU.
+
+**Scope:** new follow-up, own section below. The mgpu-audit test
+remains failing at the pipeline-distribution assertion until 5d is
+fixed; scan assertion now passes.
+
+## 6. Reservation counter underflow under cross-GPU pipeline execution — FIXED
+
+`cucascade::memory::reservation_aware_resource_adaptor::_total_allocated_bytes`
+underflowed when pipeline tasks distributed across both GPUs, triggering
+a spurious OOM at Pipeline 4 ORDER_BY:
+```
+Pipeline 4: OOM at operator ORDER_BY (id=4, index 0/1),
+requested 16 bytes, global usage 18446744073709547520 bytes
+(= 2^64 - 4096), peak allocated 256 bytes,
+reservation 0 bytes, rescheduling task 13
+```
+
+### Root cause
+
+`cucascade/src/memory/reservation_aware_resource_adaptor.cpp`:
+
+```cpp
+struct ptds_allocation_tracker {
+  static inline thread_local
+    std::unique_ptr<stream_ordered_tracker_state> thread_reservation_state;
+  …
+};
+```
+
+The `static inline thread_local` puts `thread_reservation_state` at
+class scope — a single storage location *per thread*, **shared across
+every adaptor instance** of the tracker type. Sirius has one
+`reservation_aware_resource_adaptor` per GPU (each with its own
+`ptds_allocation_tracker`), but all those trackers read and write the
+same thread-local pointer.
+
+Failure sequence under multi-GPU pipelines:
+1. Worker on thread T attaches reservation on adaptor_1 →
+   `thread_reservation_state` = arena_1.
+2. A cross-GPU deallocation (e.g., dropping a batch allocated on
+   adaptor_0) routes through adaptor_0 on thread T.
+3. adaptor_0's `do_deallocate` reads the shared thread-local, gets
+   arena_1 (adaptor_1's), and calls `arena_1.allocated_bytes.sub(size)`.
+4. arena_1 never *allocated* this size, so `arena_1.allocated_bytes`
+   goes **negative**.
+5. When arena_1 is later released, `do_release_reservation` computes
+   `released_bytes = arena_size − allocated_bytes` — with a negative
+   `allocated_bytes`, that's larger than `arena_size`.
+6. `adaptor_1._total_allocated_bytes.sub(released_bytes)` underflows
+   the counter to `(size_t)-X`, e.g. `2^64 − 4096`.
+
+### Fix
+
+`ptds_allocation_tracker` now uses a per-thread map keyed by adaptor
+instance pointer:
+
+```cpp
+using state_map =
+  std::unordered_map<ptds_allocation_tracker const*,
+                     std::unique_ptr<stream_ordered_tracker_state>>;
+static state_map& tls_states() noexcept {
+  thread_local state_map map;
+  return map;
+}
+```
+
+Each adaptor's `assign_reservation_to_tracker` / `get_tracker_state` /
+`reset_tracker_state` now keys by `this`. Lookups stay lock-free within
+a thread; cross-adaptor state is completely isolated.
+
+Single-instance cost: one extra hash-map lookup per alloc/free. The
+alternative — falling back to `PER_STREAM` tracking — was the
+workaround tested first; both paths pass the audit, but the
+`PER_THREAD` fix preserves the design intent (one reservation per task
+executing on a thread).
+
+### Verification
+
+- mgpu-audit test: `15/15 assertions, passed` — scan + pipeline both
+  distribute across GPU 0 and GPU 1, query completes cleanly.
+- Full `[integration][gpu_execution]` tag sweep: 366 test cases,
+  ~69.2M assertions, all passed.
+
+### Files changed
+
+- `cucascade/src/memory/reservation_aware_resource_adaptor.cpp` —
+  `ptds_allocation_tracker` struct only.
+
+No Sirius changes needed to pick up the fix; cucascade submodule bump
+required.
 
 ---
 

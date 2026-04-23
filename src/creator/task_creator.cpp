@@ -51,13 +51,24 @@ task_creator::task_creator(exec::thread_pool_config config,
                            const cucascade::memory::system_topology_info* sys_topology)
   : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _sys_topology(sys_topology)
 {
-  // Build NUMA node -> first GPU device mapping for HOST data locality routing
+  // Build NUMA node -> GPU device mapping for HOST data locality routing.
+  // numa_node=-1 is the Linux convention for a non-NUMA / single-NUMA host
+  // (see /sys/bus/pci/devices/*/numa_node). On those hosts the single host
+  // memory space is constructed with numa_id=0, so normalize -1 to 0 here so
+  // host_bytes lookups against this map actually find an entry. Without this
+  // normalization SCHED-02 never fires on single-NUMA multi-GPU boxes and
+  // every host-sourced pipeline task falls through to the default GPU.
+  //
+  // Record ALL GPUs on each NUMA (not just the first) — SCHED-02 can then
+  // round-robin across them, which matters when two or more GPUs share one
+  // NUMA node: single-socket boxes, the audit test host, and any GPU whose
+  // topology entry reports -1.
   if (_sys_topology) {
     for (size_t i = 0; i < _sys_topology->gpus.size(); ++i) {
-      auto numa = _sys_topology->gpus[i].numa_node;
-      if (numa >= 0 && _numa_to_gpu.find(numa) == _numa_to_gpu.end()) {
-        _numa_to_gpu[numa] = static_cast<int>(_sys_topology->gpus[i].id);
-      }
+      auto raw_numa        = _sys_topology->gpus[i].numa_node;
+      int normalized_numa  = (raw_numa < 0) ? 0 : raw_numa;
+      _numa_to_gpu[normalized_numa].push_back(
+        static_cast<int>(_sys_topology->gpus[i].id));
     }
   }
 }
@@ -457,7 +468,24 @@ void task_creator::manager_loop()
             // at the same address, so the raw pointer remains valid here.
             {
               std::optional<int> preferred_device_id;
-              if (pipelineable_input && !pipelineable_input->get_data_batches().empty()) {
+              // SCHED-00: if the input is tagged with a partition index, pin the
+              // task to partition_idx % num_gpus. Partition-based operators
+              // (hash_join, grouped_aggregate_merge, …) use cuco hash tables
+              // under the hood, and cuco tables must live on a single device —
+              // a stream bound to GPU A touching a counter built under GPU B
+              // trips cudaErrorInvalidValue at counter_storage.cuh. Routing on
+              // partition_idx keeps every task of a given partition on one GPU
+              // while still spreading partitions across GPUs.
+              if (auto* partitioned = dynamic_cast<op::partitioned_operator_data*>(
+                    pipelineable_input);
+                  partitioned && _sys_topology && !_sys_topology->gpus.empty()) {
+                auto n_gpus = _sys_topology->gpus.size();
+                auto idx    = partitioned->get_partition_idx() % n_gpus;
+                preferred_device_id =
+                  static_cast<int>(_sys_topology->gpus[idx].id);
+              }
+              if (!preferred_device_id.has_value() && pipelineable_input &&
+                  !pipelineable_input->get_data_batches().empty()) {
                 std::unordered_map<int, size_t> gpu_bytes;
                 std::unordered_map<int, size_t> host_bytes;
                 for (const auto& batch : pipelineable_input->get_data_batches()) {
@@ -467,7 +495,16 @@ void task_creator::manager_loop()
                   if (space->get_tier() == cucascade::memory::Tier::GPU) {
                     gpu_bytes[space->get_device_id()] += size;
                   } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
-                    host_bytes[space->get_device_id()] += size;
+                    // Normalize numa_id=-1 (non-NUMA / single-NUMA hosts, per
+                    // the Linux /sys/bus/pci/devices/*/numa_node convention) to
+                    // 0 so the SCHED-02 lookup matches the normalized
+                    // `_numa_to_gpu` map key. Without this, host_bytes[-1]
+                    // never hits `_numa_to_gpu[0]`, preferred_device_id stays
+                    // nullopt, and every host-sourced pipeline task falls
+                    // back to `_gpu_executors.begin()->first`.
+                    int host_key = space->get_device_id();
+                    if (host_key < 0) host_key = 0;
+                    host_bytes[host_key] += size;
                   }
                 }
                 if (!gpu_bytes.empty()) {
@@ -479,7 +516,10 @@ void task_creator::manager_loop()
                                                          })
                                           ->first;
                 } else if (!host_bytes.empty() && !_numa_to_gpu.empty()) {
-                  // SCHED-02: No GPU data, route to GPU on same NUMA as host data
+                  // SCHED-02: No GPU data, route to a GPU on the same NUMA as
+                  // the host data. When that NUMA hosts multiple GPUs, pick
+                  // round-robin across them — pinning every host-sourced
+                  // pipeline task to a single GPU defeats multi-GPU speedup.
                   auto top_host = std::max_element(host_bytes.begin(),
                                                    host_bytes.end(),
                                                    [](const auto& a, const auto& b) {
@@ -487,7 +527,10 @@ void task_creator::manager_loop()
                                                    })
                                     ->first;
                   auto it = _numa_to_gpu.find(top_host);
-                  if (it != _numa_to_gpu.end()) { preferred_device_id = it->second; }
+                  if (it != _numa_to_gpu.end() && !it->second.empty()) {
+                    auto idx = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
+                    preferred_device_id = it->second[idx];
+                  }
                 }
                 SIRIUS_LOG_DEBUG(
                   "Task Creator: locality score gpu_sources={} host_sources={} preferred_device={}",
