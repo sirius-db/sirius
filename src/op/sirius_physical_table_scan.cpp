@@ -215,16 +215,16 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                       projection_ids.size()));
       }
 
-      // Re-acquire read lock to extract table and metadata, release before creating new batch
+      // Acquire EXCLUSIVE lock since release_table() is a mutating operation
       auto batch_id = output_batch->get_batch_id();
       cucascade::memory::memory_space* space = nullptr;
       std::unique_ptr<cudf::table> table;
       {
-        auto output_ro = output_batch->to_read_only();
-        auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
-        space          = output_ro.get_memory_space();
-        table          = gpu_rep.release_table();
-      }  // read lock released here
+        auto output_mut = output_batch->to_mutable();
+        auto& gpu_rep   = output_mut.get_data()->cast<cucascade::gpu_table_representation>();
+        space           = output_mut.get_memory_space();
+        table           = gpu_rep.release_table();
+      }  // exclusive lock released here
 
       auto columns = table->release();
 
