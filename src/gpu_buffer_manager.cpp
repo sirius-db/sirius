@@ -230,8 +230,10 @@ GPUBufferManager::~GPUBufferManager()
       if (cpuCache[gpu] != nullptr) { freePinnedCPUMemory(cpuCache[gpu]); }
     }
     // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
-    mr->deallocate(
-      rmm::cuda_stream_view{}, (void*)gpuProcessing[gpu], processing_size_per_gpu, rmm::CUDA_ALLOCATION_ALIGNMENT);
+    mr->deallocate(rmm::cuda_stream_view{},
+                   (void*)gpuProcessing[gpu],
+                   processing_size_per_gpu,
+                   rmm::CUDA_ALLOCATION_ALIGNMENT);
   }
   Config::USE_PIN_MEM_FOR_CPU_PROCESSING ? freePinnedCPUMemory(cpuProcessing)
                                          : freePageableCPUMemory(cpuProcessing);
@@ -258,8 +260,7 @@ void GPUBufferManager::ResetBuffer()
       auto size = it->second;
       if (ptr != nullptr) {
         // customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
-        mr->deallocate(
-          rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
+        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
         // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), size);
         // allocation_table[gpu].erase(it);
       }
@@ -276,8 +277,7 @@ void GPUBufferManager::ResetBuffer()
       if (ptr != nullptr) {
         // SIRIUS_LOG_DEBUG("Deallocating Locked Pointer {} size {}", static_cast<void*>(ptr),
         // size);
-        mr->deallocate(
-          rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
+        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
       }
     }
     locked_allocation_table[gpu].clear();
@@ -384,8 +384,7 @@ void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
   auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
   if (it != allocation_table[gpu].end()) {
     // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
-    mr->deallocate(
-      rmm::cuda_stream_view{}, (void*)ptr, it->second, rmm::CUDA_ALLOCATION_ALIGNMENT);
+    mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, it->second, rmm::CUDA_ALLOCATION_ALIGNMENT);
     allocation_table[gpu].erase(it);
   } else {
     auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));

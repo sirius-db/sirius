@@ -105,10 +105,10 @@ void HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>>& aggregate_keys
         aggregate_keys[agg_idx]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
       auto from_cudf_column_view = aggregate_keys[agg_idx]->convertToCudfColumn();
       auto to_cudf_type          = cudf::data_type(cudf::type_id::INT64);
-    auto to_cudf_column        = cudf::cast(from_cudf_column_view,
-                                     to_cudf_type,
-                                     rmm::cuda_stream_default,
-                                     GPUBufferManager::GetInstance().get_mr_ref());
+      auto to_cudf_column        = cudf::cast(from_cudf_column_view,
+                                       to_cudf_type,
+                                       rmm::cuda_stream_default,
+                                       GPUBufferManager::GetInstance().get_mr_ref());
       aggregate_keys[agg_idx]->setFromCudfColumn(
         *to_cudf_column, false, nullptr, 0, gpuBufferManager);
     }

@@ -75,10 +75,9 @@ static std::vector<memory_space_config> create_test_configs()
   reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
-    .set_gpu_memory_resource_factory(
-      [](int device_id, size_t capacity) {
-        return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
-      })
+    .set_gpu_memory_resource_factory([](int device_id, size_t capacity) {
+      return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
+    })
     .use_host_per_gpu()
     .set_per_host_capacity(4096ull * 1024 * 1024);
   return builder.build();
@@ -501,8 +500,9 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
       cudf::set_pinned_memory_resource(prev_mr);
       cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
     }
-  } pinned_guard{cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
-                 cudf::get_allocate_host_as_pinned_threshold()};
+  } pinned_guard{
+    cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
+    cudf::get_allocate_host_as_pinned_threshold()};
   cudf::set_allocate_host_as_pinned_threshold(
     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
 
@@ -664,8 +664,9 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
       cudf::set_pinned_memory_resource(prev_mr);
       cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
     }
-  } pinned_guard{cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
-                 cudf::get_allocate_host_as_pinned_threshold()};
+  } pinned_guard{
+    cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
+    cudf::get_allocate_host_as_pinned_threshold()};
   cudf::set_allocate_host_as_pinned_threshold(
     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
 
@@ -770,10 +771,9 @@ TEST_CASE("host_parquet_representation cross-host copy converter",
   reservation_manager_configurator builder;
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
-    .set_gpu_memory_resource_factory(
-      [](int device_id, size_t capacity) {
-        return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
-      })
+    .set_gpu_memory_resource_factory([](int device_id, size_t capacity) {
+      return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
+    })
     .use_host_per_gpu()
     .set_per_host_capacity(4096ull * 1024 * 1024);
 

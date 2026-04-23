@@ -133,20 +133,18 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
         // Throw exception to trigger CPU fallback which handles overflow correctly
         throw NotImplementedException("GPU SUM of BIGINT may overflow - falling back to CPU");
       } else if (to_cudf_type.id() == cudf::type_id::DECIMAL32) {
-        int32_t scale = to_cudf_type.scale();
-        to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL64, scale);
-        auto casted_col =
-          cudf::cast(
-            cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->get_mr_ref());
+        int32_t scale   = to_cudf_type.scale();
+        to_cudf_type    = cudf::data_type(cudf::type_id::DECIMAL64, scale);
+        auto casted_col = cudf::cast(
+          cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->get_mr_ref());
         auto casted_result = cudf::reduce(casted_col->view(), *aggregate, to_cudf_type);
         column[agg]->setFromCudfScalar(*casted_result, gpuBufferManager);
         continue;
       } else if (to_cudf_type.id() == cudf::type_id::DECIMAL64) {
-        int32_t scale = to_cudf_type.scale();
-        to_cudf_type  = cudf::data_type(cudf::type_id::DECIMAL128, scale);
-        auto casted_col =
-          cudf::cast(
-            cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->get_mr_ref());
+        int32_t scale   = to_cudf_type.scale();
+        to_cudf_type    = cudf::data_type(cudf::type_id::DECIMAL128, scale);
+        auto casted_col = cudf::cast(
+          cudf_column, to_cudf_type, rmm::cuda_stream_default, gpuBufferManager->get_mr_ref());
         auto casted_result = cudf::reduce(casted_col->view(), *aggregate, to_cudf_type);
         column[agg]->setFromCudfScalar(*casted_result, gpuBufferManager);
         continue;
