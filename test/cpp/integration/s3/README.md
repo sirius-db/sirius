@@ -4,9 +4,8 @@ Local MinIO + fixture tooling for the Catch2 `[s3][integration]` tests,
 including both:
 - lower-level datasource/parquet semantic tests that read bytes through
   Sirius's S3 datasource and validate them out-of-band, and
-- a true end-to-end `gpu_execution` test that queries
-  `read_parquet('s3://...')` through Sirius itself and verifies row-level
-  correctness without DuckDB `httpfs`.
+- a small `gpu_execution` guard that documents the current DuckDB `httpfs`
+  bind-time limitation for direct `read_parquet('s3://...')`.
 
 ## What this gives you
 
@@ -21,8 +20,8 @@ including both:
   local copy.
 - `env.sh` that exports the `SIRIUS_TEST_S3_*` variables consumed by
   `test/cpp/io/s3/test_s3_ioctx.cpp`, `test_s3_integration.cpp`,
-  `test_s3_parquet_integration.cpp`, and the S3 `gpu_execution` integration
-  tests under `test/cpp/integration/`.
+  `test_s3_parquet_integration.cpp`, and the S3 `gpu_execution` guard test
+  under `test/cpp/integration/`.
 - A strict-mode toggle (`SIRIUS_TEST_S3_STRICT`) that keeps ad-hoc local runs
   best-effort while making `make s3-test` fail hard if live S3 access breaks
   after the environment is present.
@@ -83,7 +82,7 @@ sha256 manifest stays stable:
 | `hello.txt` | 16 B | HEAD + tiny-range read |
 | `small.bin` | 20 KiB | bit-equal full-object read via `datasource_factory` |
 | `medium.bin` | 8 MiB | multi-range reads at odd offsets |
-| `parquet/*.parquet` | varies | standard TPCH Parquet fixtures reused by datasource-level semantic tests and true `gpu_execution` S3 end-to-end tests. |
+| `parquet/*.parquet` | varies | standard TPCH Parquet fixtures reused by datasource-level semantic tests and by the `gpu_execution` S3 bind-time guard. |
 
 `small.bin` / `medium.bin` are opaque deterministic byte blobs, not real
 parquet - the byte-equality tests in `test_s3_integration.cpp` do not invoke
@@ -112,11 +111,11 @@ A sha256 manifest is written to `fixtures/local/MANIFEST.sha256`.
 - The `[s3][parquet][integration]` test additionally skips when
   `parquet/nation.parquet` is missing locally. In normal repo checkouts this
   means `make s3-up` did not populate fixtures successfully.
-- The `gpu_execution` S3 suite explicitly disables DuckDB extension
-  autoload/autoinstall and asserts that plain CPU
-  `read_parquet('s3://...')` fails in the same connection before verifying the
-  Sirius query path succeeds. This keeps the end-to-end test honest about not
-  using DuckDB `httpfs`.
+- Direct `gpu_execution("... read_parquet('s3://...') ...")` is currently
+  blocked at DuckDB bind time: DuckDB's `read_parquet` insists on `httpfs`
+  before Sirius can take over the scan. The S3 suite keeps a guard test that
+  asserts this limitation explicitly so it does not regress silently. Real S3
+  coverage today lives in the datasource-level semantic tests.
 - `env.sh` also exports `SIRIUS_CONFIG_FILE` pointing at `sirius.yaml` in this
   directory. It caps Super Sirius's startup GPU/host reservation at 256/128
   MiB so `require sirius` in SQL tests in this area won't OOM on GPUs that
