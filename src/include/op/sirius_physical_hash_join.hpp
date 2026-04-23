@@ -19,13 +19,13 @@
 #include "cudf/cudf_utils.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -63,7 +63,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius_physical_operator> left,
     duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     const duckdb::vector<std::size_t>& left_projection_map,
     const duckdb::vector<std::size_t>& right_projection_map,
@@ -75,12 +75,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius_physical_operator> left,
     duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     std::size_t estimated_cardinality,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
-  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::vector<sirius::join_condition> conditions;
   //! Scans where we should push generated filters into (if any)
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
 
@@ -119,7 +119,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * condition on the same side — cuDF's mixed_join API requires disjoint equality and
    * conditional table columns.
    */
-  static bool are_conditions_supported(duckdb::vector<duckdb::JoinCondition>& conditions);
+  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 

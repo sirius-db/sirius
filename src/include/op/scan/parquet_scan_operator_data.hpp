@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/sirius_physical_operator.hpp>
 
 // cudf

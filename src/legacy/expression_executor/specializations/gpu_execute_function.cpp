@@ -615,7 +615,7 @@ struct RegexFunctionDispatcher {
     if (has_backrefs) {
       if (Config::ENABLE_REGEX_JIT_IMPL) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
-          return ::sirius::expression::regex_playground::jit_transform_clickbench_q28_regex(
+          return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
             input_cudf_column->view());
         }
       }

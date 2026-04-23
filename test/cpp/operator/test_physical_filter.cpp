@@ -79,8 +79,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
       *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   }
 
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
-  exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
+  auto filter_expr = sirius::wrap(duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                                 0),
@@ -91,7 +90,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   types.push_back(Traits::logical_type());
 
   sirius_physical_filter filter(
-    sirius::from_duckdb_vec(types), std::move(exprs), filter_vals.size());
+    sirius::from_duckdb_vec(types), std::move(filter_expr), filter_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = filter.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());

@@ -21,6 +21,7 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression_internal.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius/exception.hpp"
@@ -50,18 +51,16 @@ namespace op {
 
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::vector<sirius::expression> expressions,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType distinct_validity)
+  duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
 {
-  distinct_collection_info = duckdb::DistinctAggregateCollectionInfo::Create(aggregates);
-  // aggregation_result       = duckdb::make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
-  if (!distinct_collection_info) { return; }
-  distinct_data =
-    duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
+  // Sirius's GPU aggregate path does not support DISTINCT aggregates — see the throw in
+  // build_aggregate_layout. DistinctAggregateCollectionInfo / DistinctAggregateData are not
+  // wired into any subsequent code path here, so we skip populating them.
 }
 
 namespace {
@@ -110,15 +109,14 @@ struct aggregate_layout {
   bool has_avg = false;
 };
 
-aggregate_layout build_aggregate_layout(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& aggregates)
+aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>& aggregates)
 {
   aggregate_layout layout;
   size_t local_idx = 0;
   layout.aggregates.reserve(aggregates.size());
 
   for (size_t i = 0; i < aggregates.size(); ++i) {
-    auto& agg = aggregates[i]->Cast<duckdb::BoundAggregateExpression>();
+    auto& agg = sirius::unwrap(aggregates[i])->Cast<duckdb::BoundAggregateExpression>();
     if (agg.IsDistinct()) {
       throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
     }
@@ -445,14 +443,14 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
-// Helper to deep copy Expression vector (same as in grouped_aggregate)
-static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& src)
+// Helper to deep copy the wrapped aggregate expressions (used by the merge overload below).
+static duckdb::vector<sirius::expression> copy_expressions(
+  const duckdb::vector<sirius::expression>& src)
 {
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> result;
+  duckdb::vector<sirius::expression> result;
   result.reserve(src.size());
   for (const auto& expr : src) {
-    result.push_back(expr->Copy());
+    result.push_back(sirius::wrap(sirius::unwrap(expr)->Copy()));
   }
   return result;
 }
@@ -470,18 +468,13 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::vector<sirius::expression> expressions,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType distinct_validity)
+  duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
 {
-  distinct_collection_info = duckdb::DistinctAggregateCollectionInfo::Create(aggregates);
-  // aggregation_result       = duckdb::make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
-  if (!distinct_collection_info) { return; }
-  distinct_data =
-    duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
 
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(

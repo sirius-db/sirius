@@ -128,7 +128,7 @@ TEST_CASE("join_condition - wrap_join_conditions transfers expressions and maps 
 TEST_CASE("join_condition - wrap_join_conditions on empty input returns empty vector",
           "[join_condition]")
 {
-  auto out = sirius::wrap_join_conditions({});
+  auto out = sirius::wrap_join_conditions(std::vector<duckdb::JoinCondition>{});
   REQUIRE(out.empty());
 }
 

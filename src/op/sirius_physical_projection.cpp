@@ -28,7 +28,7 @@ namespace op {
 
 sirius_physical_projection::sirius_physical_projection(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+  duckdb::vector<sirius::expression> select_list,
   std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
