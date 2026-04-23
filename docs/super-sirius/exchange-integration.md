@@ -49,12 +49,16 @@ TIME ═══> [ GPU compute+partition batch 1 ][ GPU compute+partition batch 2
 
 ```mermaid
 graph LR
+    FE["Doris/StarRocks FE"] -->|TPlan| rust
+
+    subgraph rust["Sirius Backend (Rust)"]
+        PT["Plan Translator\n(TPlan → Substrait)"] --> ENG["Execute via FFI"]
+        GRPC["gRPC Service"] --> NIXL["NIXL Exchange"] --> BUMP["Staging Bump\nAllocator"]
+    end
     subgraph core["Sirius Core (C++)"]
         GPU["GPU Pipeline\nExecutor"] --> RC["Result Collector\n(partitions + packs)"] --> CAPI["C API\n(blocking)"]
     end
-    subgraph rust["Sirius Backend (Rust)"]
-        GRPC["gRPC Service"] --> NIXL["NIXL Exchange"] --> BUMP["Staging Bump\nAllocator"]
-    end
+    ENG -->|"Substrait plan"| GPU
     CAPI -->|"blocking FFI"| GRPC
 ```
 
@@ -66,6 +70,12 @@ TIME ═══> [  GPU compute  ][  BLOCKING  ][  NIXL transfer  ][  BLOCKING  ]
 
 ```mermaid
 graph TB
+    subgraph rust["Sirius Backend (Rust)"]
+        PT["Plan Translator\n(Doris/StarRocks TPlan\n→ Substrait plan)"]
+        TC["tonic gRPC Client\n(ExchangeMetadata,\nTransferComplete)"]
+        TS["tonic gRPC Server\n→ FFI into C++:\nreserve_recv_buffer()\ningest_transfer()"]
+    end
+
     subgraph core["Sirius Core (C++)"]
         GPU["GPU Pipeline Executor\noperators → exchange_partition (sink)"]
         GPU -->|publish| REPO["shared_data_repo\n(per-partition)"]
@@ -79,11 +89,7 @@ graph TB
         WP -->|"Phase 3: RDMA transfer"| NIXL_CPP["NIXL C++ API\n(direct call)"]
     end
 
-    subgraph rust["Sirius Backend (Rust)"]
-        TC["tonic gRPC Client\n(ExchangeMetadata,\nTransferComplete)"]
-        TS["tonic gRPC Server\n→ FFI into C++:\nreserve_recv_buffer()\ningest_transfer()"]
-    end
-
+    PT -->|"Substrait plan\n(FFI)"| GPU
     WP -->|"Phase 2: send metadata\nPhase 4: send complete\n(FFI)"| TC
     TS -->|"FFI"| core
 ```
@@ -114,7 +120,7 @@ TIME ═══> [ GPU compute+partition batch1 ][ GPU compute+partition batch2 ]
 | `gpu_staging_buffer.rs` | Sirius Backend (Rust) | **Removed** — cuCascade replaces Rust bump allocator |
 | `sirius_exchange_c_api.cpp` | Sirius Core (C++) | **Replaced** — old capture API replaced by new receiver C API |
 | Exchange code in `result_collector` | Sirius Core (C++) | **Removed** — partitioning moves to exchange_partition operator |
-| Fragment execution | Sirius Backend (Rust) | Unchanged — still handles fragment dispatch, plan translation |
+| Fragment execution + plan translation | Sirius Backend (Rust) | Unchanged — receives Doris/StarRocks TPlan, translates to Substrait plan, dispatches to C++ engine via FFI |
 | bRPC exchange | Sirius Backend (Rust) | Unchanged — remains as CPU fallback path |
 
 ## Sender Side: `communication_executor`
