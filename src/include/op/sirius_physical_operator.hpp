@@ -172,7 +172,8 @@ class pipelineable_operator_data : public operator_data {
    * @return Processing handles for all batches, or std::nullopt on lock failure.
    */
   std::optional<std::vector<::cucascade::read_only_data_batch>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream) override;
+    const ::cucascade::memory::memory_space* requested_memory_space,
+    rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
