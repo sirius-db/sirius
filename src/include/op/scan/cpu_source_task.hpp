@@ -24,10 +24,10 @@
 #include <duckdb/main/client_context.hpp>
 #include <op/sirius_physical_cpu_source.hpp>
 #include <parallel/task.hpp>
-#include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
+#include <pipeline/task_scheduler.hpp>
 #include <sirius_context.hpp>
 
 namespace sirius::op::scan {
