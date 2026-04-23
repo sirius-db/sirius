@@ -16,6 +16,7 @@
 
 // sirius
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
@@ -23,7 +24,7 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 
 // cudf
-#include <cudf/column/column_factories.hpp>
+#include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
@@ -46,8 +47,10 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
   auto current_result = execute(*expr.else_expr, execution_mode::MATERIALIZE);
 
   // Loop backwards, so that the THEN of the first true WHEN is copied to the output column
-  auto num_checks = static_cast<int32_t>(
+  auto const num_checks = static_cast<int32_t>(
     expr.case_checks.size());  // This is sane, and needed for the descending loop index
+  D_ASSERT(num_checks > 0);
+
   for (int32_t i = num_checks - 1; i >= 0; --i) {
     auto& case_check = expr.case_checks[i];
 
@@ -74,7 +77,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
       }
       if (throw_error) {
         // Assume that this arises for the stated error
-        throw duckdb::InternalException(
+        throw internal_exception(
           "[gpu_expression_executor:case]: More than one row returned by a subquery used as an "
           "expression.");
       }
@@ -114,17 +117,14 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
     current_result = execute_result(std::move(output));
   }
   if (mode == execution_mode::AST) {
-    // The caller wants an AST node. Materialize the CASE result into a temp column and return an
-    // ast_result with a column_reference to it.
-    std::unique_ptr<cudf::column> result_column;
-    if (current_result.is_scalar()) {
-      result_column = cudf::make_column_from_scalar(
-        current_result.get_scalar(), _input_table.num_rows(), _stream, _mr);
-    } else {
-      result_column =
-        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr);
+    // The caller wants an AST node.
+    // Since at least one copy_if_else has been executed, current_result must have an owned column.
+    if (!current_result.is_owned_column()) {
+      throw internal_exception(
+        "[gpu_expression_executor:case]: Expected an owned column after executing CASE "
+        "expression.");
     }
-    return materialize_as_ast_column(std::move(result_column));
+    return materialize_as_ast_column(std::move(current_result.release_column()));
   }
   return current_result;
 }

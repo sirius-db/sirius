@@ -16,6 +16,7 @@
 
 // sirius
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
@@ -41,7 +42,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpressi
         case CONJUNCTION_AND: return cudf::ast::ast_operator::LOGICAL_AND;
         case CONJUNCTION_OR: return cudf::ast::ast_operator::LOGICAL_OR;
         default:
-          throw duckdb::InternalException(
+          throw invalid_input_exception(
             "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
             static_cast<int>(expr.GetExpressionType()));
       }
@@ -81,7 +82,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpressi
       case CONJUNCTION_AND: return cudf::binary_operator::LOGICAL_AND;
       case CONJUNCTION_OR: return cudf::binary_operator::LOGICAL_OR;
       default:
-        throw duckdb::InternalException(
+        throw invalid_input_exception(
           "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
           static_cast<int>(expr.GetExpressionType()));
     }
