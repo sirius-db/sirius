@@ -13,29 +13,24 @@ Sirius compiles cleanly against cucascade commit d9dc331 with the new 3-class da
 ### Validated
 
 - ✓ cucascade submodule updated to d9dc331 — existing on data_batch_refactor branch
+- ✓ `lock_or_prepare_batch` rewritten to use `to_read_only()` / `readonly_to_mutable()` / `mutable_to_readonly()` transitions — Validated in Phase 1-2
+- ✓ `pipelineable_operator_data::prepare_for_processing` returns `optional<vector<read_only_data_batch>>` — Validated in Phase 1
+- ✓ New `read_only_pipelineable_operator_data` and `read_only_partitioned_operator_data` classes created — Validated in Phase 1
+- ✓ `gpu_pipeline_task::compute_task` and `run_one_operator` receive `vector<read_only_data_batch>` input — Validated in Phase 1
+- ✓ All operators cast to `read_only_pipelineable_operator_data` or `read_only_partitioned_operator_data` — Validated in Phase 3 (OPER-01)
+- ✓ `convertible_data_batch::convert` and `convertible_gpu_pipeline_task::convert` use `to_mutable()` — Validated in Phase 1
+- ✓ All idle `batch->get_data()` / `get_memory_space()` / `get_current_tier()` replaced with `to_read_only()` — Validated in Phase 3 (ACCS-01..04)
+- ✓ All `pop_data_batch(batch_state::task_created)` replaced with `pop_idle_data_batch()` — Validated in Phase 3 (OPER-02)
+- ✓ Repository signatures updated (state param removed) — Validated in Phase 3 (OPER-03, OPER-04)
+- ✓ Subscriber count management via `subscribe()` / `unsubscribe()` — Validated in Phase 1
+- ✓ `data_batch_processing_handle`, old `batch_state` values, old lock methods removed entirely — Validated in Phase 3
+- ✓ `gpu_pipeline_task_local_state` estimation methods use `to_read_only()` — Validated in Phase 3
+- ✓ `result_collector` convert_to uses `to_mutable()` pattern — Validated in Phase 1
+- ✓ Project compiles cleanly with the new cucascade API — Validated in Phase 3 (BILD-01)
 
 ### Active
 
-- [ ] `lock_or_prepare_batch` rewritten to use `to_read_only()` / `readonly_to_mutable()` / `mutable_to_readonly()` transitions, returning `read_only_data_batch` instead of `data_batch_processing_handle`
-- [ ] `pipelineable_operator_data::prepare_for_processing` returns `optional<vector<read_only_data_batch>>` instead of `optional<vector<data_batch_processing_handle>>`
-- [ ] New `read_only_pipelineable_operator_data` class holding `vector<read_only_data_batch>` created
-- [ ] New `read_only_partitioned_operator_data` class extending `read_only_pipelineable_operator_data` with partition index
-- [ ] `gpu_pipeline_task::compute_task` receives `vector<read_only_data_batch>` input (passed from prepare_for_processing, not from local state)
-- [ ] `run_one_operator` takes `vector<read_only_data_batch>` input
-- [ ] All operators internally cast to `read_only_pipelineable_operator_data` or `read_only_partitioned_operator_data` as appropriate
-- [ ] `convertible_data_batch::convert` uses `to_mutable()` to acquire exclusive lock, then calls `convert_to` on `mutable_data_batch`
-- [ ] `convertible_gpu_pipeline_task::convert` follows same `to_mutable()` pattern
-- [ ] All `batch->get_data()` / `batch->get_memory_space()` / `batch->get_current_tier()` calls on idle data_batch replaced with `to_read_only()` accessor pattern
-- [ ] All `pop_data_batch(batch_state::task_created)` calls replaced with `pop_idle_data_batch()`
-- [ ] All `get_data_batch_by_id(id, std::nullopt, partition)` calls updated to `get_data_batch_by_id(id, partition)` (optional state param removed)
-- [ ] `pop_data_batch_by_id(id, batch_state::task_created, partition)` calls updated to `pop_data_batch_by_id(id, partition)` (state param removed)
-- [ ] Subscriber count management: `subscribe()` called at task creation, `unsubscribe()` in task destructor for all input data_batches
-- [ ] `data_batch_processing_handle` references removed entirely (type is obsolete)
-- [ ] Old `batch_state::task_created` / `batch_state::in_transit` references removed
-- [ ] Old `try_to_lock_for_in_transit` / `try_to_release_in_transit` / `wait_to_lock_for_processing` / `try_to_lock_for_processing` calls removed
-- [ ] `gpu_pipeline_task_local_state` methods (`get_task_consumption_basis`, `get_estimated_bytes_to_materialize_input`) use `to_read_only()` for data access
-- [ ] `result_collector` convert_to calls use `to_mutable()` pattern
-- [ ] Project compiles cleanly with the new cucascade API
+(None — all requirements validated)
 
 ### Out of Scope
 
@@ -66,11 +61,11 @@ Sirius compiles cleanly against cucascade commit d9dc331 with the new 3-class da
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Use `to_read_only()` for all data access on idle batches | New API makes get_data/get_memory_space private | — Pending |
-| Use blocking `to_mutable()` for convert paths | Simplifies conversion flow vs try-based approach | — Pending |
-| Replace `task_created` state with subscriber count | New API removed task_created; subscribe/unsubscribe is the replacement mechanism | — Pending |
-| Replace `pop_data_batch(task_created)` with `pop_idle_data_batch()` | task_created state gone; subscriber count distinguishes assigned vs free | — Pending |
-| Target compilation only, not test correctness | Allows incremental progress on a large refactoring | — Pending |
+| Use `to_read_only()` for all data access on idle batches | New API makes get_data/get_memory_space private | ✓ Adopted across all operators and pipeline code |
+| Use blocking `to_mutable()` for convert paths | Simplifies conversion flow vs try-based approach | ✓ Used in convertible_data_batch, convertible_gpu_pipeline_task, downgrade |
+| Replace `task_created` state with subscriber count | New API removed task_created; subscribe/unsubscribe is the replacement mechanism | ✓ Implemented in pipeline task lifecycle |
+| Replace `pop_data_batch(task_created)` with `pop_idle_data_batch()` | task_created state gone; subscriber count distinguishes assigned vs free | ✓ All 9 operator call sites migrated |
+| Target compilation only, not test correctness | Allows incremental progress on a large refactoring | ✓ Clean build achieved; test compilation also fixed |
 
 ## Evolution
 
@@ -90,4 +85,8 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-21 after initialization*
+## Current State
+
+Phase 3 complete — all 3 phases of the data_batch API refactoring milestone are done. Sirius compiles cleanly against cucascade d9dc331 with the new 3-class API. All operator, pipeline, and accessor migration requirements validated.
+
+*Last updated: 2026-04-23 after Phase 3 completion*
