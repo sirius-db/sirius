@@ -45,7 +45,7 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   SETUP_TIMING();
   START_TIMER();
 
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
 
   std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
   std::vector<std::unique_ptr<cudf::column>> keys_cast;
@@ -65,7 +65,7 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys,
         keys_cast.push_back(cudf::cast(build_key_cudf,
                                        probe_key_cudf.type(),
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr));
+                                       GPUBufferManager::GetInstance().get_mr_ref()));
         build_keys_cudf.push_back(keys_cast.back()->view());
         probe_keys_cudf.push_back(probe_key_cudf);
       } else {
@@ -73,7 +73,7 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys,
         keys_cast.push_back(cudf::cast(probe_key_cudf,
                                        build_key_cudf.type(),
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr));
+                                       GPUBufferManager::GetInstance().get_mr_ref()));
         build_keys_cudf.push_back(build_key_cudf);
         probe_keys_cudf.push_back(keys_cast.back()->view());
       }
@@ -155,7 +155,7 @@ void cudf_mixed_or_conditional_inner_join(vector<shared_ptr<GPUColumn>>& probe_c
   SETUP_TIMING();
   START_TIMER();
 
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
 
   std::vector<cudf::column_view> probe_equal_columns;
   std::vector<cudf::column_view> build_equal_columns;
@@ -284,7 +284,7 @@ void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   SETUP_TIMING();
   START_TIMER();
 
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
 
   std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
   std::vector<std::unique_ptr<cudf::column>> keys_cast;
@@ -304,7 +304,7 @@ void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
         keys_cast.push_back(cudf::cast(build_key_cudf,
                                        probe_key_cudf.type(),
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr));
+                                       GPUBufferManager::GetInstance().get_mr_ref()));
         build_keys_cudf.push_back(keys_cast.back()->view());
         probe_keys_cudf.push_back(probe_key_cudf);
       } else {
@@ -312,7 +312,7 @@ void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
         keys_cast.push_back(cudf::cast(probe_key_cudf,
                                        build_key_cudf.type(),
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr));
+                                       GPUBufferManager::GetInstance().get_mr_ref()));
         build_keys_cudf.push_back(build_key_cudf);
         probe_keys_cudf.push_back(keys_cast.back()->view());
       }
@@ -372,7 +372,7 @@ void cudf_hash_full_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   SETUP_TIMING();
   START_TIMER();
 
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
 
   std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
   std::vector<std::unique_ptr<cudf::column>> keys_cast;
@@ -390,14 +390,14 @@ void cudf_hash_full_join(vector<shared_ptr<GPUColumn>>& probe_keys,
         keys_cast.push_back(cudf::cast(build_key_cudf,
                                        probe_key_cudf.type(),
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr));
+                                       GPUBufferManager::GetInstance().get_mr_ref()));
         build_keys_cudf.push_back(keys_cast.back()->view());
         probe_keys_cudf.push_back(probe_key_cudf);
       } else {
         keys_cast.push_back(cudf::cast(probe_key_cudf,
                                        build_key_cudf.type(),
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr));
+                                       GPUBufferManager::GetInstance().get_mr_ref()));
         build_keys_cudf.push_back(build_key_cudf);
         probe_keys_cudf.push_back(keys_cast.back()->view());
       }

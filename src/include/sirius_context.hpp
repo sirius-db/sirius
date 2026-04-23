@@ -18,6 +18,7 @@
 
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
@@ -232,8 +233,11 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Destroyed before memory_manager_ (declared after it — reverse destruction order).
   std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
-  // Previous cuDF pinned resource and threshold — restored in terminate() before
-  // small_pinned_allocator_ is destroyed to prevent dangling references.
+  std::optional<
+    sirius::memory::host_device_resource_view<cucascade::memory::small_pinned_host_memory_resource>>
+    small_pinned_allocator_view_{};
+  // Previous cuDF pinned resource and threshold — restored in terminate() before the view and
+  // allocator are destroyed to prevent dangling references.
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;

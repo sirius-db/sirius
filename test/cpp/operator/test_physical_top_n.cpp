@@ -154,8 +154,9 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
 
 TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top_n_merge]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
   std::vector<std::shared_ptr<data_batch>> batches;
   batches.push_back(make_range_batch(*space, 0, 10, 10));
@@ -197,8 +198,9 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
 
 TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_top_n_merge]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
   std::vector<std::shared_ptr<data_batch>> batches;
   batches.push_back(make_range_batch(*space, 0, 5, 1));
@@ -224,8 +226,9 @@ TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_to
 
 TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_merge]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
   std::vector<std::shared_ptr<data_batch>> batches;
   batches.push_back(make_batch(*space, {}, {}));

@@ -1050,7 +1050,7 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
   // (though currently logic doesn't pass Offset)
   SIRIUS_LOG_DEBUG("CUDF Order By (Fallback)");
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
 
   std::vector<cudf::column_view> columns_cudf;
   for (int key = 0; key < num_keys; key++)

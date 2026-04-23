@@ -31,6 +31,28 @@
 #define NUM_GPUS 1
 
 namespace duckdb {
+
+namespace {
+
+inline void set_current_gpu_resource(gpu_pool_memory_resource& mr)
+{
+  cudf::set_current_device_resource_ref(rmm::device_async_resource_ref{mr});
+}
+
+inline gpu_pool_memory_resource* make_gpu_pool_memory_resource(
+  rmm::mr::cuda_memory_resource* upstream,
+  std::size_t initial_pool_size,
+  std::size_t maximum_pool_size)
+{
+#if (RMM_VERSION_MAJOR > 26) || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
+  return new gpu_pool_memory_resource(
+    rmm::device_async_resource_ref{*upstream}, initial_pool_size, maximum_pool_size);
+#else
+  return new gpu_pool_memory_resource(upstream, initial_pool_size, maximum_pool_size);
+#endif
+}
+
+}  // namespace
 using sirius::AggregationType;
 using sirius::OrderByType;
 
@@ -171,8 +193,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   available_gpu_cache_size.resize(NUM_GPUS);
 
   cuda_mr = new rmm::mr::cuda_memory_resource();
-  mr = new rmm::mr::pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_gpu);
-  cudf::set_current_device_resource(mr);
+  mr = make_gpu_pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_gpu);
+  set_current_gpu_resource(*mr);
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
   SIRIUS_LOG_INFO("Allocated processing size {} in GPU 0", processing_size_per_gpu);
@@ -203,6 +225,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
     }
 
     gpuProcessingPointer[gpu] = 0;
+    gpuProcessing[gpu]        = nullptr;
     gpuCachingPointer[gpu]    = 0;
     cpuCachingPointer[gpu]    = 0;
   }
@@ -219,8 +242,12 @@ GPUBufferManager::~GPUBufferManager()
       callCudaFree<uint8_t>(gpuCache[gpu], gpu);
       if (cpuCache[gpu] != nullptr) { freePinnedCPUMemory(cpuCache[gpu]); }
     }
-    // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
-    mr->deallocate(rmm::cuda_stream_view{}, (void*)gpuProcessing[gpu], processing_size_per_gpu);
+    if (gpuProcessing[gpu] != nullptr) {
+      mr->deallocate(rmm::cuda_stream_view{},
+                     static_cast<void*>(gpuProcessing[gpu]),
+                     processing_size_per_gpu,
+                     rmm::CUDA_ALLOCATION_ALIGNMENT);
+    }
   }
   Config::USE_PIN_MEM_FOR_CPU_PROCESSING ? freePinnedCPUMemory(cpuProcessing)
                                          : freePageableCPUMemory(cpuProcessing);
@@ -237,7 +264,7 @@ GPUBufferManager::~GPUBufferManager()
 
 void GPUBufferManager::ResetBuffer()
 {
-  cudf::set_current_device_resource(mr);
+  set_current_gpu_resource(*mr);
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
     SIRIUS_LOG_DEBUG("Resetting buffer for GPU {}", gpu);
     gpuProcessingPointer[gpu] = 0;
@@ -247,7 +274,7 @@ void GPUBufferManager::ResetBuffer()
       auto size = it->second;
       if (ptr != nullptr) {
         // customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
-        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size);
+        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
         // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), size);
         // allocation_table[gpu].erase(it);
       }
@@ -264,7 +291,7 @@ void GPUBufferManager::ResetBuffer()
       if (ptr != nullptr) {
         // SIRIUS_LOG_DEBUG("Deallocating Locked Pointer {} size {}", static_cast<void*>(ptr),
         // size);
-        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size);
+        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
       }
     }
     locked_allocation_table[gpu].clear();
@@ -313,9 +340,9 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
 {
   size_t alloc = (size * sizeof(T));
   // always ensure that it aligns with RMM's CUDA allocation alignment
-  //  int alignment = alignof(double);
-  int alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  alloc         = alloc + (alignment - alloc % alignment);
+  //  size_t alignment = alignof(double);
+  size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
+  alloc += (alignment - (alloc % alignment)) % alignment;
   if (caching) {
     size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
     T* ptr       = nullptr;
@@ -335,8 +362,8 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
     }
     return ptr;
   } else {
-    cudf::set_current_device_resource(mr);
-    void* ptr = mr->allocate(rmm::cuda_stream_view{}, alloc);
+    set_current_gpu_resource(*mr);
+    void* ptr = mr->allocate(rmm::cuda_stream_view{}, alloc, rmm::CUDA_ALLOCATION_ALIGNMENT);
     // SIRIUS_LOG_DEBUG("Allocating Pointer {} size {}", static_cast<void*>(ptr), alloc);
     if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
     if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
@@ -361,7 +388,7 @@ void GPUBufferManager::lockAllocation(void* ptr, int gpu)
 void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
 {
   // check if ptr is not in gpuCaching
-  cudf::set_current_device_resource(mr);
+  set_current_gpu_resource(*mr);
   if (ptr == nullptr) { return; }
   if (ptr >= gpuCache[gpu] && ptr < gpuCache[gpu] + available_gpu_cache_size[gpu]) { return; }
   if (cpuCache[gpu] != nullptr && ptr >= cpuCache[gpu] &&
@@ -371,7 +398,7 @@ void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
   auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
   if (it != allocation_table[gpu].end()) {
     // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
-    mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, it->second);
+    mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, it->second, rmm::CUDA_ALLOCATION_ALIGNMENT);
     allocation_table[gpu].erase(it);
   } else {
     auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
