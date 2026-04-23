@@ -61,11 +61,12 @@ Plans:
   3. All `get_data_batch_by_id` and `pop_data_batch_by_id` calls use the updated signatures without the state parameter
   4. All `batch->get_data()`, `batch->get_memory_space()`, and `batch->get_current_tier()` calls on idle batches — including estimation methods in `gpu_pipeline_task_local_state` — go through a `to_read_only()` accessor
   5. `CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make` completes with zero errors against cucascade d9dc331
-**Plans:** 2 plans
+**Plans:** 3 plans
 
 Plans:
 - [x] 03-01-PLAN.md — Sweep all operator casts, data repository signatures, idle batch accessors, and verify clean build
-- [ ] 03-02-PLAN.md — Gap closure: migrate legacy expression executor accessors and verify clean build
+- [x] 03-02-PLAN.md — Gap closure: migrate legacy expression executor accessors and verify clean build
+- [ ] 03-03-PLAN.md — Gap closure: commit uncommitted API fixes and verify clean build from committed HEAD
 
 ## Progress
 
@@ -76,4 +77,4 @@ Phases execute in numeric order: 1 → 2 → 3
 |-------|----------------|--------|-----------|
 | 1. Pipeline Data Path | 0/2 | Planning complete | - |
 | 2. Mutation Paths and Lifecycle | 2/3 | Gap closure planned | - |
-| 3. Operator Sweep and Clean Build | 1/2 | Gap closure planned | - |
+| 3. Operator Sweep and Clean Build | 2/3 | Gap closure planned | - |
