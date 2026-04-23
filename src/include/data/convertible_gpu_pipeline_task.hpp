@@ -289,7 +289,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    *        batch_state::idle?
    *
    * Lightweight -- only performs dynamic_casts and state checks. Accesses memory
-   * space via to_read_only() as required by the new cucascade API.
+   * space via to_read_only().
    *
    * @param task  The task to inspect.
    * @param space The memory space to match.

@@ -122,13 +122,12 @@ class convertible_data_batch : public convertible_data {
         default: continue;
       }
 
-      // RAII: mutable_data_batch destructor transitions back to idle automatically.
+      // RAII: mutable_data_batch destructor releases the mutable lock and transitions back to idle
+      // automatically.
       std::vector<std::size_t> bytes_per_target(target_spaces.size(), 0);
       bytes_per_target[idx] = data_size;
       return bytes_per_target;
     }
-
-    // No target space succeeded; RAII restores idle on destruction.
     return std::nullopt;
   }
 
@@ -160,8 +159,7 @@ class convertible_data_batch : public convertible_data {
  * state and matching memory_space. The default iteration order is last-to-first
  * (back-to-front) for both partitions and batches, matching the downgrade eviction
  * pattern of preferring the most recently added data.
- * Only batches in batch_state::idle are considered -- the new cucascade API requires
- * idle state before acquiring a mutable or read-only accessor.
+ * Only batches in batch_state::idle are considered.
  */
 class convertible_data_batch_provider : public convertible_data_provider {
  public:

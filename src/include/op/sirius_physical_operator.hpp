@@ -93,14 +93,19 @@ class operator_data {
    *                                current space (see pipelineable_operator_data).
    * @param stream                  CUDA stream available for any data-movement
    *                                kernels triggered by preparation.
-   * @return  A vector of read_only_data_batch handles that must remain alive for
-   *          the duration of the task; these handles keep locked batches locked
-   *          until processing completes. An empty vector is valid and appropriate
-   *          when there is nothing to lock. Returns std::nullopt to signal a
-   *          preparation failure that should trigger task reschedule/retry
-   *          (for example, a batch lock that returned null).
+   * @return  On success, std::optional holding a vector of cucascade::read_only_data_batch
+   *          accessors (cuCascade RAII objects; each holds a shared read lock on one batch
+   *          in the requested memory space). The returned vector must stay alive for the
+   *          duration of task execution while that input is consumed — the GPU pipeline
+   *          typically moves it into read_only_pipelineable_operator_data. An empty
+   *          vector is valid when no batches need locking (for example, a scan source
+   *          that only records requested_memory_space for execute()). std::nullopt means
+   *          preparation failed and the caller should reschedule or retry (for example,
+   *          a batch could not be locked or converted). Overrides may throw instead of
+   *          returning std::nullopt for some errors; pipelineable_operator_data rethrows
+   *          rmm::out_of_memory after logging.
    *
-   * The default implementation is a no-op that returns an empty handle vector.
+   * The default implementation is a no-op that returns an empty vector inside the optional.
    * It is appropriate for operator_data subclasses that own no data requiring
    * locking and need no per-task setup. Override when either condition changes.
    */
@@ -160,16 +165,18 @@ class pipelineable_operator_data : public operator_data {
    * @brief Lock all data batches for processing in the requested memory space.
    *
    * Iterates over all batches and locks (or converts then locks) each one into the
-   * requested memory space. Returns the processing handles that keep the batches locked
-   * until they go out of scope.
+   * requested memory space via `read_only_data_batch` accessors that keep shared read
+   * locks until they are destroyed.
    *
-   * Returns std::nullopt if any batch fails to lock (triggers a retry/reschedule).
-   * Propagates rmm::out_of_memory so the caller can record metrics and reschedule.
+   * Returns std::nullopt if any batch pointer is null or any batch fails to lock
+   * (triggers a retry/reschedule). Propagates rmm::out_of_memory so the caller can record
+   * metrics and reschedule.
    *
    * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
    *                                current space.
    * @param stream                  CUDA stream used for any data-movement kernels.
-   * @return Processing handles for all batches, or std::nullopt on lock failure.
+   * @return One read_only_data_batch per input batch in order, or std::nullopt on
+   *         null batch or lock failure.
    */
   std::optional<std::vector<::cucascade::read_only_data_batch>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,

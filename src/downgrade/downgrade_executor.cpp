@@ -163,16 +163,18 @@ void downgrade_executor::processing_loop()
     }
 
     // === TIER 1: Data repositories ===
-    // Iterate all repositories via for_each_repository. For each repo, snapshot eligible
-    // batches via get_all_convertible() to avoid re-scanning the same batch.
+    // Collect all repositories first so we can iterate (and later sort by priority).
+    // We use get_all_convertible() to snapshot eligible batches once per repo,
+    // avoiding re-scanning the same batch before its state changes from idle.
     bool pool_interrupted = false;
-    _data_repo_mgr.for_each_repository([&](cucascade::shared_data_repository* repo) {
-      if (req->satisfied.load() || pool_interrupted) return;
+    auto repos            = _data_repo_mgr.get_repositories();
+    for (auto* repo : repos) {
+      if (req->satisfied.load()) return;
 
       convertible_data_batch_provider provider(repo);
       auto candidates = provider.get_all_convertible(source_space, /*front_to_back=*/false);
       for (auto& candidate : candidates) {
-        if (req->satisfied.load()) break;
+        if (req->satisfied.load()) return;
 
         auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -184,7 +186,7 @@ void downgrade_executor::processing_loop()
 
         // Re-check after reserve() returns -- the previous candidate's worker may
         // have set satisfied while we were blocked waiting for a thread slot.
-        if (req->satisfied.load()) break;
+        if (req->satisfied.load()) return;
 
         auto exc_stream = _stream_pool->acquire_stream(
           cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
@@ -225,7 +227,8 @@ void downgrade_executor::processing_loop()
             }
           });
       }
-    });
+      if (pool_interrupted) break;
+    }
 
     // === TIER 2: task_scheduler task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {

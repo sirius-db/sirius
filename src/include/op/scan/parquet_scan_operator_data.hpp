@@ -110,7 +110,8 @@ class parquet_scan_data : public op::operator_data {
    *                                stored into gpu_memory_space for use during execute().
    * @param stream                  Unused — no data movement occurs during preparation
    *                                for this source input.
-   * @return  Always an empty handle vector; there are no batches to keep locked.
+   * @return  Always std::optional holding an empty vector (no read_only_data_batch
+   *          instances); there are no upstream batches to lock.
    */
   std::optional<std::vector<::cucascade::read_only_data_batch>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,

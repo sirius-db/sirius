@@ -323,7 +323,10 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
 
   // Create the data representation
   auto* space = input_batch.get_memory_space();
-  if (!space) { return nullptr; }
+  if (!space) {
+    throw sirius::internal_exception(
+      "gpu_expression_executor::execute: input batch has no memory space");
+  }
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(
       std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr), *space);
@@ -350,7 +353,10 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(
   // Apply the boolean mask to filter the input batch
   auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);
   auto* space       = input_batch.get_memory_space();
-  if (!space) { return nullptr; }
+  if (!space) {
+    throw sirius::internal_exception(
+      "gpu_expression_executor::select: input batch has no memory space");
+  }
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
 
