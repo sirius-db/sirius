@@ -97,37 +97,25 @@ One `downgrade_executor` per memory space monitors pressure and moves data to lo
 
 ### Downgrade Request Pattern
 
-The downgrade executor uses a request-based model instead of a retry loop:
+The downgrade executor uses a request-based model with tiered candidate fetching:
 
-1. Caller invokes `request_downgrade(target_bytes, predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`.
+1. Caller invokes `request_downgrade(predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`.
 2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
-3. For each request, `collect_all_candidates()` iterates all data repositories, collecting GPU-resident batches as `weak_ptr` up to `target_bytes` worth.
-4. Candidates are dispatched to the `bounded_thread_pool` one-by-one. After each batch completes downgrade, the `predicate` is evaluated. If it returns `true`, no new batches are dispatched (in-flight batches finish naturally). The promise resolves with total bytes freed.
+3. For each request, the processing loop fetches candidates lazily in tiered order:
+   - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
+   - **Tier 2 (pipeline_executor queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
+4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. After each conversion, the `predicate` is evaluated. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
 
-**Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(target_bytes, predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds — single request, no over-freeing.
+**Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
 
 ### Candidate Selection Strategy
 
-`collect_all_candidates()` selects data batches for downgrade:
+Candidates are fetched lazily via `convertible_data_provider` implementations:
 
-1. Partitioned repositories first, then by descending data size
-2. Two-pass within each repository:
-   - **Pass 1**: Non-active partitions (less likely to be needed soon)
-   - **Pass 2**: Active partitions (if pressure persists)
-3. Within a repository: iterate partitions last-to-first (newer data first)
+1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
 
-Candidates are collected as `weak_ptr` and locked just before dispatch to avoid unnecessary lifetime extension and skip already-freed batches.
-
-### `downgrade_task`
-
-**File:** `src/include/downgrade/downgrade_task.hpp`
-
-A plain struct (no polymorphism) holding a `shared_ptr<data_batch>` and a reference to the reservation manager. Execution per batch:
-1. Lock `weak_ptr` to `shared_ptr` (skip if already freed)
-2. `try_to_lock_for_in_transit()` — prevents concurrent pipeline access
-3. Acquire HOST memory reservation
-4. Convert GPU representation → HOST representation via `converter_registry`
-5. Release in-transit lock, restore previous batch state
+Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
 
 ## Memory Consumption History
 
@@ -181,8 +169,7 @@ On allocation failure:
 |------|---------|
 | `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory manager, tier configuration |
 | `src/include/downgrade/downgrade_executor.hpp` | Downgrade executor interface |
-| `src/downgrade/downgrade_executor.cpp` | Monitor loop, candidate selection |
-| `src/include/downgrade/downgrade_task.hpp` | Downgrade task definition |
+| `src/downgrade/downgrade_executor.cpp` | Processing loop, tiered candidate fetching |
 | `src/include/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
 | `src/memory/defragmenter_oom_policy.cpp` | Fragmentation detection and trimming |
 | `src/include/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |

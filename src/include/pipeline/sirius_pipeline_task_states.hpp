@@ -153,7 +153,7 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
 
   std::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources
-  std::size_t _reservation_bytes;
+  std::size_t _reservation_bytes = 0;
 };
 
 }  // namespace pipeline

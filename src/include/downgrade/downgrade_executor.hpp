@@ -16,11 +16,12 @@
 
 #pragma once
 
-#include "downgrade/downgrade_task.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
+#include "exec/inspectable_mpsc.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "parallel/task.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -48,20 +49,12 @@ namespace parallel {
  * Thread safety of the predicate function is the responsibility of the caller.
  */
 struct downgrade_request {
-  size_t target_bytes{0};
   std::function<bool()> predicate;
   std::promise<size_t> result;
   std::atomic<size_t> bytes_freed{0};
   std::atomic<size_t> batches_downgraded{0};
   std::atomic<bool> satisfied{false};
   bool is_monitor_request{false};
-};
-
-/**
- * @brief Information about a repository to consider for downgrade candidate selection.
- */
-struct downgrade_repository_info {
-  cucascade::shared_data_repository* repo;
 };
 
 /**
@@ -85,13 +78,15 @@ class downgrade_executor {
    * @param memory_space Pointer to the memory space (for pressure queries; nullptr disables
    * monitor)
    * @param reservation_manager Reference to the memory reservation manager
+   * @param pipeline_task_queue Optional pointer to pipeline task queue for tiered fallback
    */
   explicit downgrade_executor(
     exec::downgrade_executor_config config,
     cucascade::shared_data_repository_manager& data_repo_mgr,
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
-    sirius::memory::sirius_memory_reservation_manager& reservation_manager);
+    sirius::memory::sirius_memory_reservation_manager& reservation_manager,
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue = nullptr);
 
   ~downgrade_executor();
 
@@ -132,37 +127,31 @@ class downgrade_executor {
   size_t request_free_memory_and_wait(size_t bytes);
 
   /**
+   * @brief Set the pipeline task queue pointer for tiered downgrade scanning.
+   *
+   * Must be called before start(). Allows deferred wiring when the queue
+   * is not available at construction time.
+   *
+   * @param pipeline_task_queue Pointer to the pipeline_executor's task queue
+   */
+  void set_pipeline_task_queue(
+    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue);
+
+  /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
-   * Collects up to target_bytes worth of candidates and dispatches batch
-   * downgrades until the predicate returns true or candidates are exhausted.
-   * In-flight batches finish naturally.
+   * Dispatches batch downgrades until the predicate returns true or candidates
+   * are exhausted. In-flight batches finish naturally.
    *
-   * @param target_bytes Approximate bytes to collect as candidates
    * @param predicate Callable returning true when the caller's condition is met
    * @return std::future<size_t> Resolves to total bytes freed
    */
-  std::future<size_t> request_downgrade(size_t target_bytes, std::function<bool()> predicate);
+  std::future<size_t> request_downgrade(std::function<bool()> predicate);
 
  private:
   void processing_loop();
   void monitor_loop();
   void cancel_pending_requests();
-
-  std::vector<std::weak_ptr<cucascade::data_batch>> collect_all_candidates(
-    const std::vector<downgrade_repository_info>& repositories, size_t amount_to_downgrade);
-
-  static size_t get_repo_data_size_on_tier(cucascade::shared_data_repository* repo,
-                                           cucascade::memory::Tier tier);
-
-  static bool is_partition_active(cucascade::shared_data_repository* repo, size_t partition_idx);
-
-  static std::vector<std::weak_ptr<cucascade::data_batch>> collect_candidates_from_partition(
-    cucascade::shared_data_repository* repo,
-    size_t partition_idx,
-    cucascade::memory::memory_space_id source_space,
-    size_t max_bytes,
-    size_t& collected_bytes);
 
  private:
   exec::downgrade_executor_config _config;
@@ -176,7 +165,9 @@ class downgrade_executor {
   cucascade::shared_data_repository_manager& _data_repo_mgr;
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
+  std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
+  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };
 
 }  // namespace parallel

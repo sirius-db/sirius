@@ -18,6 +18,7 @@
 
 #include "gpu_executor.hpp"
 #include "log/logging.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"

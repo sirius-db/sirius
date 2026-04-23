@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -24,7 +25,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <data/sirius_converter_registry.hpp>
 
 #include <memory>
 #include <optional>
@@ -59,11 +59,12 @@ inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_ba
   // wait for processing in case a shared batch is in transit in another thread.
   auto lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
 
-  auto cancel_task_if_needed = []() {
+  auto cancel_task_if_needed = [&batch]() {
     SIRIUS_LOG_ERROR(
-      "gpu_pipeline_task: failed to lock batch for processing and cannot prepare batch for "
+      "gpu_pipeline_task: failed to lock batch {} for processing and cannot prepare batch for "
       "processing. This likely means the batch is in transit and there is a bug in "
-      "the in-transit locking logic. Cancelling task to avoid deadlock.");
+      "the in-transit locking logic. Cancelling task to avoid deadlock.",
+      batch->get_batch_id());
   };
 
   while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {

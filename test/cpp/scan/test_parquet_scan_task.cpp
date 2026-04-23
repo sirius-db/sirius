@@ -22,7 +22,6 @@
 // sirius
 #include <exec/config.hpp>
 #include <helper/type_conversions.hpp>
-#include <op/scan/duckdb_scan_task_queue.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>

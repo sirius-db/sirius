@@ -18,7 +18,7 @@
 
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
+#include "exec/inspectable_mpsc.hpp"
 #include "parallel/task.hpp"
 
 #include <absl/functional/any_invocable.h>
@@ -36,7 +36,7 @@ namespace parallel {
  * Holds the common infrastructure shared by gpu_pipeline_executor,
  * duckdb_scan_executor, and downgrade_executor:
  *   - a bounded_thread_pool for concurrency control and task execution
- *   - an interruptible MPMC task queue
+ *   - an inspectable MPSC task queue
  *   - a manager thread that drives the dispatch loop
  *
  * Subclasses must implement manager_loop() and may override the virtual
@@ -146,7 +146,7 @@ class itask_executor {
   std::atomic<bool> _running{false};
   exec::thread_pool_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
-  exec::interruptible_mpmc<std::unique_ptr<itask>> _task_queue;
+  exec::inspectable_mpsc<itask> _task_queue;
   std::thread _manager_thread;
 };
 
