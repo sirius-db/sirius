@@ -1427,7 +1427,7 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(coalesce));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.num_rows() == iv.num_rows());
     REQUIRE(ov.column(0).null_count() == 0);
@@ -1462,7 +1462,7 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(coalesce));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.num_rows() == iv.num_rows());
     REQUIRE(ov.column(0).null_count() == 1);
@@ -1496,7 +1496,7 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(coalesce));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.column(0).null_count() == 0);
     std::vector<int32_t> expected = {10, 200, -7, -7};
     REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
@@ -1525,7 +1525,7 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(coalesce));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.column(0).null_count() == 2);
 
     auto out_vals                     = copy_column_to_host<int32_t>(ov.column(0));
@@ -1556,7 +1556,7 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(coalesce));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, exprs, strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.column(0).null_count() == 0);
     REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == values_all_valid);
@@ -1581,7 +1581,7 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
     exprs.push_back(std::move(coalesce));
 
-    REQUIRE_THROWS(run_execute(*space, input, exprs, strategy));
+    REQUIRE_THROWS(run_execute(*space, input, std::move(exprs), strategy));
   }
 }
 
@@ -1616,7 +1616,7 @@ TEMPLATE_TEST_CASE("select COALESCE nested in predicate",
   duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
   exprs.push_back(std::move(cmp));
 
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, exprs, strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
   REQUIRE(ov.num_rows() == 2);
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 50});
 }
