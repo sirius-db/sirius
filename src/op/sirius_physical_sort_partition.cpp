@@ -62,7 +62,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    // Release shared locks and return idle batches for downstream sink
+    // Release shared locks and return idle batches for downstream sink.
+    // const_cast is safe: each task has exclusive ownership of its input data, so no other
+    // thread accesses this object. The execute() signature takes const& but the task owns the data.
     auto ro_vec = const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
     std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
     idle_batches.reserve(ro_vec.size());
