@@ -103,7 +103,7 @@ cudf::io::text::byte_range_info uring_reactor::align_to_physical(
   return {static_cast<int64_t>(a_start), static_cast<int64_t>(a_end - a_start)};
 }
 
-void uring_reactor::enqueue_bulk(std::vector<device_read_req_type> batch)
+void uring_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
 {
   if (batch.empty()) return;
   _queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size());
@@ -123,6 +123,14 @@ size_t uring_reactor::host_read(int fd, size_t offset, size_t size, uint8_t* dst
 void uring_reactor::host_read_async(host_read_req_type req)
 {
   _host_queue.enqueue(std::move(req));
+  _wake_seq.fetch_add(1, std::memory_order_release);
+  _wake_seq.notify_one();
+}
+
+void uring_reactor::host_enqueue_bulk(std::span<host_read_req_type> batch)
+{
+  if (batch.empty()) return;
+  _host_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size());
   _wake_seq.fetch_add(1, std::memory_order_release);
   _wake_seq.notify_one();
 }
@@ -263,13 +271,6 @@ void uring_reactor::worker_loop()
         } else {
           size_t rd     = (size_t)res;
           size_t actual = rd > req.data_off ? std::min(req.data_size, rd - req.data_off) : 0;
-          spdlog::trace(
-            "reactor done  slot={} file_off={} rd={:.2f}MB "
-            "copy={:.2f}MB",
-            si,
-            req.file_off,
-            to_mb(rd),
-            to_mb(actual));
           if (actual > 0 && !req.ctx->failed.load(std::memory_order_relaxed)) {
             _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
             if (req.device_id >= 0) cudaSetDevice(req.device_id);
@@ -290,14 +291,28 @@ void uring_reactor::worker_loop()
   };
 
   while (true) {
+    // Always drain the moodycamel queues into local dequeues BEFORE checking
+    // has_active() — the dequeues are the only state has_active() looks at.
+    // Without this, a producer that enqueued + bumped wake_seq before our
+    // seq.load() will leave work sitting invisible in the moodycamel queue,
+    // and we'll park on seq=current_value and never wake.
+    drain_queue();
+
     if (!has_active()) {
       if (_stop.load(std::memory_order_acquire)) break;
       uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-      if (!has_active()) _wake_seq.wait(seq, std::memory_order_relaxed);
+      // Re-drain AFTER the seq load.  Any producer whose enqueue is now
+      // observable either (a) landed before our load and is pulled in here,
+      // making has_active() true, or (b) landed after our load, in which
+      // case their fetch_add(1) made wake_seq != seq so the wait below
+      // returns immediately.  Either way, no lost wake-up.
+      drain_queue();
+      if (!has_active()) { _wake_seq.wait(seq, std::memory_order_relaxed); }
       if (_stop.load(std::memory_order_acquire)) break;
+      // Pull whatever work woke us up before the main body runs.
+      drain_queue();
     }
 
-    drain_queue();
     submit_pending();
 
     if (inflight > 0) {
@@ -309,8 +324,9 @@ void uring_reactor::worker_loop()
     uint64_t cuda_seq = _cuda_seq.load(std::memory_order_acquire);
     poll_cuda();
 
-    if (inflight == 0 && pending.empty() && has_active())
+    if (inflight == 0 && pending.empty() && has_active()) {
       _cuda_seq.wait(cuda_seq, std::memory_order_acquire);
+    }
   }
 }
 

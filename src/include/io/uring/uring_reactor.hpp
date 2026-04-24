@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -175,7 +176,9 @@ class uring_reactor {
   /// notification.  Preferred over single-op enqueues when a caller
   /// produces several chunks destined for this reactor — amortises the
   /// wait-atomic notify and uses moodycamel's enqueue_bulk path.
-  void enqueue_bulk(std::vector<device_read_req_type> batch);
+  /// The span's elements are moved out; the caller's backing storage
+  /// must outlive this call but the contents are left in moved-from state.
+  void enqueue_bulk(std::span<device_read_req_type> batch);
 
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
   size_t host_read(int fd, size_t offset, size_t size, uint8_t* dst);
@@ -183,6 +186,11 @@ class uring_reactor {
   /// Async buffered host read.  Request completion fires via
   /// @c req.ctx->chunk_done / chunk_failed.
   void host_read_async(host_read_req_type req);
+
+  /// Bulk counterpart of @c host_read_async — enqueue a batch of host reads
+  /// with a single wake notification.  Mirrors @c enqueue_bulk's span /
+  /// move-out semantics: caller owns the storage, elements are moved from.
+  void host_enqueue_bulk(std::span<host_read_req_type> batch);
 
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
   static cudf::io::text::byte_range_info align_to_physical(cudf::io::text::byte_range_info logical,

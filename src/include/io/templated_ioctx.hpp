@@ -52,7 +52,8 @@ concept io_object_c = std::derived_from<O, sirius_io_object> && requires(O o) {
 
 template <class R>
 concept io_reactor_c = requires(R r,
-                                std::vector<typename R::device_read_req_type> dbatch,
+                                std::span<typename R::device_read_req_type> dbatch,
+                                std::span<typename R::host_read_req_type> hbatch,
                                 typename R::host_read_req_type hreq,
                                 typename R::native_handle_type handle,
                                 size_t offset,
@@ -67,9 +68,10 @@ concept io_reactor_c = requires(R r,
 
   requires io_object_c<typename R::io_object_type, typename R::native_handle_type>;
 
-  { r.enqueue_bulk(std::move(dbatch)) };
+  { r.enqueue_bulk(dbatch) };
   { r.host_read(handle, offset, size, dst) } -> std::same_as<size_t>;
   { r.host_read_async(std::move(hreq)) };
+  { r.host_enqueue_bulk(hbatch) };
   { r.shutdown() };
   { R::align_to_physical(logical, file_size) } -> std::same_as<cudf::io::text::byte_range_info>;
 };
@@ -117,7 +119,7 @@ class templated_ioctx : public sirius_ioctx {
   }
 
   std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::unique_ptr<sirius_io_object> io_object) override
+    std::shared_ptr<sirius_io_object> io_object) override
   {
     return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
   }
@@ -228,27 +230,12 @@ class templated_ioctx : public sirius_ioctx {
       return;
     }
 
-    size_t total    = 0;
-    size_t n_active = 0;
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      auto off  = static_cast<size_t>(ranges[i].offset());
-      size_t sz = std::min(static_cast<size_t>(ranges[i].size()),
-                           file_size > off ? file_size - off : size_t{0});
-      if (sz > 0 && sz <= dst[i].size()) {
-        total += sz;
-        ++n_active;
-      }
-    }
-    if (n_active == 0) {
-      handler(0, nullptr);
-      return;
-    }
-
-    auto ctx         = std::make_shared<request_context>();
-    ctx->handler     = std::move(handler);
-    ctx->total_bytes = total;
-    ctx->pending.store(n_active, std::memory_order_relaxed);
-
+    // Build every valid request up-front; we need the exact count before
+    // creating the ctx so that pending starts at the right value, and we
+    // want the full vector in hand to split across reactors.
+    std::vector<host_read_req_type> reqs;
+    reqs.reserve(ranges.size());
+    size_t total = 0;
     for (size_t i = 0; i < ranges.size(); ++i) {
       auto off  = static_cast<size_t>(ranges[i].offset());
       size_t sz = std::min(static_cast<size_t>(ranges[i].size()),
@@ -259,8 +246,37 @@ class templated_ioctx : public sirius_ioctx {
       req.offset = off;
       req.size   = sz;
       req.dst    = reinterpret_cast<uint8_t*>(dst[i].data());
-      req.ctx    = ctx;
-      next_reactor().host_read_async(std::move(req));
+      reqs.push_back(std::move(req));
+      total += sz;
+    }
+    if (reqs.empty()) {
+      handler(0, nullptr);
+      return;
+    }
+
+    auto ctx         = std::make_shared<request_context>();
+    ctx->handler     = std::move(handler);
+    ctx->total_bytes = total;
+    ctx->pending.store(reqs.size(), std::memory_order_relaxed);
+    for (auto& r : reqs)
+      r.ctx = ctx;
+
+    // Split evenly across reactors with a rotating start.  Each reactor
+    // gets a contiguous slice of @c reqs as a span — no per-reactor vector
+    // allocation, no per-request moves.  host_enqueue_bulk moves elements
+    // out of the span; @c reqs remains alive until end of scope.
+    auto const m = _reactors.size();
+    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
+    size_t base  = reqs.size() / m;
+    size_t rem   = reqs.size() % m;
+    size_t off   = 0;
+    for (size_t k = 0; k < m; ++k) {
+      size_t group_size = base + (k < rem ? 1 : 0);
+      if (group_size == 0) continue;
+      size_t reactor_idx = (start + k) % m;
+      _reactors[reactor_idx]->host_enqueue_bulk(
+        std::span<host_read_req_type>(reqs.data() + off, group_size));
+      off += group_size;
     }
   }
 
@@ -331,18 +347,13 @@ class templated_ioctx : public sirius_ioctx {
     int device_id = -1;
     cudaGetDevice(&device_id);
 
-    // Group chunks per reactor with a rotating round-robin start, then
-    // dispatch one enqueue_bulk per non-empty group.  This collapses N
-    // wake-notifies to at most M (reactor count) and uses the cheaper
-    // bulk-enqueue path on the concurrent queue.  All chunks of a range
-    // still fan out across reactors when M >= chunk count, preserving
-    // cross-reactor parallelism for large requests.
-    auto const m = _reactors.size();
-    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
-    std::vector<std::vector<device_read_req_type>> groups(m);
+    // Build the chunks into one flat vector, then hand each reactor a
+    // contiguous span slice.  Collapses N wake-notifies to at most M
+    // (reactor count) and avoids M per-reactor vector allocations.
+    std::vector<device_read_req_type> reqs;
+    reqs.reserve(n_chunks);
 
     size_t produced = 0;
-    size_t chunk_k  = 0;
     for (size_t cur = a_start; cur < a_end; cur += CHUNK_SIZE) {
       device_read_req_type req;
       req.handle    = obj.device_handle();
@@ -355,13 +366,21 @@ class templated_ioctx : public sirius_ioctx {
       req.device_id = device_id;
       req.ctx       = ctx;
       produced += req.data_size;
-
-      groups[(start + chunk_k) % m].push_back(std::move(req));
-      ++chunk_k;
+      reqs.push_back(std::move(req));
     }
 
-    for (size_t i = 0; i < m; ++i) {
-      if (!groups[i].empty()) _reactors[i]->enqueue_bulk(std::move(groups[i]));
+    auto const m = _reactors.size();
+    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
+    size_t base  = reqs.size() / m;
+    size_t rem   = reqs.size() % m;
+    size_t off   = 0;
+    for (size_t k = 0; k < m; ++k) {
+      size_t group_size = base + (k < rem ? 1 : 0);
+      if (group_size == 0) continue;
+      size_t reactor_idx = (start + k) % m;
+      _reactors[reactor_idx]->enqueue_bulk(
+        std::span<device_read_req_type>(reqs.data() + off, group_size));
+      off += group_size;
     }
   }
 

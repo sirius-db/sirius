@@ -36,7 +36,7 @@ class sirius_datasource : public io_datasource {
   static constexpr size_t BUFFER_SIZE = CHUNK_SIZE;
 
   explicit sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
-                             std::unique_ptr<sirius_io_object> io_object);
+                             std::shared_ptr<sirius_io_object> io_object);
 
   ~sirius_datasource() override = default;
 
@@ -88,7 +88,7 @@ class sirius_datasource : public io_datasource {
 
  private:
   std::shared_ptr<sirius_ioctx> _io_ctx;
-  std::unique_ptr<sirius_io_object> _io_object;
+  std::shared_ptr<sirius_io_object> _io_object;
 };
 
 }  // namespace sirius::io

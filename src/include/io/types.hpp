@@ -66,8 +66,13 @@ static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requ
  * @brief Abstract per-file handle that provides file identity to a datasource.
  *
  * Decouples file location / cache-key logic from I/O mechanics.
+ *
+ * Inherits from @c std::enable_shared_from_this so the prefetching cache can
+ * take a reference to an io_object and safely extend its lifetime via
+ * @c shared_from_this() — this enforces at call sites that every io_object
+ * passed in is already owned by a @c std::shared_ptr.
  */
-class sirius_io_object {
+class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
  public:
   virtual ~sirius_io_object() = default;
 
@@ -176,7 +181,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   virtual void shutdown() = 0;
 
   virtual std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::unique_ptr<sirius_io_object> io_object) = 0;
+    std::shared_ptr<sirius_io_object> io_object) = 0;
 
   /// Construct the owned prefetching_cache.  Must be called before any
   /// read that should consult the cache; until then device_read falls

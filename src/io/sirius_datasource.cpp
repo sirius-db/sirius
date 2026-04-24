@@ -121,7 +121,7 @@ size_t sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size); view) {
+    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       return copy_pinned_slices_to_device(slices, dst, stream);
     }
@@ -133,7 +133,7 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size); view) {
+    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       rmm::device_buffer dbuf(size, stream);
       copy_pinned_slices_to_device(slices, static_cast<uint8_t*>(dbuf.data()), stream);
@@ -151,7 +151,7 @@ void sirius_ioctx::device_read_async(sirius_io_object& obj,
                                      io_completion_handler handler)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size); view) {
+    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       try {
         auto copied = copy_pinned_slices_to_device(slices, dst, stream);
@@ -170,7 +170,7 @@ void sirius_ioctx::device_read_async(sirius_io_object& obj,
 // ---------------------------------------------------------------------------
 
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
-                                     std::unique_ptr<sirius_io_object> io_object)
+                                     std::shared_ptr<sirius_io_object> io_object)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
 {
 }
