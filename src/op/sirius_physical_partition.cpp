@@ -171,9 +171,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto* space                = input_batch_ro.get_memory_space();
 
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
-    // Passthrough: release read lock and return idle batches
-    auto ro_vec =
-      const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
+    auto ro_vec = input.get_read_only_batches();
     std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
     idle_batches.reserve(ro_vec.size());
     for (auto& ro : ro_vec) {

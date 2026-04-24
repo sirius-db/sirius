@@ -150,8 +150,7 @@ std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::execute"};
   auto& input = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
-  auto ro_vec =
-    const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
+  auto ro_vec = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
   idle_batches.reserve(ro_vec.size());
   for (auto& ro : ro_vec) {
@@ -186,8 +185,7 @@ std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::execute"};
   auto& input2 = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
-  auto ro_vec2 =
-    const_cast<read_only_pipelineable_operator_data&>(input2).release_read_only_batches();
+  auto ro_vec2 = input2.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches2;
   idle_batches2.reserve(ro_vec2.size());
   for (auto& ro : ro_vec2) {

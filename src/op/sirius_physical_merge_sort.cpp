@@ -112,8 +112,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   if (input_batches.size() == 1) {
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
     if (_final_projections.empty()) {
-      auto ro_vec =
-        const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
+      auto ro_vec = input.get_read_only_batches();
       outputs.push_back(cucascade::data_batch::to_idle(std::move(ro_vec[0])));
     } else {
       outputs.push_back(apply_final_projection(input_batches[0]));

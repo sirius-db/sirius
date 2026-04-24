@@ -64,10 +64,7 @@ std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   auto& input = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
-  // const_cast is safe: each task has exclusive ownership of its input data, so no other
-  // thread accesses this object. The execute() signature takes const& but the task owns the data.
-  auto ro_vec =
-    const_cast<read_only_pipelineable_operator_data&>(input).release_read_only_batches();
+  auto ro_vec = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
   idle_batches.reserve(ro_vec.size());
   for (auto& ro : ro_vec) {

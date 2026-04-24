@@ -259,17 +259,6 @@ class read_only_pipelineable_operator_data : public operator_data {
     return _read_only_batches;
   }
 
-  // WSM TODO: can we do a release from an operator data? what does this do to task retries?
-
-  /**
-   * @brief Move the read-only batches out of this container, leaving it empty.
-   * @return Vector of read_only_data_batch accessors (moved out).
-   */
-  std::vector<::cucascade::read_only_data_batch> release_read_only_batches()
-  {
-    return std::move(_read_only_batches);
-  }
-
  private:
   std::vector<::cucascade::read_only_data_batch> _read_only_batches;
 };
