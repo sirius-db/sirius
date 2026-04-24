@@ -55,7 +55,7 @@ struct pipeline_conversion_result {
 //! This is a pure factory function with no engine/context dependency.
 duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
   op::sirius_physical_operator* physical_op,
-  const std::unordered_map<std::string, op::scan::IcebergDeleteFiles>* iceberg_cache = nullptr);
+  const std::unordered_map<std::string, op::scan::IcebergDeleteFiles>* iceberg_cache);
 
 class sirius_pipeline_converter {
  public:
