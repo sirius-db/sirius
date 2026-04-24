@@ -323,7 +323,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
-  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
@@ -479,7 +479,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(

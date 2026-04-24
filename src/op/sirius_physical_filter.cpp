@@ -40,7 +40,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
                                                                rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_filter::execute"};
-  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
   sirius::gpu_expression_executor gpu_expression_executor(

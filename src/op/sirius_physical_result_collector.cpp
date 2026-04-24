@@ -63,7 +63,7 @@ std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
-  auto& input = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto ro_vec = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
   idle_batches.reserve(ro_vec.size());

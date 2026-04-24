@@ -387,7 +387,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
-  auto& input               = dynamic_cast<const read_only_pipelineable_operator_data&>(input_data);
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()
                                                          : static_cast<size_t>(-1);

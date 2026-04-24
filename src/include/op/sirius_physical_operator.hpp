@@ -93,27 +93,19 @@ class operator_data {
    *                                current space (see pipelineable_operator_data).
    * @param stream                  CUDA stream available for any data-movement
    *                                kernels triggered by preparation.
-   * @return  On success, std::optional holding a vector of cucascade::read_only_data_batch
-   *          accessors (cuCascade RAII objects; each holds a shared read lock on one batch
-   *          in the requested memory space). The returned vector must stay alive for the
-   *          duration of task execution while that input is consumed — the GPU pipeline
-   *          typically moves it into read_only_pipelineable_operator_data. An empty
-   *          vector is valid when no batches need locking (for example, a scan source
-   *          that only records requested_memory_space for execute()). std::nullopt means
-   *          preparation failed and the caller should reschedule or retry (for example,
-   *          a batch could not be locked or converted). Overrides may throw instead of
-   *          returning std::nullopt for some errors; pipelineable_operator_data rethrows
+   * @return  true on success (internal state populated as side effect), false if
+   *          preparation failed and the caller should reschedule or retry.
+   *          Overrides may throw for some errors; pipelineable_operator_data rethrows
    *          rmm::out_of_memory after logging.
    *
-   * The default implementation is a no-op that returns an empty vector inside the optional.
+   * The default implementation is a no-op that returns true.
    * It is appropriate for operator_data subclasses that own no data requiring
    * locking and need no per-task setup. Override when either condition changes.
    */
-  virtual std::optional<std::vector<::cucascade::read_only_data_batch>>
-  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                         rmm::cuda_stream_view stream)
+  virtual bool prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
   {
-    return std::vector<::cucascade::read_only_data_batch>{};
+    return true;
   };
 
   /**
@@ -128,10 +120,16 @@ class operator_data {
 };
 
 /**
- * @brief Operator data carrying a collection of data batches for pipeline execution.
+ * @brief Operator data carrying data batches for pipeline execution.
  *
- * This is the standard data container used by pipeline operators. It wraps a
- * vector of data batches that flow between operators in a pipeline.
+ * Unifies idle and read-only-locked batch access in a single container. Holds an
+ * optional vector of idle data_batch shared_ptrs and/or an optional vector of
+ * read_only_data_batch RAII accessors. Lazy conversion is performed on demand:
+ *   - get_data_batches() populates _data_batches from _read_only_data_batches if needed
+ *   - get_read_only_batches() populates _read_only_data_batches from _data_batches if needed
+ *
+ * prepare_for_processing() locks idle batches and stores the result in
+ * _read_only_data_batches. remove_read_only_lock() releases all shared locks.
  */
 class pipelineable_operator_data : public operator_data {
  public:
@@ -141,46 +139,37 @@ class pipelineable_operator_data : public operator_data {
     : _data_batches(std::move(data_batches))
   {
   }
+  explicit pipelineable_operator_data(
+    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
+    : _read_only_data_batches(std::move(read_only_data_batches))
+  {
+  }
 
   /**
-   * @brief Get the data batches.
-   * @return Const reference to vector of data batch pointers
+   * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
-    const
-  {
-    return _data_batches;
-  }
+    const;
 
   /**
-   * @brief Move the data batches out of this container, leaving it empty.
-   * @return Vector of data batch pointers (moved out).
+   * @brief Get read-only locked batches, lazily populating from idle batches if needed.
    */
-  std::vector<std::shared_ptr<::cucascade::data_batch>> release_data_batches()
-  {
-    return std::move(_data_batches);
-  }
+  [[nodiscard]] const std::vector<::cucascade::read_only_data_batch>& get_read_only_batches() const;
+
+  /**
+   * @brief Release all read-only locks by resetting _read_only_data_batches.
+   */
+  void remove_read_only_lock() { _read_only_data_batches = std::nullopt; }
 
   /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
-   * Iterates over all batches and locks (or converts then locks) each one into the
-   * requested memory space via `read_only_data_batch` accessors that keep shared read
-   * locks until they are destroyed.
-   *
-   * Returns std::nullopt if any batch pointer is null or any batch fails to lock
-   * (triggers a retry/reschedule). Propagates rmm::out_of_memory so the caller can record
-   * metrics and reschedule.
-   *
-   * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
-   *                                current space.
-   * @param stream                  CUDA stream used for any data-movement kernels.
-   * @return One read_only_data_batch per input batch in order, or std::nullopt on
-   *         null batch or lock failure.
+   * Iterates over all idle batches and locks (or converts then locks) each one,
+   * storing the results in _read_only_data_batches. Returns false if any batch
+   * pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
-  std::optional<std::vector<::cucascade::read_only_data_batch>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space,
-    rmm::cuda_stream_view stream) override;
+  bool prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
@@ -195,7 +184,8 @@ class pipelineable_operator_data : public operator_data {
   }
 
  private:
-  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
+  mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
 /**
@@ -212,84 +202,6 @@ class partitioned_operator_data : public pipelineable_operator_data {
     : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
   }
-
-  /**
-   * @brief Get the partition index.
-   * @return Partition index
-   */
-  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
-
- private:
-  std::size_t _partition_idx = 0;
-};
-
-/**
- * @brief Operator data carrying a collection of read-only locked data batches.
- *
- * This is the RAII accessor-based sibling of pipelineable_operator_data. It stores
- * already-locked read_only_data_batch objects (from the new 3-class cucascade API),
- * ensuring that the shared lock is held for the lifetime of this object.
- *
- * Move-only — copying is not permitted because read_only_data_batch is move-only.
- */
-class read_only_pipelineable_operator_data : public operator_data {
- public:
-  read_only_pipelineable_operator_data() = default;
-  explicit read_only_pipelineable_operator_data(
-    std::vector<::cucascade::read_only_data_batch> batches)
-    : _read_only_batches(std::move(batches))
-  {
-  }
-
-  ~read_only_pipelineable_operator_data() override = default;
-
-  // Move-only — read_only_data_batch is move-only
-  read_only_pipelineable_operator_data(read_only_pipelineable_operator_data&&)            = default;
-  read_only_pipelineable_operator_data& operator=(read_only_pipelineable_operator_data&&) = default;
-  read_only_pipelineable_operator_data(const read_only_pipelineable_operator_data&)       = delete;
-  read_only_pipelineable_operator_data& operator=(const read_only_pipelineable_operator_data&) =
-    delete;
-
-  /**
-   * @brief Get the locked read-only data batches.
-   * @return Const reference to vector of read_only_data_batch accessors
-   */
-  [[nodiscard]] const std::vector<::cucascade::read_only_data_batch>& get_read_only_batches() const
-  {
-    return _read_only_batches;
-  }
-
- private:
-  std::vector<::cucascade::read_only_data_batch> _read_only_batches;
-};
-
-/**
- * @brief Operator data with partition index for partitioned pipeline execution, using
- * read-only locked batches.
- *
- * Extends read_only_pipelineable_operator_data to include partition index information,
- * mirroring the partitioned_operator_data -> pipelineable_operator_data relationship
- * but using the new RAII read_only_data_batch accessor type.
- *
- * Move-only — read_only_data_batch is move-only.
- */
-class read_only_partitioned_operator_data : public read_only_pipelineable_operator_data {
- public:
-  read_only_partitioned_operator_data() = default;
-  read_only_partitioned_operator_data(std::vector<::cucascade::read_only_data_batch> batches,
-                                      std::size_t partition_idx)
-    : read_only_pipelineable_operator_data(std::move(batches)), _partition_idx(partition_idx)
-  {
-  }
-
-  ~read_only_partitioned_operator_data() override = default;
-
-  // Move-only
-  read_only_partitioned_operator_data(read_only_partitioned_operator_data&&)            = default;
-  read_only_partitioned_operator_data& operator=(read_only_partitioned_operator_data&&) = default;
-  read_only_partitioned_operator_data(const read_only_partitioned_operator_data&)       = delete;
-  read_only_partitioned_operator_data& operator=(const read_only_partitioned_operator_data&) =
-    delete;
 
   /**
    * @brief Get the partition index.

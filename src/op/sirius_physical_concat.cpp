@@ -174,11 +174,10 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
                                                                rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_concat::execute"};
-  auto partitioned_input_data =
-    dynamic_cast<const read_only_partitioned_operator_data*>(&input_data);
+  auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
     throw std::runtime_error(
-      "sirius_physical_concat: input_data is not a read_only_partitioned_operator_data");
+      "sirius_physical_concat: input_data is not a partitioned_operator_data");
   }
   const auto& input_batches = partitioned_input_data->get_read_only_batches();
   auto partition_idx        = partitioned_input_data->get_partition_idx();

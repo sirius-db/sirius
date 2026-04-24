@@ -88,28 +88,18 @@ void log_operator_data(const op::sirius_physical_operator& op,
                        const char* label,
                        const std::string& extra_info = "")
 {
-  // Handle both idle (pipelineable_operator_data) and locked (read_only_pipelineable_operator_data)
   std::string batch_rows = "";
   size_t total_bytes     = 0;
   size_t num_batches     = 0;
 
-  if (auto* ro_data = dynamic_cast<const op::read_only_pipelineable_operator_data*>(&data)) {
-    num_batches = ro_data->get_read_only_batches().size();
-    for (auto const& batch : ro_data->get_read_only_batches()) {
+  if (auto* p_data = dynamic_cast<const op::pipelineable_operator_data*>(&data)) {
+    const auto& batches = p_data->get_read_only_batches();
+    num_batches         = batches.size();
+    for (auto const& batch : batches) {
       if (batch.get_data()) {
         auto view = get_cudf_table_view(batch);
         batch_rows += std::to_string(view.num_rows()) + "  ";
         total_bytes += batch.get_data()->get_size_in_bytes();
-      }
-    }
-  } else if (auto* p_data = dynamic_cast<const op::pipelineable_operator_data*>(&data)) {
-    num_batches = p_data->get_data_batches().size();
-    for (auto const& batch : p_data->get_data_batches()) {
-      if (batch) {
-        auto ro   = batch->to_read_only();
-        auto view = get_cudf_table_view(ro);
-        batch_rows += std::to_string(view.num_rows()) + "  ";
-        if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
       }
     }
   } else {
@@ -367,16 +357,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
-  auto* pipelineable_input =
-    dynamic_cast<op::pipelineable_operator_data*>(local_state._input_data.get());
-  if (!pipelineable_input) {
-    throw std::runtime_error(
-      "gpu_pipeline_task::execute: input_data is not pipelineable_operator_data");
-  }
-
-  std::optional<std::vector<::cucascade::read_only_data_batch>> ro_batches_opt;
+  bool prepare_success = false;
   try {
-    ro_batches_opt = pipelineable_input->prepare_for_processing(requested_memory_space, stream);
+    prepare_success =
+      local_state._input_data->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();
@@ -396,16 +380,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw;
   }
 
-  if (!ro_batches_opt) {
+  if (!prepare_success) {
     throw oom_reschedule_exception(
       std::move(local_state._input_data), 0, "Failed to lock or prepare batches for processing");
   }
-  // Wrap locked read-only batches into read_only_pipelineable_operator_data.
-  // These RAII accessors keep the shared locks alive until end of scope.
-  auto prepared_input =
-    std::make_unique<op::read_only_pipelineable_operator_data>(std::move(*ro_batches_opt));
-  // Replace the local state input so compute_task receives the locked version.
-  local_state._input_data = std::move(prepared_input);
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
@@ -416,10 +394,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
                    first_op.get_operator_id(),
                    prepare_duration.count() / 1000.0);
 
-  // At this point, all input batches are locked for reading via
-  // read_only_pipelineable_operator_data. The locks are held inside local_state._input_data and
-  // released once the first operator's execute() call moves and then destroys the
-  // read_only_pipelineable_operator_data.
+  // All input batches are now locked for reading via _read_only_data_batches inside
+  // local_state._input_data. The locks are released when the pipelineable_operator_data
+  // is destroyed after the first operator's execute() consumes it.
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
@@ -463,8 +440,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   if (output_data) { publish_output(*output_data, stream); }
 
-  // read_only_pipelineable_operator_data (prepared_input) goes out of scope here,
-  // releasing all shared locks on the input batches automatically.
+  // The input pipelineable_operator_data (with its _read_only_data_batches) was destroyed
+  // when compute_task replaced operator_input_output_data, releasing all shared locks.
 }
 
 std::size_t gpu_pipeline_task::get_input_size() const

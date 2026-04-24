@@ -924,7 +924,7 @@ void parquet_scan_task::publish_output(op::operator_data& output_data,
                                        rmm::cuda_stream_view /* stream */)
 {
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
-  for (auto& batch : pipelineable_output.release_data_batches()) {
+  for (auto& batch : pipelineable_output.get_data_batches()) {
     _data_repo->add_data_batch(std::move(batch));
   }
 }

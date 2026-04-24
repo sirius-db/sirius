@@ -273,10 +273,13 @@ void gpu_pipeline_executor::manager_loop()
           // The rescheduled task will handle completion instead.
           gpu_task->mark_as_rescheduled();
 
-          // WSM TODO: when we set a task to be rescheduled, we need to make sure that the operator
-          // data is not readonly any more. This is probably best done in the mar)as_rescheduled
-
           auto intermediate_data = oom.release_intermediate_data();
+          if (auto pipelineable_data =
+                dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
+            // We want to release the read-only lock on the data so that when its added back to the
+            // task queue it could be downgraded if needed.
+            pipelineable_data->remove_read_only_lock();
+          }
 
           // Build the rescheduled task via virtual factory (preserves derived type).
           auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(

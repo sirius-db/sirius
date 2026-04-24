@@ -363,7 +363,7 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
   // so publish every valid batch rather than filtering on size_in_bytes.
   // Downstream operators still need to see the batch to know a row existed.
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
-  for (auto& batch : pipelineable_output.release_data_batches()) {
+  for (auto& batch : pipelineable_output.get_data_batches()) {
     if (!batch) { continue; }
     {
       auto ro = batch->to_read_only();
