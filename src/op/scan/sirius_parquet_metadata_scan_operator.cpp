@@ -59,13 +59,17 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
     _total_files(file_paths.size()),
     _gpu_scan(gpu_scan)
 {
-  // Projection and filter pushdown both rely on column names to drive the reader;
-  // refuse early if we'd be forced into name-based paths without them.
-  if ((!projection_ids.empty() || (table_filter_set && !table_filter_set->filters.empty())) &&
-      names.empty()) {
+  // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
+  // injection — needs column names for reader set_column_names / AST name resolution /
+  // HivePartitioning::Parse lookups. The plain "read everything and emit naturally" shape
+  // does not, so we only reject empty names when the scan actually needs them.
+  bool const needs_names = !projection_ids.empty() ||
+                           (table_filter_set && !table_filter_set->filters.empty()) ||
+                           !partition_indices.empty();
+  if (needs_names && names.empty()) {
     throw sirius::internal_exception(
-      "[sirius_parquet_metadata_scan_operator] Projection or filter pushdown requires column "
-      "names to be provided.");
+      "[sirius_parquet_metadata_scan_operator] Projection, filter pushdown, or hive partitions "
+      "require column names to be provided.");
   }
 
   // One canonical plan: data columns (D-order), hive partitions, output layout, C→D map.

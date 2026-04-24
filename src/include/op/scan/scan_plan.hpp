@@ -96,6 +96,14 @@ struct scan_plan {
   /// from pushdown (they aren't in the parquet file).
   std::unordered_set<std::size_t> partition_primary_indices;
 
+  /// True iff the reader needs explicit column projection — set when the planner
+  /// pruned or reordered columns (non-empty @c projection_ids) or hive-partition
+  /// columns must be dropped from the physical read. When false, the reader's
+  /// natural "read everything in column_ids order" output already matches what
+  /// the pipeline expects, and the scan can skip @c set_column_names,
+  /// @c projected_columns_are_flat, and per-file name-based leaf resolution.
+  bool needs_reader_projection = false;
+
   //===--------------------------------------------------------------------===//
   // Convenience views
   //===--------------------------------------------------------------------===//
@@ -128,13 +136,31 @@ struct scan_plan {
   // Primary operations
   //===--------------------------------------------------------------------===//
 
-  /// Build a post-read injection closure that turns the reader's D-order batch
-  /// into the final output layout (data + partitions in column_ids order).
-  /// Returns a no-op closure if @c has_partitions() is false — in which case
-  /// the batch already matches @c output_layout.
+  /// Build a post-read assembly closure that turns the reader's D-order batch
+  /// into the final output layout (data + partition columns in column_ids order,
+  /// with pure-filter data columns dropped).
   ///
-  /// The returned closure captures the plan's output_layout and partition
-  /// metadata by value, so it remains valid after the @c scan_plan is moved.
+  /// Returns @c nullptr — telling the GPU scan operator to let the reader's
+  /// output flow through untouched — in two cases:
+  ///
+  ///   1. @c output_layout is empty. This is the SELECT count(*) shape
+  ///      (with or without a filter that pulls in pure-filter data columns).
+  ///      Emitting a 0-column table here would erase the row count that
+  ///      count-style aggregations downstream rely on, so we return the raw
+  ///      batch instead.
+  ///
+  ///   2. The plan is a trivial identity: no partitions, and @c output_layout
+  ///      covers @c data_columns 1:1 in order. In that case the reader's
+  ///      natural output already matches what the pipeline expects.
+  ///
+  /// Otherwise returns a closure that, per scan task, walks @c output_layout:
+  /// DATA entries move the corresponding data column out of the batch;
+  /// PARTITION entries synthesize a scalar-backed column from the file path.
+  /// Pure-filter data columns (present in @c data_columns but not referenced
+  /// by @c output_layout) are implicitly freed when the batch goes out of scope.
+  ///
+  /// The returned closure captures @c output_layout and @c partition_columns
+  /// by value, so it remains valid after the @c scan_plan is moved.
   [[nodiscard]] partition_inject_fn_t build_inject_fn() const;
 };
 

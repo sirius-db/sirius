@@ -38,10 +38,13 @@ namespace sirius::op::scan {
 
 bool scan_plan::is_projected() const
 {
-  // The scan is "projected" — the reader needs to be told which columns to
-  // read — whenever the set of data columns is not a plain read-everything.
-  // Callers use this to decide whether to call reader_options.set_column_names.
-  return !data_columns.empty();
+  // Driven by the @c needs_reader_projection flag set in build_scan_plan. We
+  // cannot derive this from @c data_columns alone: the factory populates
+  // data_columns even for the plain "read everything" case, so checking
+  // !data_columns.empty() would treat SELECT * as projected and spuriously
+  // trigger set_column_names / projected_columns_are_flat / per-file name
+  // resolution — silently regressing support for nested-schema SELECT *.
+  return needs_reader_projection;
 }
 
 std::vector<std::string> scan_plan::data_column_names() const
@@ -89,12 +92,18 @@ std::unordered_set<std::size_t> scan_plan::pure_filter_batch_positions() const
 
 partition_inject_fn_t scan_plan::build_inject_fn() const
 {
+  // If there are no output columns (e.g. SELECT count(*), with or without a
+  // filter that pulls in pure-filter data columns), the reader's natural batch
+  // is what downstream needs: count-style aggregations propagate row counts
+  // from the batch they receive. Projecting it down to a 0-column table would
+  // erase the row count. Output partitions are only recorded when they appear
+  // in the output, so an empty output_layout also implies no partitions to
+  // inject — nothing to do, return a null closure.
+  if (output_layout.empty()) { return nullptr; }
+
   // If assembly is a trivial identity — no partitions and output_layout covers
   // data_columns 1:1 in order — return a null closure so the GPU scan operator
   // skips the assembly step and the reader's output flows through untouched.
-  // An empty data batch with an empty output layout also qualifies: this is
-  // the SELECT count(*) case, where the reader emits its natural full batch
-  // (set_column_names is never called), and the scan must not project it down.
   bool identity = !has_partitions() && output_layout.size() == data_columns.size();
   for (std::size_t i = 0; identity && i < output_layout.size(); ++i) {
     if (output_layout[i].source != output_entry::DATA || output_layout[i].idx != i) {
@@ -126,7 +135,7 @@ partition_inject_fn_t scan_plan::build_inject_fn() const
       if (entry.source == scan_plan::output_entry::DATA) {
         out_cols.push_back(std::move(data_cols.at(entry.idx)));
       } else {
-        auto const& pcol = partitions[entry.idx];
+        auto const& pcol = partitions.at(entry.idx);
         auto it          = path_parts.find(pcol.name);
         if (it == path_parts.end()) {
           throw sirius::internal_exception(
@@ -174,6 +183,13 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     plan.partition_primary_indices.insert(hpi.index);
   }
 
+  // Reader projection is needed whenever the planner pruned / reordered columns
+  // (non-empty projection_ids) or hive-partition columns must be stripped from
+  // the physical read. When both are false, column_ids already describes the
+  // natural read order and the reader's unset-projection output matches what
+  // the pipeline expects — matching the old @c _is_projected semantics.
+  plan.needs_reader_projection = !projection_ids.empty() || !partition_indices.empty();
+
   // Walk positions in output-first order. When projection_ids is non-empty the
   // first output_types_size entries are the output columns in output order;
   // the remaining entries are pure-filter columns that must be read but not
@@ -198,15 +214,21 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       // level and our filter builder will skip them. We only materialize
       // partition metadata for output columns.
       if (!is_output) { return; }
-      plan.partition_columns.push_back(
-        scan_plan::partition_column{primary_idx, names[primary_idx], returned_types[primary_idx]});
+      // names.at / returned_types.at guard against planner inputs where the
+      // primary index exceeds the schema (empty names, schema mismatch, etc.).
+      plan.partition_columns.push_back(scan_plan::partition_column{
+        primary_idx, names.at(primary_idx), returned_types.at(primary_idx)});
       plan.output_layout.push_back(scan_plan::output_entry{scan_plan::output_entry::PARTITION,
                                                            plan.partition_columns.size() - 1});
     } else {
       // Data column — always added to the batch (even if filter-only, we need
-      // it for filter evaluation).
+      // it for filter evaluation). Store an empty name when @c names is empty:
+      // the caller's guard only forces non-empty names for name-dependent paths
+      // (projection, filter, partitions), and the plain-read case populates
+      // data_columns without ever consuming the name downstream.
       std::size_t const batch_pos = plan.data_columns.size();
-      plan.data_columns.push_back(scan_plan::data_column{primary_idx, names[primary_idx]});
+      std::string col_name        = names.empty() ? std::string{} : names.at(primary_idx);
+      plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
       primary_to_batch[primary_idx] = batch_pos;
       if (is_output) {
         plan.output_layout.push_back(
