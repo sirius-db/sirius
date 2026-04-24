@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
-status: executing
-stopped_at: Completed 09-03-PLAN.md (cross-GPU batch_id disjointness REQUIRE; build exit 0; 331/332 tests pass, 1 pre-existing failure)
-last_updated: "2026-04-24T10:25:56.080Z"
+status: verifying
+stopped_at: "Completed 09-04-PLAN.md (VERDICT: PARTIAL - SF100 ship-gate PASS, unit-test regression scoped to Phase 10)"
+last_updated: "2026-04-24T15:18:22.534Z"
 last_activity: 2026-04-24
 progress:
   total_phases: 2
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 
 Phase: 09 (scan-task-distributor-batch-ownership-affinity) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-04-24
 
 Progress: [██████████] 100% (6/6 plans complete)
@@ -47,6 +47,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 09 P01 | 25min | 3 tasks | 3 files |
 | Phase 09 P02 | 4min | 3 tasks | 3 files |
 | Phase 09 P03 | 5min | 1 tasks | 1 files |
+| Phase 09 P04 | 2h | 4 tasks | 2 files |
 
 ## Decisions
 
@@ -76,6 +77,9 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 09]: Affinity reset placed unconditionally at top of prepare_cache_for_scan_operators (before cache_level::NONE early return) so _scan_round_robin and _batch_gpu_affinity reset together on every query start regardless of caching mode (Pitfall 3 compliance)
 - [Phase 09]: [Phase 09-02] Affinity map (_batch_gpu_affinity) is written at dispatch time but not yet consulted at dispatch time — provides data structure for Plan 09-03 disjointness assertion; dispatch-time re-routing deferred to Phase 10+ if 09-04 validation shows residual cross-GPU collisions
 - [Phase 09]: [09-03] std::set_intersection on counts[0/1].scan_ids provides the permanent regression gate for Bug 1 (hypothesis E double-dispatch); REQUIRE fires on 2-GPU hosts, silently skipped on 1-GPU hosts via existing device_count < 2 WARN+return guard
+- [Phase 09]: [09-04] SF100 Q1 num_gpus=2 ship-gate PASSES — byte-identical to 1-GPU baseline, 71 scan batches dispatched disjointly across GPUs (GPU0=45, GPU1=26, intersect=0), wall-clock 5.86s, zero cudaErrorInvalidValue/SIGSEGV/fallback. Plans 09-01 (preferred_device_id), 09-02 (batch affinity), 09-03 (disjointness REQUIRE) all proven live at runtime.
+- [Phase 09]: [09-04] Verdict: PARTIAL. v1.2 ship BLOCKED on new regression (unrelated to distributor): SIGSEGV in 'SELECT * FROM gpu_execution(...)' TABLE-FUNCTION-form result materialization path. CALL-form works (SF100 passes); TABLE_FUNCTION-form crashes. Scoped to Phase 10.
+- [Phase 09]: [09-04] MCP unit-tests wrapper does not pass agent shell env to child process; SIRIUS_TEST_SF10_PATH and SIRIUS_LOG_DIR had to be set via direct binary invocation (Rule 3 auto-fix). MCP build gate still used for build verification.
 
 ## Accumulated Context
 
@@ -111,9 +115,10 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 - **[v1.2 SHIP BLOCKER — 08-06]** Residual `cudaErrorInvalidValue @ cuda_memcpy.cu:42` on num_gpus=2 parquet path. Failing tests: `gpu_execution hive partition - filter on data column` and `gpu_execution - TPC-H Query 1 parquet`. The 08-06 carryover fix at `convert_host_parquet_to_gpu_with_prefetched_data_source` (Pattern 2 idiom mirroring 08-02 Branch B template) was applied and build+HYG pass, but the same bug signature persists — indicating at least one additional fix-site. 4 hypothesis candidates and concrete suggested next actions documented in `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-06-VALIDATION.md` "Open Issue — Residual Carryover-Fix Incompleteness" section. Blocks ROADMAP criteria 1 + 2 + 4 + 6 (criteria 3 + 5 pass as static invariants).
 - **Integration fixture scope:** TPC-H fixture currently hard-codes `num_gpus: 1` via `setenv` inside the test fixture. Flipping globally may uncover other multi-GPU bugs not exposed by the unit-test suite today. Phase 8 plans should parameterize TPC-H specifically (per TEST-01) rather than flip the default globally — the parameterization approach is what AUDIT-03 requires anyway (2-GPU variant MUST execute in default unit-tests run, but the 1-GPU variant need not be removed).
+- **[v1.2 SHIP BLOCKER — 09-04 CRIT-2]** `SELECT * FROM gpu_execution("...")` TABLE_FUNCTION-form materialization path SIGSEGVs in unit tests (both 1-GPU and 2-GPU envs). The `CALL gpu_execution("...")` PROCEDURE-form works fine — SF100 Q1 num_gpus=2 ship-gate PASSES with byte-identical result vs 1-GPU baseline and disjoint cross-GPU batch dispatch. Distributor fixes (Plans 09-01/02/03) are all proven correct at runtime (`preferred_device_id=-1` count=0, cross-GPU intersection=0 at SF100 scale). Regression scoped to Phase 10: bisect across commits `3b58258`/`863cc6c`/`0c8068e`/`a8a7985`/`c0e12f3` + gdb on `gpu_execution - filter equality parquet` test. See `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-04-VALIDATION.md` Open Issue section H1-H4 (H2 TABLE_FUNCTION vs CALL-form result shaping is the leading hypothesis).
 
 ## Session Continuity
 
-Last session: 2026-04-24T10:25:56.077Z
-Stopped at: Completed 09-03-PLAN.md (cross-GPU batch_id disjointness REQUIRE; build exit 0; 331/332 tests pass, 1 pre-existing failure)
+Last session: 2026-04-24T15:18:06.455Z
+Stopped at: Completed 09-04-PLAN.md (VERDICT: PARTIAL - SF100 ship-gate PASS, unit-test regression scoped to Phase 10)
 Resume file: None
