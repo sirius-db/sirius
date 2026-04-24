@@ -34,6 +34,7 @@
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -42,8 +43,89 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+bool is_floating_point_type(duckdb::LogicalTypeId id)
+{
+  return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
+}
+
+struct comparable_result_cell {
+  bool is_null = false;
+  bool is_float = false;
+  bool is_nan = false;
+  double float_value = 0.0;
+  std::string text;
+};
+
+struct comparable_result_row {
+  std::vector<comparable_result_cell> cells;
+};
+
+comparable_result_cell make_comparable_cell(const duckdb::Value& value)
+{
+  comparable_result_cell cell;
+  cell.is_null = value.IsNull();
+  cell.text    = value.ToString();
+
+  if (!cell.is_null && is_floating_point_type(value.type().id())) {
+    cell.is_float = true;
+    cell.float_value = value.GetValue<double>();
+    cell.is_nan = std::isnan(cell.float_value);
+  }
+
+  return cell;
+}
+
+comparable_result_row make_comparable_row(duckdb::MaterializedQueryResult& result,
+                                          duckdb::idx_t row_idx)
+{
+  comparable_result_row row;
+  row.cells.reserve(result.ColumnCount());
+  for (duckdb::idx_t col_idx = 0; col_idx < result.ColumnCount(); col_idx++) {
+    row.cells.push_back(make_comparable_cell(result.GetValue(col_idx, row_idx)));
+  }
+  return row;
+}
+
+bool comparable_cell_less(const comparable_result_cell& lhs, const comparable_result_cell& rhs)
+{
+  if (lhs.is_null != rhs.is_null) { return lhs.is_null < rhs.is_null; }
+  if (lhs.is_float != rhs.is_float) { return lhs.is_float < rhs.is_float; }
+
+  if (lhs.is_float) {
+    if (lhs.is_nan != rhs.is_nan) { return lhs.is_nan < rhs.is_nan; }
+    if (!lhs.is_nan && lhs.float_value != rhs.float_value) { return lhs.float_value < rhs.float_value; }
+  }
+
+  return lhs.text < rhs.text;
+}
+
+bool comparable_row_less(const comparable_result_row& lhs, const comparable_result_row& rhs)
+{
+  for (duckdb::idx_t idx = 0; idx < lhs.cells.size(); idx++) {
+    if (comparable_cell_less(lhs.cells[idx], rhs.cells[idx])) { return true; }
+    if (comparable_cell_less(rhs.cells[idx], lhs.cells[idx])) { return false; }
+  }
+  return false;
+}
+
+std::vector<comparable_result_row> collect_sorted_rows(duckdb::MaterializedQueryResult& result)
+{
+  std::vector<comparable_result_row> rows;
+  rows.reserve(result.RowCount());
+  for (duckdb::idx_t row_idx = 0; row_idx < result.RowCount(); row_idx++) {
+    rows.push_back(make_comparable_row(result, row_idx));
+  }
+  std::stable_sort(rows.begin(), rows.end(), comparable_row_less);
+  return rows;
+}
+
+}  // namespace
 
 static fs::path get_project_root()
 {
@@ -81,11 +163,6 @@ class MultiFormatFixtureBase {
     }
   }
 
-  static bool is_floating_point(duckdb::LogicalTypeId id)
-  {
-    return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
-  }
-
   void compare_gpu_vs_cpu(const std::string& query,
                           std::optional<float> float_tolerance = std::nullopt)
   {
@@ -106,51 +183,48 @@ class MultiFormatFixtureBase {
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-    // Sort both result sets for deterministic comparison
-    auto ncols               = gpu_result->ColumnCount();
-    std::string order_clause = " ORDER BY ";
-    for (duckdb::idx_t c = 0; c < ncols; c++) {
-      if (c > 0) order_clause += ", ";
-      order_clause += std::to_string(c + 1);
-    }
+    auto gpu_rows = collect_sorted_rows(*gpu_result);
+    auto cpu_rows = collect_sorted_rows(*cpu_result);
 
-    auto clean_query = query;
-    while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
-      clean_query.pop_back();
+    for (duckdb::idx_t r = 0; r < gpu_result->RowCount(); r++) {
+      for (duckdb::idx_t c = 0; c < gpu_result->ColumnCount(); c++) {
+        const auto& gpu_value = gpu_rows[r].cells[c];
+        const auto& cpu_value = cpu_rows[r].cells[c];
 
-    auto gpu_sorted =
-      con->Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
-    auto cpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
-    REQUIRE(gpu_sorted);
-    if (gpu_sorted->HasError()) { UNSCOPED_INFO("gpu sorted error: " << gpu_sorted->GetError()); }
-    REQUIRE_FALSE(gpu_sorted->HasError());
-    REQUIRE(cpu_sorted);
-    if (cpu_sorted->HasError()) { UNSCOPED_INFO("cpu sorted error: " << cpu_sorted->GetError()); }
-    REQUIRE_FALSE(cpu_sorted->HasError());
-
-    for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-      for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-        auto gpu_value = gpu_sorted->GetValue(c, r);
-        auto cpu_value = cpu_sorted->GetValue(c, r);
-
-        if (float_tolerance.has_value() && is_floating_point(gpu_value.type().id())) {
-          double gpu_d = gpu_value.GetValue<double>();
-          double cpu_d = cpu_value.GetValue<double>();
-          double diff  = std::fabs(gpu_d - cpu_d);
-          if (diff > static_cast<double>(float_tolerance.value())) {
-            UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=[" << gpu_d
-                                 << "] CPU=[" << cpu_d << "] diff=" << diff);
-          }
-          REQUIRE(diff <= static_cast<double>(float_tolerance.value()));
-        } else {
-          auto gpu_str = gpu_value.ToString();
-          auto cpu_str = cpu_value.ToString();
-          if (gpu_str != cpu_str) {
-            UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_str << "] CPU=["
-                                 << cpu_str << "]");
-          }
-          REQUIRE(gpu_str == cpu_str);
+        if (gpu_value.is_null != cpu_value.is_null) {
+          UNSCOPED_INFO("Row " << r << " Col " << c << " nullability mismatch: GPU=["
+                               << gpu_value.text << "] CPU=[" << cpu_value.text << "]");
         }
+        REQUIRE(gpu_value.is_null == cpu_value.is_null);
+
+        if (float_tolerance.has_value() && gpu_value.is_float && cpu_value.is_float &&
+            !gpu_value.is_null && !cpu_value.is_null) {
+          auto tolerance = static_cast<double>(float_tolerance.value());
+          if (gpu_value.is_nan != cpu_value.is_nan) {
+            UNSCOPED_INFO("Row " << r << " Col " << c << " NaN mismatch: GPU=[" << gpu_value.text
+                                 << "] CPU=[" << cpu_value.text << "]");
+          }
+          REQUIRE(gpu_value.is_nan == cpu_value.is_nan);
+          if (gpu_value.is_nan) { continue; }
+
+          if (gpu_value.float_value == cpu_value.float_value) { continue; }
+
+          double diff = std::fabs(gpu_value.float_value - cpu_value.float_value);
+          if (diff > tolerance) {
+            UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=["
+                                 << gpu_value.text << "] CPU=[" << cpu_value.text
+                                 << "] diff=" << diff
+                                 << " tolerance=" << float_tolerance.value());
+          }
+          REQUIRE(diff <= tolerance);
+          continue;
+        }
+
+        if (gpu_value.text != cpu_value.text) {
+          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_value.text
+                               << "] CPU=[" << cpu_value.text << "]");
+        }
+        REQUIRE(gpu_value.text == cpu_value.text);
       }
     }
   }
