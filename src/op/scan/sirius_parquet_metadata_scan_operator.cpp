@@ -159,25 +159,30 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     // parquet column name. scan_plan::batch_column_name is the single source of truth for
     // this D→name mapping; the previously-cached _column_name_by_ref was C-indexed and
     // silently wrong whenever projection reordered or dropped columns.
-    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-      return _plan.batch_column_name(ref_index);
-    };
-    auto optional_filter =
-      translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-    stream.synchronize();
-    if (optional_filter) {
-      ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
-      result->reader_options->set_filter(ast_filter->back());
-      result->filter_expression = ast_filter;
-      SIRIUS_LOG_DEBUG(
-        "[sirius_parquet_metadata_scan_operator] Translated filter expression for pushdown.");
-    } else {
-      result->filter_expression = _duckdb_filter_expression;
-      SIRIUS_LOG_DEBUG(
-        "[sirius_parquet_metadata_scan_operator] AST translation failed; filter will be applied "
-        "post-read by the GPU scan operator.");
-    }
+
+    /// KEVIN: There is a stream/concurrency bug in the AST filter at large scale factors. Looking
+    /// into it.
+
+    // gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    // auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+    //   return _plan.batch_column_name(ref_index);
+    // };
+    // auto optional_filter =
+    //   translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+    // stream.synchronize();
+    // if (optional_filter) {
+    //   ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
+    //   result->reader_options->set_filter(ast_filter->back());
+    //   result->filter_expression = ast_filter;
+    //   SIRIUS_LOG_DEBUG(
+    //     "[sirius_parquet_metadata_scan_operator] Translated filter expression for pushdown.");
+    // } else {
+    //   result->filter_expression = _duckdb_filter_expression;
+    //   SIRIUS_LOG_DEBUG(
+    //     "[sirius_parquet_metadata_scan_operator] AST translation failed; filter will be applied "
+    //     "post-read by the GPU scan operator.");
+    // }
+    result->filter_expression = _duckdb_filter_expression;
   }
   // post_filter_projection_ids is intentionally left empty: the scan_plan-backed inject
   // closure handles output assembly (data + partition + pure-filter drop) in one pass, so

@@ -53,9 +53,31 @@ set(SIRIUS_LEGACY_SOURCES
     PARENT_SCOPE)
 
 set(SIRIUS_LEGACY_CUDA_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/allocator.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/communication.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/print.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/utils.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_materialize.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_select.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_string.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/iceberg/equality_delete_mask.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_aggregate.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_duplicate_elimination.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_groupby.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_join.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_orderby.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_utils.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/arbitrary_expression.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/comparison_expression.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/empty_str_check.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/hash_join_inner.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/hash_join_right.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/hash_join_single.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/materialize.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/nested_loop_join.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/strings_matching.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/strlen_from_offsets.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/substring.cu
     PARENT_SCOPE)
 
 # Sources only compiled when the legacy entry point is enabled

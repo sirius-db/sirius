@@ -387,7 +387,7 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
       auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                        to_cudf_type,
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr);
+                                       GPUBufferManager::GetInstance().get_mr_ref());
       left_keys[cond_idx]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
     } else {
       throw NotImplementedException(
@@ -420,7 +420,7 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
       auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                        to_cudf_type,
                                        rmm::cuda_stream_default,
-                                       GPUBufferManager::GetInstance().mr);
+                                       GPUBufferManager::GetInstance().get_mr_ref());
       right_keys[cond_idx]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
     } else {
       throw NotImplementedException(

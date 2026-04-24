@@ -51,7 +51,7 @@ void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t nu
   START_TIMER();
 
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
 
   std::vector<cudf::column_view> keys_cudf;
 

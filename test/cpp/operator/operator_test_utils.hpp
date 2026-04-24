@@ -85,7 +85,7 @@ inline cucascade::memory::memory_space* get_default_gpu_space()
 }
 inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory_space& space)
 {
-  return rmm::to_device_async_resource_ref_checked(space.get_default_allocator());
+  return space.get_default_allocator();
 }
 
 inline rmm::cuda_stream_view default_stream() { return cudf::get_default_stream(); }

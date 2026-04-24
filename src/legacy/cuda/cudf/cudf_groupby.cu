@@ -215,7 +215,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
   START_TIMER();
 
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  cudf::set_current_device_resource(gpuBufferManager->mr);
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
 
   std::vector<cudf::column_view> keys_cudf;
   bool has_nullable_key = false;
@@ -265,7 +265,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
           null_filtered_owner   = cudf::drop_nulls(dedup_table,
                                                    {static_cast<cudf::size_type>(num_keys)},
                                                  rmm::cuda_stream_default,
-                                                 gpuBufferManager->mr);
+                                                 gpuBufferManager->get_mr_ref());
           effective_dedup_table = null_filtered_owner->view();
         }
 
@@ -279,7 +279,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
                                               cudf::null_equality::EQUAL,
                                               cudf::nan_equality::ALL_EQUAL,
                                               rmm::cuda_stream_default,
-                                              gpuBufferManager->mr);
+                                              gpuBufferManager->get_mr_ref());
 
         SIRIUS_LOG_DEBUG(
           "Two-phase COUNT DISTINCT: {} -> {} after distinct", size, distinct_result->num_rows());
@@ -392,7 +392,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
         auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                          to_cudf_type,
                                          rmm::cuda_stream_default,
-                                         GPUBufferManager::GetInstance().mr);
+                                         GPUBufferManager::GetInstance().get_mr_ref());
         aggregate_keys[agg]->setFromCudfColumn(
           *to_cudf_column, false, nullptr, 0, gpuBufferManager);
       }
