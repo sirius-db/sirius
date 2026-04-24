@@ -17,7 +17,6 @@
 #pragma once
 
 // standard library
-#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -26,26 +25,14 @@ namespace sirius::ast {
 struct node;
 
 /**
- * @brief Sirius-native mirror of duckdb::BoundOperatorExpression.
+ * @brief Sirius-native representation of SQL COALESCE.
  *
- * Mixed-arity: is_null / is_not_null / not_ are unary, coalesce is N-ary,
- * in / not_in take a value plus a list. Arity is implied by the enum tag;
- * `children` carries all operands.
- *
- * Trailing underscore on `operator_` because `operator` is a C++ keyword.
+ * N-ary expression that returns the first non-null argument. Mirrors the
+ * OPERATOR_COALESCE kind of duckdb::BoundOperatorExpression. Split out of
+ * the broader `unary_op` node because coalesce is the only non-unary member
+ * of that family.
  */
-struct operator_ {
-  enum class kind : uint8_t {
-    is_null,
-    is_not_null,
-    not_,
-    coalesce,
-    try_,
-    in,
-    not_in,
-  };
-
-  kind op{kind::is_null};
+struct coalesce {
   std::vector<std::unique_ptr<node>> children;
 };
 

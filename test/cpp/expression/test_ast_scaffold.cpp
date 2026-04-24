@@ -33,15 +33,17 @@
 #include <vector>
 
 using sirius::ast::between;
-using sirius::ast::case_;
+using sirius::ast::case_expr;
 using sirius::ast::cast;
+using sirius::ast::coalesce;
 using sirius::ast::comparison;
 using sirius::ast::conjunction;
 using sirius::ast::constant;
 using sirius::ast::function_call;
+using sirius::ast::in_list;
 using sirius::ast::node;
-using sirius::ast::operator_;
 using sirius::ast::reference;
+using sirius::ast::unary_op;
 
 // ============================================================================
 // Compile-time invariants
@@ -52,8 +54,8 @@ static_assert(!std::is_copy_constructible_v<node>,
 static_assert(!std::is_copy_assignable_v<node>, "sirius::ast::node must be move-only.");
 static_assert(std::is_move_constructible_v<node>, "sirius::ast::node must be move-constructible.");
 static_assert(std::is_move_assignable_v<node>, "sirius::ast::node must be move-assignable.");
-static_assert(std::variant_size_v<node::variant_t> == 9,
-              "sirius::ast::node has exactly 9 alternatives.");
+static_assert(std::variant_size_v<node::variant_t> == 11,
+              "sirius::ast::node has exactly 11 alternatives.");
 
 // ============================================================================
 // Per-node instantiation
@@ -117,10 +119,10 @@ TEST_CASE("ast_scaffold - between holds three children and inclusivity flags", "
   REQUIRE(n.holds<between>());
 }
 
-TEST_CASE("ast_scaffold - case_ holds when/then pairs and an else clause", "[ast_scaffold]")
+TEST_CASE("ast_scaffold - case_expr holds when/then pairs and an else clause", "[ast_scaffold]")
 {
-  case_ c;
-  case_::when_then wt;
+  case_expr c;
+  case_expr::when_then wt;
   wt.when_ = std::make_unique<node>(reference{0});
   wt.then_ = std::make_unique<node>(reference{1});
   c.cases.push_back(std::move(wt));
@@ -130,7 +132,7 @@ TEST_CASE("ast_scaffold - case_ holds when/then pairs and an else clause", "[ast
   REQUIRE(c.cases[0].then_);
   REQUIRE(c.else_);
   node n{std::move(c)};
-  REQUIRE(n.holds<case_>());
+  REQUIRE(n.holds<case_expr>());
 }
 
 TEST_CASE("ast_scaffold - cast holds child, target type, and try flag", "[ast_scaffold]")
@@ -145,15 +147,40 @@ TEST_CASE("ast_scaffold - cast holds child, target type, and try flag", "[ast_sc
   REQUIRE(n.holds<cast>());
 }
 
-TEST_CASE("ast_scaffold - operator_ covers mixed-arity kinds", "[ast_scaffold]")
+TEST_CASE("ast_scaffold - unary_op wraps a single child", "[ast_scaffold]")
 {
-  operator_ op;
-  op.op = operator_::kind::is_null;
-  op.children.push_back(std::make_unique<node>(reference{0}));
-  REQUIRE(op.children.size() == 1);
-  REQUIRE(op.op == operator_::kind::is_null);
-  node n{std::move(op)};
-  REQUIRE(n.holds<operator_>());
+  unary_op u;
+  u.op    = unary_op::kind::is_null;
+  u.child = std::make_unique<node>(reference{0});
+  REQUIRE(u.op == unary_op::kind::is_null);
+  REQUIRE(u.child);
+  node n{std::move(u)};
+  REQUIRE(n.holds<unary_op>());
+}
+
+TEST_CASE("ast_scaffold - coalesce holds N-ary children", "[ast_scaffold]")
+{
+  coalesce co;
+  co.children.push_back(std::make_unique<node>(reference{0}));
+  co.children.push_back(std::make_unique<node>(reference{1}));
+  co.children.push_back(std::make_unique<node>(reference{2}));
+  REQUIRE(co.children.size() == 3);
+  node n{std::move(co)};
+  REQUIRE(n.holds<coalesce>());
+}
+
+TEST_CASE("ast_scaffold - in_list holds a probe, values, and a negation flag", "[ast_scaffold]")
+{
+  in_list il;
+  il.probe = std::make_unique<node>(reference{0});
+  il.values.push_back(std::make_unique<node>(reference{1}));
+  il.values.push_back(std::make_unique<node>(reference{2}));
+  il.negated = true;
+  REQUIRE(il.probe);
+  REQUIRE(il.values.size() == 2);
+  REQUIRE(il.negated);
+  node n{std::move(il)};
+  REQUIRE(n.holds<in_list>());
 }
 
 TEST_CASE("ast_scaffold - function_call holds arguments and a return type", "[ast_scaffold]")

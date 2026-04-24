@@ -31,9 +31,11 @@ struct constant;
 struct comparison;
 struct conjunction;
 struct between;
-struct case_;
+struct case_expr;
 struct cast;
-struct operator_;
+struct unary_op;
+struct coalesce;
+struct in_list;
 struct function_call;
 
 // Forward declaration of node as a struct (not a type alias).
@@ -50,14 +52,16 @@ struct node;
 // the forward declaration above because unique_ptr<T> does not require T to be
 // a complete type at member-declaration time.
 #include "expression/ast/between.hpp"
-#include "expression/ast/case_.hpp"
+#include "expression/ast/case_expr.hpp"
 #include "expression/ast/cast.hpp"
+#include "expression/ast/coalesce.hpp"
 #include "expression/ast/comparison.hpp"
 #include "expression/ast/conjunction.hpp"
 #include "expression/ast/constant.hpp"
 #include "expression/ast/function_call.hpp"
-#include "expression/ast/operator_.hpp"
+#include "expression/ast/in_list.hpp"
 #include "expression/ast/reference.hpp"
+#include "expression/ast/unary_op.hpp"
 
 namespace sirius::ast {
 
@@ -82,9 +86,11 @@ struct node {
                                  comparison,
                                  conjunction,
                                  between,
-                                 case_,
+                                 case_expr,
                                  cast,
-                                 operator_,
+                                 unary_op,
+                                 coalesce,
+                                 in_list,
                                  function_call>;
 
   variant_t v;

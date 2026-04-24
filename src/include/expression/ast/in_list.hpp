@@ -25,19 +25,18 @@ namespace sirius::ast {
 struct node;
 
 /**
- * @brief Sirius-native mirror of duckdb::BoundCaseExpression.
+ * @brief Sirius-native representation of SQL IN / NOT IN.
  *
- * Trailing underscore on `case_` because `case` is a C++ keyword. Member
- * names that alias keywords (when/then/else) take the same treatment.
+ * Mirrors the COMPARE_IN / COMPARE_NOT_IN kinds of
+ * duckdb::BoundOperatorExpression. The probe is evaluated once and checked
+ * against every value in the list; `negated` flips the result for NOT IN.
+ * Split out of the broader `unary_op` node because the operand structure
+ * (one probe + N values) is distinct from the other SQL-operator cases.
  */
-struct case_ {
-  struct when_then {
-    std::unique_ptr<node> when_;
-    std::unique_ptr<node> then_;
-  };
-
-  std::vector<when_then> cases;
-  std::unique_ptr<node> else_;
+struct in_list {
+  std::unique_ptr<node> probe;
+  std::vector<std::unique_ptr<node>> values;
+  bool negated{false};
 };
 
 }  // namespace sirius::ast
