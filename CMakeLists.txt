@@ -139,6 +139,7 @@ set(EXTENSION_SOURCES
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
+    src/scan_manager/sirius_scan_manager.cpp
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
