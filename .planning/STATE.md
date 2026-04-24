@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
-status: verifying
-stopped_at: "Completed 08-07-PLAN.md (gap-closure instrumentation: [mgpu-probe] breadcrumbs landed at host_parquet converter entry+exit + parquet_scan_task::compute_task entry; build exit 0; HYG-02 preserved; ready for 08-08 reproduction)"
-last_updated: "2026-04-22T13:45:33.356Z"
+status: phase-8-halted-phase-9-pending
+stopped_at: "Plan 08-08 diagnosis committed (f57f7bd) — hypothesis E (scan-task cross-GPU batch double-dispatch). Plans 08-09/10 HALTED (see 08-09-HALT.md). Phase 9 inserted in ROADMAP for the real distributor + preferred_device_id bug. Next: /clear, then /gsd:plan-phase 9 in fresh context."
+last_updated: "2026-04-22T14:30:00.000Z"
 last_activity: 2026-04-22
 progress:
-  total_phases: 1
+  total_phases: 2
   completed_phases: 0
-  total_plans: 10
+  total_plans: 8
   completed_plans: 8
-  percent: 100
+  percent: 50
 ---
 
 # Project State

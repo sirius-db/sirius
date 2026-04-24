@@ -20,9 +20,10 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 
 </details>
 
-### 🚧 v1.2 — Active (ship-blocked)
+### 🚧 v1.2 — Active
 
-- [~] **Phase 8: Multi-GPU SQL Pipeline Fix** — 6/6 plans complete; criteria 3 + 5 PASS (HYG + Pattern 2 grep); criteria 1/2/4/6 DEFERRED on residual `cudaErrorInvalidValue @ cuda_memcpy.cu:42` on parquet + num_gpus=2 path. See `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md` for full ship verdict.
+- [~] **Phase 8: Multi-GPU SQL Pipeline Fix** — 6/6 original plans + 2 gap-closure plans (08-07 probes landed, 08-08 diagnosis returned **hypothesis E**). Criteria 3 + 5 PASS (HYG + Pattern 2 grep); criteria 1/2/4/6 handed off to Phase 9. Plans 08-09/10 HALTED (see `08-09-HALT.md`).
+- [ ] **Phase 9: Scan-Task Distributor + Batch-Ownership Affinity** — fix the real bug identified by 08-08: scan-task distributor dispatches the same `batch_id` (already resident on one GPU) to a task on a different GPU, causing memspace-match failure → SIGSEGV. Plus `preferred_device_id=-1` plumbing bug at `parquet_scan_task::compute_task` entry. Ship-gate = v1.2 original Success Criteria 1/2/4/6 (SF1 + SF10 + SF100 Q1 on num_gpus=2, `[mgpu-audit]` ≥ 5 per GPU).
 
 ## Phase Details
 
@@ -54,3 +55,11 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 6. Multi-GPU Gap Closure | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 7. P2P Direct Transfer + Adaptive Scan | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 8. Multi-GPU SQL Pipeline Fix | v1.2 | 6/6 | Complete (ship-blocked) | 2026-04-22 |
+
+### Phase 9: Scan-Task Distributor + Batch-Ownership Affinity
+**Goal**: Fix the scan-task distributor so a batch with `batch_device_id=N` is only ever dispatched to tasks with `target_device_id=N`. Fix `preferred_device_id=-1` plumbing at `parquet_scan_task::compute_task` entry. Close v1.2's original ship-gate (Criteria 1/2/4/6) that Phase 8 deferred.
+**Depends on**: Phase 8 (Pattern 2 converter fixes at 4 sites + observability breadcrumbs + integration-2gpu.yaml + audit gate infrastructure)
+**Requirements**: All v1.2 requirements remain scoped; Phase 9 closes the residual gap preventing ship.
+**Evidence source**: `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-08-DIAGNOSIS.md` + `08-08-PROBE-LOG.log` + `08-09-HALT.md`
+**Success Criteria**: Inherits v1.2 ROADMAP criteria 1, 2, 4, 6 from Phase 8 (criteria 3 + 5 already closed by Phase 8).
+**Plans**: TBD (run `/gsd:plan-phase 9` to decompose)
