@@ -758,7 +758,13 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   {
     int current_device = -1;
     (void)cudaGetDevice(&current_device);
-    auto const preferred_probe = g_state.get_preferred_device_id();
+    // Phase 9 FIX-A: two-tier preferred_device_id lookup (local-wins-over-global).
+    // Mirrors gpu_pipeline_task::get_preferred_device_id (gpu_pipeline_task.hpp:188-194).
+    // Probe reports the EFFECTIVE value that _datasource construction below will see.
+    auto const local_preferred_probe = l_state.get_preferred_device_id();
+    auto const preferred_probe       = local_preferred_probe.has_value()
+      ? local_preferred_probe
+      : g_state.get_preferred_device_id();
     auto* memspace_probe       = l_state.get_memory_space();
     SIRIUS_LOG_INFO(
       "[mgpu-probe] parquet_scan_task::compute_task entry current_device={} stream={} "
@@ -791,7 +797,13 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
         "SiriusContext::initialize() must have populated at least one "
         "(Approach C seeding via task_creator required)");
     }
-    auto const preferred = g_state.get_preferred_device_id();
+    // Phase 9 FIX-A: two-tier lookup (local-wins-over-global). See also the
+    // same idiom in the [mgpu-probe] entry breadcrumb above — both must
+    // produce the SAME value for the probe log to match the actual routing.
+    auto const local_preferred = l_state.get_preferred_device_id();
+    auto const preferred       = local_preferred.has_value()
+      ? local_preferred
+      : g_state.get_preferred_device_id();
     auto backend_it =
       preferred.has_value() ? backends.find(*preferred) : backends.begin();
     if (backend_it == backends.end()) {
