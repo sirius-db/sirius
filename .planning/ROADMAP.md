@@ -68,3 +68,14 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
   - [x] 09-02-PLAN.md — batch-ownership affinity map (Bug 1): _batch_gpu_affinity std::unordered_map<uint64_t,int> + mutex in duckdb_scan_executor, recorded atomically with [mgpu-audit] log + reset on query start + [mgpu-probe] breadcrumbs on prepare_for_processing nullopt paths
   - [x] 09-03-PLAN.md — AUDIT disjointness REQUIRE: std::set_intersection(counts[0].scan_ids, counts[1].scan_ids) == ∅ added to existing AUDIT TEST_CASE
   - [x] 09-04-PLAN.md — Ship-gate validation on 2-GPU hardware (autonomous: true, MCP-executed per 2026-04-24 host-capability discovery): SF1 22 queries + SF10 Q1/Q6/Q12 + SF100 Q1 — evidence captured to 09-04-VALIDATION.md — **VERDICT: PARTIAL** (SF100 ship-gate + disjointness PASS; unit-test `SELECT * FROM gpu_execution(...)` SIGSEGV scoped to Phase 10)
+
+### Phase 10: TABLE_FUNCTION-form gpu_execution SIGSEGV fix
+**Goal**: Close v1.2 ship-gate by fixing the `SELECT * FROM gpu_execution(...)` TABLE_FUNCTION-form SIGSEGV discovered in 09-04 validation. Bisect the 5-commit Phase 9 span (`3b58258..c0e12f3`), gdb the crash to confirm the fault frame, apply a targeted fix per the confirmed hypothesis (H1–H4 from 09-VERIFICATION.md), and re-run the 09-04 ship-gate procedure to confirm CRIT-2 green.
+**Depends on**: Phase 9 (distributor fix proven correct at SF100; regression is orthogonal and needs isolation via bisect)
+**Requirements**: CRIT-1, CRIT-2, CRIT-6 (inherited v1.2 ship-gate IDs still open after Phase 9; CRIT-4 closed by Plan 09-03 disjointness REQUIRE)
+**Evidence source**: `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-VERIFICATION.md` (`gaps`, `open_issue_carryforward`, `hypotheses` H1–H4) + `09-04-VALIDATION.md` Open Issue section
+**Success Criteria**: (1) `./build/release/extension/sirius/test/cpp/sirius_unittest 'gpu_execution - filter equality parquet'` exits 0 on both 1-GPU and 2-GPU envs. (2) Full MCP unit-tests suite exits 0 with `integration.yaml` at `num_gpus: 2` (88 SF1 variants + SF10 Q1/Q6/Q12 all green). (3) Re-running the 09-04-PLAN.md ship-gate procedure produces `verdict: PASS` in a new VALIDATION.md (SF100 Q1 num_gpus=2 byte-identical vs 1-GPU baseline AND unit-tests green). (4) HYG-02 baseline preserved (`grep -c 'rmm::cuda_stream_default' src/` ≤ 41). (5) Feature branch `feature/single-node-multi-gpu2` preserved; fix scoped (< 100 LOC expected).
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 10 to break down)

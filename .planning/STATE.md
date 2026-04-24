@@ -99,6 +99,10 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - **Sirius-side converter override is the fix pattern** for cross-device stream-correctness bugs (Pattern 2 from Plan 07 research). Same approach applies to `lock_or_prepare_batch`.
 - **Sticky `cudaGetLastError()` consume** is required after any cuda* call that can leave state in the thread-local slot.
 
+### Roadmap Evolution
+
+- Phase 10 added (2026-04-24): TABLE_FUNCTION-form gpu_execution SIGSEGV fix — closes v1.2 ship-gate CRIT-1/2/6 after Phase 9 distributor fix proved correct at SF100 but unit-test SIGSEGV in `SELECT * FROM gpu_execution(...)` result-materialization path blocked the ship. Scope: bisect `3b58258..c0e12f3` → gdb → targeted fix → re-run 09-04 ship-gate. Evidence in `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-VERIFICATION.md`.
+
 ### Roadmap Decisions (v1.2)
 
 - **Single phase (Phase 8)** — user explicitly chose single-phase scoping during new-milestone questioning; granularity `coarse` in config.json reinforces this. All 11 requirements form one coherent delivery with internal dependencies (can't meaningfully test without fix; can't audit without both).
