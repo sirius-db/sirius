@@ -126,7 +126,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
 
  private:
   //! Plan-time build context for all MetaPipelines in the query plan
-  const pipeline_build_context& build_ctx;
+  const pipeline_build_context build_ctx;
   //! The pipeline_build_state for all MetaPipelines in the query plan
   sirius_pipeline_build_state& state;
   //! Parent pipeline (optional)
