@@ -1250,9 +1250,8 @@ TEST_CASE("two-pipeline scan - table with nested column, project flat only",
   duckdb::vector<duckdb::idx_t> projection_ids{0, 2};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
                                                    duckdb::LogicalType::INTEGER};
-  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
-                                                     duckdb::LogicalType::STRUCT({}),
-                                                     duckdb::LogicalType::INTEGER};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::STRUCT({}), duckdb::LogicalType::INTEGER};
 
   std::vector<std::string> files = {path.string()};
   auto batches                   = run_two_pipeline_scan(files,
