@@ -562,9 +562,25 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
     return _partition.row_group_indices;
   }
 
+  //===----------Preferred device id (Phase 9 Bug 2 fix)----------===//
+  /**
+   * @brief Record which GPU this task was assigned to at dispatch time.
+   * Set by duckdb_scan_executor::manager_loop after select_target_gpu().
+   * Read by parquet_scan_task::compute_task for per-GPU io_backend routing.
+   * Per-task (local state) by design: Pitfall 1 in 09-RESEARCH.md warns that
+   * using the shared global state creates a data race across concurrent
+   * scan tasks for the same pipeline on different GPUs.
+   */
+  void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const
+  {
+    return _preferred_device_id;
+  }
+
  private:
   parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition
   std::size_t _metadata_bytes;                                 ///< The number of metadata bytes
+  std::optional<int> _preferred_device_id;  ///< Per-task GPU assignment (Phase 9 Bug 2 fix)
 };
 
 //===----------------------------------------------------------------------===//
