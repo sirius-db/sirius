@@ -95,7 +95,7 @@ partition_inject_fn_t build_partition_inject_fn(
            std::unique_ptr<cudf::table> tbl,
            std::string const& file_path,
            rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
-    if (!tbl || tbl->num_rows() == 0) return tbl;
+    if (!tbl) return tbl;
 
     auto partitions     = duckdb::HivePartitioning::Parse(file_path);
     auto const num_rows = tbl->num_rows();

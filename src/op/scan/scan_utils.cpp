@@ -57,7 +57,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
-  const std::vector<duckdb::idx_t>& batch_column_map)
+  const std::vector<duckdb::idx_t>& batch_column_map,
+  const std::unordered_set<std::size_t>& skip_primary_indices)
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
 
@@ -80,6 +81,12 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
         std::format("TABLE_SCAN filter: primary_idx ({}) >= returned_types.size() ({})",
                     primary_idx,
                     returned_types.size()));
+    }
+    if (skip_primary_indices.count(primary_idx)) {
+      SIRIUS_LOG_DEBUG(
+        "TABLE_SCAN filter: skipping filter on primary_idx={} (hive partition or equivalent)",
+        primary_idx);
+      continue;
     }
     auto col_type = returned_types[primary_idx];
 
