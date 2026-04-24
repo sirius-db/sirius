@@ -111,7 +111,7 @@ class GPUPhysicalPlanGenerator {
   unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalCTERef& op);
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalPivot &op);
 
-  // unique_ptr<GPUPhysicalOperator> PlanAsOfJoin(LogicalComparisonJoin &op);
+  unique_ptr<GPUPhysicalOperator> PlanAsOfJoin(LogicalComparisonJoin& op);
   unique_ptr<GPUPhysicalOperator> PlanComparisonJoin(LogicalComparisonJoin& op);
   unique_ptr<GPUPhysicalOperator> PlanDelimJoin(LogicalComparisonJoin& op);
   unique_ptr<GPUPhysicalOperator> ExtractAggregateExpressions(

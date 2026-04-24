@@ -182,6 +182,7 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/sirius_physical_asof_hash_join.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
@@ -224,6 +225,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
     src/planner/query.cpp
+    src/planner/sirius_plan_asof_join.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
@@ -281,7 +283,8 @@ set(CUDA_SOURCES
     src/cuda/operator/strlen_from_offsets.cu
     src/cuda/operator/empty_str_check.cu
     src/cuda/print.cu
-    src/cuda/utils.cu)
+    src/cuda/utils.cu
+    src/cuda/operator/as_of_join.cu)
 # cmake-format: on
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")

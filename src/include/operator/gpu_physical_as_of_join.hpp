@@ -29,37 +29,26 @@
 
 namespace duckdb {
 
-template <typename T>
-void nestedLoopJoin(T** left_data,
-                    T** right_data,
-                    uint64_t*& row_ids_left,
-                    uint64_t*& row_ids_right,
-                    uint64_t*& count,
-                    uint64_t left_size,
-                    uint64_t right_size,
-                    int* condition_mode,
-                    int num_keys);
-
-//! PhysicalNestedLoopJoin represents a nested loop join between two tables
-class GPUPhysicalNestedLoopJoin : public GPUPhysicalOperator {
+//! PhysicalAsOfJoin represents an as of join between two tables
+class GPUPhysicalAsOfJoin : public GPUPhysicalOperator {
  public:
-  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::NESTED_LOOP_JOIN;
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::ASOF_JOIN;
 
  public:
-  GPUPhysicalNestedLoopJoin(LogicalOperator& op,
-                            unique_ptr<GPUPhysicalOperator> left,
-                            unique_ptr<GPUPhysicalOperator> right,
-                            vector<JoinCondition> cond,
-                            JoinType join_type,
-                            idx_t estimated_cardinality,
-                            unique_ptr<JoinFilterPushdownInfo> pushdown_info_p);
+  GPUPhysicalAsOfJoin(LogicalOperator& op,
+                      unique_ptr<GPUPhysicalOperator> left,
+                      unique_ptr<GPUPhysicalOperator> right,
+                      vector<JoinCondition> cond,
+                      JoinType join_type,
+                      idx_t estimated_cardinality,
+                      unique_ptr<JoinFilterPushdownInfo> pushdown_info_p);
 
-  GPUPhysicalNestedLoopJoin(LogicalOperator& op,
-                            unique_ptr<GPUPhysicalOperator> left,
-                            unique_ptr<GPUPhysicalOperator> right,
-                            vector<JoinCondition> cond,
-                            JoinType join_type,
-                            idx_t estimated_cardinality);
+  GPUPhysicalAsOfJoin(LogicalOperator& op,
+                      unique_ptr<GPUPhysicalOperator> left,
+                      unique_ptr<GPUPhysicalOperator> right,
+                      vector<JoinCondition> cond,
+                      JoinType join_type,
+                      idx_t estimated_cardinality);
 
   vector<JoinCondition> conditions;
   //! The types of the join keys
@@ -123,7 +112,5 @@ class GPUPhysicalNestedLoopJoin : public GPUPhysicalOperator {
   OperatorResultType ResolveComplexJoin(GPUIntermediateRelation& input_relation,
                                         GPUIntermediateRelation& output_relation) const;
 };
-
-void ReorderConditions(vector<JoinCondition>& conditions);
 
 }  // namespace duckdb

@@ -158,8 +158,8 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalCTERef& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalPivot &op);
 
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-  // plan_asof_join(duckdb::LogicalComparisonJoin &op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_asof_join(
+    duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_comparison_join(
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
