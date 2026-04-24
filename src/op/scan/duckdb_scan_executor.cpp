@@ -324,6 +324,26 @@ void duckdb_scan_executor::manager_loop()
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
 
+      // Phase 9 FIX-A (Bug 2 — 08-08-DIAGNOSIS.md hypothesis E): plumb target_gpu_id
+      // into the task's LOCAL state so parquet_scan_task::compute_task reads the
+      // real device id rather than the nullopt sentinel that routed _datasource
+      // to backends.begin() (GPU 0's io_backend) regardless of which GPU the
+      // dispatch guard pinned. Local state (per-task) avoids the shared-global
+      // race described in 09-RESEARCH.md Pitfall 1.
+      //
+      // Must happen BEFORE _bounded_pool->dispatch(...) below (Pitfall 5): once
+      // compute_task runs, _datasource is cached on the task and the preferred
+      // lookup is skipped on subsequent calls.
+      if (auto* parquet_local_state = dynamic_cast<parquet_scan_task_local_state*>(
+            scan_task->local_state())) {
+        parquet_local_state->set_preferred_device_id(target_gpu_id);
+      } else {
+        SIRIUS_LOG_ERROR(
+          "duckdb_scan_executor: parquet_scan_task local_state downcast failed "
+          "(Phase 9 FIX-A plumbing skipped; compute_task will fall back to "
+          "global get_preferred_device_id())");
+      }
+
       if (_cache_level != cache_level::NONE) {
         bool wrap_batch_data     = _cache_level != cache_level::TABLE_GPU;
         bool cache_decoded_table = _cache_level == cache_level::TABLE_HOST;
