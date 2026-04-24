@@ -137,7 +137,6 @@ endif()
 set(EXTENSION_SOURCES
     src/config.cpp
     src/helper/type_conversions.cpp
-    src/cpu_cache.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
@@ -158,8 +157,6 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/fallback.cpp
-    src/gpu_buffer_manager.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -353,7 +350,6 @@ set(TEST_SOURCES
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
-    test/cpp/memory_management/test_cpu_cache.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -392,6 +388,10 @@ set(TEST_SOURCES
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 
+if(SIRIUS_LEGACY_TEST_SOURCES)
+  list(APPEND TEST_SOURCES ${SIRIUS_LEGACY_TEST_SOURCES})
+endif()
+
 add_executable(sirius_unittest ${TEST_SOURCES})
 
 if(VCPKG_BUILD)
@@ -427,3 +427,8 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
+
+if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
+  target_compile_definitions(sirius_unittest
+                             PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
+endif()
