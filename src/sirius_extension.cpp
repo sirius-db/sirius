@@ -23,6 +23,7 @@
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
 #include "data/sirius_converter_registry.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -35,8 +36,11 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
@@ -46,6 +50,8 @@ extern "C" int cudaProfilerStop();
 #include "gpu_physical_plan_generator.hpp"
 #endif
 #include "duckdb/main/connection_manager.hpp"
+#include "io/datasource_factory.hpp"
+#include "io/s3/s3_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "sirius_config.hpp"
@@ -54,12 +60,312 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
 
+#include <chrono>
+#include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <string_view>
+#include <system_error>
 
 namespace duckdb {
 
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
+
+namespace {
+
+constexpr std::string_view NATIVE_READ_PARQUET_FN  = "read_parquet";
+constexpr std::string_view SIRIUS_READ_PARQUET_FN  = "sirius_read_parquet";
+constexpr std::string_view S3_URI_PREFIX           = "s3://";
+
+bool is_identifier_char(char c)
+{
+  auto const ch = static_cast<unsigned char>(c);
+  return std::isalnum(ch) || c == '_';
+}
+
+bool iequals_prefix(std::string_view value, std::string_view prefix)
+{
+  if (value.size() < prefix.size()) { return false; }
+  for (std::size_t i = 0; i < prefix.size(); ++i) {
+    auto const lhs = static_cast<unsigned char>(value[i]);
+    auto const rhs = static_cast<unsigned char>(prefix[i]);
+    if (std::tolower(lhs) != std::tolower(rhs)) { return false; }
+  }
+  return true;
+}
+
+std::size_t skip_whitespace(std::string const& text, std::size_t pos)
+{
+  while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) {
+    ++pos;
+  }
+  return pos;
+}
+
+std::optional<std::pair<std::string, std::size_t>> parse_single_quoted_literal(
+  std::string const& text, std::size_t pos)
+{
+  if (pos >= text.size() || text[pos] != '\'') { return std::nullopt; }
+
+  std::string literal;
+  for (std::size_t i = pos + 1; i < text.size(); ++i) {
+    if (text[i] == '\'') {
+      if (i + 1 < text.size() && text[i + 1] == '\'') {
+        literal.push_back('\'');
+        ++i;
+        continue;
+      }
+      return std::pair{std::move(literal), i + 1};
+    }
+    literal.push_back(text[i]);
+  }
+  return std::nullopt;
+}
+
+bool should_rewrite_read_parquet_call(std::string const& query, std::size_t name_pos)
+{
+  auto pos = skip_whitespace(query, name_pos + NATIVE_READ_PARQUET_FN.size());
+  if (pos >= query.size() || query[pos] != '(') { return false; }
+
+  pos = skip_whitespace(query, pos + 1);
+  auto literal = parse_single_quoted_literal(query, pos);
+  if (!literal.has_value()) { return false; }
+  return iequals_prefix(literal->first, S3_URI_PREFIX);
+}
+
+std::string rewrite_sirius_owned_remote_parquet_calls(std::string const& query)
+{
+  std::string rewritten;
+  rewritten.reserve(query.size() + 32);
+
+  bool in_single_quote  = false;
+  bool in_double_quote  = false;
+  bool in_line_comment  = false;
+  bool in_block_comment = false;
+
+  for (std::size_t i = 0; i < query.size();) {
+    auto const c = query[i];
+
+    if (in_line_comment) {
+      rewritten.push_back(c);
+      if (c == '\n') { in_line_comment = false; }
+      ++i;
+      continue;
+    }
+    if (in_block_comment) {
+      rewritten.push_back(c);
+      if (c == '*' && i + 1 < query.size() && query[i + 1] == '/') {
+        rewritten.push_back('/');
+        i += 2;
+        in_block_comment = false;
+      } else {
+        ++i;
+      }
+      continue;
+    }
+    if (in_single_quote) {
+      rewritten.push_back(c);
+      if (c == '\'') {
+        if (i + 1 < query.size() && query[i + 1] == '\'') {
+          rewritten.push_back('\'');
+          i += 2;
+          continue;
+        }
+        in_single_quote = false;
+      }
+      ++i;
+      continue;
+    }
+    if (in_double_quote) {
+      rewritten.push_back(c);
+      if (c == '"') {
+        if (i + 1 < query.size() && query[i + 1] == '"') {
+          rewritten.push_back('"');
+          i += 2;
+          continue;
+        }
+        in_double_quote = false;
+      }
+      ++i;
+      continue;
+    }
+
+    if (c == '-' && i + 1 < query.size() && query[i + 1] == '-') {
+      rewritten.append("--");
+      i += 2;
+      in_line_comment = true;
+      continue;
+    }
+    if (c == '/' && i + 1 < query.size() && query[i + 1] == '*') {
+      rewritten.append("/*");
+      i += 2;
+      in_block_comment = true;
+      continue;
+    }
+    if (c == '\'') {
+      rewritten.push_back(c);
+      ++i;
+      in_single_quote = true;
+      continue;
+    }
+    if (c == '"') {
+      rewritten.push_back(c);
+      ++i;
+      in_double_quote = true;
+      continue;
+    }
+
+    auto const remaining = std::string_view(query).substr(i);
+    if ((i == 0 || !is_identifier_char(query[i - 1])) &&
+        iequals_prefix(remaining, NATIVE_READ_PARQUET_FN) &&
+        (i + NATIVE_READ_PARQUET_FN.size() >= query.size() ||
+         !is_identifier_char(query[i + NATIVE_READ_PARQUET_FN.size()])) &&
+        should_rewrite_read_parquet_call(query, i)) {
+      rewritten.append(SIRIUS_READ_PARQUET_FN);
+      i += NATIVE_READ_PARQUET_FN.size();
+      continue;
+    }
+
+    rewritten.push_back(c);
+    ++i;
+  }
+
+  return rewritten;
+}
+
+std::filesystem::path materialize_remote_parquet_for_bind(ClientContext& context,
+                                                          std::string const& uri)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "{} requires an initialized SiriusContext", std::string(SIRIUS_READ_PARQUET_FN));
+  }
+
+  auto const& osc = sirius_ctx->get_config().get_object_store_config();
+  if (osc.endpoint.empty()) {
+    throw InvalidInputException(
+      "{} requires s3_endpoint to be set before gpu_execution planning",
+      std::string(SIRIUS_READ_PARQUET_FN));
+  }
+
+  sirius::io::s3::s3_ioctx_config io_cfg;
+  io_cfg.endpoint   = osc.endpoint;
+  io_cfg.region     = osc.region.empty() ? "us-east-1" : osc.region;
+  io_cfg.access_key = osc.access_key;
+  io_cfg.secret_key = osc.secret_key;
+
+  sirius::io::datasource_registry registry;
+  registry.register_ioctx("s3", std::make_shared<sirius::io::s3::s3_ioctx>(std::move(io_cfg)));
+
+  auto datasource = sirius::io::datasource_factory::create(uri, registry, sirius_ctx->get_config());
+  auto const object_size = datasource->size();
+  if (object_size == 0) {
+    throw InvalidInputException("{} cannot bind an empty parquet object: {}",
+                                std::string(SIRIUS_READ_PARQUET_FN),
+                                uri);
+  }
+
+  auto remote_bytes = datasource->host_read(0, object_size);
+  if (!remote_bytes || remote_bytes->size() != object_size) {
+    throw InvalidInputException("{} failed to materialize remote parquet object for bind: {}",
+                                std::string(SIRIUS_READ_PARQUET_FN),
+                                uri);
+  }
+
+  auto const unique_id =
+    static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count());
+  auto tmp_path = std::filesystem::temp_directory_path() /
+                  ("sirius_remote_bind_" + std::to_string(unique_id) + ".parquet");
+
+  std::ofstream out(tmp_path, std::ios::binary);
+  if (!out.good()) {
+    throw InvalidInputException("{} failed to create temp parquet file {}",
+                                std::string(SIRIUS_READ_PARQUET_FN),
+                                tmp_path.string());
+  }
+  out.write(reinterpret_cast<char const*>(remote_bytes->data()),
+            static_cast<std::streamsize>(object_size));
+  out.close();
+  if (!out.good()) {
+    throw InvalidInputException("{} failed to write temp parquet file {}",
+                                std::string(SIRIUS_READ_PARQUET_FN),
+                                tmp_path.string());
+  }
+  return tmp_path;
+}
+
+unique_ptr<FunctionData> bind_local_parquet_schema(ClientContext& context,
+                                                   std::filesystem::path const& parquet_path,
+                                                   vector<LogicalType>& return_types,
+                                                   vector<string>& names)
+{
+  auto& table_function_entry = Catalog::GetEntry<TableFunctionCatalogEntry>(
+    context, INVALID_CATALOG, DEFAULT_SCHEMA, "parquet_scan");
+
+  vector<LogicalType> arg_types;
+  arg_types.emplace_back(LogicalTypeId::VARCHAR);
+  auto parquet_scan = table_function_entry.functions.GetFunctionByArguments(context, arg_types);
+
+  vector<Value> inputs;
+  inputs.emplace_back(parquet_path.string());
+
+  named_parameter_map_t named_parameters;
+  vector<LogicalType> input_table_types;
+  vector<string> input_table_names;
+
+  TableFunctionRef ref;
+  vector<unique_ptr<ParsedExpression>> children;
+  children.push_back(make_uniq<ConstantExpression>(Value(parquet_path.string())));
+  ref.function = make_uniq<FunctionExpression>(
+    "parquet_scan", std::move(children), nullptr, nullptr, false, false, false);
+
+  TableFunctionBindInput bind_input(inputs,
+                                    named_parameters,
+                                    input_table_types,
+                                    input_table_names,
+                                    nullptr,
+                                    nullptr,
+                                    parquet_scan,
+                                    ref);
+  return parquet_scan.bind(context, bind_input, return_types, names);
+}
+
+unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
+                                               TableFunctionBindInput& input,
+                                               vector<LogicalType>& return_types,
+                                               vector<string>& names)
+{
+  if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
+    throw InvalidInputException("{} expects a single non-null parquet URI",
+                                std::string(SIRIUS_READ_PARQUET_FN));
+  }
+
+  auto const uri = input.inputs[0].GetValue<std::string>();
+  if (!iequals_prefix(uri, S3_URI_PREFIX)) {
+    throw InvalidInputException("{} currently only supports s3:// URIs inside gpu_execution",
+                                std::string(SIRIUS_READ_PARQUET_FN));
+  }
+
+  auto const tmp_path = materialize_remote_parquet_for_bind(context, uri);
+  return bind_local_parquet_schema(context, tmp_path, return_types, names);
+}
+
+void SiriusReadParquetFunction(ClientContext&,
+                               TableFunctionInput&,
+                               DataChunk&)
+{
+  throw InvalidInputException(
+    "{} is an internal Sirius table function and must execute through gpu_execution",
+    std::string(SIRIUS_READ_PARQUET_FN));
+}
+
+}  // namespace
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
@@ -68,6 +374,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
   unique_ptr<Connection> conn;
   unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
+  string planned_query;
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
@@ -121,7 +428,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
     unique_ptr<LogicalOperator> plan;
     try {
       Parser parser(context.GetParserOptions());
-      parser.ParseQuery(query);
+      parser.ParseQuery(planned_query.empty() ? query : planned_query);
 
       Planner planner(context);
       planner.CreatePlan(std::move(parser.statements[0]));
@@ -392,6 +699,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   auto result              = make_uniq<SiriusTableFunctionData>();
   result->conn             = make_uniq<Connection>(*context.db);
   result->query            = input.inputs[0].ToString();
+  result->planned_query    = rewrite_sirius_owned_remote_parquet_calls(result->query);
   result->enable_optimizer = true;
   result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
   if (input.inputs[0].IsNull()) {
@@ -400,7 +708,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
 
   // Parse the query just to get the result type information and to create preparedstatmement data
   Parser parser(context.GetParserOptions());
-  parser.ParseQuery(result->query);
+  parser.ParseQuery(result->planned_query);
   Planner planner(context);
   auto statement_type = parser.statements[0]->type;
   planner.CreatePlan(std::move(parser.statements[0]));
@@ -685,6 +993,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  TableFunction sirius_read_parquet("sirius_read_parquet",
+                                    {LogicalType::VARCHAR},
+                                    SiriusReadParquetFunction,
+                                    SiriusReadParquetBind);
+  CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
+  catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

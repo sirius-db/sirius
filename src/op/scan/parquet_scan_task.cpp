@@ -60,6 +60,36 @@
 
 namespace sirius::op::scan {
 
+namespace {
+
+constexpr std::string_view SIRIUS_READ_PARQUET_FN = "sirius_read_parquet";
+
+std::vector<std::string> extract_input_file_paths(sirius_physical_parquet_scan const* scan_op)
+{
+  if (scan_op->function.name == SIRIUS_READ_PARQUET_FN) {
+    if (scan_op->parameters.empty()) {
+      throw std::runtime_error(
+        "[parquet_scan_task_global_state] sirius_read_parquet scan is missing input parameters");
+    }
+    return {scan_op->parameters.front().GetValue<std::string>()};
+  }
+
+  auto& bind_data = scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
+  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+    throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
+  }
+
+  auto files = bind_data.file_list->GetAllFiles();
+  std::vector<std::string> file_paths;
+  file_paths.reserve(files.size());
+  std::for_each(files.begin(), files.end(), [&file_paths](auto const& file) {
+    file_paths.push_back(file.path);
+  });
+  return file_paths;
+}
+
+}  // namespace
+
 #if CUDF_VERSION_NUM < 2604
 namespace {
 // Fallback for cudf < 26.04 which lacks cudf::io::parquet::fetch_footer_to_host.
@@ -200,17 +230,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       "[parquet_scan_task_global_state] Dynamic table filters are not supported in sirius "
       "parquet scans.");
   }
-
-  // Expect parquet_scan to be bound through the multi-file reader
-  auto& bind_data = scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
-  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
-    throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
-  }
-
-  auto files = bind_data.file_list->GetAllFiles();
-  _file_paths.reserve(files.size());
-  std::for_each(
-    files.begin(), files.end(), [this](auto const& file) { _file_paths.push_back(file.path); });
+  _file_paths = extract_input_file_paths(scan_op);
 
   initialize_from_files();
 }
