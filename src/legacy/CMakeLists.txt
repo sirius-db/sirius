@@ -63,7 +63,6 @@ set(SIRIUS_LEGACY_CUDA_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_materialize.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_select.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_string.cu
-    ${CMAKE_CURRENT_LIST_DIR}/cuda/iceberg/equality_delete_mask.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_aggregate.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_duplicate_elimination.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_groupby.cu

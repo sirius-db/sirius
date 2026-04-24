@@ -249,10 +249,9 @@ set(EXTENSION_SOURCES
     src/util/segfault_backtrace_handler.cpp)
 # cmake-format: on
 
-# Legacy Sirius — all config lives in src/legacy/CMakeLists.txt. Deleting
-# src/legacy/ cleanly removes legacy build support (including all CUDA kernels,
-# which are only used by the legacy execution path).
-set(CUDA_SOURCES "")
+# Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
+# Deleting src/legacy/ cleanly removes legacy build support.
+set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
