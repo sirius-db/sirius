@@ -311,7 +311,12 @@ void infer_local_parquet_schema(ClientContext& context,
                                 vector<LogicalType>& return_types,
                                 vector<string>& names)
 {
-  Connection bind_conn(*context.db);
+  (void)context;
+  // Use an isolated temporary DuckDB instance for schema inference instead of
+  // re-entering the current DatabaseInstance during bind. Reusing context.db
+  // from inside gpu_execution bind can deadlock or corrupt query teardown.
+  auto bind_db = make_uniq<DuckDB>(nullptr);
+  Connection bind_conn(*bind_db);
   auto result = bind_conn.Query("SELECT * FROM read_parquet('" +
                                 escape_sql_string_literal(parquet_path.string()) +
                                 "') LIMIT 0");
