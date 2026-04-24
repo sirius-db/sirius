@@ -70,9 +70,9 @@ const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
 namespace {
-constexpr size_t EXCHANGE_GPU_CACHE_SIZE = 512ULL * 1024ULL * 1024ULL;
-constexpr size_t EXCHANGE_GPU_PROCESSING_SIZE = 512ULL * 1024ULL * 1024ULL;
-constexpr size_t EXCHANGE_CPU_PROCESSING_SIZE = 512ULL * 1024ULL * 1024ULL;
+constexpr size_t EXCHANGE_GPU_CACHE_SIZE = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr size_t EXCHANGE_GPU_PROCESSING_SIZE = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr size_t EXCHANGE_CPU_PROCESSING_SIZE = 32ULL * 1024ULL * 1024ULL * 1024ULL;
 
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
