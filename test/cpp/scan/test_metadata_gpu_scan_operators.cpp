@@ -41,6 +41,7 @@
 #include <duckdb/planner/table_filter.hpp>
 
 // standard library
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -1094,10 +1095,9 @@ TEST_CASE("two-pipeline scan - DECIMAL filter falls back to DuckDB expression ex
 //
 // Two-pipeline scan tests for parquet files containing STRUCT and LIST
 // columns.  cuDF reassembles nested columns into a single top-level
-// cudf::column when the parent name is passed via set_columns, so the
-// metadata-scan operator need only (a) push every leaf chunk into
-// selected_chunk_indices for byte accounting and (b) accept that a single
-// DuckDB column may resolve to multiple parquet leaves.
+// cudf::column when the parent name is passed via parquet_reader_options::set_column_names, so the
+// metadata-scan operator need only (a) push every leaf chunk into selected_chunk_indices for byte
+// accounting and (b) accept that a single DuckDB column may resolve to multiple parquet leaves.
 //
 // Out of scope (not tested here):
 //   - Filter on a sub-field (e.g. WHERE s.a > 10): requires a
@@ -1153,15 +1153,35 @@ TEST_CASE("two-pipeline scan - project STRUCT column",
                                        *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
+  std::vector<int32_t> all_a;
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
     auto view = sirius::get_cudf_table_view(*batch);
     REQUIRE(view.num_columns() == 1);
-    REQUIRE(view.column(0).type().id() == cudf::type_id::STRUCT);
-    REQUIRE(view.column(0).num_children() == 2);
+    auto const struct_col = view.column(0);
+    REQUIRE(struct_col.type().id() == cudf::type_id::STRUCT);
+    REQUIRE(struct_col.num_children() == 2);
+    REQUIRE(struct_col.child(0).type().id() == cudf::type_id::INT32);
+    REQUIRE(struct_col.child(1).type().id() == cudf::type_id::STRING);
+
+    // Child values must be paired: s.b == "row_" || cast(s.a AS VARCHAR).
+    auto a = copy_int32_column(struct_col.child(0));
+    auto b = copy_string_column(struct_col.child(1));
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      REQUIRE(b[i] == "row_" + std::to_string(a[i]));
+    }
+    all_a.insert(all_a.end(), a.begin(), a.end());
     total_rows += view.num_rows();
   }
   REQUIRE(total_rows == NUM_ROWS);
+
+  // Every expected id must appear exactly once across batches.
+  std::sort(all_a.begin(), all_a.end());
+  REQUIRE(all_a.size() == NUM_ROWS);
+  for (std::size_t i = 0; i < NUM_ROWS; ++i) {
+    REQUIRE(all_a[i] == static_cast<int32_t>(i));
+  }
 }
 
 TEST_CASE("two-pipeline scan - project LIST column", "[two_pipeline_scan][nested][shared_context]")
