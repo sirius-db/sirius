@@ -55,7 +55,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 6. Multi-GPU Gap Closure | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 7. P2P Direct Transfer + Adaptive Scan | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 8. Multi-GPU SQL Pipeline Fix | v1.2 | 6/6 | Complete (ship-blocked) | 2026-04-22 |
-| 9. Scan-Task Distributor + Batch-Ownership Affinity | v1.2 | 2/4 | In Progress|  |
+| 9. Scan-Task Distributor + Batch-Ownership Affinity | v1.2 | 3/4 | In Progress|  |
 
 ### Phase 9: Scan-Task Distributor + Batch-Ownership Affinity
 **Goal**: Fix the scan-task distributor so a batch with `batch_device_id=N` is only ever dispatched to tasks with `target_device_id=N`. Fix `preferred_device_id=-1` plumbing at `parquet_scan_task::compute_task` entry. Close v1.2's original ship-gate (Criteria 1/2/4/6) that Phase 8 deferred.
@@ -66,5 +66,5 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 **Plans**: 4 plans
   - [x] 09-01-PLAN.md — preferred_device_id plumbing (Bug 2): plumb target_gpu_id into parquet_scan_task_local_state + two-tier lookup in compute_task (mirrors gpu_pipeline_task.hpp:188-194)
   - [x] 09-02-PLAN.md — batch-ownership affinity map (Bug 1): _batch_gpu_affinity std::unordered_map<uint64_t,int> + mutex in duckdb_scan_executor, recorded atomically with [mgpu-audit] log + reset on query start + [mgpu-probe] breadcrumbs on prepare_for_processing nullopt paths
-  - [ ] 09-03-PLAN.md — AUDIT disjointness REQUIRE: std::set_intersection(counts[0].scan_ids, counts[1].scan_ids) == ∅ added to existing AUDIT TEST_CASE
+  - [x] 09-03-PLAN.md — AUDIT disjointness REQUIRE: std::set_intersection(counts[0].scan_ids, counts[1].scan_ids) == ∅ added to existing AUDIT TEST_CASE
   - [ ] 09-04-PLAN.md — Ship-gate validation on 2-GPU hardware (autonomous: false, user-delegated): SF1 22 queries + SF10 Q1/Q6/Q12 + SF100 Q1 — evidence captured to 09-04-VALIDATION.md

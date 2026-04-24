@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: executing
-stopped_at: Completed 09-02-PLAN.md (batch-GPU affinity map + query-start reset + [mgpu-probe] breadcrumbs; build exit 0; HYG-02 preserved; 315/316 unit tests pass)
-last_updated: "2026-04-24T10:21:29.835Z"
+stopped_at: Completed 09-03-PLAN.md (cross-GPU batch_id disjointness REQUIRE; build exit 0; 331/332 tests pass, 1 pre-existing failure)
+last_updated: "2026-04-24T10:25:56.080Z"
 last_activity: 2026-04-24
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 14
-  completed_plans: 10
+  completed_plans: 11
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 09 (scan-task-distributor-batch-ownership-affinity) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-04-24
 
@@ -46,6 +46,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 08 P07 | 10min | 2 tasks | 2 files |
 | Phase 09 P01 | 25min | 3 tasks | 3 files |
 | Phase 09 P02 | 4min | 3 tasks | 3 files |
+| Phase 09 P03 | 5min | 1 tasks | 1 files |
 
 ## Decisions
 
@@ -74,6 +75,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 09]: Two-tier local-wins-over-global preferred_device_id lookup in compute_task mirrors gpu_pipeline_task::get_preferred_device_id (gpu_pipeline_task.hpp:188-194)
 - [Phase 09]: Affinity reset placed unconditionally at top of prepare_cache_for_scan_operators (before cache_level::NONE early return) so _scan_round_robin and _batch_gpu_affinity reset together on every query start regardless of caching mode (Pitfall 3 compliance)
 - [Phase 09]: [Phase 09-02] Affinity map (_batch_gpu_affinity) is written at dispatch time but not yet consulted at dispatch time — provides data structure for Plan 09-03 disjointness assertion; dispatch-time re-routing deferred to Phase 10+ if 09-04 validation shows residual cross-GPU collisions
+- [Phase 09]: [09-03] std::set_intersection on counts[0/1].scan_ids provides the permanent regression gate for Bug 1 (hypothesis E double-dispatch); REQUIRE fires on 2-GPU hosts, silently skipped on 1-GPU hosts via existing device_count < 2 WARN+return guard
 
 ## Accumulated Context
 
@@ -112,6 +114,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-24T10:21:29.833Z
-Stopped at: Completed 09-02-PLAN.md (batch-GPU affinity map + query-start reset + [mgpu-probe] breadcrumbs; build exit 0; HYG-02 preserved; 315/316 unit tests pass)
+Last session: 2026-04-24T10:25:56.077Z
+Stopped at: Completed 09-03-PLAN.md (cross-GPU batch_id disjointness REQUIRE; build exit 0; 331/332 tests pass, 1 pre-existing failure)
 Resume file: None
