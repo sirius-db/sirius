@@ -250,41 +250,16 @@ set(EXTENSION_SOURCES
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
+# cmake-format: on
 
-# Legacy Sirius — all config lives in src/legacy/CMakeLists.txt.
-# Deleting src/legacy/ cleanly removes legacy build support.
+# Legacy Sirius — all config lives in src/legacy/CMakeLists.txt. Deleting
+# src/legacy/ cleanly removes legacy build support (including all CUDA kernels,
+# which are only used by the legacy execution path).
+set(CUDA_SOURCES "")
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
        ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
-endif()
-
-set(CUDA_SOURCES
-    src/cuda/allocator.cu
-    src/cuda/communication.cu
-    src/cuda/iceberg/equality_delete_mask.cu
-    src/cuda/cudf/cudf_aggregate.cu
-    src/cuda/cudf/cudf_duplicate_elimination.cu
-    src/cuda/cudf/cudf_groupby.cu
-    src/cuda/cudf/cudf_join.cu
-    src/cuda/cudf/cudf_orderby.cu
-    src/cuda/cudf/cudf_utils.cu
-    src/cuda/operator/arbitrary_expression.cu
-    src/cuda/operator/comparison_expression.cu
-    src/cuda/operator/hash_join_inner.cu
-    src/cuda/operator/hash_join_right.cu
-    src/cuda/operator/hash_join_single.cu
-    src/cuda/operator/materialize.cu
-    src/cuda/operator/nested_loop_join.cu
-    src/cuda/operator/strings_matching.cu
-    src/cuda/operator/substring.cu
-    src/cuda/operator/strlen_from_offsets.cu
-    src/cuda/operator/empty_str_check.cu
-    src/cuda/print.cu
-    src/cuda/utils.cu)
-# cmake-format: on
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
 endif()
 
