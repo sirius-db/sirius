@@ -158,8 +158,6 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/fallback.cpp
-    src/gpu_buffer_manager.cpp
     src/io/admission_control.cpp
     src/io/prefetching_cache.cpp
     src/io/sirius_datasource.cpp
