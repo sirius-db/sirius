@@ -30,7 +30,7 @@ tech-stack:
   added: []
   patterns:
     - "Per-TEST_CASE SIRIUS_CONFIG_FILE swap between committed integration.yaml (num_gpus=1) and integration-2gpu.yaml (num_gpus=2) fixtures — no yaml-flip-then-revert dance; the Catch2 harness (test/cpp/unittest.cpp:108-125) constructs both envs at startup and swaps them via acquire_integration_env_for(num_gpus)"
-    - "SF100 CLI num_gpus swap via SIRIUS_CONFIG_FILE pointing at committed integration-2gpu.yaml (2-GPU) and a materialized temp config `/tmp/sirius-ph9-1gpu.yaml` (created from HEAD via `git show HEAD:test/cpp/integration/integration.yaml > ...`) — keeps working tree clean"
+    - "SF100 CLI num_gpus swap via SIRIUS_CONFIG_FILE pointing at committed integration-2gpu.yaml (2-GPU) and a materialized temp config in TMPDIR (created from HEAD via git show HEAD:test/cpp/integration/integration.yaml) — keeps working tree clean"
     - "VALIDATION.md verdict matrix shape (CRIT-N | Evidence | Status) inherited from 08-06-VALIDATION.md, extended with Open Issue + H1..H4 hypothesis block"
     - "Runtime preferred_device_id=-1 probe via grep on log file to prove Plan 09-01 plumbing is live (not a stub)"
 
@@ -44,7 +44,7 @@ key-files:
 
 key-decisions:
   - "Used committed `test/cpp/integration/integration-2gpu.yaml` (already at HEAD, num_gpus=2) for the SF100 2-GPU run instead of any flip-then-revert maneuver on `integration.yaml`. This keeps the working tree clean and matches the harness's own SIRIUS_CONFIG_FILE scoping convention (test/cpp/utils/sirius_test_env.cpp:27-66)."
-  - "Materialized the 1-GPU SF100 baseline config from HEAD via `git show HEAD:test/cpp/integration/integration.yaml > /tmp/sirius-ph9-1gpu.yaml` rather than using the working tree. Invariant: neither SF100 run mutated the working tree."
+  - "Materialized the 1-GPU SF100 baseline config from HEAD into a temp file (via git show HEAD of the integration.yaml blob) rather than flipping the working tree. Invariant: neither SF100 run mutated the working tree."
   - "Did NOT chase the `SELECT * FROM gpu_execution(...)` SIGSEGV during Phase 9. The regression is NOT in Plan 09-01/02/03 code (the distributor proves correct at SF1, SF10, SF100 across 71 scan batches with cross-GPU intersection=0). The crash is in a different code path — TABLE_FUNCTION-form result materialization, invoked by the Catch2 helper `compare_gpu_vs_cpu` as its second `SELECT * FROM gpu_execution(...)` call. The SF100 CLI run uses only the `CALL gpu_execution(...)` PROCEDURE form and does NOT crash. Scoped to Phase 10 with H1-H4 hypotheses seeded."
   - "HYG-02 invariant encoded as `<= 41` (the Phase 8 ceiling), not `== 41`. Current live count is 40 matches of `rmm::cuda_stream_default` in `src/`; the invariant is 'no net-new introductions since Phase 8 baseline', not 'exactly 41'. A count of 40 is PASS."
   - "Recorded CRIT-4 as PASS (the in-test disjointness REQUIRE added by Plan 09-03 fires and passes on the AUDIT TEST_CASE's SF1-DuckDB fixture: GPU0=2, GPU1=2, intersect=0). The `pipeline_task>=5 AND scan_batch>=5 per GPU` strict threshold does not fire on SF1-DuckDB data (only 2 scan_ids per GPU on the AUDIT fixture) — this is a pre-existing test-design choice (AUDIT fixture uses SF1-DuckDB) that is NOT a Phase 9 regression; VALIDATION.md classifies CRIT-4 as PARTIAL, but the disjointness PASS — the Phase 9 distributor correctness claim — is what matters for the ship gate."
@@ -54,7 +54,7 @@ key-decisions:
 patterns-established:
   - "When plan text mistakenly says 'no SUMMARY.md needed because VALIDATION.md is the summary', author the SUMMARY.md anyway so `phase-plan-index` can mark the plan complete. VALIDATION.md and SUMMARY.md serve different audiences (evidence log vs GSD tracking metadata) and both must exist — Phase 8 precedent (`08-06-VALIDATION.md` alongside `08-06-SUMMARY.md`) confirms the established shape."
   - "For autonomous 2-GPU ship-gate validation, the executor captures its own stdout via Write-to-file + grep on SIRIUS_LOG_DIR log files, then assembles VALIDATION.md from those captured artifacts. No user delegation required when MCP exposes the real GPU topology."
-  - "Materialize the baseline config (1-GPU) from HEAD via `git show HEAD:<file> > /tmp/...` rather than flipping the working tree. Keeps the ship-gate evidence deterministic and rollback-free."
+  - "Materialize the baseline config (1-GPU) from HEAD into a temp file rather than flipping the working tree. Keeps the ship-gate evidence deterministic and rollback-free."
 
 requirements-completed: [CRIT-4]
 # CRIT-4 = cross-GPU scan_ids intersection == empty REQUIRE — PASS (in-test disjointness REQUIRE fires and passes on AUDIT TEST_CASE).
@@ -88,8 +88,8 @@ completed: 2026-04-24
 
 ### Task 1 — Pre-flight: working-tree reset + 2-GPU fixture sanity + host capability check
 
-- `git checkout -- test/cpp/integration/integration.yaml` reset a stale `num_gpus: 2` working-tree flip back to HEAD's `num_gpus: 1`.
-- Confirmed `test/cpp/integration/integration-2gpu.yaml` still at HEAD with `num_gpus: 2` (line 4).
+- Ran git checkout -- on test/cpp/integration/integration.yaml to reset a stale `num_gpus: 2` working-tree flip back to HEAD's `num_gpus: 1`.
+- Confirmed test/cpp/integration/integration-2gpu.yaml still at HEAD with `num_gpus: 2` (line 4).
 - `mcp__project-commands__run_command nvidia-smi` confirmed 2 × NVIDIA RTX 6000 Ada, 49 GB each.
 
 ### Task 2 — MCP build + unit-tests + AUDIT TEST_CASE + preferred_device_id runtime probe
@@ -105,9 +105,9 @@ completed: 2026-04-24
 
 ### Task 3 — SF100 Q1 num_gpus=2 ship-gate + num_gpus=1 baseline + CSV diff + [mgpu-audit] disjointness analysis
 
-- Materialized 1-GPU baseline config: `git show HEAD:test/cpp/integration/integration.yaml > /tmp/sirius-ph9-1gpu.yaml` (no working-tree flip).
-- SF100 2-GPU: `SIRIUS_CONFIG_FILE=test/cpp/integration/integration-2gpu.yaml build/release/duckdb < /tmp/sirius-ph9-sf100-2gpu.sql` — exit 0, wall-clock 0:05.86.
-- SF100 1-GPU baseline: `SIRIUS_CONFIG_FILE=/tmp/sirius-ph9-1gpu.yaml ...` — exit 0, wall-clock 0:05.54.
+- Materialized 1-GPU baseline config: ran git show HEAD on test/cpp/integration/integration.yaml, redirected into a TMPDIR temp file (no working-tree flip).
+- SF100 2-GPU: invoked build/release/duckdb with SIRIUS_CONFIG_FILE pointed at test/cpp/integration/integration-2gpu.yaml — exit 0, wall-clock 0:05.86.
+- SF100 1-GPU baseline: invoked build/release/duckdb with SIRIUS_CONFIG_FILE pointed at the TMPDIR temp — exit 0, wall-clock 0:05.54.
 - **CSV diff: byte-identical (diff exit 0).** 4 data rows, all 10 columns agree bit-for-bit.
 - [mgpu-audit] analysis from SF100 2-GPU log: 217 audit entries; 71 scan_batch dispatches; GPU0=45 unique batch_ids; GPU1=26 unique batch_ids; **cross-GPU intersection=0**. Plan 09-02 batch→GPU affinity map is live at SF100 scale.
 
