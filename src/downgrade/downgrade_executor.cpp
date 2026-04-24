@@ -164,13 +164,9 @@ void downgrade_executor::processing_loop()
     }
 
     // === TIER 1: Data repositories ===
-    // Collect all repositories first so we can iterate (and later sort by priority).
-    // We use get_all_convertible() to snapshot eligible batches once per repo,
-    // avoiding re-scanning the same batch before its state changes from idle.
     bool pool_interrupted = false;
-    auto repos            = _data_repo_mgr.get_repositories();
-    for (auto* repo : repos) {
-      if (req->satisfied.load()) break;
+    _data_repo_mgr.for_each_repository([&](cucascade::shared_data_repository* repo) {
+      if (req->satisfied.load() || pool_interrupted) { return; }
 
       convertible_data_batch_provider provider(repo);
       auto candidates = provider.get_all_convertible(source_space, /*front_to_back=*/false);
@@ -228,8 +224,7 @@ void downgrade_executor::processing_loop()
             }
           });
       }
-      if (pool_interrupted) break;
-    }
+    });
 
     // === TIER 2: task_scheduler task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {

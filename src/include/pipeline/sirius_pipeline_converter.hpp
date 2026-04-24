@@ -54,13 +54,13 @@ struct pipeline_conversion_result {
 //! Construct a Sirius-specific operator (scan, merge) from a generic physical operator.
 //! This is a pure factory function with no engine/context dependency.
 duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
-  op::sirius_physical_operator* op,
+  op::sirius_physical_operator* physical_op,
   const std::unordered_map<std::string, op::scan::IcebergDeleteFiles>* iceberg_cache = nullptr);
 
 class sirius_pipeline_converter {
  public:
   sirius_pipeline_converter(
-    pipeline_build_context& ctx,
+    const pipeline_build_context& ctx,
     const sirius::operator_params& op_params,
     const std::unordered_map<std::string, op::scan::IcebergDeleteFiles>* iceberg_cache = nullptr);
 
@@ -105,7 +105,7 @@ class sirius_pipeline_converter {
   // Phase 5: Debug logging
   void log_pipeline_debug_info() const;
 
-  pipeline_build_context& build_ctx_;
+  const pipeline_build_context& build_ctx_;
   const sirius::operator_params& op_params_;
   const std::unordered_map<std::string, op::scan::IcebergDeleteFiles>* iceberg_cache_;
 

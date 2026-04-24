@@ -53,7 +53,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //!         * And all pipelines that were added to the sirius_meta_pipeline after 'current'
  public:
   //! Create a sirius_meta_pipeline with the given sink
-  sirius_meta_pipeline(pipeline_build_context& ctx,
+  sirius_meta_pipeline(const pipeline_build_context& ctx,
                        sirius_pipeline_build_state& state,
                        sirius::optional_ptr<op::sirius_physical_operator> sink);
 
@@ -126,7 +126,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
 
  private:
   //! Plan-time build context for all MetaPipelines in the query plan
-  pipeline_build_context& build_ctx;
+  const pipeline_build_context& build_ctx;
   //! The pipeline_build_state for all MetaPipelines in the query plan
   sirius_pipeline_build_state& state;
   //! Parent pipeline (optional)
