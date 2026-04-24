@@ -23,6 +23,7 @@
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
+#include <sirius/exception.hpp>
 
 // cudf
 #include <cudf/io/datasource.hpp>
@@ -53,95 +54,45 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN, std::move(types), estimated_cardinality),
     _file_paths(file_paths),
-    _is_projected(!projection_ids.empty()),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
     _gpu_scan(gpu_scan)
 {
-  _selected_column_indices = detail::make_selected_column_indices(column_ids, projection_ids);
-
-  // Detect hive partition columns — these exist in the DuckDB schema but not in parquet files.
-  // Their values come from directory paths (e.g., partition_col=42/).
-  // We need to drop hive partition columns from the selected column indices, since these are are
-  // injected post-read from the directory path, not read from the parquet file itself.
-  for (auto const& hp_index : partition_indices) {
-    _hive_partition_index_set.insert(hp_index.index);
-    _hive_partition_columns.push_back(hive_partition_column{hp_index.value, hp_index.index});
-  }
-  if (!_hive_partition_index_set.empty()) {
-    _selected_column_indices.erase(
-      std::remove_if(_selected_column_indices.begin(),
-                     _selected_column_indices.end(),
-                     [this](std::size_t idx) { return _hive_partition_index_set.count(idx) > 0; }),
-      _selected_column_indices.end());
-
-    // Build and install the post-read partition injection closure on the paired GPU scan
-    // operator. The closure interleaves partition-column values parsed from the file path into
-    // the cudf table in the order DuckDB expects.
-    _gpu_scan->set_hive_partition_inject_fn(build_partition_inject_fn(column_ids,
-                                                                      names,
-                                                                      returned_types,
-                                                                      _selected_column_indices,
-                                                                      _hive_partition_columns,
-                                                                      _hive_partition_index_set));
+  // Projection and filter pushdown both rely on column names to drive the reader;
+  // refuse early if we'd be forced into name-based paths without them.
+  if ((!projection_ids.empty() || (table_filter_set && !table_filter_set->filters.empty())) &&
+      names.empty()) {
+    throw sirius::internal_exception(
+      "[sirius_parquet_metadata_scan_operator] Projection or filter pushdown requires column "
+      "names to be provided.");
   }
 
-  // Convert the table filter set into a DuckDB expression. AST translation is deferred to
-  // execute() so that a task-local CUDA stream can be used.
-  _has_filter = false;
+  // One canonical plan: data columns (D-order), hive partitions, output layout, C→D map.
+  // Everything downstream (reader projection, filter expression, post-read injection, row-group
+  // byte accounting) reads from this single structure.
+  _plan = build_scan_plan(
+    column_ids, projection_ids, names, returned_types, this->types.size(), partition_indices);
+
+  // Install the post-read assembly closure. The closure handles both hive-partition injection
+  // and pure-filter-column pruning by consuming scan_plan::output_layout; it returns a nullptr
+  // closure when the plan is an identity (no partitions and no pure-filter columns), in which
+  // case the GPU scan operator skips the assembly step altogether.
+  if (auto inject_fn = _plan.build_inject_fn()) {
+    _gpu_scan->set_hive_partition_inject_fn(std::move(inject_fn));
+  }
+
+  // Build the DuckDB filter expression. AST translation is deferred to execute() so that a
+  // task-local CUDA stream can be used. Filters on hive-partition columns are dropped because
+  // those columns aren't in the parquet file (DuckDB prunes them at the file-list level).
   if (table_filter_set && !table_filter_set->filters.empty()) {
-    auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
-    // Drop filters on hive-partition columns — they aren't in the parquet file, so pushing
-    // them into the reader crashes libcudf. DuckDB already prunes partitions at the file-list
-    // level when hive_partitioning is enabled.
-    auto duckdb_expression = convert_table_filters_to_expression(
-      *table_filter_set, column_ids, returned_types, batch_column_map, _hive_partition_index_set);
-    if (duckdb_expression) {
-      _has_filter               = true;
-      _duckdb_filter_expression = std::move(duckdb_expression);
-      // Pre-compute the ref_index -> column_name mapping for AST translation in execute().
-      // If names are empty, AST translation will be skipped and the DuckDB filter used instead.
-      if (!names.empty()) {
-        _column_name_by_ref.resize(column_ids.size());
-        for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
-          _column_name_by_ref[i] = names[column_ids[i].GetPrimaryIndex()];
-        }
-      }
-    }
-  }
-
-  // Projections require column names to map indices to parquet column names.
-  if (_is_projected && names.empty()) {
-    throw std::runtime_error(
-      "[sirius_parquet_metadata_scan_operator] Projection requires column names to be provided.");
-  }
-
-  // Construct a) the post_filter_projection_ids list of projection ids corresponding to columns
-  //              that remain after pruning pure filter columns, and
-  //           b) the set of column indices corresponding to pure filter columns that will be pruned
-  //              after filtering.
-  if (_is_projected) {
-    for (auto idx : _selected_column_indices) {
-      _projected_column_names.push_back(names[idx]);
-    }
-    if (_has_filter) {
-      std::vector<std::size_t> candidate_post_filter_ids;
-      for (std::size_t i = 0; i < projection_ids.size(); i++) {
-        auto const projection_id = projection_ids[i];
-        if (i < this->types.size()) {
-          candidate_post_filter_ids.push_back(projection_id);
-        } else {
-          // This is a pure filter column that is not among the expected output columns.
-          auto const column_index = column_ids[projection_id].GetPrimaryIndex();
-          _pure_filter_column_indices.insert(column_index);
-        }
-      }
-      // Only set post_filter_projection_ids when there are pure filter columns to prune.
-      if (!_pure_filter_column_indices.empty()) {
-        _post_filter_projection_ids = std::move(candidate_post_filter_ids);
-      }
-    }
+    auto batch_column_map  = _plan.make_batch_column_map();
+    auto duckdb_expression = convert_table_filters_to_expression(*table_filter_set,
+                                                                 column_ids,
+                                                                 returned_types,
+                                                                 batch_column_map,
+                                                                 _plan.partition_primary_indices);
+    if (duckdb_expression) { _duckdb_filter_expression = std::move(duckdb_expression); }
   }
 }
 
@@ -191,46 +142,46 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   result->file_paths = input.file_paths;
 
   //===----------Build reader options----------===//
-  result->reader_options = std::make_shared<cudf::io::parquet_reader_options>(
+  auto const data_column_names = _plan.data_column_names();
+  result->reader_options       = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
 
-  // Projections
-  if (_is_projected) { result->reader_options->set_column_names(_projected_column_names); }
+  // Tell the parquet reader which columns to produce. Required whenever the scan
+  // is projected / has hive partitions to remove.
+  if (_plan.is_projected()) { result->reader_options->set_column_names(data_column_names); }
 
-  // Filter
+  // Translate the filter to a cudf AST for reader-side pushdown, falling back to a post-read
+  // DuckDB-expression evaluation when translation isn't possible. Partition-column filters
+  // have already been dropped at construction; anything remaining references data columns.
   std::shared_ptr<translated_expression> ast_filter;
-  if (_has_filter) {
-    /// KEVIN: there is a bug hiding here that I haven't been able to find yet...
-    // if (!_column_name_by_ref.empty()) {
-    //   gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    //   auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-    //     return _column_name_by_ref.at(ref_index);
-    //   };
-    //   auto optional_filter =
-    //     translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-    //   if (optional_filter) {
-    //     ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
-    //     result->reader_options->set_filter(ast_filter->back());
-    //     result->filter_expression = ast_filter;
-    //     SIRIUS_LOG_DEBUG(
-    //       "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for
-    //       " "pushdown.");
-    //   } else {
-    //     result->filter_expression = _duckdb_filter_expression;
-    //     SIRIUS_LOG_DEBUG(
-    //       "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
-    //       "pushdown. Filter will be applied in the GPU scan operator.");
-    //   }
-    // } else {
-    //   // Column names were not provided; AST translation requires column name references.
-    //   result->filter_expression = _duckdb_filter_expression;
-    //   SIRIUS_LOG_DEBUG(
-    //     "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
-    //     "translation. Filter will be applied in the GPU scan operator.");
-    // }
-    result->filter_expression          = _duckdb_filter_expression;
-    result->post_filter_projection_ids = _post_filter_projection_ids;
+  if (_duckdb_filter_expression) {
+    // Resolver maps the BoundReferenceExpression's batch position (D) to the corresponding
+    // parquet column name. scan_plan::batch_column_name is the single source of truth for
+    // this D→name mapping; the previously-cached _column_name_by_ref was C-indexed and
+    // silently wrong whenever projection reordered or dropped columns.
+    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+      return _plan.batch_column_name(ref_index);
+    };
+    auto optional_filter =
+      translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+    stream.synchronize();
+    if (optional_filter) {
+      ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
+      result->reader_options->set_filter(ast_filter->back());
+      result->filter_expression = ast_filter;
+      SIRIUS_LOG_DEBUG(
+        "[sirius_parquet_metadata_scan_operator] Translated filter expression for pushdown.");
+    } else {
+      result->filter_expression = _duckdb_filter_expression;
+      SIRIUS_LOG_DEBUG(
+        "[sirius_parquet_metadata_scan_operator] AST translation failed; filter will be applied "
+        "post-read by the GPU scan operator.");
+    }
   }
+  // post_filter_projection_ids is intentionally left empty: the scan_plan-backed inject
+  // closure handles output assembly (data + partition + pure-filter drop) in one pass, so
+  // the GPU scan operator's separate pruning step is a no-op for this path.
 
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   result->datasources.reserve(input.file_paths.size());
@@ -247,7 +198,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
       cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
       *result->reader_options);
     auto metadata = reader.parquet_metadata();
-    if (_is_projected && !detail::projected_columns_are_flat(metadata, _projected_column_names)) {
+    if (_plan.is_projected() && !detail::projected_columns_are_flat(metadata, data_column_names)) {
       /// TODO: Support nested column schemas with projection.
       throw std::runtime_error(
         "[sirius_parquet_metadata_scan_operator] Parquet scans with projections currently only "
@@ -260,21 +211,19 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     // groups in a single file, but can vary across files).
     std::vector<std::size_t> selected_chunk_indices;
     std::unordered_set<std::size_t> pure_filter_chunk_indices;
-    if (_is_projected) {
-      selected_chunk_indices.reserve(_projected_column_names.size());
-      for (std::size_t k = 0; k < _projected_column_names.size(); ++k) {
-        auto leaves = detail::leaf_indices_for_column(metadata, _projected_column_names[k]);
+    if (_plan.is_projected()) {
+      auto const pure_filter_positions = _plan.pure_filter_batch_positions();
+      selected_chunk_indices.reserve(data_column_names.size());
+      for (std::size_t k = 0; k < data_column_names.size(); ++k) {
+        auto leaves = detail::leaf_indices_for_column(metadata, data_column_names[k]);
         // projected_columns_are_flat (checked above) guarantees exactly one leaf per name.
         if (leaves.size() != 1) {
           throw std::runtime_error(
-            "[sirius_parquet_metadata_scan_operator] Projected column '" +
-            _projected_column_names[k] +
+            "[sirius_parquet_metadata_scan_operator] Projected column '" + data_column_names[k] +
             "' did not resolve to exactly one parquet leaf in file: " + file_path);
         }
         selected_chunk_indices.push_back(leaves.front());
-        if (_pure_filter_column_indices.contains(_selected_column_indices[k])) {
-          pure_filter_chunk_indices.insert(leaves.front());
-        }
+        if (pure_filter_positions.count(k)) { pure_filter_chunk_indices.insert(leaves.front()); }
       }
     }
 
@@ -338,7 +287,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
       auto const& row_group = metadata.row_groups[rg_idx];
       partition_rg_indices.push_back(rg_idx);
 
-      if (_is_projected) {
+      if (_plan.is_projected()) {
         for (auto const chunk_idx : selected_chunk_indices) {
           accumulate_chunk(row_group.columns[chunk_idx],
                            pure_filter_chunk_indices.contains(chunk_idx));

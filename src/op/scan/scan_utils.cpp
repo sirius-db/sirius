@@ -69,26 +69,14 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
       continue;
     }
 
-    if (column_index >= column_ids.size()) {
-      throw std::runtime_error(
-        std::format("TABLE_SCAN filter: column_index ({}) >= column_ids.size() ({})",
-                    column_index,
-                    column_ids.size()));
-    }
-    auto primary_idx = column_ids[column_index].GetPrimaryIndex();
-    if (primary_idx >= returned_types.size()) {
-      throw std::runtime_error(
-        std::format("TABLE_SCAN filter: primary_idx ({}) >= returned_types.size() ({})",
-                    primary_idx,
-                    returned_types.size()));
-    }
+    auto primary_idx = column_ids.at(column_index).GetPrimaryIndex();
     if (skip_primary_indices.count(primary_idx)) {
       SIRIUS_LOG_DEBUG(
         "TABLE_SCAN filter: skipping filter on primary_idx={} (hive partition or equivalent)",
         primary_idx);
       continue;
     }
-    auto col_type = returned_types[primary_idx];
+    auto const col_type = returned_types.at(primary_idx);
 
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: column_index={}, primary_idx={}, type={}, filter_type={}",
                      column_index,
@@ -96,7 +84,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
                      col_type.to_string(),
                      static_cast<int>(filter->filter_type));
 
-    auto batch_column_index = batch_column_map[column_index];
+    auto const batch_column_index = batch_column_map[column_index];
     if (batch_column_index == static_cast<duckdb::idx_t>(-1)) {
       throw std::runtime_error(
         std::format("TABLE_SCAN filter: column_index ({}) not in projected batch", column_index));
