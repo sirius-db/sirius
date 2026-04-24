@@ -82,7 +82,7 @@ class convertible_data_batch : public convertible_data {
     const std::vector<const cucascade::memory::memory_space*>& target_spaces,
     rmm::cuda_stream_view stream,
     sirius::memory::sirius_memory_reservation_manager& res_mgr,
-    bool blocking = true) override
+    bool blocking) override
   {
     std::optional<cucascade::mutable_data_batch> mut_opt;
     if (blocking) {

@@ -75,7 +75,7 @@ class convertible_data {
     const std::vector<const cucascade::memory::memory_space*>& target_spaces,
     rmm::cuda_stream_view stream,
     sirius::memory::sirius_memory_reservation_manager& res_mgr,
-    bool blocking = true) = 0;
+    bool blocking) = 0;
 
   /**
    * @brief Get the size in bytes of this data unit in the specified memory space.

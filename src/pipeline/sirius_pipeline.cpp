@@ -337,9 +337,6 @@ void sirius_pipeline::update_pipeline_status()
         break;
       }
     }
-    // WSM TODO need to increment task created before pulling data?
-    // Lets fix this by putting task creation as a method in the pipeline class so that it can be
-    // done atomically.
     if (limit_exhausted ||
         (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
       if (tasks_created.load() == tasks_completed.load()) {

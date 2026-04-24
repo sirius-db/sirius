@@ -126,7 +126,25 @@ void downgrade_executor::processing_loop()
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
-    auto& req    = request;
+    auto& req = request;
+
+    SIRIUS_LOG_TRACE(
+      "[downgrade] {} processing request (monitor={}): amount_to_downgrade={} bytes ({:.2f} MB), "
+      "available={} bytes ({:.2f} MB), total_reserved={} bytes ({:.2f} MB)",
+      _source_label,
+      req->is_monitor_request,
+      _memory_space ? _memory_space->get_amount_to_downgrade() : 0,
+      _memory_space
+        ? static_cast<double>(_memory_space->get_amount_to_downgrade()) / (1024.0 * 1024.0)
+        : 0.0,
+      _memory_space ? _memory_space->get_available_memory() : 0,
+      _memory_space ? static_cast<double>(_memory_space->get_available_memory()) / (1024.0 * 1024.0)
+                    : 0.0,
+      _memory_space ? _memory_space->get_total_reserved_memory() : 0,
+      _memory_space
+        ? static_cast<double>(_memory_space->get_total_reserved_memory()) / (1024.0 * 1024.0)
+        : 0.0);
+
     auto t_start = std::chrono::steady_clock::now();
 
     // Per-source tracking (repos vs pipeline_queue)
@@ -169,12 +187,12 @@ void downgrade_executor::processing_loop()
     bool pool_interrupted = false;
     auto repos            = _data_repo_mgr.get_repositories();
     for (auto* repo : repos) {
-      if (req->satisfied.load()) return;
+      if (req->satisfied.load()) break;
 
       convertible_data_batch_provider provider(repo);
       auto candidates = provider.get_all_convertible(source_space, /*front_to_back=*/false);
       for (auto& candidate : candidates) {
-        if (req->satisfied.load()) return;
+        if (req->satisfied.load()) break;
 
         auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -186,7 +204,7 @@ void downgrade_executor::processing_loop()
 
         // Re-check after reserve() returns -- the previous candidate's worker may
         // have set satisfied while we were blocked waiting for a thread slot.
-        if (req->satisfied.load()) return;
+        if (req->satisfied.load()) break;
 
         auto exc_stream = _stream_pool->acquire_stream(
           cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
@@ -204,7 +222,7 @@ void downgrade_executor::processing_loop()
            &host_target_stats,
            &disk_target_stats]() mutable {
             try {
-              auto result = cand->convert(targets, exc_stream, res_mgr);
+              auto result = cand->convert(targets, exc_stream, res_mgr, false);
               if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
@@ -261,7 +279,7 @@ void downgrade_executor::processing_loop()
            &host_target_stats,
            &disk_target_stats]() mutable {
             try {
-              auto result = cand->convert(targets, exc_stream, res_mgr);
+              auto result = cand->convert(targets, exc_stream, res_mgr, false);
               if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);

@@ -93,7 +93,7 @@ TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_dat
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, true);
 
   REQUIRE(result.has_value());
   REQUIRE((*result).size() == 1);
@@ -114,7 +114,7 @@ TEST_CASE("convertible_data_batch returns nullopt with empty target_spaces",
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({}, e.stream(), *e.mgr, false);
 
   REQUIRE_FALSE(result.has_value());
   REQUIRE(batch_in_space(*batch, e.gpu_space));

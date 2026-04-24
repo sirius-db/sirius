@@ -53,7 +53,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
 {
   if (!batch) { return std::nullopt; }
 
-  // D-01: Acquire a shared (read-only) lock via to_read_only()
+  // Acquire a read-only lock
   auto read_accessor = batch->to_read_only();
 
   // Determine the target memory space
@@ -61,13 +61,13 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
     requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
-  // D-03: Memory space matches — return the read-only accessor directly
+  // Memory space matches — return the read-only accessor directly
   if (read_accessor.get_memory_space() != nullptr &&
       read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
     return std::move(read_accessor);
   }
 
-  // D-02: Memory space mismatch — upgrade to mutable, convert in-place, downgrade to read-only
+  // Memory space mismatch — go to mutable, convert in-place, go back to read-only
   auto& registry    = sirius::converter_registry::get();
   auto mut_accessor = cucascade::data_batch::readonly_to_mutable(std::move(read_accessor));
 
@@ -84,7 +84,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
       return std::nullopt;
   }
 
-  // D-02: Downgrade the exclusive lock back to a shared read-only lock
+  // Downgrade the exclusive lock back to a shared read-only lock
   return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
 }
 

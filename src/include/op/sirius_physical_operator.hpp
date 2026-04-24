@@ -156,7 +156,7 @@ class pipelineable_operator_data : public operator_data {
   /**
    * @brief Get read-only locked batches, lazily populating from idle batches if needed.
    */
-  [[nodiscard]] const std::vector<::cucascade::read_only_data_batch>& get_read_only_batches(
+  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
     bool leave_locked = false) const;
 
   /**

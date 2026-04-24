@@ -140,7 +140,7 @@ TEST_CASE("RAII returns task after successful convert", "[convertible_gpu_pipeli
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
 
-    auto result = cd->convert({e.host_space}, e.stream(), *e.mgr);
+    auto result = cd->convert({e.host_space}, e.stream(), *e.mgr, true);
     REQUIRE(result.has_value());
     // cd destroyed here, task returned to queue via RAII
   }
@@ -274,7 +274,7 @@ TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd != nullptr);
 
-  auto result = cd->convert({e.host_space}, e.stream(), *e.mgr);
+  auto result = cd->convert({e.host_space}, e.stream(), *e.mgr, true);
   REQUIRE(result.has_value());
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);

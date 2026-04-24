@@ -48,8 +48,8 @@ pipelineable_operator_data::get_data_batches() const
   return *_data_batches;
 }
 
-const std::vector<::cucascade::read_only_data_batch>&
-pipelineable_operator_data::get_read_only_batches(bool leave_locked) const
+std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches(
+  bool leave_locked) const
 {
   if (!_read_only_data_batches) {
     std::vector<::cucascade::read_only_data_batch> ro_batches;
@@ -57,7 +57,11 @@ pipelineable_operator_data::get_read_only_batches(bool leave_locked) const
     for (const auto& batch : *_data_batches) {
       ro_batches.push_back(batch->to_read_only());
     }
-    if (leave_locked) { _read_only_data_batches = std::move(ro_batches); }
+    if (leave_locked) {
+      _read_only_data_batches = std::move(ro_batches);
+    } else {
+      return std::move(ro_batches);
+    }
   }
   return *_read_only_data_batches;
 }

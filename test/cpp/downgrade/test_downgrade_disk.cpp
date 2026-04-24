@@ -160,7 +160,7 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
     target_spaces.push_back(ds);
   }
   sirius::convertible_data_batch batch_converter(batch);
-  auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr);
+  auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr, false);
   REQUIRE(converted.has_value());
 
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::DISK);
@@ -209,7 +209,7 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
     target_spaces.push_back(ds);
   }
   sirius::convertible_data_batch batch_converter(batch);
-  auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr);
+  auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr, true);
   REQUIRE(converted.has_value());
 
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
@@ -261,7 +261,7 @@ TEST_CASE("Downgrade task returns false when HOST full and no DISK tier", "[down
     target_spaces.push_back(ds);
   }
   sirius::convertible_data_batch batch_converter(batch);
-  auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr);
+  auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr, false);
   REQUIRE_FALSE(converted.has_value());
   // Batch must remain on GPU
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::GPU);
