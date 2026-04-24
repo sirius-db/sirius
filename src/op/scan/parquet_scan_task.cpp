@@ -416,6 +416,16 @@ void parquet_scan_task_global_state::initialize_from_files()
       // clang-format on
     }
     auto const& file_metadata = _file_metadatas[file_idx];
+    std::vector<size_t> partition_column_indices;
+    if (is_projected) {
+      partition_column_indices = projected_column_indices;
+    } else if (!file_metadata.row_groups.empty()) {
+      auto const num_leaf_columns = file_metadata.row_groups.front().columns.size();
+      partition_column_indices.reserve(num_leaf_columns);
+      for (std::size_t col_idx = 0; col_idx < num_leaf_columns; ++col_idx) {
+        partition_column_indices.push_back(col_idx);
+      }
+    }
 
     std::size_t partition_uncompressed_bytes = 0;
     std::size_t partition_compressed_bytes   = 0;
@@ -437,7 +447,7 @@ void parquet_scan_task_global_state::initialize_from_files()
       auto const& row_group = file_metadata.row_groups[rg_idx];
       partition_rg_indices.push_back(rg_idx);
 
-      for (auto const col_idx : projected_column_indices) {
+      for (auto const col_idx : partition_column_indices) {
         auto const& column_metadata = row_group.columns[col_idx].meta_data;
         // To reflect the fact that pure filter columns are not part of the table scan result,
         // we omit them from the uncompressed byte count.
@@ -563,18 +573,27 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   byte_ranges.emplace_back(footer_off, footer_size);  // footer + trailer
 
   // Read each byte range into the allocation asynchronously
-  int64_t bytes_read = 0;
+  std::size_t requested_bytes = 0;
   std::vector<std::future<std::size_t>> read_futures;
   for (auto const& range : byte_ranges) {
     read_range_into_allocation(
       range.offset(), range.size(), data_accessor, allocation, read_futures);
-    bytes_read += range.size();
+    requested_bytes += range.size();
   }
-  std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
+  std::size_t actual_bytes_read = 0;
+  std::for_each(read_futures.begin(), read_futures.end(), [&actual_bytes_read](auto& future) {
+    actual_bytes_read += future.get();
+  });
 
-  if (bytes_read != l_state.get_reserved_compressed_bytes()) {
+  if (actual_bytes_read != requested_bytes) {
     throw std::runtime_error(
-      "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
+      "[parquet_scan_task] Error in reading byte ranges: actual bytes read does not match "
+      "requested byte ranges");
+  }
+
+  if (requested_bytes > l_state.get_reserved_compressed_bytes()) {
+    throw std::runtime_error(
+      "[parquet_scan_task] Error in reading byte ranges: requested byte ranges exceed reserved "
       "compressed bytes");
   }
 
@@ -586,7 +605,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   g_state.get_options(),
                                                   std::move(l_state.get_rg_indices()),
                                                   std::move(byte_ranges),
-                                                  l_state.get_reserved_compressed_bytes(),
+                                                  actual_bytes_read,
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   file_size,
                                                   _datasource,
