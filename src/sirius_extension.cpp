@@ -23,8 +23,6 @@
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
 #include "data/sirius_converter_registry.hpp"
-#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -36,11 +34,8 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
@@ -236,6 +231,17 @@ std::string rewrite_sirius_owned_remote_parquet_calls(std::string const& query)
   return rewritten;
 }
 
+std::string escape_sql_string_literal(std::string_view value)
+{
+  std::string escaped;
+  escaped.reserve(value.size() + 8);
+  for (char c : value) {
+    escaped.push_back(c);
+    if (c == '\'') { escaped.push_back('\''); }
+  }
+  return escaped;
+}
+
 std::filesystem::path materialize_remote_parquet_for_bind(ClientContext& context,
                                                           std::string const& uri)
 {
@@ -300,40 +306,29 @@ std::filesystem::path materialize_remote_parquet_for_bind(ClientContext& context
   return tmp_path;
 }
 
-unique_ptr<FunctionData> bind_local_parquet_schema(ClientContext& context,
-                                                   std::filesystem::path const& parquet_path,
-                                                   vector<LogicalType>& return_types,
-                                                   vector<string>& names)
+void infer_local_parquet_schema(ClientContext& context,
+                                std::filesystem::path const& parquet_path,
+                                vector<LogicalType>& return_types,
+                                vector<string>& names)
 {
-  auto& table_function_entry = Catalog::GetEntry<TableFunctionCatalogEntry>(
-    context, INVALID_CATALOG, DEFAULT_SCHEMA, "parquet_scan");
+  Connection bind_conn(*context.db);
+  auto result = bind_conn.Query("SELECT * FROM read_parquet('" +
+                                escape_sql_string_literal(parquet_path.string()) +
+                                "') LIMIT 0");
+  if (!result) {
+    throw InvalidInputException("{} failed to infer parquet schema for {}",
+                                std::string(SIRIUS_READ_PARQUET_FN),
+                                parquet_path.string());
+  }
+  if (result->HasError()) {
+    throw InvalidInputException("{} failed to infer parquet schema for {}: {}",
+                                std::string(SIRIUS_READ_PARQUET_FN),
+                                parquet_path.string(),
+                                result->GetError());
+  }
 
-  vector<LogicalType> arg_types;
-  arg_types.emplace_back(LogicalTypeId::VARCHAR);
-  auto parquet_scan = table_function_entry.functions.GetFunctionByArguments(context, arg_types);
-
-  vector<Value> inputs;
-  inputs.emplace_back(parquet_path.string());
-
-  named_parameter_map_t named_parameters;
-  vector<LogicalType> input_table_types;
-  vector<string> input_table_names;
-
-  TableFunctionRef ref;
-  vector<unique_ptr<ParsedExpression>> children;
-  children.push_back(make_uniq<ConstantExpression>(Value(parquet_path.string())));
-  ref.function = make_uniq<FunctionExpression>(
-    "parquet_scan", std::move(children), nullptr, nullptr, false, false, false);
-
-  TableFunctionBindInput bind_input(inputs,
-                                    named_parameters,
-                                    input_table_types,
-                                    input_table_names,
-                                    nullptr,
-                                    nullptr,
-                                    parquet_scan,
-                                    ref);
-  return parquet_scan.bind(context, bind_input, return_types, names);
+  names        = result->names;
+  return_types = result->types;
 }
 
 unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
@@ -352,8 +347,17 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
                                 std::string(SIRIUS_READ_PARQUET_FN));
   }
 
-  auto const tmp_path = materialize_remote_parquet_for_bind(context, uri);
-  return bind_local_parquet_schema(context, tmp_path, return_types, names);
+  struct scoped_path {
+    std::filesystem::path path;
+    ~scoped_path()
+    {
+      std::error_code ec;
+      if (!path.empty()) { std::filesystem::remove(path, ec); }
+    }
+  } tmp_file{materialize_remote_parquet_for_bind(context, uri)};
+
+  infer_local_parquet_schema(context, tmp_file.path, return_types, names);
+  return nullptr;
 }
 
 void SiriusReadParquetFunction(ClientContext&,
