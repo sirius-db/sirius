@@ -20,16 +20,18 @@
 #     timings.csv
 #
 # Before running benchmarks, a tiny read-only filesystem benchmark is run on the
-# input parquet directory and results are recorded in run_info.txt.
+# input location (parquet directory or DuckDB database file) and recorded in run_info.txt.
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
 #   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
+#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --report <run_dir>
 #   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results <run_dir> <scale_factor>
 #
 # Example:
 #   ./test/tpch_performance/benchmark_and_validate.sh 1
+#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./performance_test.duckdb 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf1_2iter
 #   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results runs/2026-03-10_12-00-00_sf1_2iter 1
 
@@ -37,6 +39,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Set by --data-source (default: parquet → run_tpch_parquet.sh).
+DATA_SOURCE="parquet"
 RUN_SCRIPT="$SCRIPT_DIR/run_tpch_parquet.sh"
 
 # ---------------------------------------------------------------------------
@@ -53,13 +57,14 @@ generate_report() {
         local qnum="${d##*/q}"
         QUERIES+=("$qnum")
     done
-    # Deduplicate and sort numerically.
-    readarray -t QUERIES < <(printf '%s\n' "${QUERIES[@]}" | sort -un)
 
     if [ ${#QUERIES[@]} -eq 0 ]; then
         echo "ERROR: no query directories found in $RUN_DIR"
         return 1
     fi
+
+    # Deduplicate and sort numerically.
+    readarray -t QUERIES < <(printf '%s\n' "${QUERIES[@]}" | sort -un)
 
     # Try to extract SF from the directory name (e.g. ..._sf10_2iter).
     local SF="?"
@@ -81,7 +86,17 @@ generate_report() {
         local file="$1"
         [[ ! -f "$file" ]] && return 0
         [[ ! -s "$file" ]] && return 0
-        grep -qE "(Error|Segmentation fault)" "$file" 2>/dev/null
+        grep -qiE "(^error:|^no output|Invalid Error|IO Error|Catalog Error|Parser Error|Binder Error|Segmentation fault|^Error:)" "$file" 2>/dev/null
+    }
+
+    has_valid_timings() {
+        local file="$1"
+        [[ -f "$file" ]] || return 1
+        awk -F',' '
+            NR == 1 { next }
+            $2 != "" && $2 != "N/A" { found = 1 }
+            END { exit(found ? 0 : 1) }
+        ' "$file"
     }
 
     printf 'query,status\n' | tee "$VALIDATION_CSV"
@@ -91,8 +106,11 @@ generate_report() {
     for q in "${QUERIES[@]}"; do
         local SIRIUS_FILE="$RUN_DIR/sirius/q${q}/result.txt"
         local DUCKDB_FILE="$RUN_DIR/duckdb/q${q}/result.txt"
+        local SIRIUS_TIMING="$RUN_DIR/sirius/q${q}/timings.csv"
+        local DUCKDB_TIMING="$RUN_DIR/duckdb/q${q}/timings.csv"
         local status
-        if has_error "$SIRIUS_FILE"; then
+        if has_error "$SIRIUS_FILE" || has_error "$DUCKDB_FILE" || \
+            ! has_valid_timings "$SIRIUS_TIMING" || ! has_valid_timings "$DUCKDB_TIMING"; then
             status="error"
             (( errors++ ))
         elif diff -q "$SIRIUS_FILE" "$DUCKDB_FILE" >/dev/null 2>&1; then
@@ -143,28 +161,29 @@ generate_report() {
     echo "============================================================"
     echo ""
 
-    declare -A DC DW SC SW
+        declare -A DC DW SC SW
 
-    for q in "${QUERIES[@]}"; do
-        local DUCKDB_TIMING="$RUN_DIR/duckdb/q${q}/timings.csv"
-        local SIRIUS_TIMING="$RUN_DIR/sirius/q${q}/timings.csv"
+        for q in "${QUERIES[@]}"; do
+            local DUCKDB_TIMING="$RUN_DIR/duckdb/q${q}/timings.csv"
+            local SIRIUS_TIMING="$RUN_DIR/sirius/q${q}/timings.csv"
 
-        if [ -f "$DUCKDB_TIMING" ]; then
-            DC[$q]=$(awk -F',' '$1=="iter_1"{print $2}' "$DUCKDB_TIMING")
-            DW[$q]=$(awk -F',' '$1~/^iter_/ && $1!="iter_1"{v=$2+0; if(min==""||v<min)min=v}END{if(min!="")print min}' "$DUCKDB_TIMING")
-        fi
-        if [ -f "$SIRIUS_TIMING" ]; then
-            SC[$q]=$(awk -F',' '$1=="iter_1"{print $2}' "$SIRIUS_TIMING")
-            SW[$q]=$(awk -F',' '$1~/^iter_/ && $1!="iter_1"{v=$2+0; if(min==""||v<min)min=v}END{if(min!="")print min}' "$SIRIUS_TIMING")
-        fi
-    done
+            if [ -f "$DUCKDB_TIMING" ]; then
+                DC[$q]=$(awk -F',' '$1=="iter_1" && $2 != "N/A"{print $2; exit}' "$DUCKDB_TIMING")
+                DW[$q]=$(awk -F',' '$1~/^iter_/ && $1!="iter_1" && $2 != "N/A"{v=$2+0; if(min==""||v<min)min=v}END{if(min!="")print min}' "$DUCKDB_TIMING")
+            fi
+            if [ -f "$SIRIUS_TIMING" ]; then
+                SC[$q]=$(awk -F',' '$1=="iter_1" && $2 != "N/A"{print $2; exit}' "$SIRIUS_TIMING")
+                SW[$q]=$(awk -F',' '$1~/^iter_/ && $1!="iter_1" && $2 != "N/A"{v=$2+0; if(min==""||v<min)min=v}END{if(min!="")print min}' "$SIRIUS_TIMING")
+            fi
+        done
 
     printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
         "Query" "DuckDB Cold" "DuckDB Warm" "Sirius Cold" "Sirius Warm" "Speedup (warm)"
     printf "%-7s-+-%13s-+-%13s-+-%13s-+-%13s-+-%14s\n" \
         "-------" "-------------" "-------------" "-------------" "-------------" "--------------"
 
-    local TOTAL_DC=0 TOTAL_DW=0 TOTAL_SC=0 TOTAL_SW=0
+        local TOTAL_DC=0 TOTAL_DW=0 TOTAL_SC=0 TOTAL_SW=0
+        local HAVE_DC=0 HAVE_DW=0 HAVE_SC=0 HAVE_SW=0
 
     for q in "${QUERIES[@]}"; do
         local dc="${DC[$q]:-N/A}" dw="${DW[$q]:-N/A}"
@@ -185,26 +204,43 @@ generate_report() {
         printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
             "Q${q}" "$fmt_dc" "$fmt_dw" "$fmt_sc" "$fmt_sw" "$speedup"
 
-        [ "$dc" != "N/A" ] && TOTAL_DC=$(echo "$TOTAL_DC + $dc" | bc)
-        [ "$dw" != "N/A" ] && TOTAL_DW=$(echo "$TOTAL_DW + $dw" | bc)
-        [ "$sc" != "N/A" ] && TOTAL_SC=$(echo "$TOTAL_SC + $sc" | bc)
-        [ "$sw" != "N/A" ] && TOTAL_SW=$(echo "$TOTAL_SW + $sw" | bc)
-    done
+            if [ "$dc" != "N/A" ]; then
+                TOTAL_DC=$(echo "$TOTAL_DC + $dc" | bc)
+                HAVE_DC=1
+            fi
+            if [ "$dw" != "N/A" ]; then
+                TOTAL_DW=$(echo "$TOTAL_DW + $dw" | bc)
+                HAVE_DW=1
+            fi
+            if [ "$sc" != "N/A" ]; then
+                TOTAL_SC=$(echo "$TOTAL_SC + $sc" | bc)
+                HAVE_SC=1
+            fi
+            if [ "$sw" != "N/A" ]; then
+                TOTAL_SW=$(echo "$TOTAL_SW + $sw" | bc)
+                HAVE_SW=1
+            fi
+        done
 
-    local total_speedup="N/A"
-    if [ "$(echo "$TOTAL_SW > 0" | bc)" -eq 1 ]; then
-        total_speedup=$(echo "scale=2; $TOTAL_DW / $TOTAL_SW" | bc 2>/dev/null || echo "N/A")
-        [ "$total_speedup" != "N/A" ] && total_speedup="${total_speedup}x"
-    fi
+        local total_speedup="N/A"
+        if [ "$HAVE_DW" -eq 1 ] && [ "$HAVE_SW" -eq 1 ] && [ "$(echo "$TOTAL_SW > 0" | bc)" -eq 1 ]; then
+            total_speedup=$(echo "scale=2; $TOTAL_DW / $TOTAL_SW" | bc 2>/dev/null || echo "N/A")
+            [ "$total_speedup" != "N/A" ] && total_speedup="${total_speedup}x"
+        fi
 
-    printf "%-7s-+-%13s-+-%13s-+-%13s-+-%13s-+-%14s\n" \
-        "-------" "-------------" "-------------" "-------------" "-------------" "--------------"
-    printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
-        "TOTAL" "$(printf '%.2fs' "$TOTAL_DC")" "$(printf '%.2fs' "$TOTAL_DW")" \
-        "$(printf '%.2fs' "$TOTAL_SC")" "$(printf '%.2fs' "$TOTAL_SW")" "$total_speedup"
-    echo ""
-    echo "============================================================"
-    echo "All output saved to $RUN_DIR"
+        local fmt_total_dc="N/A" fmt_total_dw="N/A" fmt_total_sc="N/A" fmt_total_sw="N/A"
+        [ "$HAVE_DC" -eq 1 ] && fmt_total_dc=$(printf '%.2fs' "$TOTAL_DC")
+        [ "$HAVE_DW" -eq 1 ] && fmt_total_dw=$(printf '%.2fs' "$TOTAL_DW")
+        [ "$HAVE_SC" -eq 1 ] && fmt_total_sc=$(printf '%.2fs' "$TOTAL_SC")
+        [ "$HAVE_SW" -eq 1 ] && fmt_total_sw=$(printf '%.2fs' "$TOTAL_SW")
+
+        printf "%-7s-+-%13s-+-%13s-+-%13s-+-%13s-+-%14s\n" \
+            "-------" "-------------" "-------------" "-------------" "-------------" "--------------"
+        printf "%-7s | %13s | %13s | %13s | %13s | %14s\n" \
+            "TOTAL" "$fmt_total_dc" "$fmt_total_dw" "$fmt_total_sc" "$fmt_total_sw" "$total_speedup"
+        echo ""
+        echo "============================================================"
+        echo "All output saved to $RUN_DIR"
     } | tee "$RUN_DIR/comparison.txt"
 }
 
@@ -235,11 +271,29 @@ fi
 
 # Parse optional flags
 DUCKDB_RESULTS_DIR=""
+DUCKDB_FILE=""
 MULTI_SESSION=false
+DROP_OS_CACHE=false
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
             export SIRIUS_CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --data-source)
+            case "$2" in
+                parquet | duckdb)
+                    DATA_SOURCE="$2"
+                    ;;
+                *)
+                    echo "ERROR: --data-source must be 'parquet' or 'duckdb' (got: $2)"
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        --duckdb-file)
+            DUCKDB_FILE="$2"
             shift 2
             ;;
         --parquet-dir)
@@ -266,6 +320,10 @@ while [ $# -gt 1 ]; do
             MULTI_SESSION=true
             shift
             ;;
+        --drop-os-cache)
+            DROP_OS_CACHE=true
+            shift
+            ;;
         *)
             break
             ;;
@@ -276,11 +334,16 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--parquet-dir <path>] [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] <scale_factor>"
+    echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb] [--parquet-dir <path>] [--duckdb-file <path>]"
+    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] [--drop-os-cache] <scale_factor>"
     echo "       $0 --report <run_dir>"
+    echo "  --data-source parquet  (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
+    echo "  --data-source duckdb             → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file"
     echo "Example: $0 --config ~/.sirius/sirius.yaml --engines sirius --iterations 3 --timeout 120 1000"
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
+    echo "         $0 --data-source duckdb --duckdb-file ./performance_test.duckdb 1"
+    echo "         $0 --multi-session --drop-os-cache --engines sirius 1000  # cold-run with OS cache drops"
     exit 1
 fi
 
@@ -341,9 +404,35 @@ if [ -n "$DUCKDB_RESULTS_DIR" ]; then
 fi
 
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
-PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
+
+if [ "$DATA_SOURCE" = "duckdb" ]; then
+    RUN_SCRIPT="$SCRIPT_DIR/run_tpch_duckdb.sh"
+    if [ ! -f "$RUN_SCRIPT" ]; then
+        echo "ERROR: DuckDB run script not found: $RUN_SCRIPT"
+        exit 1
+    fi
+    DUCKDB_FILE="${DUCKDB_FILE:-$PROJECT_DIR/performance_test.duckdb}"
+    DUCKDB_FILE="$(cd "$(dirname "$DUCKDB_FILE")" && pwd)/$(basename "$DUCKDB_FILE")"
+    if [ ! -f "$DUCKDB_FILE" ]; then
+        echo "ERROR: DuckDB database not found: $DUCKDB_FILE"
+        exit 1
+    fi
+else
+    RUN_SCRIPT="$SCRIPT_DIR/run_tpch_parquet.sh"
+    if [ ! -f "$RUN_SCRIPT" ]; then
+        echo "ERROR: Parquet run script not found: $RUN_SCRIPT"
+        exit 1
+    fi
+    PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
+fi
 
 echo "Scale factor: SF${SF}   Iterations: ${NUM_ITERATIONS} (1 cold + $((NUM_ITERATIONS - 1)) warm)"
+echo "Data source: $DATA_SOURCE   Run script: $(basename "$RUN_SCRIPT")"
+if [ "$DATA_SOURCE" = "duckdb" ]; then
+    echo "DuckDB file: $DUCKDB_FILE"
+else
+    echo "Parquet dir: $PARQUET_DIR"
+fi
 echo "Run directory: $RUN_DIR"
 if [ -n "${DUCKDB_RESULTS_DIR:-}" ]; then
     echo "DuckDB results: reusing from $DUCKDB_RESULTS_DIR"
@@ -373,6 +462,20 @@ echo "=== Collecting run info and filesystem benchmark ==="
         echo "source: $DUCKDB_RESULTS_DIR (copied, not re-run)"
         echo ""
     fi
+
+    echo "--- Benchmark settings ---"
+    echo "multi_session: $MULTI_SESSION"
+    echo "drop_os_cache: $DROP_OS_CACHE"
+    echo ""
+
+    echo "--- Benchmark input ---"
+    echo "data_source: $DATA_SOURCE"
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        echo "duckdb_file: $DUCKDB_FILE"
+    else
+        echo "parquet_dir: $PARQUET_DIR"
+    fi
+    echo ""
 
     echo "--- Git ---"
     if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
@@ -441,7 +544,28 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo ""
 
     echo "--- Filesystem benchmark (read-only, input location) ---"
-    if [ -d "$PARQUET_DIR" ]; then
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        if [ -f "$DUCKDB_FILE" ]; then
+            SIZE_BYTES=$(stat -c %s "$DUCKDB_FILE" 2>/dev/null || stat -f %z "$DUCKDB_FILE" 2>/dev/null)
+            SIZE_MB=$((SIZE_BYTES / 1048576))
+            READ_MB=$((SIZE_MB < 100 ? SIZE_MB : 100))
+            echo "file: $DUCKDB_FILE"
+            echo "read_size_mb: $READ_MB"
+            START=$(date +%s.%N)
+            dd if="$DUCKDB_FILE" of=/dev/null bs=1M count="$READ_MB" 2>/dev/null
+            END=$(date +%s.%N)
+            ELAPSED=$(echo "$END - $START" | bc 2>/dev/null || echo "?")
+            if [ "$ELAPSED" != "?" ] && [ "$(echo "$ELAPSED > 0" | bc 2>/dev/null)" -eq 1 ]; then
+                THROUGHPUT=$(echo "scale=2; $READ_MB / $ELAPSED" | bc 2>/dev/null)
+                echo "elapsed_s: $ELAPSED"
+                echo "throughput_mb_s: $THROUGHPUT"
+            else
+                echo "elapsed_s: $ELAPSED (could not compute throughput)"
+            fi
+        else
+            echo "duckdb file not found: $DUCKDB_FILE (benchmark skipped)"
+        fi
+    elif [ -d "$PARQUET_DIR" ]; then
         FIRST_PARQUET=""
         for f in "$PARQUET_DIR"/lineitem.parquet \
                  "$PARQUET_DIR"/lineitem_*.parquet \
@@ -478,6 +602,7 @@ echo "=== Collecting run info and filesystem benchmark ==="
 echo "Run info saved to $RUN_INFO_FILE"
 echo "=========================================="
 
+OVERALL_STATUS=0
 for engine in $ENGINES; do
     ENGINE_DIR="$RUN_DIR/$engine"
     mkdir -p "$ENGINE_DIR"
@@ -485,7 +610,9 @@ for engine in $ENGINES; do
     echo ""
     echo "=== Running $engine ==="
     EXTRA_ARGS=()
-    if [ -n "${PARQUET_DIR:-}" ]; then
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        EXTRA_ARGS+=(--duckdb-file "$DUCKDB_FILE")
+    elif [ -n "${PARQUET_DIR:-}" ]; then
         EXTRA_ARGS+=(--parquet-dir "$PARQUET_DIR")
     fi
     EXTRA_ARGS+=(--iterations "$NUM_ITERATIONS")
@@ -493,8 +620,17 @@ for engine in $ENGINES; do
     if [ "$MULTI_SESSION" = true ]; then
         EXTRA_ARGS+=(--multi-session)
     fi
+    if [ "$DROP_OS_CACHE" = true ]; then
+        EXTRA_ARGS+=(--drop-os-cache)
+    fi
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
-        2>&1 | tee "$ENGINE_DIR/run.log" || true
+        2>&1 | tee "$ENGINE_DIR/run.log"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        OVERALL_STATUS=1
+        echo "ERROR: $engine benchmark run failed with exit code $status" | tee -a "$ENGINE_DIR/run.log"
+    fi
 done
 
-generate_report "$RUN_DIR"
+generate_report "$RUN_DIR" || OVERALL_STATUS=1
+exit "$OVERALL_STATUS"

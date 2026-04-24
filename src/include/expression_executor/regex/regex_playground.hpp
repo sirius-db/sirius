@@ -23,7 +23,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 namespace sirius {
-namespace expression {
+namespace regex {
 
 class regex_playground {
  public:
@@ -31,5 +31,5 @@ class regex_playground {
     const cudf::column_view& input);
 };
 
-}  // namespace expression
+}  // namespace regex
 }  // namespace sirius

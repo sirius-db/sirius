@@ -92,8 +92,7 @@ Scripts are in `test/tpch_performance/`.
 
 ## TPC-H Query Files
 
-- **Sirius (GPU):** `test/tpch_performance/tpch_queries/gpu/q*.sql` — wrapped with `call gpu_execution('...');`
-- **DuckDB (CPU):** `test/tpch_performance/tpch_queries/orig/q*.sql` — plain SQL
+- **Sirius and DuckDB runners:** `test/tpch_performance/tpch_queries/orig/q*.sql` — plain TPC-H SQL (used by `run_tpch_parquet.sh`, `run_tpch_duckdb.sh`, `benchmark_and_validate.sh`)
 
 ## Workflow H-A: Generate TPC-H Data
 
@@ -121,8 +120,13 @@ export SIRIUS_CONFIG_FILE=/path/to/config.cfg
 - `--iterations <N>` — Iterations per query (default: 2 = 1 cold + 1 warm)
 - `--timeout <seconds>` — Session timeout (default: 1200)
 - `--multi-session` — Run each query in its own DuckDB process (fresh state per query, useful for DuckDB baselines)
+- `--drop-os-cache` — Drop OS filesystem cache before each query (requires `--multi-session` and passwordless sudo). For true cold-run benchmarking.
 - `--duckdb-results <run_dir>` — Reuse previously stored DuckDB results (skip re-running DuckDB)
 - `--report <run_dir>` — Regenerate reports from existing run directory (no benchmarks run)
+
+**Cache level configuration:**
+- **Single-session**: cache level comes from the Sirius config YAML (`executor.duckdb_scan.cache`). The benchmark script does not override it.
+- **Multi-session**: same Sirius config default, with optional per-query overrides in `test/tpch_performance/scan_cache_levels.yaml`.
 
 **Examples:**
 ```bash
@@ -133,11 +137,24 @@ export SIRIUS_CONFIG_FILE=~/sirius_config.cfg
 # 3 iterations, 5-minute timeout
 ./test/tpch_performance/benchmark_and_validate.sh --config ~/my.cfg --iterations 3 --timeout 300 100
 
+# Cold-run benchmark with OS cache drops (requires sudo setup, see below)
+./test/tpch_performance/benchmark_and_validate.sh --multi-session --drop-os-cache --engines sirius 1000
+
 # Reuse prior DuckDB results
 ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results runs/2026-03-10_12-00-00_sf100_2iter 100
 
 # Regenerate report from existing run
 ./test/tpch_performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf100_2iter
+```
+
+### Cold-Run Benchmarking
+
+For true cold-run performance testing (no OS filesystem cache), use `--multi-session --drop-os-cache`.
+
+**Before running a cold-run benchmark, ask the user to run this one-time setup** to configure passwordless sudo for cache dropping. Do not proceed until the user confirms it is done:
+
+```bash
+echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
 ```
 
 **Output:** `runs/<timestamp>_sf<SF>_<N>iter/`
@@ -156,13 +173,14 @@ export SIRIUS_CONFIG_FILE=/path/to/config.cfg
 ./test/tpch_performance/run_tpch_parquet.sh [options] <engine> <scale_factor> <query_numbers...>
 ```
 
-**Options:** `--parquet-dir`, `--iterations`, `--timeout`, `--cache-level`, `--multi-session`
+**Options:** `--parquet-dir`, `--iterations`, `--timeout`, `--multi-session`, `--drop-os-cache`
 
 **Examples:**
 ```bash
 ./test/tpch_performance/run_tpch_parquet.sh sirius 100 $(seq 1 22)
 ./test/tpch_performance/run_tpch_parquet.sh duckdb 100 1 3 6
 ./test/tpch_performance/run_tpch_parquet.sh --multi-session duckdb 100 $(seq 1 22)
+./test/tpch_performance/run_tpch_parquet.sh --multi-session --drop-os-cache sirius 100 $(seq 1 22)
 ./test/tpch_performance/run_tpch_parquet.sh --iterations 5 --parquet-dir /data/tpch sirius 100 $(seq 1 22)
 ```
 

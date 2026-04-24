@@ -16,10 +16,14 @@
 
 #include "op/sirius_physical_parquet_scan.hpp"
 
-#include "expression_executor/gpu_expression_translator.hpp"
+#include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+
+#include <duckdb/common/multi_file/multi_file_states.hpp>
+
+#include <unordered_set>
 
 namespace sirius {
 namespace op {
@@ -85,9 +89,19 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
       auto const primary_idx = column_ids[ref_index].GetPrimaryIndex();
       return names[primary_idx];
     };
-    auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
+    auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
+    // Drop filters on hive-partition columns — they aren't in the parquet file, so pushing
+    // them into the reader crashes libcudf. DuckDB already prunes partitions at the file-list
+    // level when hive_partitioning is enabled.
+    std::unordered_set<std::size_t> hive_partition_primary_indices;
+    if (bind_data) {
+      auto const& multi_file_bind = bind_data->Cast<duckdb::MultiFileBindData>();
+      for (auto const& hpi : multi_file_bind.reader_bind.hive_partitioning_indexes) {
+        hive_partition_primary_indices.insert(hpi.index);
+      }
+    }
     auto duckdb_expression = convert_table_filters_to_expression(
-      *table_filters, column_ids, returned_types, batch_column_map);
+      *table_filters, column_ids, returned_types, batch_column_map, hive_partition_primary_indices);
     if (duckdb_expression) {
       gpu_expression_translator translator(rmm::cuda_stream_default,
                                            cudf::get_current_device_resource_ref());
@@ -102,7 +116,7 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
         if (table_scan) { table_scan->passthrough = true; }
       }
       // Move the duckdb_expression into the table scan
-      if (table_scan) { table_scan->filter_expr = std::move(duckdb_expression); }
+      if (table_scan) { table_scan->filter_expr = sirius::wrap(std::move(duckdb_expression)); }
     }
   } else {
     translated_filter = std::nullopt;

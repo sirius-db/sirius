@@ -24,6 +24,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -57,7 +58,7 @@ template <typename Traits>
 inline std::unique_ptr<cudf::column> vector_to_cudf_column(
   const std::vector<typename Traits::type>& values,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource())
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   auto size = static_cast<cudf::size_type>(values.size());
 
@@ -182,7 +183,7 @@ inline std::vector<std::unique_ptr<cudf::table>> make_random_striped_split(
   std::unique_ptr<cudf::table> input,
   std::size_t num_splits,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource())
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   if (num_splits == 0) { return {}; }
 

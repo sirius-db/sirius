@@ -17,7 +17,8 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <op/scan/hive_partition.hpp>  // For partition_inject_fn_t
 
 // cucascade
 #include <cucascade/data/common.hpp>
@@ -39,6 +40,7 @@
 #include <vector>
 
 namespace sirius {
+using partition_inject_fn_t = op::scan::partition_inject_fn_t;
 
 /**
  * @brief Function called after a parquet batch is decompressed to a GPU cuDF table.
@@ -60,16 +62,6 @@ using post_convert_fn_t =
                                              std::string const& data_file_path,
                                              int64_t first_row_offset,
                                              rmm::cuda_stream_view)>;
-
-/**
- * @brief Function that injects hive partition columns into a GPU table.
- *
- * Called after post_convert (if any) to add constant partition columns
- * (whose values come from the file path, not the parquet data) at the
- * correct positions in the output table.
- */
-using partition_inject_fn_t = std::function<std::unique_ptr<cudf::table>(
-  std::unique_ptr<cudf::table>, std::string const& data_file_path, rmm::cuda_stream_view)>;
 
 /**
  * @brief A host representation of Parquet data for use in a hybrid scan.

@@ -146,15 +146,16 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   // Apply table filters as a GPU expression if present.
   std::shared_ptr<cucascade::data_batch> output_batch;
-  duckdb::unique_ptr<duckdb::Expression> filter_expr;
+  sirius::expression local_filter_expr;
   if (table_filters) {
-    filter_expr = convert_table_filters_to_expression(
-      *table_filters, column_ids, returned_types, batch_column_map);
+    local_filter_expr = sirius::wrap(convert_table_filters_to_expression(
+      *table_filters, column_ids, returned_types, batch_column_map));
   }
 
-  if (filter_expr != nullptr) {
-    duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
-    output_batch = gpu_expression_executor.select(batch_ref, stream);
+  if (static_cast<bool>(local_filter_expr)) {
+    sirius::gpu_expression_executor gpu_expression_executor(
+      local_filter_expr, cudf::get_current_device_resource_ref(), stream);
+    output_batch = gpu_expression_executor.select(batch_ref);
     if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
   } else {
     output_batch = batch_ref;

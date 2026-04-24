@@ -29,7 +29,9 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
-#include "expression_executor/gpu_expression_translator.hpp"
+#include "duckdb/planner/joinside.hpp"
+#include "expression/expression_internal.hpp"
+#include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -45,7 +47,7 @@ namespace sirius {
 namespace op {
 
 /// Recursively collect all BoundReferenceExpression indices from an expression tree.
-static void collect_bound_ref_indices(duckdb::Expression& expr,
+static void collect_bound_ref_indices(const duckdb::Expression& expr,
                                       std::unordered_set<std::size_t>& indices)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
@@ -53,17 +55,21 @@ static void collect_bound_ref_indices(duckdb::Expression& expr,
     return;
   }
   duckdb::ExpressionIterator::EnumerateChildren(
-    expr, [&](duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
+    expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
+}
+
+static bool is_equality(sirius::comparison_type c)
+{
+  return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
 }
 
 bool sirius_physical_hash_join::are_conditions_supported(
-  duckdb::vector<duckdb::JoinCondition>& conditions)
+  duckdb::vector<sirius::join_condition>& conditions)
 {
   // Must have at least one equality condition for a hash-based join.
   bool has_equality = false;
   for (auto const& cond : conditions) {
-    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    if (is_equality(cond.comparison)) {
       has_equality = true;
       break;
     }
@@ -73,8 +79,7 @@ bool sirius_physical_hash_join::are_conditions_supported(
   // Pure equality join: always supported.
   bool has_inequality = false;
   for (auto const& cond : conditions) {
-    if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-        cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    if (!is_equality(cond.comparison)) {
       has_inequality = true;
       break;
     }
@@ -84,25 +89,19 @@ bool sirius_physical_hash_join::are_conditions_supported(
   // Mixed join: collect the column indices used on each side of the equality conditions.
   std::unordered_set<std::size_t> equality_left_cols, equality_right_cols;
   for (auto const& cond : conditions) {
-    if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-        cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      continue;
-    }
-    collect_bound_ref_indices(*cond.left, equality_left_cols);
-    collect_bound_ref_indices(*cond.right, equality_right_cols);
+    if (!is_equality(cond.comparison)) { continue; }
+    collect_bound_ref_indices(*sirius::unwrap(cond.left), equality_left_cols);
+    collect_bound_ref_indices(*sirius::unwrap(cond.right), equality_right_cols);
   }
 
   // For each inequality condition, verify that its left/right column references don't overlap
   // with the equality key columns on the same side. cuDF's mixed_join API requires the equality
   // and conditional table columns to be disjoint.
   for (auto const& cond : conditions) {
-    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      continue;
-    }
+    if (is_equality(cond.comparison)) { continue; }
     std::unordered_set<std::size_t> ineq_left_cols, ineq_right_cols;
-    collect_bound_ref_indices(*cond.left, ineq_left_cols);
-    collect_bound_ref_indices(*cond.right, ineq_right_cols);
+    collect_bound_ref_indices(*sirius::unwrap(cond.left), ineq_left_cols);
+    collect_bound_ref_indices(*sirius::unwrap(cond.right), ineq_right_cols);
     for (auto const idx : ineq_left_cols) {
       if (equality_left_cols.count(idx) > 0) { return false; }
     }
@@ -114,13 +113,12 @@ bool sirius_physical_hash_join::are_conditions_supported(
   return true;
 }
 
-void reorder_join_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
+void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
 {
   bool is_ordered     = true;
   bool seen_non_equal = false;
   for (auto& cond : conditions) {
-    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    if (is_equality(cond.comparison)) {
       if (seen_non_equal) {
         is_ordered = false;
         break;
@@ -130,11 +128,10 @@ void reorder_join_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
     }
   }
   if (is_ordered) { return; }
-  duckdb::vector<duckdb::JoinCondition> equal_conditions;
-  duckdb::vector<duckdb::JoinCondition> other_conditions;
+  duckdb::vector<sirius::join_condition> equal_conditions;
+  duckdb::vector<sirius::join_condition> other_conditions;
   for (auto& cond : conditions) {
-    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    if (is_equality(cond.comparison)) {
       equal_conditions.push_back(std::move(cond));
     } else {
       other_conditions.push_back(std::move(cond));
@@ -153,7 +150,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<duckdb::JoinCondition> cond,
+  duckdb::vector<sirius::join_condition> cond,
   duckdb::JoinType join_type,
   const duckdb::vector<std::size_t>& left_projection_map,
   const duckdb::vector<std::size_t>& right_projection_map,
@@ -223,12 +220,11 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
 
   for (std::size_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-    auto& condition = conditions[cond_idx];
-    const bool is_equality =
-      (condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-       condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+    auto& condition        = conditions[cond_idx];
+    auto const* left_expr  = sirius::unwrap(condition.left);
+    auto const* right_expr = sirius::unwrap(condition.right);
 
-    if (!is_equality) {
+    if (!is_equality(condition.comparison)) {
       // Inequality conditions are handled at execute time via the cuDF mixed_join binary predicate.
       // No key index extraction is needed here.
       continue;
@@ -239,14 +235,13 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
     // Extract left key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
     key_cast_info cast_info;
-    auto left_class  = condition.left->GetExpressionClass();
-    auto right_class = condition.right->GetExpressionClass();
+    auto left_class  = left_expr->GetExpressionClass();
+    auto right_class = right_expr->GetExpressionClass();
 
     if (left_class == duckdb::ExpressionClass::BOUND_REF) {
-      left_key_col_indices.push_back(
-        condition.left->Cast<duckdb::BoundReferenceExpression>().index);
+      left_key_col_indices.push_back(left_expr->Cast<duckdb::BoundReferenceExpression>().index);
     } else if (left_class == duckdb::ExpressionClass::BOUND_CAST) {
-      auto& bound_cast = condition.left->Cast<duckdb::BoundCastExpression>();
+      auto& bound_cast = left_expr->Cast<duckdb::BoundCastExpression>();
       if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw std::runtime_error(
           "Unsupported join condition: BOUND_CAST child is not BOUND_REF (left)");
@@ -254,7 +249,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       left_key_col_indices.push_back(
         bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
       cast_info.cast_left        = true;
-      cast_info.left_target_type = duckdb::GetCudfType(condition.left->return_type);
+      cast_info.left_target_type = duckdb::GetCudfType(left_expr->return_type);
       cast_necessary             = true;
     } else {
       throw std::runtime_error("Unsupported join condition left expression");
@@ -262,10 +257,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
     // Extract right key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
     if (right_class == duckdb::ExpressionClass::BOUND_REF) {
-      right_key_col_indices.push_back(
-        condition.right->Cast<duckdb::BoundReferenceExpression>().index);
+      right_key_col_indices.push_back(right_expr->Cast<duckdb::BoundReferenceExpression>().index);
     } else if (right_class == duckdb::ExpressionClass::BOUND_CAST) {
-      auto& bound_cast = condition.right->Cast<duckdb::BoundCastExpression>();
+      auto& bound_cast = right_expr->Cast<duckdb::BoundCastExpression>();
       if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw std::runtime_error(
           "Unsupported join condition: BOUND_CAST child is not BOUND_REF (right)");
@@ -273,7 +267,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       right_key_col_indices.push_back(
         bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
       cast_info.cast_right        = true;
-      cast_info.right_target_type = duckdb::GetCudfType(condition.right->return_type);
+      cast_info.right_target_type = duckdb::GetCudfType(right_expr->return_type);
       cast_necessary              = true;
     } else {
       throw std::runtime_error("Unsupported join condition right expression");
@@ -293,7 +287,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<duckdb::JoinCondition> cond,
+  duckdb::vector<sirius::join_condition> cond,
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality,
   uint64_t max_build_hash_table_bytes)

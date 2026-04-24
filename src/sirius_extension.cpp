@@ -18,6 +18,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
+#include "expression_executor/expression_executor_strategy.hpp"
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -732,15 +733,16 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
 static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto value = StringValue::Get(parameter);
-  if (value != "materialize" && value != "ast_interpret" && value != "ast_jit") {
+  sirius::expression_executor_strategy parsed;
+  if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
       "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
       "ast_jit",
       value);
   }
-  Config::EXPRESSION_EXECUTOR_STRATEGY = std::move(value);
+  Config::EXPRESSION_EXECUTOR_STRATEGY = parsed;
   SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
-                   Config::EXPRESSION_EXECUTOR_STRATEGY);
+                   sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY));
 }
 
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
@@ -931,10 +933,10 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "expression_executor_strategy",
-    "Strategy for the experimental gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "Strategy for the gpu_expression_executor: 'materialize', 'ast_interpret', or "
     "'ast_jit'",
     LogicalType::VARCHAR,
-    Value(Config::EXPRESSION_EXECUTOR_STRATEGY),
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY))),
     SetExpressionExecutorStrategy);
 
   // Add in config option for top-N

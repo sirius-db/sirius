@@ -17,7 +17,6 @@
 #include "op/sirius_physical_filter.hpp"
 
 #include "config.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -27,26 +26,14 @@
 namespace sirius {
 namespace op {
 
-sirius_physical_filter::sirius_physical_filter(
-  duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-  std::size_t estimated_cardinality)
+sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
+                                               sirius::expression expression_p,
+                                               std::size_t estimated_cardinality)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
+    expression(std::move(expression_p))
 {
-  D_ASSERT(select_list.size() > 0);
-  if (select_list.size() > 1) {
-    // KEVIN: I don't think this code path is ever entered
-    // create a big AND out of the expressions
-    auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
-      duckdb::ExpressionType::CONJUNCTION_AND);
-    for (auto& expr : select_list) {
-      conjunction->children.push_back(std::move(expr));
-    }
-    expression = std::move(conjunction);
-  } else {
-    expression = std::move(select_list[0]);
-  }
+  D_ASSERT(static_cast<bool>(expression));
 }
 
 std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_data& input_data,
@@ -56,17 +43,8 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_data_batches();
 
-  sirius::experimental::expression_executor_strategy strategy;
-  if (!sirius::experimental::string_to_strategy(duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY,
-                                                strategy)) {
-    throw duckdb::InvalidInputException(
-      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
-      "ast_jit",
-      duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY);
-  }
-  // The executor uses the data_batch API to filter rows according to `expression`.
-  sirius::experimental::gpu_expression_executor gpu_expression_executor(
-    expression.get(), strategy, cudf::get_current_device_resource_ref(), stream);
+  sirius::gpu_expression_executor gpu_expression_executor(
+    expression, cudf::get_current_device_resource_ref(), stream);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

@@ -18,9 +18,10 @@
 
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
@@ -145,8 +146,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const cucascade::shared_data_repository_manager& get_data_repository_manager()
     const;
 
-  [[nodiscard]] sirius::pipeline::pipeline_executor& get_pipeline_executor();
-  [[nodiscard]] const sirius::pipeline::pipeline_executor& get_pipeline_executor() const;
+  [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
+  [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
   /// \brief Get the downgrade executor for a specific memory space.
   [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor(
@@ -229,12 +230,15 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Destroyed before memory_manager_ (declared after it — reverse destruction order).
   std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
-  // Previous cuDF pinned resource and threshold — restored in terminate() before
-  // small_pinned_allocator_ is destroyed to prevent dangling references.
+  std::optional<
+    sirius::memory::host_device_resource_view<cucascade::memory::small_pinned_host_memory_resource>>
+    small_pinned_allocator_view_{};
+  // Previous cuDF pinned resource and threshold — restored in terminate() before the view and
+  // allocator are destroyed to prevent dangling references.
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
-  std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
+  std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   duckdb::shared_ptr<sirius::planner::query> query_;

@@ -233,7 +233,7 @@ void sirius_engine::execute()
                              .query_id  = query_handle->uuid(),
                              .worker_id = sirius_iface.telemetry.worker_id(),
                            });
-  auto future = sirius_ctx->get_pipeline_executor().start_query();
+  auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
     future.get();
   } catch (const std::exception& e) {
@@ -242,11 +242,11 @@ void sirius_engine::execute()
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_pipeline_executor().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
-    sirius_ctx->get_pipeline_executor().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   }
 }
@@ -256,10 +256,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
 {
   if (op->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "parquet_scan" ||
-        scan_physical_op.function.name == "read_parquet") {
-      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
-    } else if (scan_physical_op.function.name == "iceberg_scan") {
+    if (scan_physical_op.function.name == "iceberg_scan") {
       return construct_iceberg_scan_operator(scan_physical_op);
     } else if (scan_physical_op.function.name == "seq_scan") {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
@@ -379,7 +376,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   root_pipeline->get_pipelines(sirius_pipelines, true);
   SIRIUS_LOG_DEBUG("total_pipelines = {}", sirius_pipelines.size());
 
-  // Auto-log the enriched query plan (D-08)
+  // Auto-log the enriched query plan
   pipeline::sirius_plan_printer plan_printer(new_scheduled);
   SIRIUS_LOG_INFO("Query Plan:\n{}", plan_printer.render());
 }
