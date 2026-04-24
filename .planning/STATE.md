@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
-status: phase-8-halted-phase-9-pending
-stopped_at: "Plan 08-08 diagnosis committed (f57f7bd) — hypothesis E (scan-task cross-GPU batch double-dispatch). Plans 08-09/10 HALTED (see 08-09-HALT.md). Phase 9 inserted in ROADMAP for the real distributor + preferred_device_id bug. Next: /clear, then /gsd:plan-phase 9 in fresh context."
-last_updated: "2026-04-22T14:30:00.000Z"
-last_activity: 2026-04-22
+status: executing
+stopped_at: "Completed 09-01-PLAN.md (preferred_device_id Bug 2 plumbing: local-state accessor + manager_loop set + two-tier compute_task lookup; build exit 0; HYG-02 preserved; runtime confirmation deferred to 09-04)"
+last_updated: "2026-04-24T10:14:21.790Z"
+last_activity: 2026-04-24
 progress:
   total_phases: 2
   completed_phases: 0
-  total_plans: 8
-  completed_plans: 8
-  percent: 50
+  total_plans: 14
+  completed_plans: 9
+  percent: 100
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 08 — multi-gpu-sql-pipeline-fix
+**Current focus:** Phase 09 — scan-task-distributor-batch-ownership-affinity
 
 ## Current Position
 
-Phase: 08 (multi-gpu-sql-pipeline-fix) — COMPLETE (ship-blocked)
-Plan: 6 of 6
-Status: Phase complete — ready for verification
-Last activity: 2026-04-22
+Phase: 09 (scan-task-distributor-batch-ownership-affinity) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-04-24
 
 Progress: [██████████] 100% (6/6 plans complete)
 Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md`
@@ -44,6 +44,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 08 P05 | 86min | 3 tasks | 4 files |
 | Phase 08 P06 | 21min | 3 tasks | 3 files |
 | Phase 08 P07 | 10min | 2 tasks | 2 files |
+| Phase 09 P01 | 25min | 3 tasks | 3 files |
 
 ## Decisions
 
@@ -68,6 +69,8 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 08]: [08-06] Phase 8 ship verdict BLOCKED — criteria 1/2/4/6 DEFERRED because TPC-H Q1 parquet + num_gpus=2 still hits cudaErrorInvalidValue @ cuda_memcpy.cu:42 after carryover fix. SF100 Q1 ship-gate not run because SF1 parquet already reproduces the blocker.
 - [Phase 08]: [08-07] Added three [mgpu-probe] INFO breadcrumbs (host_parquet entry+exit, parquet_scan_task::compute_task entry) with grep-stable payload discriminating hypotheses A/B/C/D carried forward from 08-VERIFICATION.md. Plan's <interfaces> claim on log/logging.hpp include wiring was wrong — added it inline per Rule 3.
 - [Phase 08]: [08-07] HYG-02 baseline still 41 matches; zero logic changes, zero new RAII, zero new stream acquires, zero yaml edits, zero cucascade edits. Instrumentation-only gap-closure plan unblocks 08-08 reproduction.
+- [Phase 09]: Path B for parquet_scan_task_local_state: sirius_pipeline_task_local_state base does NOT have preferred_device_id accessors (only global state does); accessors added directly to local state class
+- [Phase 09]: Two-tier local-wins-over-global preferred_device_id lookup in compute_task mirrors gpu_pipeline_task::get_preferred_device_id (gpu_pipeline_task.hpp:188-194)
 
 ## Accumulated Context
 
@@ -106,6 +109,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-22T13:45:33.354Z
-Stopped at: Completed 08-07-PLAN.md (gap-closure instrumentation: [mgpu-probe] breadcrumbs landed at host_parquet converter entry+exit + parquet_scan_task::compute_task entry; build exit 0; HYG-02 preserved; ready for 08-08 reproduction)
+Last session: 2026-04-24T10:14:21.788Z
+Stopped at: Completed 09-01-PLAN.md (preferred_device_id Bug 2 plumbing: local-state accessor + manager_loop set + two-tier compute_task lookup; build exit 0; HYG-02 preserved; runtime confirmation deferred to 09-04)
 Resume file: None
