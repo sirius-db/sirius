@@ -16,13 +16,18 @@
 
 #include "utils.hpp"
 
+#ifdef SIRIUS_ENABLE_LEGACY
 #include "catch.hpp"
 #include "operator/gpu_materialize.hpp"
+#endif
+
+#include <cudf/column/column_factories.hpp>
 
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 
+#ifdef SIRIUS_ENABLE_LEGACY
 namespace duckdb {
 
 template <typename T>
@@ -333,6 +338,7 @@ shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId col_type,
 }
 
 }  // namespace duckdb
+#endif
 
 namespace sirius {
 
@@ -431,7 +437,7 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
 
         rmm::device_buffer d_chars(h_chars.data(), h_chars.size(), stream, mr);
 
-        auto col = make_strings_column(
+        auto col = cudf::make_strings_column(
           num_rows, std::move(offsets_col), std::move(d_chars), 0, rmm::device_buffer{});
         cols.push_back(std::move(col));
         break;

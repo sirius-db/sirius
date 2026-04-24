@@ -17,7 +17,6 @@
 #pragma once
 
 // sirius
-#include <gpu_query_result.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <sirius_context.hpp>
 

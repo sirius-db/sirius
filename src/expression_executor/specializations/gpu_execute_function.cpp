@@ -18,8 +18,6 @@
 #include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/regex/regex_playground.hpp>
-#include <operator/gpu_physical_strings_matching.hpp>
-#include <operator/strlen_from_offsets.cuh>
 #include <sirius/exception.hpp>
 
 // duckdb

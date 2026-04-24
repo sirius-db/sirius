@@ -16,7 +16,6 @@
 
 // sirius
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <operator/gpu_materialize.hpp>
 
 // duckdb
 #include <duckdb/planner/expression/bound_reference_expression.hpp>

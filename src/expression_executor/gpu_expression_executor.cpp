@@ -20,7 +20,6 @@
 #include <expression/expression_internal.hpp>
 #include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <operator/gpu_materialize.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
