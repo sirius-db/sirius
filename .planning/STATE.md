@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: executing
-stopped_at: "Completed 09-01-PLAN.md (preferred_device_id Bug 2 plumbing: local-state accessor + manager_loop set + two-tier compute_task lookup; build exit 0; HYG-02 preserved; runtime confirmation deferred to 09-04)"
-last_updated: "2026-04-24T10:14:21.790Z"
+stopped_at: Completed 09-02-PLAN.md (batch-GPU affinity map + query-start reset + [mgpu-probe] breadcrumbs; build exit 0; HYG-02 preserved; 315/316 unit tests pass)
+last_updated: "2026-04-24T10:21:29.835Z"
 last_activity: 2026-04-24
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 14
-  completed_plans: 9
+  completed_plans: 10
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 09 (scan-task-distributor-batch-ownership-affinity) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-04-24
 
@@ -45,6 +45,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 08 P06 | 21min | 3 tasks | 3 files |
 | Phase 08 P07 | 10min | 2 tasks | 2 files |
 | Phase 09 P01 | 25min | 3 tasks | 3 files |
+| Phase 09 P02 | 4min | 3 tasks | 3 files |
 
 ## Decisions
 
@@ -71,6 +72,8 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 08]: [08-07] HYG-02 baseline still 41 matches; zero logic changes, zero new RAII, zero new stream acquires, zero yaml edits, zero cucascade edits. Instrumentation-only gap-closure plan unblocks 08-08 reproduction.
 - [Phase 09]: Path B for parquet_scan_task_local_state: sirius_pipeline_task_local_state base does NOT have preferred_device_id accessors (only global state does); accessors added directly to local state class
 - [Phase 09]: Two-tier local-wins-over-global preferred_device_id lookup in compute_task mirrors gpu_pipeline_task::get_preferred_device_id (gpu_pipeline_task.hpp:188-194)
+- [Phase 09]: Affinity reset placed unconditionally at top of prepare_cache_for_scan_operators (before cache_level::NONE early return) so _scan_round_robin and _batch_gpu_affinity reset together on every query start regardless of caching mode (Pitfall 3 compliance)
+- [Phase 09]: [Phase 09-02] Affinity map (_batch_gpu_affinity) is written at dispatch time but not yet consulted at dispatch time — provides data structure for Plan 09-03 disjointness assertion; dispatch-time re-routing deferred to Phase 10+ if 09-04 validation shows residual cross-GPU collisions
 
 ## Accumulated Context
 
@@ -109,6 +112,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-24T10:14:21.788Z
-Stopped at: Completed 09-01-PLAN.md (preferred_device_id Bug 2 plumbing: local-state accessor + manager_loop set + two-tier compute_task lookup; build exit 0; HYG-02 preserved; runtime confirmation deferred to 09-04)
+Last session: 2026-04-24T10:21:29.833Z
+Stopped at: Completed 09-02-PLAN.md (batch-GPU affinity map + query-start reset + [mgpu-probe] breadcrumbs; build exit 0; HYG-02 preserved; 315/316 unit tests pass)
 Resume file: None
