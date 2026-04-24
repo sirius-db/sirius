@@ -49,12 +49,9 @@ using sirius::ast::reference;
 
 static_assert(!std::is_copy_constructible_v<node>,
               "sirius::ast::node must be move-only (variant over unique_ptr-holding structs).");
-static_assert(!std::is_copy_assignable_v<node>,
-              "sirius::ast::node must be move-only.");
-static_assert(std::is_move_constructible_v<node>,
-              "sirius::ast::node must be move-constructible.");
-static_assert(std::is_move_assignable_v<node>,
-              "sirius::ast::node must be move-assignable.");
+static_assert(!std::is_copy_assignable_v<node>, "sirius::ast::node must be move-only.");
+static_assert(std::is_move_constructible_v<node>, "sirius::ast::node must be move-constructible.");
+static_assert(std::is_move_assignable_v<node>, "sirius::ast::node must be move-assignable.");
 static_assert(std::variant_size_v<node::variant_t> == 9,
               "sirius::ast::node has exactly 9 alternatives.");
 

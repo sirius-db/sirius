@@ -101,9 +101,9 @@ struct node {
 
   // Move-only. Expression trees own their children via std::unique_ptr, so
   // copying is neither supported nor intended.
-  node(const node&)            = delete;
-  node& operator=(const node&) = delete;
-  node(node&&) noexcept        = default;
+  node(const node&)                = delete;
+  node& operator=(const node&)     = delete;
+  node(node&&) noexcept            = default;
   node& operator=(node&&) noexcept = default;
 
   ~node() = default;
