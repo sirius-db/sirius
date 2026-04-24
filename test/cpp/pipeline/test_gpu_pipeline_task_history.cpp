@@ -24,8 +24,6 @@
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
-#include "sirius_engine.hpp"
-#include "sirius_interface.hpp"
 #include "utils/utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -170,13 +168,9 @@ struct pipeline_task_history_fixture {
 };
 
 //------------------------------------------------------------------------------
-// Pipeline context: DuckDB, engine, pipeline, and stub operator.
+// Pipeline context: minimal pipeline shell and stub operator.
 //------------------------------------------------------------------------------
 struct pipeline_context {
-  std::unique_ptr<duckdb::DuckDB> db;
-  std::unique_ptr<duckdb::Connection> con;
-  std::unique_ptr<sirius::sirius_interface> iface;
-  std::unique_ptr<sirius::sirius_engine> engine;
   duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<stub_operator> stub_op;
 };
@@ -184,11 +178,7 @@ struct pipeline_context {
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  ctx.db     = std::make_unique<duckdb::DuckDB>(nullptr);
-  ctx.con    = std::make_unique<duckdb::Connection>(*ctx.db);
-  ctx.iface  = std::make_unique<sirius::sirius_interface>(*ctx.con->context);
-  ctx.engine = std::make_unique<sirius::sirius_engine>(*ctx.con->context, *ctx.iface);
-  static sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_op = std::make_unique<stub_operator>();
