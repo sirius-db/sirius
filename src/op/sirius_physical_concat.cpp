@@ -192,7 +192,9 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
   if (input_batches.size() == 1) {
-    output_batches.push_back(input_batches[0].clone(sirius::get_next_batch_id(), stream));
+    auto copy   = input_batches[0];
+    auto output = cucascade::data_batch::to_idle(std::move(copy));
+    output_batches.push_back(std::move(output));
   } else {
     auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space);
     output_batches.push_back(std::move(merged_batch));

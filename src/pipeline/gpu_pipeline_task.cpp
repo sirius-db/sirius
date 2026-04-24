@@ -418,11 +418,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     auto* pipelineable_output =
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
-      for (const auto& batch : pipelineable_output->get_data_batches()) {
-        if (batch) {
-          auto ro = batch->to_read_only();
-          if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
-        }
+      for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
+        output_bytes += batch.get_data()->get_size_in_bytes();
       }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
@@ -452,10 +449,8 @@ std::size_t gpu_pipeline_task::get_input_size() const
   auto* pipelineable_input =
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
-  for (const auto& batch : pipelineable_input->get_data_batches()) {
-    if (!batch) { continue; }
-    auto ro = batch->to_read_only();
-    if (ro.get_data()) { input_size += ro.get_data()->get_size_in_bytes(); }
+  for (const auto& batch : pipelineable_input->get_read_only_batches(false)) {
+    input_size += batch.get_data()->get_size_in_bytes();
   }
   return input_size;
 }

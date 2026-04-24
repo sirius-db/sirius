@@ -59,11 +59,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   // Determine the target memory space
   const auto* target_space =
     requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
-  if (target_space == nullptr) {
-    // Release the shared lock back to idle and return nullopt
-    cucascade::data_batch::to_idle(std::move(read_accessor));
-    return std::nullopt;
-  }
+  if (target_space == nullptr) { return std::nullopt; }
 
   // D-03: Memory space matches — return the read-only accessor directly
   if (read_accessor.get_memory_space() != nullptr &&
@@ -85,7 +81,6 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
     default:
       SIRIUS_LOG_ERROR("lock_or_prepare_batch: unsupported target tier for batch {}",
                        mut_accessor.get_batch_id());
-      cucascade::data_batch::to_idle(std::move(mut_accessor));
       return std::nullopt;
   }
 

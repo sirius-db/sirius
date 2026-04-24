@@ -102,6 +102,8 @@ class operator_data {
    * It is appropriate for operator_data subclasses that own no data requiring
    * locking and need no per-task setup. Override when either condition changes.
    */
+
+  // WSM TODO: this should be void and throw an exception if preparation fails
   virtual bool prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
   {
@@ -154,12 +156,20 @@ class pipelineable_operator_data : public operator_data {
   /**
    * @brief Get read-only locked batches, lazily populating from idle batches if needed.
    */
-  [[nodiscard]] const std::vector<::cucascade::read_only_data_batch>& get_read_only_batches() const;
+  [[nodiscard]] const std::vector<::cucascade::read_only_data_batch>& get_read_only_batches(
+    bool leave_locked = false) const;
 
   /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
    */
-  void remove_read_only_lock() { _read_only_data_batches = std::nullopt; }
+  void remove_read_only_lock()
+  {
+    // Releasing the lock means getting rid of any _read_only_data_batches that we may have cached.
+    // But we want to make sure we do keep the data alive. So we ensure that the data_batches are
+    // populated.
+    if (!_data_batches) { auto _ = get_data_batches(); }
+    _read_only_data_batches = std::nullopt;
+  }
 
   /**
    * @brief Lock all data batches for processing in the requested memory space.
@@ -378,14 +388,6 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
-    return true;
-  }
-
-  /// \brief check if all tasks have been processed
-  virtual bool has_processed_all_tasks() const
-  {
-    // WSM TODO implement this
-    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
     return true;
   }
 

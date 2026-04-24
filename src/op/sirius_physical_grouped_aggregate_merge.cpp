@@ -172,13 +172,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
-  // WSM TODO: revisit these two clones here.
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
-    idle_batches.push_back(input_batches[0].clone(sirius::get_next_batch_id(), stream));
-    return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one

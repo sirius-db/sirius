@@ -105,14 +105,8 @@ std::unique_ptr<operator_data> sirius_physical_column_data_scan::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_column_data_scan::execute"};
-  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  auto ro_vec = input.get_read_only_batches();
-  std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
-  idle_batches.reserve(ro_vec.size());
-  for (auto& ro : ro_vec) {
-    idle_batches.push_back(::cucascade::data_batch::to_idle(std::move(ro)));
-  }
-  return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
+  return std::make_unique<pipelineable_operator_data>(
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
 }
 
 }  // namespace op
