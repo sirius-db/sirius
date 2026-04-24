@@ -55,8 +55,8 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
 
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -71,9 +71,9 @@ bool SiriusExtension::buffer_is_initialized = false;
 
 namespace {
 
-constexpr std::string_view NATIVE_READ_PARQUET_FN  = "read_parquet";
-constexpr std::string_view SIRIUS_READ_PARQUET_FN  = "sirius_read_parquet";
-constexpr std::string_view S3_URI_PREFIX           = "s3://";
+constexpr std::string_view NATIVE_READ_PARQUET_FN = "read_parquet";
+constexpr std::string_view SIRIUS_READ_PARQUET_FN = "sirius_read_parquet";
+constexpr std::string_view S3_URI_PREFIX          = "s3://";
 
 bool is_identifier_char(char c)
 {
@@ -125,7 +125,7 @@ bool should_rewrite_read_parquet_call(std::string const& query, std::size_t name
   auto pos = skip_whitespace(query, name_pos + NATIVE_READ_PARQUET_FN.size());
   if (pos >= query.size() || query[pos] != '(') { return false; }
 
-  pos = skip_whitespace(query, pos + 1);
+  pos          = skip_whitespace(query, pos + 1);
   auto literal = parse_single_quoted_literal(query, pos);
   if (!literal.has_value()) { return false; }
   return iequals_prefix(literal->first, S3_URI_PREFIX);
@@ -249,15 +249,14 @@ std::filesystem::path materialize_remote_parquet_for_bind(ClientContext& context
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (!sirius_ctx) {
-    throw InvalidInputException(
-      "{} requires an initialized SiriusContext", std::string(SIRIUS_READ_PARQUET_FN));
+    throw InvalidInputException("{} requires an initialized SiriusContext",
+                                std::string(SIRIUS_READ_PARQUET_FN));
   }
 
   auto const& osc = sirius_ctx->get_config().get_object_store_config();
   if (osc.endpoint.empty()) {
-    throw InvalidInputException(
-      "{} requires s3_endpoint to be set before gpu_execution planning",
-      std::string(SIRIUS_READ_PARQUET_FN));
+    throw InvalidInputException("{} requires s3_endpoint to be set before gpu_execution planning",
+                                std::string(SIRIUS_READ_PARQUET_FN));
   }
 
   sirius::io::s3::s3_ioctx_config io_cfg;
@@ -272,9 +271,8 @@ std::filesystem::path materialize_remote_parquet_for_bind(ClientContext& context
   auto datasource = sirius::io::datasource_factory::create(uri, registry, sirius_ctx->get_config());
   auto const object_size = datasource->size();
   if (object_size == 0) {
-    throw InvalidInputException("{} cannot bind an empty parquet object: {}",
-                                std::string(SIRIUS_READ_PARQUET_FN),
-                                uri);
+    throw InvalidInputException(
+      "{} cannot bind an empty parquet object: {}", std::string(SIRIUS_READ_PARQUET_FN), uri);
   }
 
   auto remote_bytes = datasource->host_read(0, object_size);
@@ -318,8 +316,7 @@ void infer_local_parquet_schema(ClientContext& context,
   auto bind_db = make_uniq<DuckDB>(nullptr);
   Connection bind_conn(*bind_db);
   auto result = bind_conn.Query("SELECT * FROM read_parquet('" +
-                                escape_sql_string_literal(parquet_path.string()) +
-                                "') LIMIT 0");
+                                escape_sql_string_literal(parquet_path.string()) + "') LIMIT 0");
   if (!result) {
     throw InvalidInputException("{} failed to infer parquet schema for {}",
                                 std::string(SIRIUS_READ_PARQUET_FN),
@@ -365,9 +362,7 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   return nullptr;
 }
 
-void SiriusReadParquetFunction(ClientContext&,
-                               TableFunctionInput&,
-                               DataChunk&)
+void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
 {
   throw InvalidInputException(
     "{} is an internal Sirius table function and must execute through gpu_execution",
@@ -1144,8 +1139,7 @@ static void SetS3Transport(ClientContext& context, SetScope scope, Value& parame
   auto value = StringValue::Get(parameter);
   sirius::io::object_store_config::transport t;
   if (!sirius::io::string_to_enum(std::string_view{value}, t)) {
-    throw InvalidInputException(
-      "Invalid s3_transport '{}'. Valid values: auto, http, rdma", value);
+    throw InvalidInputException("Invalid s3_transport '{}'. Valid values: auto, http, rdma", value);
   }
   cfg->s3_transport = t;
   SIRIUS_LOG_DEBUG("Updated config s3_transport to {}", value);

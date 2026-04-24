@@ -63,14 +63,15 @@ struct sigv4_signed_request {
  *
  * @throw std::invalid_argument on empty credentials.
  */
-sigv4_signed_request sign_request(std::string_view method,
-                                  std::string_view host,
-                                  std::string_view canonical_uri,
-                                  std::string_view canonical_query,
-                                  std::string_view payload_sha256_hex,
-                                  std::vector<std::pair<std::string, std::string>> const& extra_headers,
-                                  sigv4_signer_config const& creds,
-                                  std::time_t timestamp_utc);
+sigv4_signed_request sign_request(
+  std::string_view method,
+  std::string_view host,
+  std::string_view canonical_uri,
+  std::string_view canonical_query,
+  std::string_view payload_sha256_hex,
+  std::vector<std::pair<std::string, std::string>> const& extra_headers,
+  sigv4_signer_config const& creds,
+  std::time_t timestamp_utc);
 
 /// Hex-encoded SHA256 digest of @p data. Thin wrapper around OpenSSL SHA256.
 std::string sha256_hex(std::string_view data);

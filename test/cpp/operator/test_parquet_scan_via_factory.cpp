@@ -19,16 +19,15 @@
 // collides with duckdb concurrentqueue's BLOCK_SIZE identifier. Include all
 // duckdb headers BEFORE the uring headers.
 #include "catch.hpp"
-
-#include <duckdb.hpp>
-#include <duckdb/main/connection.hpp>
-
 #include "io/datasource_factory.hpp"
 #include "io/types.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "sirius_config.hpp"
 
 #include <cudf/io/datasource.hpp>
+
+#include <duckdb.hpp>
+#include <duckdb/main/connection.hpp>
 
 #include <cerrno>
 #include <cstring>
@@ -63,8 +62,8 @@ std::filesystem::path write_tiny_parquet(std::string const& label, std::size_t n
   REQUIRE(insert);
   REQUIRE(!insert->HasError());
 
-  auto path = std::filesystem::temp_directory_path() /
-              ("sirius_factory_scan_" + label + ".parquet");
+  auto path =
+    std::filesystem::temp_directory_path() / ("sirius_factory_scan_" + label + ".parquet");
   auto copy = con.Query("COPY t TO '" + path.string() + "' (FORMAT PARQUET, COMPRESSION snappy)");
   REQUIRE(copy);
   REQUIRE(!copy->HasError());

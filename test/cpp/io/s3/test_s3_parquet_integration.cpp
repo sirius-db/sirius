@@ -40,14 +40,13 @@
 // a macro that collides with a duckdb concurrentqueue identifier of the same
 // name. All duckdb headers must precede sirius io/uring headers.
 #include "catch.hpp"
-
-#include <duckdb.hpp>
-#include <duckdb/main/connection.hpp>
-
 #include "io/datasource_factory.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "sirius_config.hpp"
 #include "utils/s3_live_test.hpp"
+
+#include <duckdb.hpp>
+#include <duckdb/main/connection.hpp>
 
 #include <array>
 #include <cstdint>
@@ -79,8 +78,8 @@ struct env_cfg {
 
   bool present() const
   {
-    return !endpoint.empty() && !access_key.empty() && !secret_key.empty() &&
-           !bucket.empty() && !local_dir.empty();
+    return !endpoint.empty() && !access_key.empty() && !secret_key.empty() && !bucket.empty() &&
+           !local_dir.empty();
   }
 };
 
@@ -110,10 +109,10 @@ constexpr std::size_t NATION_ROWS = 25;
 constexpr std::array<std::int32_t, NATION_ROWS> EXPECTED_REGION_KEYS{
   0, 1, 1, 1, 4, 0, 3, 3, 2, 2, 4, 4, 2, 4, 0, 0, 0, 1, 2, 3, 4, 2, 3, 3, 1};
 constexpr std::array<char const*, NATION_ROWS> EXPECTED_NATION_NAMES{
-  "ALGERIA", "ARGENTINA", "BRAZIL", "CANADA", "EGYPT", "ETHIOPIA", "FRANCE",
-  "GERMANY", "INDIA", "INDONESIA", "IRAN", "IRAQ", "JAPAN", "JORDAN", "KENYA",
-  "MOROCCO", "MOZAMBIQUE", "PERU", "CHINA", "ROMANIA", "SAUDI ARABIA", "VIETNAM",
-  "RUSSIA", "UNITED KINGDOM", "UNITED STATES"};
+  "ALGERIA", "ARGENTINA", "BRAZIL",         "CANADA",       "EGYPT", "ETHIOPIA", "FRANCE",
+  "GERMANY", "INDIA",     "INDONESIA",      "IRAN",         "IRAQ",  "JAPAN",    "JORDAN",
+  "KENYA",   "MOROCCO",   "MOZAMBIQUE",     "PERU",         "CHINA", "ROMANIA",  "SAUDI ARABIA",
+  "VIETNAM", "RUSSIA",    "UNITED KINGDOM", "UNITED STATES"};
 
 std::int64_t expected_sum_regionkeys()
 {
@@ -187,18 +186,21 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
   // to DuckDB's parquet reader. This validates the semantic end-to-end path:
   // if the reader observes different rows than the checked-in TPCH fixture,
   // the s3 pipeline is returning wrong or truncated data.
-  auto const tmp_path = std::filesystem::temp_directory_path() /
-                        ("sirius_s3_parquet_integration_" +
-                         std::to_string(std::rand()) + ".parquet");
+  auto const tmp_path =
+    std::filesystem::temp_directory_path() /
+    ("sirius_s3_parquet_integration_" + std::to_string(std::rand()) + ".parquet");
   {
     std::ofstream out(tmp_path, std::ios::binary);
     REQUIRE(out.good());
-    out.write(reinterpret_cast<char const*>(remote->data()),
-              static_cast<std::streamsize>(n_bytes));
+    out.write(reinterpret_cast<char const*>(remote->data()), static_cast<std::streamsize>(n_bytes));
   }
   struct scoped_file {
     std::filesystem::path p;
-    ~scoped_file() { std::error_code ec; std::filesystem::remove(p, ec); }
+    ~scoped_file()
+    {
+      std::error_code ec;
+      std::filesystem::remove(p, ec);
+    }
   } cleanup{tmp_path};
 
   duckdb::DuckDB db(nullptr);
@@ -207,17 +209,16 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
   auto const parquet_ref = "read_parquet('" + tmp_path.string() + "')";
 
   // Row count + key range + region distribution.
-  auto agg = con.Query("SELECT COUNT(*)::BIGINT, MIN(n_nationkey)::INTEGER, "
-                       "MAX(n_nationkey)::INTEGER, SUM(n_regionkey)::BIGINT FROM " +
-                       parquet_ref);
+  auto agg = con.Query(
+    "SELECT COUNT(*)::BIGINT, MIN(n_nationkey)::INTEGER, "
+    "MAX(n_nationkey)::INTEGER, SUM(n_regionkey)::BIGINT FROM " +
+    parquet_ref);
   REQUIRE(agg);
   REQUIRE(!agg->HasError());
   REQUIRE(agg->RowCount() == 1);
-  CHECK(agg->GetValue(0, 0).GetValue<std::int64_t>() ==
-        static_cast<std::int64_t>(NATION_ROWS));
+  CHECK(agg->GetValue(0, 0).GetValue<std::int64_t>() == static_cast<std::int64_t>(NATION_ROWS));
   CHECK(agg->GetValue(1, 0).GetValue<std::int32_t>() == 0);
-  CHECK(agg->GetValue(2, 0).GetValue<std::int32_t>() ==
-        static_cast<std::int32_t>(NATION_ROWS - 1));
+  CHECK(agg->GetValue(2, 0).GetValue<std::int32_t>() == static_cast<std::int32_t>(NATION_ROWS - 1));
   CHECK(agg->GetValue(3, 0).GetValue<std::int64_t>() == expected_sum_regionkeys());
 
   // Spot-check boundary rows. Full-row scan below

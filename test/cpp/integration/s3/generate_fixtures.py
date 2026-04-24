@@ -31,8 +31,8 @@ from pathlib import Path
 
 
 HELLO_BYTES = b"sirius-s3-hello\n"  # exactly 16 bytes
-SMALL_SIZE = 20 * 1024              # 20 KiB
-MEDIUM_SIZE = 8 * 1024 * 1024       # 8 MiB (medium test needs > 4 MiB)
+SMALL_SIZE = 20 * 1024  # 20 KiB
+MEDIUM_SIZE = 8 * 1024 * 1024  # 8 MiB (medium test needs > 4 MiB)
 SMALL_SEED = 0xA17E57
 MEDIUM_SEED = 0xBE57ED
 
@@ -40,7 +40,9 @@ MEDIUM_SEED = 0xBE57ED
 def write_hello(out_dir: Path) -> Path:
     p = out_dir / "hello.txt"
     p.write_bytes(HELLO_BYTES)
-    assert p.stat().st_size == 16, f"hello.txt should be 16 bytes, got {p.stat().st_size}"
+    assert (
+        p.stat().st_size == 16
+    ), f"hello.txt should be 16 bytes, got {p.stat().st_size}"
     return p
 
 
@@ -105,7 +107,13 @@ def main() -> int:
 
     out_dir: Path = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    for stale in ("hello.txt", "small.bin", "medium.bin", "small.parquet", "MANIFEST.sha256"):
+    for stale in (
+        "hello.txt",
+        "small.bin",
+        "medium.bin",
+        "small.parquet",
+        "MANIFEST.sha256",
+    ):
         stale_path = out_dir / stale
         if stale_path.exists():
             stale_path.unlink()

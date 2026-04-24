@@ -45,10 +45,10 @@ TEST_CASE("sirius_config exposes mutable object_store_config", "[config][object_
 {
   sirius::sirius_config sc;
   // mutation through the non-const accessor must persist.
-  sc.get_object_store_config().endpoint   = "https://s3.example.com";
-  sc.get_object_store_config().region     = "us-west-2";
-  sc.get_object_store_config().access_key = "AKIA_TEST";
-  sc.get_object_store_config().secret_key = "shh";
+  sc.get_object_store_config().endpoint     = "https://s3.example.com";
+  sc.get_object_store_config().region       = "us-west-2";
+  sc.get_object_store_config().access_key   = "AKIA_TEST";
+  sc.get_object_store_config().secret_key   = "shh";
   sc.get_object_store_config().s3_transport = object_store_config::transport::RDMA;
 
   auto const& view = sc.get_object_store_config();

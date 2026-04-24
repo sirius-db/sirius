@@ -184,12 +184,11 @@ TEST_CASE("parse: empty host on object-store scheme rejected", "[uri]")
   CHECK_THROWS_AS(parse("s3:///key"), std::invalid_argument);
 }
 
-TEST_CASE("parse: fuzzy 10k random inputs never crash and never throw unexpected types",
-          "[uri]")
+TEST_CASE("parse: fuzzy 10k random inputs never crash and never throw unexpected types", "[uri]")
 {
   // Fixed seed for reproducibility. Alphabet includes the structural delimiters
   // the parser must navigate plus some benign content.
-  static constexpr char kAlphabet[] = "ABCabc012:/?&=%#-._~";
+  static constexpr char kAlphabet[]          = "ABCabc012:/?&=%#-._~";
   static constexpr std::size_t kAlphabetSize = sizeof(kAlphabet) - 1;
 
   std::mt19937_64 rng{0xC0FFEEULL};
@@ -201,7 +200,8 @@ TEST_CASE("parse: fuzzy 10k random inputs never crash and never throw unexpected
     buf.clear();
     auto len = len_dist(rng);
     buf.reserve(len);
-    for (std::size_t j = 0; j < len; ++j) buf.push_back(kAlphabet[ch_dist(rng)]);
+    for (std::size_t j = 0; j < len; ++j)
+      buf.push_back(kAlphabet[ch_dist(rng)]);
 
     try {
       (void)parse(buf);

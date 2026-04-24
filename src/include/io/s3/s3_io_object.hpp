@@ -36,8 +36,12 @@ namespace sirius::io::s3 {
 class s3_io_object final : public sirius_io_object {
  public:
   s3_io_object(std::string bucket, std::string key, std::size_t size)
-    : _bucket(std::move(bucket)), _key(std::move(key)), _size(size),
-      _cache_id("s3://" + _bucket + "/" + _key) {}
+    : _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _size(size),
+      _cache_id("s3://" + _bucket + "/" + _key)
+  {
+  }
 
   [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _cache_id; }
   [[nodiscard]] std::size_t size() const noexcept override { return _size; }

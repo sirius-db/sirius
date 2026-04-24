@@ -15,7 +15,6 @@
  */
 
 #include "catch.hpp"
-
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "io/uring/uring_ioctx.hpp"
@@ -68,8 +67,7 @@ class cap_probe_ioctx : public sirius_ioctx {
 
   void shutdown() override {}
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::unique_ptr<sirius_io_object>) override
+  std::unique_ptr<cudf::io::datasource> make_datasource(std::unique_ptr<sirius_io_object>) override
   {
     throw std::logic_error("cap_probe_ioctx::make_datasource: not exercised");
   }
@@ -101,8 +99,7 @@ class cap_probe_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-  size_t device_read(
-    sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
+  size_t device_read(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
   {
     throw std::logic_error("unused");
   }
@@ -111,10 +108,9 @@ class cap_probe_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-  std::future<size_t> host_read_ranges_async(
-    sirius_io_object&,
-    std::vector<cudf::io::text::byte_range_info> const&,
-    std::span<cudf::host_span<std::byte>>) override
+  std::future<size_t> host_read_ranges_async(sirius_io_object&,
+                                             std::vector<cudf::io::text::byte_range_info> const&,
+                                             std::span<cudf::host_span<std::byte>>) override
   {
     throw std::logic_error("unused");
   }
@@ -176,10 +172,8 @@ TEST_CASE("sirius_datasource_forwards_caps_from_ioctx", "[io_caps]")
     bool supports;
     bool preferred;
   };
-  for (auto const c : {case_t{true, true},
-                       case_t{true, false},
-                       case_t{false, true},
-                       case_t{false, false}}) {
+  for (auto const c :
+       {case_t{true, true}, case_t{true, false}, case_t{false, true}, case_t{false, false}}) {
     auto ctx = std::make_shared<cap_probe_ioctx>(c.supports, c.preferred);
     sirius_datasource ds{ctx, std::make_unique<mock_io_object>()};
 

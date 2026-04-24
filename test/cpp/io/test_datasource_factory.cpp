@@ -20,6 +20,9 @@
 #include "io/uring/uring_ioctx.hpp"
 #include "sirius_config.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <barrier>
 #include <cerrno>
@@ -27,7 +30,6 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -35,7 +37,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 using namespace sirius;
@@ -67,15 +68,54 @@ class mock_ioctx : public sirius_ioctx {
   [[nodiscard]] bool is_device_read_preferred(size_t) const override { return false; }
 
   // Unused read APIs — PR1 does not drive IO through the mock.
-  size_t host_read(sirius_io_object&, size_t, size_t, uint8_t*) override { throw std::logic_error("unused"); }
-  std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object&, size_t, size_t) override { throw std::logic_error("unused"); }
-  std::future<size_t> host_read_async(sirius_io_object&, size_t, size_t, uint8_t*) override { throw std::logic_error("unused"); }
-  std::future<std::unique_ptr<cudf::io::datasource::buffer>> host_read_async(sirius_io_object&, size_t, size_t) override { throw std::logic_error("unused"); }
-  std::unique_ptr<cudf::io::datasource::buffer> device_read(sirius_io_object&, size_t, size_t, rmm::cuda_stream_view) override { throw std::logic_error("unused"); }
-  size_t device_read(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override { throw std::logic_error("unused"); }
-  std::future<size_t> device_read_async(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override { throw std::logic_error("unused"); }
-  std::future<size_t> host_read_ranges_async(sirius_io_object&, std::vector<cudf::io::text::byte_range_info> const&, std::span<cudf::host_span<std::byte>>) override { throw std::logic_error("unused"); }
-  size_t host_read_ranges(sirius_io_object&, std::vector<cudf::io::text::byte_range_info> const&, std::span<cudf::host_span<std::byte>>) override { throw std::logic_error("unused"); }
+  size_t host_read(sirius_io_object&, size_t, size_t, uint8_t*) override
+  {
+    throw std::logic_error("unused");
+  }
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object&,
+                                                          size_t,
+                                                          size_t) override
+  {
+    throw std::logic_error("unused");
+  }
+  std::future<size_t> host_read_async(sirius_io_object&, size_t, size_t, uint8_t*) override
+  {
+    throw std::logic_error("unused");
+  }
+  std::future<std::unique_ptr<cudf::io::datasource::buffer>> host_read_async(sirius_io_object&,
+                                                                             size_t,
+                                                                             size_t) override
+  {
+    throw std::logic_error("unused");
+  }
+  std::unique_ptr<cudf::io::datasource::buffer> device_read(sirius_io_object&,
+                                                            size_t,
+                                                            size_t,
+                                                            rmm::cuda_stream_view) override
+  {
+    throw std::logic_error("unused");
+  }
+  size_t device_read(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
+  {
+    throw std::logic_error("unused");
+  }
+  std::future<size_t> device_read_async(
+    sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
+  {
+    throw std::logic_error("unused");
+  }
+  std::future<size_t> host_read_ranges_async(sirius_io_object&,
+                                             std::vector<cudf::io::text::byte_range_info> const&,
+                                             std::span<cudf::host_span<std::byte>>) override
+  {
+    throw std::logic_error("unused");
+  }
+  size_t host_read_ranges(sirius_io_object&,
+                          std::vector<cudf::io::text::byte_range_info> const&,
+                          std::span<cudf::host_span<std::byte>>) override
+  {
+    throw std::logic_error("unused");
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -97,7 +137,11 @@ class scoped_temp_file {
     os.write(contents.data(), static_cast<std::streamsize>(contents.size()));
   }
 
-  ~scoped_temp_file() { std::error_code ec; std::filesystem::remove(_path, ec); }
+  ~scoped_temp_file()
+  {
+    std::error_code ec;
+    std::filesystem::remove(_path, ec);
+  }
 
   scoped_temp_file(scoped_temp_file const&)            = delete;
   scoped_temp_file& operator=(scoped_temp_file const&) = delete;
@@ -138,20 +182,17 @@ TEST_CASE("datasource_factory::extract_scheme — basic forms", "[datasource_fac
   CHECK(datasource_factory::extract_scheme("gs://bucket/key") == "gs");
   CHECK(datasource_factory::extract_scheme("rdma_s3://bucket/key") == "rdma_s3");
   // PR8 rejects relative bare paths; callers must pass absolute or scheme://.
-  CHECK_THROWS_AS(datasource_factory::extract_scheme("relative/f.parquet"),
-                  std::invalid_argument);
+  CHECK_THROWS_AS(datasource_factory::extract_scheme("relative/f.parquet"), std::invalid_argument);
   CHECK_THROWS_AS(datasource_factory::extract_scheme("file.parquet"), std::invalid_argument);
 }
 
-TEST_CASE("datasource_factory::extract_scheme — malformed URIs throw",
-          "[datasource_factory]")
+TEST_CASE("datasource_factory::extract_scheme — malformed URIs throw", "[datasource_factory]")
 {
   CHECK_THROWS_AS(datasource_factory::extract_scheme(""), std::invalid_argument);
   CHECK_THROWS_AS(datasource_factory::extract_scheme("://nopath"), std::invalid_argument);
 }
 
-TEST_CASE("datasource_factory::extract_path — strips scheme delimiter",
-          "[datasource_factory]")
+TEST_CASE("datasource_factory::extract_path — strips scheme delimiter", "[datasource_factory]")
 {
   CHECK(datasource_factory::extract_path("/abs/path.parquet") == "/abs/path.parquet");
   CHECK(datasource_factory::extract_path("file:///abs/path.parquet") == "/abs/path.parquet");
@@ -189,17 +230,14 @@ TEST_CASE("datasource_registry — register, lookup, clear", "[datasource_factor
   CHECK(reg.lookup("file") == nullptr);
 }
 
-TEST_CASE("datasource_registry — rejects null ioctx / empty scheme",
-          "[datasource_factory]")
+TEST_CASE("datasource_registry — rejects null ioctx / empty scheme", "[datasource_factory]")
 {
   datasource_registry reg;
-  CHECK_THROWS_AS(reg.register_ioctx("", std::make_shared<mock_ioctx>()),
-                  std::invalid_argument);
+  CHECK_THROWS_AS(reg.register_ioctx("", std::make_shared<mock_ioctx>()), std::invalid_argument);
   CHECK_THROWS_AS(reg.register_ioctx("file", nullptr), std::invalid_argument);
 }
 
-TEST_CASE("datasource_registry — thread-safe for concurrent lookup",
-          "[datasource_factory]")
+TEST_CASE("datasource_registry — thread-safe for concurrent lookup", "[datasource_factory]")
 {
   datasource_registry reg;
   auto ctx = std::make_shared<mock_ioctx>();
@@ -220,7 +258,8 @@ TEST_CASE("datasource_registry — thread-safe for concurrent lookup",
       }
     });
   }
-  for (auto& th : threads) th.join();
+  for (auto& th : threads)
+    th.join();
   CHECK(hits.load() == n_threads * n_iters);
 }
 
@@ -228,27 +267,22 @@ TEST_CASE("datasource_registry — thread-safe for concurrent lookup",
 // datasource_factory::create — negative paths
 // ===========================================================================
 
-TEST_CASE("datasource_factory::create — empty URI rejected",
-          "[datasource_factory]")
+TEST_CASE("datasource_factory::create — empty URI rejected", "[datasource_factory]")
 {
   datasource_registry reg;
   sirius_config cfg;
   CHECK_THROWS_AS(datasource_factory::create("", reg, cfg), std::invalid_argument);
 }
 
-TEST_CASE("datasource_factory::create — throws when scheme unregistered",
-          "[datasource_factory]")
+TEST_CASE("datasource_factory::create — throws when scheme unregistered", "[datasource_factory]")
 {
   datasource_registry reg;
   sirius_config cfg;
-  CHECK_THROWS_AS(datasource_factory::create("s3://bucket/key", reg, cfg),
-                  std::runtime_error);
-  CHECK_THROWS_AS(datasource_factory::create("/data/file.parquet", reg, cfg),
-                  std::runtime_error);
+  CHECK_THROWS_AS(datasource_factory::create("s3://bucket/key", reg, cfg), std::runtime_error);
+  CHECK_THROWS_AS(datasource_factory::create("/data/file.parquet", reg, cfg), std::runtime_error);
 }
 
-TEST_CASE("datasource_factory::create — s3 scheme requires an s3_ioctx",
-          "[datasource_factory]")
+TEST_CASE("datasource_factory::create — s3 scheme requires an s3_ioctx", "[datasource_factory]")
 {
   // PR9: s3:// is wired, but construction still requires the registered ioctx
   // to actually be an s3::s3_ioctx (it must HEAD the object to cache size).
@@ -270,8 +304,7 @@ TEST_CASE("datasource_factory::create — s3 scheme requires an s3_ioctx",
 // datasource_factory::create — happy path with a real uring_ioctx
 // ===========================================================================
 
-TEST_CASE("datasource_factory::create — dispatches file:// to uring_ioctx",
-          "[datasource_factory]")
+TEST_CASE("datasource_factory::create — dispatches file:// to uring_ioctx", "[datasource_factory]")
 {
   auto ctx = try_make_uring_ioctx();
   if (!ctx) {
@@ -290,8 +323,10 @@ TEST_CASE("datasource_factory::create — dispatches file:// to uring_ioctx",
   } catch (std::exception const& e) {
     // Some sandboxes (e.g. tmpfs) reject O_DIRECT. That's a runtime
     // capability, not a factory defect.
-    WARN("uring_io_object could not open temp file (likely no O_DIRECT "
-         "support): " << e.what());
+    WARN(
+      "uring_io_object could not open temp file (likely no O_DIRECT "
+      "support): "
+      << e.what());
     SUCCEED("Skipping: filesystem does not support O_DIRECT");
     return;
   }

@@ -54,8 +54,8 @@ struct env_cfg {
 
   bool present() const
   {
-    return !endpoint.empty() && !access_key.empty() && !secret_key.empty() &&
-           !bucket.empty() && !key.empty();
+    return !endpoint.empty() && !access_key.empty() && !secret_key.empty() && !bucket.empty() &&
+           !key.empty();
   }
 };
 
@@ -98,8 +98,7 @@ TEST_CASE("s3_ioctx: ctor rejects empty credentials", "[s3][ioctx]")
   CHECK_THROWS_AS(s3_ioctx{cfg}, std::invalid_argument);
 }
 
-TEST_CASE("s3_ioctx: ctor rejects malformed endpoint (no scheme)",
-          "[s3][ioctx]")
+TEST_CASE("s3_ioctx: ctor rejects malformed endpoint (no scheme)", "[s3][ioctx]")
 {
   s3_ioctx_config cfg;
   cfg.endpoint   = "127.0.0.1:9000";
@@ -122,9 +121,8 @@ TEST_CASE("s3_ioctx: HEAD + range GET against live endpoint", "[s3][ioctx][integ
   try {
     obj_size = ctx->head_object_size(e.bucket, e.key);
   } catch (std::exception const& ex) {
-    sirius::test::s3::handle_live_runtime_failure("HEAD failed",
-                                                  ex,
-                                                  "Skipping: endpoint unreachable or object missing");
+    sirius::test::s3::handle_live_runtime_failure(
+      "HEAD failed", ex, "Skipping: endpoint unreachable or object missing");
     return;
   }
   REQUIRE(obj_size > 0);
@@ -139,11 +137,11 @@ TEST_CASE("s3_ioctx: HEAD + range GET against live endpoint", "[s3][ioctx][integ
   auto partial = std::min<std::size_t>(16, obj_size);
   std::vector<std::uint8_t> head(partial);
   CHECK(ctx->host_read(*obj, 0, partial, head.data()) == partial);
-  for (std::size_t i = 0; i < partial; ++i) CHECK(head[i] == buf[i]);
+  for (std::size_t i = 0; i < partial; ++i)
+    CHECK(head[i] == buf[i]);
 }
 
-TEST_CASE("datasource_factory: end-to-end s3:// via live endpoint",
-          "[s3][ioctx][integration]")
+TEST_CASE("datasource_factory: end-to-end s3:// via live endpoint", "[s3][ioctx][integration]")
 {
   auto e = read_env();
   if (!e.present()) {

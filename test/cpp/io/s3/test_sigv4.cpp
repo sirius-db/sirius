@@ -39,26 +39,24 @@ std::string auth_of(sirius::io::s3::sigv4_signed_request const& r)
 
 TEST_CASE("sha256_hex: empty string digest", "[s3][sigv4]")
 {
-  CHECK(sha256_hex("") ==
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  CHECK(sha256_hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
 
 TEST_CASE("sha256_hex: 'abc' digest", "[s3][sigv4]")
 {
-  CHECK(sha256_hex("abc") ==
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  CHECK(sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }
 
 TEST_CASE("uri_encode: alphanumerics + unreserved pass through", "[s3][sigv4]")
 {
   CHECK(uri_encode("Abc-_.~", /*encode_slash=*/false) == "Abc-_.~");
-  CHECK(uri_encode("Abc-_.~", /*encode_slash=*/true)  == "Abc-_.~");
+  CHECK(uri_encode("Abc-_.~", /*encode_slash=*/true) == "Abc-_.~");
 }
 
 TEST_CASE("uri_encode: slash preserved when encode_slash=false", "[s3][sigv4]")
 {
   CHECK(uri_encode("a/b/c", /*encode_slash=*/false) == "a/b/c");
-  CHECK(uri_encode("a/b/c", /*encode_slash=*/true)  == "a%2Fb%2Fc");
+  CHECK(uri_encode("a/b/c", /*encode_slash=*/true) == "a%2Fb%2Fc");
 }
 
 TEST_CASE("uri_encode: space becomes %20 with uppercase hex", "[s3][sigv4]")
@@ -72,13 +70,11 @@ TEST_CASE("sign_request: rejects empty credentials", "[s3][sigv4]")
 {
   sigv4_signer_config bad;
   bad.region = "us-east-1";
-  CHECK_THROWS_AS(sign_request("GET", "example.com", "/", "", sha256_hex(""),
-                               {}, bad, 0),
+  CHECK_THROWS_AS(sign_request("GET", "example.com", "/", "", sha256_hex(""), {}, bad, 0),
                   std::invalid_argument);
 }
 
-TEST_CASE("sign_request: produces expected signature for AWS 'get-vanilla' vector",
-          "[s3][sigv4]")
+TEST_CASE("sign_request: produces expected signature for AWS 'get-vanilla' vector", "[s3][sigv4]")
 {
   // Reference vector from the AWS SigV4 test-suite "get-vanilla":
   //   https://docs.aws.amazon.com/general/latest/gr/signature-v4-test-suite.html
@@ -106,16 +102,14 @@ TEST_CASE("sign_request: produces expected signature for AWS 'get-vanilla' vecto
   creds.service    = "service";
 
   std::time_t ts = 1315611360;  // 20110909T233600Z
-  auto out = sign_request("GET", "example.amazonaws.com", "/", "",
-                          sha256_hex(""), {}, creds, ts);
+  auto out = sign_request("GET", "example.amazonaws.com", "/", "", sha256_hex(""), {}, creds, ts);
 
   auto auth = auth_of(out);
   REQUIRE_FALSE(auth.empty());
   CHECK(auth.find("AWS4-HMAC-SHA256 ") == 0);
   CHECK(auth.find("Credential=AKIDEXAMPLE/20110909/us-east-1/service/aws4_request") !=
         std::string::npos);
-  CHECK(auth.find("SignedHeaders=host;x-amz-content-sha256;x-amz-date") !=
-        std::string::npos);
+  CHECK(auth.find("SignedHeaders=host;x-amz-content-sha256;x-amz-date") != std::string::npos);
   // x-amz-date header is present and correctly formatted.
   bool found_date = false;
   for (auto const& [k, v] : out.headers) {
@@ -127,8 +121,7 @@ TEST_CASE("sign_request: produces expected signature for AWS 'get-vanilla' vecto
   CHECK(found_date);
 }
 
-TEST_CASE("sign_request: same inputs produce same Authorization (determinism)",
-          "[s3][sigv4]")
+TEST_CASE("sign_request: same inputs produce same Authorization (determinism)", "[s3][sigv4]")
 {
   sigv4_signer_config creds;
   creds.access_key = "AKIDEXAMPLE";
@@ -136,10 +129,10 @@ TEST_CASE("sign_request: same inputs produce same Authorization (determinism)",
   creds.region     = "us-west-2";
   creds.service    = "s3";
 
-  auto a = sign_request("GET", "bucket.s3.us-west-2.amazonaws.com", "/key", "",
-                        sha256_hex(""), {}, creds, 1700000000);
-  auto b = sign_request("GET", "bucket.s3.us-west-2.amazonaws.com", "/key", "",
-                        sha256_hex(""), {}, creds, 1700000000);
+  auto a = sign_request(
+    "GET", "bucket.s3.us-west-2.amazonaws.com", "/key", "", sha256_hex(""), {}, creds, 1700000000);
+  auto b = sign_request(
+    "GET", "bucket.s3.us-west-2.amazonaws.com", "/key", "", sha256_hex(""), {}, creds, 1700000000);
   CHECK(auth_of(a) == auth_of(b));
 }
 
@@ -150,10 +143,9 @@ TEST_CASE("sign_request: extra headers influence the signature", "[s3][sigv4]")
   creds.secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
   creds.region     = "us-east-1";
 
-  auto a = sign_request("GET", "example.com", "/", "",
-                        sha256_hex(""), {}, creds, 1700000000);
-  auto b = sign_request("GET", "example.com", "/", "",
-                        sha256_hex(""), {{"range", "bytes=0-99"}}, creds, 1700000000);
+  auto a = sign_request("GET", "example.com", "/", "", sha256_hex(""), {}, creds, 1700000000);
+  auto b = sign_request(
+    "GET", "example.com", "/", "", sha256_hex(""), {{"range", "bytes=0-99"}}, creds, 1700000000);
   CHECK(auth_of(a) != auth_of(b));
   // And the range header must be emitted verbatim so the caller can attach it.
   bool found_range = false;
@@ -176,9 +168,8 @@ TEST_CASE("sign_request: changing the timestamp changes the signature", "[s3][si
   creds.secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
   creds.region     = "us-east-1";
 
-  auto a = sign_request("GET", "example.com", "/", "", sha256_hex(""),
-                        {}, creds, 1700000000);
-  auto b = sign_request("GET", "example.com", "/", "", sha256_hex(""),
-                        {}, creds, 1700086400);  // +1 day
+  auto a = sign_request("GET", "example.com", "/", "", sha256_hex(""), {}, creds, 1700000000);
+  auto b =
+    sign_request("GET", "example.com", "/", "", sha256_hex(""), {}, creds, 1700086400);  // +1 day
   CHECK(auth_of(a) != auth_of(b));
 }

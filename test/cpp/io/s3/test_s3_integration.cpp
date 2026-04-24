@@ -68,8 +68,8 @@ struct env_cfg {
 
   bool present() const
   {
-    return !endpoint.empty() && !access_key.empty() && !secret_key.empty() &&
-           !bucket.empty() && !local_dir.empty();
+    return !endpoint.empty() && !access_key.empty() && !secret_key.empty() && !bucket.empty() &&
+           !local_dir.empty();
   }
 };
 
@@ -127,8 +127,7 @@ bool skip_if_env_missing(env_cfg const& e)
 
 }  // namespace
 
-TEST_CASE("s3_integration: hello.txt bytes match local fixture exactly",
-          "[s3][integration]")
+TEST_CASE("s3_integration: hello.txt bytes match local fixture exactly", "[s3][integration]")
 {
   auto e = read_env();
   if (skip_if_env_missing(e)) return;
@@ -137,7 +136,7 @@ TEST_CASE("s3_integration: hello.txt bytes match local fixture exactly",
   auto const local      = read_file_bytes(local_path);
   REQUIRE(local.size() == 16);
 
-  auto ctx = make_ctx(e);
+  auto ctx                = make_ctx(e);
   std::size_t object_size = 0;
   try {
     object_size = ctx->head_object_size(e.bucket, "hello.txt");
@@ -155,8 +154,7 @@ TEST_CASE("s3_integration: hello.txt bytes match local fixture exactly",
   CHECK(std::memcmp(remote.data(), local.data(), object_size) == 0);
 }
 
-TEST_CASE("s3_integration: small.bin bit-equal via factory",
-          "[s3][integration]")
+TEST_CASE("s3_integration: small.bin bit-equal via factory", "[s3][integration]")
 {
   auto e = read_env();
   if (skip_if_env_missing(e)) return;
@@ -191,13 +189,12 @@ TEST_CASE("s3_integration: small.bin bit-equal via factory",
   // Small tail fetch: mirrors the access pattern a parquet reader would use
   // when probing the footer at the end of an object.
   constexpr std::size_t tail = 8;
-  auto tail_buf = ds->host_read(local.size() - tail, tail);
+  auto tail_buf              = ds->host_read(local.size() - tail, tail);
   REQUIRE(tail_buf->size() == tail);
   CHECK(std::memcmp(tail_buf->data(), local.data() + local.size() - tail, tail) == 0);
 }
 
-TEST_CASE("s3_integration: multi-range reads on medium.bin match local bytes",
-          "[s3][integration]")
+TEST_CASE("s3_integration: multi-range reads on medium.bin match local bytes", "[s3][integration]")
 {
   auto e = read_env();
   if (skip_if_env_missing(e)) return;
@@ -206,7 +203,7 @@ TEST_CASE("s3_integration: multi-range reads on medium.bin match local bytes",
   auto const local      = read_file_bytes(local_path);
   REQUIRE(local.size() > 4 * 1024 * 1024);  // expect at least 4 MiB
 
-  auto ctx = make_ctx(e);
+  auto ctx                = make_ctx(e);
   std::size_t object_size = 0;
   try {
     object_size = ctx->head_object_size(e.bucket, "medium.bin");
@@ -221,11 +218,13 @@ TEST_CASE("s3_integration: multi-range reads on medium.bin match local bytes",
 
   // Four disjoint 512 KB windows spread across the file. Using odd offsets
   // ensures we are not accidentally aligned to MinIO's internal chunk size.
-  struct range { std::size_t off, len; };
+  struct range {
+    std::size_t off, len;
+  };
   std::array<range, 4> const windows{{
-    {1,                      512 * 1024},
-    {object_size / 4 + 123,  512 * 1024},
-    {object_size / 2 + 777,  512 * 1024},
+    {1, 512 * 1024},
+    {object_size / 4 + 123, 512 * 1024},
+    {object_size / 2 + 777, 512 * 1024},
     {object_size - 512 * 1024 - 17, 512 * 1024},
   }};
 
@@ -238,21 +237,18 @@ TEST_CASE("s3_integration: multi-range reads on medium.bin match local bytes",
   }
 }
 
-TEST_CASE("s3_integration: HEAD on missing key reports an error",
-          "[s3][integration]")
+TEST_CASE("s3_integration: HEAD on missing key reports an error", "[s3][integration]")
 {
   auto e = read_env();
   if (skip_if_env_missing(e)) return;
 
   auto ctx = make_ctx(e);
-  CHECK_THROWS_AS(ctx->head_object_size(e.bucket,
-                                        "definitely-does-not-exist-" +
-                                          std::to_string(std::rand())),
-                  std::runtime_error);
+  CHECK_THROWS_AS(
+    ctx->head_object_size(e.bucket, "definitely-does-not-exist-" + std::to_string(std::rand())),
+    std::runtime_error);
 }
 
-TEST_CASE("s3_integration: bad credentials rejected at HEAD",
-          "[s3][integration]")
+TEST_CASE("s3_integration: bad credentials rejected at HEAD", "[s3][integration]")
 {
   auto e = read_env();
   if (skip_if_env_missing(e)) return;

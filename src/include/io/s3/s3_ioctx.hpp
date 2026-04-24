@@ -94,35 +94,41 @@ class s3_ioctx final : public sirius_ioctx {
 
   // -- Read APIs ------------------------------------------------------------
 
-  std::size_t host_read(sirius_io_object& obj, std::size_t offset,
-                        std::size_t size, std::uint8_t* dst) override;
+  std::size_t host_read(sirius_io_object& obj,
+                        std::size_t offset,
+                        std::size_t size,
+                        std::uint8_t* dst) override;
 
-  std::unique_ptr<cudf::io::datasource::buffer> host_read(
-    sirius_io_object& obj, std::size_t offset, std::size_t size) override;
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object& obj,
+                                                          std::size_t offset,
+                                                          std::size_t size) override;
 
-  std::future<std::size_t> host_read_async(sirius_io_object& obj, std::size_t offset,
-                                           std::size_t size, std::uint8_t* dst) override;
+  std::future<std::size_t> host_read_async(sirius_io_object& obj,
+                                           std::size_t offset,
+                                           std::size_t size,
+                                           std::uint8_t* dst) override;
 
   std::future<std::unique_ptr<cudf::io::datasource::buffer>> host_read_async(
     sirius_io_object& obj, std::size_t offset, std::size_t size) override;
 
   // Device reads are not supported for S3. These overloads throw.
-  std::unique_ptr<cudf::io::datasource::buffer> device_read(
-    sirius_io_object&, std::size_t, std::size_t, rmm::cuda_stream_view) override;
-  std::size_t device_read(sirius_io_object&, std::size_t, std::size_t,
-                          std::uint8_t*, rmm::cuda_stream_view) override;
-  std::future<std::size_t> device_read_async(sirius_io_object&, std::size_t, std::size_t,
-                                             std::uint8_t*, rmm::cuda_stream_view) override;
+  std::unique_ptr<cudf::io::datasource::buffer> device_read(sirius_io_object&,
+                                                            std::size_t,
+                                                            std::size_t,
+                                                            rmm::cuda_stream_view) override;
+  std::size_t device_read(
+    sirius_io_object&, std::size_t, std::size_t, std::uint8_t*, rmm::cuda_stream_view) override;
+  std::future<std::size_t> device_read_async(
+    sirius_io_object&, std::size_t, std::size_t, std::uint8_t*, rmm::cuda_stream_view) override;
 
   std::future<std::size_t> host_read_ranges_async(
     sirius_io_object& obj,
     std::vector<cudf::io::text::byte_range_info> const& ranges,
     std::span<cudf::host_span<std::byte>> dst) override;
 
-  std::size_t host_read_ranges(
-    sirius_io_object& obj,
-    std::vector<cudf::io::text::byte_range_info> const& ranges,
-    std::span<cudf::host_span<std::byte>> dst) override;
+  std::size_t host_read_ranges(sirius_io_object& obj,
+                               std::vector<cudf::io::text::byte_range_info> const& ranges,
+                               std::span<cudf::host_span<std::byte>> dst) override;
 
  private:
   struct handle_slot;
@@ -134,8 +140,11 @@ class s3_ioctx final : public sirius_ioctx {
 
   /// Core: sign + issue a GET with Range header, write body into @p dst.
   /// Returns bytes actually received.
-  std::size_t range_get(std::string_view bucket, std::string_view key,
-                        std::size_t offset, std::size_t size, std::uint8_t* dst);
+  std::size_t range_get(std::string_view bucket,
+                        std::string_view key,
+                        std::size_t offset,
+                        std::size_t size,
+                        std::uint8_t* dst);
 
   /// RAII wrapper around an easy-handle loan.
   struct handle_slot {
@@ -174,8 +183,8 @@ class s3_ioctx final : public sirius_ioctx {
 
   std::mutex _pool_mtx;
   std::condition_variable _pool_cv;
-  std::vector<void*> _free_handles;     ///< Available CURL*.
-  std::size_t _total_handles{0};        ///< Handles ever allocated; capped at _cfg.max_connections.
+  std::vector<void*> _free_handles;  ///< Available CURL*.
+  std::size_t _total_handles{0};     ///< Handles ever allocated; capped at _cfg.max_connections.
   bool _shutdown{false};
 };
 

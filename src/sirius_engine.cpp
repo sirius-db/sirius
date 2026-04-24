@@ -96,8 +96,8 @@ io::datasource_registry& sirius_engine::datasource_registry()
           scfg.region     = osc.region.empty() ? "us-east-1" : osc.region;
           scfg.access_key = osc.access_key;
           scfg.secret_key = osc.secret_key;
-          datasource_registry_->register_ioctx(
-            "s3", std::make_shared<io::s3::s3_ioctx>(std::move(scfg)));
+          datasource_registry_->register_ioctx("s3",
+                                               std::make_shared<io::s3::s3_ioctx>(std::move(scfg)));
         } catch (std::exception const& e) {
           SIRIUS_LOG_WARN("sirius_engine: failed to register s3 backend: {}", e.what());
         }

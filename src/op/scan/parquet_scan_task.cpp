@@ -527,9 +527,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   if (!_datasource) {
     auto& engine = g_state.get_pipeline()->get_engine();
     _datasource  = io::datasource_factory::create(
-      g_state.get_file_path(l_state.get_file_idx()),
-      engine.datasource_registry(),
-      engine.config());
+      g_state.get_file_path(l_state.get_file_idx()), engine.datasource_registry(), engine.config());
   }
 
   auto reader = g_state.make_reader(l_state.get_file_idx());

@@ -16,6 +16,14 @@
 
 #pragma once
 
+// linux/fs.h (included by liburing.h) defines BLOCK_SIZE as a macro, which
+// conflicts with moodycamel::ConcurrentQueue::BLOCK_SIZE. Include concurrentqueue
+// headers first, or undefine BLOCK_SIZE before including them.
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
+
+#include "blockingconcurrentqueue.h"
 #include "concurrentqueue.h"
 #include "io/types.hpp"
 

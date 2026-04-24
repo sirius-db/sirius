@@ -51,7 +51,8 @@ std::vector<std::string> datasource_registry::schemes() const
   std::shared_lock lk{_mtx};
   std::vector<std::string> out;
   out.reserve(_ioctxs.size());
-  for (auto const& [scheme, _] : _ioctxs) out.push_back(scheme);
+  for (auto const& [scheme, _] : _ioctxs)
+    out.push_back(scheme);
   return out;
 }
 
@@ -96,14 +97,12 @@ std::unique_ptr<io_datasource> datasource_factory::create(std::string_view uri,
     io_object = std::make_unique<uring_io_object>(std::move(p.path));
   } else if (p.scheme == kS3Scheme) {
     // s3://bucket/key — host carries the bucket, path carries the key.
-    if (p.host.empty())
-      throw std::invalid_argument("datasource_factory: s3 URI missing bucket");
+    if (p.host.empty()) throw std::invalid_argument("datasource_factory: s3 URI missing bucket");
     auto* s3_ctx = dynamic_cast<s3::s3_ioctx*>(ioctx.get());
     if (!s3_ctx)
       throw std::runtime_error("datasource_factory: scheme 's3' registered with non-s3 ioctx");
     auto obj_size = s3_ctx->head_object_size(p.host, p.path);
-    io_object =
-      std::make_unique<s3::s3_io_object>(std::move(p.host), std::move(p.path), obj_size);
+    io_object = std::make_unique<s3::s3_io_object>(std::move(p.host), std::move(p.path), obj_size);
   } else {
     throw std::runtime_error("datasource_factory: scheme '" + p.scheme +
                              "' is registered but object construction is not yet implemented");

@@ -33,8 +33,7 @@ inline std::string getenv_or(char const* key, char const* dflt = "")
 inline bool strict_mode_enabled()
 {
   auto const value = getenv_or("SIRIUS_TEST_S3_STRICT", "0");
-  return value == "1" || value == "true" || value == "TRUE" || value == "yes" ||
-         value == "on";
+  return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "on";
 }
 
 inline void handle_live_runtime_failure(std::string const& action,

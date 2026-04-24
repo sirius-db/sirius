@@ -20,15 +20,13 @@
 // all duckdb headers (and anything that pulls them in) BEFORE the uring
 // headers.
 #include "catch.hpp"
-#include "sirius_engine.hpp"
-#include "sirius_interface.hpp"
-
-#include <duckdb.hpp>
-#include <duckdb/main/connection.hpp>
-
+#include "duckdb.hpp"
+#include "duckdb/main/connection.hpp"
 #include "io/datasource_factory.hpp"
 #include "io/types.hpp"
 #include "io/uring/uring_ioctx.hpp"
+#include "sirius_engine.hpp"
+#include "sirius_interface.hpp"
 
 #include <exception>
 #include <memory>

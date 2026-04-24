@@ -42,7 +42,8 @@ namespace {
 // is intentionally not called: it races with late-destroyed static curl
 // handles in third-party libs and AWS SDK has hit this too. The leak is bounded.
 struct curl_global_init_once {
-  curl_global_init_once() {
+  curl_global_init_once()
+  {
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0)
       throw std::runtime_error("s3_ioctx: curl_global_init failed");
   }
@@ -88,13 +89,13 @@ void parse_endpoint(std::string_view endpoint, std::string& scheme, std::string&
   auto pos = endpoint.find("://");
   if (pos == std::string_view::npos)
     throw std::invalid_argument("s3_ioctx: endpoint must start with http(s)://");
-  scheme = std::string(endpoint.substr(0, pos));
+  scheme                = std::string(endpoint.substr(0, pos));
   std::string_view rest = endpoint.substr(pos + 3);
   // Trim trailing slash; libcurl handles both but canonical host must not.
-  while (!rest.empty() && rest.back() == '/') rest.remove_suffix(1);
+  while (!rest.empty() && rest.back() == '/')
+    rest.remove_suffix(1);
   host_port = std::string(rest);
-  if (host_port.empty())
-    throw std::invalid_argument("s3_ioctx: endpoint has no host");
+  if (host_port.empty()) throw std::invalid_argument("s3_ioctx: endpoint has no host");
 }
 
 }  // namespace
@@ -105,9 +106,7 @@ void parse_endpoint(std::string_view endpoint, std::string& scheme, std::string&
 
 void s3_ioctx::handle_slot::reset()
 {
-  if (owner && easy) {
-    owner->release_handle(handle_slot{owner, easy});
-  }
+  if (owner && easy) { owner->release_handle(handle_slot{owner, easy}); }
   owner = nullptr;
   easy  = nullptr;
 }
@@ -118,8 +117,7 @@ void s3_ioctx::handle_slot::reset()
 
 s3_ioctx::s3_ioctx(s3_ioctx_config config) : _cfg(std::move(config))
 {
-  if (_cfg.endpoint.empty())
-    throw std::invalid_argument("s3_ioctx: endpoint is required");
+  if (_cfg.endpoint.empty()) throw std::invalid_argument("s3_ioctx: endpoint is required");
   if (_cfg.access_key.empty() || _cfg.secret_key.empty())
     throw std::invalid_argument("s3_ioctx: credentials are required");
   if (_cfg.max_connections == 0) _cfg.max_connections = 1;
@@ -147,7 +145,8 @@ void s3_ioctx::shutdown()
     _free_handles.clear();
   }
   _pool_cv.notify_all();
-  for (auto* h : to_free) curl_easy_cleanup(static_cast<CURL*>(h));
+  for (auto* h : to_free)
+    curl_easy_cleanup(static_cast<CURL*>(h));
 }
 
 std::unique_ptr<cudf::io::datasource> s3_ioctx::make_datasource(
@@ -182,7 +181,7 @@ s3_ioctx::handle_slot s3_ioctx::acquire_handle()
 
 void s3_ioctx::release_handle(handle_slot slot)
 {
-  void* h = slot.easy;
+  void* h    = slot.easy;
   slot.easy  = nullptr;
   slot.owner = nullptr;
   if (!h) return;
@@ -210,13 +209,19 @@ std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view
 
   // Canonical URI: "/bucket/uri_encode(key, encode_slash=false)" — path-style.
   // Slashes inside key are allowed to pass through so that "a/b/c" works.
-  std::string canonical_uri = "/" + std::string(bucket) + "/" + uri_encode(key, /*encode_slash=*/false);
-  std::string url           = _url_scheme + "://" + _host_header + canonical_uri;
+  std::string canonical_uri =
+    "/" + std::string(bucket) + "/" + uri_encode(key, /*encode_slash=*/false);
+  std::string url = _url_scheme + "://" + _host_header + canonical_uri;
 
   std::string empty_sha = sha256_hex("");
-  auto signed_req = sign_request("HEAD", _host_header, canonical_uri, /*canonical_query=*/"",
-                                 empty_sha, /*extra_headers=*/{},
-                                 _creds, std::time(nullptr));
+  auto signed_req       = sign_request("HEAD",
+                                 _host_header,
+                                 canonical_uri,
+                                 /*canonical_query=*/"",
+                                 empty_sha,
+                                 /*extra_headers=*/{},
+                                 _creds,
+                                 std::time(nullptr));
 
   struct curl_slist* hdrs = nullptr;
   for (auto const& [k, v] : signed_req.headers) {
@@ -227,8 +232,7 @@ std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view
   curl_easy_setopt(h, CURLOPT_URL, url.c_str());
   curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
   curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
-  if (_cfg.request_timeout_s > 0)
-    curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+  if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
 
   auto rc = curl_easy_perform(h);
   curl_slist_free_all(hdrs);
@@ -242,22 +246,25 @@ std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view
     os << "s3_ioctx: HEAD " << bucket << "/" << key << " returned HTTP " << http_code;
     throw std::runtime_error(os.str());
   }
-  curl_off_t clen = -1;
-  curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &clen);
-  if (clen < 0)
-    throw std::runtime_error("s3_ioctx: HEAD response missing Content-Length");
-  return static_cast<std::size_t>(clen);
+  curl_off_t content_len = -1;
+  curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_len);
+  if (content_len < 0) throw std::runtime_error("s3_ioctx: HEAD response missing Content-Length");
+  return static_cast<std::size_t>(content_len);
 }
 
-std::size_t s3_ioctx::range_get(std::string_view bucket, std::string_view key,
-                                std::size_t offset, std::size_t size, std::uint8_t* dst)
+std::size_t s3_ioctx::range_get(std::string_view bucket,
+                                std::string_view key,
+                                std::size_t offset,
+                                std::size_t size,
+                                std::uint8_t* dst)
 {
   if (size == 0) return 0;
   auto slot = acquire_handle();
   auto* h   = static_cast<CURL*>(slot.easy);
 
-  std::string canonical_uri = "/" + std::string(bucket) + "/" + uri_encode(key, /*encode_slash=*/false);
-  std::string url           = _url_scheme + "://" + _host_header + canonical_uri;
+  std::string canonical_uri =
+    "/" + std::string(bucket) + "/" + uri_encode(key, /*encode_slash=*/false);
+  std::string url = _url_scheme + "://" + _host_header + canonical_uri;
 
   // Range: bytes=offset-(offset+size-1). HTTP range is inclusive.
   std::ostringstream range_os;
@@ -265,9 +272,15 @@ std::size_t s3_ioctx::range_get(std::string_view bucket, std::string_view key,
   std::string range_value = range_os.str();
 
   std::vector<std::pair<std::string, std::string>> extras = {{"range", range_value}};
-  std::string empty_sha = sha256_hex("");
-  auto signed_req = sign_request("GET", _host_header, canonical_uri, /*canonical_query=*/"",
-                                 empty_sha, extras, _creds, std::time(nullptr));
+  std::string empty_sha                                   = sha256_hex("");
+  auto signed_req                                         = sign_request("GET",
+                                 _host_header,
+                                 canonical_uri,
+                                 /*canonical_query=*/"",
+                                 empty_sha,
+                                 extras,
+                                 _creds,
+                                 std::time(nullptr));
 
   struct curl_slist* hdrs = nullptr;
   for (auto const& [k, v] : signed_req.headers) {
@@ -281,8 +294,7 @@ std::size_t s3_ioctx::range_get(std::string_view bucket, std::string_view key,
   curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
   curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, curl_write_buf);
   curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
-  if (_cfg.request_timeout_s > 0)
-    curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+  if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
 
   auto rc = curl_easy_perform(h);
   curl_slist_free_all(hdrs);
@@ -296,8 +308,8 @@ std::size_t s3_ioctx::range_get(std::string_view bucket, std::string_view key,
   // the bytes we asked for.
   if (http_code != 200 && http_code != 206) {
     std::ostringstream os;
-    os << "s3_ioctx: GET " << bucket << "/" << key << " range=" << range_value
-       << " returned HTTP " << http_code;
+    os << "s3_ioctx: GET " << bucket << "/" << key << " range=" << range_value << " returned HTTP "
+       << http_code;
     throw std::runtime_error(os.str());
   }
   return sink.written;
@@ -307,15 +319,18 @@ std::size_t s3_ioctx::range_get(std::string_view bucket, std::string_view key,
 // host read APIs
 // ===========================================================================
 
-std::size_t s3_ioctx::host_read(sirius_io_object& obj, std::size_t offset,
-                                std::size_t size, std::uint8_t* dst)
+std::size_t s3_ioctx::host_read(sirius_io_object& obj,
+                                std::size_t offset,
+                                std::size_t size,
+                                std::uint8_t* dst)
 {
   auto& so = dynamic_cast<s3_io_object&>(obj);
   return range_get(so.bucket(), so.key(), offset, size, dst);
 }
 
-std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::host_read(
-  sirius_io_object& obj, std::size_t offset, std::size_t size)
+std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::host_read(sirius_io_object& obj,
+                                                                  std::size_t offset,
+                                                                  std::size_t size)
 {
   auto& so = dynamic_cast<s3_io_object&>(obj);
   size     = std::min(size, so.size() > offset ? so.size() - offset : 0UL);
@@ -325,11 +340,14 @@ std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::host_read(
   return cudf::io::datasource::buffer::create(std::move(owned));
 }
 
-std::future<std::size_t> s3_ioctx::host_read_async(sirius_io_object& obj, std::size_t offset,
-                                                   std::size_t size, std::uint8_t* dst)
+std::future<std::size_t> s3_ioctx::host_read_async(sirius_io_object& obj,
+                                                   std::size_t offset,
+                                                   std::size_t size,
+                                                   std::uint8_t* dst)
 {
-  return std::async(std::launch::async,
-                    [this, &obj, offset, size, dst]() { return host_read(obj, offset, size, dst); });
+  return std::async(std::launch::async, [this, &obj, offset, size, dst]() {
+    return host_read(obj, offset, size, dst);
+  });
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> s3_ioctx::host_read_async(
@@ -348,10 +366,9 @@ std::future<std::size_t> s3_ioctx::host_read_ranges_async(
                     [this, &obj, ranges, dst]() { return host_read_ranges(obj, ranges, dst); });
 }
 
-std::size_t s3_ioctx::host_read_ranges(
-  sirius_io_object& obj,
-  std::vector<cudf::io::text::byte_range_info> const& ranges,
-  std::span<cudf::host_span<std::byte>> dst)
+std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
+                                       std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                       std::span<cudf::host_span<std::byte>> dst)
 {
   if (ranges.size() != dst.size())
     throw std::invalid_argument("s3_ioctx::host_read_ranges: ranges/dst size mismatch");
@@ -370,20 +387,22 @@ std::size_t s3_ioctx::host_read_ranges(
 // device read APIs — unsupported on S3
 // ===========================================================================
 
-std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::device_read(
-  sirius_io_object&, std::size_t, std::size_t, rmm::cuda_stream_view)
+std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::device_read(sirius_io_object&,
+                                                                    std::size_t,
+                                                                    std::size_t,
+                                                                    rmm::cuda_stream_view)
 {
   throw std::logic_error("s3_ioctx: device_read not supported (host-only backend)");
 }
 
-std::size_t s3_ioctx::device_read(sirius_io_object&, std::size_t, std::size_t,
-                                  std::uint8_t*, rmm::cuda_stream_view)
+std::size_t s3_ioctx::device_read(
+  sirius_io_object&, std::size_t, std::size_t, std::uint8_t*, rmm::cuda_stream_view)
 {
   throw std::logic_error("s3_ioctx: device_read not supported (host-only backend)");
 }
 
-std::future<std::size_t> s3_ioctx::device_read_async(sirius_io_object&, std::size_t, std::size_t,
-                                                     std::uint8_t*, rmm::cuda_stream_view)
+std::future<std::size_t> s3_ioctx::device_read_async(
+  sirius_io_object&, std::size_t, std::size_t, std::uint8_t*, rmm::cuda_stream_view)
 {
   throw std::logic_error("s3_ioctx: device_read_async not supported (host-only backend)");
 }

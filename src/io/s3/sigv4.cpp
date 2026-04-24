@@ -55,9 +55,12 @@ std::array<unsigned char, 32> hmac_sha256(std::string_view key, std::string_view
   // should never happen, but guard anyway so we fail loudly rather than
   // produce a silently-zero signature.
   if (HMAC(EVP_sha256(),
-           key.data(), static_cast<int>(key.size()),
-           reinterpret_cast<unsigned char const*>(msg.data()), msg.size(),
-           out.data(), &len) == nullptr ||
+           key.data(),
+           static_cast<int>(key.size()),
+           reinterpret_cast<unsigned char const*>(msg.data()),
+           msg.size(),
+           out.data(),
+           &len) == nullptr ||
       len != out.size()) {
     throw std::runtime_error("sigv4: HMAC-SHA256 failed");
   }
@@ -71,15 +74,18 @@ std::string trim_header_value(std::string_view v)
 {
   std::size_t b = 0;
   std::size_t e = v.size();
-  while (b < e && (v[b] == ' ' || v[b] == '\t')) ++b;
-  while (e > b && (v[e - 1] == ' ' || v[e - 1] == '\t')) --e;
+  while (b < e && (v[b] == ' ' || v[b] == '\t'))
+    ++b;
+  while (e > b && (v[e - 1] == ' ' || v[e - 1] == '\t'))
+    --e;
   return std::string(v.substr(b, e - b));
 }
 
 std::string to_lower(std::string_view s)
 {
   std::string out(s);
-  for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  for (auto& c : out)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return out;
 }
 
@@ -102,8 +108,8 @@ std::string uri_encode(std::string_view s, bool encode_slash)
   std::string out;
   out.reserve(s.size());
   for (unsigned char c : s) {
-    bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                      (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+    bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                      c == '-' || c == '_' || c == '.' || c == '~';
     if (unreserved || (c == '/' && !encode_slash)) {
       out.push_back(static_cast<char>(c));
     } else {
@@ -119,17 +125,18 @@ std::string uri_encode(std::string_view s, bool encode_slash)
 // sign_request
 // ---------------------------------------------------------------------------
 
-sigv4_signed_request sign_request(std::string_view method,
-                                  std::string_view host,
-                                  std::string_view canonical_uri,
-                                  std::string_view canonical_query,
-                                  std::string_view payload_sha256_hex,
-                                  std::vector<std::pair<std::string, std::string>> const& extra_headers,
-                                  sigv4_signer_config const& creds,
-                                  std::time_t timestamp_utc)
+sigv4_signed_request sign_request(
+  std::string_view method,
+  std::string_view host,
+  std::string_view canonical_uri,
+  std::string_view canonical_query,
+  std::string_view payload_sha256_hex,
+  std::vector<std::pair<std::string, std::string>> const& extra_headers,
+  sigv4_signer_config const& creds,
+  std::time_t timestamp_utc)
 {
-  if (creds.access_key.empty() || creds.secret_key.empty() ||
-      creds.region.empty() || creds.service.empty()) {
+  if (creds.access_key.empty() || creds.secret_key.empty() || creds.region.empty() ||
+      creds.service.empty()) {
     throw std::invalid_argument("sigv4: empty credentials/region/service");
   }
 
@@ -137,8 +144,8 @@ sigv4_signed_request sign_request(std::string_view method,
   std::tm tm_utc{};
   ::gmtime_r(&timestamp_utc, &tm_utc);
 
-  char amz_date[17];        // YYYYMMDDTHHMMSSZ + NUL
-  char date_stamp[9];       // YYYYMMDD + NUL
+  char amz_date[17];   // YYYYMMDDTHHMMSSZ + NUL
+  char date_stamp[9];  // YYYYMMDD + NUL
   std::strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &tm_utc);
   std::strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", &tm_utc);
 
@@ -153,8 +160,8 @@ sigv4_signed_request sign_request(std::string_view method,
   for (auto const& [k, v] : extra_headers) {
     headers.emplace_back(to_lower(k), trim_header_value(v));
   }
-  std::sort(headers.begin(), headers.end(),
-            [](auto const& a, auto const& b) { return a.first < b.first; });
+  std::sort(
+    headers.begin(), headers.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
 
   // ---- 3. Canonical headers + signed header list. ----
   std::string canonical_headers;
@@ -170,11 +177,16 @@ sigv4_signed_request sign_request(std::string_view method,
 
   // ---- 4. Canonical request. ----
   std::string canonical_request;
-  canonical_request += method;                 canonical_request += '\n';
-  canonical_request += canonical_uri;          canonical_request += '\n';
-  canonical_request += canonical_query;        canonical_request += '\n';
-  canonical_request += canonical_headers;      canonical_request += '\n';
-  canonical_request += signed_headers;         canonical_request += '\n';
+  canonical_request += method;
+  canonical_request += '\n';
+  canonical_request += canonical_uri;
+  canonical_request += '\n';
+  canonical_request += canonical_query;
+  canonical_request += '\n';
+  canonical_request += canonical_headers;
+  canonical_request += '\n';
+  canonical_request += signed_headers;
+  canonical_request += '\n';
   canonical_request += payload_sha256_hex;
 
   // ---- 5. String to sign. ----
@@ -196,15 +208,18 @@ sigv4_signed_request sign_request(std::string_view method,
 
   // ---- 6. Signing key chain. ----
   std::string k_secret = "AWS4" + creds.secret_key;
-  auto k_date    = hmac_sha256(k_secret, date_stamp);
-  auto k_region  = hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_date.data()), k_date.size()),
-                               creds.region);
-  auto k_service = hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_region.data()), k_region.size()),
-                               creds.service);
-  auto k_signing = hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_service.data()), k_service.size()),
-                               "aws4_request");
-  auto sig       = hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_signing.data()), k_signing.size()),
-                               string_to_sign);
+  auto k_date          = hmac_sha256(k_secret, date_stamp);
+  auto k_region        = hmac_sha256(
+    std::string_view(reinterpret_cast<char const*>(k_date.data()), k_date.size()), creds.region);
+  auto k_service =
+    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_region.data()), k_region.size()),
+                creds.service);
+  auto k_signing =
+    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_service.data()), k_service.size()),
+                "aws4_request");
+  auto sig =
+    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_signing.data()), k_signing.size()),
+                string_to_sign);
 
   std::string signature_hex = hex_encode(sig.data(), sig.size());
 

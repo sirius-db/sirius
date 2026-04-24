@@ -326,9 +326,14 @@ if(VCPKG_BUILD)
 endif()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::URING
-                      PkgConfig::CURL OpenSSL::Crypto
-                      yaml-cpp::yaml-cpp absl::any_invocable)
+target_link_libraries(
+  sirius_extension
+  PkgConfig::NUMA
+  PkgConfig::URING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  yaml-cpp::yaml-cpp
+  absl::any_invocable)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)

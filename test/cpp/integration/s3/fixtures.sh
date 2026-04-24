@@ -19,7 +19,7 @@ ENDPOINT="${SIRIUS_TEST_S3_ENDPOINT:-http://127.0.0.1:9000}"
 ACCESS_KEY="${SIRIUS_TEST_S3_ACCESS_KEY:-minioadmin}"
 SECRET_KEY="${SIRIUS_TEST_S3_SECRET_KEY:-minioadmin}"
 BUCKET="${SIRIUS_TEST_S3_BUCKET:-sirius-test}"
-MC_IMAGE="${MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
+MC_IMAGE="${MC_IMAGE:-docker.1ms.run/minio/mc:RELEASE.2025-04-16T18-13-26Z}"
 
 echo "[fixtures] generating local fixtures under ${FIXTURE_DIR}"
 python3 "${SCRIPT_DIR}/generate_fixtures.py" \

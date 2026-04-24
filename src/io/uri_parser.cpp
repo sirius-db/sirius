@@ -88,8 +88,8 @@ std::unordered_map<std::string, std::string> parse_query(std::string_view query,
     auto val_sv = (eq == std::string_view::npos) ? std::string_view{} : seg.substr(eq + 1);
     if (key_sv.empty()) fail("empty query key", uri);
 
-    auto key = percent_decode(key_sv, uri);
-    auto val = percent_decode(val_sv, uri);
+    auto key            = percent_decode(key_sv, uri);
+    auto val            = percent_decode(val_sv, uri);
     out[std::move(key)] = std::move(val);  // last-wins
   }
   return out;
@@ -114,7 +114,8 @@ std::string to_lower(std::string_view s)
 {
   std::string out;
   out.reserve(s.size());
-  for (char c : s) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  for (char c : s)
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   return out;
 }
 
@@ -149,7 +150,8 @@ parsed_uri parse(std::string_view uri)
 
   // Must have `://` for a scheme-qualified URI; bare relative paths are rejected.
   auto delim = uri.find(kSchemeDelim);
-  if (delim == std::string_view::npos) fail("relative path not allowed; use absolute or scheme://", uri);
+  if (delim == std::string_view::npos)
+    fail("relative path not allowed; use absolute or scheme://", uri);
   if (delim == 0) fail("empty scheme", uri);
 
   auto scheme_sv = uri.substr(0, delim);
@@ -175,9 +177,9 @@ parsed_uri parse(std::string_view uri)
     out.path = percent_decode(authpath, uri);
   } else {
     // Object-store scheme: authpath is `host[/key]`.
-    auto slash      = authpath.find('/');
-    auto host_sv    = (slash == std::string_view::npos) ? authpath : authpath.substr(0, slash);
-    auto key_sv     = (slash == std::string_view::npos) ? std::string_view{} : authpath.substr(slash);
+    auto slash   = authpath.find('/');
+    auto host_sv = (slash == std::string_view::npos) ? authpath : authpath.substr(0, slash);
+    auto key_sv  = (slash == std::string_view::npos) ? std::string_view{} : authpath.substr(slash);
     if (host_sv.empty()) fail("empty host", uri);
     // Why: do not percent-decode host; decoding could smuggle a '/' via %2F and
     // change the authority/path boundary after parsing.
@@ -187,7 +189,8 @@ parsed_uri parse(std::string_view uri)
     // Why: s3://bucket/key and s3://bucket//key must both yield key="key";
     // object stores treat them as identical.
     std::size_t i = 0;
-    while (i < key_sv.size() && key_sv[i] == '/') ++i;
+    while (i < key_sv.size() && key_sv[i] == '/')
+      ++i;
     key_sv.remove_prefix(i);
     if (key_sv.empty()) fail("empty object key", uri);
     out.path = percent_decode(key_sv, uri);
