@@ -21,11 +21,11 @@
 #include "operator/gpu_materialize.hpp"
 #endif
 
+#include <cudf/column/column_factories.hpp>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-
-#include <cudf/column/column_factories.hpp>
 
 #ifdef SIRIUS_ENABLE_LEGACY
 namespace duckdb {

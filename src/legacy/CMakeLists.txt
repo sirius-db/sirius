@@ -9,8 +9,8 @@ option(ENABLE_LEGACY_SIRIUS
        "Enable legacy Sirius code path (gpu_processing table function)" OFF)
 
 if(ENABLE_LEGACY_SIRIUS)
-# Sources compiled only when the legacy entry point is enabled.
-# cmake-format: off
+  # Sources compiled only when the legacy entry point is enabled.
+  # cmake-format: off
 set(SIRIUS_LEGACY_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/cpu_cache.cpp
     ${CMAKE_CURRENT_LIST_DIR}/expression_executor/gpu_expression_executor.cpp
