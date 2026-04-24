@@ -18,12 +18,14 @@
 
 // standard library
 #include <memory>
+#include <type_traits>
+#include <utility>
 #include <variant>
 
 namespace sirius::ast {
 
-// Forward declarations — each node type is completed by its own header,
-// which must be included below before `node` is used by value.
+// Forward declarations of each node kind. Each per-node header
+// defines its struct and may hold std::unique_ptr<node> members.
 struct reference;
 struct constant;
 struct comparison;
@@ -34,30 +36,19 @@ struct cast;
 struct operator_;
 struct function_call;
 
-/**
- * @brief Sum type over every Sirius AST node kind.
- *
- * Recursive children are carried via std::unique_ptr<node> inside each struct,
- * which is why forward declarations above are sufficient at this point.
- *
- * The alternative order is part of the public ABI — std::variant indexes by
- * position and Phase 5's std::visit dispatch depends on this ordering.
- */
-using node = std::variant<reference,
-                          constant,
-                          comparison,
-                          conjunction,
-                          between,
-                          case_,
-                          cast,
-                          operator_,
-                          function_call>;
+// Forward declaration of node as a struct (not a type alias).
+// std::variant cannot contain an incomplete type, so `node` must wrap the
+// variant inside a struct that CAN be forward-declared. The per-node headers
+// store std::unique_ptr<node> with node still incomplete, which is permitted
+// for unique_ptr.
+struct node;
 
 }  // namespace sirius::ast
 
-// Completing includes — each per-node header defines its struct, which may
-// store std::unique_ptr<node>. unique_ptr<T> does not require T to be complete
-// at the point of declaration, so circular completion is safe.
+// Completing includes — each per-node header defines its struct. Structs that
+// hold std::unique_ptr<node> or std::vector<std::unique_ptr<node>> work with
+// the forward declaration above because unique_ptr<T> does not require T to be
+// a complete type at member-declaration time.
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_.hpp"
 #include "expression/ast/cast.hpp"
@@ -67,3 +58,76 @@ using node = std::variant<reference,
 #include "expression/ast/function_call.hpp"
 #include "expression/ast/operator_.hpp"
 #include "expression/ast/reference.hpp"
+
+namespace sirius::ast {
+
+/**
+ * @brief Sum type over every Sirius AST node kind.
+ *
+ * `node` is a struct wrapping `std::variant<...>` rather than a plain type
+ * alias. A struct is required because:
+ *   1. Recursive children in per-node headers store `std::unique_ptr<node>`,
+ *      which needs `node` to be forward-declarable. Type aliases cannot be
+ *      forward-declared; structs can.
+ *   2. `std::variant<Ts...>` requires every `T` to be complete at the point
+ *      the variant is instantiated. Since the variant is defined here — after
+ *      all per-node headers are included — every alternative is complete.
+ *
+ * The alternative order is part of the public ABI — std::variant indexes by
+ * position and Phase 5's std::visit dispatch depends on this ordering.
+ */
+struct node {
+  using variant_t = std::variant<reference,
+                                 constant,
+                                 comparison,
+                                 conjunction,
+                                 between,
+                                 case_,
+                                 cast,
+                                 operator_,
+                                 function_call>;
+
+  variant_t v;
+
+  node() = default;
+
+  /// Construct a node from any alternative by forwarding into the variant.
+  /// Excluded from overload resolution when T is `node` itself so the copy /
+  /// move special members below are preferred.
+  template <class T, std::enable_if_t<!std::is_same_v<std::decay_t<T>, node>, int> = 0>
+  node(T&& alt) : v(std::forward<T>(alt))
+  {
+  }
+
+  // Move-only. Expression trees own their children via std::unique_ptr, so
+  // copying is neither supported nor intended.
+  node(const node&)            = delete;
+  node& operator=(const node&) = delete;
+  node(node&&) noexcept        = default;
+  node& operator=(node&&) noexcept = default;
+
+  ~node() = default;
+
+  /// Returns true if this node currently holds an alternative of type T.
+  template <class T>
+  [[nodiscard]] bool holds() const noexcept
+  {
+    return std::holds_alternative<T>(v);
+  }
+
+  /// Returns a reference to the held alternative of type T.
+  /// Throws std::bad_variant_access if the held alternative is a different type.
+  template <class T>
+  [[nodiscard]] T& get()
+  {
+    return std::get<T>(v);
+  }
+
+  template <class T>
+  [[nodiscard]] T const& get() const
+  {
+    return std::get<T>(v);
+  }
+};
+
+}  // namespace sirius::ast
