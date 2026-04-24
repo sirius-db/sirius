@@ -43,9 +43,11 @@
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>  // Phase 9: std::set_intersection for cross-GPU batch_id disjointness
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>  // Phase 9: std::back_inserter
 #include <map>
 #include <memory>
 #include <regex>
@@ -244,6 +246,29 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   REQUIRE(counts[1].pipeline_ids.size() >= min_count);
   REQUIRE(counts[0].scan_ids.size() >= min_count);
   REQUIRE(counts[1].scan_ids.size() >= min_count);
+
+  // Phase 9 FIX-B regression gate (08-08-DIAGNOSIS.md hypothesis E):
+  // No batch_id may be dispatched to BOTH GPUs. The evidence in the diagnosis
+  // log showed `batch_id=3 batch_device_id=0` landing on both a GPU 0 task
+  // (lock_status=0 success=true) AND a GPU 1 task (lock_status=3 memspace_mismatch,
+  // success=false) — the second dispatch is the SIGSEGV seed. Plan 09-02's
+  // sticky batch→GPU affinity map records which GPU each batch_id was assigned
+  // to, atomically with this TEST_CASE's regex source ([mgpu-audit] scan_batch
+  // line). If the distributor ever re-introduces a cross-GPU assignment, the
+  // scan_ids sets will overlap and this REQUIRE breaks the build.
+  std::vector<std::string> cross_gpu_intersection;
+  std::set_intersection(counts[0].scan_ids.begin(),
+                        counts[0].scan_ids.end(),
+                        counts[1].scan_ids.begin(),
+                        counts[1].scan_ids.end(),
+                        std::back_inserter(cross_gpu_intersection));
+  INFO("cross-GPU scan_batch intersection size: " << cross_gpu_intersection.size());
+  if (!cross_gpu_intersection.empty()) {
+    std::string overlap_list;
+    for (auto const& id : cross_gpu_intersection) { overlap_list += id + " "; }
+    INFO("overlapping batch_ids (GPU 0 ∩ GPU 1): " << overlap_list);
+  }
+  REQUIRE(cross_gpu_intersection.empty());
 
   // Cleanup: restore previous env vars and drop the tmp log dir.
   if (had_saved_log_dir) {
