@@ -1139,10 +1139,18 @@ TEST_CASE("two-pipeline scan - project STRUCT column",
   duckdb::vector<std::string> names{"id", "s"};
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1184,10 +1192,18 @@ TEST_CASE("two-pipeline scan - project LIST column", "[two_pipeline_scan][nested
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{
     duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1234,10 +1250,19 @@ TEST_CASE("two-pipeline scan - table with nested column, project flat only",
   duckdb::vector<duckdb::idx_t> projection_ids{0, 2};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
                                                    duckdb::LogicalType::INTEGER};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({}),
+                                                     duckdb::LogicalType::INTEGER};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1286,10 +1311,18 @@ TEST_CASE("two-pipeline scan - mixed flat and nested projection",
   duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
                                                    duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1336,14 +1369,22 @@ TEST_CASE("two-pipeline scan - nested column across multiple files",
   duckdb::vector<std::string> names{"id", "s"};
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
   std::vector<std::string> files;
   for (auto const& p : paths) {
     files.push_back(p.string());
   }
 
-  auto batches = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1387,10 +1428,18 @@ TEST_CASE("two-pipeline scan - STRUCT inside STRUCT", "[two_pipeline_scan][neste
   duckdb::vector<std::string> names{"id", "s"};
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1434,10 +1483,19 @@ TEST_CASE("two-pipeline scan - LIST of LIST", "[two_pipeline_scan][nested][share
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{
     duckdb::LogicalType::LIST(duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER))};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER,
+    duckdb::LogicalType::LIST(duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER))};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1479,10 +1537,18 @@ TEST_CASE("two-pipeline scan - LIST inside STRUCT", "[two_pipeline_scan][nested]
   duckdb::vector<std::string> names{"id", "s"};
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1534,6 +1600,8 @@ TEST_CASE("two-pipeline scan - flat filter with nested projection",
   duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
                                                    duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
   table_filters->PushFilter(
@@ -1544,6 +1612,7 @@ TEST_CASE("two-pipeline scan - flat filter with nested projection",
   std::vector<std::string> files = {path.string()};
   auto batches                   = run_two_pipeline_scan(files,
                                        output_types,
+                                       returned_types,
                                        column_ids,
                                        projection_ids,
                                        names,
@@ -1599,10 +1668,18 @@ TEST_CASE("two-pipeline scan - LIST with empty and populated rows",
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{
     duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -1645,10 +1722,18 @@ TEST_CASE("two-pipeline scan - STRUCT with NULL rows",
   duckdb::vector<std::string> names{"id", "s"};
   duckdb::vector<duckdb::idx_t> projection_ids{1};
   duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
   std::vector<std::string> files = {path.string()};
-  auto batches                   = run_two_pipeline_scan(
-    files, output_types, column_ids, projection_ids, names, 1024 * 1024, *gpu_space);
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
