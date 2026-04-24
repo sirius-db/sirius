@@ -134,6 +134,15 @@ void duckdb_scan_executor::set_scan_caching_enabled(cache_level level)
 void duckdb_scan_executor::prepare_cache_for_scan_operators(
   const std::vector<sirius::op::sirius_physical_operator*>& scan_operators)
 {
+  // Phase 9 FIX-B (Pitfall 3): reset affinity map alongside _scan_round_robin
+  // at query start. Without this paired reset, a new query's counter values
+  // would collide with stale entries from a prior query.
+  _scan_round_robin.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
+    _batch_gpu_affinity.clear();
+  }
+
   if (_cache_level == cache_level::NONE) { return; }
 
   std::lock_guard<std::mutex> lock(_cache_mutex);
@@ -181,8 +190,17 @@ int duckdb_scan_executor::select_target_gpu()
 
   if (total_available == 0) {
     // All GPUs full, round-robin fallback
-    auto idx = _scan_round_robin.fetch_add(1) % _gpu_memory_spaces.size();
-    return _gpu_memory_spaces[idx]->get_device_id();
+    auto fallback_counter = _scan_round_robin.fetch_add(1);
+    auto idx              = fallback_counter % _gpu_memory_spaces.size();
+    auto device_id        = _gpu_memory_spaces[idx]->get_device_id();
+    // Phase 9 FIX-B: record affinity in the fallback branch too — a stale
+    // entry from this path would otherwise cause a disjointness assert to
+    // pass by accident (counter not in map → not counted in intersection).
+    {
+      std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
+      _batch_gpu_affinity[fallback_counter] = device_id;
+    }
+    return device_id;
   }
 
   // Weighted selection: use round-robin counter as deterministic distribution
@@ -213,6 +231,15 @@ int duckdb_scan_executor::select_target_gpu()
       // against log-line duplication from retries). The leading
       // "[mgpu-audit] scan_batch assigned to GPU N" substring is preserved
       // verbatim for backward-compat with v1.1 verification greps.
+      // Phase 9 FIX-B (Bug 1 — 08-08-DIAGNOSIS.md hypothesis E): record batch→GPU
+      // affinity atomically with the audit emission. The `counter` value is the
+      // same batch_id=K that appears in the log line below, so a test parsing
+      // the log can cross-reference with this map deterministically. Lock held
+      // for the insertion only — contention negligible vs. I/O cost per batch.
+      {
+        std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
+        _batch_gpu_affinity[counter] = space->get_device_id();
+      }
       SIRIUS_LOG_INFO("[mgpu-audit] scan_batch assigned to GPU {} batch_id={} (available: {} bytes)",
                       space->get_device_id(),
                       counter,
