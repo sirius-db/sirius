@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_operator.hpp"
 
-#include "gpu_executor.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/batch_lock_utils.hpp"
