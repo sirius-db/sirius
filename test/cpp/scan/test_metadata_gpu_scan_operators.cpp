@@ -371,8 +371,14 @@ TEST_CASE("two-pipeline scan - basic scan with all columns", "[two_pipeline_scan
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  auto batches = run_two_pipeline_scan(
-    files, schema.types, con, schema.column_ids, no_projection, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       con,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
 
@@ -411,8 +417,14 @@ TEST_CASE("two-pipeline scan - projection selects subset of columns",
   output_types.push_back(schema.types[0]);
   output_types.push_back(schema.types[2]);
 
-  auto batches = run_two_pipeline_scan(
-    files, output_types, con, schema.column_ids, projection_ids, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       output_types,
+                                       con,
+                                       schema.column_ids,
+                                       projection_ids,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
@@ -445,8 +457,14 @@ TEST_CASE("two-pipeline scan - diverse types (VARCHAR, DECIMAL, DATE)",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  auto batches = run_two_pipeline_scan(
-    files, schema.types, con, schema.column_ids, no_projection, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       con,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   REQUIRE_FALSE(batches.empty());
 
@@ -631,8 +649,14 @@ TEST_CASE("two-pipeline scan - multiple files", "[two_pipeline_scan][multi_file]
   std::vector<std::string> files = {path_a.string(), path_b.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  auto batches = run_two_pipeline_scan(
-    files, schema.types, con, schema.column_ids, no_projection, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       schema.types,
+                                       con,
+                                       schema.column_ids,
+                                       no_projection,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
@@ -777,8 +801,14 @@ TEST_CASE("two-pipeline scan - projection on diverse types",
   output_types.push_back(schema.types[3]);
   output_types.push_back(schema.types[4]);
 
-  auto batches = run_two_pipeline_scan(
-    files, output_types, con, schema.column_ids, projection_ids, schema.names, 1024 * 1024, *gpu_space);
+  auto batches = run_two_pipeline_scan(files,
+                                       output_types,
+                                       con,
+                                       schema.column_ids,
+                                       projection_ids,
+                                       schema.names,
+                                       1024 * 1024,
+                                       *gpu_space);
 
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
