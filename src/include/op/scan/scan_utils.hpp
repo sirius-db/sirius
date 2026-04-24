@@ -23,6 +23,9 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/planner/table_filter.hpp>
 
+// standard library
+#include <unordered_set>
+
 namespace sirius::op {
 
 /**
@@ -46,12 +49,19 @@ std::vector<duckdb::idx_t> build_batch_column_map(
  * @brief Convert a DuckDB TableFilterSet into a single bound DuckDB expression (conjunction of
  * all filters), suitable for passing to gpu_expression_translator::translate_expression().
  *
- * Returns nullptr if the filter set is empty or contains only unsupported filter types.
+ * Filters whose column's primary index is in @p skip_primary_indices are omitted. Parquet scans
+ * pass the hive-partition primary-index set here: partition columns don't exist in the parquet
+ * file, so pushing a filter that references one crashes libcudf's reader. DuckDB already applies
+ * partition filters at the file-list level when hive_partitioning is enabled, so dropping them
+ * here is safe.
+ *
+ * Returns nullptr if the filter set is empty or contains only unsupported/skipped filter types.
  */
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
-  const std::vector<duckdb::idx_t>& batch_column_map);
+  const std::vector<duckdb::idx_t>& batch_column_map,
+  const std::unordered_set<std::size_t>& skip_primary_indices = {});
 
 }  // namespace sirius::op

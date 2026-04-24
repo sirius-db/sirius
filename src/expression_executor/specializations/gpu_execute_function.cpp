@@ -211,7 +211,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       cudf::strings::slice_strings(cudf::strings_column_view(input.get_column_view()),
                                    cudf::numeric_scalar(start_val, true, _stream, _mr),
                                    cudf::numeric_scalar(stop_val, true, _stream, _mr),
-                                   1,
+                                   cudf::numeric_scalar<cudf::size_type>(1, true, _stream, _mr),
                                    _stream,
                                    _mr);
     return execute_result(std::move(result_column));

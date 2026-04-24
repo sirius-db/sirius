@@ -91,9 +91,12 @@ sirius_parquet_metadata_scan_operator::sirius_parquet_metadata_scan_operator(
   // execute() so that a task-local CUDA stream can be used.
   _has_filter = false;
   if (table_filter_set && !table_filter_set->filters.empty()) {
-    auto batch_column_map  = build_batch_column_map(projection_ids, column_ids.size());
+    auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
+    // Drop filters on hive-partition columns — they aren't in the parquet file, so pushing
+    // them into the reader crashes libcudf. DuckDB already prunes partitions at the file-list
+    // level when hive_partitioning is enabled.
     auto duckdb_expression = convert_table_filters_to_expression(
-      *table_filter_set, column_ids, returned_types, batch_column_map);
+      *table_filter_set, column_ids, returned_types, batch_column_map, _hive_partition_index_set);
     if (duckdb_expression) {
       _has_filter               = true;
       _duckdb_filter_expression = std::move(duckdb_expression);
@@ -197,40 +200,35 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   // Filter
   std::shared_ptr<translated_expression> ast_filter;
   if (_has_filter) {
-    if (!_column_name_by_ref.empty()) {
-      gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-      auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-        if (ref_index >= _column_name_by_ref.size()) {
-          throw std::runtime_error(
-            "[sirius_parquet_metadata_scan_operator] Filter expression contains reference to "
-            "column index " +
-            std::to_string(ref_index) +
-            " which is out of bounds for the provided column metadata.");
-        }
-        return _column_name_by_ref[ref_index];
-      };
-      auto optional_filter =
-        translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-      if (optional_filter) {
-        ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
-        result->reader_options->set_filter(ast_filter->back());
-        result->filter_expression = ast_filter;
-        SIRIUS_LOG_DEBUG(
-          "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for "
-          "pushdown.");
-      } else {
-        result->filter_expression = _duckdb_filter_expression;
-        SIRIUS_LOG_DEBUG(
-          "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
-          "pushdown. Filter will be applied in the GPU scan operator.");
-      }
-    } else {
-      // Column names were not provided; AST translation requires column name references.
-      result->filter_expression = _duckdb_filter_expression;
-      SIRIUS_LOG_DEBUG(
-        "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
-        "translation. Filter will be applied in the GPU scan operator.");
-    }
+    /// KEVIN: there is a bug hiding here that I haven't been able to find yet...
+    // if (!_column_name_by_ref.empty()) {
+    //   gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    //   auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+    //     return _column_name_by_ref.at(ref_index);
+    //   };
+    //   auto optional_filter =
+    //     translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+    //   if (optional_filter) {
+    //     ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
+    //     result->reader_options->set_filter(ast_filter->back());
+    //     result->filter_expression = ast_filter;
+    //     SIRIUS_LOG_DEBUG(
+    //       "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for
+    //       " "pushdown.");
+    //   } else {
+    //     result->filter_expression = _duckdb_filter_expression;
+    //     SIRIUS_LOG_DEBUG(
+    //       "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
+    //       "pushdown. Filter will be applied in the GPU scan operator.");
+    //   }
+    // } else {
+    //   // Column names were not provided; AST translation requires column name references.
+    //   result->filter_expression = _duckdb_filter_expression;
+    //   SIRIUS_LOG_DEBUG(
+    //     "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
+    //     "translation. Filter will be applied in the GPU scan operator.");
+    // }
+    result->filter_expression          = _duckdb_filter_expression;
     result->post_filter_projection_ids = _post_filter_projection_ids;
   }
 
