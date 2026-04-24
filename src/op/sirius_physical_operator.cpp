@@ -44,6 +44,7 @@ pipelineable_operator_data::prepare_for_processing(
   for (const auto& batch : _data_batches) {
     if (!batch) {
       SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
+      SIRIUS_LOG_INFO("[mgpu-probe] prepare_for_processing returning nullopt null_batch=true");
       return std::nullopt;
     }
     std::optional<::cucascade::data_batch_processing_handle> handle;
@@ -64,7 +65,18 @@ pipelineable_operator_data::prepare_for_processing(
         e.what());
       throw;
     }
-    if (!handle) { return std::nullopt; }
+    if (!handle) {
+      // Phase 9 FIX-B observability: breadcrumb confirms nullopt propagates
+      // out of the loop cleanly, so the caller (gpu_pipeline_task::run_pipeline_task_round
+      // at gpu_pipeline_task.cpp:325) can handle it via `handles_opt.has_value()`.
+      // If the SIGSEGV reported in 08-08-DIAGNOSIS.md is a null-deref downstream,
+      // the fix site is in the caller, not here — this log helps correlate.
+      SIRIUS_LOG_INFO(
+        "[mgpu-probe] prepare_for_processing returning nullopt batch_id={} batch_state={}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+      return std::nullopt;
+    }
     handles.emplace_back(std::move(*handle));
   }
 
