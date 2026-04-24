@@ -42,9 +42,9 @@ bool is_floating_point_type(duckdb::LogicalTypeId id)
 }
 
 struct comparable_result_cell {
-  bool is_null = false;
-  bool is_float = false;
-  bool is_nan = false;
+  bool is_null       = false;
+  bool is_float      = false;
+  bool is_nan        = false;
   double float_value = 0.0;
   std::string text;
 };
@@ -60,9 +60,9 @@ comparable_result_cell make_comparable_cell(const duckdb::Value& value)
   cell.text    = value.ToString();
 
   if (!cell.is_null && is_floating_point_type(value.type().id())) {
-    cell.is_float = true;
+    cell.is_float    = true;
     cell.float_value = value.GetValue<double>();
-    cell.is_nan = std::isnan(cell.float_value);
+    cell.is_nan      = std::isnan(cell.float_value);
   }
 
   return cell;
@@ -86,7 +86,9 @@ bool comparable_cell_less(const comparable_result_cell& lhs, const comparable_re
 
   if (lhs.is_float) {
     if (lhs.is_nan != rhs.is_nan) { return lhs.is_nan < rhs.is_nan; }
-    if (!lhs.is_nan && lhs.float_value != rhs.float_value) { return lhs.float_value < rhs.float_value; }
+    if (!lhs.is_nan && lhs.float_value != rhs.float_value) {
+      return lhs.float_value < rhs.float_value;
+    }
   }
 
   return lhs.text < rhs.text;
@@ -227,9 +229,8 @@ class GPUExecutionFixtureBase {
 
           double diff = std::fabs(gpu_value.float_value - cpu_value.float_value);
           if (diff > tolerance) {
-            UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=["
-                                 << gpu_value.text << "] CPU=[" << cpu_value.text
-                                 << "] diff=" << diff
+            UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=[" << gpu_value.text
+                                 << "] CPU=[" << cpu_value.text << "] diff=" << diff
                                  << " tolerance=" << float_tolerance.value());
           }
           REQUIRE(diff <= tolerance);
