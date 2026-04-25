@@ -197,6 +197,8 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
     size_t total_data_bytes_allocated =
       0;  ///< Total number of data bytes allocated for this column (only needed for VARCHAR)
     size_t null_count = 0;  ///< Number of NULL values in the column
+    bool has_metadata_bound =
+      false;  ///< True if type_size was set from DuckDB storage metadata (safe upper bound)
 
     // The allocation accessors for the column data, mask, and offsets
     memory::multiple_blocks_allocation_accessor<uint8_t> data_blocks_accessor;

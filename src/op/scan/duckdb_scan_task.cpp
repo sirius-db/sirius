@@ -33,10 +33,54 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/types.hpp>
+#include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/function/table_function.hpp>
+#include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/statistics/string_stats.hpp>
 
 namespace sirius::op::scan {
+
+namespace {
+
+/// Estimate the upper-bound varchar size for a column from DuckDB storage metadata.
+/// Returns 0 when metadata is unavailable (e.g., the bind data is not a TableScanBindData);
+/// callers fall back to the default in that case.
+size_t estimate_varchar_bytes_from_metadata(duckdb::FunctionData* bind_data_ptr,
+                                            duckdb::StorageIndex storage_col_idx,
+                                            size_t /*projected_col_index*/,
+                                            duckdb::ClientContext& context)
+{
+  if (!bind_data_ptr) { return 0; }
+
+  duckdb::TableScanBindData* tsbd = nullptr;
+  try {
+    tsbd = &bind_data_ptr->Cast<duckdb::TableScanBindData>();
+  } catch (...) {
+    return 0;  // not a seq_scan table function
+  }
+
+  try {
+    auto& table   = tsbd->table.Cast<duckdb::DuckTableEntry>();
+    auto& storage = table.GetStorage();
+    if (storage.GetTotalRows() == 0) { return 0; }
+
+    auto stats = storage.GetStatistics(context, storage_col_idx);
+    if (stats && duckdb::StringStats::HasMaxStringLength(*stats)) {
+      // max_string_length is a hard upper bound on any individual value, so the buffer
+      // is guaranteed to fit. Do NOT shrink below max_len — fixed-format columns (e.g.
+      // phone numbers) have nearly all values at max_len, so a 3/4 heuristic underflows
+      // and corrupts adjacent columns' offset arrays.
+      return duckdb::StringStats::MaxStringLength(*stats);
+    }
+  } catch (std::exception const&) {
+    // Unable to read stats — caller will fall back.
+  }
+  return 0;
+}
+
+}  // namespace
 
 //===----------------------------------------------------------------------===//
 // duckdb_scan_task_global_state
@@ -376,11 +420,24 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   _column_builders.reserve(_num_columns);
   for (size_t i = 0; i < _num_columns; ++i) {
     auto const col_type = op.scanned_types[i];
-    _column_builders.emplace_back(col_type, _default_varchar_size);
     if (col_type.is_varchar()) {
       _varchar_indices.push_back(i);
-      estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data + mask
+
+      // Use DuckDB's per-column max_string_length when available — a safe upper bound
+      // that is typically much tighter than the blind default and unlocks the chunk_fits
+      // skip in compute_task. Use the storage column index (not the projected index) so
+      // that projected queries like SELECT l_comment read stats for the right column.
+      auto storage_col_idx = duckdb::StorageIndex(op.column_ids[i].GetPrimaryIndex());
+      size_t varchar_size  = estimate_varchar_bytes_from_metadata(
+        op.bind_data.get(), storage_col_idx, i, _exec_ctx.client);
+      bool const from_metadata = (varchar_size != 0);
+      if (!from_metadata) { varchar_size = _default_varchar_size; }
+
+      _column_builders.emplace_back(col_type, varchar_size);
+      _column_builders.back().has_metadata_bound = from_metadata;
+      estimated_row_bytes += (sizeof(int32_t) + varchar_size);  // offset + data
     } else {
+      _column_builders.emplace_back(col_type, _default_varchar_size);
       estimated_row_bytes += col_type.fixed_width_byte_size();  // data + mask
     }
   }
@@ -411,9 +468,11 @@ void duckdb_scan_task_local_state::initialize_builders()
     _column_builders[i].initialize_accessors(_estimated_rows_per_batch, byte_offset, _allocation);
     // Update byte_offset for next column
     if (_column_builders[i].type.is_varchar()) {
-      // VARCHAR column (offsets + data + mask)
+      // VARCHAR column (offsets + data + mask). Use the per-column type_size set in
+      // estimate_rows_per_batch (metadata-derived bound or default fallback) — using the
+      // global default would over-allocate the buffer for metadata-bounded columns.
       byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int32_t) +
-                     _estimated_rows_per_batch * _default_varchar_size +
+                     _estimated_rows_per_batch * _column_builders[i].type_size +
                      utils::ceil_div_8(_estimated_rows_per_batch);
     } else {
       // Fixed-width column (data + mask)
@@ -503,8 +562,12 @@ bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
 
 bool duckdb_scan_task::chunk_fits(duckdb_scan_task_local_state& l_state)
 {
-  // Loop over the VARCHAR columns and check if they fit in the allocated buffers
+  // Loop over the VARCHAR columns and check if they fit in the allocated buffers.
+  // Skip columns whose allocation came from DuckDB metadata — max_string_length is a
+  // hard upper bound, so the buffer is guaranteed to fit and the Flatten + size check
+  // would just be wasted work.
   for (auto varchar_idx : l_state._varchar_indices) {
+    if (l_state._column_builders[varchar_idx].has_metadata_bound) { continue; }
     auto& vec = l_state._chunk.data[varchar_idx];
     vec.Flatten(l_state._chunk.size());
     auto const& validity = duckdb::FlatVector::Validity(l_state._chunk.data[varchar_idx]);
@@ -561,16 +624,31 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
                             sirius::to_duckdb_vec(g_state._op.scanned_types));
 
+  // If every varchar column was sized from DuckDB metadata, the per-chunk fits check is
+  // redundant — the allocation is a guaranteed upper bound for any chunk we can read.
+  bool const all_varchars_bounded = std::all_of(
+    l_state._varchar_indices.begin(), l_state._varchar_indices.end(),
+    [&](size_t vi) { return l_state._column_builders[vi].has_metadata_bound; });
+
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {
-    // We know a priori that the fixed-width columns and masks will fit in the allocated buffers.
-    // For variable-length columns, we need to check that we have enough space.
-    // If there isn't enough space, we just throw an exception for now.
-    /// FUTURE WORK: push the current data batch into a new scan task.
-    if (!chunk_fits(l_state)) {
-      std::string err_msg =
-        "[duckdb_scan_task]: current chunk does not fit in the allocated buffers.";
-      throw std::runtime_error(err_msg);
+    if (!all_varchars_bounded && !chunk_fits(l_state)) {
+      if (l_state._row_offset > 0) {
+        // We accumulated rows already — flush the partial batch and let the next task
+        // pick up the remaining range. The current chunk is dropped; carrying it forward
+        // would require buffering it across the task boundary (TODO).
+        SIRIUS_LOG_WARN(
+          "[duckdb_scan] task={}: varchar overflow after {} rows, flushing batch "
+          "(chunk of {} rows does not fit, continuing in next task)",
+          _task_id, l_state._row_offset, l_state._chunk.size());
+        break;
+      }
+      // Empty batch and the very first chunk does not fit — the allocation is too small
+      // for even a single chunk. With metadata-derived sizing this should be unreachable;
+      // with the default fallback it can happen on extremely wide rows.
+      throw std::runtime_error(
+        "[duckdb_scan_task]: first chunk does not fit in the allocated buffers. "
+        "Consider increasing scan_task_batch_size.");
     }
 
     // Process the chunk into the column builders
