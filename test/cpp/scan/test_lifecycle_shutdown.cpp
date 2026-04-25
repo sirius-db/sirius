@@ -16,6 +16,14 @@
 
 // test
 #include <catch.hpp>
+#include <scan/test_utils.hpp>
+#include <utils/utils.hpp>
+
+// sirius
+#include <sirius_context.hpp>
+
+// duckdb
+#include <duckdb.hpp>
 
 // standard library
 #include <sys/wait.h>
@@ -23,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -120,4 +129,49 @@ TEST_CASE("scan lifecycle - clean exit after duckdb_scan_task query (regression:
             "the scan ran (init error, missing GPU, missing config). The subprocess output "
             "above contains the actual error from the CLI.");
   }
+}
+
+// In-process variant of the lifecycle test. Forces the production CLI's destruction order
+// (DatabaseInstance dies before SiriusContext) by holding the SiriusContext shared_ptr in
+// a scope that outlives the unique_ptr<DuckDB>. Pre-fix, ~SiriusContext destroys
+// task_creator_, which holds a unique_ptr<GlobalTableFunctionState> referencing now-freed
+// DuckDB storage objects (BlockMemory, RowGroups) → SIGSEGV in release.
+//
+// Empirically the SIGSEGV fires deterministically in release (verified by reverting the
+// QueryEnd reset and re-running). Catch2's signal handler attributes the failure to this
+// test before the runner dies, so the per-test diagnostic is clean even though the
+// process exits 139. The subprocess test above is kept as belt-and-suspenders:
+//   - in-process: faster (~50 ms vs seconds), no shell, no env var dance, deterministic.
+//   - subprocess: isolates the runner from any crash, exercises the actual CLI exit chain.
+// Both tests should fail simultaneously on a regression — they catch the same bug from
+// different angles.
+TEST_CASE(
+  "scan lifecycle in-process - SiriusContext outlives DatabaseInstance "
+  "(regression: QueryEnd UAF)",
+  "[scan][lifecycle][shutdown]")
+{
+  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx;
+  std::unique_ptr<duckdb::DuckDB> db;
+
+  {
+    db         = std::make_unique<duckdb::DuckDB>(nullptr);
+    auto con   = duckdb::Connection(*db);
+    sirius_ctx = sirius::get_sirius_context(con, sirius::scan_test_utils::get_test_config_path());
+    REQUIRE(sirius_ctx != nullptr);
+
+    REQUIRE_FALSE(con.Query("CREATE TABLE t(s VARCHAR)")->HasError());
+    REQUIRE_FALSE(con.Query("INSERT INTO t SELECT 'x' FROM range(1000)")->HasError());
+    REQUIRE_FALSE(con.Query("CHECKPOINT")->HasError());
+    auto result = con.Query("CALL gpu_execution('SELECT count(*) FROM t')");
+    REQUIRE_FALSE(result->HasError());
+  }  // ~Connection — registered_state drops its sirius_ctx ref. Our shared_ptr holds it alive.
+
+  // Production CLI inversion: destroy DuckDB while task_creator_ still holds storage refs.
+  db.reset();
+
+  // Now drop the SiriusContext. Pre-fix this destroys task_creator_ → ~GlobalTableFunctionState
+  // dereferences freed storage. Post-fix, QueryEnd already cleared task_creator_ during
+  // the gpu_execution query, so this is a no-op shutdown.
+  sirius_ctx.reset();
+  SUCCEED("clean shutdown after DatabaseInstance death");
 }
