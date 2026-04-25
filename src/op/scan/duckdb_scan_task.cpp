@@ -308,9 +308,9 @@ void duckdb_scan_task_local_state::column_builder::process_dictionary_varchar(
   std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
   // PRECONDITION: vec is DICTIONARY_VECTOR with VARCHAR child.
-  auto& sel_vec        = duckdb::DictionaryVector::SelVector(vec);
-  auto& child          = duckdb::DictionaryVector::Child(vec);
-  auto& child_validity = duckdb::FlatVector::Validity(child);
+  auto& sel_vec         = duckdb::DictionaryVector::SelVector(vec);
+  auto& child           = duckdb::DictionaryVector::Child(vec);
+  auto& child_validity  = duckdb::FlatVector::Validity(child);
   auto const* dict_data = duckdb::FlatVector::GetData<duckdb::string_t>(child);
 
   auto dict_size_hint = duckdb::DictionaryVector::DictionarySize(vec);
@@ -714,9 +714,10 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
 
   // If every varchar column was sized from DuckDB metadata, the per-chunk fits check is
   // redundant — the allocation is a guaranteed upper bound for any chunk we can read.
-  bool const all_varchars_bounded = std::all_of(
-    l_state._varchar_indices.begin(), l_state._varchar_indices.end(),
-    [&](size_t vi) { return l_state._column_builders[vi].has_metadata_bound; });
+  bool const all_varchars_bounded =
+    std::all_of(l_state._varchar_indices.begin(), l_state._varchar_indices.end(), [&](size_t vi) {
+      return l_state._column_builders[vi].has_metadata_bound;
+    });
 
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {
@@ -728,7 +729,9 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
         SIRIUS_LOG_WARN(
           "[duckdb_scan] task={}: varchar overflow after {} rows, flushing batch "
           "(chunk of {} rows does not fit, continuing in next task)",
-          _task_id, l_state._row_offset, l_state._chunk.size());
+          _task_id,
+          l_state._row_offset,
+          l_state._chunk.size());
         break;
       }
       // Empty batch and the very first chunk does not fit — the allocation is too small

@@ -378,6 +378,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_lifecycle_shutdown.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
