@@ -30,9 +30,9 @@
 #include <memory>
 #include <optional>
 
-namespace sirius::op::scan {
-class sirius_parquet_metadata_scan_operator;
-}  // namespace sirius::op::scan
+namespace sirius::scan_manager {
+class split_provider;
+}  // namespace sirius::scan_manager
 
 namespace sirius::op::scan {
 
@@ -43,55 +43,12 @@ namespace sirius::op::scan {
  * @brief Operator that reads parquet byte ranges for a batch of row groups and produces
  *        gpu_table_representation data batches for downstream GPU operators.
  *
- * This operator is the source of the GPU parquet scan pipeline. It is paired with a
- * sirius_parquet_metadata_scan_operator, which runs as a separate upstream pipeline and
- * streams parsed metadata into this operator — not through the data-batch / port
- * channel, since partitioned_parquet_metadata is not a data_batch.
- *
- * Lifecycle (streaming — the scan pipeline runs concurrently with the metadata pipeline):
- *
- *   1. Metadata accumulation (upstream pipeline, CPU-only):
- *      - sirius_parquet_metadata_scan_operator::execute() parses parquet footers and
- *        produces partitioned_parquet_metadata.
- *      - Its sink() forwards each result here via accumulate_metadata(), which copies
- *        the metadata into a shared_ptr and appends one partition_entry per
- *        row_group_range to _partition_index under _metadata_mutex. Partitions become
- *        claimable by the scan pipeline the moment they are appended.
- *      - When the upstream pipeline finishes, its finalize_operator() calls
- *        finalize_partitions() on this operator, which sets _finalized to signal that
- *        no further partitions will arrive.
- *
- *   2. Scan (this pipeline, GPU):
- *      - get_next_task_hint() returns READY as soon as _partition_index contains an
- *        unclaimed entry, regardless of _finalized. If no entry is currently claimable
- *        and _finalized is false, it surfaces the upstream metadata scan as
- *        WAITING_FOR_INPUT_DATA so task_creator can schedule it.
- *      - get_next_task_input_data() claims one partition from the index under
- *        _metadata_mutex and returns it as parquet_scan_data. Each partition maps 1:1
- *        to a row_group_range — the metadata scan operator is responsible for sizing
- *        partitions to the target batch size.
- *      - execute(parquet_scan_data) reads the byte ranges, optionally applies a
- *        fallback filter expression, and emits a gpu_table_representation data batch.
- *
- * Scheduling coupling:
- *   The upstream → downstream pipeline edge is expressed via a null-repo "handoff"
- *   port on this operator (MemoryBarrierType::PARTIAL). setup_pipeline_parents() uses
- *   that port to discover the dependency so the metadata pipeline is registered as a
- *   parent of this pipeline. No data flows through the port — the handoff is via
- *   accumulate_metadata() / finalize_partitions().
- *
- * Thread-safety:
- *   - accumulate_metadata() is called from upstream worker threads; _metadata_mutex
- *     serializes its appends to _partition_index against concurrent claims by
- *     get_next_task_input_data() and size reads by get_next_task_hint() /
- *     all_ports_empty().
- *   - finalize_partitions() must be called exactly once, after ALL accumulate_metadata()
- *     calls have returned. It sets _finalized with release semantics; get_next_task_hint()
- *     reads it with acquire semantics to decide whether to return nullopt or to defer
- *     to the upstream pipeline.
- *   - get_next_task_input_data() / get_next_task_hint() / all_ports_empty() are safe to
- *     call from multiple worker threads and serve partitions as soon as they are
- *     appended; returning "no work right now" does not imply the scan is finished.
+ * This operator is the source of the GPU parquet scan pipeline. Its splits — one
+ * parquet_scan_data per row-group partition — are produced by a parquet_split_provider
+ * driven by the scan_manager on its own thread pool, and pushed into the operator's
+ * bound split_connector. The operator pulls splits from the connector via
+ * get_next_task_input_data(); get_next_task_hint() reports READY (self) until the
+ * connector is closed and drained, then nullopt.
  */
 class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
  public:
@@ -124,45 +81,26 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
     return _split_connector.get();
   }
 
-  //===----------Metadata-scan-op handoff to scan_manager----------===//
+  //===----------Split-provider handoff to scan_manager----------===//
   /**
-   * @brief Attach the metadata scan operator constructed during plan generation.
+   * @brief Attach the split provider constructed during plan generation.
    *
-   * The pipeline converter still extracts bind_data and constructs the metadata
-   * scan operator. Instead of placing it in its own pipeline, it parks the
-   * operator here so the scan_manager can take ownership during prepare_for_query
-   * and drive its execute() on the scan-manager thread pool.
+   * The pipeline converter extracts bind_data and builds a parquet_split_provider
+   * here so the scan_manager can take ownership during prepare_for_query and
+   * start it on the scan-manager thread pool.
    */
-  void attach_metadata_scan_op(std::unique_ptr<sirius_parquet_metadata_scan_operator> op);
+  void attach_split_provider(std::unique_ptr<scan_manager::split_provider> provider);
 
   /**
-   * @brief Take ownership of the attached metadata scan operator. Returns nullptr
-   *        if none was attached.
+   * @brief Take ownership of the attached split provider. Returns nullptr if
+   *        none was attached.
    */
-  std::unique_ptr<sirius_parquet_metadata_scan_operator> take_metadata_scan_op();
-
-  //===----------Metadata handoff (called by metadata_scan)----------===//
-  /**
-   * @brief Build a parquet_scan_data per partition in @p metadata and push them into
-   *        the bound split_connector. Invoked from metadata_scan.sink() on upstream
-   *        worker threads.
-   *
-   * @param metadata The metadata scan output.
-   */
-  void accumulate_metadata(const partitioned_parquet_metadata& metadata);
-
-  /**
-   * @brief Close the bound split_connector, signaling that no more splits will arrive.
-   *
-   * Must be called exactly once, after all accumulate_metadata() calls have returned.
-   * Invoked from metadata_scan.finalize_operator().
-   */
-  void finalize_partitions();
+  std::unique_ptr<scan_manager::split_provider> take_split_provider();
 
   /**
    * @brief Install a hive-partition injection function.
    *
-   * Called once by the paired metadata scan operator at construction time when the scan
+   * Called once by the paired split provider during plan generation when the scan
    * involves hive partition columns. The closure, built by build_partition_inject_fn(),
    * is invoked by execute() after the data columns have been read from the parquet file,
    * to interleave partition-column values parsed from the file path into the output table.
@@ -217,7 +155,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
  private:
   partition_inject_fn_t _hive_partition_inject_fn;
   std::unique_ptr<scan_manager::split_connector> _split_connector;
-  std::unique_ptr<sirius_parquet_metadata_scan_operator> _metadata_scan_op;
+  std::unique_ptr<scan_manager::split_provider> _split_provider;
 };
 
 }  // namespace sirius::op::scan

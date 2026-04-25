@@ -63,55 +63,6 @@ struct row_group_range {
 };
 
 //===----------------------------------------------------------------------===//
-// parquet_metadata_input
-//===----------------------------------------------------------------------===//
-/**
- * @brief Input to a parquet metadata scan task.
- *
- * Carries a batch of file paths (up to max_file_processed) along with the
- * target approximate batch size used when partitioning row groups.
- */
-class parquet_metadata_input : public op::operator_data {
- public:
-  parquet_metadata_input(std::vector<std::string> file_paths, std::size_t approximate_batch_size)
-    : file_paths(std::move(file_paths)), approximate_batch_size(approximate_batch_size)
-  {
-  }
-
-  std::vector<std::string> file_paths;
-  std::size_t approximate_batch_size;
-};
-
-//===----------------------------------------------------------------------===//
-// partitioned_parquet_metadata
-//===----------------------------------------------------------------------===//
-/**
- * @brief Output of a parquet metadata scan task.
- *
- * Contains the parsed parquet file metadata and the row-group partitions
- * computed from it, ready for consumption by sirius_gpu_parquet_scan_operator.
- */
-class partitioned_parquet_metadata : public op::operator_data {
- public:
-  using translated_expression = gpu_expression_translator::translated_expression;
-
-  partitioned_parquet_metadata() = default;
-
-  std::vector<std::string> file_paths;
-  std::vector<std::shared_ptr<cudf::io::datasource>> datasources;  ///< Parallel to file_paths.
-  std::vector<row_group_range> row_group_partitions;
-
-  std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
-  /// Either a) the translated filter expression for row-group pruning and filter pushdown, or
-  ///        b) the coalesced duckdb expression if filter translation failed.
-  /// Shared ownership of the translated filter expression is used so that
-  /// the cuDF AST nodes referenced by reader_options remain alive.
-  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
-    filter_expression;
-  std::vector<std::size_t> post_filter_projection_ids;
-};
-
-//===----------------------------------------------------------------------===//
 // parquet_scan_data
 //===----------------------------------------------------------------------===//
 /**

@@ -18,28 +18,19 @@
 
 #include "creator/task_creator.hpp"
 #include "log/logging.hpp"
-#include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
-#include "op/scan/sirius_parquet_metadata_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/split_connector.hpp"
-
-#include <cudf/utilities/default_stream.hpp>
+#include "scan_manager/split_provider.hpp"
 
 #include <algorithm>
-#include <atomic>
-#include <exception>
 
 namespace sirius::scan_manager {
 
 struct scan_op_state {
-  std::unique_ptr<op::scan::sirius_parquet_metadata_scan_operator> metadata_scan_op;
-  split_connector* connector{nullptr};
-  op::scan::sirius_gpu_parquet_scan_operator* gpu_scan_op{nullptr};
-  creator::task_creator* task_creator{nullptr};
-  std::atomic<std::size_t> remaining{0};
+  std::unique_ptr<split_provider> provider;
 };
 
 sirius_scan_manager::sirius_scan_manager(exec::thread_pool_config config)
@@ -78,30 +69,9 @@ void sirius_scan_manager::register_scan_operator(op::scan::sirius_gpu_parquet_sc
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::register_scan_operator] registered op_id={}",
                    op->get_operator_id());
 
-  auto metadata_scan_op = op->take_metadata_scan_op();
-  if (!metadata_scan_op) {
+  auto provider = op->take_split_provider();
+  if (!provider) {
     // Nothing to do — caller will populate the connector by other means (e.g. tests).
-    return;
-  }
-
-  // Drain all metadata-scan inputs upfront. Once we know the count we can size the
-  // remaining-task counter precisely; the connector closes when the last task lands.
-  std::vector<std::unique_ptr<op::operator_data>> inputs;
-  while (auto next = metadata_scan_op->get_next_task_input_data()) {
-    inputs.push_back(std::move(next));
-  }
-
-  auto state              = std::make_shared<scan_op_state>();
-  state->metadata_scan_op = std::move(metadata_scan_op);
-  state->connector        = op->get_split_connector();
-  state->gpu_scan_op      = op;
-  state->task_creator     = _task_creator;
-  state->remaining.store(inputs.size(), std::memory_order_relaxed);
-  _scan_op_states.push_back(state);
-
-  if (inputs.empty()) {
-    state->connector->close();
-    if (state->task_creator) { state->task_creator->schedule(state->gpu_scan_op); }
     return;
   }
 
@@ -110,40 +80,30 @@ void sirius_scan_manager::register_scan_operator(op::scan::sirius_gpu_parquet_sc
       "[sirius_scan_manager::register_scan_operator] thread pool not started");
   }
 
-  auto* metadata_scan_op_ptr = state->metadata_scan_op.get();
-  for (auto& input : inputs) {
-    auto input_local = std::shared_ptr<op::operator_data>(std::move(input));
-    _thread_pool->schedule([state, input_local, metadata_scan_op_ptr]() {
-      try {
-        auto stream    = cudf::get_default_stream();
-        auto result    = metadata_scan_op_ptr->execute(*input_local, stream);
-        auto* metadata = dynamic_cast<op::scan::partitioned_parquet_metadata*>(result.get());
-        if (metadata != nullptr) {
-          auto md_ptr =
-            std::make_shared<op::scan::partitioned_parquet_metadata>(std::move(*metadata));
-          for (std::size_t i = 0; i < md_ptr->row_group_partitions.size(); ++i) {
-            auto const& rg = md_ptr->row_group_partitions[i];
-            state->connector->push_split(
-              std::make_unique<op::scan::parquet_scan_data>(md_ptr->file_paths[rg.file_idx],
-                                                            rg,
-                                                            md_ptr->reader_options,
-                                                            md_ptr->filter_expression,
-                                                            md_ptr->post_filter_projection_ids,
-                                                            md_ptr->datasources[rg.file_idx]));
-          }
-        }
-      } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR("[sirius_scan_manager] metadata scan task failed: {}", e.what());
-      }
+  auto* connector       = op->get_split_connector();
+  auto* task_creator    = _task_creator;
+  auto* gpu_scan_op_ptr = op;
+  split_provider::notify_fn notify = [task_creator, gpu_scan_op_ptr]() {
+    if (task_creator) { task_creator->schedule(gpu_scan_op_ptr); }
+    // Re-evaluate pipeline status — if the connector just closed and all GPU
+    // tasks have already completed, the source-pipeline's update_pipeline_status
+    // would otherwise never fire (mark_task_completed already happened with
+    // an open connector).
+    if (auto pipeline = gpu_scan_op_ptr->get_pipeline()) {
+      pipeline->update_pipeline_status();
+    }
+  };
 
-      if (state->task_creator) { state->task_creator->schedule(state->gpu_scan_op); }
+  provider->start(*_thread_pool, *connector, std::move(notify));
 
-      if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        state->connector->close();
-        if (state->task_creator) { state->task_creator->schedule(state->gpu_scan_op); }
-      }
-    });
-  }
+  auto state      = std::make_shared<scan_op_state>();
+  state->provider = std::move(provider);
+  _scan_op_states.push_back(state);
+}
+
+void sirius_scan_manager::set_task_creator(creator::task_creator& task_creator) noexcept
+{
+  _task_creator = &task_creator;
 }
 
 void sirius_scan_manager::reset()

@@ -19,7 +19,7 @@
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
-#include "op/scan/sirius_parquet_metadata_scan_operator.hpp"
+#include "scan_manager/parquet_split_provider.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
@@ -191,22 +191,26 @@ void sirius_pipeline_converter::split_parquet_scan_source(
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality);
-  auto metadata_scan_op = duckdb::make_uniq<op::scan::sirius_parquet_metadata_scan_operator>(
-    gpu_scan_op.get(),
-    scan_op.types,
+  auto provider = std::make_unique<scan_manager::parquet_split_provider>(
     scan_op.returned_types,
-    scan_op.estimated_cardinality,
     file_paths,
     scan_op.column_ids,
     scan_op.projection_ids,
     scan_op.names,
+    scan_op.types.size(),
     std::move(scan_op.table_filters),
     partition_indices);
 
+  // Install hive-partition injection on gpu_scan_op (was previously done from
+  // inside the metadata scan operator's constructor).
+  if (auto inject_fn = provider->take_hive_partition_inject_fn()) {
+    gpu_scan_op->set_hive_partition_inject_fn(std::move(inject_fn));
+  }
+
   auto* gpu_scan_ptr = gpu_scan_op.get();
 
-  // Park the metadata scan operator on gpu_scan_op so the scan_manager can take it.
-  gpu_scan_op->attach_metadata_scan_op(std::move(metadata_scan_op));
+  // Park the provider on gpu_scan_op so the scan_manager can take and start it.
+  gpu_scan_op->attach_split_provider(std::move(provider));
 
   // gpu_scan_op replaces the table scan as the new source. finalize_pipeline_structure()
   // will set current_pipeline->source = &operators[0] = gpu_scan_op.
@@ -996,23 +1000,6 @@ void sirius_pipeline_converter::wire_data_repositories()
       }
     } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // No action needed for RESULT_COLLECTOR sinks
-    } else if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN) {
-      // Scheduling-only dependency port. The metadata handoff itself happens through
-      // accumulate_metadata() / finalize_partitions(); no data batches flow through this port
-      // (repo is null). setup_pipeline_parents() walks metadata_scan's next_port_after_sink list
-      // and reads this port's dest_pipeline to register current_pipeline as a parent of
-      // metadata_pipeline.
-      for (auto const& dependent_pipeline : source_to_pipelines[scheduled_[i]->get_sink().get()]) {
-        auto* next_op            = dependent_pipeline->get_operators().size() == 0
-                                     ? dependent_pipeline->get_sink().get()
-                                     : &dependent_pipeline->get_operators()[0].get();
-        std::string_view port_id = "handoff";
-        next_op->add_port(
-          port_id,
-          std::make_unique<op::sirius_physical_operator::port>(
-            op::MemoryBarrierType::PARTIAL, nullptr, scheduled_[i], dependent_pipeline));
-        scheduled_[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
-      }
     } else {
       // Intermediate operators acting as pipeline sinks (e.g., filter, projection, join
       // placed as sink before a PARTITION pipeline). Use the base class sink() which
@@ -1184,13 +1171,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<int>(scan_port->type),
                           static_cast<void*>(scan_port->repo));
         }
-      } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
-        auto const* handoff_port = first_op.get_port("handoff");
-        if (handoff_port) {
-          SIRIUS_LOG_INFO("    Port 'handoff': barrier_type={}, repo=NONE",
-                          static_cast<int>(handoff_port->type));
-        }
-      } else if (first_op.type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
+      } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
@@ -1235,21 +1216,15 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<int>(scan_port->type),
                           static_cast<void*>(scan_port->repo));
         }
-      } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
-        auto const* handoff_port = sink->get_port("handoff");
-        if (handoff_port) {
-          SIRIUS_LOG_INFO("    Port 'handoff': barrier_type={}, repo=NONE",
-                          static_cast<int>(handoff_port->type));
-        }
-      } else if (sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
+      } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
                  sink->type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
                  sink->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
-        // ignore DUCKDB_SCAN, PARQUET_SCAN, ICEBERG_SCAN, PARQUET_METADATA_SCAN
-        // (they don't have ports)
+        // scan-like operators don't have ports
+
       } else if (sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
         // ignore RESULT_COLLECTOR since it doesn't have ports
       } else {

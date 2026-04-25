@@ -20,10 +20,10 @@
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
-#include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
 #include <scan_manager/split_connector.hpp>
+#include <scan_manager/split_provider.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -62,40 +62,19 @@ void sirius_gpu_parquet_scan_operator::set_split_connector(
 }
 
 //===----------------------------------------------------------------------===//
-// Metadata-scan-op handoff
+// Split-provider handoff
 //===----------------------------------------------------------------------===//
-void sirius_gpu_parquet_scan_operator::attach_metadata_scan_op(
-  std::unique_ptr<sirius_parquet_metadata_scan_operator> op)
+void sirius_gpu_parquet_scan_operator::attach_split_provider(
+  std::unique_ptr<scan_manager::split_provider> provider)
 {
-  _metadata_scan_op = std::move(op);
+  _split_provider = std::move(provider);
 }
 
-std::unique_ptr<sirius_parquet_metadata_scan_operator>
-sirius_gpu_parquet_scan_operator::take_metadata_scan_op()
+std::unique_ptr<scan_manager::split_provider>
+sirius_gpu_parquet_scan_operator::take_split_provider()
 {
-  return std::move(_metadata_scan_op);
+  return std::move(_split_provider);
 }
-
-//===----------------------------------------------------------------------===//
-// Metadata handoff (invoked from metadata_scan pipeline)
-//===----------------------------------------------------------------------===//
-void sirius_gpu_parquet_scan_operator::accumulate_metadata(
-  const partitioned_parquet_metadata& metadata)
-{
-  auto metadata_ptr = std::make_shared<partitioned_parquet_metadata>(metadata);
-  for (std::size_t i = 0; i < metadata_ptr->row_group_partitions.size(); ++i) {
-    auto const& rg_range = metadata_ptr->row_group_partitions[i];
-    _split_connector->push_split(
-      std::make_unique<parquet_scan_data>(metadata_ptr->file_paths[rg_range.file_idx],
-                                          rg_range,
-                                          metadata_ptr->reader_options,
-                                          metadata_ptr->filter_expression,
-                                          metadata_ptr->post_filter_projection_ids,
-                                          metadata_ptr->datasources[rg_range.file_idx]));
-  }
-}
-
-void sirius_gpu_parquet_scan_operator::finalize_partitions() { _split_connector->close(); }
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface

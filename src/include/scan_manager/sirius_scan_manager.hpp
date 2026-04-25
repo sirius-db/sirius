@@ -77,6 +77,10 @@ class sirius_scan_manager {
   /// closed.
   void register_scan_operator(op::scan::sirius_gpu_parquet_scan_operator* op);
 
+  /// \brief Wire the task_creator so the scan manager can re-schedule scan
+  ///        operators when splits become available or the connector is closed.
+  void set_task_creator(creator::task_creator& task_creator) noexcept;
+
   /// \brief Clear all registrations from the previous query.
   void reset();
 
