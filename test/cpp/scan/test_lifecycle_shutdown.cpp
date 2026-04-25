@@ -20,9 +20,11 @@
 // standard library
 #include <sys/wait.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -43,6 +45,23 @@ std::string find_duckdb_binary()
     if (std::filesystem::exists(candidate)) { return candidate.string(); }
   }
   return {};
+}
+
+// Run a shell command, capturing merged stdout+stderr inline. Returns {raw_status, output}
+// where raw_status is the value popen/pclose hands back (use W* macros to interpret).
+std::pair<int, std::string> run_capture(std::string const& cmd)
+{
+  std::string const full = cmd + " 2>&1";
+  FILE* pipe             = ::popen(full.c_str(), "r");
+  if (!pipe) { return {-1, "popen() failed"}; }
+
+  std::string output;
+  char buf[4096];
+  while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+    output.append(buf);
+  }
+  int const raw = ::pclose(pipe);
+  return {raw, std::move(output)};
 }
 
 }  // namespace
@@ -73,15 +92,23 @@ TEST_CASE("scan lifecycle - clean exit after duckdb_scan_task query (regression:
     "INSERT INTO t SELECT 'x' FROM range(1000); "
     "CHECKPOINT; "
     "CALL gpu_execution('SELECT count(*) FROM t');"
-    "\" >/tmp/sirius_lifecycle_test.out 2>&1";
+    "\"";
 
-  int const raw = std::system(cmd.c_str());
+  auto const [raw, output] = run_capture(cmd);
   INFO("command: " << cmd);
+  INFO("subprocess merged stdout+stderr:\n" << output);
+
   if (WIFSIGNALED(raw)) {
     FAIL("duckdb CLI terminated by signal "
          << WTERMSIG(raw)
          << " (SIGSEGV = 11; CLI exit code = 139 indicates the QueryEnd UAF regressed)");
   }
   REQUIRE(WIFEXITED(raw));
-  REQUIRE(WEXITSTATUS(raw) == 0);
+  if (WEXITSTATUS(raw) != 0) {
+    FAIL("duckdb CLI exited with status "
+         << WEXITSTATUS(raw)
+         << " (non-zero, non-signal). This usually means a setup precondition failed before "
+            "the scan ran (init error, missing GPU, missing config). The subprocess output "
+            "above contains the actual error from the CLI.");
+  }
 }
