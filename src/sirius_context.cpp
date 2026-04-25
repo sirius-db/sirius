@@ -155,6 +155,11 @@ void SiriusContext::QueryEnd()
       executor->drain();
     }
 
+    // Release DuckDB table scan state while the database is still fully alive. If deferred
+    // to terminate() (called from ~DatabaseInstance), DuckDB storage objects (BlockMemory,
+    // RowGroups) may already be partially torn down, causing a use-after-free on exit.
+    if (task_creator_) { task_creator_->reset(); }
+
     // Clear all data repositories between queries.
     // Any batches still present are leaked — operators should have popped everything.
     if (data_repository_manager_) {
