@@ -81,12 +81,17 @@ TEST_CASE("scan lifecycle - clean exit after duckdb_scan_task query (regression:
     return;
   }
 
-  // Strip env vars the unit-test harness sets but the spawned CLI must not inherit:
-  //   SIRIUS_DISABLE          — set by shared_test_env::create_db; would block CLI init
-  //   SIRIUS_CONFIG_FILE      — points at the test-only memory.yaml
-  //   SIRIUS_INTEGRATION_*    — TPC-H test data path
+  // Sirius's default GPU memory pool grabs ~14 GB upfront, which OOMs on CI runners.
+  // Point the spawned CLI at the small (2 GB GPU / 4 GB host) test config sitting next
+  // to this test file. Strip SIRIUS_DISABLE (shared_test_env sets it; would block CLI
+  // init) and SIRIUS_INTEGRATION_TEST_DB_PATH (TPC-H test data path, irrelevant here).
+  auto const test_config = std::filesystem::path(__FILE__).parent_path() / "memory.yaml";
+  REQUIRE(std::filesystem::exists(test_config));
+
   std::string const cmd =
-    "env -u SIRIUS_DISABLE -u SIRIUS_CONFIG_FILE -u SIRIUS_INTEGRATION_TEST_DB_PATH " + duckdb_bin +
+    "env -u SIRIUS_DISABLE -u SIRIUS_INTEGRATION_TEST_DB_PATH "
+    "SIRIUS_CONFIG_FILE=" +
+    test_config.string() + " " + duckdb_bin +
     " -unsigned -c \""
     "CREATE TABLE t(s VARCHAR); "
     "INSERT INTO t SELECT 'x' FROM range(1000); "
