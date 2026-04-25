@@ -818,14 +818,18 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
 
   REQUIRE(op.is_source());
 
-  // With no metadata accumulated and no "handoff" port wired to an upstream
-  // pipeline, the gpu scan operator has nothing to claim and nothing to defer
-  // to — all_ports_empty() is true and get_next_task_hint() returns nullopt.
-  REQUIRE(op.all_ports_empty());
-  REQUIRE(op.get_next_task_hint() == std::nullopt);
+  // Fresh operator: the bound split_connector is open and empty. With the
+  // connector-based semantics, hint reports READY (self) until the connector
+  // is closed; the operator just returns nullptr from get_next_task_input_data
+  // when no split is queued.
+  REQUIRE_FALSE(op.all_ports_empty());
+  auto hint = op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == sirius::op::TaskCreationHint::READY);
+  REQUIRE(hint->producer == &op);
   REQUIRE(op.get_next_task_input_data() == nullptr);
 
-  // Finalize with no metadata → no partitions, still idle.
+  // Finalize with no metadata → connector closed and drained.
   op.finalize_partitions();
   REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_hint() == std::nullopt);

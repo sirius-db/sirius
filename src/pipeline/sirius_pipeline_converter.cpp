@@ -165,24 +165,12 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
 //===----------------------------------------------------------------------===//
 // split_parquet_scan_source()
 //
-// Rewrites a DuckDB parquet table scan into two Sirius pipelines:
-//
-//   metadata_pipeline (new, single op):
-//     metadata_scan_op is both source and sink. Its execute() parses parquet
-//     footers and produces partitioned_parquet_metadata; its sink() override
-//     forwards each result directly into the paired gpu_scan_op via
-//     accumulate_metadata(). finalize_operator() calls finalize_partitions()
-//     on gpu_scan_op once the pipeline completes.
-//
-//   current_pipeline (rewritten):
-//     gpu_scan_op replaces the DuckDB table scan as the source. It cannot
-//     dispatch tasks until its partition index has been finalized by the
-//     upstream metadata_pipeline.
-//
-// The handoff is a direct function call — no data repository is wired
-// between the two pipelines. A null-repo "dependency" port on gpu_scan_op
-// exists only so setup_pipeline_parents() can discover the
-// metadata_pipeline -> current_pipeline scheduling dependency.
+// Rewrites a DuckDB parquet table scan into a Sirius gpu_scan_op as the
+// pipeline source. The companion metadata scan operator is constructed here
+// (so we can extract bind_data while we still have it) but is not placed in
+// any pipeline — it is parked on the gpu_scan_op via attach_metadata_scan_op()
+// so the scan_manager can take ownership and drive its execute() on its own
+// thread pool during prepare_for_query.
 //===----------------------------------------------------------------------===//
 void sirius_pipeline_converter::split_parquet_scan_source(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
@@ -201,8 +189,6 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   }
   auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
 
-  // Construct the pair. metadata_scan_op holds a raw pointer back to gpu_scan_op for the direct
-  // accumulate_metadata() / finalize_partitions() handoff.
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality);
   auto metadata_scan_op = duckdb::make_uniq<op::scan::sirius_parquet_metadata_scan_operator>(
@@ -217,22 +203,15 @@ void sirius_pipeline_converter::split_parquet_scan_source(
     std::move(scan_op.table_filters),
     partition_indices);
 
-  auto* gpu_scan_ptr      = gpu_scan_op.get();
-  auto* metadata_scan_ptr = metadata_scan_op.get();
+  auto* gpu_scan_ptr = gpu_scan_op.get();
 
-  // metadata_pipeline: single-op self-pipeline. metadata_scan_op is both the task-emitting
-  // source and the sink.
-  auto metadata_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
-  metadata_pipeline->source = nullptr;
-  metadata_pipeline->sink   = metadata_scan_ptr;
+  // Park the metadata scan operator on gpu_scan_op so the scan_manager can take it.
+  gpu_scan_op->attach_metadata_scan_op(std::move(metadata_scan_op));
 
-  // current_pipeline: gpu_scan_op becomes the new source. finalize_pipeline_structure() will
-  // later set current_pipeline->source = &operators[0] and push the existing sink on the end.
-  current_pipeline->source = metadata_scan_ptr;
+  // gpu_scan_op replaces the table scan as the new source. finalize_pipeline_structure()
+  // will set current_pipeline->source = &operators[0] = gpu_scan_op.
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
 
-  scheduled_.push_back(std::move(metadata_pipeline));
-  pipeline_breakers_.push_back(std::move(metadata_scan_op));
   pipeline_breakers_.push_back(std::move(gpu_scan_op));
 }
 

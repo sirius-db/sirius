@@ -40,6 +40,7 @@ void query::build_indices()
       if (source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN ||
+          source->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
         _scan_operators.push_back(source.get());
       }

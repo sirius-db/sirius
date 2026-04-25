@@ -21,15 +21,18 @@
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
+#include <scan_manager/split_connector.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <vector>
+
+namespace sirius::op::scan {
+class sirius_parquet_metadata_scan_operator;
+}  // namespace sirius::op::scan
 
 namespace sirius::op::scan {
 
@@ -102,27 +105,57 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   sirius_gpu_parquet_scan_operator(duckdb::vector<sirius::logical_type> types,
                                    duckdb::idx_t estimated_cardinality);
 
+  ~sirius_gpu_parquet_scan_operator() override;
+
+  //===----------Split-connector binding----------===//
+  /**
+   * @brief Replace the bound split_connector. Intended for the scan_manager to install
+   *        its own connector during query preparation; before this is called, the
+   *        operator uses an internally-allocated default connector.
+   */
+  void set_split_connector(std::unique_ptr<scan_manager::split_connector> connector);
+
+  /**
+   * @brief Get the bound split_connector for split production. Never null — the
+   *        operator default-allocates a connector at construction.
+   */
+  scan_manager::split_connector* get_split_connector() noexcept
+  {
+    return _split_connector.get();
+  }
+
+  //===----------Metadata-scan-op handoff to scan_manager----------===//
+  /**
+   * @brief Attach the metadata scan operator constructed during plan generation.
+   *
+   * The pipeline converter still extracts bind_data and constructs the metadata
+   * scan operator. Instead of placing it in its own pipeline, it parks the
+   * operator here so the scan_manager can take ownership during prepare_for_query
+   * and drive its execute() on the scan-manager thread pool.
+   */
+  void attach_metadata_scan_op(std::unique_ptr<sirius_parquet_metadata_scan_operator> op);
+
+  /**
+   * @brief Take ownership of the attached metadata scan operator. Returns nullptr
+   *        if none was attached.
+   */
+  std::unique_ptr<sirius_parquet_metadata_scan_operator> take_metadata_scan_op();
+
   //===----------Metadata handoff (called by metadata_scan)----------===//
   /**
-   * @brief Append partitions for one partitioned_parquet_metadata to the partition index.
-   *
-   * Invoked from metadata_scan.sink() on upstream worker threads. Copies @p metadata
-   * into a shared_ptr so its lifetime is tied to the partition entries, then expands
-   * each element of row_group_partitions into an individual partition_entry under
-   * _metadata_mutex. Partitions become claimable by get_next_task_input_data() as
-   * soon as they are appended.
+   * @brief Build a parquet_scan_data per partition in @p metadata and push them into
+   *        the bound split_connector. Invoked from metadata_scan.sink() on upstream
+   *        worker threads.
    *
    * @param metadata The metadata scan output.
    */
   void accumulate_metadata(const partitioned_parquet_metadata& metadata);
 
   /**
-   * @brief Signal that no more metadata will arrive.
+   * @brief Close the bound split_connector, signaling that no more splits will arrive.
    *
    * Must be called exactly once, after all accumulate_metadata() calls have returned.
-   * Invoked from metadata_scan.finalize_operator(). Sets _finalized under
-   * _metadata_mutex so get_next_task_hint() can return std::nullopt once the partition
-   * index is fully drained instead of continuing to defer to the upstream pipeline.
+   * Invoked from metadata_scan.finalize_operator().
    */
   void finalize_partitions();
 
@@ -146,36 +179,24 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
 
   //===----------Scheduling interface----------===//
   /**
-   * @return READY pointing at this operator while _partition_index contains an
-   *         unclaimed entry (regardless of whether accumulation is still in
-   *         progress);
-   *         WAITING_FOR_INPUT_DATA pointing at the upstream metadata scan when no
-   *         entry is currently claimable and the metadata pipeline has not yet
-   *         been finalized (surfaces the upstream dependency to
-   *         task_creator::get_operator_for_next_task, which otherwise cannot
-   *         discover it — the metadata handoff is a side channel, not a data
-   *         repo);
-   *         nullopt once all partitions have been claimed AND
-   *         finalize_partitions() has been called.
+   * @return nullopt once the bound split_connector is closed and drained;
+   *         READY pointing at this operator otherwise.
    */
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   /**
-   * @return true when no partition is currently claimable (either all have been
-   *         claimed or none have been accumulated yet); false while
-   *         _partition_index contains an unclaimed entry. Callers combine this
-   *         with is_source_pipeline_finished() to decide whether the scan
-   *         pipeline is truly done.
+   * @return true once the bound split_connector is closed and drained.
    */
   [[nodiscard]] bool all_ports_empty() override;
 
   /**
-   * @brief Claims and returns the next parquet_scan_data for a single row_group_range.
+   * @brief Pull the next parquet_scan_data from the bound split_connector.
    *
-   * @return the claimed parquet_scan_data, or nullptr when no partition is currently
-   *         claimable (either all partitions have been claimed, or none have been
-   *         accumulated yet). Returning nullptr does not imply the scan is finished —
-   *         the caller must consult is_source_pipeline_finished() for that.
+   * @return the next split, or nullptr when no split is currently available
+   *         (either the connector is empty-but-open, or it has been closed and
+   *         drained). Returning nullptr does not imply the scan is finished —
+   *         the caller must consult get_next_task_hint() / all_ports_empty()
+   *         for that.
    */
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -194,34 +215,9 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
  private:
-  // ===----------------------------------------------------------------------===//
-  // Streaming partition index
-  //   _metadata_mutex    — serializes accumulate_metadata() appends against
-  //                         get_next_task_input_data() claims. Also covers size
-  //                         reads by get_next_task_hint() / all_ports_empty() so
-  //                         the observed size is consistent with ongoing appends.
-  //   _partition_index   — grown incrementally by accumulate_metadata(); each entry
-  //                         holds a shared_ptr to the metadata object it indexes
-  //                         into (so the copy outlives the upstream sink's
-  //                         operator_data) plus the partition offset within that
-  //                         metadata's row_group_partitions.
-  //   _next_partition_idx— counter of the next unclaimed entry; advanced under
-  //                         _metadata_mutex by get_next_task_input_data().
-  //   _finalized         — set once by finalize_partitions() under _metadata_mutex
-  //                         to signal that no more accumulate_metadata() calls will
-  //                         arrive. Read by get_next_task_hint() under _metadata_mutex
-  //                         to decide nullopt vs. WAITING.
-  // ===----------------------------------------------------------------------===//
-  std::mutex _metadata_mutex;
-  bool _finalized{false};
   partition_inject_fn_t _hive_partition_inject_fn;
-
-  struct partition_entry {
-    std::shared_ptr<partitioned_parquet_metadata> metadata;
-    std::size_t partition_idx;  ///< Index into the associated metadata's partition list
-  };
-  std::vector<partition_entry> _partition_index;
-  std::size_t _next_partition_idx{0};
+  std::unique_ptr<scan_manager::split_connector> _split_connector;
+  std::unique_ptr<sirius_parquet_metadata_scan_operator> _metadata_scan_op;
 };
 
 }  // namespace sirius::op::scan

@@ -20,8 +20,10 @@
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
+#include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
+#include <scan_manager/split_connector.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -32,7 +34,6 @@
 #include <cucascade/data/gpu_data_representation.hpp>
 
 // standard library
-#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -44,8 +45,35 @@ namespace sirius::op::scan {
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
   duckdb::vector<sirius::logical_type> types, duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
+    _split_connector(std::make_unique<scan_manager::split_connector>())
 {
+}
+
+sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
+
+//===----------------------------------------------------------------------===//
+// Split-connector binding
+//===----------------------------------------------------------------------===//
+void sirius_gpu_parquet_scan_operator::set_split_connector(
+  std::unique_ptr<scan_manager::split_connector> connector)
+{
+  _split_connector = std::move(connector);
+}
+
+//===----------------------------------------------------------------------===//
+// Metadata-scan-op handoff
+//===----------------------------------------------------------------------===//
+void sirius_gpu_parquet_scan_operator::attach_metadata_scan_op(
+  std::unique_ptr<sirius_parquet_metadata_scan_operator> op)
+{
+  _metadata_scan_op = std::move(op);
+}
+
+std::unique_ptr<sirius_parquet_metadata_scan_operator>
+sirius_gpu_parquet_scan_operator::take_metadata_scan_op()
+{
+  return std::move(_metadata_scan_op);
 }
 
 //===----------------------------------------------------------------------===//
@@ -55,78 +83,36 @@ void sirius_gpu_parquet_scan_operator::accumulate_metadata(
   const partitioned_parquet_metadata& metadata)
 {
   auto metadata_ptr = std::make_shared<partitioned_parquet_metadata>(metadata);
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-  for (std::size_t i = 0; i < metadata.row_group_partitions.size(); ++i) {
-    _partition_index.emplace_back(metadata_ptr, i);
+  for (std::size_t i = 0; i < metadata_ptr->row_group_partitions.size(); ++i) {
+    auto const& rg_range = metadata_ptr->row_group_partitions[i];
+    _split_connector->push_split(
+      std::make_unique<parquet_scan_data>(metadata_ptr->file_paths[rg_range.file_idx],
+                                          rg_range,
+                                          metadata_ptr->reader_options,
+                                          metadata_ptr->filter_expression,
+                                          metadata_ptr->post_filter_projection_ids,
+                                          metadata_ptr->datasources[rg_range.file_idx]));
   }
 }
 
-void sirius_gpu_parquet_scan_operator::finalize_partitions()
-{
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-  _finalized = true;
-}
+void sirius_gpu_parquet_scan_operator::finalize_partitions() { _split_connector->close(); }
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface
 //===----------------------------------------------------------------------===//
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
-  {
-    std::lock_guard<std::mutex> lock(_metadata_mutex);
-
-    // 1. Work available? Dispatch immediately, even if metadata pipeline
-    //    is still producing.
-    if (_next_partition_idx < _partition_index.size()) {
-      return task_creation_hint{TaskCreationHint::READY, this};
-    }
-
-    // 2. No work and metadata pipeline is done — we are finished.
-    if (_finalized) { return std::nullopt; }
-  }
-
-  // 3. Metadata pipeline is still running — defer to it.
-  auto it = ports.find("handoff");
-  if (it != ports.end() && it->second && it->second->src_pipeline) {
-    if (auto upstream = it->second->src_pipeline->get_source()) {
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, upstream.get()};
-    }
-  }
-  return std::nullopt;
+  if (_split_connector->is_closed()) { return std::nullopt; }
+  return task_creation_hint{TaskCreationHint::READY, this};
 }
 
-bool sirius_gpu_parquet_scan_operator::all_ports_empty()
-{
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-  return _next_partition_idx >= _partition_index.size();
-}
+bool sirius_gpu_parquet_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
-  std::size_t idx;
-  {
-    std::lock_guard<std::mutex> lock(_metadata_mutex);
-    if (_next_partition_idx >= _partition_index.size()) { return nullptr; }
-    idx = _next_partition_idx++;
-  }
-
-  auto const& entry    = _partition_index[idx];
-  auto meta            = entry.metadata;
-  auto const& rg_range = meta->row_group_partitions[entry.partition_idx];
-
-  SIRIUS_LOG_DEBUG(
-    "[sirius_gpu_parquet_scan_operator] Creating parquet_scan_data for partition {} "
-    "(file_idx={}, {} row groups)",
-    idx,
-    rg_range.file_idx,
-    rg_range.row_group_indices.size());
-
-  return std::make_unique<parquet_scan_data>(meta->file_paths[rg_range.file_idx],
-                                             rg_range,
-                                             meta->reader_options,
-                                             meta->filter_expression,
-                                             meta->post_filter_projection_ids,
-                                             meta->datasources[rg_range.file_idx]);
+  auto next = _split_connector->get_next_split();
+  if (!next.has_value()) { return nullptr; }
+  return std::move(*next);
 }
 
 //===----------------------------------------------------------------------===//
