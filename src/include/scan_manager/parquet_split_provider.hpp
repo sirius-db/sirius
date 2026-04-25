@@ -96,9 +96,7 @@ class parquet_split_provider : public split_provider {
   ///        hive partition columns.
   op::scan::partition_inject_fn_t take_hive_partition_inject_fn();
 
-  void start(exec::thread_pool& pool,
-             split_connector& connector,
-             notify_fn notify = {}) override;
+  std::future<void> start(exec::thread_pool& pool, split_connector& connector) override;
 
  private:
   struct file_batch {
@@ -111,7 +109,7 @@ class parquet_split_provider : public split_provider {
 
   /// \brief Run the metadata-scan logic for one batch and push parquet_scan_data
   ///        per partition into @p connector.
-  void run_batch(file_batch const& batch, split_connector& connector, notify_fn const& notify);
+  void run_batch(file_batch const& batch, split_connector& connector);
 
   std::vector<std::string> _file_paths;
   std::vector<std::size_t> _selected_column_indices;

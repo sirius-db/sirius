@@ -152,9 +152,8 @@ std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_t
   return batch;
 }
 
-void parquet_split_provider::start(exec::thread_pool& pool,
-                                   split_connector& connector,
-                                   notify_fn notify)
+std::future<void> parquet_split_provider::start(exec::thread_pool& pool,
+                                                split_connector& connector)
 {
   // Drain all batches up-front so we can size the remaining-task counter
   // precisely; the connector closes when the last batch lands.
@@ -163,31 +162,33 @@ void parquet_split_provider::start(exec::thread_pool& pool,
     batches.push_back(std::move(*next));
   }
 
+  auto promise = std::make_shared<std::promise<void>>();
+  auto future  = promise->get_future();
+
   if (batches.empty()) {
     connector.close();
-    if (notify) { notify(); }
-    return;
+    promise->set_value();
+    return future;
   }
 
   auto remaining = std::make_shared<std::atomic<std::size_t>>(batches.size());
   for (auto& batch : batches) {
-    pool.schedule([this, batch = std::move(batch), &connector, remaining, notify]() {
+    pool.schedule([this, batch = std::move(batch), &connector, remaining, promise]() {
       try {
-        run_batch(batch, connector, notify);
+        run_batch(batch, connector);
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("[parquet_split_provider] metadata scan task failed: {}", e.what());
       }
       if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
         connector.close();
-        if (notify) { notify(); }
+        promise->set_value();
       }
     });
   }
+  return future;
 }
 
-void parquet_split_provider::run_batch(file_batch const& batch,
-                                       split_connector& connector,
-                                       notify_fn const& notify)
+void parquet_split_provider::run_batch(file_batch const& batch, split_connector& connector)
 {
   auto stream = cudf::get_default_stream();
 
@@ -264,7 +265,6 @@ void parquet_split_provider::run_batch(file_batch const& batch,
                                                                  _post_filter_projection_ids,
                                                                  datasource_shared);
       connector.push_split(std::move(split));
-      if (notify) { notify(); }
     };
 
     auto accumulate_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {

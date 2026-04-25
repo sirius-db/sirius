@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -32,11 +33,11 @@ namespace sirius::scan_manager {
  *
  * The connector is a lock-protected queue of pre-built splits. The producer side enqueues
  * splits as they become ready and calls close() when no more will arrive. The consumer
- * side (the scan operator) pulls splits via get_next_split() with three-state semantics:
+ * pulls splits via get_next_split(), which BLOCKS until either a split is available or
+ * the connector has been closed and drained:
  *
- *   - returned optional is std::nullopt          → connector is closed and drained.
- *   - returned optional contains a null pointer  → no split ready yet, retry later.
- *   - returned optional contains a non-null ptr  → next split.
+ *   - returns std::nullopt           → connector is closed and drained, no more will arrive.
+ *   - returns a non-null unique_ptr  → next split.
  */
 class split_connector {
  public:
@@ -48,26 +49,24 @@ class split_connector {
   split_connector(split_connector&&)                 = delete;
   split_connector& operator=(split_connector&&)      = delete;
 
-  /// \brief Enqueue a ready split. Producer side.
+  /// \brief Enqueue a ready split. Producer side. Wakes a waiting consumer.
   void push_split(std::unique_ptr<op::operator_data> split);
 
   /// \brief Mark the connector as closed: no more splits will be pushed. Idempotent.
+  ///        Wakes all waiting consumers.
   void close();
 
-  /// \brief Pull the next split.
-  /// \return std::nullopt when closed and drained; an optional containing a null
-  ///         unique_ptr when open but currently empty; an optional containing the
-  ///         next split otherwise.
+  /// \brief Pull the next split, blocking until one is available or the connector
+  ///        is closed and drained.
+  /// \return std::nullopt when closed and drained; the next split otherwise.
   std::optional<std::unique_ptr<op::operator_data>> get_next_split();
 
   /// \brief True iff close() has been called and the queue is drained.
   [[nodiscard]] bool is_closed() const;
 
-  /// \brief True iff a split is currently queued.
-  [[nodiscard]] bool has_pending_split() const;
-
  private:
   mutable std::mutex _mutex;
+  std::condition_variable _cv;
   std::deque<std::unique_ptr<op::operator_data>> _splits;
   bool _closed{false};
 };

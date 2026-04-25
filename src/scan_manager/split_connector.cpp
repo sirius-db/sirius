@@ -27,38 +27,38 @@ split_connector::~split_connector() = default;
 
 void split_connector::push_split(std::unique_ptr<op::operator_data> split)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-  _splits.push_back(std::move(split));
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _splits.push_back(std::move(split));
+  }
+  _cv.notify_one();
 }
 
 void split_connector::close()
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-  _closed = true;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _closed = true;
+  }
+  _cv.notify_all();
 }
 
 std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_split()
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
+  _cv.wait(lock, [this] { return !_splits.empty() || _closed; });
   if (!_splits.empty()) {
     auto split = std::move(_splits.front());
     _splits.pop_front();
     return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
   }
-  if (_closed) { return std::nullopt; }
-  return std::optional<std::unique_ptr<op::operator_data>>{nullptr};
+  return std::nullopt;
 }
 
 bool split_connector::is_closed() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
   return _closed && _splits.empty();
-}
-
-bool split_connector::has_pending_split() const
-{
-  std::lock_guard<std::mutex> lock(_mutex);
-  return !_splits.empty();
 }
 
 }  // namespace sirius::scan_manager

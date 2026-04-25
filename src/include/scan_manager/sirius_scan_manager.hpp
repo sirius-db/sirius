@@ -18,13 +18,11 @@
 
 #include "exec/config.hpp"
 #include "exec/thread_pool.hpp"
+#include "scan_manager/split_provider.hpp"
 
 #include <memory>
+#include <thread>
 #include <vector>
-
-namespace sirius::creator {
-class task_creator;
-}  // namespace sirius::creator
 
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
@@ -35,8 +33,6 @@ class query;
 }  // namespace sirius::planner
 
 namespace sirius::scan_manager {
-
-struct scan_op_state;
 
 /**
  * @brief Manages scan-side preparation for a query.
@@ -63,39 +59,45 @@ class sirius_scan_manager {
 
   /// \brief Prepare per-scan state for the given query.
   ///
-  /// Walks @p query 's pipelines, locates GPU parquet scan sources, and registers
-  /// each one (binding a split_connector and recording per-operator state).
+  /// Walks @p query 's pipelines in scan-operator order, registers each GPU
+  /// parquet scan source (binding it a fresh split_connector and taking the
+  /// parked split_provider), and launches a driver thread that runs the
+  /// providers SEQUENTIALLY: provider[0] starts, when its future completes
+  /// provider[1] starts, and so on. Consumers (the gpu scan operators) block
+  /// in split_connector::get_next_split until splits arrive or the connector
+  /// is closed, so no separate wake-up channel is needed.
   void prepare_for_query(const sirius::planner::query& query);
 
   /// \brief Register a GPU parquet scan operator with this scan manager.
   ///
-  /// Creates a fresh split_connector, installs it on @p op, takes ownership of
-  /// the metadata scan operator parked on @p op, and dispatches metadata-scan
-  /// tasks to the scan-manager thread pool. Each task runs the metadata scan
-  /// against cudf::get_default_stream() and pushes the resulting parquet_scan_data
-  /// splits into the connector. When the last task completes, the connector is
-  /// closed.
+  /// Installs a fresh split_connector on @p op, takes ownership of the parked
+  /// split_provider, and queues the (op, provider) pair for sequential
+  /// execution by the driver thread. Idempotent per-query.
   void register_scan_operator(op::scan::sirius_gpu_parquet_scan_operator* op);
 
-  /// \brief Wire the task_creator so the scan manager can re-schedule scan
-  ///        operators when splits become available or the connector is closed.
-  void set_task_creator(creator::task_creator& task_creator) noexcept;
-
-  /// \brief Clear all registrations from the previous query.
+  /// \brief Clear all registrations from the previous query and join the
+  ///        driver thread if it is still running.
   void reset();
 
   /// \brief Start the worker thread pool. Idempotent.
   void start();
 
-  /// \brief Stop the worker thread pool. Idempotent.
+  /// \brief Stop the worker thread pool and the driver. Idempotent.
   void stop();
 
  private:
+  struct registration {
+    op::scan::sirius_gpu_parquet_scan_operator* op;
+    std::unique_ptr<split_provider> provider;
+  };
+
+  /// \brief Run providers sequentially: start each, wait on its future, advance.
+  void run_driver_loop();
+
   exec::thread_pool_config _config;
   std::unique_ptr<exec::thread_pool> _thread_pool;
-  creator::task_creator* _task_creator{nullptr};
-  std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _registered_scan_operators;
-  std::vector<std::shared_ptr<scan_op_state>> _scan_op_states;
+  std::vector<registration> _registrations;
+  std::thread _driver_thread;
 };
 
 }  // namespace sirius::scan_manager

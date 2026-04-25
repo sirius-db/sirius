@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <functional>
+#include <future>
 
 namespace sirius::exec {
 class thread_pool;
@@ -32,15 +32,10 @@ class split_connector;
  * A concrete provider, when started, dispatches tasks onto a worker pool that
  * compute split metadata and push it (as @c operator_data instances) into the
  * supplied @ref split_connector. The provider must call @c connector.close()
- * once it has no more splits to produce, regardless of success.
+ * exactly once after it has no more splits to produce (including failure paths).
  */
 class split_provider {
  public:
-  /// Optional callback invoked after each split is pushed and after close().
-  /// Used by the scan_manager to wake up the consumer (e.g. re-schedule the
-  /// scan operator on the task_creator) so the consumer drains the connector.
-  using notify_fn = std::function<void()>;
-
   virtual ~split_provider() = default;
 
   /**
@@ -48,12 +43,13 @@ class split_provider {
    *
    * May dispatch work onto @p pool and return immediately; production may
    * continue asynchronously. Implementations must eventually close
-   * @p connector exactly once. If @p notify is set, it is invoked after each
-   * split is pushed and after the connector is closed.
+   * @p connector exactly once.
+   *
+   * @return a future that completes once the connector has been closed
+   *         (i.e. all production tasks finished). Allows a sequential driver
+   *         to wait on one provider before starting the next.
    */
-  virtual void start(exec::thread_pool& pool,
-                     split_connector& connector,
-                     notify_fn notify = {}) = 0;
+  virtual std::future<void> start(exec::thread_pool& pool, split_connector& connector) = 0;
 };
 
 }  // namespace sirius::scan_manager
