@@ -88,11 +88,15 @@ TEST_CASE("scan lifecycle - clean exit after duckdb_scan_task query (regression:
   auto const test_config = std::filesystem::path(__FILE__).parent_path() / "memory.yaml";
   REQUIRE(std::filesystem::exists(test_config));
 
+  // Single-quote both paths so a build path with spaces (or a custom
+  // SIRIUS_TEST_DUCKDB_BIN containing spaces) doesn't tokenize incorrectly.
+  // Embedded single quotes in paths are extraordinarily rare; if encountered,
+  // switch to fork/exec with argv to avoid the shell entirely.
   std::string const cmd =
     "env -u SIRIUS_DISABLE -u SIRIUS_INTEGRATION_TEST_DB_PATH "
-    "SIRIUS_CONFIG_FILE=" +
-    test_config.string() + " " + duckdb_bin +
-    " -unsigned -c \""
+    "SIRIUS_CONFIG_FILE='" +
+    test_config.string() + "' '" + duckdb_bin +
+    "' -unsigned -c \""
     "CREATE TABLE t(s VARCHAR); "
     "INSERT INTO t SELECT 'x' FROM range(1000); "
     "CHECKPOINT; "

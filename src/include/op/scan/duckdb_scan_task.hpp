@@ -334,6 +334,14 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
    */
   std::shared_ptr<data_batch> make_data_batch();
 
+  /// Test-only inspector for column_builders state after estimate_rows_per_batch /
+  /// initialize_builders run in the constructor. Used to assert that varchar sizing
+  /// resolved through projection_ids correctly.
+  [[nodiscard]] std::vector<column_builder> const& column_builders_for_testing() const noexcept
+  {
+    return _column_builders;
+  }
+
  private:
   //===----------Fields----------===//
   size_t _approximate_batch_size;                ///< Approximate target batch size in bytes

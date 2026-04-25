@@ -40,6 +40,9 @@
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 
+// standard library
+#include <algorithm>
+
 namespace sirius::op::scan {
 
 namespace {
@@ -502,9 +505,14 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
 
       // Use DuckDB's per-column max_string_length when available — a safe upper bound
       // that is typically much tighter than the blind default and unlocks the chunk_fits
-      // skip in compute_task. Use the storage column index (not the projected index) so
-      // that projected queries like SELECT l_comment read stats for the right column.
-      auto storage_col_idx = duckdb::StorageIndex(op.column_ids[i].GetPrimaryIndex());
+      // skip in compute_task. Resolve the output column through projection_ids when
+      // present (DuckDB filter pushdown can produce non-identity projection_ids: the
+      // scan reads N storage columns but outputs M < N, with projection_ids mapping
+      // output index → column_ids index). Reading stats for the wrong storage column
+      // here would set has_metadata_bound=true with a wrong (often smaller) bound,
+      // which the chunk_fits skip would then trust — silent buffer overflow.
+      size_t const column_id_index = op.projection_ids.empty() ? i : op.projection_ids[i];
+      auto storage_col_idx = duckdb::StorageIndex(op.column_ids[column_id_index].GetPrimaryIndex());
       size_t varchar_size  = estimate_varchar_bytes_from_metadata(
         op.bind_data.get(), storage_col_idx, i, _exec_ctx.client);
       bool const from_metadata = (varchar_size != 0);
@@ -722,24 +730,16 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {
     if (!all_varchars_bounded && !chunk_fits(l_state)) {
-      if (l_state._row_offset > 0) {
-        // We accumulated rows already — flush the partial batch and let the next task
-        // pick up the remaining range. The current chunk is dropped; carrying it forward
-        // would require buffering it across the task boundary (TODO).
-        SIRIUS_LOG_WARN(
-          "[duckdb_scan] task={}: varchar overflow after {} rows, flushing batch "
-          "(chunk of {} rows does not fit, continuing in next task)",
-          _task_id,
-          l_state._row_offset,
-          l_state._chunk.size());
-        break;
-      }
-      // Empty batch and the very first chunk does not fit — the allocation is too small
-      // for even a single chunk. With metadata-derived sizing this should be unreachable;
-      // with the default fallback it can happen on extremely wide rows.
+      // get_next_chunk has already advanced DuckDB's local scan state and populated
+      // l_state._chunk. Breaking here would drop the current chunk's rows entirely
+      // (the next task resumes from the *moved* local_tf_state, past this chunk).
+      // Until we implement carry-forward (buffer the chunk in local_state and replay
+      // it before the next get_next_chunk in the successor task), fail fast to
+      // preserve correctness. With metadata-derived sizing this is unreachable.
       throw std::runtime_error(
-        "[duckdb_scan_task]: first chunk does not fit in the allocated buffers. "
-        "Consider increasing scan_task_batch_size.");
+        "[duckdb_scan_task]: chunk does not fit in the allocated buffers. "
+        "Consider increasing scan_task_batch_size or providing column statistics so "
+        "metadata-derived sizing engages.");
     }
 
     // Process the chunk into the column builders
