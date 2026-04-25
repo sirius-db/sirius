@@ -301,6 +301,83 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   process_mask_for_column(validity, num_rows, row_offset, allocation);
 }
 
+void duckdb_scan_task_local_state::column_builder::process_dictionary_varchar(
+  duckdb::Vector& vec,
+  size_t num_rows,
+  size_t row_offset,
+  std::unique_ptr<multiple_blocks_allocation>& allocation)
+{
+  // PRECONDITION: vec is DICTIONARY_VECTOR with VARCHAR child.
+  auto& sel_vec        = duckdb::DictionaryVector::SelVector(vec);
+  auto& child          = duckdb::DictionaryVector::Child(vec);
+  auto& child_validity = duckdb::FlatVector::Validity(child);
+  auto const* dict_data = duckdb::FlatVector::GetData<duckdb::string_t>(child);
+
+  auto dict_size_hint = duckdb::DictionaryVector::DictionarySize(vec);
+  size_t dict_count   = dict_size_hint.IsValid() ? dict_size_hint.GetIndex() : 0;
+  if (dict_count == 0) {
+    // Hint missing — discover the dictionary upper bound by scanning the selection.
+    for (size_t row = 0; row < num_rows; ++row) {
+      auto idx = sel_vec.get_index(row);
+      if (idx >= dict_count) { dict_count = idx + 1; }
+    }
+  }
+
+  // Materialize a small lookup of (data, len) per dict entry so the row loop hits
+  // L1-cached data instead of chasing string_t pointers each iteration. Stack-allocate
+  // for the common small-dict case; spill to heap for large dictionaries.
+  constexpr size_t STACK_DICT_LIMIT = 256;
+  struct dict_entry {
+    const char* data;
+    uint32_t len;
+  };
+  dict_entry stack_dict[STACK_DICT_LIMIT];
+  std::vector<dict_entry> heap_dict;
+  dict_entry* dict = stack_dict;
+  if (dict_count > STACK_DICT_LIMIT) {
+    heap_dict.resize(dict_count);
+    dict = heap_dict.data();
+  }
+  for (size_t k = 0; k < dict_count; ++k) {
+    if (child_validity.RowIsValid(k)) {
+      dict[k] = {dict_data[k].GetData(), static_cast<uint32_t>(dict_data[k].GetSize())};
+    } else {
+      dict[k] = {nullptr, 0};
+    }
+  }
+
+  // Build offsets + copy chars in one pass over the selection vector. Output validity
+  // is derived from dictionary-entry validity for this row's selected index.
+  size_t data_bytes = 0;
+  for (size_t row = 0; row < num_rows; ++row) {
+    auto const prev_offset = offset_blocks_accessor.get_current(allocation);
+    offset_blocks_accessor.advance();
+    auto const& entry = dict[sel_vec.get_index(row)];
+    if (entry.data != nullptr) {
+      offset_blocks_accessor.set_current(prev_offset + entry.len, allocation);
+      data_blocks_accessor.memcpy_from(entry.data, entry.len, allocation);
+      data_bytes += entry.len;
+    } else {
+      offset_blocks_accessor.set_current(prev_offset, allocation);
+    }
+  }
+  total_data_bytes += data_bytes;
+
+  if (!child_validity.AllValid()) {
+    duckdb::ValidityMask output_validity(num_rows);
+    for (size_t row = 0; row < num_rows; ++row) {
+      if (!child_validity.RowIsValid(sel_vec.get_index(row))) {
+        output_validity.SetInvalid(row);
+        null_count++;
+      }
+    }
+    process_mask_for_column(output_validity, num_rows, row_offset, allocation);
+  } else {
+    duckdb::ValidityMask all_valid;  // default-constructed = all valid
+    process_mask_for_column(all_valid, num_rows, row_offset, allocation);
+  }
+}
+
 cucascade::memory::column_metadata
 duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_rows) const
 {
@@ -583,6 +660,17 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 {
   for (size_t i = 0; i < l_state._num_columns; ++i) {
     auto& vec = l_state._chunk.data[i];
+
+    // Fast path: dictionary-encoded varchar columns are read straight from the
+    // (small) dictionary + selection vector, skipping the cost of Flatten and
+    // improving cache locality for the per-row string copies.
+    if (vec.GetVectorType() == duckdb::VectorType::DICTIONARY_VECTOR &&
+        l_state._column_builders[i].type.is_varchar()) {
+      l_state._column_builders[i].process_dictionary_varchar(
+        vec, l_state._chunk.size(), l_state._row_offset, l_state._allocation);
+      continue;
+    }
+
     vec.Flatten(l_state._chunk.size());
     auto const& validity = duckdb::FlatVector::Validity(vec);
     l_state._column_builders[i].process_column(

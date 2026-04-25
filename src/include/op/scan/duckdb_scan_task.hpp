@@ -279,6 +279,16 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
                         std::unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
+     * @brief Fast path for DICTIONARY_VECTOR VARCHAR columns: skip Flatten and build
+     * cuDF STRING (offsets + chars) directly from the DuckDB dictionary + selection
+     * vector.
+     */
+    void process_dictionary_varchar(duckdb::Vector& vec,
+                                    size_t num_rows,
+                                    size_t row_offset,
+                                    std::unique_ptr<multiple_blocks_allocation>& allocation);
+
+    /**
      * @brief Create a column_metadata for this column for building a host_table_allocation.
      *
      * @param[in] num_rows The number of rows in the column.
