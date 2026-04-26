@@ -25,6 +25,7 @@
 
 #include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/gpu_decode_validity.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
@@ -189,8 +190,12 @@ void launch_fill_constant(uint8_t* d_dest,
   }
 }
 
+}  // anonymous namespace
+
 //===----------------------------------------------------------------------===//
-// Validity-mask kernels — only consumed by `decode_validity_mask` below.
+// Validity-mask kernels — file-scope so cross-TU consumers (e.g. the string
+// decoder in gpu_decode_batched_string.cu) can launch them by name via the
+// declarations in gpu_decode_validity.cuh.
 //===----------------------------------------------------------------------===//
 
 /// CUDA kernel to set all validity bits to 1 (all valid).
@@ -233,6 +238,8 @@ __global__ void kernel_count_valid_bits(const uint64_t* __restrict__ mask,
 
   if (threadIdx.x == 0) *d_valid_count = s_counts[0];
 }
+
+namespace {
 
 //===----------------------------------------------------------------------===//
 // Bulk block transfer: stage every unique block referenced by any column
