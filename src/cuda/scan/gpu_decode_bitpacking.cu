@@ -178,6 +178,11 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
     return;
   }
 
+  // Anything other than DELTA_FOR at this point is INVALID metadata or a
+  // future-added mode we don't know how to decode — bail rather than fall
+  // through and write zeros silently.
+  if (mode != BitpackingMode::DELTA_FOR) return;
+
   //--- DELTA_FOR: unpack, prefix sum ---
   constexpr uint32_t BLOCK_DIM = 256;
   constexpr uint32_t VPT       = 8;

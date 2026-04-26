@@ -94,7 +94,23 @@ inline pinned_bounce_ring& get_tls_bounce_ring()
       }
       ::cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming);
     }
-    if (all_ok) ring.capacity = BOUNCE_SLOT_BYTES;
+    if (!all_ok) {
+      // Release any slots we did manage to allocate before the failure so a
+      // transient cudaHostAlloc error doesn't permanently pin tens of MB
+      // for the lifetime of this thread.
+      for (auto& s : ring.slots) {
+        if (s.ev) {
+          ::cudaEventDestroy(s.ev);
+          s.ev = nullptr;
+        }
+        if (s.buf) {
+          ::cudaFreeHost(s.buf);
+          s.buf = nullptr;
+        }
+      }
+    } else {
+      ring.capacity = BOUNCE_SLOT_BYTES;
+    }
   }
   return ring;
 }

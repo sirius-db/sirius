@@ -78,7 +78,9 @@ cudf::data_type to_cudf_type(const duckdb::LogicalType& type)
     case duckdb::LogicalTypeId::TIMESTAMP:
       return cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS);
     case duckdb::LogicalTypeId::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
-    case duckdb::LogicalTypeId::HUGEINT: return cudf::data_type(cudf::type_id::INT64);
+    // HUGEINT is signed 128-bit in DuckDB; cuDF has no int128 column type.
+    // Fall through to the viability-invariant throw below — PR E's
+    // check_viability must refuse HUGEINT columns until cuDF gains support.
     case duckdb::LogicalTypeId::DECIMAL: {
       switch (type.InternalType()) {
         case duckdb::PhysicalType::INT32:
