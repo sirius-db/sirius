@@ -94,9 +94,18 @@ inline arena_alloc arena_allocate(size_t bytes, cudaStream_t stream, size_t alig
 
   // Arena too small for this request — record for next-reset grow and
   // fall back to stream-ordered malloc. The caller will free on teardown.
-  a.peak  = std::max(a.peak, aligned_off + bytes);
-  void* p = nullptr;
-  ::cudaMallocAsync(&p, bytes, stream);
+  a.peak         = std::max(a.peak, aligned_off + bytes);
+  void* p        = nullptr;
+  cudaError_t rc = ::cudaMallocAsync(&p, bytes, stream);
+  if (rc != cudaSuccess) {
+    // Clear the sticky error so unrelated callers don't see it later.
+    // Surface the failure loudly — silently returning nullptr leads to
+    // confusing crashes in downstream CUDA calls instead of OOM here.
+    ::cudaGetLastError();
+    SIRIUS_LOG_WARN(
+      "[decode_arena] overflow alloc of {} bytes failed: {}", bytes, ::cudaGetErrorString(rc));
+    return {nullptr, false};
+  }
   return {p, true};
 }
 

@@ -33,6 +33,7 @@
 
 #include <duckdb/common/types.hpp>
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -760,7 +761,8 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   std::vector<fsst_decoder_compact> fsst_decoders;  // host-deserialized decoders
   uint32_t total_fsst_rows = 0;
   size_t cum_rows          = 0;
-  size_t cum_chars_upper   = 0;  // CPU upper-bound on total string bytes
+  size_t cum_chars_upper   = 0;      // CPU upper-bound on total string bytes
+  bool any_unknown_max_len = false;  // any segment with max_string_length == 0
 
   for (auto const& seg : col_scan.data.segments) {
     if (seg.row_count == 0) {
@@ -774,7 +776,12 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       continue;
     }
 
-    // Accumulate char upper bound from segment metadata
+    // Accumulate char upper bound from segment metadata.  max_string_length
+    // is documented as 0 = unknown (no segment stats available); a single
+    // unknown segment makes the column-wide upper bound an under-estimate,
+    // which would silently OOB the gather kernels in pass 2.  Track it so
+    // we can force the exact-allocation path below.
+    if (seg.max_string_length == 0) any_unknown_max_len = true;
     cum_chars_upper += static_cast<size_t>(seg.row_count) * seg.max_string_length;
 
     // Resolve device block pointer
@@ -1044,10 +1051,14 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   // Pass 2 kernels write at offsets computed by CUB (exact), so only the
   // leading portion of d_chars is used.  Excess is wasted but harmless.
   //
-  // Safety: fall back to exact allocation (with sync) if upper bound
-  // exceeds 512MB to prevent OOM from pathological max_string_length.
+  // Safety constraints:
+  //   - Force the exact (sync) path if any segment had max_string_length=0
+  //     (unknown).  cum_chars_upper would be an under-estimate and pass 2
+  //     would gather past the end of d_chars.
+  //   - Force the exact path when upper bound exceeds 512MB to prevent OOM
+  //     from pathological max_string_length stats.
   constexpr size_t UPPER_BOUND_LIMIT = 512ULL * 1024 * 1024;
-  bool use_upper_bound               = cum_chars_upper <= UPPER_BOUND_LIMIT;
+  bool use_upper_bound               = !any_unknown_max_len && cum_chars_upper <= UPPER_BOUND_LIMIT;
 
   size_t alloc_chars = 0;
   if (use_upper_bound) {
@@ -1063,9 +1074,25 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
     int32_t total_chars = 0;
     cudaMemcpy(
       &total_chars, d_offsets.data() + total_rows, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    // total_chars is read from the last entry of an int32 offsets array
+    // CUB scanned cumulatively.  A single overflow would wrap to negative;
+    // a multi-overflow can wrap back to a small positive — to catch that,
+    // additionally cross-check against the 64-bit upper bound when any
+    // segment reported a known max_string_length.
     if (total_chars < 0) {
-      throw std::runtime_error("batched string decode: negative total_chars=" +
-                               std::to_string(total_chars));
+      throw std::runtime_error(
+        "batched string decode: total_chars wrapped negative (column exceeds cuDF's "
+        "INT32_MAX-byte string-column limit): " +
+        std::to_string(total_chars));
+    }
+    if (!any_unknown_max_len &&
+        static_cast<size_t>(total_chars) > cum_chars_upper + (cum_chars_upper >> 1)) {
+      // Pass-1 result more than 1.5x the metadata upper bound — the int32
+      // running total has almost certainly wrapped multiple times.  Refuse.
+      throw std::runtime_error(
+        "batched string decode: pass-1 total_chars=" + std::to_string(total_chars) +
+        " disagrees with metadata upper bound " + std::to_string(cum_chars_upper) +
+        " — likely int32 offset overflow");
     }
     alloc_chars = static_cast<size_t>(total_chars);
   }

@@ -415,11 +415,17 @@ __global__ void kernel_alprd_decode_f32(const uint8_t* __restrict__ d_seg,
   const uint32_t r_bytes  = bp_bytes(vec_size, right_bw);
   const uint32_t r_mask   = (right_bw >= 32u) ? ~0u : ((1u << right_bw) - 1u);
 
+  // When right_bw == 32 (left_bw == 0), shifting a uint32_t by 32 is UB —
+  // the entire 32-bit value lives in right_val and there's no left part to
+  // splice in.  Branch is decided once per kernel invocation off a shared
+  // value; no warp divergence in the hot loop.
+  const bool full_right = (right_bw >= 32u);
+
   for (uint32_t i = threadIdx.x; i < vec_size; i += blockDim.x) {
     const uint16_t left_idx  = (uint16_t)alp_bp_unpack(left_bp, i, left_bw);
     const uint32_t right_val = (uint32_t)alp_bp_unpack(right_bp, i, right_bw);
     const uint32_t left_val  = sh_dict[left_idx];
-    const uint32_t bits      = (left_val << right_bw) | right_val;
+    const uint32_t bits      = full_right ? right_val : ((left_val << right_bw) | right_val);
     float v;
     __builtin_memcpy(&v, &bits, 4);
     out[i] = v;
@@ -438,7 +444,10 @@ __global__ void kernel_alprd_decode_f32(const uint8_t* __restrict__ d_seg,
       uint32_t existing_bits;
       __builtin_memcpy(&existing_bits, out + pos, 4);  // out+pos is 4-byte aligned
       const uint32_t right_part = existing_bits & r_mask;
-      const uint32_t bits       = ((uint32_t)exc_left << right_bw) | right_part;
+      // Same shift guard — when right_bw == 32 the exception's left bits
+      // have nowhere to land, so the corrected value is just right_part.
+      const uint32_t bits =
+        full_right ? right_part : (((uint32_t)exc_left << right_bw) | right_part);
       float v;
       __builtin_memcpy(&v, &bits, 4);
       out[pos] = v;
@@ -494,11 +503,16 @@ __global__ void kernel_alprd_decode_f64(const uint8_t* __restrict__ d_seg,
   const uint32_t r_bytes  = bp_bytes(vec_size, right_bw);
   const uint64_t r_mask   = (right_bw >= 64u) ? ~0ULL : ((1ULL << right_bw) - 1ULL);
 
+  // Mirror of the float path's UB guard: shifting a uint64_t by 64 is UB,
+  // so when right_bw == 64 (left_bw == 0) the entire double lives in
+  // right_val and there's no left part to splice.
+  const bool full_right = (right_bw >= 64u);
+
   for (uint32_t i = threadIdx.x; i < vec_size; i += blockDim.x) {
     const uint16_t left_idx  = (uint16_t)alp_bp_unpack(left_bp, i, left_bw);
     const uint64_t right_val = alp_bp_unpack(right_bp, i, right_bw);
     const uint64_t left_val  = sh_dict[left_idx];
-    const uint64_t bits      = (left_val << right_bw) | right_val;
+    const uint64_t bits      = full_right ? right_val : ((left_val << right_bw) | right_val);
     double v;
     __builtin_memcpy(&v, &bits, 8);
     out[i] = v;
@@ -515,7 +529,8 @@ __global__ void kernel_alprd_decode_f64(const uint8_t* __restrict__ d_seg,
       uint64_t existing_bits;
       __builtin_memcpy(&existing_bits, out + pos, 8);  // out+pos is 8-byte aligned
       const uint64_t right_part = existing_bits & r_mask;
-      const uint64_t bits       = ((uint64_t)exc_left << right_bw) | right_part;
+      const uint64_t bits =
+        full_right ? right_part : (((uint64_t)exc_left << right_bw) | right_part);
       double v;
       __builtin_memcpy(&v, &bits, 8);
       out[pos] = v;
