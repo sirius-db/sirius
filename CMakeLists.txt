@@ -369,6 +369,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/scan/test_gpu_decode_bitpacking_batched.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
