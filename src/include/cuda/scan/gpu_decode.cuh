@@ -38,14 +38,8 @@ namespace sirius::cuda::scan {
 // DuckDB compression format constants (must match duckdb internals)
 //===----------------------------------------------------------------------===//
 
-/// Bitpacking algorithm group size — 32 values per group (warp-aligned).
-static constexpr uint32_t BP_GROUP_SIZE = 32;
-
 /// Metadata group size — 2048 values per metadata entry.
 static constexpr uint32_t BP_META_GROUP_SIZE = 2048;
-
-/// Number of algorithm groups per metadata group.
-static constexpr uint32_t BP_ALGO_GROUPS_PER_META = BP_META_GROUP_SIZE / BP_GROUP_SIZE;  // 64
 
 /// DuckDB storage block size (256KB).
 static constexpr size_t DUCKDB_BLOCK_SIZE = 262144;
@@ -58,16 +52,6 @@ enum class BitpackingMode : uint8_t {
   CONSTANT_DELTA = 3,
   DELTA_FOR      = 4,
   FOR            = 5
-};
-
-/// Decoded metadata for one 2048-value group.
-struct bp_group_meta {
-  BitpackingMode mode;
-  uint32_t data_offset;       ///< Byte offset from segment base to compressed data
-  uint32_t width;             ///< Bitpacking width (only for FOR/DELTA_FOR)
-  int64_t frame_of_ref;       ///< Frame of reference value
-  int64_t constant_or_delta;  ///< Constant value (CONSTANT) or delta (CONSTANT_DELTA/DELTA_FOR)
-  uint32_t row_count;         ///< Number of rows in this group (last group may be < 2048)
 };
 
 //===----------------------------------------------------------------------===//

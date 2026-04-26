@@ -25,7 +25,6 @@
 
 #include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
-#include "cuda/scan/gpu_decode_validity.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
@@ -44,7 +43,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -189,7 +187,9 @@ void launch_fill_constant(uint8_t* d_dest,
   }
 }
 
-}  // anonymous namespace
+//===----------------------------------------------------------------------===//
+// Validity-mask kernels — only consumed by `decode_validity_mask` below.
+//===----------------------------------------------------------------------===//
 
 /// CUDA kernel to set all validity bits to 1 (all valid).
 __global__ void kernel_fill_valid(uint64_t* mask, uint32_t num_words)
@@ -231,8 +231,6 @@ __global__ void kernel_count_valid_bits(const uint64_t* __restrict__ mask,
 
   if (threadIdx.x == 0) *d_valid_count = s_counts[0];
 }
-
-namespace {
 
 //===----------------------------------------------------------------------===//
 // Bulk block transfer: stage every unique block referenced by any column
@@ -280,20 +278,6 @@ std::pair<device_block_map, rmm::device_buffer> transfer_blocks_bulk_h2d(
   rmm::device_buffer staging(sorted.size() * DUCKDB_BLOCK_SIZE, stream, mr);
   auto* d_staging = static_cast<uint8_t*>(staging.data());
 
-  static const bool kUseBatch = [] {
-    auto* v = std::getenv("SIRIUS_USE_BATCH_H2D");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-  }();
-
-  std::vector<void*> b_dsts;
-  std::vector<void*> b_srcs;
-  std::vector<size_t> b_sizes;
-  if (kUseBatch) {
-    b_dsts.reserve(sorted.size());
-    b_srcs.reserve(sorted.size());
-    b_sizes.reserve(sorted.size());
-  }
-
   size_t offset = 0;
   for (size_t i = 0; i < sorted.size();) {
     size_t run_start = i;
@@ -304,45 +288,12 @@ std::pair<device_block_map, rmm::device_buffer> transfer_blocks_bulk_h2d(
     ++i;
     size_t run_len = i - run_start;
 
-    if (kUseBatch) {
-      b_dsts.push_back(d_staging + offset);
-      b_srcs.push_back(const_cast<uint8_t*>(sorted[run_start].host_base));
-      b_sizes.push_back(run_len * DUCKDB_BLOCK_SIZE);
-    } else {
-      bounce_h2d_async(d_staging + offset,
-                       sorted[run_start].host_base,
-                       run_len * DUCKDB_BLOCK_SIZE,
-                       stream.value());
-    }
+    bounce_h2d_async(
+      d_staging + offset, sorted[run_start].host_base, run_len * DUCKDB_BLOCK_SIZE, stream.value());
 
     for (size_t j = run_start; j < i; ++j) {
       map.offsets[sorted[j].block_id] = offset;
       offset += DUCKDB_BLOCK_SIZE;
-    }
-  }
-
-  if (kUseBatch && !b_dsts.empty()) {
-    cudaMemcpyAttributes attr{};
-    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attr.srcLocHint     = {cudaMemLocationTypeHost, 0};
-    attr.dstLocHint     = {cudaMemLocationTypeDevice, 0};
-    attr.flags          = cudaMemcpyFlagDefault;
-    std::vector<size_t> idxs(b_dsts.size(), 0);
-    // CUDA 12.9+ added a `failIdx` out-param before `stream`; we don't act
-    // on which copy failed, the cudaError_t is enough.
-    size_t fail_idx = 0;
-    cudaError_t err = cudaMemcpyBatchAsync(b_dsts.data(),
-                                           b_srcs.data(),
-                                           b_sizes.data(),
-                                           b_dsts.size(),
-                                           &attr,
-                                           idxs.data(),
-                                           1,
-                                           &fail_idx,
-                                           stream.value());
-    if (err != cudaSuccess) {
-      SIRIUS_LOG_ERROR("cudaMemcpyBatchAsync failed: {}", cudaGetErrorString(err));
-      throw std::runtime_error("cudaMemcpyBatchAsync failed");
     }
   }
 
