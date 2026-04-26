@@ -157,6 +157,39 @@ inline std::vector<uint8_t> make_delta_for_block(T frame,
 }
 
 //===----------------------------------------------------------------------===//
+// DuckDB-RLE-format block construction.  Layout (within the segment slot):
+//
+//   bytes [0..8)                     uint64_t rle_count_offset
+//   bytes [8 .. rle_count_offset)    Values: T[entry_count]
+//   bytes [rle_count_offset .. )     Counts: uint16_t[entry_count]
+//
+// Entry count is implicit — gpu_decode_rle's CPU header parser walks the
+// counts array adding to a running total until it equals row_count, so
+// the test harness must size `counts` so its sum equals the row_count
+// passed at decode time.
+//===----------------------------------------------------------------------===//
+
+template <typename T>
+inline std::vector<uint8_t> make_rle_block(std::vector<T> const& values,
+                                           std::vector<uint16_t> const& counts)
+{
+  // Caller bug if these don't match — surface it instead of producing
+  // a malformed block that decodes silently wrong.
+  if (values.size() != counts.size()) {
+    throw std::runtime_error("make_rle_block: values and counts size mismatch (caller error)");
+  }
+  size_t entry_count        = values.size();
+  size_t values_bytes       = entry_count * sizeof(T);
+  size_t counts_bytes       = entry_count * sizeof(uint16_t);
+  uint64_t rle_count_offset = 8 + values_bytes;
+  std::vector<uint8_t> block(8 + values_bytes + counts_bytes, 0);
+  std::memcpy(block.data(), &rle_count_offset, sizeof(rle_count_offset));
+  if (values_bytes > 0) std::memcpy(block.data() + 8, values.data(), values_bytes);
+  if (counts_bytes > 0) std::memcpy(block.data() + 8 + values_bytes, counts.data(), counts_bytes);
+  return block;
+}
+
+//===----------------------------------------------------------------------===//
 // Device buffer helpers (don't drag in cucascade — kernel tests only need
 // raw cudaMalloc/cudaMemcpy semantics).
 //===----------------------------------------------------------------------===//
