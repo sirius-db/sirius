@@ -252,7 +252,13 @@ set(EXTENSION_SOURCES
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
-set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu)
+set(CUDA_SOURCES
+    src/op/scan/equality_delete_mask.cu
+    src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_batched_string.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu
+    src/cuda/scan/gpu_decode_rle.cu
+    src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -368,6 +374,9 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/scan/test_gpu_decode_bitpacking_batched.cpp
+    test/cpp/operator/scan/test_gpu_decode_rle.cpp
+    test/cpp/operator/scan/test_gpu_decode_validity.cu
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
@@ -419,6 +428,10 @@ set_target_properties(
   sirius_unittest
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+             CUDA_SEPARABLE_COMPILATION ON
+             CUDA_RESOLVE_DEVICE_SYMBOLS ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
 target_compile_definitions(
