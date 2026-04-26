@@ -404,6 +404,20 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
   rmm::device_buffer data_buf(total_rows * type_size, stream, mr);
   auto* d_output = static_cast<uint8_t*>(data_buf.data());
 
+  // RLE cumsum scratch: lazily allocated only if any segment in this column
+  // is RLE-encoded.  Sourced from the thread-local decode arena so repeat
+  // batches hit the bump fast-path instead of cudaMallocFromPoolAsync.
+  constexpr size_t RLE_CUMSUM_CAP = 4096 * sizeof(uint32_t);
+  uint32_t* d_rle_cumsum          = nullptr;
+  arena_alloc rle_alloc{nullptr, false};
+  for (auto const& seg : col_scan.data.segments) {
+    if (seg.compression == duckdb::CompressionType::COMPRESSION_RLE) {
+      rle_alloc    = arena_allocate(RLE_CUMSUM_CAP, stream.value());
+      d_rle_cumsum = static_cast<uint32_t*>(rle_alloc.ptr);
+      break;
+    }
+  }
+
   // Bitpacking segments are batched into one kernel launch across the column.
   // When the block is pre-staged, block_ptr is the device pointer and
   // on_device=true; otherwise block_ptr is the host base (for fallback H2D).
@@ -459,6 +473,20 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
                                row_offset});
         break;
       }
+      case duckdb::CompressionType::COMPRESSION_RLE: {
+        gpu_decode_rle(seg.data_ptr - seg.block_offset,
+                       DUCKDB_BLOCK_SIZE,
+                       seg.block_offset,
+                       seg.row_count,
+                       type_size,
+                       d_dest,
+                       stream,
+                       d_block ? const_cast<void*>(static_cast<const void*>(d_block)) : nullptr,
+                       /*skip_block_copy=*/d_block != nullptr,
+                       d_rle_cumsum,
+                       RLE_CUMSUM_CAP);
+        break;
+      }
       default:
         // Defensive assert: PR E's check_viability owns keeping unsupported
         // compression types out of this dispatcher.  Reaching here means the
@@ -507,6 +535,8 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
 
     if (d_fb_staging) cudaFreeAsync(d_fb_staging, stream.value());
   }
+
+  if (d_rle_cumsum && rle_alloc.needs_free) cudaFreeAsync(d_rle_cumsum, stream.value());
 
   auto [null_mask, null_count] =
     decode_validity_mask(col_scan, total_rows, stream, mr, d_valid_count_out);
