@@ -25,6 +25,7 @@
 
 #include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/gpu_decode_alp.cuh"
 #include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "cuda/scan/gpu_decode_validity.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
@@ -485,6 +486,25 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
                        /*skip_block_copy=*/d_block != nullptr,
                        d_rle_cumsum,
                        RLE_CUMSUM_CAP);
+        break;
+      }
+      case duckdb::CompressionType::COMPRESSION_ALP: {
+        // ALP kernels read straight from device staging — they don't have a
+        // per-segment H2D fallback path.  Reaching here without a staged
+        // block means the bulk-stage step earlier missed this segment.
+        if (!d_block) {
+          throw std::runtime_error(
+            "gpu_native_decode: ALP segment missing staged block — unexpected");
+        }
+        gpu_decode_alp(d_block + seg.block_offset, seg.row_count, type_size, d_dest, stream);
+        break;
+      }
+      case duckdb::CompressionType::COMPRESSION_ALPRD: {
+        if (!d_block) {
+          throw std::runtime_error(
+            "gpu_native_decode: ALPRD segment missing staged block — unexpected");
+        }
+        gpu_decode_alprd(d_block + seg.block_offset, seg.row_count, type_size, d_dest, stream);
         break;
       }
       default:

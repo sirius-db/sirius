@@ -253,6 +253,7 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/scan/equality_delete_mask.cu
+    src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_batched_string.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
