@@ -61,37 +61,29 @@ void sirius_gpu_parquet_scan_operator::accumulate_metadata(
   }
 }
 
-void sirius_gpu_parquet_scan_operator::finalize_partitions()
-{
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-  _finalized = true;
-}
-
 //===----------------------------------------------------------------------===//
 // Scheduling interface
 //===----------------------------------------------------------------------===//
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
-  {
-    std::lock_guard<std::mutex> lock(_metadata_mutex);
+  std::lock_guard<std::mutex> lock(_metadata_mutex);
 
-    // 1. Work available? Dispatch immediately, even if metadata pipeline
-    //    is still producing.
-    if (_next_partition_idx < _partition_index.size()) {
-      return task_creation_hint{TaskCreationHint::READY, this};
-    }
-
-    // 2. No work and metadata pipeline is done — we are finished.
-    if (_finalized) { return std::nullopt; }
+  // 1. Work available? Dispatch immediately, even if metadata pipeline
+  //    is still producing.
+  if (_next_partition_idx < _partition_index.size()) {
+    return task_creation_hint{TaskCreationHint::READY, this};
   }
 
-  // 3. Metadata pipeline is still running — defer to it.
+  // 2. Metadata pipeline still running? Wait on it.
   auto it = ports.find("handoff");
-  if (it != ports.end() && it->second && it->second->src_pipeline) {
+  if (it != ports.end() && it->second && it->second->src_pipeline &&
+      !it->second->src_pipeline->is_pipeline_finished()) {
     if (auto upstream = it->second->src_pipeline->get_source()) {
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, upstream.get()};
     }
   }
+
+  // 3. No work, pipeline done — finished.
   return std::nullopt;
 }
 

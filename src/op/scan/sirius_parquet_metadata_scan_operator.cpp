@@ -382,9 +382,4 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
   _gpu_scan->accumulate_metadata(*metadata);
 }
 
-void sirius_parquet_metadata_scan_operator::finalize_operator()
-{
-  _gpu_scan->finalize_partitions();
-}
-
 }  // namespace sirius::op::scan

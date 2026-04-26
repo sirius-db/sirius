@@ -166,7 +166,7 @@ schema_info diverse_table_schema()
   return info;
 }
 
-/// Run the full two-pipeline scan: metadata scan → sink → finalize → GPU scan.
+/// Run the full two-pipeline scan: metadata scan → sink → GPU scan.
 /// Returns all output data_batches.
 std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   std::vector<std::string> const& file_paths,
@@ -205,9 +205,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     REQUIRE(output);
     metadata_op.sink(*output, stream);
   }
-
-  // --- Pipeline 1 → Pipeline 2 transition ---
-  metadata_op.finalize_operator();
 
   // --- Pipeline 2: GPU scan ---
   std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
@@ -806,7 +803,7 @@ TEST_CASE("two-pipeline scan - small batch size creates multiple partitions",
   REQUIRE(total_rows == NUM_ROWS);
 }
 
-TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator][shared_context]")
+TEST_CASE("gpu_scan_operator - idle without handoff port", "[gpu_scan_operator][shared_context]")
 {
   auto memory_manager = initialize_memory_manager();
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
@@ -824,11 +821,6 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
   REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_hint() == std::nullopt);
   REQUIRE(op.get_next_task_input_data() == nullptr);
-
-  // Finalize with no metadata → no partitions, still idle.
-  op.finalize_partitions();
-  REQUIRE(op.all_ports_empty());
-  REQUIRE(op.get_next_task_hint() == std::nullopt);
 }
 
 TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",
