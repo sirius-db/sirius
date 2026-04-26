@@ -447,6 +447,25 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
     const uint8_t* d_block =
       (blk_it != blocks.offsets.end()) ? device_staging + blk_it->second : nullptr;
 
+    // Audit: every persistent non-CONSTANT segment with a valid data_ptr is
+    // expected to have been pre-staged in transfer_blocks_bulk_h2d (which
+    // requires block_id >= 0).  The per-segment H2D fallback paths below
+    // (BITPACKING / UNCOMPRESSED / RLE) are defensive code for an edge case
+    // we have not actually observed in production scans.  Log loudly when
+    // it does fire so we can decide whether the fallbacks are worth keeping
+    // or whether the bulk-stage step should be tightened.  ALP and ALPRD
+    // already throw on this case (their kernels have no fallback path).
+    if (!d_block && seg.compression != duckdb::CompressionType::COMPRESSION_CONSTANT) {
+      SIRIUS_LOG_WARN(
+        "[gpu_native_decode] segment without staged block — block_id={} "
+        "persistent={} compression={} row_count={}.  Falling back to per-segment H2D; "
+        "if this fires in CI please flag — the fallback paths may be removable.",
+        seg.block_id,
+        seg.persistent,
+        static_cast<int>(seg.compression),
+        seg.row_count);
+    }
+
     switch (seg.compression) {
       case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED: {
         if (d_block) {
