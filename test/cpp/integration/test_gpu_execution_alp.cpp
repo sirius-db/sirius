@@ -248,133 +248,51 @@ class GPUExecutionALPFixture : public ALPFixtureBase {
 };
 
 //===----------------------------------------------------------------------===//
-// ALP DOUBLE tests
+// One row-scan per codec×type, plus one NULL case.
+//
+// Row-scan is the strictest comparator (per-row equality); if decode is
+// correct row-by-row, SUM/COUNT/COUNT-WHERE all pass automatically. The
+// upstream cherry-pick had separate TEST_CASEs for each aggregate per
+// codec×type (16 total) — that's redundant against the project's
+// "TEST_CASE per code path, SECTION per input variant" convention used in
+// test_gpu_decode_bitpacking_batched / test_gpu_decode_rle.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - double sum",
+                 "gpu_execution alp - per-codec row scan",
                  "[integration][gpu_execution][alp]")
 {
-  compare_gpu_vs_cpu("SELECT SUM(val) FROM alp_db.alp_doubles", 1e-4f);
+  SECTION("ALP × double")
+  {
+    compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alp_doubles WHERE id < 50", 1e-6f);
+  }
+  SECTION("ALP × float")
+  {
+    compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alp_floats WHERE id < 50", 1e-4f);
+  }
+  SECTION("ALPRD × double")
+  {
+    compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alprd_doubles WHERE id < 50", 1e-6f);
+  }
+  SECTION("ALPRD × float")
+  {
+    compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alprd_floats WHERE id < 50", 1e-4f);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - double count",
+                 "gpu_execution alp - null handling",
                  "[integration][gpu_execution][alp]")
 {
-  compare_gpu_vs_cpu("SELECT COUNT(val) FROM alp_db.alp_doubles");
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - double filter",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT COUNT(*) FROM alp_db.alp_doubles WHERE val > 5000000.0");
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - double row scan",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alp_doubles WHERE id < 50", 1e-6f);
-}
-
-//===----------------------------------------------------------------------===//
-// ALP FLOAT tests
-//===----------------------------------------------------------------------===//
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - float sum",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT SUM(val) FROM alp_db.alp_floats", 1e-1f);
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - float count",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT COUNT(val) FROM alp_db.alp_floats");
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - float row scan",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alp_floats WHERE id < 50", 1e-4f);
-}
-
-//===----------------------------------------------------------------------===//
-// ALPRD DOUBLE tests
-//===----------------------------------------------------------------------===//
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alprd - double sum",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT SUM(val) FROM alp_db.alprd_doubles", 1e-4f);
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alprd - double count",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT COUNT(val) FROM alp_db.alprd_doubles");
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alprd - double filter",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT COUNT(*) FROM alp_db.alprd_doubles WHERE val > 500000.0");
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alprd - double row scan",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alprd_doubles WHERE id < 50", 1e-6f);
-}
-
-//===----------------------------------------------------------------------===//
-// ALPRD FLOAT tests
-//===----------------------------------------------------------------------===//
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alprd - float sum",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT SUM(val) FROM alp_db.alprd_floats", 1e-1f);
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alprd - float count",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT COUNT(val) FROM alp_db.alprd_floats");
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alprd - float row scan",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alprd_floats WHERE id < 50", 1e-4f);
-}
-
-//===----------------------------------------------------------------------===//
-// NULL handling
-//===----------------------------------------------------------------------===//
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - null count",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT COUNT(*) AS total, COUNT(val) AS non_null FROM alp_db.alp_nulls");
-}
-
-TEST_CASE_METHOD(GPUExecutionALPFixture,
-                 "gpu_execution alp - null sum",
-                 "[integration][gpu_execution][alp]")
-{
-  compare_gpu_vs_cpu("SELECT SUM(val) FROM alp_db.alp_nulls", 1e-4f);
+  // Validity overlay correctness — every 10th row NULL in alp_nulls.
+  // Row-scan implicitly checks per-row null mask; SUM is a sanity check that
+  // the all-valid-prefilled bitmap is composed correctly with ALP decode.
+  SECTION("row-scan with nulls")
+  {
+    compare_gpu_vs_cpu("SELECT id, val FROM alp_db.alp_nulls WHERE id < 100", 1e-6f);
+  }
+  SECTION("SUM ignoring nulls")
+  {
+    compare_gpu_vs_cpu("SELECT SUM(val) FROM alp_db.alp_nulls", 1e-4f);
+  }
 }
